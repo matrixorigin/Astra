@@ -389,6 +389,56 @@ fn attach_runtime_volatile_injections(
 
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
+    fn deferred_tool_contract_schemas(&self) -> &[Value] {
+        &self.all_schemas
+    }
+
+    fn injects_round_guidance(&self) -> bool {
+        // A sub-run posts to the canonical Server loop; it does not assemble
+        // a provider request locally.  Round guidance is therefore owned by
+        // the server pipeline and must not be duplicated in the edge payload.
+        true
+    }
+
+    fn bind_deferred_tool_activations(
+        &mut self,
+        state: &mut AgenticLoopState,
+        activations: &[astra_turn_types::DeferredToolActivation],
+    ) {
+        // A fork sub-run has one explicit CLI-owned provider.  Bind the
+        // selected compact contract to that provider's exact full schema
+        // before the activation can cross the next-round carrier boundary;
+        // the shared resolver will reject a descriptor-less history record.
+        let Ok(provider_binding) = astra_turn_types::ProviderBindingRef::new("cli-subrun") else {
+            return;
+        };
+        for activation in activations {
+            let Some(schema) = self.all_schemas.iter().find(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema)
+                    .is_some_and(|name| name == activation.name)
+            }) else {
+                continue;
+            };
+            let Ok(native_tool_id) = astra_turn_types::NativeToolId::new(activation.name.clone())
+            else {
+                continue;
+            };
+            let Ok(descriptor) = astra_turn_types::ResolvedToolDescriptorRef::new(
+                astra_turn_types::ToolIdentity::new(provider_binding.clone(), native_tool_id),
+                astra_runtime_env::canonical_tool_schema_digest(schema),
+            ) else {
+                continue;
+            };
+            for retained in &mut state.deferred_tool_activations {
+                if retained.name == activation.name
+                    && retained.schema_digest == activation.schema_digest
+                {
+                    retained.descriptor = Some(descriptor.clone());
+                }
+            }
+        }
+    }
+
     fn continuation_authority(
         &self,
         result: &HostTurnResult,
@@ -1277,7 +1327,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
@@ -1453,13 +1503,7 @@ fn attach_subrun_tool_surface(
         );
     }
 
-    let activated = executor.activated_deferred_tool_names_for_schema_injection();
-    if !activated.is_empty() {
-        let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-        inject_required_tool_names(&mut schemas_to_use, &mut surface_report, &refs, all_schemas);
-    }
     schemas_to_use = executor.runtime_bound_tool_schemas(schemas_to_use);
-
     astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
         payload,
         schemas_to_use,
@@ -1498,6 +1542,16 @@ fn attach_subrun_tool_surface(
             tool_surface.deferred_manifest_with_context_window(context_window_tokens)
     {
         activatable_tool_names = manifest.names.iter().cloned().collect();
+        let deferred_provider_names: HashSet<&str> =
+            manifest.names.iter().map(String::as_str).collect();
+        let deferred_provider_schemas =
+            astra_runtime::turn::chat_turn_edge_profile::deferred_provider_schemas_for_names(
+                &eligible_provider_schemas,
+                &deferred_provider_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            );
         merge_edge_profile_extensions(
             payload,
             &json!({
@@ -1509,8 +1563,20 @@ fn attach_subrun_tool_surface(
                     manifest.names,
                 astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES:
                     manifest.omitted_names,
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS:
+                    deferred_provider_schemas,
             }),
         );
+        // The carrier is a runtime protocol primitive, not a capability that
+        // a child allowlist may remove while leaving the deferred manifest
+        // visible.
+        payload["edge_tools"]
+            .as_array_mut()
+            .expect("edge_tools attached before deferred manifest")
+            .push(
+                astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(
+                ),
+            );
     }
     // Mirror exactly what the sub-run request exposes. Visible and
     // activatable names are written together so tool_search/direct-call
@@ -1542,7 +1608,8 @@ mod tests {
         AgenticLoopHost, TurnInteractionMode, interaction_scoped_tool_restrictions,
     };
     use astra_runtime::turn::chat_turn_edge_profile::{
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS,
+        EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES,
     };
     use astra_skills::executor::isolated::SkillSubRunExecutor;
     use astra_skills::executor::isolated::{SubRunOutcome, SubRunResult};
@@ -2050,25 +2117,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subrun_surface_injects_activated_deferred_tool_and_excludes_it_from_manifest() {
+    async fn subrun_surface_keeps_deferred_selection_out_of_the_wire_schema() {
         let root = tempfile::tempdir().unwrap();
         let executor = edge_tools::ToolExecutor::new(root.path());
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["reflect".to_string()]));
 
         let selected = executor
-            .execute("tool_search", &json!({"query": "select:memory"}))
+            .execute("tool_search", &json!({"query": "select:reflect"}))
             .await;
         let selected: Value = serde_json::from_str(&selected).unwrap();
-        assert_eq!(selected["matches"][0]["name"].as_str(), Some("memory"));
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
-        );
+        assert_eq!(selected["matches"][0]["name"].as_str(), Some("reflect"));
 
-        let mut payload = json!({});
+        // Production sub-runs start from `chat_turn_base_payload`, which owns
+        // the typed edge-profile object. Keep this focused helper fixture on
+        // that same boundary so the deferred manifest is observable.
+        let mut payload = json!({"edge_profile": {}});
         let mut restricted_tools = HashSet::new();
-        let all_schemas = vec![schema("tool_search"), schema("memory"), schema("read_file")];
+        let all_schemas = vec![
+            schema("tool_search"),
+            schema("reflect"),
+            schema("read_file"),
+        ];
 
         let policy = attach_subrun_tool_surface(
             &mut payload,
@@ -2088,10 +2158,13 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert!(
-            visible_tool_names.contains("memory"),
-            "subrun must keep activated deferred tools in the next visible schema set: {visible_tool_names:?}"
+            !visible_tool_names.contains("reflect"),
+            "selection must not inject a deferred target schema: {visible_tool_names:?}"
         );
-        assert!(policy.visible_tool_names.contains(&"memory".to_string()));
+        assert!(visible_tool_names.contains(
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+        ));
+        assert!(!policy.visible_tool_names.contains(&"reflect".to_string()));
 
         let deferred_tool_names: HashSet<String> = payload["edge_profile"]
             [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
@@ -2105,19 +2178,66 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            !deferred_tool_names.contains("memory"),
-            "activated visible tool must not also remain in the deferred manifest: visible={visible_tool_names:?} deferred={deferred_tool_names:?}"
+            deferred_tool_names.contains("reflect"),
+            "the selected target must remain in the deferred control-plane catalog without entering the wire schema: visible={visible_tool_names:?} deferred={deferred_tool_names:?}"
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "subrun surface assembly must preserve selected schema materialization"
+        let _ = executor.execute("reflect", &json!({})).await;
+    }
+
+    #[test]
+    fn subrun_surface_carries_provider_deferred_schema_in_control_plane_only() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+        let provider_schema = json!({
+                "type": "function",
+                "function": {
+                "name": "custom_weather",
+                "description": "Get a forecast from the CLI-owned provider.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_cli_local_provider_schemas(vec![provider_schema.clone()]);
+
+        let mut payload = json!({"edge_profile": {}});
+        let mut restricted_tools = HashSet::new();
+        let all_schemas = vec![schema("tool_search")];
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search")],
+            &all_schemas,
+            &mut restricted_tools,
+            &executor,
+            Some(200_000),
+            TurnInteractionMode::NonInteractive,
         );
-        let _ = executor.execute("memory", &json!({})).await;
+
+        assert!(
+            policy
+                .visible_tool_names
+                .contains(&"tool_search".to_string())
+        );
+        let visible_names = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect::<HashSet<_>>();
+        assert!(!visible_names.contains("custom_weather"));
         assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "a selected schema must remain materialized for the subrun after a call"
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS],
+            json!([provider_schema]),
+            "the full provider contract belongs in the control plane, not tools[]"
+        );
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name.as_str() == Some("custom_weather"))
         );
     }
 

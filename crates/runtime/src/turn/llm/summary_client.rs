@@ -434,21 +434,31 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }
         };
         match result {
-            Ok(result) if !result.tool_calls.is_empty() => Err(format!(
-                "summary inference returned {} tool call(s) instead of structured text",
-                result.tool_calls.len()
-            )),
-            Ok(result) if result.full_text.trim().is_empty() => {
-                Err("summary inference returned empty text".to_string())
+            // A no-tool provider response that nevertheless contains a native
+            // or degraded call is a completed transport with invalid
+            // structured output, not a network failure. Return an empty typed
+            // payload so schema-owning callers can take their one bounded
+            // repair path. No call from this private adapter is executable.
+            Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
+                Ok(SummaryResponse {
+                    text: String::new(),
+                    is_ptl_error: false,
+                    finish_reason: result.effective_finish_reason.or(result.finish_reason),
+                    usage: result.usage,
+                })
             }
             Ok(result) => Ok(SummaryResponse {
                 text: result.full_text,
                 is_ptl_error: false,
+                finish_reason: result.effective_finish_reason.or(result.finish_reason),
+                usage: result.usage,
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
                     text: String::new(),
                     is_ptl_error: true,
+                    finish_reason: None,
+                    usage: serde_json::Map::new(),
                 })
             }
             Err(error) => Err(error.to_string()),
@@ -1032,6 +1042,14 @@ mod tests {
             .await
             .expect("the no-tool transport must return summary text");
         assert_eq!(summary.text, "structured summary");
+        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            summary
+                .usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(10)
+        );
 
         let body = captured_body
             .lock()
@@ -1068,7 +1086,7 @@ mod tests {
                             ))
                             .expect("strict provider rejection");
                     }
-                    let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary","acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#;
+                    let decision = r#"{"work_lifecycle":"not_required","execution_topology":"primary","acceptance_units":[{"objective":"Answer the question","expected_result":"One direct answer"}]}"#;
                     if body["stream"] == true {
                         let event = serde_json::json!({"choices":[{"index":0,"delta":{"content":decision},"finish_reason":null}]});
                         return Response::builder().status(200).header("content-type", "text/event-stream")
@@ -1234,6 +1252,52 @@ mod tests {
             .clone()
             .expect("captured configured request");
         assert_eq!(body.get("temperature"), Some(&serde_json::json!(0.7)));
+    }
+
+    #[tokio::test]
+    async fn provider_tool_call_on_no_tool_summary_is_repairable_invalid_output() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let response = serde_json::json!({
+                    "id": "invalid-summary-response",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"work_lifecycle\":\"not_required\"}",
+                            "tool_calls": [{
+                                "id": "forbidden-call",
+                                "type": "function",
+                                "function": {"name": "bash", "arguments": "{\"command\":\"true\"}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+                });
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(response.to_string()))
+                    .expect("summary provider response")
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64);
+        let summary = client
+            .summarize(
+                InferencePurpose::Introspection,
+                &[serde_json::json!({"role": "user", "content": "classify"})],
+            )
+            .await
+            .expect("completed transport must reach the structured repair owner");
+
+        assert!(summary.text.is_empty());
+        assert_eq!(summary.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            summary.usage.get("input_tokens").and_then(Value::as_u64),
+            Some(7)
+        );
     }
 
     #[test]

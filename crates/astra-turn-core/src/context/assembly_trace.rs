@@ -279,8 +279,8 @@ pub struct CompressionStage {
 pub enum CompressionMethod {
     /// Tool result truncation.
     ToolResultTruncation,
-    /// Duplicate file read elimination.
-    DuplicateReadElimination,
+    /// Byte-identical tool output elimination.
+    DuplicateToolOutputElimination,
     /// LLM-based summarization.
     LlmSummarization,
     /// Tiered compaction.
@@ -943,8 +943,8 @@ mod tests {
             12_000,
             &[
                 (
-                    "duplicate read elimination".to_string(),
-                    CompressionMethod::DuplicateReadElimination,
+                    "duplicate tool output elimination".to_string(),
+                    CompressionMethod::DuplicateToolOutputElimination,
                     3_000,
                 ),
                 (
@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(trace.compression_stages.len(), 1);
         assert_eq!(
             trace.compression_stages[0].stage,
-            "duplicate read elimination"
+            "duplicate tool output elimination"
         );
         assert_eq!(trace.compression_stages[0].tokens_freed, 3_000);
     }

@@ -50,6 +50,14 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         hot_path_hint="projection-sequence (projection/sequence) reads and hot coordination",
     ),
     SchemaSource(
+        owner="astra_services::work::establishment_operation",
+        domain="work",
+        path="crates/services/src/work/establishment_operation.rs",
+        startup_owner="ensure_core_schema via crate::work::WORK_SCHEMA_TABLES",
+        state_class_hint="durable recovery-idempotency authority for multi-phase Work establishment",
+        hot_path_hint="cold establishment/recovery path with bounded idempotency lookup",
+    ),
+    SchemaSource(
         owner="astra_services::config_version_cloud",
         domain="config_versions",
         path="crates/services/src/config_version_cloud.rs",
@@ -1270,6 +1278,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::work",
         product_owner="Work goal authority and immutable change history",
     ),
+    "work_establishment_operations": TableMetadata(
+        semantic_owner="astra_services::work::establishment_operation",
+        state_class="durable Work establishment recovery and idempotency authority",
+        primary_query="establishment operation by owner_id/operation_id with request_hash, phase, state, and updated_at",
+        retention_policy="retain pending and terminal operations through retry, recovery, and audit; prune only with Work cleanup after terminal reconciliation",
+        rebuildability="not rebuildable during recovery because request identity, phase, outcome, and operation-to-Work binding are authoritative",
+        merge_guidance="keep establishment operations separate from provider invocations and Work root state; this table fences multi-transaction Work genesis while the invocation ledger owns provider delivery",
+        migration_owner="astra_services::work::establishment_operation",
+        product_owner="Work establishment recovery, idempotency, and multi-transaction fencing",
+    ),
     "work_criteria": TableMetadata(
         semantic_owner="astra_services::work::criteria",
         state_class="durable Work criterion identity catalog",
@@ -1970,7 +1988,11 @@ def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
         text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)
         if CREATE_TABLE_RE.search(text):
             discovered.append(path.relative_to(root).as_posix())
-    return discovered
+    # Path.glob ordering is filesystem/path-object dependent for a sibling
+    # module directory and its parent Rust file (for example `work/` and
+    # `work.rs`).  Keep the discovery contract deterministic and comparable to
+    # the canonical manifest ordering.
+    return sorted(discovered)
 
 
 def production_source(text: str, *, stop_at_cfg_test: bool) -> str:

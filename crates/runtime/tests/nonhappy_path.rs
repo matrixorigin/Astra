@@ -360,8 +360,15 @@ mod multi_file_edit_regression {
         .map(|_| json!({"name": "git"}))
         .collect();
 
-        let retained =
-            retain_invoked_tool_schemas(&mut selected, &mut report, &tool_results, &all_schemas);
+        let previously_visible =
+            std::collections::HashSet::from(["bash".to_string(), "git".to_string()]);
+        let retained = retain_invoked_tool_schemas(
+            &mut selected,
+            &mut report,
+            &tool_results,
+            &all_schemas,
+            &previously_visible,
+        );
 
         assert_eq!(retained, 1, "git should be retained exactly once");
         assert_eq!(selected.len(), 3, "bash + read_file + git");

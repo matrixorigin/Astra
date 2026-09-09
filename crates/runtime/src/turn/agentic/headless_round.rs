@@ -20,6 +20,9 @@ use astra_turn_core::headless_tool_assembly::{
     resolve_headless_tool_slot,
 };
 use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
+use astra_turn_core::tool::deferred_activation::{
+    DeferredToolActivation, RuntimeControlInvocationKind,
+};
 use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
 use astra_turn_core::turn_guard::TurnGuard;
 
@@ -42,6 +45,36 @@ pub trait HeadlessActionFence: Send + Sync {
 pub struct HeadlessRoundOutcome {
     pub superseded_before_action: bool,
     pub action_admission_error: Option<String>,
+    /// Exact server call IDs whose terminal event is owned by the shared
+    /// headless loop. Runtime-route and edge-owned calls are excluded.
+    pub shared_loop_terminal_call_ids: HashSet<String>,
+}
+
+/// Ordered views of one provider batch at the history/execution boundary.
+///
+/// The physical view is append-only provider evidence. The logical view is
+/// the already-admitted execution target. Keeping this as one typed value
+/// prevents a future caller from accidentally using the transcript carrier as
+/// an executable tool call.
+pub struct HeadlessToolCallViews<'a> {
+    pub physical: &'a [Value],
+    pub logical: &'a [Value],
+}
+
+impl<'a> HeadlessToolCallViews<'a> {
+    pub fn validate(self) -> Result<Self, String> {
+        if self.physical.len() != self.logical.len() {
+            return Err("physical and logical tool views have different lengths".to_string());
+        }
+        for (physical, logical) in self.physical.iter().zip(self.logical) {
+            let physical_id = physical.get("id").and_then(Value::as_str);
+            let logical_id = logical.get("id").and_then(Value::as_str);
+            if physical_id.is_none() || physical_id != logical_id {
+                return Err("physical and logical tool views have different call ids".to_string());
+            }
+        }
+        Ok(self)
+    }
 }
 
 /// Typed execution context for one headless tool round.
@@ -64,11 +97,21 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// capability in the same transaction as `Prepared -> Dispatched`.
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
-    pub tool_calls: &'a [Value],
+    /// Exact provider calls, used only to append the assistant transcript.
+    pub physical_tool_calls: &'a [Value],
+    /// Admitted execution targets, used by policy, scheduling, and execution.
+    /// This has the same call IDs and order as `physical_tool_calls`.
+    pub logical_tool_calls: &'a [Value],
+    /// Typed selection evidence for deferred logical targets, keyed by the
+    /// provider-owned call ID. This is deliberately separate from the visible
+    /// tool-name set so selection cannot become name-only authority.
+    pub deferred_activations_by_call_id: &'a HashMap<String, DeferredToolActivation>,
+    /// Host-owned lifecycle calls are admitted by typed runtime provenance,
+    /// never by adding their deferred names to the provider-visible allowlist.
+    pub runtime_control_calls_by_id: &'a HashMap<String, RuntimeControlInvocationKind>,
     pub edge_tool_round: &'a [E],
     pub reasoning_content: &'a str,
     pub reasoning_signature: &'a str,
-    pub edge_callback_outputs: &'a HashMap<String, String>,
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
@@ -103,6 +146,10 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// Optional server-side tool executor for web agent sessions.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+    /// Executor-owned external observation scope carried across the bounded
+    /// recovery boundary.  This is structured state, never inferred from a
+    /// Bash command or assistant prose.
+    pub external_effect_recovery_paths: Option<&'a [String]>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -114,7 +161,7 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
 
 struct HeadlessPreparedRound<'a> {
     effective_permission_timeout: Duration,
-    tool_calls: &'a [Value],
+    logical_tool_calls: &'a [Value],
     pre_resolved_ids: HashSet<String>,
     indices: Vec<astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx>,
     step_deadline: HeadlessStepDeadline,
@@ -123,7 +170,8 @@ struct HeadlessPreparedRound<'a> {
 
 async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     permission_context: Option<&PermissionSyncHandle>,
-    tool_calls: &'a [Value],
+    physical_tool_calls: &'a [Value],
+    logical_tool_calls: &'a [Value],
     edge_tool_round: &'a [E],
     reasoning_content: &str,
     reasoning_signature: &str,
@@ -152,7 +200,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     let force_reasoning = !reasoning_content.is_empty()
         || astra_turn_core::edge_ledger::history_has_reasoning(messages);
     let opening = begin_headless_tool_round_opening_ext(
-        tool_calls,
+        physical_tool_calls,
         edge_tool_round,
         reasoning_content,
         reasoning_signature,
@@ -184,7 +232,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         .indices
         .iter()
         .map(|idx| {
-            let slot = resolve_headless_tool_slot(*idx, tool_calls, |edge_idx| {
+            let slot = resolve_headless_tool_slot(*idx, logical_tool_calls, |edge_idx| {
                 let edge = &edge_tool_round[edge_idx];
                 (
                     edge.assistant_tool_call_id(edge_idx),
@@ -210,7 +258,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
 
     HeadlessPreparedRound {
         effective_permission_timeout,
-        tool_calls,
+        logical_tool_calls,
         pre_resolved_ids,
         indices: opening.indices,
         step_deadline,
@@ -241,11 +289,13 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         current_run_id,
         current_turn_chain_id,
         durable_dispatch_admission,
-        tool_calls,
+        physical_tool_calls,
+        logical_tool_calls,
+        deferred_activations_by_call_id,
+        runtime_control_calls_by_id,
         edge_tool_round,
         reasoning_content,
         reasoning_signature,
-        edge_callback_outputs,
         messages,
         tool_results,
         valid_tool_names,
@@ -268,13 +318,36 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         progress_emitter,
         pre_resolved_results,
         runtime_tool_executor,
+        external_effect_recovery_paths,
         turn_start,
         llm_round,
         plan_mode_active,
     } = ctx;
-    let canonical_tool_calls =
-        match astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(tool_calls)
-        {
+    // All messages appended by this invocation belong to the current
+    // provider run, including policy/timeout/cancelled tool results emitted
+    // before the normal record boundary.  Stamp them as one final canonical
+    // step so every result that may later be compacted has an owner without
+    // teaching each unhappy-path helper a second identity protocol.
+    let history_start = messages.len();
+    let views = match (HeadlessToolCallViews {
+        physical: physical_tool_calls,
+        logical: logical_tool_calls,
+    })
+    .validate()
+    {
+        Ok(views) => views,
+        Err(error) => {
+            return HeadlessRoundOutcome {
+                superseded_before_action: false,
+                action_admission_error: Some(format!("tool-call view protocol violation: {error}")),
+                ..Default::default()
+            };
+        }
+    };
+    let canonical_physical_tool_calls =
+        match astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(
+            views.physical,
+        ) {
             Ok(tool_calls) => tool_calls,
             Err(error) => {
                 return HeadlessRoundOutcome {
@@ -282,29 +355,65 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
                     action_admission_error: Some(format!(
                         "provider tool-call protocol violation: {error}"
                     )),
+                    ..Default::default()
                 };
             }
         };
-    let tool_calls = canonical_tool_calls.as_ref();
-    if tool_calls.is_empty() && edge_tool_round.is_empty() && pre_resolved_results.is_empty() {
+    let canonical_logical_tool_calls =
+        match astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(
+            views.logical,
+        ) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                return HeadlessRoundOutcome {
+                    superseded_before_action: false,
+                    action_admission_error: Some(format!(
+                        "logical tool-call protocol violation: {error}"
+                    )),
+                    ..Default::default()
+                };
+            }
+        };
+    let physical_tool_calls = canonical_physical_tool_calls.as_ref();
+    let logical_tool_calls = canonical_logical_tool_calls.as_ref();
+    if let Err(error) = (HeadlessToolCallViews {
+        physical: physical_tool_calls,
+        logical: logical_tool_calls,
+    })
+    .validate()
+    {
+        return HeadlessRoundOutcome {
+            superseded_before_action: false,
+            action_admission_error: Some(format!(
+                "canonical tool-call view protocol violation: {error}"
+            )),
+            ..Default::default()
+        };
+    }
+    if logical_tool_calls.is_empty()
+        && edge_tool_round.is_empty()
+        && pre_resolved_results.is_empty()
+    {
         return HeadlessRoundOutcome {
             superseded_before_action: false,
             action_admission_error: Some(
                 "headless tool round requires at least one admitted, rejected, or edge carrier"
                     .to_string(),
             ),
+            ..Default::default()
         };
     }
     let HeadlessPreparedRound {
         effective_permission_timeout,
-        tool_calls,
+        logical_tool_calls,
         pre_resolved_ids,
         indices,
         step_deadline,
         consumed_edge,
     } = prepare_headless_tool_round(
         permission_context,
-        tool_calls,
+        physical_tool_calls,
+        logical_tool_calls,
         edge_tool_round,
         reasoning_content,
         reasoning_signature,
@@ -327,9 +436,10 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_run_id,
             current_turn_chain_id,
             durable_dispatch_admission,
-            tool_calls,
+            tool_calls: logical_tool_calls,
+            deferred_activations_by_call_id,
+            runtime_control_calls_by_id,
             edge_tool_round,
-            by_sig: edge_callback_outputs,
             pre_resolved_ids: &pre_resolved_ids,
             messages,
             tool_results,
@@ -353,6 +463,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             progress_emitter,
             effective_permission_timeout,
             runtime_tool_executor,
+            external_effect_recovery_paths,
             turn_start,
             llm_round,
             plan_mode_active,
@@ -363,26 +474,28 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
 
     // Partition indices into batches: consecutive read-only tools run concurrently,
     // non-read-only tools run serially (one at a time).
-    let batches = partition_tool_batches_with_provider_policy(&indices, tool_calls, |tool_name| {
-        runtime_tool_executor.and_then(|executor| {
-            match executor.provider_policy_lookup(tool_name) {
-                crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider => None,
-                crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => {
-                    Some(policy.parallelizable)
+    let batches = partition_tool_batches_with_provider_policy_and_serial_gate(
+        &indices,
+        logical_tool_calls,
+        |tool_name| {
+            runtime_tool_executor.and_then(|executor| {
+                match executor.provider_policy_lookup(tool_name) {
+                    crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider => None,
+                    crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(
+                        policy,
+                    ) => Some(policy.parallelizable),
+                    crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
+                        ..
+                    } => Some(false),
                 }
-                crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
-                    ..
-                } => Some(false),
-            }
-        })
-    });
+            })
+        },
+        |call| astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"),
+    );
     'outer: for batch in &batches {
-        if let Some((aborted_count, aborted_tools)) = step_deadline.step_timeout_abort(
-            &indices,
-            pipeline.tool_results_len(),
-            pipeline.tool_calls(),
-            |i| pipeline.edge_tool_name(i),
-        ) {
+        if step_deadline.is_past_deadline() {
+            let aborted_tools = pipeline.unsettled_tool_names(&indices);
+            let aborted_count = aborted_tools.len();
             agent_warn!(
                 "step",
                 "Step timeout exceeded: {}ms > {}ms, aborting {} tools: {:?}",
@@ -392,25 +505,64 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
                 aborted_tools
             );
             pipeline.record_step_abort(&aborted_tools);
+            pipeline
+                .settle_unstarted_slots(
+                    &indices,
+                    "the headless tool-step deadline was exceeded",
+                    astra_core::ErrorKind::ToolTimeout,
+                )
+                .await;
             break;
         }
 
         match batch {
             ToolBatch::Concurrent(items) => {
                 if !pipeline.run_batch_concurrent(items).await {
+                    pipeline
+                        .settle_unstarted_slots(
+                            &indices,
+                            "the headless tool round was aborted before dispatch",
+                            astra_core::ErrorKind::Cancelled,
+                        )
+                        .await;
                     break 'outer;
                 }
             }
             ToolBatch::Serial(item) => {
                 if !pipeline.run_slot_with_control(*item).await {
+                    pipeline
+                        .settle_unstarted_slots(
+                            &indices,
+                            "the headless tool round was aborted before dispatch",
+                            astra_core::ErrorKind::Cancelled,
+                        )
+                        .await;
                     break 'outer;
                 }
             }
         }
     }
+    let superseded_before_action = pipeline.action_fence_superseded();
+    let action_admission_error = pipeline.action_fence_error().map(ToString::to_string);
+    let shared_loop_terminal_call_ids = pipeline.into_shared_loop_terminal_call_ids();
+    for message in messages.iter_mut().skip(history_start) {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        if let Err(error) =
+            astra_turn_core::tool_result_storage::mark_tool_result_run_id(message, current_run_id)
+        {
+            tracing::error!(
+                run_id = ?current_run_id,
+                error = %error,
+                "headless tool result could not be assigned its canonical run identity"
+            );
+        }
+    }
     HeadlessRoundOutcome {
-        superseded_before_action: pipeline.action_fence_superseded(),
-        action_admission_error: pipeline.action_fence_error().map(ToString::to_string),
+        superseded_before_action,
+        action_admission_error,
+        shared_loop_terminal_call_ids,
     }
 }
 
@@ -429,6 +581,7 @@ pub(crate) fn partition_tool_batches(
     partition_tool_batches_with_provider_policy(indices, tool_calls, |_| None)
 }
 
+#[cfg(test)]
 pub(crate) fn partition_tool_batches_with_provider_policy<F>(
     indices: &[HeadlessRoundToolIdx],
     tool_calls: &[Value],
@@ -511,6 +664,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_views_require_ordered_matching_provider_identity() {
+        let physical = vec![
+            json!({"id":"direct-1","function":{"name":"read_file","arguments":"{}"}}),
+            json!({"id":"deferred-2","function":{"name":"invoke_tool","arguments":"{}"}}),
+        ];
+        let logical = vec![
+            json!({"id":"direct-1","function":{"name":"read_file","arguments":"{}"}}),
+            json!({"id":"deferred-2","function":{"name":"web_fetch","arguments":"{}"}}),
+        ];
+        assert!(
+            HeadlessToolCallViews {
+                physical: &physical,
+                logical: &logical,
+            }
+            .validate()
+            .is_ok()
+        );
+
+        let reordered = vec![logical[1].clone(), logical[0].clone()];
+        assert!(
+            HeadlessToolCallViews {
+                physical: &physical,
+                logical: &reordered,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn partition_batches_agent_spawn_calls_concurrently() {
         let calls = vec![
             json!({
@@ -551,6 +734,31 @@ mod tests {
             matches!(batches.as_slice(), [ToolBatch::Serial(_)]),
             "agent.send_message mutates mailbox ordering and must stay serial"
         );
+    }
+
+    #[test]
+    fn partition_batches_work_establishment_owns_a_serial_boundary() {
+        let calls = vec![
+            json!({
+                "id": "start",
+                "function": {"name": "start_work", "arguments": "{}"}
+            }),
+            json!({
+                "id": "read",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }),
+        ];
+        let batches = partition_tool_batches_with_provider_policy_and_serial_gate(
+            &[server_idx(0), server_idx(1)],
+            &calls,
+            |_| Some(true),
+            |call| astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"),
+        );
+        assert!(matches!(
+            batches.as_slice(),
+            [ToolBatch::Serial(start), ToolBatch::Concurrent(reads)]
+                if *start == server_idx(0) && reads == &[server_idx(1)]
+        ));
     }
 
     #[test]

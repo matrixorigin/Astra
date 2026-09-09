@@ -8,6 +8,7 @@
 
 use astra_turn_types::STABLE_TOOL_ALIAS_SCHEMA_KEY;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const SELECT_DESCRIPTION_MAX_CHARS: usize = 220;
 const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
@@ -37,8 +38,9 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .collect();
 
     // Direct selection mode: select:tool_name or select:a,b,c.
-    // Returns compact schema shape and lets the host queue the selected schema
-    // for the next request's tools[].
+    // Returns the compact schema-addressed contract. The host records the
+    // selection for typed admission; it must not reinsert the full target
+    // schema into the repeated provider `tools[]` prefix.
     if let Some(tool_names) = select_payload(query) {
         let mut requested = Vec::new();
         for name in tool_names
@@ -68,27 +70,16 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     canonical_name,
                     matched_by,
                 } => {
-                    let Some(func) = tool.get("function") else {
+                    let Some(mut entry) = tool_selection_contract(tool) else {
                         missing.push(name.clone());
                         continue;
                     };
-                    let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                    let desc = discovery_description(func);
-                    let (compact_desc, desc_truncated) =
-                        compact_description(desc, SELECT_DESCRIPTION_MAX_CHARS);
-                    let mut entry = json!({
-                        "name": tool_name,
-                        "description": compact_desc,
-                        "description_truncated": desc_truncated,
-                    });
-                    // Include parameter shape, but strip nested prose. The
-                    // full schema will be injected into tools[] on the next
-                    // request; this tool_result should not become a long-lived
-                    // duplicate copy in history.
-                    if let Some(params) = func.get("parameters")
-                        && let Some(obj) = entry.as_object_mut()
-                    {
-                        obj.insert("parameters".to_string(), compact_select_parameters(params));
+                    // This addresses the exact compact contract the model saw,
+                    // not hidden provider metadata. Runtime admission still
+                    // independently re-resolves the current provider binding.
+                    let selection_digest = tool_selection_contract_digest(&entry);
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("schema_digest".to_string(), Value::String(selection_digest));
                     }
                     if let Some(matched_by) = matched_by
                         && let Some(obj) = entry.as_object_mut()
@@ -137,6 +128,46 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
+
+/// Compact structural contract returned to a model after `select:NAME`.
+///
+/// This is deliberately reusable by execution admission: the selected digest
+/// and the later current-surface digest must be derived from one projection,
+/// rather than two similar-but-drifting serializers.
+#[must_use]
+pub fn tool_selection_contract(schema: &Value) -> Option<Value> {
+    let function = schema.get("function")?;
+    let name = function.get("name")?.as_str()?;
+    let description = discovery_description(function);
+    let (description, description_truncated) =
+        compact_description(description, SELECT_DESCRIPTION_MAX_CHARS);
+    let mut contract = json!({
+        "name": name,
+        "description": description,
+        "description_truncated": description_truncated,
+    });
+    if let Some(parameters) = function.get("parameters")
+        && let Some(object) = contract.as_object_mut()
+    {
+        object.insert(
+            "parameters".to_string(),
+            compact_select_parameters(parameters),
+        );
+    }
+    Some(contract)
+}
+
+/// Stable content address for one compact selection contract.
+///
+/// The digest covers exactly the contract returned to the model by
+/// `tool_search`: canonical name, compact description, parameter shape, and
+/// truncation fact. Provider binding and capability authority are deliberately
+/// excluded and must be revalidated at execution time.
+#[must_use]
+pub fn tool_selection_contract_digest(selection: &Value) -> String {
+    let canonical = astra_core::canonical_json_string(selection);
+    format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
+}
 
 fn select_payload(query: &str) -> Option<&str> {
     const SELECT_PREFIX: &str = "select:";
@@ -354,8 +385,19 @@ fn string_array_field(value: &Value, field: &str) -> Vec<String> {
 }
 
 fn compact_select_parameters(params: &Value) -> Value {
+    let action_contract = params
+        .as_object()
+        .and_then(crate::schemas::action_contract_description);
     let mut compact = params.clone();
     strip_schema_descriptions(&mut compact);
+    // Keep the load-bearing conditional fields after removing internal
+    // producer annotations.  This stays a single compact description rather
+    // than reintroducing the full schema prose or a provider-specific union.
+    if let Some(action_contract) = action_contract
+        && let Some(object) = compact.as_object_mut()
+    {
+        object.insert("description".to_string(), Value::String(action_contract));
+    }
     compact
 }
 
@@ -406,7 +448,7 @@ fn is_schema_map_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_search;
+    use super::{tool_search, tool_selection_contract_digest};
     use serde_json::{Value, json};
 
     fn sample_schemas() -> Vec<Value> {
@@ -527,6 +569,17 @@ mod tests {
         assert_eq!(field_strings(&parsed, "resolved"), strings(&["bash"]));
         assert!(field_strings(&parsed, "missing").is_empty());
         assert_eq!(match_names(&parsed), strings(&["bash"]));
+        let mut selection_contract = parsed["matches"][0].clone();
+        selection_contract
+            .as_object_mut()
+            .expect("match is an object")
+            .remove("schema_digest");
+        let expected_digest = tool_selection_contract_digest(&selection_contract);
+        assert_eq!(
+            parsed["matches"][0]["schema_digest"].as_str(),
+            Some(expected_digest.as_str()),
+            "selection evidence must address the exact compact contract returned to the model"
+        );
         assert_eq!(parsed["total_tools"].as_u64(), Some(schemas.len() as u64));
         assert!(
             parsed["matches"][0].get("score").is_none(),
@@ -883,10 +936,9 @@ mod tests {
     }
 
     // ── select: mode must return compact schema shape ─────────────────────
-    // The next request needs enough shape for activation metadata. Long
-    // parameter prose is stripped because the selected tool is injected into
-    // tools[] on the next request; keeping a duplicate verbose schema in
-    // history burns tokens.
+    // This result is the model's invocation contract, retained in canonical
+    // history. The target schema never enters tools[]; retain structural
+    // constraints and bounded action guidance without duplicating long prose.
 
     fn schemas_with_params() -> Vec<Value> {
         vec![json!({
@@ -907,8 +959,7 @@ mod tests {
 
     #[test]
     fn select_returns_compact_parameter_shape() {
-        // select: mode returns compact parameter shape because the full
-        // callable schema is injected into tools[] on the next request.
+        // select: mode returns the compact structural invocation contract.
         let schemas = schemas_with_params();
 
         let result = tool_search(&schemas, &json!({"query": "select:read_file"}));
@@ -921,6 +972,73 @@ mod tests {
             params["properties"]["path"].get("description").is_none(),
             "select result should keep callable shape but strip nested prose: {parsed}"
         );
+    }
+
+    #[test]
+    fn selection_contract_digest_is_stable_for_equivalent_object_key_order() {
+        let left = json!({
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}}
+        });
+        let right = json!({
+            "function": {"parameters": {"type": "object"}, "name": "read_file"},
+            "type": "function"
+        });
+
+        assert_eq!(
+            tool_selection_contract_digest(&left),
+            tool_selection_contract_digest(&right)
+        );
+        assert_ne!(
+            tool_selection_contract_digest(&left),
+            tool_selection_contract_digest(&json!({
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {"type": "object", "additionalProperties": false}}
+            }))
+        );
+    }
+
+    #[test]
+    fn selection_digest_ignores_hidden_prose_but_tracks_nested_required_shape() {
+        let base = json!({
+            "type": "function",
+            "function": {
+                "name": "deploy",
+                "description": "deploy a release",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "description": "deployment target"},
+                        "options": {
+                            "type": "object",
+                            "properties": {"region": {"type": "string", "description": "region"}},
+                            "required": ["region"]
+                        }
+                    },
+                    "required": ["target", "options"]
+                }
+            }
+        });
+        let mut prose_changed = base.clone();
+        prose_changed["function"]["parameters"]["properties"]["options"]["properties"]["region"]
+            ["description"] = json!("also invisible");
+        prose_changed["function"]["parameters"]["x-astra-internal-note"] =
+            json!("invisible provider metadata");
+        let mut required_changed = base.clone();
+        required_changed["function"]["parameters"]["properties"]["options"]["required"] = json!([]);
+
+        let digest_for = |schema: &Value| {
+            let result = parse_result(&tool_search(
+                std::slice::from_ref(schema),
+                &json!({"query": "select:deploy"}),
+            ));
+            result["matches"][0]["schema_digest"]
+                .as_str()
+                .expect("selection returns digest")
+                .to_string()
+        };
+        assert_eq!(digest_for(&base), digest_for(&prose_changed));
+        assert_ne!(digest_for(&base), digest_for(&required_changed));
     }
 
     #[test]
@@ -984,8 +1102,8 @@ mod tests {
 
     #[test]
     fn select_description_stays_compact() {
-        // Full prose arrives through the selected tool schema in the next
-        // tools[] request.
+        // Contract prose is bounded in history; discovery is not a promise
+        // to inject another schema into a later request.
         let long_desc = "x".repeat(500);
         let schemas = vec![json!({
             "type": "function",
@@ -1032,6 +1150,26 @@ mod tests {
                 && desc.contains("foreground")
                 && desc.contains("run_chain"),
             "selection summary must keep agent action constraints: {desc}"
+        );
+    }
+
+    #[test]
+    fn explicit_selection_materializes_conditional_required_fields() {
+        let schemas = crate::schemas::all_tool_schemas();
+
+        let selected = tool_search(&schemas, &json!({"query": "select:agent"}));
+        let selected: Value = serde_json::from_str(&selected).expect("valid json");
+        let parameters = &selected["matches"][0]["parameters"];
+        let description = parameters["description"]
+            .as_str()
+            .expect("compact parameters must explain action requirements");
+        assert!(
+            description.contains("spawn requires description + prompt"),
+            "conditional spawn fields must survive compact discovery: {selected}"
+        );
+        assert!(
+            parameters.get("x-astra-per-action-required").is_none(),
+            "internal action metadata must remain hidden from the model schema"
         );
     }
 }

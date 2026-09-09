@@ -113,13 +113,12 @@ pub struct CliSpawnAgentExecutor {
 /// - Break byte-for-byte prefix cache reuse (the extra bytes shift
 ///   the cache key so the parent's cached KV is unusable)
 ///
-/// The child's identity ("You are agent_id, specialized sub-agent…")
-/// is communicated via the child_task user message, not via a system
-/// block, so the fork child still knows its role.
+/// The child's runtime identity is carried by typed context; the system block
+/// contains only the reusable sub-agent role and execution contract.  This
+/// keeps fresh sibling children on one provider-cache prefix.
 ///
-/// **Fresh mode** (`prefix_messages` is `None`): the child gets a
-/// system message with its identity, then the child task as a user
-/// message — same as before fork support.
+/// **Fresh mode** (`prefix_messages` is `None`): the child gets the reusable
+/// system role/contract, then the child task as a user message.
 pub(crate) fn build_child_messages(
     system_prompt: &str,
     prefix_messages: Option<&[Value]>,
@@ -184,6 +183,19 @@ pub(crate) fn build_child_messages(
             turn_chain_id,
         );
         messages
+    }
+}
+
+/// Build the reusable fresh-child system prompt.  Per-run IDs stay in typed
+/// runtime context so sibling children can share this provider-cache prefix.
+fn build_child_system_prompt(system_prompt_addendum: &str) -> String {
+    if system_prompt_addendum.is_empty() {
+        "You are a specialized sub-agent. Complete the task thoroughly.".to_string()
+    } else {
+        format!(
+            "You are a specialized sub-agent.\n\n{}\n\nComplete the task thoroughly.",
+            system_prompt_addendum
+        )
     }
 }
 
@@ -785,17 +797,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         };
 
         // Build system message from agent type definition
-        let system_prompt = if config.system_prompt_addendum.is_empty() {
-            format!(
-                "You are '{}', a specialized sub-agent. Complete the task thoroughly.",
-                config.agent_id
-            )
-        } else {
-            format!(
-                "You are '{}', a specialized sub-agent.\n\n{}\n\nComplete the task thoroughly.",
-                config.agent_id, config.system_prompt_addendum
-            )
-        };
+        // The runtime carries the child identity and parent route in typed
+        // context.  Keep random IDs out of the system prefix so sibling
+        // children with the same persona can reuse the provider cache.
+        let system_prompt = build_child_system_prompt(&config.system_prompt_addendum);
 
         // PR 5.6: if the spawner resolved a parent prefix, prepend
         // the captured prefix messages between the system prompt
@@ -1024,7 +1029,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             message: config.task.clone(),
             user_intent: config.task.clone(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,
@@ -1456,7 +1461,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 mod tests {
     use super::{
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
-        cancelled_loop_origin, classified_error_cancellation_origin,
+        build_child_system_prompt, cancelled_loop_origin, classified_error_cancellation_origin,
         emit_agent_transcript_committed,
     };
     use crate::lock_recovery::LockRecovery;
@@ -1500,6 +1505,15 @@ mod tests {
             None,
             "a real provider failure must remain on the failed branch"
         );
+    }
+
+    #[test]
+    fn fresh_child_system_prompt_is_stable_across_run_identities() {
+        let prompt = build_child_system_prompt("\nYou are an exploration agent.");
+        assert!(prompt.starts_with("You are a specialized sub-agent."));
+        assert!(prompt.contains("You are an exploration agent."));
+        assert!(!prompt.contains("run_id"));
+        assert!(!prompt.contains("agent_id"));
     }
 
     fn test_permission_context() -> (

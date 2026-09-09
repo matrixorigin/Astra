@@ -150,11 +150,12 @@ pub enum SectionKind {
     SelfModel,
     /// §3 — workspace rules, conventions.
     ProjectContext,
-    /// Turn-visible deferred tool discovery manifest.
+    /// Capability-epoch deferred tool discovery manifest.
     ///
     /// The names are selected from the current wire surface and runtime
-    /// admission state, so this section belongs after the session cache
-    /// boundary even though its rendering is deterministic.
+    /// admission state. They are stable until that capability epoch changes,
+    /// so this section belongs in the Session-scoped cache prefix; a changed
+    /// manifest intentionally starts a new epoch.
     DeferredTools,
     /// Session-stable available skill catalog.
     AvailableSkills,
@@ -256,11 +257,10 @@ impl SectionKind {
             Self::Identity | Self::Constraints => 0,
             Self::SelfModel => 1,
             Self::ProjectContext => 2,
-            // Deferred names follow the admitted wire surface and may change
-            // within a user turn. Keep them after the turn-volatile runtime
-            // lane in the volatility ordering as well as in the planner's
-            // explicit manifest order.
-            Self::DeferredTools => 11,
+            // Deferred names follow the admitted capability epoch. They are
+            // Session-stable like RuntimeIdentity (the planner places them
+            // immediately after it and before turn-volatile content).
+            Self::DeferredTools => 6,
             Self::AvailableSkills => 4,
             Self::Skills => 5,
             Self::RuntimeIdentity => 6, // session-stable; sits with Session blocks
@@ -294,6 +294,7 @@ impl SectionKind {
             | Self::Constraints
             | Self::SelfModel
             | Self::ProjectContext
+            | Self::DeferredTools
             | Self::AvailableSkills
             | Self::Skills
             | Self::RuntimeIdentity => false,
@@ -304,8 +305,7 @@ impl SectionKind {
             | Self::RuntimeVolatile
             | Self::EmergentSkills
             | Self::EmergentMemory
-            | Self::EmergentSummary
-            | Self::DeferredTools => true,
+            | Self::EmergentSummary => true,
         }
     }
 }
@@ -558,6 +558,12 @@ mod tests {
         // ranks highest (most-drifting, emitted last in the prompt).
         assert!(SectionKind::RuntimeIdentity.volatility() < SectionKind::History.volatility());
         assert!(SectionKind::History.volatility() < SectionKind::RuntimeVolatile.volatility());
+        assert_eq!(
+            SectionKind::DeferredTools.volatility(),
+            SectionKind::RuntimeIdentity.volatility(),
+            "deferred capability metadata shares the session-stable volatility tier"
+        );
+        assert!(!SectionKind::DeferredTools.is_volatile());
     }
 
     #[test]

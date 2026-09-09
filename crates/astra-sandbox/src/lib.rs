@@ -22,7 +22,8 @@ pub use astra_skills::manifest::TrustTier;
 pub use bash_ast::{parse_plain_bash_commands, strip_benign_bash_redirects};
 pub use command::{
     CommandRisk, SandboxCommandError, analyze_command_risks, analyze_command_risks_in_workspace,
-    filter_environment, is_rm_catastrophic_rm_path, sandbox_command, wrap_command_with_limits,
+    analyze_command_risks_in_workspace_from, filter_environment, is_rm_catastrophic_rm_path,
+    sandbox_command, wrap_command_with_limits,
 };
 pub use git_safety::{
     GitSafetyViolation, is_bare_git_repo, is_soft_violation, validate_git_command,

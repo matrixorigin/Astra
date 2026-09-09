@@ -63,7 +63,7 @@ fn with_user_runtime_toml<F: FnOnce(&RuntimeConfig)>(contents: &str, f: F) {
 
 #[test]
 #[serial_test::serial]
-fn user_pinned_tools_dash_entry_is_ignored_in_wire() {
+fn user_pinned_tools_can_defer_a_default_in_wire() {
     with_user_runtime_toml(
         r#"
 [tool_surface]
@@ -73,13 +73,17 @@ pinned_tools = ["-grep"]
             let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
             let always_load = names(&surface.always_load_schemas());
             assert!(
-                always_load.iter().any(|n| n == "grep"),
-                "`-grep` is not a supported removal syntax; grep remains default always_load: {always_load:?}"
+                !always_load.iter().any(|n| n == "grep"),
+                "`-grep` must remove grep from the resident wire surface: {always_load:?}"
             );
             let deferred: Vec<&str> = surface.deferred().iter().map(|e| e.name.as_str()).collect();
             assert!(
-                !deferred.contains(&"grep"),
-                "default always_load grep must not also appear in deferred list"
+                deferred.contains(&"grep"),
+                "a deferred default remains discoverable in the manifest"
+            );
+            assert!(
+                always_load.iter().any(|n| n == "tool_search"),
+                "the activation protocol floor must remain resident"
             );
         },
     );
@@ -102,7 +106,16 @@ pinned_tools = ["github"]
             );
             // Default always-load tools still there.
             assert!(always_load.iter().any(|n| n == "bash"));
+            // The compact remember/recall shape is a core resident primitive;
+            // only its advanced fields require the canonical deferred schema.
             assert!(always_load.iter().any(|n| n == "memory"));
+            assert!(
+                !surface
+                    .deferred()
+                    .iter()
+                    .any(|entry| entry.name == "memory"),
+                "resident memory must not be duplicated in the deferred manifest"
+            );
         },
     );
 }
@@ -114,22 +127,17 @@ fn missing_toml_defaults_are_in_wire() {
     with_user_runtime_toml("# empty", |config| {
         let surface = ToolSurface::build(catalog_schemas(), &config.tool_surface, &[]);
         let always_load = names(&surface.always_load_schemas());
-        // Spot check: all defaults present, no extras.
-        for must in [
-            "ask_user",
-            "bash",
-            "read_file",
-            "git",
-            "grep",
-            "memory",
-            "skill",
-            "tool_search",
-        ] {
+        // The wire default is derived from the single ToolSpec load-policy
+        // authority; do not duplicate a second hand-maintained list here.
+        for must in astra_runtime::tool_registry::surface::default_always_load_names() {
             assert!(
                 always_load.iter().any(|n| n == must),
                 "missing default {must}"
             );
         }
+        // Workflow-sized tools are intentionally deferred by default.
+        assert!(!always_load.iter().any(|n| n == "git"));
+        assert!(always_load.iter().any(|n| n == "memory"));
         assert!(!always_load.iter().any(|n| n == "github"));
         assert!(!always_load.iter().any(|n| n == "web_fetch"));
     });

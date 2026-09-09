@@ -1560,11 +1560,6 @@ fn truncate_for_projection(text: &str, max_chars: usize) -> String {
 pub(crate) fn extract_session_state_compact(
     state: &AgenticLoopState,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
-    let activated_deferred_tool_names = state
-        .runtime_tool_executor
-        .as_deref()
-        .map(crate::server::runtime_tool_executor::RuntimeToolExecutor::activated_deferred_tool_names)
-        .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
     astra_turn_core::conversation_log::SessionStateCompact {
         source_cursor: None,
         // CSL is conversation materialization, not execution policy. Persisting
@@ -1575,7 +1570,17 @@ pub(crate) fn extract_session_state_compact(
         // subject to the current surface and runtime bindings on restore.
         blocked_tools: Vec::new(),
         recent_tools: state.recent_tools.clone(),
-        activated_deferred_tool_names,
+        // Carrier calls are authorized solely by the digest-bearing evidence
+        // below. A name-only shadow set must never revive an obsolete schema
+        // decision into a later provider surface.
+        // Only paired tool_search results carrying a digest may later
+        // authorize the stable deferred carrier. Name-only state is retained
+        // separately for transitional prompt continuity, never for dispatch.
+        deferred_tool_activations:
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &state.messages,
+                state.deferred_tool_activations.clone(),
+            ),
         approval_overrides: None,
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
@@ -1597,10 +1602,13 @@ pub(crate) fn restore_session_state_compact(
     // transcript can legitimately predate a deferred-tool selection that the
     // step checkpoint already restored, so CSL must only contribute durable
     // activation facts; it must never erase a newer one.
-    let mut activated = std::mem::take(&mut loop_state.activated_deferred_tool_names);
-    activated.extend(ss.activated_deferred_tool_names);
-    loop_state.activated_deferred_tool_names =
-        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(&[], activated);
+    loop_state.deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+            &[],
+            std::mem::take(&mut loop_state.deferred_tool_activations)
+                .into_iter()
+                .chain(ss.deferred_tool_activations),
+        );
     // Intentionally ignore all actual runtime-control fields in
     // SessionStateCompact. Older CSL records may contain them, but restoring
     // them here would leak stale pauses, approvals, budget pressure, and
@@ -1612,12 +1620,12 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     current_date: &str,
     loop_state: &mut AgenticLoopState,
 ) {
-    let mut persisted_activation = std::mem::take(&mut loop_state.activated_deferred_tool_names);
-    persisted_activation.extend(restored.activated_deferred_tool_names.clone());
-    loop_state.activated_deferred_tool_names =
-        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+    loop_state.deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &restored.messages,
-            persisted_activation,
+            std::mem::take(&mut loop_state.deferred_tool_activations)
+                .into_iter()
+                .chain(restored.deferred_tool_activations),
         );
     if !restored.cache_restore_report.journal_complete {
         tracing::warn!(

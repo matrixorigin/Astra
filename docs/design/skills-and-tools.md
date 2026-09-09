@@ -26,6 +26,15 @@ level unless its production discovery and activation path demonstrates it.
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.
 
+Resident tools expose a small stable `tools[]` contract. `tool_search` selects
+deferred invocation contracts into canonical conversation evidence; it does not
+inject their schemas into later `tools[]` requests. Invoke selected tools through
+the resident `invoke_tool` carrier and reuse the selection across turns while
+its contract and capability remain current. Selection is knowledge, not a
+permission grant: request projection and execution still enforce current provider
+and policy admission. After compaction removes necessary argument knowledge,
+rediscovery is legitimate; do not require or prohibit it merely by turn count.
+
 ## Relationship
 
 A skill may require tools, but it does not make those tools available by itself. Provider decision still controls whether a required capability can run in the current session.

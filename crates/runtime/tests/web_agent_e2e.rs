@@ -1408,11 +1408,18 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
                     },
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-reviewer", "agent", json!({
-                                "action": "spawn",
-                                "description": "structured child review",
-                                "prompt": "Review src/lib.rs and summarize one issue.",
-                                "agent_type": "code-review"
+                            // `agent` is a deferred capability.  Discovery binds
+                            // its exact contract, while execution stays on the
+                            // resident carrier so the provider tool prefix does
+                            // not change between rounds.
+                            tool_call("call-spawn-reviewer", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "structured child review",
+                                    "prompt": "Review src/lib.rs and summarize one issue.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },
@@ -1567,23 +1574,26 @@ async fn web_agent_parallel_fanout_without_work_authority_fails_closed() {
                     },
                     {
                         "tool_calls": [
-                            tool_call("call-fanout", "agent_fanout", json!({
-                                "action": "start",
-                                "target_count": 2,
-                                "slots": [
-                                    {
-                                        "id": "concern-a",
-                                        "description": "parallel child A",
-                                        "prompt": "Review one independent concern.",
-                                        "agent_type": "code-review"
-                                    },
-                                    {
-                                        "id": "concern-b",
-                                        "description": "parallel child B",
-                                        "prompt": "Review another independent concern.",
-                                        "agent_type": "code-review"
-                                    }
-                                ]
+                            tool_call("call-fanout", "invoke_tool", json!({
+                                "name": "agent_fanout",
+                                "arguments": {
+                                    "action": "start",
+                                    "target_count": 2,
+                                    "slots": [
+                                        {
+                                            "id": "concern-a",
+                                            "description": "parallel child A",
+                                            "prompt": "Review one independent concern.",
+                                            "agent_type": "code-review"
+                                        },
+                                        {
+                                            "id": "concern-b",
+                                            "description": "parallel child B",
+                                            "prompt": "Review another independent concern.",
+                                            "agent_type": "code-review"
+                                        }
+                                    ]
+                                }
                             }))
                         ]
                     },
@@ -1664,11 +1674,14 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                     },
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-edge-reviewer", "agent", json!({
-                                "action": "spawn",
-                                "description": "edge child review",
-                                "prompt": "Review src/lib.rs in the inherited edge workspace.",
-                                "agent_type": "code-review"
+                            tool_call("call-spawn-edge-reviewer", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "edge child review",
+                                    "prompt": "Review src/lib.rs in the inherited edge workspace.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },
@@ -2300,14 +2313,25 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     let tool_call = find_event(&events, "tool_call")
         .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
     assert_eq!(tool_call["tool_call"]["id"], "call-bash-binding");
-    assert_eq!(tool_call["workspace"]["kind"], "server_sandbox");
-    assert_eq!(tool_call["executor"]["kind"], "server_local");
-    assert_eq!(tool_call["transport"], "server_local");
+    // The provider event is an intent, not an execution receipt.  It must not
+    // claim the host's default owner before admission selects a route.
+    assert!(tool_call.get("workspace").is_none());
+    assert!(tool_call.get("executor").is_none());
+    assert!(tool_call.get("transport").is_none());
+
+    // Route-owned lifecycle events are the authoritative execution evidence.
+    let tool_end = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"] == "call-bash-binding")
+        .unwrap_or_else(|| panic!("expected routed tool_call_end event: {events:?}"));
+    assert_eq!(tool_end["workspace"]["kind"], "server_sandbox");
+    assert_eq!(tool_end["executor"]["kind"], "server_local");
+    assert_eq!(tool_end["transport"], "server_local");
     assert!(
-        tool_call["workspace"]["cwd"].as_str().is_some_and(|cwd| {
+        tool_end["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
         }),
-        "tool_call should carry the actual provisioned workspace: {tool_call:?}"
+        "tool_call_end should carry the actual provisioned workspace: {tool_end:?}"
     );
 }
 
@@ -2419,11 +2443,14 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                     },
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-offline-child", "agent", json!({
-                                "action": "spawn",
-                                "description": "edge child command",
-                                "prompt": "Run a command in the inherited edge workspace.",
-                                "agent_type": "code-review"
+                            tool_call("call-spawn-offline-child", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "edge child command",
+                                    "prompt": "Run a command in the inherited edge workspace.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },

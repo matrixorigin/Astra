@@ -712,12 +712,10 @@ pub struct HeavyCheckpoint {
     /// Session state
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    /// Deferred schemas already materialized in the retained prompt context.
-    ///
-    /// This is not execution authority; resume paths must intersect it with
-    /// the current advertised surface and live runtime bindings.
+    /// Schema-addressed deferred selections. This is the durable carrier
+    /// authorization evidence; names above are only legacy prompt continuity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activated_deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -922,7 +920,7 @@ impl StepCheckpoint {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -2981,7 +2979,7 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3019,7 +3017,7 @@ mod tests {
             budget_remaining_rounds: 10,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -3134,7 +3132,11 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
-            h.activated_deferred_tool_names = vec!["github".into()];
+            h.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }];
             h.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
                 reason: "weak_process_ownership".into(),
                 scope: "bound_workspace".into(),
@@ -3148,7 +3150,14 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
-            assert_eq!(h.activated_deferred_tool_names, vec!["github"]);
+            assert_eq!(
+                h.deferred_tool_activations,
+                vec![astra_turn_types::DeferredToolActivation {
+                    name: "github".into(),
+                    schema_digest: "sha256:checkpoint".into(),
+                    descriptor: None,
+                }]
+            );
             assert_eq!(
                 h.workspace_observation_quarantine,
                 Some(WorkspaceObservationQuarantineV1 {
@@ -3163,14 +3172,22 @@ mod tests {
         legacy_json["Heavy"]
             .as_object_mut()
             .expect("externally tagged heavy checkpoint")
-            .remove("activated_deferred_tool_names");
+            .insert(
+                "activated_deferred_tool_names".into(),
+                serde_json::json!(["github"]),
+            );
         let legacy: StepCheckpoint = serde_json::from_value(legacy_json).unwrap();
         let StepCheckpoint::Heavy(legacy) = legacy else {
             panic!("expected heavy checkpoint");
         };
-        assert!(
-            legacy.activated_deferred_tool_names.is_empty(),
-            "checkpoints written before activation persistence must remain readable"
+        assert_eq!(
+            legacy.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }],
+            "unknown name-only checkpoint fields must not alter typed evidence"
         );
     }
 

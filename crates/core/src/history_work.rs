@@ -124,7 +124,6 @@ pub enum HistoryWorkSite {
     ServerCompactionFixedContextClone,
     ServerToolPolicySchemaClone,
     ServerToolAdmissionSnapshotClone,
-    ServerToolSchemaEstimationSerialization,
     DelegationContextClone,
     DelegationRetryContextClone,
     DelegationParentMessagesClone,
@@ -174,7 +173,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 154;
+    const COUNT: usize = 153;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::AgenticRequestSnapshot,
@@ -284,7 +283,6 @@ impl HistoryWorkSite {
         Self::ServerCompactionFixedContextClone,
         Self::ServerToolPolicySchemaClone,
         Self::ServerToolAdmissionSnapshotClone,
-        Self::ServerToolSchemaEstimationSerialization,
         Self::DelegationContextClone,
         Self::DelegationRetryContextClone,
         Self::DelegationParentMessagesClone,
@@ -460,9 +458,6 @@ impl HistoryWorkSite {
             Self::ServerCompactionFixedContextClone => "server_compaction_fixed_context_clone",
             Self::ServerToolPolicySchemaClone => "server_tool_policy_schema_clone",
             Self::ServerToolAdmissionSnapshotClone => "server_tool_admission_snapshot_clone",
-            Self::ServerToolSchemaEstimationSerialization => {
-                "server_tool_schema_estimation_serialization"
-            }
             Self::DelegationContextClone => "delegation_context_clone",
             Self::DelegationRetryContextClone => "delegation_retry_context_clone",
             Self::DelegationParentMessagesClone => "delegation_parent_messages_clone",
@@ -638,9 +633,6 @@ impl HistoryWorkSite {
             Self::ServerCompactionFixedContextClone => "runtime.server.compaction",
             Self::ServerToolPolicySchemaClone => "runtime.server.tool_policy",
             Self::ServerToolAdmissionSnapshotClone => "runtime.server.tool_admission_snapshot",
-            Self::ServerToolSchemaEstimationSerialization => {
-                "runtime.server.tool_schema_estimation"
-            }
             Self::DelegationContextClone
             | Self::DelegationRetryContextClone
             | Self::DelegationParentMessagesClone => "runtime.server.delegation",
@@ -758,7 +750,6 @@ impl HistoryWorkSite {
             | Self::BridgeCompactionFixedContextClone
             | Self::ServerCompactionFixedContextClone
             | Self::ServerToolPolicySchemaClone
-            | Self::ServerToolSchemaEstimationSerialization
             | Self::MemoryExtractionPromptSanitization
             | Self::ToolSchemaCacheStabilizationClone
             | Self::ToolSchemaWireSortSerialization => 6,

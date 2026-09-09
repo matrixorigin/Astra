@@ -336,10 +336,11 @@ pub fn prepare(
 /// before it has a chance to react to an advisory.
 pub fn prepare_inferred(
     workspace_root: &Path,
+    execution_dir: &Path,
     command: &str,
     scope: &str,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
-    let paths = infer_source_artifacts(workspace_root, command);
+    let paths = infer_source_artifacts(workspace_root, execution_dir, command);
     if paths.is_empty() {
         return Ok(None);
     }
@@ -503,7 +504,7 @@ fn command_has_unquoted_output_redirect(command: &str) -> bool {
     false
 }
 
-fn inferred_operand_path(root: &Path, token: &str) -> Option<String> {
+fn inferred_operand_path(root: &Path, execution_dir: &Path, token: &str) -> Option<String> {
     if token.is_empty()
         || token.starts_with('-')
         || token == "."
@@ -524,7 +525,7 @@ fn inferred_operand_path(root: &Path, token: &str) -> Option<String> {
         }
         canonical
     } else {
-        root.join(raw)
+        execution_dir.join(raw)
     };
     let link_metadata = fs::symlink_metadata(&candidate).ok()?;
     if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
@@ -587,7 +588,7 @@ fn inferred_companion_paths(root: &Path, relative: &str) -> Vec<String> {
     companions
 }
 
-fn infer_source_artifacts(root: &Path, command: &str) -> Vec<String> {
+fn infer_source_artifacts(root: &Path, execution_dir: &Path, command: &str) -> Vec<String> {
     let segments = split_command_segments(command);
     let words_by_segment: Vec<Vec<String>> = segments
         .iter()
@@ -611,7 +612,7 @@ fn infer_source_artifacts(root: &Path, command: &str) -> Vec<String> {
             continue;
         };
         for token in words.iter().skip(1) {
-            let Some(path) = inferred_operand_path(root, token) else {
+            let Some(path) = inferred_operand_path(root, execution_dir, token) else {
                 continue;
             };
             let companions = inferred_companion_paths(root, &path);
@@ -968,6 +969,7 @@ mod tests {
         fs::write(workspace.path().join("evidence.bin-journal"), b"journal").unwrap();
         let paths = infer_source_artifacts(
             workspace.path(),
+            workspace.path(),
             "sha256sum evidence.bin evidence.bin-journal; custom-transform evidence.bin",
         );
         assert_eq!(paths, vec!["evidence.bin", "evidence.bin-journal"]);
@@ -980,10 +982,24 @@ mod tests {
         fs::write(workspace.path().join("record.bin-wal"), b"journal").unwrap();
         fs::write(workspace.path().join("record.bin-shm"), b"shared").unwrap();
         fs::write(workspace.path().join("unrelated.txt"), b"other").unwrap();
-        let paths = infer_source_artifacts(workspace.path(), "custom-open record.bin");
+        let paths =
+            infer_source_artifacts(workspace.path(), workspace.path(), "custom-open record.bin");
         assert_eq!(
             paths,
             vec!["record.bin", "record.bin-shm", "record.bin-wal"]
+        );
+    }
+
+    #[test]
+    fn inference_resolves_relative_operands_from_execution_directory() {
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("input.bin"), b"input").unwrap();
+
+        assert_eq!(
+            infer_source_artifacts(workspace.path(), &nested, "custom-transform input.bin"),
+            vec!["nested/input.bin"]
         );
     }
 
@@ -992,17 +1008,31 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.bin"), b"input").unwrap();
         assert!(
-            infer_source_artifacts(workspace.path(), "cat input.bin; sha256sum input.bin")
+            infer_source_artifacts(
+                workspace.path(),
+                workspace.path(),
+                "cat input.bin; sha256sum input.bin"
+            )
+            .is_empty()
+        );
+        assert!(
+            infer_source_artifacts(workspace.path(), workspace.path(), "grep '>' input.bin")
                 .is_empty()
         );
-        assert!(infer_source_artifacts(workspace.path(), "grep '>' input.bin").is_empty());
         assert_eq!(
-            infer_source_artifacts(workspace.path(), "cat input.bin > input.bin"),
+            infer_source_artifacts(
+                workspace.path(),
+                workspace.path(),
+                "cat input.bin > input.bin"
+            ),
             vec!["input.bin"]
         );
-        assert!(infer_source_artifacts(workspace.path(), "custom-open *.bin").is_empty());
+        assert!(
+            infer_source_artifacts(workspace.path(), workspace.path(), "custom-open *.bin")
+                .is_empty()
+        );
         assert_eq!(
-            infer_source_artifacts(workspace.path(), "unknown_tool input.bin"),
+            infer_source_artifacts(workspace.path(), workspace.path(), "unknown_tool input.bin"),
             vec!["input.bin"]
         );
     }
@@ -1013,10 +1043,14 @@ mod tests {
         with_store(|_| {
             let workspace = TempDir::new().unwrap();
             fs::write(workspace.path().join("input.bin"), b"input").unwrap();
-            let mut plan =
-                prepare_inferred(workspace.path(), "cp input.bin output.bin", "owner/session")
-                    .unwrap()
-                    .unwrap();
+            let mut plan = prepare_inferred(
+                workspace.path(),
+                workspace.path(),
+                "cp input.bin output.bin",
+                "owner/session",
+            )
+            .unwrap()
+            .unwrap();
             let metadata = plan.finish();
             assert_eq!(metadata["source_preimage"]["mode"], "inferred_advisory");
             assert_eq!(metadata["source_preimage"]["guarantee"], false);
@@ -1079,6 +1113,30 @@ mod tests {
             let fields = Map::from_iter([("source_preimage".into(), invalid)]);
             assert!(inferred_recovery_fact(&fields).is_none());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inference_follows_the_pinned_execution_directory_after_path_retarget() {
+        use std::os::fd::AsRawFd;
+
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("nested");
+        let retained = workspace.path().join("retained");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("input"), b"pinned").unwrap();
+        let directory = fs::File::open(&nested).unwrap();
+
+        fs::rename(&nested, &retained).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("input"), b"replacement").unwrap();
+        let inspection_path =
+            PathBuf::from("/proc/self/fd").join(directory.as_raw_fd().to_string());
+
+        assert_eq!(
+            infer_source_artifacts(workspace.path(), &inspection_path, "cp input output"),
+            vec!["retained/input"]
+        );
     }
 
     #[test]

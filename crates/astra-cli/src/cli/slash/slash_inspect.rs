@@ -131,7 +131,7 @@ pub(crate) fn inspect_workbench(state: &SessionState) -> WorkbenchInspection {
         ),
         InspectorFact::observed(
             "Deferred tools",
-            state.activated_deferred_tool_names.len().to_string(),
+            state.deferred_tool_activations.len().to_string(),
         ),
     ]);
     let capability_section = InspectorSection {

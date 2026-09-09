@@ -1570,8 +1570,6 @@ fn wire_executor_into_state(
     executor: runtime_tool_executor::RuntimeToolExecutor,
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
-    executor
-        .restore_activated_deferred_tool_names_for_session(&state.activated_deferred_tool_names);
     let executor = std::sync::Arc::new(executor);
     state.runtime_tool_executor = Some(executor);
 }
@@ -3480,6 +3478,30 @@ async fn run_post_loop_memory_cleanup_work(
                         metrics_registry.as_ref(),
                         "clean",
                     );
+                } else if matches!(svc.write_access_enabled().await, Ok(false)) {
+                    // A disabled optional capability is a normal settled
+                    // outcome only when no current snapshot was confirmed.
+                    // Check freshness first so revocation after a successful
+                    // write cannot hide a healthy extraction as a skip.
+                    record_session_memory_post_loop_drain_metrics(
+                        metrics_registry.as_ref(),
+                        "access_disabled",
+                    );
+                    persist_post_loop_memory_event(
+                        &owner_id,
+                        &session_id,
+                        &run_id,
+                        &astra_services::session_journal::JournalEvent::subsystem_settled(
+                            Some(&session_id),
+                            session_turn,
+                            "post_loop_memory",
+                        ),
+                    );
+                    record_post_loop_memory_cleanup_worker_metrics(
+                        metrics_registry.as_ref(),
+                        "completed",
+                    );
+                    return;
                 } else {
                     // A finished worker is not necessarily a successful
                     // extraction: e.g. persistence can fail after the
@@ -5511,7 +5533,7 @@ impl AgenticRunLifecycleService {
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
         rewrite_proof: Option<&CanonicalRewriteProof>,
-        preserve_execution_scratch: bool,
+        allow_empty_delta: bool,
         run_id: &str,
     ) -> Result<Option<astra_turn_types::SessionCursorV1>, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
@@ -5524,7 +5546,7 @@ impl AgenticRunLifecycleService {
                 admission.had_canonical_head,
                 messages,
                 rewrite_proof,
-                preserve_execution_scratch,
+                allow_empty_delta,
             )?
             else {
                 return Ok(None);
@@ -6667,7 +6689,7 @@ impl AgenticRunLifecycleService {
         let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
-                let mut session_state = mat.session_state;
+                let session_state = mat.session_state;
                 resume_cursor = session_state.source_cursor.clone();
                 if resume_cursor.is_none() {
                     tracing::warn!(
@@ -6680,11 +6702,6 @@ impl AgenticRunLifecycleService {
                     }
                     return Some(mgr);
                 }
-                session_state.activated_deferred_tool_names =
-                    astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
-                        &mat.messages,
-                        session_state.activated_deferred_tool_names,
-                    );
                 restored_messages = mat.messages;
                 restored_session_state = Some(session_state);
             }
@@ -11185,7 +11202,7 @@ impl AgenticRunLifecycleService {
             message: prompt_user_message.clone(),
             user_intent: prompt_user_intent,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,
@@ -12052,7 +12069,7 @@ impl AgenticRunLifecycleService {
     }
 }
 
-fn should_preserve_execution_scratch(
+fn should_allow_empty_delta(
     outcome: &Result<
         crate::turn::agentic_loop::host::AgenticLoopOutcome,
         astra_core::ClassifiedError,
@@ -12964,7 +12981,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_tool_schemas_with_native_ids(
+                bundle.schemas.clone(),
+                bundle.control_tools.clone(),
+                bundle.native_tool_ids_by_public_name(),
+            );
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         // In agent-binding mode with an EdgeAgent executor, the host only installs
@@ -13757,10 +13778,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // turns post-loop I/O into a cross-user model queue.
                 drop(execution_permit);
                 park_server_root_mailbox(&mut loop_state).await;
+                host.on_loop_terminal(&loop_state, &outcome).await;
                 let (outcome, events) = host.settle_loop_turn(outcome);
                 enforce_completed_tool_ledger_closure(&outcome, &mut loop_state);
-                let preserve_execution_scratch =
-                    should_preserve_execution_scratch(&outcome, loop_state.interruption.is_some());
+                let allow_empty_delta =
+                    should_allow_empty_delta(&outcome, loop_state.interruption.is_some());
                 let loop_success = outcome.is_ok() && loop_state.interruption.is_none();
                 let (mut events, final_status, error_msg) =
                     Self::finalize_run_events(outcome, events, &loop_state);
@@ -14081,7 +14103,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &loop_state.messages,
                         loop_state.canonical_rewrite_proof(),
-                        preserve_execution_scratch
+                        allow_empty_delta
                             || bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
@@ -15264,7 +15286,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_tool_schemas_with_native_ids(
+                bundle.schemas.clone(),
+                bundle.control_tools.clone(),
+                bundle.native_tool_ids_by_public_name(),
+            );
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         // In agent-binding mode with an EdgeAgent executor, the host only installs
@@ -16103,10 +16129,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 park_server_root_mailbox(&mut state).await;
+                host.on_loop_terminal(&state, &loop_result).await;
                 let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 enforce_completed_tool_ledger_closure(&loop_result, &mut state);
-                let preserve_execution_scratch =
-                    should_preserve_execution_scratch(&loop_result, state.interruption.is_some());
+                let allow_empty_delta =
+                    should_allow_empty_delta(&loop_result, state.interruption.is_some());
                 let loop_success = loop_result.is_ok() && state.interruption.is_none();
                 let (mut final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, emitted_events, &state);
@@ -16577,7 +16604,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &state.messages,
                         state.canonical_rewrite_proof(),
-                        preserve_execution_scratch
+                        allow_empty_delta
                             || bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
@@ -19060,14 +19087,11 @@ fn spawn_system_prompt(config: &SpawnRunConfig) -> String {
         ("Complete the task thoroughly.", "")
     };
     if config.system_prompt_addendum.trim().is_empty() {
-        format!(
-            "You are '{}', a specialized sub-agent. {completion_contract}{work_settlement}",
-            config.agent_id,
-        )
+        format!("You are a specialized sub-agent. {completion_contract}{work_settlement}",)
     } else {
         format!(
-            "You are '{}', a specialized sub-agent.\n\n{}\n\n{completion_contract}{work_settlement}",
-            config.agent_id, config.system_prompt_addendum,
+            "You are a specialized sub-agent.\n\n{}\n\n{completion_contract}{work_settlement}",
+            config.system_prompt_addendum,
         )
     }
 }
@@ -21279,7 +21303,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task.clone(),
             user_intent: full_task,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: inherited_turn_intent,
             task_profile,
@@ -21548,6 +21572,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     .unwrap_or_default()
             ));
         }
+        host.on_loop_terminal(&loop_state, &outcome).await;
         let (outcome, retained_host_events) = host.settle_loop_turn(outcome);
         // Loop lifecycle is explicit control-plane state. Tool-level outcome
         // failures remain evaluation/evidence facts and must not vote a

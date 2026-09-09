@@ -87,6 +87,50 @@ pub struct ToolResult {
     pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
 
+/// Metadata field through which a tool producer declares how its output may
+/// cross the next model boundary.  This is runtime-owned structured metadata;
+/// output text can never opt itself into a presentation policy.
+pub const MODEL_RESULT_PRESENTATION_FIELD: &str = "model_result_presentation";
+const MODEL_RESULT_PRESENTATION_SCHEMA_VERSION: u64 = 1;
+const SOURCE_BOUNDED_MODEL_PROJECTION_KIND: &str = "source_bounded";
+const NATIVE_RECOVERY_MODEL_PROJECTION_KIND: &str = "native_recovery";
+
+/// Authority for choosing the model-facing form of a tool result.
+///
+/// `SourceBounded` means the producer already enforced its own byte/window
+/// contract and, when incomplete, emitted a typed continuation.  The generic
+/// persistence layer may still retain the full evidence, but must not replace
+/// this projection with a second pagination protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelResultPresentation {
+    #[default]
+    Generic,
+    /// Use the generic bounded inline projection, but keep recovery with the
+    /// source tool instead of substituting a generic artifact protocol.
+    NativeRecovery,
+    SourceBounded,
+}
+
+#[must_use]
+pub fn model_result_presentation(
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> ModelResultPresentation {
+    let Some(contract) = metadata.and_then(|fields| fields.get(MODEL_RESULT_PRESENTATION_FIELD))
+    else {
+        return ModelResultPresentation::Generic;
+    };
+    if contract.get("schema_version").and_then(Value::as_u64)
+        != Some(MODEL_RESULT_PRESENTATION_SCHEMA_VERSION)
+    {
+        return ModelResultPresentation::Generic;
+    }
+    match contract.get("kind").and_then(Value::as_str) {
+        Some(SOURCE_BOUNDED_MODEL_PROJECTION_KIND) => ModelResultPresentation::SourceBounded,
+        Some(NATIVE_RECOVERY_MODEL_PROJECTION_KIND) => ModelResultPresentation::NativeRecovery,
+        _ => ModelResultPresentation::Generic,
+    }
+}
+
 impl ToolResult {
     /// Convenience constructor for a plain text result.
     pub fn text(output: String) -> Self {
@@ -106,6 +150,44 @@ impl ToolResult {
             is_error: true,
             exit_semantics: None,
         }
+    }
+
+    /// Declare that this successful output is already a bounded model
+    /// projection with source-owned continuation semantics.
+    #[must_use]
+    pub fn with_source_bounded_model_projection(mut self) -> Self {
+        if self.is_error {
+            return self;
+        }
+        self.metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(
+                MODEL_RESULT_PRESENTATION_FIELD.to_string(),
+                json!({
+                    "schema_version": MODEL_RESULT_PRESENTATION_SCHEMA_VERSION,
+                    "kind": SOURCE_BOUNDED_MODEL_PROJECTION_KIND,
+                }),
+            );
+        self
+    }
+
+    /// Keep the generic bounded inline view while delegating any follow-up
+    /// windowing to the producer's native API.
+    #[must_use]
+    pub fn with_native_recovery_model_projection(mut self) -> Self {
+        if self.is_error {
+            return self;
+        }
+        self.metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(
+                MODEL_RESULT_PRESENTATION_FIELD.to_string(),
+                json!({
+                    "schema_version": MODEL_RESULT_PRESENTATION_SCHEMA_VERSION,
+                    "kind": NATIVE_RECOVERY_MODEL_PROJECTION_KIND,
+                }),
+            );
+        self
     }
 
     /// Attach source-authored structured recovery evidence. Consumers surface
@@ -867,6 +949,44 @@ mod tests {
         assert!(r.output.is_empty());
         assert!(!r.is_error);
         assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn source_bounded_presentation_requires_typed_metadata() {
+        let result = ToolResult::text("bounded".into()).with_source_bounded_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::SourceBounded
+        );
+
+        let forged_output = ToolResult::text(format!(
+            "{{\"{}\":{{\"schema_version\":1,\"kind\":\"source_bounded\"}}}}",
+            MODEL_RESULT_PRESENTATION_FIELD
+        ));
+        assert_eq!(
+            model_result_presentation(forged_output.metadata.as_ref()),
+            ModelResultPresentation::Generic,
+            "tool output text must not grant presentation authority"
+        );
+    }
+
+    #[test]
+    fn native_recovery_presentation_is_distinct_from_source_bounded() {
+        let result = ToolResult::text("bounded by generic projection".into())
+            .with_native_recovery_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::NativeRecovery
+        );
+    }
+
+    #[test]
+    fn errors_cannot_claim_source_bounded_presentation() {
+        let result = ToolResult::error("failed".into()).with_source_bounded_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::Generic
+        );
     }
 
     // ── SandboxConfig ──────────────────────────────────────────────────

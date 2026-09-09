@@ -28,7 +28,7 @@
 use astra_core::ObservationFacet;
 use astra_turn_core::introspect::{
     CircuitBreakerSnapshot, IntrospectSnapshot, prompt_cache_fresh_input_tokens,
-    prompt_cache_read_share_pct, turn_budget_label,
+    prompt_cache_read_share_pct, prompt_cache_stable_prefix_tokens, turn_budget_label,
 };
 
 use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
@@ -267,6 +267,13 @@ pub fn local_reflect_from_snapshot(
                     pressure,
                     cache_share,
                 ));
+                if let Some(eligible) = prompt_cache_stable_prefix_tokens(snapshot) {
+                    lines.push(format!(
+                        "prompt_cache_stable_prefix_tokens={} read_over_stable_prefix={:.2}",
+                        eligible,
+                        frame.cache_read_vs_eligible_ratio().unwrap_or_default(),
+                    ));
+                }
                 if let Some(usage) = frame.run_usage {
                     lines.push(format!(
                         "prompt_tokens: input_total={} fresh={} cached_read={} cache_create={} output={}",
@@ -398,6 +405,7 @@ mod tests {
                 model_context_window_tokens: Some(1_000_000),
                 effective_input_limit_tokens: Some(800_000),
                 estimated_input_tokens: Some(42_000),
+                estimated_cache_eligible_tokens: Some(88),
                 token_pressure: Some(0.42),
                 compaction_tier: astra_turn_core::compaction_types::CompactionTier::TrimSchemas,
             },
@@ -534,6 +542,8 @@ mod tests {
         assert!(summary.contains("pressure=42%"));
         assert!(summary.contains("prompt_cache_read_share=88%"));
         assert!(summary.contains("prompt_cache_scope=current_runtime_snapshot"));
+        assert!(summary.contains("prompt_cache_stable_prefix_tokens=88"));
+        assert!(summary.contains("read_over_stable_prefix=1.00"));
         assert!(!summary.contains("cache=88%"));
         assert!(summary.contains("snapshot_age_turns=2"));
         assert!(summary.contains("turns: session_turn=3 round=3/10 remaining=7"));

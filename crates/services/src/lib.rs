@@ -390,10 +390,12 @@ pub use triggers::{
     UnconfiguredTriggerService, WebhookFireData,
 };
 pub use turn_intent_judge::{
-    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, WorkAdmissionActivation,
-    WorkAdmissionCapability, WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask,
-    WorkExecutionTopology, build_turn_intent_prompt, parse_turn_intent_response,
-    parse_work_admission_response, turn_intent_judge_messages, work_admission_judge_messages,
+    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
+    WORK_ADMISSION_MAX_OUTPUT_TOKENS, WORK_ADMISSION_MAX_TEXT_CHARS, WORK_ADMISSION_MAX_UNITS,
+    WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision,
+    WorkAdmissionGraphMutation, WorkAdmissionTask, WorkExecutionTopology, build_turn_intent_prompt,
+    parse_turn_intent_response, parse_work_admission_response, turn_intent_judge_messages,
+    work_admission_judge_messages,
 };
 pub use verification::{
     LlmJudge, SubtaskVerificationReport, VerificationCriterion, VerificationResult,

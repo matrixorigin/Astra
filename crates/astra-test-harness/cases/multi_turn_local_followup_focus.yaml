@@ -64,3 +64,16 @@ criteria:
   - type: turn_rounds_between
     min: 1
     max: 5
+  - type: hard_judger
+    question: |
+      Review the complete ordered assistant transcript. In the response to the initial user
+      message, did the assistant concisely acknowledge the newly supplied LEGACY-ALPHA fact for
+      this conversation, without using tools or making any provenance claim? The user asked only
+      for a conversational confirmation. A denial or caveat equivalent to “I cannot confirm”,
+      “there is no history/record”, “I cannot recall”, or an offer/request to look up or persist
+      memory is a failure here, even when phrased as an honest disclaimer: no historical lookup
+      or persistence was requested, and no evidence authorizes those claims. Later correct turns
+      cannot repair an initial violation. Score 1.0 only when the first response directly
+      acknowledges the supplied fact and stays concise; score 0.0 for any such denial, provenance
+      or storage discussion, or tool call.
+    threshold: 0.8

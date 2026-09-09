@@ -32,6 +32,7 @@ mod criteria_proposal_repository;
 mod criteria_read_repository;
 mod delivery_selection;
 mod delivery_selection_repository;
+mod establishment_operation;
 mod event_read_repository;
 mod events;
 mod events_repository;
@@ -127,6 +128,13 @@ pub use delivery_selection::{
     WORK_DELIVERY_SELECTION_SCHEMA_VERSION, WorkDeliverySelection,
     WorkDeliverySelectionBasisResource, WorkDeliverySelectionOutcome, WorkDeliverySelectionReceipt,
     WorkDeliverySelectionSubject,
+};
+pub(crate) use establishment_operation::cancel_pending_for_new_turn_tx;
+pub use establishment_operation::{
+    DatabaseWorkEstablishmentService, WORK_ESTABLISHMENT_OPERATION_SCHEMA_VERSION,
+    WorkEstablishmentActivation, WorkEstablishmentAdmission, WorkEstablishmentAdmissionDisposition,
+    WorkEstablishmentError, WorkEstablishmentOperation, WorkEstablishmentPhase,
+    WorkEstablishmentRequest, WorkEstablishmentState,
 };
 pub use events::{
     WORK_EVENT_PAGE_MAX_ITEMS, WorkEventCoverage, WorkEventKind, WorkEventPage, WorkEventPageLimit,
@@ -1295,6 +1303,10 @@ pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL: &str =
 /// task, plan, checklist, transcript, and reflection stores are deliberately
 /// absent: they are not inputs to a fresh WorkRepository.
 pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
+    (
+        "work_establishment_operations",
+        establishment_operation::WORK_ESTABLISHMENT_OPERATIONS_CREATE_SQL,
+    ),
     ("works", WORKS_CREATE_SQL),
     ("work_goal_revisions", WORK_GOAL_REVISIONS_CREATE_SQL),
     ("work_criteria", WORK_CRITERIA_CREATE_SQL),

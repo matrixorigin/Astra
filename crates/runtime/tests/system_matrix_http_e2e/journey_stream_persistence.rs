@@ -83,6 +83,26 @@ fn mock_tool_call(id: &str, name: &str, args: Value) -> Value {
     })
 }
 
+fn deferred_tool_search_round(call_id: &str, tool_name: &str) -> Value {
+    json!({
+        "tool_calls": [mock_tool_call(
+            call_id,
+            "tool_search",
+            json!({"query": format!("select:{tool_name}")}),
+        )]
+    })
+}
+
+fn deferred_tool_invoke_round(call_id: &str, tool_name: &str, arguments: Value) -> Value {
+    json!({
+        "tool_calls": [mock_tool_call(
+            call_id,
+            "invoke_tool",
+            json!({"name": tool_name, "arguments": arguments}),
+        )]
+    })
+}
+
 fn parse_sse_events(raw: &str) -> Vec<Value> {
     raw.lines()
         .filter_map(|line| line.strip_prefix("data: "))
@@ -159,37 +179,35 @@ fn concurrent_fanout_payload(
                 "workspace_mutation": "read_only",
                 "execution_topology": "parallel_subruns",
                 "required_capabilities": ["agent_spawner"],
-                "acceptance_unit_relationship": "single_outcome",
                 "acceptance_units": [{"objective": "Synthesize the fanout", "expected_result": "One combined result"}]
             },
             "test_llm_rounds": [
-                {
-                    "tool_calls": [mock_tool_call(
-                        &call_id,
-                        "agent_fanout",
-                        json!({
-                            "action": "start",
-                            // Intentional collision: a fanout group is scoped
-                            // by owner + session + parent, never by this label.
-                            "group_id": shared_group_id,
-                            "title": "Concurrent isolation gate",
-                            "target_count": 2,
-                            "slots": [
-                                {
-                                    "id": "first",
-                                    "description": "First isolated child",
-                                    "prompt": "Return the first independent finding."
-                                },
-                                {
-                                    "id": "second",
-                                    "description": "Second isolated child",
-                                    "prompt": "Return the second independent finding."
-                                }
-                            ],
-                            "defaults": {"agent_type": "general-purpose"}
-                        })
-                    )]
-                },
+                deferred_tool_search_round(&format!("{}-tool-search", case.name), "agent_fanout"),
+                deferred_tool_invoke_round(
+                    &call_id,
+                    "agent_fanout",
+                    json!({
+                        "action": "start",
+                        // Intentional collision: a fanout group is scoped
+                        // by owner + session + parent, never by this label.
+                        "group_id": shared_group_id,
+                        "title": "Concurrent isolation gate",
+                        "target_count": 2,
+                        "slots": [
+                            {
+                                "id": "first",
+                                "description": "First isolated child",
+                                "prompt": "Return the first independent finding."
+                            },
+                            {
+                                "id": "second",
+                                "description": "Second isolated child",
+                                "prompt": "Return the second independent finding."
+                            }
+                        ],
+                        "defaults": {"agent_type": "general-purpose"}
+                    }),
+                ),
                 {"full_text": case.final_reply}
             ],
             "test_spawn_child_llm_rounds": [child_round]
@@ -752,17 +770,11 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
                 "workspace_mutation": "read_only",
                 "execution_topology": "parallel_subruns",
                 "required_capabilities": ["agent_spawner"],
-                "acceptance_unit_relationship": "single_outcome",
                 "acceptance_units": [{"objective": "Synthesize the reviews", "expected_result": "One combined review"}]
             },
             "test_llm_rounds": [
-                {
-                    "tool_calls": [mock_tool_call(
-                        "online-fanout-start",
-                        "agent_fanout",
-                        fanout_args
-                    )]
-                },
+                deferred_tool_search_round("online-fanout-search", "agent_fanout"),
+                deferred_tool_invoke_round("online-fanout-start", "agent_fanout", fanout_args),
                 {"full_text": final_reply}
             ],
             "test_spawn_child_llm_rounds": [
@@ -1203,28 +1215,26 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
                 "workspace_mutation": "read_only",
                 "execution_topology": "parallel_subruns",
                 "required_capabilities": ["agent_spawner"],
-                "acceptance_unit_relationship": "single_outcome",
                 "acceptance_units": [{"objective": "Run the cancellable review group", "expected_result": "One group outcome"}]
             },
             "test_llm_rounds": [
-                {
-                    "tool_calls": [mock_tool_call(
-                        "slow-fanout-before-root-cancel",
-                        "agent_fanout",
-                        json!({
-                            "action": "start",
-                            "group_id": "slow-fanout-root-cancel",
-                            "title": "Slow fanout cancellation gate",
-                            "target_count": 3,
-                            "slots": [
-                                {"id": "one", "description": "Slow child one", "prompt": "Return finding one."},
-                                {"id": "two", "description": "Slow child two", "prompt": "Return finding two."},
-                                {"id": "three", "description": "Slow child three", "prompt": "Return finding three."}
-                            ],
-                            "defaults": {"agent_type": "general-purpose"}
-                        })
-                    )]
-                },
+                deferred_tool_search_round("slow-fanout-tool-search", "agent_fanout"),
+                deferred_tool_invoke_round(
+                    "slow-fanout-before-root-cancel",
+                    "agent_fanout",
+                    json!({
+                        "action": "start",
+                        "group_id": "slow-fanout-root-cancel",
+                        "title": "Slow fanout cancellation gate",
+                        "target_count": 3,
+                        "slots": [
+                            {"id": "one", "description": "Slow child one", "prompt": "Return finding one."},
+                            {"id": "two", "description": "Slow child two", "prompt": "Return finding two."},
+                            {"id": "three", "description": "Slow child three", "prompt": "Return finding three."}
+                        ],
+                        "defaults": {"agent_type": "general-purpose"}
+                    }),
+                ),
                 {"full_text": forbidden_late_reply}
             ],
             "test_spawn_child_llm_rounds": [{
@@ -1527,6 +1537,17 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
                     {"full_text": premature_reply},
                     {
                         "tool_calls": [mock_tool_call(
+                            "prepare-canonical-result",
+                            "memory",
+                            json!({
+                                "action": "remember",
+                                "content": "One durable prepared result",
+                                "memory_type": "working"
+                            })
+                        )]
+                    },
+                    {
+                        "tool_calls": [mock_tool_call(
                             "settle-canonical-task",
                             "settle_work_item",
                             json!({
@@ -1536,6 +1557,17 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
                         )]
                     },
                     {"full_text": second_premature_reply},
+                    {
+                        "tool_calls": [mock_tool_call(
+                            "verify-canonical-result",
+                            "memory",
+                            json!({
+                                "action": "recall",
+                                "query": "One durable prepared result",
+                                "top_k": 1
+                            })
+                        )]
+                    },
                     {
                         "tool_calls": [mock_tool_call(
                             "settle-canonical-verification",
@@ -1598,17 +1630,42 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
     let initial_board_tasks = initial_board["tasks"]
         .as_array()
         .unwrap_or_else(|| panic!("start receipt omitted live-board tasks: {raw_sse}"));
-    assert_eq!(initial_board_tasks.len(), 2, "start receipt: {raw_sse}");
+    // The canonical board snapshot includes its synthetic root alongside the
+    // declared task items. Validate by item identity rather than array
+    // position so the lifecycle projection can evolve without weakening the
+    // two task obligations.
     assert_eq!(
-        initial_board_tasks[0]["execution_status"], "running",
+        initial_board_tasks.len(),
+        declared_tasks.len() + 1,
+        "start receipt must include the canonical root plus declared tasks: {raw_sse}"
+    );
+    let board_task = |item_id: &str| {
+        initial_board_tasks
+            .iter()
+            .find(|task| task["item_id"].as_str() == Some(item_id))
+            .unwrap_or_else(|| panic!("missing board item {item_id}: {raw_sse}"))
+    };
+    let root_board_task = board_task("root");
+    assert_eq!(root_board_task["execution_status"], "not_started");
+    assert_eq!(root_board_task["delivery_status"], "unreported");
+    let first_declared_id = declared_tasks[0]["item_id"]
+        .as_str()
+        .expect("first declared task identity");
+    let second_declared_id = declared_tasks[1]["item_id"]
+        .as_str()
+        .expect("second declared task identity");
+    let first_board_task = board_task(first_declared_id);
+    let second_board_task = board_task(second_declared_id);
+    assert_eq!(
+        first_board_task["execution_status"], "running",
         "the first durable task must be visible as active before the next model round: {raw_sse}"
     );
-    assert_eq!(initial_board_tasks[0]["delivery_status"], "unreported");
+    assert_eq!(first_board_task["delivery_status"], "unreported");
     assert_eq!(
-        initial_board_tasks[1]["execution_status"], "not_started",
+        second_board_task["execution_status"], "not_started",
         "the second durable task must be visible immediately, not discovered by a later poll: {raw_sse}"
     );
-    assert_eq!(initial_board_tasks[1]["delivery_status"], "unreported");
+    assert_eq!(second_board_task["delivery_status"], "unreported");
     let first_settlement = events
         .iter()
         .find(|event| {
@@ -1892,28 +1949,26 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                     "workspace_mutation": "read_only",
                     "execution_topology": "parallel_subruns",
                     "required_capabilities": ["agent_spawner"],
-                    "acceptance_unit_relationship": "single_outcome",
                     "acceptance_units": [{"objective": "Synthesize the failed reviews", "expected_result": "One combined failure report"}]
                 },
                 "test_llm_rounds": [
-                    {
-                        "tool_calls": [mock_tool_call(
-                            "online-failed-fanout-start",
-                            "agent_fanout",
-                            json!({
-                                "action": "start",
-                                "group_id": "online-failed-review-group",
-                                "title": "Online failed three-way review",
-                                "target_count": 3,
-                                "slots": [
-                                    {"id": "storage", "description": "Failed storage review", "prompt": "Inspect storage."},
-                                    {"id": "runtime", "description": "Failed runtime review", "prompt": "Inspect runtime."},
-                                    {"id": "journey", "description": "Failed journey review", "prompt": "Inspect journey."}
-                                ],
-                                "defaults": {"agent_type": "general-purpose"}
-                            })
-                        )]
-                    },
+                    deferred_tool_search_round("online-failed-fanout-search", "agent_fanout"),
+                    deferred_tool_invoke_round(
+                        "online-failed-fanout-start",
+                        "agent_fanout",
+                        json!({
+                            "action": "start",
+                            "group_id": "online-failed-review-group",
+                            "title": "Online failed three-way review",
+                            "target_count": 3,
+                            "slots": [
+                                {"id": "storage", "description": "Failed storage review", "prompt": "Inspect storage."},
+                                {"id": "runtime", "description": "Failed runtime review", "prompt": "Inspect runtime."},
+                                {"id": "journey", "description": "Failed journey review", "prompt": "Inspect journey."}
+                            ],
+                            "defaults": {"agent_type": "general-purpose"}
+                        }),
+                    ),
                     {"full_text": final_reply}
                 ],
                 "test_spawn_child_llm_rounds": [{

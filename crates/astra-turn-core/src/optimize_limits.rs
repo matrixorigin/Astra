@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// trace entries showing what *could have* happened but didn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizeLimits {
-    /// Reorder sections within explicitly marked reorderable groups.
+    /// Reorder cache scopes within contiguous non-anchor section groups.
     pub allow_reorder: bool,
     /// Clear old tool results (microcompact).
     pub allow_tool_result_clearing: bool,

@@ -2,11 +2,13 @@ name: work_implicit_replacement_journey
 description: |
   **What**: Exercise a natural cancel-and-add request where the user names two desired outcomes
   but does not invent a third outcome for the replacement.
-  **Tests**: Admission preserves cancel and add as two atomic operations, the runtime
-  cancels the still-unexecuted original before executing the fresh task, and no unrelated domain is
-  fabricated merely to make the graph look dynamic.
-  **Pass means**: Two initial serial tasks are established; after the first settles, the second is
-  cancelled without settlement; a semantically identical fresh task is added and delivered.
+  **Tests**: Admission preserves cancel and add as two atomic operations, the runtime never
+  assigns the retired original, and no unrelated domain is fabricated merely to make the graph
+  look dynamic. The accepted graph mutation may be committed atomically with start_work because
+  the user's whole lifecycle instruction is already authoritative at admission.
+  **Pass means**: The two requested serial outcomes are admitted; the original second item is
+  cancelled without settlement; a semantically identical fresh task is added and delivered after
+  the first outcome.
   **Fail means**: Both original tasks execute, a delivered task is retroactively called cancelled,
   an unrelated third task is invented, or the turn closes with blocked/unsettled Work.
 prompt: |
@@ -53,16 +55,6 @@ criteria:
     require_retired_revision: true
     require_cancelled_revision: true
     require_atomic_retire_and_add: true
-  - type: journal_tool_json
-    name: propose_work_plan
-    document: result
-    path: /active_attempt_present
-    equals: false
-  - type: journal_tool_json
-    name: propose_work_plan
-    document: result
-    path: /next_action
-    equals: call_run_next_work_item
   - type: journal_tool_call_count
     name: settle_work_item
     min: 2

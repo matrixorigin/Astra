@@ -161,7 +161,6 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) first_surface_report: Option<ToolSelectionReport>,
     pub(crate) selected_skills: Vec<String>,
     pub(crate) tools_used: HashSet<String>,
-    pub(crate) activated_deferred_tool_names: Vec<String>,
     pub(crate) tool_call_records: Vec<ToolCallRecord>,
     pub(crate) budget_pressure: f64,
     pub(crate) stall_events: Vec<(String, u32)>,
@@ -183,6 +182,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) server_terminal_authoritative: bool,
     pub(crate) tool_record_coverage_partial: bool,
     pub(crate) final_messages: Vec<serde_json::Value>,
+    pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     pub(crate) run_transcript_messages: Vec<serde_json::Value>,
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
 }
@@ -296,7 +296,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         first_surface_report,
         selected_skills,
         tools_used,
-        activated_deferred_tool_names,
         tool_call_records,
         budget_pressure,
         stall_events,
@@ -318,6 +317,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         server_terminal_authoritative,
         tool_record_coverage_partial,
         final_messages,
+        deferred_tool_activations,
         run_transcript_messages,
         applied_user_intents,
     } = ctx;
@@ -407,7 +407,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         visible_tools: report.visible_tools,
         selected_skills,
         tools_used,
-        activated_deferred_tool_names,
         tool_call_records,
         budget_used: report.schema_budget_used,
         budget_pressure,
@@ -432,6 +431,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         server_terminal_authoritative,
         tool_record_coverage_partial,
         final_messages,
+        deferred_tool_activations,
         run_transcript_messages,
         applied_user_intents,
         background_agent_results: Vec::new(),
@@ -488,7 +488,6 @@ mod tests {
             first_surface_report: None,
             selected_skills: vec!["sk1".into()],
             tools_used: HashSet::from(["bash".into(), "read".into()]),
-            activated_deferred_tool_names: Vec::new(),
             tool_call_records: vec![],
             budget_pressure: 0.5,
             stall_events: vec![],
@@ -510,6 +509,11 @@ mod tests {
             server_terminal_authoritative: false,
             tool_record_coverage_partial: false,
             final_messages: Vec::new(),
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "memory".to_string(),
+                schema_digest: "digest".to_string(),
+                descriptor: None,
+            }],
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
         }
@@ -541,6 +545,7 @@ mod tests {
         assert_eq!(result.tool_calls_count, 3);
         assert_eq!(result.ttft_ms, Some(42));
         assert_eq!(result.context_ms, Some(100));
+        assert_eq!(result.deferred_tool_activations.len(), 1);
     }
 
     #[test]

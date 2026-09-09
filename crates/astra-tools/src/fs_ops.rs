@@ -521,6 +521,10 @@ fn should_skip_path_identity_dir(path: &Path) -> bool {
 }
 
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
+    read_file_inner(workspace_root, args).with_native_recovery_model_projection()
+}
+
+fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     if let Err(error) = validate_read_file_args(args) {
         return ToolResult::error(error);
     }
@@ -1076,7 +1080,12 @@ pub fn prepare_write_file(
     let path = resolve_write_target_path(workspace_root, path_str, "write_file")?;
     let requested_content_state =
         crate::workspace_observation::workspace_file_state_identity(content.as_bytes());
-    let content = normalize_content_before_write(&path, content);
+    // Content normalization is part of the invocation contract.  Base it on
+    // the path spelling the caller supplied, not on a second canonical path
+    // resolution.  The owner has already resolved and authorized `path`; a
+    // later receipt check must not silently apply a different sandbox policy
+    // (for example for an explicitly allowed absolute path).
+    let content = normalize_content_before_write(Path::new(path_str), content);
 
     let existing_bytes = std::fs::read(&path).ok();
     let already_desired = existing_bytes.as_deref() == Some(content.as_bytes());
@@ -2231,12 +2240,11 @@ pub fn normalize_content_before_write(path: &Path, content: &str) -> String {
 }
 
 pub fn write_file_desired_state_identity(
-    workspace_root: &Path,
+    _workspace_root: &Path,
     args: &Value,
 ) -> Option<crate::workspace_observation::WorkspaceFileStateIdentity> {
-    let path = resolve_write_target_path(workspace_root, args.get("path")?.as_str()?, "write_file")
-        .ok()?;
-    let content = normalize_content_before_write(&path, args.get("content")?.as_str()?);
+    let path = Path::new(args.get("path")?.as_str()?);
+    let content = normalize_content_before_write(path, args.get("content")?.as_str()?);
     Some(crate::workspace_observation::workspace_file_state_identity(
         content.as_bytes(),
     ))

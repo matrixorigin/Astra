@@ -1,6 +1,4 @@
-use super::super::layers::{
-    DuplicateReadElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
-};
+use super::super::layers::{ReactiveCompact, TieredCompaction, ToolResultTruncation};
 use super::*;
 use crate::prompts::estimate_str_tokens;
 use astra_turn_core::compression_types::{
@@ -326,6 +324,36 @@ fn tool_truncation_respects_age_threshold() {
 }
 
 #[test]
+fn tool_truncation_preserves_typed_artifact_projection() {
+    let dir = tempfile::tempdir().expect("artifact dir");
+    let persisted = astra_turn_core::tool_result_storage::persist_tool_result_for_compaction(
+        dir.path(),
+        "run-truncation",
+        "call-truncation",
+        "read_file",
+        &"evidence\n".repeat(400),
+    )
+    .expect("persisted result");
+    let message = json!({
+        "role": "tool",
+        "tool_call_id": "call-truncation",
+        "content": persisted.replacement,
+        "_timestamp": 1,
+        "_round_index": 0,
+        astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-truncation",
+        astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:
+            serde_json::to_value(&persisted.descriptor).expect("descriptor json"),
+    });
+    let original = message["content"].clone();
+    let mut messages = vec![message];
+    let budget = budget_with_round(64_000, 100_000, 1);
+    let layer = ToolResultTruncation::new(Duration::from_secs(0), 10, 0.0);
+    let result = compress_layer_values(&layer, &mut messages, &budget);
+    assert_eq!(result.estimated_tokens_freed, 0);
+    assert_eq!(messages[0]["content"], original);
+}
+
+#[test]
 fn tool_truncation_safe_utf8_boundary_cjk() {
     let mut msgs = vec![
         json!({"role": "system", "content": "你是助手。"}),
@@ -370,493 +398,9 @@ fn duplicate_read_stubs_earlier_keeps_latest() {
     assert!(outcome.total_tokens_freed > 0);
     // First read must be stubbed; second must be intact.
     let first_read = msgs[3]["content"].as_str().unwrap();
-    assert!(first_read.contains("[duplicate read"));
+    assert!(first_read.contains("[identical output retained"));
     let last_read = msgs[6]["content"].as_str().unwrap();
     assert!(last_read.contains("fn main()"));
-}
-
-#[test]
-fn duplicate_read_uses_file_path_arg_key() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "Read file lib.rs"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"file_path\": \"src/lib.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "pub fn lib() {}"}),
-        json!({"role": "user", "content": "Re-read lib.rs"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"file_path\": \"src/lib.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "pub fn lib() {}"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-}
-
-#[test]
-fn duplicate_read_no_match_for_non_read_tools() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        json!({"role": "user", "content": "Run bash"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "bash", "arguments": "{\"command\": \"echo hello\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "hello"}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "bash", "arguments": "{\"command\": \"echo hello\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "hello"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let result = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert_eq!(result.estimated_tokens_freed, 0);
-}
-
-#[test]
-fn duplicate_read_skips_protected_head() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "Read main.rs"}),
-        json!({
-            "role": "assistant",
-            "content": "Read:",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "fn main() {}"}),
-        // Second read of same file (different call).
-        json!({"role": "user", "content": "Re-read main.rs"}),
-        json!({
-            "role": "assistant",
-            "content": "Re-reading:",
-            "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "fn main() {}"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    // Protected head (system + first user + first read) is untouched.
-    // The first read at index 3 should be stubbed, last at index 6 intact.
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-    assert!(msgs[6]["content"].as_str().unwrap().contains("fn main()"));
-}
-
-#[test]
-fn duplicate_read_stubs_all_but_last_with_triple_reads() {
-    let data = "fn main() {}\n".repeat(100);
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        json!({"role": "user", "content": "Read main.rs"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": &data}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": &data}),
-        json!({"role": "user", "content": "Third time"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c3", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c3", "content": &data}),
-    ];
-    let b = budget(80_000, 60_000);
-    let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-    assert!(
-        msgs[6]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-    assert!(msgs[9]["content"].as_str().unwrap().contains("fn main()"));
-}
-
-#[test]
-fn duplicate_read_skips_tool_results_without_call_id() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        json!({"role": "user", "content": "Read main.rs"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "content": "fn main() {}"}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "fn main() {}"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let result = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert_eq!(result.estimated_tokens_freed, 0);
-}
-
-#[test]
-fn duplicate_read_recognizes_grep_and_git_log() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "Grep"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"main\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "match in src/main.rs:1"}),
-        json!({"role": "user", "content": "Grep again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"main\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "match in src/main.rs:1"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-}
-
-#[test]
-fn duplicate_read_does_not_collide_grep_with_same_path_different_pattern() {
-    // Regression: same path, different pattern → distinct results.
-    // Earlier code keyed only on `path` and stubbed the first grep
-    // even though the second was searching for something different.
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "First grep"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"foo\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "FOO_RESULT_KEEP_ME"}),
-        json!({"role": "user", "content": "Second grep"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"bar\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "BAR_RESULT_KEEP_ME"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    let foo_content = msgs[3]["content"].as_str().unwrap_or("");
-    let bar_content = msgs[6]["content"].as_str().unwrap_or("");
-    assert!(
-        !foo_content.contains("[duplicate read"),
-        "different patterns must NOT dedup, but got stub: {foo_content}"
-    );
-    assert!(
-        foo_content.contains("FOO_RESULT_KEEP_ME"),
-        "first grep result must survive: got {foo_content}"
-    );
-    assert!(
-        bar_content.contains("BAR_RESULT_KEEP_ME"),
-        "second grep result must survive: got {bar_content}"
-    );
-}
-
-#[test]
-fn duplicate_read_dedups_grep_with_identical_pattern() {
-    // Sanity: when both path AND pattern match, dedup MUST still fire.
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "Same grep twice"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"foo\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "match"}),
-        json!({"role": "user", "content": "again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "grep", "arguments": "{\"path\": \"src/\", \"pattern\": \"foo\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "match"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read"),
-        "identical grep calls must be deduped"
-    );
-}
-
-#[test]
-fn duplicate_read_recognizes_path_less_git_log() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "You are helpful."}),
-        json!({"role": "user", "content": "git log"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "commit abc123"}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "commit abc123"}),
-    ];
-    let budget = budget(64000, 100000);
-    let engine = CompactionEngine::default_pipeline_for(64000);
-    engine.compress_if_needed(&mut msgs, &budget);
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read")
-    );
-}
-
-#[test]
-fn duplicate_read_does_not_dedupe_different_path_less_args() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        json!({"role": "user", "content": "git log"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":5}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "5 commits"}),
-        json!({"role": "user", "content": "Now 10"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\":\"log\",\"n\":10}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "10 commits"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let result = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert_eq!(result.estimated_tokens_freed, 0);
-}
-#[test]
-fn duplicate_read_recognizes_list_dir_glob_symbols() {
-    // Test path-based tools: list_dir, glob, symbols
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        // list_dir
-        json!({"role": "user", "content": "List"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "list_dir", "arguments": "{\"path\": \"src\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "main.rs  lib.rs  mod.rs  config.rs  utils.rs  helpers.rs  types.rs  error.rs"}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "list_dir", "arguments": "{\"path\": \"src\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "main.rs  lib.rs  mod.rs  config.rs  utils.rs  helpers.rs  types.rs  error.rs"}),
-        // glob
-        json!({"role": "user", "content": "Glob"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c3", "function": {"name": "glob", "arguments": "{\"pattern\": \"**/*.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c3", "content": "found 50 files matching pattern in workspace including deeply nested modules"}),
-        json!({"role": "user", "content": "Glob again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c4", "function": {"name": "glob", "arguments": "{\"pattern\": \"**/*.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c4", "content": "found 50 files matching pattern in workspace including deeply nested modules"}),
-        // symbols
-        json!({"role": "user", "content": "Symbols"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c5", "function": {"name": "symbols", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c5", "content": "fn main  fn run  struct Config  impl Config  fn parse_args  fn setup_logging"}),
-        json!({"role": "user", "content": "Symbols again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c6", "function": {"name": "symbols", "arguments": "{\"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c6", "content": "fn main  fn run  struct Config  impl Config  fn parse_args  fn setup_logging"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    // Algorithm stubs the EARLIER duplicate, keeps the LATEST intact.
-    // Indices 3, 9, 15 get stubbed; 6, 12, 18 remain as latest.
-    // NOTE: estimated_tokens_freed may be 0 for short content because the
-    // stub prefix `[` triggers the JSON divisor (2) in estimate_str_tokens.
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `src`")
-    );
-    assert!(
-        msgs[9]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `**/*.rs`")
-    );
-    assert!(
-        msgs[15]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `src/main.rs`")
-    );
-}
-
-#[test]
-fn duplicate_read_recognizes_git_action_reads() {
-    // Test git/path tools with semantic dedup keys.
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        // git(action=show)
-        json!({"role": "user", "content": "Show"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"abc123\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "commit abc123 Author: alice Date: 2025-01-01 Fix the widget parsing logic in the parser module"}),
-        json!({"role": "user", "content": "Again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"abc123\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "commit abc123 Author: alice Date: 2025-01-01 Fix the widget parsing logic in the parser module"}),
-        // git(action=diff)
-        json!({"role": "user", "content": "Diff"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c3", "function": {"name": "git", "arguments": "{\"action\": \"diff\", \"base_ref\": \"main\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c3", "content": "diff --git a/src/main.rs b/src/main.rs --- before +++ after @@ removed old code and added new implementation @@"}),
-        json!({"role": "user", "content": "Diff again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c4", "function": {"name": "git", "arguments": "{\"action\": \"diff\", \"base_ref\": \"main\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c4", "content": "diff --git a/src/main.rs b/src/main.rs --- before +++ after @@ removed old code and added new implementation @@"}),
-        // git(action=blame)
-        json!({"role": "user", "content": "Blame"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c5", "function": {"name": "git", "arguments": "{\"action\": \"blame\", \"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c5", "content": "line 1: alice 2025-01-01 initial commit line 2: bob 2025-01-02 added error handling line 3: alice refactor"}),
-        json!({"role": "user", "content": "Blame again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c6", "function": {"name": "git", "arguments": "{\"action\": \"blame\", \"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c6", "content": "line 1: alice 2025-01-01 initial commit line 2: bob 2025-01-02 added error handling line 3: alice refactor"}),
-        // git(action=file_history)
-        json!({"role": "user", "content": "History"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c7", "function": {"name": "git", "arguments": "{\"action\": \"file_history\", \"file\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c7", "content": "3 commits: abc123 fix parsing def456 add tests ghi789 initial implementation of the main entry point"}),
-        json!({"role": "user", "content": "History again"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c8", "function": {"name": "git", "arguments": "{\"action\": \"file_history\", \"file\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c8", "content": "3 commits: abc123 fix parsing def456 add tests ghi789 initial implementation of the main entry point"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    // Algorithm stubs the EARLIER duplicate, keeps the LATEST intact.
-    // Indices 3, 9, 15, 21 get stubbed; 6, 12, 18, 24 remain as latest.
-    // git show/diff are path-less here, so the human-facing stub falls back
-    // to the action label; git blame/file_history show the file path.
-    // NOTE: see comment above about estimated_tokens_freed for short content.
-    assert!(
-        msgs[3]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `git:show`")
-    );
-    assert!(
-        msgs[9]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `git:diff`")
-    );
-    assert!(
-        msgs[15]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `src/main.rs`")
-    );
-    assert!(
-        msgs[21]["content"]
-            .as_str()
-            .unwrap()
-            .contains("[duplicate read of `src/main.rs`")
-    );
-}
-
-#[test]
-fn duplicate_read_does_not_conflate_git_action_show_same_file_different_revision() {
-    let mut msgs = vec![
-        json!({"role": "system", "content": "S"}),
-        json!({"role": "user", "content": "Show commit A"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"aaa111\", \"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c1", "content": "COMMIT_A_CONTENT"}),
-        json!({"role": "user", "content": "Show commit B"}),
-        json!({
-            "role": "assistant", "content": "",
-            "tool_calls": [{"id": "c2", "function": {"name": "git", "arguments": "{\"action\": \"show\", \"revision\": \"bbb222\", \"path\": \"src/main.rs\"}"}}]
-        }),
-        json!({"role": "tool", "tool_call_id": "c2", "content": "COMMIT_B_CONTENT"}),
-    ];
-    let b = budget(80_000, 60_000);
-    let _ = compress_layer_values(&DuplicateReadElimination::new(0.0), &mut msgs, &b);
-    assert_eq!(msgs[3]["content"].as_str(), Some("COMMIT_A_CONTENT"));
-    assert_eq!(msgs[6]["content"].as_str(), Some("COMMIT_B_CONTENT"));
 }
 
 // ── Tiered compaction tests ──────────────────────────────────────────
@@ -1835,37 +1379,25 @@ fn factory_micro_pipeline_only_l1_l2_no_message_dropping() {
 
 #[test]
 fn integration_micro_pipeline_layer_execution_order() {
-    // Create a session with duplicate reads AND old tool results to trigger both layers.
+    // Both transformations must actually save tokens, not merely be eligible.
     let mut msgs = make_agentic_session_msgs(5, 2, 3000);
-    // Add duplicate file reads (triggers L1: DuplicateReadElimination).
-    msgs.push(serde_json::json!({
-        "role": "assistant",
-        "content": "Let me read the file."
-    }));
-    msgs.push(serde_json::json!({
-        "role": "tool",
-        "content": "file content here",
-        "name": "read_file",
-        "tool_call_id": "call_1",
-        "_timestamp": 1000000
-    }));
-    msgs.push(serde_json::json!({
-        "role": "assistant",
-        "content": "Let me read it again."
-    }));
-    msgs.push(serde_json::json!({
-        "role": "tool",
-        "content": "file content here",
-        "name": "read_file",
-        "tool_call_id": "call_2",
-        "_timestamp": 1000001
-    }));
+    for index in 0..2 {
+        msgs.push(json!({
+            "role":"assistant", "content":null,
+            "tool_calls":[{"id":format!("duplicate-{index}"), "type":"function",
+                "function":{"name":"custom", "arguments":"{}"}}]
+        }));
+        msgs.push(json!({
+            "role":"tool", "tool_call_id":format!("duplicate-{index}"),
+            "content":"repeated observation\n".repeat(500), "_timestamp":0,
+        }));
+    }
 
     let budget = budget_with_round(64000, 500000, 5);
     let engine = CompactionEngine::micro_pipeline();
     let outcome = engine.compress_if_needed(&mut msgs, &budget);
 
-    // Verify layers fired in correct order: L1 (duplicate_read_elimination) before L2 (tool_result_truncation).
+    // Verify layers fired in correct order: L1 (duplicate_tool_output_elimination) before L2 (tool_result_truncation).
     let layer_names: Vec<&str> = outcome
         .layer_results
         .iter()
@@ -1880,7 +1412,7 @@ fn integration_micro_pipeline_layer_execution_order() {
         layer_names
     );
     assert_eq!(
-        layer_names[0], "duplicate_read_elimination",
+        layer_names[0], "duplicate_tool_output_elimination",
         "L1 must fire first"
     );
     assert_eq!(
@@ -1979,64 +1511,18 @@ fn fast_path_skips_conversion_when_under_pressure() {
         now_secs: 0,
     };
 
+    let original = msgs.clone();
     let outcome = engine.compress_if_needed(&mut msgs, &budget);
     assert!(outcome.budget_satisfied);
     assert_eq!(outcome.layer_results.len(), 0);
     assert_eq!(outcome.total_tokens_freed, 0);
     // fast path must not modify msgs or convert them
-    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs, original);
 }
 
 // ── Turn index: agentic sessions must use round_index, not idx/2 ──
 // When tools_per_turn > 1, (idx/2) gives wrong turn numbers because
 // there are more than 2 messages per turn.
-
-#[test]
-fn duplicate_elimination_uses_round_index_for_affected_turns() {
-    // Agentic session: 3 tools per turn => 5 messages/turn (user, assistant, 3×tool)
-    let mut msgs: Vec<Value> = vec![json!({"role": "system", "content": "system"})];
-    for t in 0u32..3 {
-        msgs.push(json!({"role": "user", "content": format!("task {}", t), "_round_index": t}));
-        msgs.push(json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{"id": format!("c{}a", t), "type": "function",
-                "function": {"name": "read_file", "arguments": format!(r#"{{"path":"/f{}.rs"}}"#, t)}}]
-        }));
-        for j in 0..3 {
-            msgs.push(json!({
-                "role": "tool",
-                "tool_call_id": format!("c{}a", t),
-                "content": format!("content of turn {} tool {}", t, j),
-                "_round_index": t
-            }));
-        }
-    }
-
-    let engine = CompactionEngine::aggressive_pipeline();
-    let budget = budget(64_000, 60_000);
-    let outcome = engine.compress_if_needed(&mut msgs, &budget);
-
-    // Find the dedup result
-    for (name, result) in &outcome.layer_results {
-        if name == "duplicate_read_elimination" {
-            // All 3 turns read the same file, so turns 0 and 1 should be affected
-            assert!(
-                result.affected_turns.iter().all(|t| *t < 3),
-                "affected_turns must use round_index, got: {:?}",
-                result.affected_turns
-            );
-            // Turn 0: first read → stubbed. Turn 1: duplicate → stubbed.
-            // Turn 2: last read → kept. So affected_turns = [0, 1].
-            assert_eq!(
-                result.affected_turns,
-                vec![0, 1],
-                "expected turns 0 and 1 affected, got {:?}",
-                result.affected_turns
-            );
-        }
-    }
-}
 
 #[test]
 fn tool_truncation_uses_round_index_for_affected_turns() {

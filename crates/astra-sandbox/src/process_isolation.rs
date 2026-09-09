@@ -78,8 +78,19 @@ pub struct IsolationConfig {
     pub timeout: Duration,
     /// Maximum combined stdout/stderr bytes retained in memory.
     pub max_output_bytes: usize,
-    /// Working directory for the subprocess.
+    /// Filesystem authority root mounted as the writable workspace when mount
+    /// isolation is active.
+    pub workspace_root: PathBuf,
+    /// Call-scoped working directory for the subprocess. It must remain within
+    /// `workspace_root` when mount isolation is active.
     pub working_dir: PathBuf,
+    /// Caller-opened handles that pin the authority root and execution identity
+    /// across path renames. Mount isolation admits a pinned working directory
+    /// only when both handles identify the same directory.
+    #[cfg(unix)]
+    pub pinned_workspace_root: Option<std::sync::Arc<std::fs::File>>,
+    #[cfg(unix)]
+    pub pinned_working_dir: Option<std::sync::Arc<std::fs::File>>,
     /// Host-owned paths inside the workspace that remain readable but must
     /// not be writable by the child mount namespace.
     pub read_only_paths: Vec<PathBuf>,
@@ -96,7 +107,12 @@ impl IsolationConfig {
             cpu_quota: 1.0,                        // 1 full core
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            workspace_root: working_dir.clone(),
             working_dir,
+            #[cfg(unix)]
+            pinned_workspace_root: None,
+            #[cfg(unix)]
+            pinned_working_dir: None,
             read_only_paths: Vec::new(),
         }
     }
@@ -111,7 +127,12 @@ impl IsolationConfig {
             cpu_quota: 2.0,                         // 2 cores
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            workspace_root: working_dir.clone(),
             working_dir,
+            #[cfg(unix)]
+            pinned_workspace_root: None,
+            #[cfg(unix)]
+            pinned_working_dir: None,
             read_only_paths: Vec::new(),
         }
     }
@@ -128,7 +149,12 @@ impl IsolationConfig {
             cpu_quota: 2.0,                         // 2 cores
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            workspace_root: working_dir.clone(),
             working_dir,
+            #[cfg(unix)]
+            pinned_workspace_root: None,
+            #[cfg(unix)]
+            pinned_working_dir: None,
             read_only_paths: Vec::new(),
         }
     }
@@ -146,7 +172,12 @@ impl IsolationConfig {
             cpu_quota: 0.0,
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            workspace_root: working_dir.clone(),
             working_dir,
+            #[cfg(unix)]
+            pinned_workspace_root: None,
+            #[cfg(unix)]
+            pinned_working_dir: None,
             read_only_paths,
         }
     }
@@ -1287,7 +1318,12 @@ fn probe_cgroup_parent(parent: &Path) -> bool {
         cpu_quota: 0.0,
         timeout: Duration::from_secs(1),
         max_output_bytes: 0,
+        workspace_root: PathBuf::from("/"),
         working_dir: PathBuf::from("/"),
+        #[cfg(unix)]
+        pinned_workspace_root: None,
+        #[cfg(unix)]
+        pinned_working_dir: None,
         read_only_paths: Vec::new(),
     };
     let Some(cg_path) = create_child_cgroup(parent, &config) else {
@@ -1703,7 +1739,12 @@ pub fn apply_cgroup(memory_limit_bytes: u64, cpu_quota: f64) -> CgroupGuard {
         cpu_quota,
         timeout: Duration::from_secs(0),
         max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+        workspace_root: PathBuf::new(),
         working_dir: PathBuf::new(),
+        #[cfg(unix)]
+        pinned_workspace_root: None,
+        #[cfg(unix)]
+        pinned_working_dir: None,
         read_only_paths: Vec::new(),
     };
     let cg_path = match create_cgroup(&config) {
@@ -1745,7 +1786,12 @@ pub fn apply_process_scope() -> CgroupGuard {
         cpu_quota: 0.0,
         timeout: Duration::from_secs(0),
         max_output_bytes: 0,
+        workspace_root: PathBuf::new(),
         working_dir: PathBuf::new(),
+        #[cfg(unix)]
+        pinned_workspace_root: None,
+        #[cfg(unix)]
+        pinned_working_dir: None,
         read_only_paths: Vec::new(),
     };
     let Some(cg_path) =
@@ -1902,7 +1948,8 @@ async fn drain_stream_pumps_after_exit(
 /// 1. Remounts `/` as private to prevent mount propagation.
 /// 2. Mounts a fresh `/proc` (required by PID namespace).
 /// 3. Mounts `tmpfs` over `/tmp` and `/var/tmp` to block temp-file leaks.
-/// 4. Creates a `tmpfs` at `/workspace` and bind-mounts `working_dir` into it
+/// 4. Creates a private workspace mount from `workspace_root` and changes to
+///    the requested call-scoped `working_dir` inside it
 ///    so tools can read/write their workspace without seeing the host tree.
 ///
 /// Every mount that establishes the write boundary is fatal. A managed tool
@@ -1923,17 +1970,18 @@ mount -t tmpfs -o size=32M,mode=1777 tmpfs /var/tmp
 # writable in unprivileged user namespaces (root-owned on the host).
 # The path comes from argv, not the environment, so callers cannot spoof it.
 # Validate arguments are present
-if [ $# -lt 2 ]; then
-  echo "Error: command and working directory arguments required" >&2
+if [ $# -lt 3 ]; then
+  echo "Error: command, workspace root, and working directory arguments required" >&2
   exit 1
 fi
 user_command=$1
 workspace_root=$2
+workspace_workdir=$3
 mkdir -p /tmp/_astra_ws
 mount --bind -- "$2" /tmp/_astra_ws
 # Each remaining argument is a host-owned lane below the selected workspace.
 # Bind-remount it read-only inside the child view before user code starts.
-shift 2
+shift 3
 for protected in "$@"; do
   case "$protected" in
     "$workspace_root"/*) relative=${protected#"$workspace_root"/} ;;
@@ -1948,7 +1996,7 @@ done
 # workspace bind remain writable mounts; protected workspace submounts do not.
 mount --bind / /
 mount -o remount,bind,ro /
-cd /tmp/_astra_ws
+cd "/tmp/_astra_ws/$workspace_workdir"
 # Root inside the private user namespace was needed only to construct mounts.
 # Drop every capability before executing untrusted code so it cannot remount a
 # protected lane read-write again.
@@ -2117,6 +2165,54 @@ async fn execute_isolated_with_cancel_impl(
     cancel_token: Option<&CancellationToken>,
     supervisor_helper: Option<(PathBuf, Vec<String>)>,
 ) -> IsolatedOutput {
+    let preflight_error = |stderr: String| IsolatedOutput {
+        stdout: String::new(),
+        stderr,
+        exit_code: None,
+        timed_out: false,
+        cancelled: false,
+        execution_started: false,
+        stdout_capped: false,
+        stderr_capped: false,
+        namespace_active: false,
+        cgroup_active: false,
+        scope_settled: false,
+        scope_ownership: None,
+        descendants_terminated: false,
+    };
+    if config.mount_namespace {
+        #[cfg(unix)]
+        let working_dir_is_root = match (
+            config.pinned_workspace_root.as_ref(),
+            config.pinned_working_dir.as_ref(),
+        ) {
+            (Some(root), Some(cwd)) => {
+                use std::os::unix::fs::MetadataExt;
+                match (root.metadata(), cwd.metadata()) {
+                    (Ok(root), Ok(cwd)) => root.dev() == cwd.dev() && root.ino() == cwd.ino(),
+                    _ => false,
+                }
+            }
+            (None, None) => {
+                let root = config.workspace_root.canonicalize();
+                let cwd = config.working_dir.canonicalize();
+                root.as_ref().ok() == cwd.as_ref().ok()
+            }
+            _ => false,
+        };
+        #[cfg(not(unix))]
+        let working_dir_is_root = {
+            let root = config.workspace_root.canonicalize();
+            let cwd = config.working_dir.canonicalize();
+            root.as_ref().ok() == cwd.as_ref().ok()
+        };
+        if !working_dir_is_root {
+            return preflight_error(
+                "Error: call-scoped subdirectory workdir is not supported by the managed mount boundary; no command was run"
+                    .to_string(),
+            );
+        }
+    }
     let wants_ns = config.pid_namespace || config.mount_namespace || config.net_namespace;
     let ns_available = wants_ns && requested_namespaces_available(config);
 
@@ -2147,28 +2243,68 @@ async fn execute_isolated_with_cancel_impl(
             descendants_terminated: false,
         };
     }
-    if config.mount_namespace
-        && config
-            .read_only_paths
-            .iter()
-            .any(|path| path == &config.working_dir || !path.starts_with(&config.working_dir))
-    {
-        return IsolatedOutput {
-            stdout: String::new(),
-            stderr: "Error: managed read-only path escapes the selected workspace".to_string(),
-            exit_code: None,
-            timed_out: false,
-            cancelled: false,
-            execution_started: false,
-            stdout_capped: false,
-            stderr_capped: false,
-            namespace_active: false,
-            cgroup_active: false,
-            scope_settled: false,
-            scope_ownership: None,
-            descendants_terminated: false,
+    let mount_projection = if config.mount_namespace {
+        let workspace_root = match config.workspace_root.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                return preflight_error(format!(
+                    "Error: cannot resolve managed workspace root: {error}"
+                ));
+            }
         };
-    }
+        let working_dir = match config.working_dir.canonicalize() {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                return preflight_error(
+                    "Error: managed working directory is not a directory".to_string(),
+                );
+            }
+            Err(error) => {
+                return preflight_error(format!(
+                    "Error: cannot resolve managed working directory: {error}"
+                ));
+            }
+        };
+        let Ok(relative_workdir) = working_dir.strip_prefix(&workspace_root) else {
+            return preflight_error(
+                "Error: managed working directory escapes the selected workspace".to_string(),
+            );
+        };
+        let Some(relative_workdir) = relative_workdir.to_str() else {
+            return preflight_error(
+                "Error: managed working directory is not valid UTF-8".to_string(),
+            );
+        };
+        let mut read_only_paths = Vec::with_capacity(config.read_only_paths.len());
+        for path in &config.read_only_paths {
+            let resolved = match path.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    return preflight_error(format!(
+                        "Error: cannot resolve managed read-only path '{}': {error}",
+                        path.display()
+                    ));
+                }
+            };
+            if resolved == workspace_root || !resolved.starts_with(&workspace_root) {
+                return preflight_error(
+                    "Error: managed read-only path escapes the selected workspace".to_string(),
+                );
+            }
+            read_only_paths.push(resolved);
+        }
+        Some((
+            workspace_root,
+            if relative_workdir.is_empty() {
+                ".".to_string()
+            } else {
+                relative_workdir.to_string()
+            },
+            read_only_paths,
+        ))
+    } else {
+        None
+    };
 
     // ── Build the command ────────────────────────────────────────────
     let (program, args) = if ns_available {
@@ -2208,13 +2344,16 @@ async fn execute_isolated_with_cancel_impl(
             .map(String::from)
             .collect::<Vec<_>>();
         if config.mount_namespace {
+            let (workspace_root, workspace_workdir, read_only_paths) = mount_projection
+                .as_ref()
+                .expect("mount namespace requires a validated projection");
             args.push(build_mount_namespace_wrapper());
             args.push("astra-mount-wrapper".to_string());
             args.push(command.to_string());
-            args.push(config.working_dir.display().to_string());
+            args.push(workspace_root.display().to_string());
+            args.push(workspace_workdir.clone());
             args.extend(
-                config
-                    .read_only_paths
+                read_only_paths
                     .iter()
                     .map(|path| path.display().to_string()),
             );
@@ -2277,8 +2416,39 @@ async fn execute_isolated_with_cancel_impl(
             }
         }
     };
+    #[cfg(unix)]
+    let pinned_working_dir = config
+        .pinned_working_dir
+        .as_ref()
+        .map(|directory| directory.try_clone())
+        .transpose();
+    #[cfg(unix)]
+    let pinned_working_dir = match pinned_working_dir {
+        Ok(directory) => directory,
+        Err(error) => {
+            return preflight_error(format!(
+                "Error: cannot clone pinned working directory: {error}"
+            ));
+        }
+    };
+    #[cfg(unix)]
+    if let Some(directory) = pinned_working_dir {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            std_cmd.pre_exec(move || {
+                if libc::fchdir(directory.as_raw_fd()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        std_cmd.current_dir(&config.workspace_root);
+    } else {
+        std_cmd.current_dir(&config.working_dir);
+    }
+    #[cfg(not(unix))]
+    std_cmd.current_dir(&config.working_dir);
     std_cmd
-        .current_dir(&config.working_dir)
         .env_clear()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3361,8 +3531,8 @@ mod tests {
             "must bind-mount to /tmp/_astra_ws"
         );
         assert!(
-            script.contains("cd /tmp/_astra_ws"),
-            "must change to workspace dir"
+            script.contains("cd \"/tmp/_astra_ws/$workspace_workdir\""),
+            "must change to the validated call-scoped workspace directory"
         );
         assert!(
             script.contains("setpriv --bounding-set=-all"),
@@ -3507,6 +3677,65 @@ mod tests {
         assert_eq!(
             std::fs::read(protected.join("owned.txt")).unwrap(),
             b"host-owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_boundary_rejects_unpinned_nested_workdir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(workspace.path().join("sibling.txt"), b"sibling").unwrap();
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let mut config =
+            IsolationConfig::filesystem_boundary(workspace.path().to_path_buf(), Vec::new());
+        config.working_dir = nested;
+
+        let output = execute_isolated("pwd; cat ../sibling.txt", &env, &config).await;
+
+        assert!(!output.execution_started, "{output:?}");
+        assert!(
+            output
+                .stderr
+                .contains("not supported by the managed mount boundary"),
+            "{output:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_boundary_does_not_upgrade_retargeted_pinned_subdirectory_to_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        let retained = workspace.path().join("retained");
+        std::fs::create_dir(&nested).unwrap();
+        let root_handle = std::sync::Arc::new(std::fs::File::open(workspace.path()).unwrap());
+        let nested_handle = std::sync::Arc::new(std::fs::File::open(&nested).unwrap());
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let mut config =
+            IsolationConfig::filesystem_boundary(workspace.path().to_path_buf(), Vec::new());
+        config.working_dir = nested.clone();
+        config.pinned_workspace_root = Some(root_handle);
+        config.pinned_working_dir = Some(nested_handle);
+
+        std::fs::rename(&nested, &retained).unwrap();
+        std::os::unix::fs::symlink(workspace.path(), &nested).unwrap();
+        assert_eq!(
+            config.workspace_root.canonicalize().unwrap(),
+            config.working_dir.canonicalize().unwrap(),
+            "the regression requires the mutable path check to appear root-equivalent"
+        );
+
+        let output = execute_isolated("pwd", &env, &config).await;
+
+        assert!(!output.execution_started, "{output:?}");
+        assert!(
+            output
+                .stderr
+                .contains("not supported by the managed mount boundary"),
+            "{output:?}"
         );
     }
 

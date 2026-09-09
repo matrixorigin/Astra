@@ -80,6 +80,7 @@ use crate::server::tool_route_runtime::{
     ToolRouteRuntimeContext, emit_tool_route_completion_events,
     execute_tool_route_before_completion_events,
 };
+use crate::server::tool_route_selection::{ToolExecutionClass, tool_execution_class};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -92,8 +93,8 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED, TOOL_ERROR_KIND_CAPABILITY_DENIED,
     TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TOOL_TIMEOUT,
     TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
-    ToolExecutionRequest, ToolExecutionService, ToolPolicySnapshot, WorkspaceAuthority,
-    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
+    ToolExecutionRequest, ToolExecutionService, ToolPolicySnapshot, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filtered_server_tool_schemas_with_context,
 };
 use crate::server::tool_work_surface_events::{WorkSurfaceEventEmitter, binding_snapshot_events};
@@ -540,6 +541,20 @@ async fn acquire_server_workspace_authority(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum WorkEstablishmentInvocation {
+    Establish { operation_id: String },
+    DeferPending { operation_id: String },
+}
+
+impl WorkEstablishmentInvocation {
+    pub(super) fn operation_id(&self) -> &str {
+        match self {
+            Self::Establish { operation_id } | Self::DeferPending { operation_id } => operation_id,
+        }
+    }
+}
+
 pub struct RuntimeToolExecutor {
     // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
@@ -564,6 +579,11 @@ pub struct RuntimeToolExecutor {
     /// prose or task names.
     work_item_attempt_bound: bool,
     active_primary_work_attempt: Arc<std::sync::RwLock<Option<ActivePrimaryWorkAttempt>>>,
+    /// Trusted physical-call to durable Work-establishment identity. This is
+    /// internal provenance installed by the loop host; provider arguments and
+    /// call-id text cannot select an operation.
+    work_establishment_invocations:
+        Arc<std::sync::RwLock<HashMap<String, WorkEstablishmentInvocation>>>,
     /// Budget-adaptive introspection snapshot, updated each turn by the
     /// execution phase. The `introspect` tool reads this to return runtime
     /// state without coupling to AgenticLoopState.
@@ -670,9 +690,6 @@ pub struct RuntimeToolExecutor {
     /// source cannot authorize reuse; it only supplies facts for an already
     /// trusted freshness-bound provider policy.
     semantic_read_freshness_source: Option<Arc<dyn ProviderSemanticFreshnessSource>>,
-    /// Deferred tool names whose full schema has been fetched via
-    /// `tool_search(query="select:NAME")` in this session.
-    activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Tool names searchable/admissible in the current server-host turn.
     /// `None` keeps direct unit-test executor calls permissive.
     current_searchable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
@@ -686,6 +703,24 @@ pub struct RuntimeToolExecutor {
     /// from `ToolSurface::deferred()` per turn so the validator can emit the
     /// activation hint and `tool_search` can resolve `select:NAME` for these.
     current_activatable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
+    /// Capability-scoped schemas owned by the currently bound edge provider.
+    /// These are control-plane contracts for deferred discovery and typed
+    /// routing; they are never copied into the resident model `tools[]`
+    /// surface.
+    current_edge_provider_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Capability- and readiness-filtered deferred contracts for the current
+    /// host turn. Keeping this projection separate from the resident/search
+    /// names prevents tool_search from falling back to a stale full registry
+    /// schema after the host has narrowed a typed action contract.
+    current_deferred_tool_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Discovery contracts for the current host turn. This projection is
+    /// intentionally policy-neutral with respect to action branches whose
+    /// admission is decided after the provider response (for example a
+    /// topology-dependent fanout start). It is the exact catalog used by
+    /// `tool_search` and by deferred-carrier digest admission; otherwise a
+    /// same-turn topology decision could change the search schema between
+    /// selection and invocation and create a retry storm.
+    current_discovery_deferred_tool_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Shared dynamic-agent tool context for `agent(action='spawn'|'get_result')`.
     agent_tool_context: Option<AgentToolContext>,
     /// When enabled, server-local execution rejects names outside the current
@@ -793,6 +828,7 @@ impl RuntimeToolExecutor {
             work_binding: std::sync::OnceLock::new(),
             work_item_attempt_bound: false,
             active_primary_work_attempt: Arc::new(std::sync::RwLock::new(None)),
+            work_establishment_invocations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
@@ -800,10 +836,12 @@ impl RuntimeToolExecutor {
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
             semantic_read_freshness_source: None,
-            activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
+            current_edge_provider_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            current_deferred_tool_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            current_discovery_deferred_tool_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
             agent_binding_mcp: None,
             agent_tool_context: None,
@@ -1155,6 +1193,80 @@ impl RuntimeToolExecutor {
         *guard = Some(names);
     }
 
+    /// Install the exact edge-owned provider contracts for this host turn.
+    ///
+    /// The host has already validated these schemas against the edge profile
+    /// and runtime binding. The executor keeps a private copy so deferred
+    /// discovery and typed execution can use the same contract without
+    /// widening the prompt-visible resident surface.
+    pub fn set_current_edge_provider_schemas(&self, schemas: &[Value]) {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut by_name = std::collections::BTreeMap::<String, Value>::new();
+        let mut conflicts = HashSet::new();
+        for schema in schemas {
+            let Some(name) = tool_schema_name(schema) else {
+                continue;
+            };
+            // A client may carry the process-wide deferred manifest back to
+            // the server, including canonical control-plane/service names.
+            // Those names are not edge-owned contracts: keeping the client
+            // projection beside the server projection would create a
+            // same-name schema conflict and remove both from discovery. The
+            // server catalog is the route owner for these classes; retain
+            // only genuinely edge/dynamic contracts in this lane.
+            if matches!(
+                tool_execution_class(name, &registry),
+                ToolExecutionClass::ServerControlPlane | ToolExecutionClass::ServerService
+            ) {
+                continue;
+            }
+            match by_name.get(name) {
+                Some(existing) if existing != schema => {
+                    conflicts.insert(name.to_string());
+                }
+                Some(_) => {}
+                None => {
+                    by_name.insert(name.to_string(), schema.clone());
+                }
+            }
+        }
+        for name in conflicts {
+            by_name.remove(&name);
+        }
+        let mut schemas = by_name.into_values().collect::<Vec<_>>();
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_edge_provider_schemas,
+            "current_edge_provider_schemas",
+        );
+        *guard = schemas;
+    }
+
+    /// Install the host's current deferred contract projection. This is a
+    /// private discovery/execution catalog, not a provider-visible schema
+    /// surface; it may contain action branches narrowed by current typed
+    /// admission and must therefore outrank the process-wide registry copy.
+    pub fn set_current_deferred_tool_schemas(&self, schemas: &[Value]) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_deferred_tool_schemas,
+            "current_deferred_tool_schemas",
+        );
+        *guard = schemas.to_vec();
+    }
+
+    /// Install the policy-neutral deferred discovery catalog for this host
+    /// turn. Unlike the execution projection, this catalog must remain stable
+    /// when a same-turn semantic decision changes only action admission. The
+    /// selected compact contract and later carrier validation both read this
+    /// exact projection.
+    pub fn set_current_discovery_deferred_tool_schemas(&self, schemas: &[Value]) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_discovery_deferred_tool_schemas,
+            "current_discovery_deferred_tool_schemas",
+        );
+        *guard = schemas.to_vec();
+    }
+
     pub fn set_current_selected_tool_offers(
         &self,
         offers: HashMap<String, SelectedToolOfferSnapshot>,
@@ -1204,112 +1316,59 @@ impl RuntimeToolExecutor {
     }
 
     pub(super) fn current_tool_search_pool_schemas(&self) -> Vec<Value> {
-        let mut pool = self.capability_filtered_server_tool_schemas();
+        // Older direct executor callers install only the execution projection;
+        // use it as a narrow fallback. The server host always installs both
+        // projections before a live turn, so production discovery remains
+        // tied to the policy-neutral catalog above.
+        let mut scoped_deferred = self.current_discovery_deferred_tool_schemas_snapshot();
+        if scoped_deferred.is_empty() {
+            scoped_deferred = self.current_deferred_tool_schemas_snapshot();
+        }
+        let mut pool =
+            if self.current_searchable_tool_names().is_some() && !scoped_deferred.is_empty() {
+                scoped_deferred.clone()
+            } else {
+                self.capability_filtered_server_tool_schemas()
+            };
         let activatable = self.current_activatable_tool_names_snapshot();
         if !activatable.is_empty() {
-            let mut activatable_pool = self.capability_filtered_server_tool_schemas();
+            let mut activatable_pool = if !scoped_deferred.is_empty() {
+                scoped_deferred.clone()
+            } else {
+                self.capability_filtered_server_tool_schemas()
+            };
             retain_tool_schemas_by_names(&mut activatable_pool, &activatable);
             activatable_pool.retain(|schema| {
                 tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
             });
             pool.extend(activatable_pool);
         }
+        // Edge-owned contracts enter discovery only after the host has
+        // installed the current wire surface. The final name filter below
+        // still requires either a resident schema or a manifest activation.
+        if self.current_searchable_tool_names().is_some() {
+            pool.extend(self.current_edge_provider_schemas_snapshot());
+        }
         pool.extend(self.ready_request_scoped_mcp_schemas());
         remove_prompt_schema_conflicts(&mut pool);
         dedupe_tool_schema_pool(&mut pool);
 
+        // The private discovery pool is still an executable contract. Do not
+        // let a dynamic schema appear merely because it was copied into the
+        // control-plane profile: EdgeWs has no descriptor-aware execution
+        // path for unknown names, while EdgeLedger does. Built-ins continue
+        // through the normal readiness/admission checks below.
+        pool.retain(|schema| {
+            tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
+        });
+
         let Some(mut searchable_names) = self.current_searchable_tool_names() else {
             return pool;
         };
-        searchable_names.extend(self.current_activatable_tool_names_snapshot());
+        let activatable_names = self.current_activatable_tool_names_snapshot();
+        searchable_names.extend(activatable_names.clone());
         retain_tool_schemas_by_names(&mut pool, &searchable_names);
         pool
-    }
-
-    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let allowed = self.current_activatable_tool_names_state();
-
-        // Use zero-clone filter path to avoid cloning the entire HashSet
-        let mut result = Vec::new();
-        match self.activated_deferred_tools.read() {
-            Ok(guard) => {
-                for name in guard.iter() {
-                    if allowed
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(name))
-                    {
-                        result.push(name.clone());
-                    }
-                }
-            }
-            Err(poisoned) => {
-                tracing::error!(
-                    cache = "activated_deferred_tools",
-                    "RwLock poisoned on read; resetting cached state to default"
-                );
-                drop(poisoned);
-                // Clear poison BEFORE acquiring write lock — if write() panics
-                // (e.g. during reset), the flag would otherwise remain stuck.
-                self.activated_deferred_tools.clear_poison();
-                let mut guard = match self.activated_deferred_tools.write() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                *guard = HashSet::new();
-            }
-        }
-        result.sort();
-        result
-    }
-
-    pub fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_restore",
-        );
-        guard.clear();
-        guard.extend(
-            names
-                .iter()
-                .map(|name| name.trim())
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned),
-        );
-    }
-
-    fn record_tool_search_activation_output(&self, output: &str) {
-        let names =
-            astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output(
-                output,
-            );
-        if names.is_empty() {
-            return;
-        }
-        // Gate activation recording against the activatable set (deferred
-        // manifest), not the searchable set (visible). The model was told it
-        // could activate these names via `<deferred_tools>`; mirroring the
-        // CLI's `tool_admission_denial` contract. `None` (not yet configured)
-        // means no restriction — symmetric with the CLI executor.
-        let allowed: Option<HashSet<String>> = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_activation",
-        );
-        let names: Vec<String> = names
-            .into_iter()
-            .filter(|name| {
-                allowed
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.contains(name))
-            })
-            .collect();
-        if names.is_empty() {
-            return;
-        }
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools",
-        );
-        guard.extend(names);
     }
 
     pub(crate) fn request_scoped_mcp_schemas_snapshot(&self, label: &str) -> Vec<Value> {
@@ -1344,31 +1403,6 @@ impl RuntimeToolExecutor {
             .collect::<Vec<_>>();
         astra_core::tool_schema::sort_tool_schemas_by_name(&mut ready);
         ready
-    }
-
-    /// Record a direct deferred call as an activation intent. Called when the
-    /// model invokes a deferred tool directly before its schema is visible; the
-    /// next turn can then surface the full schema instead of executing untrusted
-    /// arguments.
-    pub(crate) fn record_direct_deferred_call_activation(&self, name: &str) {
-        if name.is_empty() {
-            return;
-        }
-        let allowed = self.current_activatable_tool_names_state();
-        if allowed
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(name))
-        {
-            return;
-        }
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools",
-        );
-        astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(
-            &mut guard,
-            [name.to_string()],
-        );
     }
 
     async fn execute_mcp_tool(
@@ -1545,14 +1579,37 @@ impl RuntimeToolExecutor {
         run_id: &str,
         authorized_owner_generation: u64,
     ) -> Result<bool, String> {
+        macro_rules! deny {
+            ($reason:literal) => {{
+                tracing::debug!(
+                    target: "astra_runtime::work",
+                    reason = $reason,
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    owner_generation = authorized_owner_generation,
+                    "canonical Work final synthesis denied"
+                );
+                return Ok(false);
+            }};
+        }
         let Some(binding) = self.work_binding.get() else {
-            return Ok(false);
+            deny!("missing_binding");
         };
         if self.has_active_primary_work_attempt() {
+            tracing::debug!(
+                target: "astra_runtime::work",
+                active_attempt = ?self.active_primary_work_attempt(),
+                user_id = %user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                owner_generation = authorized_owner_generation,
+                "canonical Work final synthesis denied: active primary attempt"
+            );
             return Ok(false);
         }
         if binding.owner_id.as_str() != user_id || binding.session_id.as_str() != session_id {
-            return Ok(false);
+            deny!("binding_identity_mismatch");
         }
         let snapshot = binding
             .repository
@@ -1562,13 +1619,13 @@ impl RuntimeToolExecutor {
         if snapshot.basis().work_id != binding.work_id
             || snapshot.basis().branch_id != binding.branch_id
         {
-            return Ok(false);
+            deny!("binding_snapshot_mismatch");
         }
 
         let Some(control_epoch) =
             snapshot.final_synthesis_control_epoch(run_id, authorized_owner_generation)
         else {
-            return Ok(false);
+            deny!("missing_terminal_cut");
         };
         let Some(pool) = self.context_manifest_pool.as_ref() else {
             return Err("durable Run store is unavailable for final Work synthesis".to_string());
@@ -1592,7 +1649,10 @@ impl RuntimeToolExecutor {
         .map_err(|error| {
             format!("could not revalidate newer user intent for final Work synthesis: {error}")
         })?;
-        Ok(newer_user_intent.is_none())
+        if newer_user_intent.is_some() {
+            deny!("newer_user_intent");
+        }
+        Ok(true)
     }
 
     /// Mark this executor as the terminal executor for a durable WorkItem.
@@ -1611,6 +1671,66 @@ impl RuntimeToolExecutor {
 
     pub(super) fn active_primary_work_attempt(&self) -> Option<ActivePrimaryWorkAttempt> {
         self.active_primary_work_attempt.read().ok()?.clone()
+    }
+
+    pub(super) fn bind_work_establishment_operation(
+        &self,
+        tool_call_id: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        self.bind_work_establishment_invocation(
+            tool_call_id,
+            WorkEstablishmentInvocation::Establish {
+                operation_id: operation_id.to_string(),
+            },
+        )
+    }
+
+    pub(super) fn bind_work_establishment_defer(
+        &self,
+        tool_call_id: &str,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        self.bind_work_establishment_invocation(
+            tool_call_id,
+            WorkEstablishmentInvocation::DeferPending {
+                operation_id: operation_id.to_string(),
+            },
+        )
+    }
+
+    fn bind_work_establishment_invocation(
+        &self,
+        tool_call_id: &str,
+        invocation: WorkEstablishmentInvocation,
+    ) -> Result<(), String> {
+        let operation_id = invocation.operation_id();
+        if tool_call_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err("Work establishment provenance requires complete identities".to_string());
+        }
+        let mut bindings = self
+            .work_establishment_invocations
+            .write()
+            .map_err(|_| "Work establishment provenance is unavailable".to_string())?;
+        match bindings.get(tool_call_id) {
+            Some(existing) if existing == &invocation => Ok(()),
+            Some(_) => Err("physical tool call is bound to another Work operation".to_string()),
+            None => {
+                bindings.insert(tool_call_id.to_string(), invocation);
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn work_establishment_invocation(
+        &self,
+        tool_call_id: &str,
+    ) -> Option<WorkEstablishmentInvocation> {
+        self.work_establishment_invocations
+            .read()
+            .ok()?
+            .get(tool_call_id)
+            .cloned()
     }
 
     pub(super) async fn transition_active_primary_work_attempt_carrier(
@@ -1706,7 +1826,57 @@ impl RuntimeToolExecutor {
                 .iter()
                 .filter_map(|schema| tool_schema_name(schema).map(str::to_string)),
         );
+        if self.current_edge_provider_binding() {
+            names.extend(
+                self.current_edge_provider_schemas_snapshot()
+                    .iter()
+                    .filter_map(|schema| tool_schema_name(schema).map(str::to_string)),
+            );
+        }
         names
+    }
+
+    fn current_edge_provider_schemas_snapshot(&self) -> Vec<Value> {
+        rwlock_read_clone_or_default(
+            &self.current_edge_provider_schemas,
+            "current_edge_provider_schemas",
+        )
+    }
+
+    fn current_deferred_tool_schemas_snapshot(&self) -> Vec<Value> {
+        rwlock_read_clone_or_default(
+            &self.current_deferred_tool_schemas,
+            "current_deferred_tool_schemas",
+        )
+    }
+
+    fn current_discovery_deferred_tool_schemas_snapshot(&self) -> Vec<Value> {
+        rwlock_read_clone_or_default(
+            &self.current_discovery_deferred_tool_schemas,
+            "current_discovery_deferred_tool_schemas",
+        )
+    }
+
+    fn current_edge_provider_schema_contains(&self, name: &str) -> bool {
+        self.current_edge_provider_schemas_snapshot()
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some(name))
+    }
+
+    fn current_edge_provider_binding(&self) -> bool {
+        matches!(
+            self.execution_binding.workspace().kind,
+            WorkspaceBindingKind::EdgeWorkspace
+        ) && matches!(
+            self.execution_binding.executor().kind,
+            ExecutorBindingKind::EdgeAgent
+        ) && matches!(
+            self.execution_binding.executor().status,
+            ExecutorStatus::Online | ExecutorStatus::Degraded
+        ) && matches!(
+            self.execution_binding.executor().transport,
+            ToolTransportKind::EdgeWs | ToolTransportKind::EdgeLedger
+        )
     }
 
     pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
@@ -1733,6 +1903,29 @@ impl RuntimeToolExecutor {
     }
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
+        if self.current_edge_provider_binding() && self.current_edge_provider_schema_contains(name)
+        {
+            // The websocket handshake still advertises and authorizes only
+            // registry-owned tools. Unknown provider contracts are executable
+            // only through the authenticated callback ledger, where the
+            // provider descriptor and full schema are carried by the host.
+            if astra_runtime_env::ToolRegistry::builtins()
+                .get(name)
+                .is_none()
+                && !matches!(
+                    self.execution_binding.executor().transport,
+                    ToolTransportKind::EdgeLedger
+                )
+            {
+                return ExecutorToolReadiness::UnknownTool;
+            }
+            tracing::debug!(
+                tool_name = %name,
+                "edge_tool_schema: typed edge provider contract → Ready"
+            );
+            return ExecutorToolReadiness::Ready;
+        }
+
         if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             if let Some(denial) = self.request_scoped_mcp_admission_policy_denial(name) {
                 return ExecutorToolReadiness::RuntimeEnvironmentDenied(denial);
@@ -2555,10 +2748,12 @@ impl RuntimeToolExecutor {
                         context,
                     );
                 return decision.selected_offer.map(|offer| {
-                    SelectedToolOfferSnapshot::new_with_route(
+                    SelectedToolOfferSnapshot::new_with_route_digest_and_native(
                         offer.tool_name,
                         offer.provider_id,
                         offer.route,
+                        Some(offer.schema_digest),
+                        offer.native_tool_id,
                     )
                 });
             }
@@ -2725,11 +2920,15 @@ impl RuntimeToolExecutor {
         let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
-        self.execute_request_before_governance(
+        // This path owns the full durable admission/route state machine. Keep
+        // that large future out of the caller future's inline state: server
+        // SSE runs on a bounded Tokio worker stack, and embedding all route
+        // branches there can overflow before the first await is polled.
+        Box::pin(self.execute_request_before_governance(
             request,
             self.cancel_token.clone(),
             durable_dispatch_admission,
-        )
+        ))
         .await
     }
 
@@ -2787,9 +2986,9 @@ impl RuntimeToolExecutor {
         let effective_cancel_token = cancel_token
             .map(|token| Arc::new(token.clone()))
             .or_else(|| self.cancel_token.clone());
-        let deferred = self
-            .execute_request_before_governance(request, effective_cancel_token, None)
-            .await;
+        let deferred =
+            Box::pin(self.execute_request_before_governance(request, effective_cancel_token, None))
+                .await;
         let governed = govern_runtime_tool_result(deferred.result, false);
         self.finish_governed_tool_result(governed, deferred.pending)
             .await
@@ -2824,6 +3023,16 @@ impl RuntimeToolExecutor {
                 self.tool_execution_service
                     .cancelled_before_route_result(&request),
             );
+        }
+
+        // Argument validation is part of the provider admission boundary,
+        // not a handler convenience.  It must happen before an approval wait,
+        // durable invocation prepare, or provider dispatch so a malformed
+        // dynamic call cannot acquire execution custody.  Builtins use the
+        // canonical registry schema; dynamic calls use the exact schema
+        // carried by the current authenticated provider/deferred contract.
+        if let Some(result) = self.validate_request_arguments(&request) {
+            return GovernableRuntimeToolResult::completed(result);
         }
 
         request.policy.admission_snapshot = Some(
@@ -3158,6 +3367,52 @@ impl RuntimeToolExecutor {
             }),
             dispatch_control: RuntimeToolDispatchControl::Continue,
         }
+    }
+
+    fn validate_request_arguments(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<astra_tools::ToolResult> {
+        // Transport metadata is attached to the request carrier so durable
+        // identity and work-surface tracing can survive every route.  It is
+        // not part of the model/provider argument object, however, and must
+        // not make a closed provider schema reject an otherwise valid call.
+        // Keep this normalization typed and centralized: arbitrary
+        // underscore-prefixed fields remain provider input and are still
+        // validated by the schema.
+        let public_arguments = astra_turn_types::canonical_public_tool_arguments(&request.args);
+        let validation = if astra_runtime_env::ToolRegistry::builtins()
+            .get(&request.tool_name)
+            .is_some()
+        {
+            astra_tools::schemas::validate_tool_arguments(&request.tool_name, &public_arguments)
+        } else {
+            self.current_edge_provider_schemas_snapshot()
+                .into_iter()
+                .chain(self.current_deferred_tool_schemas_snapshot())
+                .find(|schema| tool_schema_name(schema) == Some(request.tool_name.as_str()))
+                .map_or(Ok(()), |schema| {
+                    astra_tools::schemas::validate_tool_arguments_against_schema(
+                        &request.tool_name,
+                        &public_arguments,
+                        &schema,
+                    )
+                })
+        };
+        validation.err().map(|error| {
+            let mut result = error.into_tool_result();
+            // Preflight must remain side-effect free, but an invalid call is
+            // still a completed route decision from the caller's point of
+            // view. Preserve the same binding metadata that a handler error
+            // would carry without emitting transport lifecycle events or
+            // acquiring durable dispatch custody.
+            let route = self.tool_execution_service.routing_decision(request);
+            let boundary =
+                crate::server::tool_route_boundary::ToolRouteBoundary::new(request.clone(), route);
+            boundary
+                .attach_binding_metadata(&mut result, self.tool_execution_service.tool_registry());
+            result
+        })
     }
 
     pub(crate) async fn finish_governed_tool_result(
@@ -3805,11 +4060,7 @@ impl RuntimeToolExecutor {
         // guards. Release before asynchronous lifecycle persistence so an
         // unrelated caller is not held behind database or UI latency.
         drop(workspace_authority);
-        let result = lifecycle.finish(name, &call_id, result).await;
-        if name == "tool_search" && !result.is_error {
-            self.record_tool_search_activation_output(&result.output);
-        }
-        result
+        lifecycle.finish(name, &call_id, result).await
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
@@ -4488,6 +4739,65 @@ mod tests {
                 .and_then(Value::as_str),
             Some("invalid_arguments"),
             "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_provider_arguments_fail_before_durable_admission() {
+        use crate::server::tool_execution_binding::{
+            ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+        };
+
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "CLI workspace",
+                dir.path().display().to_string(),
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-process-42",
+                "CLI workspace",
+                ToolTransportKind::EdgeLedger,
+                ExecutorStatus::Online,
+            ),
+        );
+        exec.set_current_edge_provider_schemas(&[json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather__forecast",
+                "description": "Get a forecast",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })]);
+        let grant = ToolPermissionGrantSnapshot {
+            source: ToolPermissionGrantSource::ImplicitPolicy,
+            reason: None,
+            updates_hash: None,
+        };
+
+        let outcome = exec
+            .execute_invocation_before_governance(
+                "run-invalid-provider",
+                "turn-invalid-provider",
+                "call-invalid-provider",
+                "mcp__weather__forecast",
+                &json!({"city": 42}),
+                None,
+                Some(&grant),
+                None,
+            )
+            .await;
+
+        assert_tool_invalid_args(&outcome.result);
+        assert!(outcome.pending.is_none());
+        assert_eq!(
+            outcome.dispatch_control,
+            RuntimeToolDispatchControl::Continue
         );
     }
 
@@ -5843,6 +6153,15 @@ mod tests {
         if request.tool_call_id.is_empty() {
             request.tool_call_id = "test-call".to_string();
         }
+        request.selected_offer = Some(
+            crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+                &request.tool_name,
+                "binding-a",
+                crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp,
+                Some("descriptor-v1".to_string()),
+                "native-read",
+            ),
+        );
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             &request.user_id,
             &request.session_id,
@@ -6714,24 +7033,24 @@ mod tests {
         )
         .expect("runtime owner and session resolve to a private artifact directory");
         let content = "server-owned evidence 😀\n".repeat(3_000);
-        assert!(
-            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
-                &session_dir,
-                "call-server-artifact",
-                "git",
-                &content,
-            )
-            .is_some(),
-            "setup must persist a recoverable result in the runtime owner's session"
-        );
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            &session_dir,
+            "run-server-artifact",
+            "call-server-artifact",
+            "git",
+            &content,
+        )
+        .expect("setup must persist a recoverable result in the runtime owner's session");
+        let artifact =
+            astra_turn_core::tool_result_storage::session_tool_result_artifact_uri_for_descriptor(
+                &persisted.descriptor,
+            );
 
         let result = exec
             .execute_with_metadata(
                 "introspect",
                 &json!({
-                    "artifact": astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
-                        "call-server-artifact"
-                    ),
+                    "artifact": artifact,
                     "max_bytes": 31,
                 }),
             )
@@ -9726,38 +10045,6 @@ esac
             matched_names.iter().any(|n| n == "agent_fanout"),
             "deferred name from the activatable set must resolve through tool_search; got: {}",
             result.output
-        );
-        // Activation must be recorded against the activatable (deferred manifest)
-        // set, not the visible set.
-        let activated = exec.activated_deferred_tool_names();
-        assert!(
-            activated.contains(&"agent_fanout".to_string()),
-            "activated_deferred_tool_names must include agent_fanout after select: activation; got: {:?}",
-            activated
-        );
-    }
-
-    #[test]
-    fn restored_activation_is_deterministic_and_filtered_by_current_surface() {
-        let (exec, _dir) = test_executor_with_agent_context();
-        exec.restore_activated_deferred_tool_names_for_session(&[
-            "web_fetch".to_string(),
-            " agent_fanout ".to_string(),
-            "agent_fanout".to_string(),
-            String::new(),
-        ]);
-        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
-
-        assert_eq!(
-            exec.activated_deferred_tool_names(),
-            vec!["agent_fanout"],
-            "restored prompt facts must be deduplicated and intersected with the live surface"
-        );
-
-        exec.set_current_activatable_tool_names(HashSet::new());
-        assert!(
-            exec.activated_deferred_tool_names().is_empty(),
-            "an explicitly empty installed surface must fail closed rather than act like an uninstalled surface"
         );
     }
 

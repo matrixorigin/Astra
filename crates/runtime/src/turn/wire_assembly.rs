@@ -47,6 +47,29 @@ fn structured_runtime_instruction(message: &Value) -> Option<(String, Value)> {
     let kind = message.get(RUNTIME_VOLATILE_KIND_MARKER)?.as_str()?;
     RuntimeAuthorityKind::instruction_field_for_wire_kind(kind)?;
     let content = message.get("content")?.as_str()?;
+
+    // Before the structured-facts projection was introduced, instruction
+    // injections were persisted as a `<runtime-instruction>` envelope whose
+    // `instruction` value contained the entire producer payload.  Decode
+    // that trusted, typed envelope as well so a provider switch/rehome cannot
+    // silently downgrade an unconsumed authority frame to ordinary context.
+    if let Some(envelope) = content
+        .strip_prefix("<runtime-instruction>\n")
+        .and_then(|content| content.strip_suffix("\n</runtime-instruction>"))
+    {
+        let mut payload: Value = serde_json::from_str(envelope).ok()?;
+        if payload.get("kind")?.as_str()? != kind {
+            return None;
+        }
+        let mut instruction_payload = payload.get_mut("instruction")?.take();
+        if let Value::String(encoded) = instruction_payload {
+            instruction_payload = serde_json::from_str(&encoded).ok()?;
+        }
+        let facts = instruction_payload.as_object_mut()?;
+        let instruction = facts.remove("instruction")?.as_str()?.to_owned();
+        return Some((instruction, Value::Object(facts.clone())));
+    }
+
     // RuntimeVolatileInjection envelopes are also stored inside durable frames.
     // Decode their typed context before splitting authority, including the
     // JSON-string payload used by Work retry. Never infer kind from prompt text.
@@ -118,9 +141,20 @@ const RUNTIME_AUTHORITY_CURRENT_USER_TURN: &str = "current_user_turn";
 const RUNTIME_AUTHORITY_NEXT_DECISION: &str = "next_assistant_decision";
 const INVOKED_SKILLS_CONTEXT_KIND_PREFIX: &str = "invoked_skill_context";
 const COMPACTION_CONTINUATION_KIND: &str = "compaction_continuation";
-const TURN_FOCUS_POLICY: &str = r#"<runtime-focus-policy>
-{"schema":"active_turn_focus_policy.v1","instruction":"Answer the latest user message first. Resolve a short, elliptical, or deictic follow-up from the immediately preceding user-assistant exchange by default. Use older conversation only when the latest user message explicitly broadens the scope. Canonical conversation messages contain the exact current and prior text; do not treat older history, memory, or tool output as a competing request."}
-</runtime-focus-policy>"#;
+const ACTIVE_TURN_FOCUS_INSTRUCTION: &str = "Answer the latest user message first. Resolve a short, elliptical, or deictic follow-up from the immediately preceding user-assistant exchange by default. Use older conversation only when the latest user message explicitly broadens the scope. Canonical conversation messages contain the exact current and prior text; do not treat older history, memory, or tool output as a competing request. New facts are current context: bare ‘remember’/‘confirm’ means acknowledge directly, not recall or verify. Historical subject matter alone does not change this. Do not search memory or append a disclaimer about records, recall, verification, or persistence unless explicitly requested.";
+pub(crate) fn active_turn_focus_policy() -> Value {
+    serde_json::json!({
+        "schema": "active_turn_focus_policy.v1",
+        "instruction": ACTIVE_TURN_FOCUS_INSTRUCTION
+    })
+}
+
+fn focus_policy_text() -> String {
+    format!(
+        "<runtime-focus-policy>\n{}\n</runtime-focus-policy>",
+        active_turn_focus_policy()
+    )
+}
 #[cfg(test)]
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
 #[cfg(test)]
@@ -195,8 +229,12 @@ pub(crate) fn observe_context_compaction(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireBudgetStatus {
     pub estimated_input_tokens: usize,
-    pub estimated_tool_schema_tokens: usize,
-    pub admission_estimated_input_tokens: usize,
+    /// Token cost of provider-visible system messages, including their
+    /// per-message framing. This is the prompt overhead that can be reused
+    /// when the next pressure estimate is based on canonical history.
+    pub estimated_system_tokens: usize,
+    /// Token cost of the provider-visible tool schemas used for this request.
+    pub tool_schema_tokens: usize,
     pub requested_output_tokens: usize,
     pub reserved_protocol_tokens: usize,
     pub effective_input_limit: usize,
@@ -229,6 +267,8 @@ impl WireBudgetStatus {
     pub fn to_json(self) -> Value {
         serde_json::json!({
             "estimated_input_tokens": self.estimated_input_tokens,
+            "estimated_system_tokens": self.estimated_system_tokens,
+            "tool_schema_tokens": self.tool_schema_tokens,
             "requested_output_tokens": self.requested_output_tokens,
             "reserved_protocol_tokens": self.reserved_protocol_tokens,
             "effective_input_limit": self.effective_input_limit,
@@ -262,41 +302,13 @@ pub(crate) fn wire_budget_status_with_metadata(
         .iter()
         .map(crate::prompts::estimate_json_value_tokens)
         .sum();
-    let estimated_input_tokens =
-        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens).total_tokens;
-    // Preserve the historical provider-admission estimate exactly while
-    // reusing the message measurement above. Tool schema accounting used a
-    // whole-list serialization, whereas the wire budget intentionally walks
-    // individual JSON values.
-    let serialized_tools = serde_json::to_string(tools);
-    let estimated_tool_schema_tokens = match serialized_tools {
-        Ok(value) => {
-            let site =
-                astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization;
-            if astra_core::history_work::instrumentation_enabled() {
-                astra_core::history_work::record_operation(
-                    site,
-                    value.len().try_into().unwrap_or(u64::MAX),
-                    tools.len().try_into().unwrap_or(u64::MAX),
-                    0,
-                );
-            }
-            usize::try_from(astra_turn_core::section_types::estimate_text_tokens(&value))
-                .unwrap_or(usize::MAX)
-        }
-        Err(error) => {
-            astra_core::history_work::record_serialization_failure(
-                astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization,
-                &error,
-            );
-            0
-        }
-    };
-    let admission_estimated_input_tokens = estimated_input_tokens
-        .saturating_sub(tool_tokens)
-        .saturating_add(estimated_tool_schema_tokens)
-        .saturating_add(crate::prompts::DEFAULT_SYSTEM_PROMPT_TOKENS)
-        .saturating_add(crate::prompts::MODEL_FRAMING_TOKENS);
+    let system_tokens = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .map(crate::prompts::estimate_json_value_tokens)
+        .map(|tokens| tokens.saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD))
+        .sum();
+    let estimated_input_tokens = crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
     let budget = crate::prompts::budget_for_model_with_metadata(
         Some(model_name),
         context_window,
@@ -305,8 +317,8 @@ pub(crate) fn wire_budget_status_with_metadata(
     let policy = budget.window_policy();
     WireBudgetStatus {
         estimated_input_tokens,
-        estimated_tool_schema_tokens,
-        admission_estimated_input_tokens,
+        estimated_system_tokens: system_tokens,
+        tool_schema_tokens: tool_tokens,
         requested_output_tokens,
         reserved_protocol_tokens: policy.reserved_protocol_tokens,
         effective_input_limit: budget.effective_input_limit(),
@@ -348,6 +360,7 @@ pub(crate) enum RuntimeAuthorityKind {
     ReadOnlyEffectBoundary,
     FinalWorkSynthesis,
     CanonicalWorkEstablishmentRetry,
+    FinalAnswerSettlement,
     ExecutionTimeBudget,
     OutputCapContinuation,
 }
@@ -367,6 +380,7 @@ impl RuntimeAuthorityKind {
             Self::PendingWorkGraphMutations,
             Self::FinalWorkSynthesis,
             Self::CanonicalWorkEstablishmentRetry,
+            Self::FinalAnswerSettlement,
         ]
         .into_iter()
         .any(|candidate| candidate.as_str() == kind)
@@ -381,6 +395,7 @@ impl RuntimeAuthorityKind {
             Self::ReadOnlyEffectBoundary => "read_only_effect_boundary",
             Self::FinalWorkSynthesis => "final_work_synthesis",
             Self::CanonicalWorkEstablishmentRetry => "canonical_work_establishment_retry",
+            Self::FinalAnswerSettlement => "final_answer_settlement",
             Self::ExecutionTimeBudget => "execution_time_budget",
             Self::OutputCapContinuation => "output_cap_continuation",
         }
@@ -661,7 +676,8 @@ fn append_stable_system_policy(system_messages: &mut Vec<Value>, policy: &str) {
 }
 
 fn append_focus_policy(system_messages: &mut Vec<Value>) {
-    append_stable_system_policy(system_messages, TURN_FOCUS_POLICY);
+    let policy = focus_policy_text();
+    append_stable_system_policy(system_messages, &policy);
 }
 
 pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut Vec<Value>) {
@@ -855,15 +871,32 @@ fn validate_append_only_runtime_authority(
 pub(crate) fn rehome_append_only_runtime_authority(
     messages: &mut Vec<Value>,
 ) -> Result<Vec<Value>, AppendOnlyRuntimeAuthorityError> {
+    // Most provider projections have no append-only frames at all. Validate
+    // runtime-owned metadata first, then leave the caller's history borrowed
+    // in place when there is nothing to re-home. The old unconditional
+    // `mem::take` + per-message clone made every ordinary TailSuffix request
+    // pay O(history) allocation even though its output was byte-identical.
+    let mut has_append_only_frame = false;
+    for message in messages.iter() {
+        if astra_turn_types::is_runtime_owned_message(message)
+            && astra_turn_types::runtime_message_delivery(message).is_none()
+        {
+            return Err(AppendOnlyRuntimeAuthorityError::MissingOrInvalidDelivery);
+        }
+        if astra_turn_types::runtime_message_delivery(message)
+            == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        {
+            has_append_only_frame = true;
+        }
+    }
+    if !has_append_only_frame {
+        return Ok(Vec::new());
+    }
+
     let original = std::mem::take(messages);
     let mut projected = Vec::with_capacity(original.len());
     let mut rehomed = Vec::new();
     for (index, mut message) in original.iter().cloned().enumerate() {
-        if astra_turn_types::is_runtime_owned_message(&message)
-            && astra_turn_types::runtime_message_delivery(&message).is_none()
-        {
-            return Err(AppendOnlyRuntimeAuthorityError::MissingOrInvalidDelivery);
-        }
         if astra_turn_types::runtime_message_delivery(&message)
             != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
         {
@@ -2139,6 +2172,60 @@ mod tests {
     }
 
     #[test]
+    fn provider_switch_rehomes_legacy_settlement_instruction_without_replacement() {
+        let human = json!({"role":"user", "content":"finish"});
+        let legacy_payload = json!({
+            "schema": "completion_settlement.v2",
+            "revision": 1,
+            "mode": "text_only",
+            "instruction": "Answer from verified evidence."
+        });
+        let legacy_content = format!(
+            "<runtime-instruction>\n{}\n</runtime-instruction>",
+            json!({
+                "kind": "final_answer_settlement",
+                "instruction": legacy_payload
+            })
+        );
+        let runtime = required_runtime_preamble_message(
+            &legacy_content,
+            RuntimeAuthorityKind::FinalAnswerSettlement,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .expect("legacy settlement preamble");
+        let frame = into_append_only_runtime_authority(runtime).unwrap();
+        let mut history = vec![human.clone(), frame];
+
+        let rehomed = rehome_append_only_runtime_authority(&mut history).unwrap();
+        assert_eq!(history, vec![human.clone()]);
+        assert_eq!(rehomed.len(), 1);
+        history.extend(rehomed);
+
+        let provider = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &history, "openai", None,
+        );
+        assert_eq!(
+            provider
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
+        let system = message_text(&provider[0]);
+        assert!(system.contains("Answer from verified evidence."));
+        assert!(!system.contains("completion_settlement.v2"));
+        let facts_index = provider
+            .iter()
+            .position(|message| {
+                message["role"] == "user"
+                    && message_text(message).contains("completion_settlement.v2")
+            })
+            .expect("legacy settlement facts remain provider-visible");
+        let facts = message_text(&provider[facts_index]);
+        assert!(!facts.contains("Answer from verified evidence."));
+    }
+
+    #[test]
     fn structured_instruction_requires_matching_runtime_provenance() {
         let text = format!(
             "<runtime-required-context>\n{}\n</runtime-required-context>",
@@ -2182,6 +2269,31 @@ mod tests {
         assert!(rehomed.is_empty());
         assert_eq!(consumed_history.len(), 2);
         assert_eq!(consumed_history[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn provider_switch_without_append_only_frames_keeps_history_allocation() {
+        let mut history = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        let pointer = history.as_ptr();
+        let capacity = history.capacity();
+
+        let rehomed = rehome_append_only_runtime_authority(&mut history).unwrap();
+
+        assert!(rehomed.is_empty());
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history.as_ptr(),
+            pointer,
+            "no-frame fast path must not rebuild history"
+        );
+        assert_eq!(
+            history.capacity(),
+            capacity,
+            "no-frame fast path must not reallocate"
+        );
     }
 
     #[test]
@@ -2257,12 +2369,6 @@ mod tests {
             )
             .unwrap(),
             required_runtime_preamble_message(
-                "pending graph mutation",
-                RuntimeAuthorityKind::PendingWorkGraphMutations,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            )
-            .unwrap(),
-            required_runtime_preamble_message(
                 "edge revision 2",
                 RuntimeAuthorityKind::EdgeRequiredContext,
                 astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
@@ -2298,7 +2404,7 @@ mod tests {
         .unwrap();
 
         let frames = &output.new_append_only_runtime_messages;
-        assert_eq!(frames.len(), 5, "only the older edge revision is redundant");
+        assert_eq!(frames.len(), 4, "only the older edge revision is redundant");
         let kinds = frames
             .iter()
             .filter_map(astra_turn_types::runtime_authority_kind)
@@ -2308,7 +2414,6 @@ mod tests {
             std::collections::HashSet::from([
                 "edge_required_context",
                 "active_work_attempt_start",
-                "pending_work_graph_mutations",
                 "read_only_effect_boundary",
                 "final_work_synthesis",
             ])
@@ -2704,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_budget_reuses_measurement_without_changing_provider_admission_estimate() {
+    fn wire_budget_counts_final_messages_and_tool_schemas_once() {
         let messages = vec![
             json!({"role": "system", "content": "stable instructions"}),
             json!({"role": "user", "content": "你好"}),
@@ -2720,10 +2825,27 @@ mod tests {
 
         let status =
             wire_budget_status_with_metadata(&messages, &tools, "model", Some(32_000), None, 1_000);
-        let historical =
-            crate::prompts::estimate_tokens(&messages, status.estimated_tool_schema_tokens, 0);
+        let expected = crate::prompts::estimate_wire_input_tokens(
+            &messages,
+            tools
+                .iter()
+                .map(crate::prompts::estimate_json_value_tokens)
+                .sum(),
+        );
 
-        assert_eq!(status.admission_estimated_input_tokens, historical);
+        assert_eq!(status.estimated_input_tokens, expected);
+        assert_eq!(
+            status.tool_schema_tokens,
+            tools
+                .iter()
+                .map(crate::prompts::estimate_json_value_tokens)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            status.estimated_system_tokens,
+            crate::prompts::estimate_json_value_tokens(&messages[0])
+                + crate::prompts::PER_MESSAGE_OVERHEAD
+        );
     }
 
     #[tokio::test]
@@ -3064,7 +3186,7 @@ mod tests {
         // Expect system first, then compacted. No attachments injected.
         assert_eq!(
             msgs[0],
-            json!({"role": "system", "content": format!("sys\n\n{TURN_FOCUS_POLICY}")})
+            json!({"role": "system", "content": format!("sys\n\n{}", focus_policy_text())})
         );
         assert_eq!(msgs[1], compacted[0]);
         // No trailing attachment markers.
@@ -3492,7 +3614,7 @@ mod tests {
         assert_eq!(msgs.len(), 5);
         assert_eq!(
             msgs[0]["content"],
-            format!("stable core rules only\n\n{TURN_FOCUS_POLICY}")
+            format!("stable core rules only\n\n{}", focus_policy_text())
         );
         assert_eq!(
             msgs[1],
@@ -4075,11 +4197,11 @@ mod tests {
         let settlement_index = settlement
             .iter()
             .position(|message| {
-                message.get("role").and_then(Value::as_str) == Some("system")
+                message.get("role").and_then(Value::as_str) == Some("user")
                     && message_text(message).contains("completion_settlement.v2")
             })
-            .expect("required completion settlement remains provider-visible");
-        assert_eq!(settlement_index, 0);
+            .expect("required completion settlement facts remain provider-visible");
+        assert!(settlement_index > 0);
         assert_eq!(
             settlement
                 .iter()
@@ -4087,8 +4209,17 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(settlement.last().unwrap()["role"], "tool");
-        assert_eq!(settlement.last().unwrap()["content"], "ok");
+        assert!(
+            settlement[..settlement_index]
+                .iter()
+                .any(|message| message["role"] == "tool")
+        );
+        let provider_instruction = message_text(&settlement[0]);
+        assert!(provider_instruction.contains("answer now"));
+        assert!(!provider_instruction.contains("completion_settlement.v2"));
+        let provider_facts = message_text(&settlement[settlement_index]);
+        assert!(provider_facts.contains("completion_settlement.v2"));
+        assert!(!provider_facts.contains("answer now"));
     }
 
     #[test]
@@ -4129,6 +4260,8 @@ mod tests {
         assert!(message_text(&first[0]).starts_with("stable\n\n"));
         let focus_policy = message_text(&first[0]);
         assert!(focus_policy.contains("active_turn_focus_policy.v1"));
+        assert!(focus_policy.contains("New facts are current context"));
+        assert!(focus_policy.contains("acknowledge directly, not recall or verify"));
         for dynamic in ["Reply ACK", "first request", "问题总结？", "只读 review"] {
             assert!(!focus_policy.contains(dynamic));
         }

@@ -201,15 +201,40 @@ pub struct SkillAutoRouteJudgeContext<'a> {
 
 #[derive(Clone)]
 pub struct RejectedToolCall {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) canonical_call: Value,
+    pub(crate) invocation: astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
     pub(crate) result: String,
+}
+
+impl RejectedToolCall {
+    #[must_use]
+    pub(crate) fn ordinary(canonical_call: Value, result: String) -> Self {
+        Self {
+            invocation:
+                astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
+                    canonical_call,
+                ),
+            result,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn provider_call_id(&self) -> &str {
+        self.invocation.provider_call_id().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub(crate) fn logical_name(&self) -> &str {
+        astra_turn_core::tool::args::shape::tool_call_name(self.invocation.logical_target_call())
+            .unwrap_or("unknown")
+    }
 }
 
 #[derive(Clone)]
 pub struct ToolCallAdmission {
-    pub(crate) admitted: Vec<Value>,
+    /// One provider identity paired with its logical execution target.
+    /// Direct calls retain one JSON value; deferred carriers add a target only
+    /// after shared resolution has proved their activation evidence.
+    pub(crate) admitted: Vec<astra_turn_core::tool::deferred_activation::CanonicalToolInvocation>,
     pub(crate) rejected: Vec<RejectedToolCall>,
     /// Whether the typed completion-action filter has already been applied to
     /// this admission result. Server turns may pre-admit before the shared
@@ -489,6 +514,58 @@ pub trait AgenticLoopHost: Send {
         crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
     }
 
+    /// Catalog of deferred contracts available to this host. The default is
+    /// empty: a host that cannot prove the current schema revision must not
+    /// turn a carrier into an executable target.
+    fn deferred_tool_contract_schemas(&self) -> &[Value] {
+        &[]
+    }
+
+    /// Convert admitted provider carrier calls into paired logical targets
+    /// before shared terminal policy and execution. Every host uses this same
+    /// transition; only the host-owned current contract catalog varies.
+    fn canonicalize_deferred_tool_admission(
+        &mut self,
+        state: &AgenticLoopState,
+        admission: ToolCallAdmission,
+    ) -> ToolCallAdmission {
+        let schemas = self.deferred_tool_contract_schemas();
+        if schemas.is_empty() {
+            return admission;
+        }
+        let activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &state.messages,
+                state.deferred_tool_activations.clone(),
+            );
+        crate::turn::agentic::tool_interception::resolve_deferred_tool_admission(
+            admission,
+            &activations,
+            |name| {
+                schemas
+                    .iter()
+                    .find(|schema| {
+                        astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                    })
+                    .and_then(astra_tools::tool_search::tool_selection_contract)
+                    .map(|contract| {
+                        astra_tools::tool_search::tool_selection_contract_digest(&contract)
+                    })
+            },
+        )
+    }
+
+    /// Bind fresh schema-addressed selections to the current resolved
+    /// provider descriptor. Hosts with an authenticated provider ledger may
+    /// override this to retain identity across the carrier boundary; the
+    /// default keeps provider-neutral hosts unchanged.
+    fn bind_deferred_tool_activations(
+        &mut self,
+        _state: &mut AgenticLoopState,
+        _activations: &[astra_turn_types::DeferredToolActivation],
+    ) {
+    }
+
     /// Exact process-local recall ledger scope owned by this loop.
     ///
     /// The default covers ordinary CLI and server runs. Hosts whose tool
@@ -526,6 +603,18 @@ pub trait AgenticLoopHost: Send {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError>;
 
+    /// Close durable host-owned carriers before the loop's terminal result is
+    /// handed to the outer run lifecycle.  This is intentionally a single
+    /// hook at the state-machine terminal boundary: cancellation and fatal
+    /// errors must release durable ownership just as reliably as the happy
+    /// path releases it with a successful receipt.
+    async fn on_loop_terminal(
+        &mut self,
+        _state: &AgenticLoopState,
+        _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) {
+    }
+
     /// Publish and route tool calls only after the runtime has admitted them
     /// into the canonical execution shape. Implementations must not inspect
     /// the provider's raw tool-call JSON for execution side effects.
@@ -535,6 +624,23 @@ pub trait AgenticLoopHost: Send {
         _tool_calls: &[Value],
     ) -> AdmittedToolCallOutcome {
         AdmittedToolCallOutcome::default()
+    }
+
+    /// Execute the canonical invocation objects after deferred carriers have
+    /// been resolved. The default preserves the value-only hook for hosts
+    /// that do not own a delivery ledger; hosts with a typed edge lane may
+    /// use `CanonicalToolInvocation::activation()` to keep carrier proof
+    /// attached through dispatch.
+    async fn handle_admitted_tool_invocations(
+        &mut self,
+        state: &AgenticLoopState,
+        invocations: &[astra_turn_core::tool::deferred_activation::CanonicalToolInvocation],
+    ) -> AdmittedToolCallOutcome {
+        let tool_calls = invocations
+            .iter()
+            .map(|invocation| invocation.logical_target_call().clone())
+            .collect::<Vec<_>>();
+        self.handle_admitted_tool_calls(state, &tool_calls).await
     }
 
     /// Optional semantic judge for the current user turn.
@@ -1287,8 +1393,14 @@ pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
 }
 
 pub(crate) fn introspect_estimated_input_tokens(state: &AgenticLoopState) -> u64 {
-    crate::prompts::estimate_tokens(&state.messages, state.pinned_tool_schema_tokens as usize, 0)
-        as u64
+    crate::prompts::estimate_tokens(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        )
+        .unwrap_or(0),
+    ) as u64
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -1910,9 +2022,6 @@ pub struct CompletionSettlementState {
     /// Number of same-turn recovery calls made after the provider returned a
     /// successful response with neither tool calls nor user-visible text.
     pub textless_response_retries: u32,
-    /// Number of bounded retries after a runtime/session retrospective tried
-    /// to settle without the live observation required for its claims.
-    pub runtime_evidence_retries: u32,
     /// Number of bounded terminal rewrites after a tool failure remained
     /// unresolved across multiple policy observations.  The retry is
     /// synthesis-only: it calibrates claims against retained evidence rather
@@ -1927,6 +2036,11 @@ pub struct CompletionSettlementState {
     /// Number of bounded retries after an external or mixed mutation contract
     /// attempted to finish without an executor-owned external delta receipt.
     pub external_effect_retries: u32,
+    /// Structured external observation scope carried across the bounded
+    /// recovery boundary.  A model may split observation and mutation across
+    /// two calls; the executor-owned scope is the only authority allowed to
+    /// bridge those calls, never command text or assistant prose.
+    pub external_effect_recovery_paths: Option<Vec<String>>,
     /// Number of bounded same-turn retries after the final successful
     /// workspace mutation had no later successful observation.  A mutation is
     /// progress, but it is not evidence that the resulting workspace is
@@ -2999,7 +3113,10 @@ pub struct AgenticLoopState {
     /// This is prompt continuity, not an authorization grant. The runtime
     /// executor still intersects these names with the current advertised
     /// surface and live bindings before schema injection or execution.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed deferred selections retained across compaction and
+    /// resume. Unlike the name projection above, these records may prove a
+    /// stable carrier target only after the current schema digest matches.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// True when the prior (immediately preceding) turn produced assistant
     /// output (text or tool calls). Set by the agentic loop on every turn
     /// boundary (`has_any_usage` from the just-completed ingest).
@@ -4806,7 +4923,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         user_intent: "test query".to_string(),
         has_prior_assistant_turn: false,
         recent_tools: Vec::new(),
-        activated_deferred_tool_names: Vec::new(),
+        deferred_tool_activations: Vec::new(),
         turn_intent: None,
         task_profile: TaskExecutionProfile::default(),
         last_turn_policy: TurnInteractionPolicy::default(),
@@ -6359,7 +6476,7 @@ pub(crate) mod tests {
             user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_finish_reason: None,

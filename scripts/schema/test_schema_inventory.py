@@ -95,6 +95,7 @@ class SchemaInventoryTest(unittest.TestCase):
 
         expected = {
             "works",
+            "work_establishment_operations",
             "work_goal_revisions",
             "work_criteria",
             "work_criterion_revisions",
@@ -129,7 +130,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(30, len(actual))
+        self.assertEqual(31, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}

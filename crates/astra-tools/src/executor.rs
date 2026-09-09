@@ -132,6 +132,9 @@ pub struct DefaultToolExecutor {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BashCacheKey {
     workspace_root: String,
+    /// Canonical call-scoped execution directory. The same read-only command
+    /// may produce different output in different workspace directories.
+    workdir: String,
     /// Monotonic counter bumped whenever a mutation tool succeeds. A
     /// newly-created key after `write_file` will miss the cache, so
     /// prior `ls` / `grep` results don't leak across edits made
@@ -409,10 +412,25 @@ impl ToolExecutor for DefaultToolExecutor {
             return ToolResult::error(error);
         }
 
+        // Resolve once per invocation. The same canonical identity drives
+        // cache lookup, spawn, evidence, and cache insertion so a path alias
+        // cannot be retargeted between those phases.
+        let bash_workdir = if name == "bash" {
+            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args) {
+                Ok(workdir) => Some(workdir),
+                Err(error) => return ToolResult::error(error),
+            }
+        } else {
+            None
+        };
+
         if name == "bash"
             && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
-            && let Some(key) = self.bash_cache_key(args)
+            && let Some(key) = self.bash_cache_key(
+                args,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+            )
             && let Some(mut cached) = {
                 // Lookup + TTL check + stale eviction under one
                 // critical section. We clone the `ToolResult` out
@@ -440,6 +458,12 @@ impl ToolExecutor for DefaultToolExecutor {
             }
         {
             mark_result_cached(&mut cached);
+            crate::shell_ops::attach_bash_workdir_evidence(
+                &mut cached,
+                &self.ctx.workspace_root,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+                args,
+            );
             if let Some(cb) = &self.progress_callback {
                 cb.tool_completed(&call_id, &cached.output, !cached.is_error)
                     .await;
@@ -529,7 +553,7 @@ impl ToolExecutor for DefaultToolExecutor {
         } else {
             None
         };
-        let dispatch = self.dispatch(name, args);
+        let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
         // abandon the post-execution workspace receipt after a partial write.
@@ -695,7 +719,10 @@ impl ToolExecutor for DefaultToolExecutor {
         if name == "bash"
             && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !result.is_error
-            && let Some(key) = self.bash_cache_key(args)
+            && let Some(key) = self.bash_cache_key(
+                args,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+            )
         {
             self.bash_cache
                 .lock()
@@ -825,13 +852,16 @@ impl DefaultToolExecutor {
             .await
     }
 
-    fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
+    fn bash_cache_key(
+        &self,
+        args: &Value,
+        workdir: &crate::shell_ops::PreparedBashWorkdir,
+    ) -> Option<BashCacheKey> {
         use crate::bash_cache_safety::bash_command_is_cache_safe;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let command = args.get("command")?.as_str()?.to_string();
-
         // Readonly classifier: only commands whose output depends
         // solely on fs + env may hit the cache. Anything with side
         // effects (rm, cargo build, git commit, curl, …) or shell
@@ -877,6 +907,7 @@ impl DefaultToolExecutor {
 
         Some(BashCacheKey {
             workspace_root: self.ctx.workspace_root.display().to_string(),
+            workdir: workdir.identity().to_string(),
             workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
             command,
             env_fingerprint,
@@ -884,7 +915,12 @@ impl DefaultToolExecutor {
         })
     }
 
-    async fn dispatch(&self, name: &str, args: &Value) -> ToolResult {
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: &Value,
+        bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
+    ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
         let pr = &self.ctx.project_root;
 
@@ -926,10 +962,23 @@ impl DefaultToolExecutor {
             // ── Shell operations ─────────────────────────────────────
             "bash" => match &self.filesystem_write_boundary {
                 Some(paths) => {
-                    crate::shell_ops::execute_bash_with_filesystem_boundary(&self.ctx, args, paths)
-                        .await
+                    crate::shell_ops::execute_bash_with_filesystem_boundary_at_workdir(
+                        &self.ctx,
+                        args,
+                        paths,
+                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                    )
+                    .await
                 }
-                None => crate::shell_ops::execute_bash(&self.ctx, args).await,
+                None => {
+                    crate::shell_ops::execute_bash_with_environment_at_workdir(
+                        &self.ctx,
+                        args,
+                        &[],
+                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                    )
+                    .await
+                }
             },
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
@@ -1973,6 +2022,130 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true),
             "second call must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_cache_separates_execution_directories() {
+        let (tmp, exec) = test_executor();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        std::fs::create_dir(tmp.path().join("b")).unwrap();
+
+        let in_a = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "a"}),
+            )
+            .await;
+        let in_b = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "b"}),
+            )
+            .await;
+        assert!(!in_a.is_error && !in_b.is_error);
+        assert_ne!(in_a.output, in_b.output);
+        assert_ne!(
+            in_b.metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "same command in another workdir must not reuse cached output"
+        );
+
+        let in_b_again = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "b"}),
+            )
+            .await;
+        assert_eq!(
+            in_b_again
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "same command in the same canonical workdir should remain cacheable"
+        );
+
+        let in_b_alias = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "a/../b"}),
+            )
+            .await;
+        assert_eq!(
+            in_b_alias.metadata.as_ref().unwrap()["bash_workdir"]["requested"],
+            "a/../b",
+            "a canonical cache hit must retain the current invocation's requested directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_bash_cache_identity_survives_workdir_alias_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, exec) = test_executor();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("input"), "from-a\n").unwrap();
+        std::fs::write(b.join("input"), "from-b\n").unwrap();
+        let alias = tmp.path().join("alias");
+        symlink("a", &alias).unwrap();
+
+        let first = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert!(!first.is_error, "first call failed: {}", first.output);
+        assert_eq!(first.output.trim(), "from-a");
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink("b", &alias).unwrap();
+
+        let from_b = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert_eq!(from_b.output.trim(), "from-b");
+        assert_ne!(
+            from_b
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "retargeting an alias must not relabel or reuse the old directory's cache entry"
+        );
+        let from_b_again = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert!(
+            !from_b_again.is_error,
+            "cached call failed: {}",
+            from_b_again.output
+        );
+        assert_eq!(from_b_again.output.trim(), "from-b");
+        assert_eq!(
+            from_b_again
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "the new canonical workdir should be cached independently"
         );
     }
 

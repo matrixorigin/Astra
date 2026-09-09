@@ -275,6 +275,7 @@ fn provider_request_shape_identifies_only_the_matching_stream_fallback() {
     let streaming = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"task\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
     let matching_fallback = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"task\"}],\"stream\":false}";
     let auxiliary_call = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"auxiliary\"}],\"stream\":false}";
+    let classification = "POST /v1/chat/completions HTTP/1.1\r\n\r\n{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"classifier prompt\"}],\"tool_choice\":\"none\",\"stream\":true}";
 
     assert_eq!(
         provider_request_shape(streaming),
@@ -284,6 +285,8 @@ fn provider_request_shape_identifies_only_the_matching_stream_fallback() {
         provider_request_shape(streaming),
         provider_request_shape(auxiliary_call)
     );
+    assert!(is_work_classification_request(classification));
+    assert!(!is_work_classification_request(streaming));
 }
 
 fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: &str) {
@@ -298,7 +301,17 @@ fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: 
 }
 
 fn is_work_classification_request(request: &str) -> bool {
-    request.contains("Classify goal as JSON")
+    let Some(shape) = provider_request_shape(request) else {
+        return false;
+    };
+    // The semantic Work judge is a no-tool control-plane request. Identify it
+    // from the typed wire shape, not from mutable prompt prose: prompt wording
+    // is an implementation detail and must never decide which provider calls
+    // a transport fixture counts as primary execution.
+    shape.get("tool_choice").and_then(Value::as_str) == Some("none")
+        && shape
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_none_or(Vec::is_empty))
 }
 
 async fn write_work_classification_response(
@@ -309,7 +322,6 @@ async fn write_work_classification_response(
         "workspace_mutation": "read_only",
         "mutation_completion_scope": "unknown",
         "execution_topology": "primary",
-        "acceptance_unit_relationship": "single_outcome",
         "acceptance_units": [{
             "objective": "exercise provider streaming",
             "expected_result": "preserve the exact provider outcome"

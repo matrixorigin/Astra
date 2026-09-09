@@ -193,10 +193,10 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
         },
         // Session-stable runtime identity: typed model / cwd / branch +
         // fragments that only change at session boundaries
-        // (`system_override`, `extra_stable_sections`). Tool-dependent
-        // and self-awareness fragments are per-turn in dynamic-tool-selection
-        // flows and must sit after the Session→None
-        // cache marker in `RuntimeVolatile`.
+        // (`system_override`, `extra_stable_sections`). Tool-dependent and
+        // self-awareness fragments are per-turn in dynamic-tool-selection
+        // flows and must sit after the Session→None cache marker in
+        // `RuntimeVolatile`.
         // Placing these in `Session` scope is the cache optimization that
         // gives a 2nd marker its target — everything up through here sits in
         // the cached prefix, only truly per-turn content is re-sent.
@@ -207,28 +207,30 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             priority: CompressionPriority::Normal,
             source: SectionSource::Environment,
         },
+        // Deferred names are derived from the admitted capability epoch. They
+        // are control-plane metadata, not per-round conversation state: when
+        // the admitted surface is unchanged, keeping this listing in Session
+        // scope avoids re-sending the same catalog after every tool round.
+        // A real readiness/restriction/Work transition changes the bytes and
+        // therefore intentionally starts one new cache epoch. Admission still
+        // owns the name set; this scope is only the cache placement contract.
+        PlannedSection {
+            kind: SectionKind::DeferredTools,
+            scope: CacheScope::Session,
+            estimated_tokens: budget.budget_for(SectionKind::DeferredTools),
+            priority: CompressionPriority::LastResort,
+            source: SectionSource::Environment,
+        },
         // Turn-volatile runtime fragments: tool-round guidance (uses current
         // messages), effort hint (depends on active skill), plan_context,
         // and `extra_dynamic_sections` (bridge escape hatch — session anchor,
         // feedback, memoria insights). These drift every turn so they must
-        // sit AFTER the marker.
+        // sit AFTER the Session→None marker.
         PlannedSection {
             kind: SectionKind::RuntimeVolatile,
             scope: CacheScope::None,
             estimated_tokens: budget.budget_for(SectionKind::RuntimeVolatile),
             priority: CompressionPriority::Normal,
-            source: SectionSource::Environment,
-        },
-        // Deferred names are derived from the current wire surface,
-        // restrictions, readiness, and runtime binding. A Work admission or
-        // tool activation may therefore change them within one user turn.
-        // Keep a dedicated budget and trace entry, but place the section
-        // after the Session→None cache boundary.
-        PlannedSection {
-            kind: SectionKind::DeferredTools,
-            scope: CacheScope::None,
-            estimated_tokens: budget.budget_for(SectionKind::DeferredTools),
-            priority: CompressionPriority::LastResort,
             source: SectionSource::Environment,
         },
         // Goal/task continuity is turn-facing by nature: current decisions,
@@ -553,8 +555,8 @@ mod tests {
                 SectionKind::AvailableSkills,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
-                SectionKind::RuntimeVolatile,
                 SectionKind::DeferredTools,
+                SectionKind::RuntimeVolatile,
                 SectionKind::WorkingMemory,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
@@ -562,7 +564,7 @@ mod tests {
             ],
             "canonical section order drifted — this breaks Anthropic prompt-cache prefix. \
              RuntimeIdentity (Session) must precede RuntimeVolatile (None) so the 2nd cache \
-             marker falls at the Session→None boundary."
+             marker falls at the Session→None boundary after all capability-epoch sections."
         );
     }
 
@@ -583,8 +585,8 @@ mod tests {
                 SectionKind::AvailableSkills,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
-                SectionKind::RuntimeVolatile,
                 SectionKind::DeferredTools,
+                SectionKind::RuntimeVolatile,
                 SectionKind::WorkingMemory,
                 SectionKind::Memory,
                 SectionKind::EmergentSkills,
@@ -626,7 +628,7 @@ mod tests {
             assert!(
                 last_session < first_none,
                 "Session-scope sections must precede all None-scope sections so the \
-                 2nd cache marker falls at a clean Session→None boundary. \
+                     2nd cache marker falls at a clean Session→None boundary. \
                  RuntimeVolatile (None) appearing between Session blocks would leak \
                  per-turn drift into the cached prefix."
             );
@@ -686,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_tools_are_turn_volatile_not_session_cached() {
+    fn deferred_tools_are_session_stable_until_capability_epoch_changes() {
         let (tokens, recovery, latches, stats, policy) = default_input();
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
@@ -695,11 +697,11 @@ mod tests {
             .iter()
             .find(|section| section.kind == SectionKind::DeferredTools)
             .expect("deferred tool section must be planned");
-        assert_eq!(deferred.scope, CacheScope::None);
+        assert_eq!(deferred.scope, CacheScope::Session);
         assert_eq!(
             deferred.priority,
             CompressionPriority::LastResort,
-            "tool discovery remains available under pressure without entering the cache prefix"
+            "tool discovery remains low-priority under pressure without becoming disposable protocol state"
         );
         let runtime_identity = plan
             .sections
@@ -712,6 +714,15 @@ mod tests {
             .position(|section| section.kind == SectionKind::DeferredTools)
             .expect("deferred tool section must be planned");
         assert!(deferred_position > runtime_identity);
+        let working_memory_position = plan
+            .sections
+            .iter()
+            .position(|section| section.kind == SectionKind::WorkingMemory)
+            .expect("working memory section must be planned");
+        assert!(
+            deferred_position < working_memory_position,
+            "deferred discovery belongs to the stable capability epoch before volatile working memory"
+        );
     }
 
     #[test]

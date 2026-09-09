@@ -12,8 +12,12 @@ use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
-    EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, READ_ONLY_TOOLS,
-    resolve_headless_tool_slot, take_edge_output_for_tool_call_id_or_signature_with_duration,
+    EdgeMatchConflict, EdgeMatchOutcome, EdgeToolRoundRow, HeadlessResolvedToolSlot,
+    HeadlessRoundToolIdx, READ_ONLY_TOOLS, resolve_headless_tool_slot,
+    take_edge_output_for_tool_call_id_with_duration,
+};
+use astra_turn_core::tool::deferred_activation::{
+    DeferredToolActivation, RuntimeControlInvocationKind,
 };
 
 mod execute;
@@ -90,7 +94,95 @@ pub(crate) struct HeadlessResolvedExecution {
         Option<crate::server::runtime_tool_executor::PendingRuntimeToolCompletion>,
     edge_duration_ms: u64,
     is_edge_tool: bool,
+    /// The provider call had no exact edge callback identity. This is a
+    /// machine-owned routing fact; execution must never rediscover it by
+    /// matching a human-readable error body.
+    edge_result_missing: bool,
+    /// True only when this execution is backed by the exact edge callback
+    /// identity for the provider call (or an explicitly synthetic edge slot).
+    /// A callback row without this identity is not execution custody for the
+    /// provider call, even when its name and arguments look identical.
+    edge_terminal_authority: bool,
     early_exit_ms: u64,
+}
+
+/// Runtime-only ownership of the single live terminal event for a tool call.
+/// This is deliberately not persisted in `ToolCallRecord`: journal outcome
+/// and event-stream ownership are different contracts. The owner is derived
+/// from typed execution boundaries, never from disposition strings or names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalProjectionOwner {
+    SharedLoop,
+    RuntimeRoute,
+    EdgeCallback,
+}
+
+impl HeadlessResolvedExecution {
+    fn edge_replay_snapshot(&self) -> Option<Self> {
+        self.is_edge_tool.then(|| Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            args: self.args.clone(),
+            result_str: self.result_str.clone(),
+            tool_result_fields: self.tool_result_fields.clone(),
+            authoritative_is_error: self.authoritative_is_error,
+            // Edge callbacks never establish a runtime route. Keeping this
+            // snapshot intentionally drops the non-cloneable route completion
+            // token instead of making that token clonable or replayable.
+            pending_runtime_completion: None,
+            edge_duration_ms: self.edge_duration_ms,
+            is_edge_tool: true,
+            edge_result_missing: false,
+            edge_terminal_authority: self.edge_terminal_authority,
+            early_exit_ms: self.early_exit_ms,
+        })
+    }
+
+    fn terminal_projection_owner(&self) -> TerminalProjectionOwner {
+        if self.edge_terminal_authority {
+            TerminalProjectionOwner::EdgeCallback
+        } else if self.pending_runtime_completion.is_some() {
+            TerminalProjectionOwner::RuntimeRoute
+        } else {
+            // A runtime executor can reject before establishing its route
+            // boundary. No executor terminal exists in that case.
+            TerminalProjectionOwner::SharedLoop
+        }
+    }
+}
+
+/// Carry an executor-owned external observation scope into the next
+/// foreground Bash invocation when the model omitted the field.  This is a
+/// typed recovery mechanism, not a command classifier: only the exact Bash
+/// tool, an active recovery scope, and an absent structured field qualify.
+pub(super) fn inherit_external_effect_recovery_scope(
+    tool_name: &str,
+    args: &mut Value,
+    recovery_paths: Option<&[String]>,
+) -> bool {
+    if tool_name != "bash" || recovery_paths.is_none_or(|paths| paths.is_empty()) {
+        return false;
+    }
+    let Some(object) = args.as_object_mut() else {
+        return false;
+    };
+    if object.contains_key(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+        || object.get("run_in_background").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    object.insert(
+        astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD.to_string(),
+        Value::Array(
+            recovery_paths
+                .expect("checked above")
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    true
 }
 
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
@@ -205,7 +297,7 @@ fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution)
         })
 }
 
-struct HeadlessBlockedTool<'a> {
+pub(super) struct HeadlessBlockedTool<'a> {
     id: &'a str,
     name: &'a str,
     args: &'a Value,
@@ -218,9 +310,10 @@ struct HeadlessBlockedTool<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeadlessShortCircuitJournalKind {
+pub(super) enum HeadlessShortCircuitJournalKind {
     HardBlocked,
     SuppressedRetry,
+    Cancelled { error_kind: astra_core::ErrorKind },
 }
 
 enum HeadlessToolSlotControl {
@@ -258,6 +351,26 @@ pub(crate) struct ExecutedExecution {
     pub executed_ms: u64,
 }
 
+/// The single lifecycle table for one provider-facing tool-call id.
+///
+/// A call is either an exact edge fact waiting for the normal record boundary,
+/// a pending edge execution that has passed one policy phase, or a settled
+/// terminal with an explicit owner. Keeping these states together prevents
+/// independent sets/maps from describing impossible combinations such as a
+/// call being both pending and settled.
+enum SlotSettlement {
+    EdgeObserved,
+    PendingEdgeValidated {
+        execution: HeadlessResolvedExecution,
+        idem_key: IdempotencyKey,
+    },
+    PendingEdgePermitted(PermittedExecution),
+    /// `None` is an internal settled marker for a slot whose canonical
+    /// terminal was already emitted elsewhere; it must not be projected by
+    /// the shared loop.
+    Settled(Option<TerminalProjectionOwner>),
+}
+
 pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     /// Internal agentic step index (0-based) for cache and dedup accounting.
     pub turn_index: usize,
@@ -273,8 +386,14 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
     pub tool_calls: &'a [Value],
+    /// Schema-addressed deferred selection proof for a specific provider call.
+    /// It bypasses only wire-schema visibility; every execution policy below
+    /// still runs against the logical target and current runtime binding.
+    pub deferred_activations_by_call_id: &'a HashMap<String, DeferredToolActivation>,
+    /// Host-owned lifecycle calls carry independent typed provenance. This is
+    /// not deferred activation evidence: the provider did not select them.
+    pub runtime_control_calls_by_id: &'a HashMap<String, RuntimeControlInvocationKind>,
     pub edge_tool_round: &'a [E],
-    pub by_sig: &'a HashMap<String, String>,
     pub pre_resolved_ids: &'a HashSet<String>,
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
@@ -308,6 +427,10 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     /// When present, tools that have no edge match are executed directly by the server.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+    /// Executor-owned external observation scope carried across a bounded
+    /// recovery sequence.  It is applied only to a foreground Bash call
+    /// which omitted the structured field; no command-text inference occurs.
+    pub external_effect_recovery_paths: Option<&'a [String]>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -324,54 +447,59 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
 pub(crate) struct HeadlessToolExecutionPipeline<'a, E: EdgeToolRoundRow> {
     ctx: HeadlessToolExecutionCtx<'a, E>,
     consumed_edge: Vec<bool>,
-    exact_edge_indices: HashMap<String, usize>,
     consecutive_empty_name: u32,
     executed_this_turn: u32,
     action_fence: Option<&'a dyn crate::turn::agentic::headless_round::HeadlessActionFence>,
     action_fence_superseded: bool,
     action_fence_error: Option<String>,
+    slot_settlements: HashMap<String, SlotSettlement>,
 }
 
 fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
     slot: HeadlessResolvedToolSlot,
     edge_tool_round: &[E],
     consumed_edge: &mut [bool],
-    by_sig: &HashMap<String, String>,
-) -> HeadlessResolvedExecution {
+) -> (HeadlessResolvedExecution, EdgeMatchOutcome) {
     let HeadlessResolvedToolSlot {
         id,
         name,
         args,
         synthetic_edge_index,
     } = slot;
-    let consumed_before = consumed_edge.iter().filter(|&&c| c).count();
-
-    let (result_str, edge_duration_ms, edge_execution_status, tool_result_fields) =
-        if let Some(i) = synthetic_edge_index {
-            (
-                edge_tool_round[i].tool_output().to_string(),
-                edge_tool_round[i].tool_duration_ms(),
-                edge_tool_round[i]
-                    .tool_execution_status()
-                    .map(ToString::to_string),
-                edge_tool_round[i].tool_result_fields().cloned(),
-            )
-        } else {
-            let matched = take_edge_output_for_tool_call_id_or_signature_with_duration(
-                &id,
-                &name,
-                &args,
-                edge_tool_round,
-                consumed_edge,
-                by_sig,
-            );
-            (
-                matched.output,
-                matched.duration_ms,
-                matched.execution_status,
-                matched.tool_result_fields,
-            )
-        };
+    let (
+        result_str,
+        edge_duration_ms,
+        edge_execution_status,
+        tool_result_fields,
+        edge_match_outcome,
+    ) = if let Some(i) = synthetic_edge_index {
+        (
+            edge_tool_round[i].tool_output().to_string(),
+            edge_tool_round[i].tool_duration_ms(),
+            edge_tool_round[i]
+                .tool_execution_status()
+                .map(ToString::to_string),
+            edge_tool_round[i].tool_result_fields().cloned(),
+            // A synthetic edge slot is itself the callback-owned
+            // identity.  Its terminal was emitted by the edge producer
+            // before this headless round was assembled.
+            EdgeMatchOutcome::Exact,
+        )
+    } else {
+        let matched = take_edge_output_for_tool_call_id_with_duration(
+            &id,
+            &name,
+            edge_tool_round,
+            consumed_edge,
+        );
+        (
+            matched.output,
+            matched.duration_ms,
+            matched.execution_status,
+            matched.tool_result_fields,
+            matched.match_outcome,
+        )
+    };
 
     // The edge status is a typed result from the executor, while the output
     // is model-facing diagnostics and may be plain prose.  Preserve the
@@ -385,8 +513,7 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
             .or_insert(Value::String(status.to_string()));
     }
 
-    let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
-    let is_edge_tool = synthetic_edge_index.is_some() || consumed_after > consumed_before;
+    let is_edge_tool = synthetic_edge_index.is_some() || edge_match_outcome.is_exact();
     let authoritative_is_error = is_edge_tool.then(|| {
         edge_execution_status
             .as_deref()
@@ -418,18 +545,23 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
         0
     };
 
-    HeadlessResolvedExecution {
-        id,
-        name,
-        args,
-        result_str,
-        tool_result_fields,
-        authoritative_is_error,
-        pending_runtime_completion: None,
-        edge_duration_ms,
-        is_edge_tool,
-        early_exit_ms,
-    }
+    (
+        HeadlessResolvedExecution {
+            id,
+            name,
+            args,
+            result_str,
+            tool_result_fields,
+            authoritative_is_error,
+            pending_runtime_completion: None,
+            edge_duration_ms,
+            is_edge_tool,
+            edge_result_missing: edge_match_outcome.is_absent(),
+            edge_terminal_authority: is_edge_tool && edge_match_outcome.is_exact(),
+            early_exit_ms,
+        },
+        edge_match_outcome,
+    )
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
@@ -445,28 +577,143 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // feedback, and the bounded round/tool budgets—not a lifetime quota on
         // name+arguments.
         ctx.call_counts.clear();
-        let mut exact_edge_indices = HashMap::with_capacity(ctx.edge_tool_round.len());
-        for (index, edge) in ctx.edge_tool_round.iter().enumerate() {
-            if edge.has_explicit_assistant_tool_call_id() {
-                let call_id = edge.assistant_tool_call_id(index);
-                exact_edge_indices
-                    .entry(call_id)
-                    // Duplicate exact identities are ambiguous and therefore
-                    // cannot grant post-execution authority to either row.
-                    .and_modify(|existing| *existing = usize::MAX)
-                    .or_insert(index);
-            }
-        }
         Self {
             ctx,
             consumed_edge,
-            exact_edge_indices,
             consecutive_empty_name: 0,
             executed_this_turn: 0,
             action_fence,
             action_fence_superseded: false,
             action_fence_error: None,
+            slot_settlements: HashMap::new(),
         }
+    }
+
+    /// Return exact call IDs whose terminal event belongs to this shared
+    /// headless loop. Runtime-route and edge-owned calls are excluded so the
+    /// caller cannot emit a duplicate terminal event.
+    pub(crate) fn into_shared_loop_terminal_call_ids(self) -> HashSet<String> {
+        self.slot_settlements
+            .into_iter()
+            .filter_map(|(id, settlement)| {
+                matches!(
+                    settlement,
+                    SlotSettlement::Settled(Some(TerminalProjectionOwner::SharedLoop))
+                )
+                .then_some(id)
+            })
+            .collect()
+    }
+
+    fn observe_resolved_edge(&mut self, execution: &HeadlessResolvedExecution) {
+        if execution.edge_terminal_authority {
+            self.slot_settlements
+                .insert(execution.id.clone(), SlotSettlement::EdgeObserved);
+        }
+    }
+
+    fn slot_is_settled(&self, id: &str) -> bool {
+        matches!(
+            self.slot_settlements.get(id),
+            Some(SlotSettlement::Settled(_))
+        )
+    }
+
+    fn slot_has_edge_terminal(&self, id: &str) -> bool {
+        matches!(
+            self.slot_settlements.get(id),
+            Some(SlotSettlement::EdgeObserved)
+                | Some(SlotSettlement::Settled(Some(
+                    TerminalProjectionOwner::EdgeCallback,
+                )))
+        )
+    }
+
+    fn exact_edge_callback_index(&self, slot: &HeadlessResolvedToolSlot) -> Option<usize> {
+        if let Some(index) = slot.synthetic_edge_index {
+            return Some(index);
+        }
+        let mut index = None;
+        for (candidate, edge) in self.ctx.edge_tool_round.iter().enumerate() {
+            if !edge.has_explicit_assistant_tool_call_id()
+                || edge.assistant_tool_call_id(candidate) != slot.id
+            {
+                continue;
+            }
+            if index.replace(candidate).is_some() {
+                return None;
+            }
+        }
+        index.filter(|&candidate| self.ctx.edge_tool_round[candidate].tool_name() == slot.name)
+    }
+
+    fn is_edge_callback_slot(&self, item: HeadlessRoundToolIdx) -> bool {
+        let slot = self.resolve_slot(item);
+        self.exact_edge_callback_index(&slot).is_some()
+    }
+
+    /// Whether an edge result has already been consumed as execution custody
+    /// for this slot. Only exact callback identity (or a pending exact edge
+    /// execution) can establish custody.
+    fn has_edge_execution_custody(&self, item: HeadlessRoundToolIdx) -> bool {
+        let slot = self.resolve_slot(item);
+        self.is_edge_callback_slot(item)
+            || matches!(
+                self.slot_settlements.get(&slot.id),
+                Some(SlotSettlement::EdgeObserved)
+                    | Some(SlotSettlement::PendingEdgeValidated { .. })
+                    | Some(SlotSettlement::PendingEdgePermitted(_))
+                    | Some(SlotSettlement::Settled(Some(
+                        TerminalProjectionOwner::EdgeCallback,
+                    )))
+            )
+    }
+
+    fn defer_permitted_edge_execution(&mut self, permitted: PermittedExecution) {
+        if permitted.execution.is_edge_tool {
+            self.slot_settlements.insert(
+                permitted.execution.id.clone(),
+                SlotSettlement::PendingEdgePermitted(permitted),
+            );
+        }
+    }
+
+    fn defer_permitted_edge_batch(&mut self, permitted: Vec<PermittedExecution>) {
+        for item in permitted {
+            self.defer_permitted_edge_execution(item);
+        }
+    }
+
+    async fn record_deferred_edge_execution(&mut self, permitted: PermittedExecution) {
+        let (executed, dispatch_control) = self
+            .execute_execution_with_dispatch_control(permitted)
+            .await;
+        self.record_execution(executed).await;
+        self.observe_runtime_dispatch_control(dispatch_control);
+    }
+
+    fn observe_execution_terminal_owner(&mut self, execution: &HeadlessResolvedExecution) {
+        self.slot_settlements.insert(
+            execution.id.clone(),
+            SlotSettlement::Settled(Some(execution.terminal_projection_owner())),
+        );
+    }
+
+    /// Policy short-circuits happen after the provider-facing start but before
+    /// a runtime route owns a terminal. Mark only server calls that did not
+    /// resolve to an edge result or a pre-resolution interception.
+    fn observe_policy_short_circuit(&mut self, item: HeadlessRoundToolIdx) {
+        let slot = self.resolve_slot(item);
+        if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
+            return;
+        }
+        let owner = if self.slot_has_edge_terminal(&slot.id) {
+            TerminalProjectionOwner::EdgeCallback
+        } else {
+            TerminalProjectionOwner::SharedLoop
+        };
+        self.slot_settlements
+            .insert(slot.id, SlotSettlement::Settled(Some(owner)));
     }
 
     pub(crate) fn action_fence_superseded(&self) -> bool {
@@ -520,16 +767,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
     }
 
-    pub(crate) fn tool_results_len(&self) -> usize {
-        self.ctx.tool_results.len()
-    }
-
-    pub(crate) fn tool_calls(&self) -> &[Value] {
-        self.ctx.tool_calls
-    }
-
-    pub(crate) fn edge_tool_name(&self, i: usize) -> String {
-        self.ctx.edge_tool_round[i].tool_name().to_string()
+    pub(crate) fn unsettled_tool_names(&self, items: &[HeadlessRoundToolIdx]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| {
+                if matches!(item, HeadlessRoundToolIdx::SyntheticEdge(_)) {
+                    return None;
+                }
+                let slot = self.resolve_slot(*item);
+                (!self.ctx.pre_resolved_ids.contains(slot.id.as_str())
+                    && !self.slot_is_settled(&slot.id)
+                    && !self.is_edge_callback_slot(*item))
+                .then_some(slot.name)
+            })
+            .collect()
     }
 
     pub(crate) fn scheduling_timeout_ms(&self) -> u64 {
@@ -538,6 +789,106 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(crate) fn record_step_abort(&mut self, aborted_tools: &[String]) {
         self.ctx.turn_guard.record_step_abort(aborted_tools);
+    }
+
+    /// Settle a slot that was already part of the provider-facing round but
+    /// never reached an executor.  A timeout/abort is a real terminal for the
+    /// shared loop; it must not be represented as success, and it must not be
+    /// assigned to a runtime route that never existed.
+    pub(crate) async fn settle_unstarted_slots(
+        &mut self,
+        items: &[HeadlessRoundToolIdx],
+        reason: &str,
+        error_kind: astra_core::ErrorKind,
+    ) {
+        for &item in items {
+            let slot = self.resolve_slot(item);
+            if self.ctx.pre_resolved_ids.contains(slot.id.as_str())
+                || self.slot_is_settled(&slot.id)
+            {
+                continue;
+            }
+            // An edge callback is an already completed external fact. It can
+            // appear as a normal ServerToolCall when the provider returned a
+            // mixed batch, and it can already have been consumed by validation
+            // while a later sibling caused the batch to abort. Replay the
+            // retained typed execution through the ordinary record boundary;
+            // never manufacture a cancellation for it.
+            if self.has_edge_execution_custody(item) {
+                match self.slot_settlements.remove(&slot.id) {
+                    Some(SlotSettlement::PendingEdgePermitted(permitted)) => {
+                        self.record_deferred_edge_execution(permitted).await;
+                    }
+                    Some(SlotSettlement::PendingEdgeValidated {
+                        execution,
+                        idem_key,
+                    }) => {
+                        // Re-enter the existing edge permission/capability gate
+                        // before replaying a validation-phase fact. This keeps a
+                        // future abort point from bypassing wrong-executor or
+                        // runtime-environment checks merely because the callback
+                        // was already consumed by resolution.
+                        match self
+                            .permit_execution(ValidatedExecution {
+                                execution,
+                                idem_key,
+                            })
+                            .await
+                        {
+                            HeadlessPipelineStage::Continue(permitted) => {
+                                self.record_deferred_edge_execution(permitted).await;
+                            }
+                            HeadlessPipelineStage::ShortCircuit
+                            | HeadlessPipelineStage::AbortRound => {
+                                self.observe_policy_short_circuit(item);
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        self.slot_settlements.insert(slot.id.clone(), other);
+                        if !self.slot_has_edge_terminal(&slot.id) {
+                            let _ = self.run_slot_with_control(item).await;
+                        }
+                    }
+                    None => {
+                        let _ = self.run_slot_with_control(item).await;
+                    }
+                }
+                continue;
+            }
+            let message = format!(
+                "Tool '{}' was cancelled before dispatch: {reason}",
+                slot.name
+            );
+            self.slot_settlements.insert(
+                slot.id.clone(),
+                SlotSettlement::Settled(Some(TerminalProjectionOwner::SharedLoop)),
+            );
+            let reason_code = if error_kind == astra_core::ErrorKind::ToolTimeout {
+                "tool_timeout"
+            } else {
+                "tool_cancelled"
+            };
+            policy::emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &slot.id,
+                    name: &slot.name,
+                    args: &slot.args,
+                    reason_code,
+                    journal_kind: HeadlessShortCircuitJournalKind::Cancelled { error_kind },
+                    err_msg: message.clone(),
+                    journal_reason: message,
+                    early_exit_ms: 0,
+                    status_line: Some(format!("  ⚠ Tool cancelled before dispatch: {}", slot.name)),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+        }
     }
 
     fn begin_execution_trace(
@@ -577,13 +928,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(crate) async fn run_slot_with_control(&mut self, item: HeadlessRoundToolIdx) -> bool {
         let validated = match self.validate_slot(item) {
             HeadlessPipelineStage::Continue(validated) => validated,
-            HeadlessPipelineStage::ShortCircuit => return true,
-            HeadlessPipelineStage::AbortRound => return false,
+            HeadlessPipelineStage::ShortCircuit => {
+                self.observe_policy_short_circuit(item);
+                return true;
+            }
+            HeadlessPipelineStage::AbortRound => {
+                // The validator has already emitted a terminal tool result
+                // (for example the empty-name guard) but the round must stop.
+                // It still belongs to the shared loop because no executor
+                // route was established.
+                self.observe_policy_short_circuit(item);
+                return false;
+            }
         };
 
         let permitted = match self.permit_execution(validated).await {
             HeadlessPipelineStage::Continue(permitted) => permitted,
-            HeadlessPipelineStage::ShortCircuit => return true,
+            HeadlessPipelineStage::ShortCircuit => {
+                self.observe_policy_short_circuit(item);
+                return true;
+            }
             HeadlessPipelineStage::AbortRound => return false,
         };
 
@@ -600,8 +964,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let (executed, dispatch_control) = self
             .execute_execution_with_dispatch_control(permitted)
             .await;
+        let is_work_establishment = executed.execution.name == "start_work";
         self.record_execution(executed).await;
-        self.observe_runtime_dispatch_control(dispatch_control)
+        let continue_round = self.observe_runtime_dispatch_control(dispatch_control);
+        // `start_work` is a state-machine transition, not an ordinary
+        // capability. Its result (success or failure) is only visible to the
+        // next provider round, where the typed receipt/initial assignment can
+        // be consumed. Stop the current round after the transition so a
+        // sibling can never run against a merely proposed or failed binding.
+        if is_work_establishment {
+            return false;
+        }
+        continue_round
     }
 
     /// Execute a batch of read-only tools concurrently.
@@ -614,13 +988,27 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         for &item in items {
             let validated = match self.validate_slot(item) {
                 HeadlessPipelineStage::Continue(v) => v,
-                HeadlessPipelineStage::ShortCircuit => continue,
-                HeadlessPipelineStage::AbortRound => return false,
+                HeadlessPipelineStage::ShortCircuit => {
+                    self.observe_policy_short_circuit(item);
+                    continue;
+                }
+                HeadlessPipelineStage::AbortRound => {
+                    self.observe_policy_short_circuit(item);
+                    self.defer_permitted_edge_batch(permitted_batch);
+                    return false;
+                }
             };
             match self.permit_execution(validated).await {
                 HeadlessPipelineStage::Continue(p) => permitted_batch.push(p),
-                HeadlessPipelineStage::ShortCircuit => continue,
-                HeadlessPipelineStage::AbortRound => return false,
+                HeadlessPipelineStage::ShortCircuit => {
+                    self.observe_policy_short_circuit(item);
+                    continue;
+                }
+                HeadlessPipelineStage::AbortRound => {
+                    self.observe_policy_short_circuit(item);
+                    self.defer_permitted_edge_batch(permitted_batch);
+                    return false;
+                }
             };
         }
 
@@ -642,6 +1030,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 self.ctx.session_turn, self.ctx.llm_round, batch_digest
             );
             if !self.authorize_action(&action_id).await {
+                self.defer_permitted_edge_batch(permitted_batch);
                 return false;
             }
         }
@@ -854,6 +1243,56 @@ mod tests {
         })
     }
 
+    #[test]
+    fn external_effect_recovery_scope_is_injected_only_for_foreground_bash() {
+        let paths = vec!["/etc/ssh/sshd_config.d/99-gitlab.conf".to_string()];
+        let mut args = json!({"command": "printf done"});
+        assert!(inherit_external_effect_recovery_scope(
+            "bash",
+            &mut args,
+            Some(&paths),
+        ));
+        assert_eq!(
+            args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
+            json!(paths),
+        );
+
+        let mut explicit = json!({
+            "command": "printf done",
+            "external_state_paths": ["/different/root"]
+        });
+        assert!(!inherit_external_effect_recovery_scope(
+            "bash",
+            &mut explicit,
+            Some(&paths),
+        ));
+        assert_eq!(
+            explicit[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
+            json!(["/different/root"]),
+        );
+
+        let mut background = json!({
+            "command": "printf done",
+            "run_in_background": true
+        });
+        assert!(!inherit_external_effect_recovery_scope(
+            "bash",
+            &mut background,
+            Some(&paths),
+        ));
+        assert!(
+            !background
+                .as_object()
+                .expect("background args object")
+                .contains_key(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+        );
+        assert!(!inherit_external_effect_recovery_scope(
+            "read_file",
+            &mut args,
+            Some(&paths),
+        ));
+    }
+
     fn edge_runtime_environment_fields() -> Map<String, Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
@@ -888,12 +1327,16 @@ mod tests {
         api: ThinClient,
         tool_calls: Vec<Value>,
         edge_tool_round: Vec<EdgeToolExecResult>,
-        by_sig: HashMap<String, String>,
         pre_resolved_ids: HashSet<String>,
         messages: Vec<Value>,
         tool_results: Vec<Value>,
         valid_tool_names: HashSet<String>,
         deferred_tool_names: HashSet<String>,
+        deferred_activations_by_call_id: HashMap<String, DeferredToolActivation>,
+        runtime_control_calls_by_id: HashMap<
+            String,
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
+        >,
         restricted_tools: HashSet<String>,
         turn_guard: TurnGuard,
         step_recorder: StepRecorder,
@@ -935,12 +1378,13 @@ mod tests {
                     status: "completed".to_string(),
                     duration_ms: 12,
                 }],
-                by_sig: HashMap::new(),
                 pre_resolved_ids: HashSet::new(),
                 messages: Vec::new(),
                 tool_results: Vec::new(),
                 valid_tool_names: HashSet::from(["grep".to_string()]),
                 deferred_tool_names: HashSet::new(),
+                deferred_activations_by_call_id: HashMap::new(),
+                runtime_control_calls_by_id: HashMap::new(),
                 restricted_tools: HashSet::new(),
                 turn_guard: TurnGuard::new(),
                 step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
@@ -980,6 +1424,18 @@ mod tests {
             )
         }
 
+        fn pipeline_with_action_fence<'a>(
+            &'a mut self,
+            action_fence: &'a dyn crate::turn::agentic::headless_round::HeadlessActionFence,
+        ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
+            self.pipeline_with_server_executor_for_session_turn_and_fence(
+                0,
+                1,
+                None,
+                Some(action_fence),
+            )
+        }
+
         fn durable_pipeline_with_server_executor<'a>(
             &'a mut self,
             runtime_tool_executor: &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
@@ -994,6 +1450,23 @@ mod tests {
             runtime_tool_executor: Option<
                 &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
+        ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
+            self.pipeline_with_server_executor_for_session_turn_and_fence(
+                turn_index,
+                session_turn,
+                runtime_tool_executor,
+                None,
+            )
+        }
+
+        fn pipeline_with_server_executor_for_session_turn_and_fence<'a>(
+            &'a mut self,
+            turn_index: usize,
+            session_turn: u32,
+            runtime_tool_executor: Option<
+                &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
+            >,
+            action_fence: Option<&'a dyn crate::turn::agentic::headless_round::HeadlessActionFence>,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             let has_runtime_executor = runtime_tool_executor.is_some();
             HeadlessToolExecutionPipeline::new(
@@ -1010,8 +1483,9 @@ mod tests {
                         .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
                     tool_calls: &self.tool_calls,
+                    deferred_activations_by_call_id: &self.deferred_activations_by_call_id,
+                    runtime_control_calls_by_id: &self.runtime_control_calls_by_id,
                     edge_tool_round: &self.edge_tool_round,
-                    by_sig: &self.by_sig,
                     pre_resolved_ids: &self.pre_resolved_ids,
                     messages: &mut self.messages,
                     tool_results: &mut self.tool_results,
@@ -1035,12 +1509,13 @@ mod tests {
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
                     runtime_tool_executor,
+                    external_effect_recovery_paths: None,
                     turn_start: None,
                     llm_round: 0,
                     plan_mode_active: false,
                 },
                 vec![false; self.edge_tool_round.len()],
-                None,
+                action_fence,
             )
         }
     }
@@ -1099,6 +1574,39 @@ mod tests {
             !result.contains("required runtime capability is not connected"),
             "control-plane deferred tools are not executor-gated runtime tools: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn schema_addressed_deferred_call_bypasses_only_wire_schema_visibility() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-session",
+            "type": "function",
+            "function": {"name": "session", "arguments": "{}"}
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["session".to_string()]);
+        harness.deferred_activations_by_call_id.insert(
+            "call-session".to_string(),
+            DeferredToolActivation {
+                name: "session".to_string(),
+                schema_digest:
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                descriptor: None,
+            },
+        );
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => {
+                assert_eq!(validated.execution.id, "call-session");
+                assert_eq!(validated.execution.name, "session");
+            }
+            _ => panic!("typed deferred proof must bypass only visible-schema admission"),
+        }
     }
 
     #[tokio::test]
@@ -1847,6 +2355,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_work_establishment_aborts_sibling_capability_before_executor_dispatch() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("sibling-executed");
+        let marker_path = marker.to_string_lossy().into_owned();
+        harness.tool_calls = vec![
+            json!({
+                "id": "call-start-fails",
+                "type": "function",
+                "function": {"name": "start_work", "arguments": "{}"}
+            }),
+            json!({
+                "id": "call-sibling-must-not-run",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": serde_json::to_string(&json!({
+                        "command": format!("printf executed > {}", marker_path)
+                    }))
+                    .unwrap()
+                }
+            }),
+        ];
+        harness.valid_tool_names = HashSet::from(["bash".to_string()]);
+        harness.runtime_control_calls_by_id.insert(
+            "call-start-fails".to_string(),
+            RuntimeControlInvocationKind::WorkEstablishment,
+        );
+        begin_recorded_turn(&mut harness, 2);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), "test-session");
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+            assert!(
+                !pipeline
+                    .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                    .await,
+                "a Work establishment transition must end the provider round even when it fails"
+            );
+            pipeline
+                .settle_unstarted_slots(
+                    &[
+                        HeadlessRoundToolIdx::ServerToolCall(0),
+                        HeadlessRoundToolIdx::ServerToolCall(1),
+                    ],
+                    "canonical Work establishment did not settle",
+                    astra_core::ErrorKind::Cancelled,
+                )
+                .await;
+        }
+
+        assert!(
+            !marker.exists(),
+            "a sibling capability must not reach the executor after start_work failed"
+        );
+        assert!(
+            harness
+                .tool_results
+                .iter()
+                .any(|result| result.to_string().contains("cancelled before dispatch")),
+            "the skipped sibling needs a typed cancellation result"
+        );
+        assert!(
+            harness
+                .tool_call_records
+                .iter()
+                .any(|record| record.name == "bash" && !record.ok),
+            "the sibling must be journaled as cancelled, not as an executed failure"
+        );
+    }
+
     #[test]
     fn server_admitted_client_pipeline_result_bypasses_workspace_executor_guard_only() {
         let mut execution = HeadlessResolvedExecution {
@@ -1862,6 +2444,8 @@ mod tests {
             authoritative_is_error: Some(false),
             pending_runtime_completion: None,
             edge_duration_ms: 1,
+            edge_terminal_authority: true,
+            edge_result_missing: false,
             early_exit_ms: 0,
         };
         assert!(is_admitted_client_pipeline_result(&execution));
@@ -1901,6 +2485,8 @@ mod tests {
             pending_runtime_completion: None,
             edge_duration_ms: 1,
             is_edge_tool: true,
+            edge_result_missing: false,
+            edge_terminal_authority: true,
             early_exit_ms: 0,
         };
 
@@ -1920,7 +2506,7 @@ mod tests {
 
         match pipeline.permit_execution(validated).await {
             HeadlessPipelineStage::ShortCircuit => {
-                assert_eq!(pipeline.tool_results_len(), 1);
+                assert_eq!(pipeline.ctx.tool_results.len(), 1);
             }
             _ => panic!("expected restricted tool short circuit"),
         }
@@ -2257,6 +2843,8 @@ mod tests {
                         pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic(tool_name, &args),
@@ -2331,6 +2919,8 @@ mod tests {
                         pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
@@ -2429,6 +3019,8 @@ mod tests {
                         pending_runtime_completion: None,
                         edge_duration_ms: 1,
                         is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
                         early_exit_ms: 0,
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
@@ -2588,9 +3180,301 @@ mod tests {
 
         pipeline.record_execution(executed).await;
 
-        assert_eq!(pipeline.tool_results_len(), 1);
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
         assert_eq!(pipeline.executed_this_turn, 1);
         assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_unstarted_server_slot_records_shared_terminal_once() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-timeout",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"x\"}"}
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names.insert("read_file".to_string());
+        let mut pipeline = harness.pipeline();
+
+        pipeline
+            .settle_unstarted_slots(
+                &[HeadlessRoundToolIdx::ServerToolCall(0)],
+                "deadline",
+                astra_core::ErrorKind::ToolTimeout,
+            )
+            .await;
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(shared_ids.contains("call-timeout"));
+
+        assert_eq!(harness.tool_results.len(), 1);
+        assert!(
+            harness.tool_results[0]
+                .to_string()
+                .contains("cancelled before dispatch")
+        );
+        let record = harness
+            .tool_call_records
+            .last()
+            .expect("cancellation is journaled");
+        assert_eq!(record.tool_call_id.as_deref(), Some("call-timeout"));
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled_tool"))
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_unstarted_slots_reconciles_exact_ids_not_result_counts() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = (0..3)
+            .map(|index| {
+                json!({
+                    "id": format!("call-{index}"),
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                })
+            })
+            .collect();
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names.insert("read_file".to_string());
+        let mut pipeline = harness.pipeline();
+        // Simulate an out-of-order policy result for the middle slot.  A
+        // count-based suffix would either duplicate it or miss slot zero.
+        pipeline
+            .slot_settlements
+            .insert("call-1".to_string(), SlotSettlement::Settled(None));
+        pipeline
+            .settle_unstarted_slots(
+                &[
+                    HeadlessRoundToolIdx::ServerToolCall(0),
+                    HeadlessRoundToolIdx::ServerToolCall(1),
+                    HeadlessRoundToolIdx::ServerToolCall(2),
+                ],
+                "round abort",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+        pipeline
+            .settle_unstarted_slots(
+                &[
+                    HeadlessRoundToolIdx::ServerToolCall(0),
+                    HeadlessRoundToolIdx::ServerToolCall(1),
+                    HeadlessRoundToolIdx::ServerToolCall(2),
+                ],
+                "round abort replay",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(shared_ids.contains("call-0"));
+        assert!(!shared_ids.contains("call-1"));
+        assert!(shared_ids.contains("call-2"));
+        let ids = harness
+            .tool_call_records
+            .iter()
+            .filter_map(|record| record.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call-0", "call-2"]);
+    }
+
+    #[tokio::test]
+    async fn settling_unstarted_edge_slot_replays_callback_fact_instead_of_cancelling() {
+        let mut harness = PipelineHarness::new();
+        let mut pipeline = harness.pipeline();
+        pipeline
+            .settle_unstarted_slots(
+                &[HeadlessRoundToolIdx::SyntheticEdge(0)],
+                "round abort",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(!shared_ids.contains("edge-0"));
+        let record = harness
+            .tool_call_records
+            .last()
+            .expect("edge callback fact is recorded");
+        assert!(record.ok);
+        assert_ne!(record.error_kind, Some(astra_core::ErrorKind::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn settling_mixed_batch_server_slot_with_exact_edge_id_replays_callback_fact() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "request-edge-mixed",
+            "type": "function",
+            "function": {"name": "grep", "arguments": "{\"pattern\":\"headless\"}"}
+        })];
+        harness.edge_tool_round[0].request_id = "request-edge-mixed".to_string();
+        let mut pipeline = harness.pipeline();
+
+        pipeline
+            .settle_unstarted_slots(
+                &[HeadlessRoundToolIdx::ServerToolCall(0)],
+                "deadline",
+                astra_core::ErrorKind::ToolTimeout,
+            )
+            .await;
+
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(!shared_ids.contains("request-edge-mixed"));
+        assert_eq!(harness.tool_call_records.len(), 1);
+        let record = &harness.tool_call_records[0];
+        assert_eq!(record.tool_call_id.as_deref(), Some("request-edge-mixed"));
+        assert!(record.ok, "the edge fact must not become a cancellation");
+        assert_ne!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+    }
+
+    #[tokio::test]
+    async fn idless_edge_output_does_not_match_provider_call() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "provider-call",
+            "type": "function",
+            "function": {"name": "grep", "arguments": "{\"pattern\":\"headless\"}"}
+        })];
+        // Same name and arguments are not an execution identity. An id-less
+        // callback must not be allowed to bypass the provider permission and
+        // execution route.
+        harness.edge_tool_round[0].request_id.clear();
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("an id-less callback must remain an executable provider call"),
+        };
+        assert!(!validated.execution.is_edge_tool);
+        assert!(validated.execution.edge_result_missing);
+        assert!(!validated.execution.edge_terminal_authority);
+        assert!(!pipeline.consumed_edge[0]);
+    }
+
+    #[tokio::test]
+    async fn unmatched_edge_output_still_owns_shared_terminal() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "provider-rejected-call",
+            "type": "function",
+            "function": {"name": "grep", "arguments": "{\"pattern\":\"headless\"}"}
+        })];
+        harness.edge_tool_round[0].request_id.clear();
+        // Force the post-resolution policy branch. The unmatched callback is
+        // not an edge terminal and therefore remains owned by the shared loop.
+        harness.valid_tool_names.clear();
+        let mut pipeline = harness.pipeline();
+        assert!(
+            pipeline
+                .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                .await
+        );
+        assert!(
+            pipeline
+                .into_shared_loop_terminal_call_ids()
+                .contains("provider-rejected-call")
+        );
+    }
+
+    #[tokio::test]
+    async fn settling_edge_fact_consumed_during_validation_records_it_once() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "request-edge-consumed",
+            "type": "function",
+            "function": {"name": "grep", "arguments": "{\"pattern\":\"headless\"}"}
+        })];
+        harness.edge_tool_round[0].request_id = "request-edge-consumed".to_string();
+        let mut pipeline = harness.pipeline();
+
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("exact edge callback should validate"),
+        };
+        assert!(validated.execution.is_edge_tool);
+        assert!(pipeline.ctx.tool_call_records.is_empty());
+
+        pipeline
+            .settle_unstarted_slots(
+                &[HeadlessRoundToolIdx::ServerToolCall(0)],
+                "sibling aborted",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+        pipeline
+            .settle_unstarted_slots(
+                &[HeadlessRoundToolIdx::ServerToolCall(0)],
+                "replay",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+
+        assert_eq!(harness.tool_call_records.len(), 1);
+        assert!(harness.tool_call_records[0].ok);
+        assert_ne!(
+            harness.tool_call_records[0].error_kind,
+            Some(astra_core::ErrorKind::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_abort_records_permitted_edge_before_cancelling_server_tail() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![
+            json!({
+                "id": "request-edge-batch",
+                "type": "function",
+                "function": {"name": "grep", "arguments": "{\"pattern\":\"headless\"}"}
+            }),
+            json!({
+                "id": "call-server-tail",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"tail\"}"}
+            }),
+        ];
+        harness.edge_tool_round[0].request_id = "request-edge-batch".to_string();
+        harness.valid_tool_names.insert("read_file".to_string());
+        let fence = RejectActionFence(AtomicUsize::new(0));
+        let mut pipeline = harness.pipeline_with_action_fence(&fence);
+        let indices = [
+            HeadlessRoundToolIdx::ServerToolCall(0),
+            HeadlessRoundToolIdx::ServerToolCall(1),
+        ];
+
+        assert!(!pipeline.run_batch_concurrent(&indices).await);
+        pipeline
+            .settle_unstarted_slots(
+                &indices,
+                "sibling aborted",
+                astra_core::ErrorKind::Cancelled,
+            )
+            .await;
+        pipeline
+            .settle_unstarted_slots(&indices, "replay", astra_core::ErrorKind::Cancelled)
+            .await;
+
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(!shared_ids.contains("request-edge-batch"));
+        assert!(shared_ids.contains("call-server-tail"));
+        assert_eq!(harness.tool_call_records.len(), 2);
+        let edge_record = harness
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("request-edge-batch"))
+            .expect("mixed edge fact is recorded");
+        assert!(edge_record.ok);
+        assert_ne!(
+            edge_record.error_kind,
+            Some(astra_core::ErrorKind::Cancelled)
+        );
+        let tail_record = harness
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("call-server-tail"))
+            .expect("server tail has a typed terminal");
+        assert!(!tail_record.ok);
     }
 
     #[tokio::test]
@@ -2741,6 +3625,50 @@ mod tests {
             .expect("successful read should populate the observation cache");
         assert!(cached.output.contains("[REDACTED:"), "{}", cached.output);
         assert!(!cached.output.contains("AKIA1234567890ABCDEF"));
+    }
+
+    #[tokio::test]
+    async fn invalid_runtime_arguments_still_close_shared_loop_terminal() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-invalid-run-next",
+            "type": "function",
+            "function": {
+                "name": "run_next_work_item",
+                "arguments": r#"{"activation":"start","goal":"wrong carrier","tasks":[]}"#,
+            }
+        })];
+        harness.edge_tool_round.clear();
+        harness
+            .valid_tool_names
+            .insert("run_next_work_item".to_string());
+        begin_recorded_turn(&mut harness, 1);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let mut pipeline = harness.durable_pipeline_with_server_executor(&executor);
+
+        assert!(
+            pipeline
+                .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                .await,
+            "a typed argument rejection must settle the round instead of aborting before ownership is recorded"
+        );
+        let shared_ids = pipeline.into_shared_loop_terminal_call_ids();
+        assert!(
+            shared_ids.contains("call-invalid-run-next"),
+            "pre-dispatch schema validation has no RuntimeToolExecutor terminal owner"
+        );
+        let record = harness
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("call-invalid-run-next"))
+            .expect("invalid call should have one journal record");
+        assert!(!record.ok);
+        assert_eq!(
+            record.error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
     }
 
     #[tokio::test]
@@ -2977,6 +3905,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
@@ -3029,6 +3959,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
@@ -3074,6 +4006,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("git", &args),
@@ -3136,6 +4070,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("read_file", &args),
@@ -3186,6 +4122,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("bash", &args),
@@ -3234,6 +4172,8 @@ mod tests {
                 pending_runtime_completion: None,
                 edge_duration_ms: 0,
                 is_edge_tool: false,
+                edge_result_missing: true,
+                edge_terminal_authority: false,
                 early_exit_ms: 0,
             },
             idem_key: IdempotencyKey::semantic("write_file", &args),
@@ -3330,11 +4270,11 @@ mod tests {
         );
     }
 
-    /// Direct-call recovery contract: when the model calls a deferred tool
-    /// that the current runtime can activate, the validator records the
-    /// activation intent instead of emitting the bare "Unknown tool" message.
+    /// Direct-call recovery contract: a deferred tool's full schema is not
+    /// trusted on a direct call. The validator rejects that batch entry and
+    /// points the model at typed selection plus the stable invocation carrier.
     #[tokio::test]
-    async fn validator_direct_deferred_call_records_activation_hint() {
+    async fn validator_direct_deferred_call_requires_carrier() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "memory");
         begin_recorded_turn(&mut harness, 1);
@@ -3351,23 +4291,18 @@ mod tests {
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
         drop(pipeline);
 
-        assert_eq!(
-            server_exec.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "validator path must record activation for the next model request"
-        );
         let record = harness
             .tool_call_records
             .last()
-            .expect("direct deferred activation should record a journal placeholder");
+            .expect("direct deferred rejection should record a journal entry");
         assert_eq!(record.name, "memory");
-        assert!(record.ok);
-        assert_eq!(record.error.as_deref(), Some("deferred_tool_activated"));
+        assert!(!record.ok);
+        assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
         assert_eq!(
             record.effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Suppressed
+            astra_services::session_journal::ToolCallDisposition::Rejected
         );
-        assert!(record.is_synthetic_placeholder());
+        assert!(!record.is_synthetic_placeholder());
         assert!(
             record
                 .result_preview
@@ -3381,7 +4316,7 @@ mod tests {
                 .as_ref()
                 .and_then(|payload| payload.get("reason"))
                 .and_then(Value::as_str),
-            Some("direct_deferred_call_activated")
+            Some("direct_deferred_call_requires_carrier")
         );
 
         // Hallucinated names still get the Unknown-tool body.
@@ -3403,6 +4338,46 @@ mod tests {
             halluc_body.starts_with("Unknown tool"),
             "hallucinated names must still get the bare unknown-tool copy; got: {halluc_body}"
         );
+    }
+
+    #[tokio::test]
+    async fn validator_accepts_only_exact_host_owned_control_identity() {
+        let mut harness = PipelineHarness::new();
+        let call_id = "server-work-admission-t1-r0";
+        harness.tool_calls.push(json!({
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        }));
+        harness.runtime_control_calls_by_id.insert(
+            call_id.to_string(),
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkEstablishment,
+        );
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        assert!(matches!(
+            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+            HeadlessPipelineStage::Continue(_)
+        ));
+        drop(pipeline);
+        assert!(
+            harness.tool_call_records.is_empty(),
+            "host-owned provenance should cross the visibility check without a synthetic rejection"
+        );
+
+        let mut forged = PipelineHarness::new();
+        forged.tool_calls.push(json!({
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        }));
+        begin_recorded_turn(&mut forged, 1);
+        let mut forged_pipeline = forged.pipeline();
+        assert!(matches!(
+            forged_pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+            HeadlessPipelineStage::ShortCircuit
+        ));
     }
 
     #[tokio::test]
@@ -3436,10 +4411,6 @@ mod tests {
         assert!(
             !body.contains("select:github"),
             "validator must not invent activation guidance without a prompt manifest: {body}"
-        );
-        assert!(
-            server_exec.activated_deferred_tool_names().is_empty(),
-            "stale activatable state must not activate a tool that was not prompt-advertised"
         );
     }
 

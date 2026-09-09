@@ -130,6 +130,14 @@ impl ToolInvocationDecisionSnapshot {
         registry: &astra_runtime_env::ToolRegistry,
     ) -> Result<Self, ToolInvocationDecisionError> {
         let provider_policy = request.policy.resolved_provider_policy.clone();
+        if let Some(policy) = provider_policy.as_ref() {
+            let offer = request.selected_offer.as_ref().ok_or_else(|| {
+                ToolInvocationDecisionError::MissingProviderOffer {
+                    tool_name: request.tool_name.clone(),
+                }
+            })?;
+            validate_provider_offer_consistency(&request.tool_name, route, policy, offer)?;
+        }
         let tool = if let Some(policy) = provider_policy.as_ref() {
             DurableToolReference::Provider {
                 descriptor: policy.descriptor.clone(),
@@ -356,6 +364,32 @@ impl ToolInvocationDecisionSnapshot {
     }
 }
 
+fn validate_provider_offer_consistency(
+    tool_name: &str,
+    route: ToolExecutionRouteKind,
+    policy: &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+    offer: &SelectedToolOfferSnapshot,
+) -> Result<(), ToolInvocationDecisionError> {
+    let descriptor = &policy.descriptor;
+    let mismatch = |field: &'static str| ToolInvocationDecisionError::ProviderOfferMismatch {
+        tool_name: tool_name.to_string(),
+        field,
+    };
+    if offer.route != route {
+        return Err(mismatch("route"));
+    }
+    if offer.provider_id != descriptor.identity.provider_binding.as_str() {
+        return Err(mismatch("provider_id"));
+    }
+    if offer.native_tool_id.as_deref() != Some(descriptor.identity.native_tool_id.as_str()) {
+        return Err(mismatch("native_tool_id"));
+    }
+    if offer.schema_digest.as_deref() != Some(descriptor.descriptor_version.as_str()) {
+        return Err(mismatch("schema_digest"));
+    }
+    Ok(())
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -389,6 +423,13 @@ fn resolve_semantic_read_cache_decision(
 pub(crate) enum ToolInvocationDecisionError {
     #[error("tool '{tool_name}' has no exact provider descriptor or built-in registry contract")]
     MissingToolContract { tool_name: String },
+    #[error("provider tool '{tool_name}' has no selected provider offer")]
+    MissingProviderOffer { tool_name: String },
+    #[error("provider offer for '{tool_name}' disagrees with the resolved policy ({field})")]
+    ProviderOfferMismatch {
+        tool_name: String,
+        field: &'static str,
+    },
     #[error("tool invocation is missing its frozen admission snapshot")]
     MissingAdmissionSnapshot,
     #[error("serialize tool invocation decision: {0}")]
@@ -489,6 +530,13 @@ mod tests {
     ) -> ToolExecutionRequest {
         let mut request = request();
         request.tool_name = "projected_read_alias".to_string();
+        request.selected_offer = Some(SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            &request.tool_name,
+            "provider-binding",
+            ToolExecutionRouteKind::RequestScopedMcp,
+            Some(descriptor_version.to_string()),
+            "native-read",
+        ));
         request.policy.resolved_provider_policy = Some(provider_policy(
             descriptor_version,
             ResolvedToolEffect::ReadOnly,
@@ -562,6 +610,7 @@ mod tests {
             ResolvedSemanticCacheBaseline::FreshnessBound,
         )
         .descriptor;
+        request.selected_offer.as_mut().unwrap().schema_digest = Some("descriptor-v2".to_string());
         let changed_descriptor = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::RequestScopedMcp,
@@ -572,6 +621,56 @@ mod tests {
             original.decision_id().unwrap(),
             changed_descriptor.decision_id().unwrap()
         );
+    }
+
+    #[test]
+    fn provider_policy_and_offer_must_be_one_execution_identity() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut request = provider_request(
+            "descriptor-v1",
+            ResolvedSemanticCacheBaseline::FreshnessBound,
+        );
+        request.selected_offer.as_mut().unwrap().route = ToolExecutionRouteKind::ServerRuntime;
+        assert!(matches!(
+            ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                ToolExecutionRouteKind::RequestScopedMcp,
+                &registry,
+            ),
+            Err(ToolInvocationDecisionError::ProviderOfferMismatch { field: "route", .. })
+        ));
+
+        let mut request = provider_request(
+            "descriptor-v1",
+            ResolvedSemanticCacheBaseline::FreshnessBound,
+        );
+        request.selected_offer.as_mut().unwrap().native_tool_id =
+            Some("different-native".to_string());
+        assert!(matches!(
+            ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                ToolExecutionRouteKind::RequestScopedMcp,
+                &registry,
+            ),
+            Err(ToolInvocationDecisionError::ProviderOfferMismatch {
+                field: "native_tool_id",
+                ..
+            })
+        ));
+
+        let mut request = provider_request(
+            "descriptor-v1",
+            ResolvedSemanticCacheBaseline::FreshnessBound,
+        );
+        request.selected_offer = None;
+        assert!(matches!(
+            ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                ToolExecutionRouteKind::RequestScopedMcp,
+                &registry,
+            ),
+            Err(ToolInvocationDecisionError::MissingProviderOffer { .. })
+        ));
     }
 
     #[test]

@@ -14635,6 +14635,35 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(AtomicRunUserIntentApply::SettlementFenced);
         }
 
+        // A committed user-intent disposition starts a new canonical semantic
+        // turn. Supersede any abandoned Work-establishment carrier in this
+        // same transaction, before publishing `user_intent_applied`; otherwise
+        // a crash between the two commits could resurrect the old carrier and
+        // block or reinterpret the already-applied user turn.
+        let current_turn_chain_id = expected
+            .last()
+            .and_then(|(applied, _)| applied.get("data"))
+            .and_then(|data| data.get("intent_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|intent_id| !intent_id.trim().is_empty())
+            .ok_or_else(|| {
+                "validated user-intent apply batch lost its canonical intent identity".to_string()
+            })?;
+        let work_owner = crate::work::WorkOwnerId::parse(request.user_id.to_string())
+            .map_err(|error| format!("invalid Work owner at user-intent apply: {error}"))?;
+        let work_session =
+            crate::work::InternalSessionId::parse(request.expected_session_id.to_string())
+                .map_err(|error| format!("invalid Work session at user-intent apply: {error}"))?;
+        crate::work::cancel_pending_for_new_turn_tx(
+            &mut tx,
+            &work_owner,
+            &work_session,
+            current_turn_chain_id,
+            "new user turn superseded an unfinished Work establishment",
+        )
+        .await
+        .map_err(|error| format!("durable Work supersession failed: {error}"))?;
+
         let first_event_index = run
             .last_event_idx
             .checked_add(1)

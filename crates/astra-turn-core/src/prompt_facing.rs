@@ -1,10 +1,9 @@
 //! Prompt-facing conversation message normalization.
 //!
-//! Runtime state may contain provider tool-call frames, tool outputs, cache
-//! markers, reasoning-only assistant frames, and compaction boundaries. Those
-//! are execution trace, not stable prompt input. Use this module only at
-//! prompt/session-display projection boundaries; canonical stores such as CSL
-//! must retain raw runtime history.
+//! Display projections omit execution detail. Canonical continuation retains
+//! complete tool call/result groups as model evidence; only the context
+//! optimizer decides when pressure justifies compaction. Do not substitute a
+//! display projection for canonical history.
 
 use crate::conversation_log::SessionStateCompact;
 use astra_turn_types::{
@@ -164,25 +163,28 @@ pub fn sanitize_prompt_facing_messages_with_state(
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, false)
+    sanitize_canonical_continuation_messages_impl(messages, false, false)
 }
 
-/// Project an already-compacted current-turn delta for resumable canonical
-/// commit.
+/// Project a current-turn delta for canonical commit, independent of outcome.
 ///
 /// Tiered compaction has already removed the compacted middle from this
 /// vector. Only an explicit typed replacement in the retained tail supersedes
 /// the protected head. Refinements, corrections, continuations, and unjudged
-/// user messages retain the objective they depend on.
-pub fn sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+/// user messages retain the objective they depend on. `has_prior_user_context`
+/// comes only from the immutable admitted prefix, not from runtime scaffolding;
+/// it lets a resumed suffix continue that user turn without copying its anchor.
+pub fn sanitize_canonical_turn_delta_with_turn_semantics(
     messages: Vec<Value>,
+    has_prior_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, true)
+    sanitize_canonical_continuation_messages_impl(messages, true, has_prior_user_context)
 }
 
 fn sanitize_canonical_continuation_messages_impl(
     messages: Vec<Value>,
     preserve_compacted_head: bool,
+    mut has_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
     for message in &messages {
         if message
@@ -216,7 +218,6 @@ fn sanitize_canonical_continuation_messages_impl(
 
     let mut out = Vec::new();
     let mut index = 0;
-    let mut has_user_context = false;
     while index < messages.len() {
         let message = &messages[index];
         if runtime_message_delivery(message)
@@ -253,59 +254,6 @@ fn sanitize_canonical_continuation_messages_impl(
             // Tool messages are admitted only by `append_complete_tool_group`,
             // which guarantees that every retained result has a matching call.
             _ => index += 1,
-        }
-    }
-    Ok(out)
-}
-
-/// Project a successfully completed turn into durable conversational meaning.
-///
-/// Completed tool call/result frames are execution evidence owned by the run
-/// transcript and recovery checkpoint, not by every future model request. This
-/// projection intentionally has no generic recent-message cap: the caller
-/// passes one canonical turn delta. Its opening objective is retained unless
-/// a typed replacement after compaction explicitly supersedes it.
-pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
-    messages: Vec<Value>,
-) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    for message in &messages {
-        if message
-            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
-            .is_some()
-        {
-            astra_turn_types::user_turn_semantics(message)?;
-        }
-    }
-
-    let start = compacted_canonical_turn_start(&messages)?;
-    let mut out = Vec::new();
-    let mut has_user_context = false;
-    for message in messages.into_iter().skip(start) {
-        if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        if runtime_message_delivery(&message)
-            == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
-        {
-            out.push(message);
-            continue;
-        }
-        if is_runtime_owned_message(&message) {
-            continue;
-        }
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-        if role == "assistant" && contains_tool_call_frame(&message) {
-            continue;
-        }
-        if !matches!(role, "user" | "assistant" | "system") {
-            continue;
-        }
-        if role == "assistant" && !has_user_context {
-            continue;
-        }
-        if let Some(projected) = canonical_text_message(&message, role, role == "user") {
-            out.push(projected);
-            has_user_context |= role == "user";
         }
     }
     Ok(out)
@@ -689,9 +637,8 @@ mod tests {
     use super::{
         recover_canonical_continuation_messages_with_turn_semantics, runtime_recap_message,
         sanitize_canonical_continuation_messages_with_state,
-        sanitize_completed_canonical_turn_messages_with_turn_semantics,
-        sanitize_prompt_facing_messages, sanitize_prompt_facing_messages_with_state,
-        sanitize_user_visible_messages,
+        sanitize_canonical_turn_delta_with_turn_semantics, sanitize_prompt_facing_messages,
+        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use astra_turn_types::{
@@ -773,17 +720,6 @@ mod tests {
         );
     }
 
-    fn compacted_turn_projections(messages: Vec<Value>) -> Vec<Vec<Value>> {
-        vec![
-            super::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
-                messages.clone(),
-            )
-            .expect("valid compacted turn"),
-            super::sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
-                .expect("valid completed turn"),
-        ]
-    }
-
     fn typed_user(content: &str, relation: astra_turn_types::ObjectiveRelation) -> Value {
         let mut message = json!({"role": "user", "content": content});
         astra_turn_types::mark_user_turn_semantics(
@@ -822,9 +758,9 @@ mod tests {
             if relation != Some(ObjectiveRelation::Replace) {
                 expected.insert(0, head);
             }
-            for projected in compacted_turn_projections(messages) {
-                assert_eq!(projected, expected, "relation: {relation:?}");
-            }
+            let projected = sanitize_canonical_turn_delta_with_turn_semantics(messages, false)
+                .expect("valid compacted turn");
+            assert_eq!(projected, expected, "relation: {relation:?}");
         }
     }
 
@@ -842,9 +778,9 @@ mod tests {
             replacement.clone(),
             refinement.clone(),
         ];
-        for projected in compacted_turn_projections(messages) {
-            assert_eq!(projected, vec![replacement.clone(), refinement.clone()]);
-        }
+        let projected = sanitize_canonical_turn_delta_with_turn_semantics(messages, false)
+            .expect("valid compacted turn");
+        assert_eq!(projected, vec![replacement, refinement]);
     }
 
     #[test]
@@ -863,9 +799,9 @@ mod tests {
             control,
             typed_user("  ", ObjectiveRelation::Replace),
         ];
-        for projected in compacted_turn_projections(messages) {
-            assert_eq!(projected, vec![head.clone()]);
-        }
+        let projected = sanitize_canonical_turn_delta_with_turn_semantics(messages, false)
+            .expect("valid compacted turn");
+        assert_eq!(projected, vec![head]);
     }
 
     #[test]
@@ -880,16 +816,7 @@ mod tests {
                 },
             }),
         ];
-        assert!(
-            super::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
-                messages.clone()
-            )
-            .is_err()
-        );
-        assert!(
-            super::sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
-                .is_err()
-        );
+        assert!(sanitize_canonical_turn_delta_with_turn_semantics(messages, false).is_err());
     }
 
     #[test]
@@ -915,9 +842,8 @@ mod tests {
         )
         .expect("valid canonical history");
         assert_eq!(continuation[1], authority);
-        let completed =
-            sanitize_completed_canonical_turn_messages_with_turn_semantics(messages.clone())
-                .expect("valid completed history");
+        let completed = sanitize_canonical_turn_delta_with_turn_semantics(messages.clone(), false)
+            .expect("valid completed history");
         assert_eq!(completed[1], authority);
         assert_eq!(sanitize_prompt_facing_messages(messages).len(), 2);
     }
@@ -1293,7 +1219,6 @@ mod tests {
         let state = SessionStateCompact {
             blocked_tools: vec!["stale_block".into()],
             recent_tools: vec!["read_file".into(), "grep".into()],
-            activated_deferred_tool_names: vec!["write_file".into()],
             budget_remaining_tokens: 1234,
             budget_remaining_rounds: 7,
             consecutive_ctx_errors: 2,

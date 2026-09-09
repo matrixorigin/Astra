@@ -38,9 +38,9 @@ steps:
       - type: judger
         question: |
           The agent was asked to re-read crates/astra-turn-core/Cargo.toml
-          and report its package name and version. The correct answers are:
+          and report its package name and version declaration. The correct answers are:
           - package name: astra-turn-core
-          - version: 0.1.0
+          - version declaration: version.workspace = true
           Did the agent successfully re-read the file (not return [Cleared] or error)
           and provide the correct package name and version?
           Score 1.0 if both correct, 0.5 if partially, 0.0 if it failed to re-read.

@@ -574,7 +574,12 @@ fn default_budget_exhaustion_completion_text(state: &AgenticLoopState) -> String
 #[derive(Default)]
 struct ParallelAgentSummary {
     label: Option<String>,
+    /// Terminality is ownership state, not outcome quality.  A failed or
+    /// cancelled child is no longer live and must not block parent synthesis.
+    terminal: bool,
+    successful: bool,
     completed_result: Option<String>,
+    partial_result: Option<String>,
     incomplete_reason: Option<String>,
     control_errors: Vec<String>,
 }
@@ -591,9 +596,56 @@ struct UnfinishedParallelAgent {
     control_errors: Vec<String>,
 }
 
+struct TerminalParallelAgentIssue {
+    agent_id: String,
+    label: String,
+    partial_result: Option<String>,
+    incomplete_reason: Option<String>,
+    control_errors: Vec<String>,
+}
+
 struct ParallelAgentBudgetRollup {
     completed: Vec<CompletedParallelAgent>,
+    terminal_issues: Vec<TerminalParallelAgentIssue>,
     unfinished: Vec<UnfinishedParallelAgent>,
+}
+
+/// Apply one typed observation to the owner's per-agent lifecycle state.
+///
+/// `agent.spawn` is allowed to return a terminal child result directly.  It
+/// must therefore use the same reducer as `agent.get_result`; otherwise a
+/// foreground spawn-only completion is recorded as launched forever.  Once a
+/// terminal result is observed it is sticky: a later stale running/launched
+/// observation must not reopen the child or make the owner look incomplete.
+fn apply_parallel_agent_budget_projection(
+    entry: &mut ParallelAgentSummary,
+    projection: &crate::orchestration::AgentToolBudgetRecordProjection,
+) {
+    if entry.label.is_none() {
+        entry.label = projection.display_name_hint.clone();
+    }
+    if let Some(summarized) = projection.control_error_summary.clone()
+        && !entry
+            .control_errors
+            .iter()
+            .any(|existing| existing == &summarized)
+    {
+        entry.control_errors.push(summarized);
+    }
+    // Once a terminal observation releases the child owner, later stale
+    // running/terminal callbacks must not reopen or rewrite that outcome.
+    if entry.terminal {
+        return;
+    }
+    if projection.terminal {
+        entry.terminal = true;
+        entry.successful = projection.successful;
+        entry.completed_result = projection.completed_result.clone();
+        entry.partial_result = projection.partial_result.clone();
+        entry.incomplete_reason = projection.incomplete_reason.clone();
+    } else {
+        entry.incomplete_reason = projection.incomplete_reason.clone();
+    }
 }
 
 fn collect_parallel_agent_budget_rollup(
@@ -609,7 +661,7 @@ fn collect_parallel_agent_budget_rollup(
         let projection = project_agent_tool_budget_record(record);
 
         match projection.action {
-            AgentToolRecordActionKind::Spawn => {
+            AgentToolRecordActionKind::Spawn | AgentToolRecordActionKind::GetResult => {
                 let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
@@ -617,32 +669,7 @@ fn collect_parallel_agent_budget_rollup(
                     order.push(agent_id.clone());
                 }
                 let entry = summaries.entry(agent_id).or_default();
-                if entry.label.is_none() {
-                    entry.label = projection.display_name_hint.clone();
-                }
-            }
-            AgentToolRecordActionKind::GetResult => {
-                let Some(agent_id) = projection.agent_id.clone() else {
-                    continue;
-                };
-                if !order.iter().any(|id| id == &agent_id) {
-                    order.push(agent_id.clone());
-                }
-                let entry = summaries.entry(agent_id).or_default();
-                if let Some(summarized) = projection.control_error_summary.clone() {
-                    if !entry
-                        .control_errors
-                        .iter()
-                        .any(|existing| existing == &summarized)
-                    {
-                        entry.control_errors.push(summarized);
-                    }
-                }
-                if let Some(result) = projection.completed_result.clone() {
-                    entry.completed_result = Some(result);
-                } else if entry.completed_result.is_none() {
-                    entry.incomplete_reason = projection.incomplete_reason.clone();
-                }
+                apply_parallel_agent_budget_projection(entry, &projection);
             }
             AgentToolRecordActionKind::Other => {}
         }
@@ -652,9 +679,9 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                entry
-                    .completed_result
-                    .as_ref()
+                (entry.successful)
+                    .then_some(entry.completed_result.as_ref())
+                    .flatten()
                     .map(|result| CompletedParallelAgent {
                         label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
                         result: result.clone(),
@@ -662,11 +689,28 @@ fn collect_parallel_agent_budget_rollup(
             })
         })
         .collect();
+    let terminal_issues: Vec<_> = order
+        .iter()
+        .filter_map(|agent_id| {
+            summaries.get(agent_id).and_then(|entry| {
+                if !entry.terminal || entry.successful {
+                    return None;
+                }
+                Some(TerminalParallelAgentIssue {
+                    agent_id: agent_id.clone(),
+                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                    partial_result: entry.partial_result.clone(),
+                    incomplete_reason: entry.incomplete_reason.clone(),
+                    control_errors: entry.control_errors.clone(),
+                })
+            })
+        })
+        .collect();
     let unfinished: Vec<_> = order
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                if entry.completed_result.is_some() {
+                if entry.terminal {
                     return None;
                 }
                 Some(UnfinishedParallelAgent {
@@ -679,12 +723,13 @@ fn collect_parallel_agent_budget_rollup(
         })
         .collect();
 
-    if completed.is_empty() && unfinished.is_empty() {
+    if completed.is_empty() && terminal_issues.is_empty() && unfinished.is_empty() {
         return None;
     }
 
     Some(ParallelAgentBudgetRollup {
         completed,
+        terminal_issues,
         unfinished,
     })
 }
@@ -694,7 +739,10 @@ fn parallel_agent_budget_exhaustion_summary(
     cancelled_agents: &HashSet<String>,
 ) -> Option<String> {
     let rollup = collect_parallel_agent_budget_rollup(state)?;
-    if rollup.completed.is_empty() || rollup.unfinished.is_empty() {
+    if rollup.completed.is_empty()
+        && rollup.terminal_issues.is_empty()
+        && rollup.unfinished.is_empty()
+    {
         return None;
     }
 
@@ -703,34 +751,53 @@ fn parallel_agent_budget_exhaustion_summary(
     } else {
         " You can continue in the next message."
     };
-    let mut lines = vec![
-        format!(
-            "[The owner turn reached its execution boundary after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} did not finish before the turn ended.{}]",
-            current_agentic_step(state),
-            rollup.completed.len(),
-            rollup.unfinished.len(),
-            checkpoint_note
-        ),
-        String::new(),
-        "Completed sub-agent results:".to_string(),
-    ];
-    for (idx, entry) in rollup.completed.iter().enumerate() {
-        lines.push(format!(
-            "{}. {} — {}",
-            idx + 1,
-            entry.label,
-            summarize_agent_tool_budget_result(&entry.result)
-        ));
+    let mut lines = vec![format!(
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} parallel sub-agent result(s) completed; {} terminated without a successful result; {} remain live.{}]",
+        current_agentic_step(state),
+        rollup.completed.len(),
+        rollup.terminal_issues.len(),
+        rollup.unfinished.len(),
+        checkpoint_note
+    )];
+    if !rollup.completed.is_empty() {
+        lines.push(String::new());
+        lines.push("Completed sub-agent results:".to_string());
+        for (idx, entry) in rollup.completed.iter().enumerate() {
+            lines.push(format!(
+                "{}. {} — {}",
+                idx + 1,
+                entry.label,
+                summarize_agent_tool_budget_result(&entry.result)
+            ));
+        }
     }
-    lines.push(String::new());
-    lines.push("Unfinished sub-agent results:".to_string());
-    for (idx, entry) in rollup.unfinished.iter().enumerate() {
-        let detail = render_agent_tool_budget_unfinished_detail(
-            entry.incomplete_reason.as_deref(),
-            &entry.control_errors,
-            cancelled_agents.contains(&entry.agent_id),
-        );
-        lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+    if !rollup.terminal_issues.is_empty() {
+        lines.push(String::new());
+        lines.push("Terminal sub-agent issues:".to_string());
+        for (idx, entry) in rollup.terminal_issues.iter().enumerate() {
+            let mut detail = render_agent_tool_budget_unfinished_detail(
+                entry.incomplete_reason.as_deref(),
+                &entry.control_errors,
+                cancelled_agents.contains(&entry.agent_id),
+            );
+            if let Some(partial_result) = entry.partial_result.as_deref() {
+                detail.push_str("; partial result: ");
+                detail.push_str(&summarize_agent_tool_budget_result(partial_result));
+            }
+            lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+        }
+    }
+    if !rollup.unfinished.is_empty() {
+        lines.push(String::new());
+        lines.push("Live sub-agent results:".to_string());
+        for (idx, entry) in rollup.unfinished.iter().enumerate() {
+            let detail = render_agent_tool_budget_unfinished_detail(
+                entry.incomplete_reason.as_deref(),
+                &entry.control_errors,
+                cancelled_agents.contains(&entry.agent_id),
+            );
+            lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
+        }
     }
     Some(lines.join("\n"))
 }
@@ -3290,7 +3357,9 @@ fn begin_budget_settlement_for_work_state(
                 "mode": if active_work_attempt { "completion_then_work_settlement" } else { "one_completion_action" },
                 "allowed_action": action,
                 "attempts_remaining": 1,
-                "action_hint": super::execution_phase::completion_action_hint(&action),
+                "action_hint": super::execution_phase::completion_action_hint_for_state(
+                    state, &action,
+                ),
                 "declarations_may_remain_visible_for_cache": true,
                 "execution_authority": "one_matching_action",
                 "instruction": if active_work_attempt {
@@ -3559,15 +3628,57 @@ fn apply_structured_user_feedback(state: &mut AgenticLoopState, intent: &TurnInt
 /// ratio against `max_turn_input_tokens`. When no limit is configured
 /// (`max_turn_input_tokens == 0`) returns `(0.0, 0)`.
 #[inline]
+#[cfg(test)]
 pub(crate) fn estimate_context_pressure(
     messages: &[serde_json::Value],
     pinned_tool_schema_tokens: usize,
     max_turn_input_tokens: u64,
 ) -> (f64, u64) {
+    estimate_context_pressure_with_system_prompt_tokens(
+        messages,
+        pinned_tool_schema_tokens,
+        max_turn_input_tokens,
+        None,
+    )
+}
+
+/// Estimate pressure using the last prompt assembly measured by the shared
+/// provider-context manifest when one is available.
+///
+/// The canonical history does not contain the assembled system prompt, so a
+/// pressure estimate needs that prompt overhead exactly once.  Before the
+/// first provider request the generic estimator's conservative fallback is
+/// unavoidable; after a request, reusing the typed manifest avoids charging
+/// the old fixed-size approximation on every later round.  This affects only
+/// the local compaction decision — the final provider wire estimate remains
+/// authoritative.
+#[inline]
+pub(crate) fn estimate_context_pressure_for_state(state: &AgenticLoopState) -> (f64, u64) {
+    estimate_context_pressure_with_system_prompt_tokens(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        state.max_turn_input_tokens,
+        crate::prompts::measured_prompt_tokens_from_manifest(
+            state.last_llm_context_manifest_trace.as_ref(),
+        ),
+    )
+}
+
+#[inline]
+pub(crate) fn estimate_context_pressure_with_system_prompt_tokens(
+    messages: &[serde_json::Value],
+    pinned_tool_schema_tokens: usize,
+    max_turn_input_tokens: u64,
+    system_prompt_tokens: Option<usize>,
+) -> (f64, u64) {
     if max_turn_input_tokens == 0 {
         return (0.0, 0);
     }
-    let tokens = crate::prompts::estimate_tokens(messages, pinned_tool_schema_tokens, 0) as u64;
+    let tokens = crate::prompts::estimate_tokens(
+        messages,
+        pinned_tool_schema_tokens,
+        system_prompt_tokens.unwrap_or(0),
+    ) as u64;
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
@@ -4368,11 +4479,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
-        let (mut pressure, mut pressure_estimate_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (mut pressure, mut pressure_estimate_tokens) =
+            estimate_context_pressure_for_state(state);
 
         // Pre-turn LLM compact: if pressure exceeds the model-adaptive
         // trigger, let the host run an optional cache-friendly inline-summary
@@ -4402,11 +4510,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     sess.stats.record_compaction(event.tokens_freed);
                 }
                 host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) = estimate_context_pressure(
-                    &state.messages,
-                    state.pinned_tool_schema_tokens as usize,
-                    state.max_turn_input_tokens,
-                );
+                (pressure, pressure_estimate_tokens) = estimate_context_pressure_for_state(state);
             }
         }
 
@@ -4506,11 +4610,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure_for_state(state);
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
@@ -4532,11 +4632,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // proactively compress before the first LLM call.  This prevents an
     // immediate 413 when resuming from a CompactAndRetry interruption.
     if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let (estimated_pressure, estimated_tokens) = estimate_context_pressure(
-            &state.messages,
-            state.pinned_tool_schema_tokens as usize,
-            state.max_turn_input_tokens,
-        );
+        let (estimated_pressure, estimated_tokens) = estimate_context_pressure_for_state(state);
         if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
             run_proactive_compaction(
                 estimated_pressure,
@@ -6960,6 +7056,85 @@ mod tests {
     }
 
     #[test]
+    fn parallel_budget_rollup_accepts_terminal_spawn_and_keeps_it_sticky() {
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({
+                    "agent_id": "agent-a",
+                    "description": "Direct review"
+                }),
+                Some(json!({
+                    "status": "completed",
+                    "agent_id": "agent-a",
+                    "result": "Direct review finished."
+                })),
+                None,
+            ),
+            // A stale callback must not reopen a child after its terminal
+            // result was already observed from the foreground spawn.
+            agent_record(
+                "get_result",
+                json!({"agent_id": "agent-a"}),
+                Some(json!({
+                    "status": "launched",
+                    "agent_id": "agent-a"
+                })),
+                None,
+            ),
+        ];
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert_eq!(rollup.unfinished.len(), 0);
+        assert_eq!(rollup.completed.len(), 1);
+        assert_eq!(rollup.completed[0].label, "Direct review");
+        assert_eq!(rollup.completed[0].result, "Direct review finished.");
+        assert!(unfinished_parallel_agent_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn parallel_budget_rollup_releases_non_success_terminal_child() {
+        let mut state = make_state();
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"agent_id": "agent-failed", "description": "Failed review"}),
+                Some(json!({
+                    "status": "failed",
+                    "agent_id": "agent-failed",
+                    "error": "child exploded"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"agent_id": "agent-cancelled", "description": "Cancelled review"}),
+                Some(json!({
+                    "status": "cancelled",
+                    "agent_id": "agent-cancelled",
+                    "reason": "parent cancelled this sub-agent"
+                })),
+                None,
+            ),
+        ];
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert!(rollup.completed.is_empty());
+        assert!(
+            unfinished_parallel_agent_ids(&state).is_empty(),
+            "terminal failure/cancellation must not be treated as live ownership"
+        );
+        let details = rollup
+            .terminal_issues
+            .iter()
+            .map(|entry| entry.incomplete_reason.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(details.contains(&"parent cancelled this sub-agent"));
+        assert!(details.contains(&"child exploded"));
+    }
+
+    #[test]
     fn budget_exhaustion_summary_uses_shared_child_result_projection() {
         let mut state = make_state();
         state.max_turns = 9;
@@ -8443,6 +8618,47 @@ mod tests {
         assert!(p100 > p50, "100 msgs > 50 msgs pressure");
         assert!(p50 > p10, "50 msgs > 10 msgs pressure");
         assert!(p100 > p10, "100 msgs > 10 msgs pressure");
+    }
+
+    #[test]
+    fn estimate_context_pressure_for_state_reuses_last_assembly_measurement() {
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.messages = vec![json!({
+            "role": "user",
+            "content": "a short retained message",
+        })];
+        state.pinned_tool_schema_tokens = 2_000;
+
+        let fallback_tokens = estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        )
+        .1;
+        state.last_llm_context_manifest_trace = Some(json!({
+            "system_prompt_tokens": 4_000,
+            "volatile_preamble_tokens": 100,
+            "wire": {
+                "budget": {
+                    "estimated_system_tokens": 3_900,
+                },
+            },
+        }));
+
+        let (pressure, measured_tokens) = estimate_context_pressure_for_state(&state);
+        assert!(
+            measured_tokens < fallback_tokens,
+            "a measured prompt must replace the stale fallback estimate"
+        );
+        assert_eq!(
+            measured_tokens,
+            crate::prompts::estimate_tokens(&state.messages, 2_000, 3_900) as u64
+        );
+        assert_eq!(
+            pressure,
+            measured_tokens as f64 / state.max_turn_input_tokens as f64
+        );
     }
 
     #[test]

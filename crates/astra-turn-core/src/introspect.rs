@@ -426,6 +426,12 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
         s.alerts.len(),
         format_args!("{:?}", frame.context.compaction_tier),
     );
+    if let Some(eligible) = frame.context.estimated_cache_eligible_tokens {
+        out.push_str(&format!(" prompt_cache_stable_prefix_tokens={eligible}"));
+        if let Some(ratio) = frame.cache_read_vs_eligible_ratio() {
+            out.push_str(&format!(" prompt_cache_read_over_stable_prefix={ratio:.2}"));
+        }
+    }
     if s.snapshot_age_turns > 0 {
         out.push_str(&format!(" snapshot_age_turns={}", s.snapshot_age_turns));
     }
@@ -740,6 +746,15 @@ pub fn prompt_cache_fresh_input_tokens(s: &IntrospectSnapshot) -> Option<u64> {
     s.runtime_feedback
         .as_ref()
         .and_then(|frame| frame.run_usage.map(|usage| usage.prompt))
+}
+
+/// Estimated provider-visible stable prefix size for diagnostics. This is
+/// intentionally separate from `prompt_cache_read_share_pct`: providers may
+/// cache conversation history beyond the stable system/tool prefix.
+pub fn prompt_cache_stable_prefix_tokens(s: &IntrospectSnapshot) -> Option<u64> {
+    s.runtime_feedback
+        .as_ref()
+        .and_then(|frame| frame.context.estimated_cache_eligible_tokens)
 }
 
 fn render_full(s: &IntrospectSnapshot) -> String {
@@ -1225,6 +1240,7 @@ pub(crate) fn test_runtime_feedback(
             model_context_window_tokens: Some(1_000_000),
             effective_input_limit_tokens: Some(800_000),
             estimated_input_tokens: Some(132_000),
+            estimated_cache_eligible_tokens: Some(95_000),
             token_pressure: Some(0.72),
             compaction_tier: crate::compaction_types::CompactionTier::Normal,
         },
@@ -1322,6 +1338,8 @@ mod tests {
         assert!(output.contains("prompt_cache_scope=current_runtime_snapshot"));
         assert!(output.contains("input_total=145000"));
         assert!(output.contains("cached_read=95000"));
+        assert!(output.contains("prompt_cache_stable_prefix_tokens=95000"));
+        assert!(output.contains("prompt_cache_read_over_stable_prefix=1.00"));
         assert!(output.contains("cache_create=8000"));
         assert!(!output.contains("cache=66%"));
         assert!(output.contains("turns=session_turn=8 round=8/20 remaining=12"));

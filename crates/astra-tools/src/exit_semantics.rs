@@ -102,7 +102,14 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     {
         return ExitSemantics::TimedOut;
     }
-    if exit_code == 141 && pipeline_sigpipe_is_benign(command) {
+    if matches!(exit_code, 141) && pipeline_sigpipe_is_benign(command) {
+        return ExitSemantics::PipelineTruncated;
+    }
+    // libcurl reports a downstream EPIPE as CURLE_WRITE_ERROR (23) instead of
+    // surfacing the shell's SIGPIPE status (141).  With a bounded passive sink
+    // such as `head -c`, that is the same normal truncation boundary; outside
+    // this typed pipeline shape, 23 remains a real command failure.
+    if exit_code == 23 && pipeline_curl_write_error_is_benign(command) {
         return ExitSemantics::PipelineTruncated;
     }
     if exit_code == 128 && matches!(command_family(command).as_deref(), Some("git")) {
@@ -394,6 +401,112 @@ fn pipeline_sigpipe_is_benign(command: &str) -> bool {
             .is_some_and(|last| is_passive_pipe_sink(last))
 }
 
+fn pipeline_curl_write_error_is_benign(command: &str) -> bool {
+    let final_command = last_shell_list_segment(command);
+    let segments = split_pipeline_segments(final_command);
+    // Without per-process wait status, only recognize the narrow two-process
+    // form for which libcurl's write error has an unambiguous owner: curl's
+    // stdout is directly connected to a bounded passive sink.  A longer
+    // pipeline can fail in an intermediate process, and an output redirect or
+    // curl's file-output options make code 23 a real curl failure rather than
+    // downstream EPIPE.
+    segments.len() == 2
+        && segment_family(segments.first().copied().unwrap_or_default()).as_deref() == Some("curl")
+        && curl_segment_writes_to_pipeline_stdout(segments[0])
+        && segments
+            .last()
+            .is_some_and(|last| is_passive_pipe_sink(last))
+}
+
+fn curl_segment_writes_to_pipeline_stdout(segment: &str) -> bool {
+    if has_unquoted_stdout_redirect(segment) {
+        return false;
+    }
+
+    shell_words(segment).into_iter().all(|token| {
+        !matches!(
+            token.as_str(),
+            "-o" | "-O" | "--output" | "--remote-name" | "--remote-name-all"
+        ) && !token.starts_with("--output=")
+            && !token.starts_with("--remote-name=")
+            // curl accepts the short option in attached form (`-ofile`).
+            && !(token.len() > 2
+                && token.starts_with('-')
+                && !token.starts_with("--")
+                && token.as_bytes()[1..].contains(&b'o'))
+    })
+}
+
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in segment.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn has_unquoted_stdout_redirect(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        match byte {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single && !in_double => {
+                let mut fd_start = index;
+                while fd_start > 0 && bytes[fd_start - 1].is_ascii_digit() {
+                    fd_start -= 1;
+                }
+                let fd = &bytes[fd_start..index];
+                // No explicit descriptor means stdout; descriptor 1 is
+                // stdout.  Other descriptors (notably 2>/dev/null) do not
+                // change the pipeline's stdout owner.
+                if fd.is_empty() || fd == b"1" {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn last_shell_list_segment(command: &str) -> &str {
     let bytes = command.as_bytes();
     let mut last_start = 0;
@@ -661,6 +774,45 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn curl_write_error_to_bounded_sink_is_pipeline_truncation() {
+        let command = "curl -s https://example.test/feed | head -c 2000";
+        assert_eq!(classify_exit(command, 23), ExitSemantics::PipelineTruncated);
+        assert_eq!(
+            classify_command_result(command, "{\"status\":\"ok\"}", "", Some(23)),
+            CommandResultClass::Success
+        );
+        assert_eq!(
+            classify_exit("curl -s -o /tmp/feed https://example.test/feed", 23),
+            ExitSemantics::ExecutionError
+        );
+        for command in [
+            "curl -s -o /dev/full https://example.test/feed | head -c 2000",
+            "curl -s --output=/dev/full https://example.test/feed | head -c 2000",
+            "curl -s https://example.test/feed > /dev/full | head -c 2000",
+            "curl -s https://example.test/feed 1>/dev/full | head -c 2000",
+            "curl -s -O https://example.test/feed | head -c 2000",
+            "curl -s https://example.test/feed | sed -n 1,10p | head -c 2000",
+        ] {
+            assert_eq!(
+                classify_exit(command, 23),
+                ExitSemantics::ExecutionError,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_exit(
+                "curl -s https://example.test/feed 2>/dev/null | head -c 2000",
+                23
+            ),
+            ExitSemantics::PipelineTruncated
+        );
+        assert_eq!(
+            classify_exit("python producer | head -c 2000", 23),
+            ExitSemantics::ExecutionError
+        );
     }
 
     #[test]

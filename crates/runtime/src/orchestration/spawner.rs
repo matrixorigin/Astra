@@ -104,6 +104,22 @@ fn effective_spawn_allowed_tools(
     tools
 }
 
+/// Add the static coordination contract to a child persona prompt.
+///
+/// Run/agent IDs are runtime metadata, not instructions.  Keeping them out of
+/// the system prompt lets sibling children with the same persona share the
+/// provider's stable prefix cache; mailbox routing still resolves the typed
+/// `to="parent"` target from the child context.
+fn parent_coordination_addendum(agent_prompt: &str) -> String {
+    format!(
+        "{}\n\n## Parent coordination\n\
+         The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
+         Stay within the delegated task boundary. Use `agent(action=\"send_message\", to=\"parent\", ...)` only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
+         Routine tool-by-tool progress does not need reporting. Your terminal result is delivered to the parent automatically.",
+        agent_prompt,
+    )
+}
+
 /// Stable cause and proven origin shared by descendant cancellation and
 /// durable run cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3970,13 +3986,12 @@ impl DynamicAgentSpawner {
             super::permission_sync::PermissionSyncContext::shared(inherited_permissions.clone());
 
         // 8. Build run config
-        let coordination_addendum = format!(
-            "{}\n\n## Parent coordination\n\
-             Your run_id is `{run_id}` and agent_id is `{agent_id}`. Your parent is agent `{}` on run `{}`. \
-             Stay within the delegated task boundary. Use `agent(action=\"send_message\", to=\"parent\", ...)` only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
-             Routine tool-by-tool progress does not need reporting. Your terminal result is delivered to the parent automatically.",
-            agent_def.system_prompt_addendum, context.parent_agent_id, context.parent_run_id,
-        );
+        // Keep the child system prompt reusable across runs.  Run/agent
+        // identities are already carried by the runtime context and the
+        // mailbox resolver understands the typed `to="parent"` target; putting
+        // random IDs in this system text would make every fanout child a new
+        // provider-cache prefix without adding execution authority.
+        let coordination_addendum = parent_coordination_addendum(&agent_def.system_prompt_addendum);
         let workspace_mutation = if agent_def.read_only {
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
         } else {
@@ -6440,6 +6455,18 @@ mod tests {
         let transport = Arc::new(InProcessTransport::new());
         let dt = Arc::new(DelegationTracker::new());
         Arc::new(AgentMailboxRouter::new(transport, dt))
+    }
+
+    #[test]
+    fn parent_coordination_prompt_is_stable_across_child_identities() {
+        let persona = "\nYou are an exploration agent.";
+        let first = parent_coordination_addendum(persona);
+        let second = parent_coordination_addendum(persona);
+        assert_eq!(first, second);
+        assert!(first.contains("runtime owns your run identity"));
+        assert!(first.contains("to=\"parent\""));
+        assert!(!first.contains("run_id"));
+        assert!(!first.contains("agent_id"));
     }
 
     struct PendingTerminalTransport {

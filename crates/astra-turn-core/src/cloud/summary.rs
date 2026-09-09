@@ -13,7 +13,7 @@
 //!   tests can inject mock responses without a real API.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     cloud::compact_prompt::{
@@ -145,6 +145,12 @@ pub struct SummaryResponse {
     pub text: String,
     /// Whether the request exceeded the context window (PTL error).
     pub is_ptl_error: bool,
+    /// Provider terminal reason, preserved so structured auxiliary callers can
+    /// distinguish an output-cap boundary from a schema-invalid completion.
+    pub finish_reason: Option<String>,
+    /// Provider-reported usage for this inference. Auxiliary inference is part
+    /// of the durable turn budget and must not disappear at this abstraction.
+    pub usage: Map<String, Value>,
 }
 
 /// Abstraction over the LLM API for summary generation.
@@ -404,6 +410,8 @@ pub mod test_support {
                 responses: vec![Ok(SummaryResponse {
                     text: text.to_string(),
                     is_ptl_error: false,
+                    finish_reason: Some("stop".to_string()),
+                    usage: Map::new(),
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),
@@ -417,10 +425,14 @@ pub mod test_support {
                     Ok(SummaryResponse {
                         text: String::new(),
                         is_ptl_error: true,
+                        finish_reason: None,
+                        usage: Map::new(),
                     }),
                     Ok(SummaryResponse {
                         text: success_text.to_string(),
                         is_ptl_error: false,
+                        finish_reason: Some("stop".to_string()),
+                        usage: Map::new(),
                     }),
                 ],
                 call_count: Arc::new(AtomicUsize::new(0)),
@@ -434,6 +446,8 @@ pub mod test_support {
                 responses: vec![Ok(SummaryResponse {
                     text: String::new(),
                     is_ptl_error: true,
+                    finish_reason: None,
+                    usage: Map::new(),
                 })],
                 call_count: Arc::new(AtomicUsize::new(0)),
                 purposes: Arc::new(Mutex::new(Vec::new())),

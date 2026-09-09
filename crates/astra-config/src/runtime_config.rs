@@ -350,13 +350,19 @@ impl Default for RuntimeConfig {
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.
 ///
+/// This is a local prompt-cost policy: a CLI/Edge process and a Server process
+/// may each resolve their own configuration. It never grants execution
+/// authority. The active deployment boundary's capability binding, allowlist,
+/// and runtime readiness still filter the resulting candidate surface.
+///
 /// # `pinned_tools` semantics
 ///
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
 /// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
 /// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
 /// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
-///   the pinned set (it lands in deferred instead).
+///   the pinned set (it lands in deferred instead). `tool_search` is the
+///   activation protocol floor and cannot be removed.
 /// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
 ///   ignored (see `ToolSurface::build`).
 ///

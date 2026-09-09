@@ -9,6 +9,7 @@ mod agent_transcript_location;
 mod canonical_tool_pairing;
 mod context_identity;
 mod context_window;
+mod deferred_tool;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
@@ -44,6 +45,7 @@ pub use context_identity::{
     PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
+pub use deferred_tool::DeferredToolActivation;
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
     client_direct_execution_field,

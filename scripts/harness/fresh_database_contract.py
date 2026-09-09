@@ -51,6 +51,10 @@ BOOT_METADATA_TABLES = frozenset(
         "maintenance_sweep_cursors",
         "preview_template_registry",
         "raw_ref_scheme_registry",
+        # The distributed weighted-admission coordinator owns one durable
+        # scope gate. It is created during core-schema bootstrap and is not
+        # user/session/work state; its exact scope is validated below.
+        "session_weighted_admission_gates",
         "sweeper_leases",
         # A fresh scored database is seeded through the production admin API.
         # Its single bootstrap administrator is control-plane state, not a
@@ -300,6 +304,7 @@ def _validate_closed_schema_counts(
         "astra_schema_contracts": 1,
         "infra_llm_models": 1,
         "maintenance_sweep_cursors": 1,
+        "session_weighted_admission_gates": 1,
         "sweeper_leases": 1,
     }
     for table, expected in expected_boot_counts.items():
@@ -359,6 +364,21 @@ def _core_schema_contract_version(repo: Path) -> str:
     )
     if match is None:
         raise ContractError("cannot resolve the canonical core schema contract version")
+    return match.group(1)
+
+
+def _distributed_admission_scope(repo: Path) -> str:
+    source = (
+        repo / "crates" / "services" / "src" / "weighted_admission.rs"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r'pub\(crate\) const DISTRIBUTED_ADMISSION_SCOPE: &str = "([^"]+)";',
+        source,
+    )
+    if match is None:
+        raise ContractError(
+            "cannot resolve the source-owned distributed admission scope"
+        )
     return match.group(1)
 
 
@@ -660,6 +680,14 @@ def _validate_boot_metadata(database: str, repo: Path, counts: dict[str, int]) -
     if seen != required_contracts:
         raise ContractError(
             "schema table contracts differ from the exact startup-owned inventory"
+        )
+    admission_gates = _mysql_rows(
+        "SELECT scope_name FROM session_weighted_admission_gates ORDER BY scope_name",
+        database,
+    )
+    if admission_gates != [[_distributed_admission_scope(repo)]]:
+        raise ContractError(
+            "session_weighted_admission_gates does not match the exact source scope"
         )
     digest = hashlib.sha256(
         json.dumps(table_contracts, sort_keys=True, separators=(",", ":")).encode()

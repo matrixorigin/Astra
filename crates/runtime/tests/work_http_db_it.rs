@@ -237,7 +237,15 @@ async fn setup_pool() -> Option<SharedPool> {
     if std::env::var("ASTRA_TEST_DB_IT").as_deref() != Ok("1") {
         return None;
     }
-    let settings = MatrixOneSettings::from_env();
+    let mut settings = MatrixOneSettings::from_env();
+    // Each HTTP case owns a pool and libtest may schedule ignored cases in
+    // parallel.  Keep the integration harness below MatrixOne's global
+    // connection cap so a test run cannot fail before exercising the route
+    // under test.  Production settings remain untouched.
+    settings.db_pool_max_connections = settings.db_pool_max_connections.clamp(1, 4);
+    settings.db_pool_min_connections = settings
+        .db_pool_min_connections
+        .min(settings.db_pool_max_connections);
     let _setup_guard = SCHEMA_SETUP_LOCK.lock().await;
     let catalog =
         std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());

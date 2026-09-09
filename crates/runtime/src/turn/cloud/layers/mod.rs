@@ -3,12 +3,12 @@
 //! Each layer implements [`CompressionLayer`] and is composed by
 //! [`super::compaction_engine::CompactionEngine`] into an ordered pipeline.
 
-pub mod duplicate_read_elimination;
+pub mod duplicate_tool_output_elimination;
 pub mod reactive_compact;
 pub mod tiered_compaction;
 pub mod tool_result_truncation;
 
-pub use duplicate_read_elimination::DuplicateReadElimination;
+pub use duplicate_tool_output_elimination::DuplicateToolOutputElimination;
 pub use reactive_compact::ReactiveCompact;
 pub use tiered_compaction::TieredCompaction;
 pub use tool_result_truncation::ToolResultTruncation;

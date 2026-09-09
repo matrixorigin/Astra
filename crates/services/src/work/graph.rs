@@ -473,4 +473,82 @@ mod tests {
             Err(WorkDomainError::RevisionExhausted { field: "work item" })
         ));
     }
+
+    #[test]
+    fn deferred_cancel_and_add_remain_distinct_after_current_item_settlement() {
+        // A deferred cancellation is a revision of the settled/current item;
+        // an add is a new identity.  Neither operation may borrow the other
+        // one's id or be considered complete before the repository allocates
+        // the cancellation's successor revision.
+        let current_id = WorkItemId::parse("current-task").expect("current item id");
+        let replacement_id = WorkItemId::parse("replacement-task").expect("replacement id");
+        let mut cancelled = WorkItemRevisionChange::new(
+            current_id.clone(),
+            WorkItemRevision::INITIAL,
+            WorkItemKind::Task,
+            WorkItemText::parse("Cancel the already settled task").expect("objective"),
+            WorkItemText::parse("Cancellation is durably recorded").expect("result"),
+            WorkItemDeclarationState::Cancelled,
+        );
+        assert!(matches!(
+            cancelled.result_ref(),
+            Err(WorkDomainError::UnallocatedWorkItemRevision { .. })
+        ));
+
+        let replacement = NewWorkItem {
+            item_id: replacement_id.clone(),
+            kind: WorkItemKind::Task,
+            objective: WorkItemText::parse("Execute the replacement task").expect("objective"),
+            expected_result: WorkItemText::parse("Replacement delivery is recorded")
+                .expect("result"),
+        };
+        cancelled.assign_result_revision(WorkItemRevision::new(2).expect("cancel revision"));
+        let cancelled_change = WorkGraphItemChange::Revised(cancelled);
+        let graph = validate_and_canonicalize_graph(
+            &[
+                cancelled_change.clone(),
+                WorkGraphItemChange::New(replacement.clone()),
+            ],
+            &[],
+        )
+        .expect("cancel and add must form one valid graph");
+        assert_eq!(
+            graph.item_refs,
+            vec![
+                WorkItemRevisionRef {
+                    item_id: current_id.clone(),
+                    revision: WorkItemRevision::new(2).expect("cancel revision"),
+                },
+                WorkItemRevisionRef {
+                    item_id: replacement_id.clone(),
+                    revision: WorkItemRevision::INITIAL,
+                },
+            ]
+        );
+
+        // Reusing the settled item's identity for the add is not a replacement
+        // shortcut; it is a duplicate graph identity and must be rejected.
+        let mut aliased_cancel = WorkItemRevisionChange::new(
+            current_id.clone(),
+            WorkItemRevision::INITIAL,
+            WorkItemKind::Task,
+            WorkItemText::parse("Cancel current").expect("objective"),
+            WorkItemText::parse("Cancelled").expect("result"),
+            WorkItemDeclarationState::Cancelled,
+        );
+        aliased_cancel.assign_result_revision(WorkItemRevision::new(2).expect("cancel revision"));
+        assert!(matches!(
+            validate_and_canonicalize_graph(
+                &[
+                    WorkGraphItemChange::Revised(aliased_cancel),
+                    WorkGraphItemChange::New(NewWorkItem {
+                        item_id: current_id,
+                        ..replacement.clone()
+                    }),
+                ],
+                &[],
+            ),
+            Err(WorkDomainError::DuplicateWorkItem { .. })
+        ));
+    }
 }

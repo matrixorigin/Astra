@@ -6,7 +6,6 @@
 
 mod agentic_loop_turn;
 mod agentic_sse_loop;
-mod deferred_activation_state;
 mod server_admission_host;
 
 pub(crate) use agentic_loop_turn::{
@@ -564,7 +563,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref mgr) = p.mcp_manager {
         executor.install_mcp_bundle(mgr.clone(), mcp_runtime_schemas);
     }
-    deferred_activation_state::restore_into_executor(&p.activated_deferred_tool_names, &executor);
     let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
@@ -815,6 +813,14 @@ pub(crate) async fn stream_chat_sse(
         })
         .clone();
 
+    let deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+            &messages,
+            p.deferred_tool_activations
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
+        );
     let mut state = AgenticLoopState {
         observation_journal: Default::default(),
         tool_ledger_receipt: Default::default(),
@@ -990,7 +996,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message.to_string(),
         user_intent: p.user_intent.to_string(),
         recent_tools: p.recent_tools.to_vec(),
-        activated_deferred_tool_names: host.executor.activated_deferred_tool_names(),
+        deferred_tool_activations,
         has_prior_assistant_turn: false,
         turn_intent: None,
         task_profile,
@@ -1134,10 +1140,9 @@ pub(crate) async fn stream_chat_sse(
             .map(|failure| failure.message().to_string()),
     };
     if let Some(error) = loop_failure {
-        deferred_activation_state::snapshot_from_executor(
-            &mut p.activated_deferred_tool_names,
-            host.executor.as_ref(),
-        );
+        if let Some(slot) = &mut p.deferred_tool_activations {
+            **slot = state.deferred_tool_activations.clone();
+        }
         finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
             *shared = state.skills.discovered.clone();
@@ -1198,11 +1203,9 @@ pub(crate) async fn stream_chat_sse(
     let post_loop_projection_started_at = Instant::now();
 
     // ─── Finalize ────────────────────────────────────────────────────────
-    deferred_activation_state::snapshot_from_executor(
-        &mut p.activated_deferred_tool_names,
-        host.executor.as_ref(),
-    );
-    let activated_deferred_tool_names = host.executor.activated_deferred_tool_names();
+    if let Some(slot) = &mut p.deferred_tool_activations {
+        **slot = state.deferred_tool_activations.clone();
+    }
     // Merge skill quality data back to session-scoped tracker
     *p.skill_quality_tracker = state.skills.quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
@@ -1333,7 +1336,6 @@ pub(crate) async fn stream_chat_sse(
         first_surface_report: state.telemetry.first_selection_report,
         selected_skills: state.telemetry.all_selected_skills,
         tools_used: state.telemetry.all_tools_used,
-        activated_deferred_tool_names,
         tool_call_records: state.stall.tool_call_records,
         budget_pressure: state.telemetry.first_budget_pressure,
         stall_events: state.stall.events,
@@ -1368,6 +1370,7 @@ pub(crate) async fn stream_chat_sse(
             }),
         tool_record_coverage_partial: state.telemetry.server_record_gap_observed,
         final_messages,
+        deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,
         applied_user_intents,
     });

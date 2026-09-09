@@ -217,6 +217,40 @@ pub fn journal_record_blocked_tool(
     }
 }
 
+/// Record a tool call that was never dispatched because the shared round
+/// stopped it (for example a scheduling deadline).  This is distinct from a
+/// policy rejection: the call was admitted, but no executor owned its
+/// terminal.  Keeping the typed timeout/cancellation kind in the journal lets
+/// lifecycle consumers settle the exact call without treating it as success.
+#[must_use]
+pub fn journal_record_cancelled_tool(
+    tool_call_id: String,
+    name: String,
+    reason: &str,
+    args_preview: Option<String>,
+    tool_elapsed_ms: u64,
+    error_kind: astra_core::ErrorKind,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
+        name,
+        ok: false,
+        ms: tool_elapsed_ms,
+        error: Some(format!("cancelled_tool: {reason}")),
+        input_bytes: None,
+        output_bytes: None,
+        args_preview,
+        result_preview: Some(format!("Cancelled before dispatch: {reason}")),
+        file_path: None,
+        surgically_removed: None,
+        original_tool_name: None,
+        error_kind: Some(error_kind),
+        disposition: Some(ToolCallDisposition::Rejected),
+        result_class: Some(BLOCKED_TOOL_RESULT_CLASS.to_string()),
+        ..Default::default()
+    }
+}
+
 #[must_use]
 pub fn journal_record_suppressed_tool_retry(
     tool_call_id: String,

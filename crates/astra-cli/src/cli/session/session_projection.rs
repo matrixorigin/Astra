@@ -447,7 +447,7 @@ pub(crate) fn build_full_session_state_compact(
         // projection must explicitly leave this field empty rather than
         // dropping the struct field at compile time or inventing local
         // evidence that the server did not authorize.
-        activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
+        deferred_tool_activations: state.deferred_tool_activations.clone(),
         blocked_tools: Vec::new(),
         approval_overrides: None,
         budget_remaining_tokens: 0,
@@ -910,12 +910,20 @@ mod tests {
     fn csl_projection_preserves_tool_continuity_state_only() {
         let state = &SessionState {
             recent_tools: vec!["exec".into()],
-            activated_deferred_tool_names: vec!["write_file".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "write_file".into(),
+                schema_digest: "sha256:write-file".into(),
+                descriptor: None,
+            }],
             ..Default::default()
         };
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             blocked_tools: vec!["old_bash".into()],
-            activated_deferred_tool_names: vec!["old_deferred".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "old_deferred".into(),
+                schema_digest: "sha256:old".into(),
+                descriptor: None,
+            }],
             approval_overrides: Some(serde_json::json!({"old": true})),
             delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
                 id: "old_d".into(),
@@ -932,7 +940,7 @@ mod tests {
 
         let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
         assert_eq!(result.recent_tools, vec!["exec"]);
-        assert_eq!(result.activated_deferred_tool_names, vec!["write_file"]);
+        assert_eq!(result.deferred_tool_activations.len(), 1);
         assert!(result.blocked_tools.is_empty());
         assert!(result.approval_overrides.is_none());
         assert_eq!(result.budget_remaining_tokens, 0);

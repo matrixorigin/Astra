@@ -36,8 +36,6 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: agent_fanout
   - type: journal_tool_call_count
     name: agent_fanout
     min: 1
@@ -89,6 +87,13 @@ criteria:
   # completion contract.
   - type: journal_tool_call_count
     name: tool_search
+    min: 0
+    max: 1
+  # Fanout has no skill contract. A guessed/nonexistent skill is a model
+  # protocol error even when the runtime later recovers through tool_search;
+  # keep that unhappy path visible instead of silently certifying a noisy run.
+  - type: journal_tool_call_count
+    name: skill
     min: 0
     max: 0
   - type: journal_tool_call_count

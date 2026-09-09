@@ -1420,7 +1420,7 @@ impl StepRecorder {
             budget_remaining_rounds,
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: self
                 .current_step
                 .as_ref()

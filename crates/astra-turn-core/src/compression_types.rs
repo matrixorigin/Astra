@@ -277,6 +277,8 @@ impl From<Message> for Value {
                     astra_turn_types::USER_TURN_SEMANTICS_FIELD
                         | astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD
                         | astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
                 )
             {
                 map.insert(k, v);
@@ -473,6 +475,26 @@ mod tests {
         let msg = Message::from(v.clone());
         let back = Value::from(msg);
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn round_trip_preserves_tool_result_artifact_metadata() {
+        let descriptor = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 42,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let v = json!({
+            "role": "tool",
+            "content": "<persisted-output>\nRecover with introspect(...)\n</persisted-output>",
+            "tool_call_id": "call-1",
+            "_astra_tool_result_run_id": "run-1",
+            "_astra_tool_result_artifact": descriptor,
+        });
+        let msg = Message::from(v.clone());
+        assert_eq!(Value::from(msg), v);
     }
 
     #[test]

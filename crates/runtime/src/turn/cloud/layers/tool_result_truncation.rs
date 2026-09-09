@@ -51,6 +51,33 @@ impl CompressionLayer for ToolResultTruncation {
             if msg.role != "tool" {
                 continue;
             }
+            // A persisted result is already a bounded recovery projection.
+            // Its typed descriptor is canonical metadata; truncating the
+            // rendered body would sever the only model-visible handle.
+            let artifact_descriptor = msg
+                .extra
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .and_then(
+                    astra_turn_core::tool_result_storage::parse_tool_result_artifact_descriptor,
+                );
+            if artifact_descriptor.is_some_and(|descriptor| {
+                astra_turn_core::tool_result_storage::artifact_descriptor_matches_identity(
+                    &descriptor,
+                    msg.tool_call_id.as_deref(),
+                    msg.extra
+                        .get(astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                        .and_then(serde_json::Value::as_str),
+                )
+            }) || msg
+                .content
+                .as_deref()
+                .and_then(
+                    astra_turn_core::tool_result_storage::parse_tool_result_artifact_projection,
+                )
+                .is_some()
+            {
+                continue;
+            }
             if idx < head_end {
                 continue;
             }

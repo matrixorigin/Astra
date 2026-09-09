@@ -1,106 +1,11 @@
 use crate::prompts::{CompactConfig, CompactionTier};
-use astra_turn_core::tool_call_shape::tool_call_name;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
-// Tool-aware micro-compaction (per-tool trunc + duplicate read stubs)
+// Budget-based truncation. Exact-output deduplication belongs to the pipeline's
+// DuplicateToolOutputElimination layer, never to path/name heuristics here.
 // ---------------------------------------------------------------------------
-
-/// Resolve `function.name` + `function.arguments` for a `role: tool` message by matching
-/// `tool_call_id` to the nearest preceding assistant `tool_calls` entry.
-fn resolve_tool_call_meta(messages: &[Value], tool_index: usize) -> Option<(String, String)> {
-    let call_id = messages
-        .get(tool_index)?
-        .get("tool_call_id")
-        .and_then(Value::as_str)?;
-    for i in (0..tool_index).rev() {
-        let m = &messages[i];
-        if m.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(arr) = m.get("tool_calls").and_then(Value::as_array) else {
-            continue;
-        };
-        for tc in arr {
-            if tc.get("id").and_then(Value::as_str) != Some(call_id) {
-                continue;
-            }
-            let name = tool_call_name(tc)?.to_string();
-            let args = tc
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|a| {
-                    a.as_str()
-                        .map(String::from)
-                        .or_else(|| serde_json::to_string(a).ok())
-                })
-                .unwrap_or_else(|| "{}".to_string());
-            return Some((name, args));
-        }
-    }
-    None
-}
-
-fn parse_tool_arguments_json(args: &str) -> Option<Value> {
-    serde_json::from_str(args).ok()
-}
-
-fn read_target_path(tool_name: &str, args: &str) -> Option<String> {
-    if !is_read_like_tool(tool_name) {
-        return None;
-    }
-    let v = parse_tool_arguments_json(args)?;
-    let p = v
-        .get("path")
-        .or_else(|| v.get("file_path"))
-        .or_else(|| v.get("target_file"))
-        .and_then(Value::as_str)?;
-    let n = normalize_read_path(p);
-    if n.is_empty() { None } else { Some(n) }
-}
-
-fn normalize_read_path(p: &str) -> String {
-    p.trim().replace('\\', "/")
-}
-
-fn is_read_like_tool(name: &str) -> bool {
-    name == "read_file" || name.to_lowercase().ends_with("/read_file")
-}
-
-/// Per-tool truncation scale (percent of tier `trunc_limit`). Lower = more aggressive.
-fn tool_trunc_numerator(tool_name: Option<&str>) -> usize {
-    let Some(name) = tool_name else {
-        return 100;
-    };
-    let n = name.to_lowercase();
-    if n.contains("bash")
-        || n.contains("shell")
-        || n.contains("terminal")
-        || n == "run_terminal_cmd"
-        || n.contains("powershell")
-    {
-        return 35;
-    }
-    if n.contains("grep") || n.contains("glob") || n.contains("list_dir") {
-        return 55;
-    }
-    100
-}
-
-fn effective_tool_trunc_limit(base: usize, tool_name: Option<&str>) -> usize {
-    let num = tool_trunc_numerator(tool_name);
-    let scaled = (base.saturating_mul(num)) / 100;
-    scaled.max(80)
-}
-
-fn duplicate_read_stub(path: &str) -> String {
-    format!(
-        "[duplicate read of `{path}` — same path as an earlier tool result in this transcript; \
-         re-read only if the file may have changed]"
-    )
-}
 
 fn serialized_value_chars(value: &Value) -> usize {
     let site = astra_core::history_work::HistoryWorkSite::CompactionHistorySerialization;
@@ -150,7 +55,26 @@ fn truncate_text_with_suffix(text: &str, max_chars: usize, suffix: &str) -> Stri
     truncated
 }
 
+fn is_recoverable_tool_result(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("tool") {
+        return false;
+    }
+    astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message).is_some()
+        || message
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(astra_turn_core::tool_result_storage::parse_tool_result_artifact_projection)
+            .is_some()
+}
+
 fn truncate_tool_text_content(message: &mut Value, keep_chars: usize, suffix: &str) -> bool {
+    // A persisted result is already a bounded recovery projection.  The
+    // descriptor/strict projection parser is the canonical contract shared by
+    // every cloud compaction path; never turn its handle into an ordinary
+    // truncated string.
+    if is_recoverable_tool_result(message) {
+        return false;
+    }
     let Some(content) = message.get_mut("content") else {
         return false;
     };
@@ -327,9 +251,6 @@ fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
     messages.len() < before
 }
 
-/// Resolve `function.name` + `function.arguments` for a `role: tool` message by matching
-/// `tool_call_id` to the nearest preceding assistant `tool_calls` entry.
-/// Apply context release stubs to messages
 // Compaction Types
 // ---------------------------------------------------------------------------
 
@@ -477,10 +398,8 @@ impl CompactCircuitBreaker {
     }
 }
 
-/// Tier-aware compaction returning a [`CompactResult`] with rich metadata.
-///
-/// Delegates to [`CompactionEngine::compact_tiered`] — the canonical
-/// pipeline-based implementation.
+/// Test entrypoint for the same tier-aware budget pass used by Memoria and
+/// `CompactionEngine::compact_tiered`.
 #[cfg(test)]
 pub(crate) fn compact_tiered_with_result(
     messages: &[Value],
@@ -551,66 +470,23 @@ pub(crate) fn compact_tiered_impl(
         CompactionTier::AggressivePrune => keep_chars / 2,
     };
 
-    let mut seen_read_paths: HashSet<String> = HashSet::new();
-    let tool_indices: Vec<usize> = compacted
+    let latest_tool_index = compacted
         .iter()
-        .enumerate()
-        .filter_map(|(i, m)| (m.get("role").and_then(Value::as_str) == Some("tool")).then_some(i))
-        .collect();
-    let compact_limit = if tool_indices.len() <= 1 {
-        tool_indices.len()
-    } else {
-        tool_indices.len() - 1
-    };
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
     const TOOL_COMPACT_SUFFIX: &str = "\n...[compacted for context budget]";
-    for &index in tool_indices.iter().take(compact_limit) {
-        let meta = resolve_tool_call_meta(&compacted, index);
-        let tool_name_s = meta.as_ref().map(|(n, _)| n.as_str());
-
-        if matches!(
-            tier,
-            CompactionTier::TrimSchemas
-                | CompactionTier::CompactHistory
-                | CompactionTier::AggressivePrune
-        ) {
-            if let Some((name, args)) = meta.as_ref() {
-                if let Some(p) = read_target_path(name, args) {
-                    if seen_read_paths.contains(&p) {
-                        compacted[index]["content"] = Value::String(duplicate_read_stub(&p));
-                        continue;
-                    }
-                    seen_read_paths.insert(p);
-                }
-            }
-        }
-
-        let content = compacted[index]
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let eff_limit = effective_tool_trunc_limit(trunc_limit, tool_name_s);
-
-        if content.chars().count() <= eff_limit {
+    for (index, message) in compacted.iter_mut().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("tool")
+            || Some(index) == latest_tool_index
+        {
             continue;
         }
-        let line_count = content.lines().count();
-        if matches!(
-            tier,
-            CompactionTier::CompactHistory | CompactionTier::AggressivePrune
-        ) && !content.starts_with("Error")
-            && line_count > 5
-        {
-            let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
-            let suffix = format!("\n...[{line_count} lines compacted — re-run tool if needed]");
-            compacted[index]["content"] =
-                Value::String(truncate_text_with_suffix(&preview, eff_limit, &suffix));
-        } else {
-            compacted[index]["content"] = Value::String(truncate_text_with_suffix(
-                content,
-                eff_limit,
-                TOOL_COMPACT_SUFFIX,
-            ));
-        }
+        truncate_tool_text_content(
+            message,
+            trunc_limit
+                .max(80)
+                .saturating_sub(TOOL_COMPACT_SUFFIX.chars().count()),
+            TOOL_COMPACT_SUFFIX,
+        );
     }
 
     if matches!(
@@ -650,6 +526,9 @@ pub(crate) fn compact_tiered_impl(
         let first_user_idx = compacted
             .iter()
             .position(astra_turn_types::is_human_user_message);
+        let latest_user_idx = compacted
+            .iter()
+            .rposition(astra_turn_types::is_human_user_message);
         let conv_indices: Vec<usize> = compacted
             .iter()
             .enumerate()
@@ -676,6 +555,7 @@ pub(crate) fn compact_tiered_impl(
                 .filter(|(index, message)| {
                     message.get("role").and_then(Value::as_str) == Some("system")
                         || Some(*index) == first_user_idx
+                        || Some(*index) == latest_user_idx
                         || *index >= tail_start
                 })
                 .map(|(_, m)| m)
@@ -742,6 +622,7 @@ fn extract_discovered_tools(messages: &[Value]) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
 
     fn tool(content: &str) -> Value {
         json!({"role": "tool", "content": content})
@@ -1056,6 +937,68 @@ mod tests {
                 .iter()
                 .all(|message| tool_text_chars(message) < 200),
             "one linear pass must compact every eligible result even when the irreducible envelope exceeds the budget"
+        );
+    }
+
+    #[test]
+    fn tiered_compaction_preserves_recoverable_artifact_projection() {
+        let dir = tempfile::tempdir().expect("artifact dir");
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_for_compaction(
+            dir.path(),
+            "run-tiered",
+            "call-artifact",
+            "read_file",
+            &"evidence\n".repeat(400),
+        )
+        .expect("persisted result");
+        let artifact = json!({
+            "role": "tool",
+            "tool_call_id": "call-artifact",
+            "content": persisted.replacement,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-tiered",
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:
+                serde_json::to_value(&persisted.descriptor).expect("descriptor json"),
+        });
+        let plain = json!({
+            "role": "tool",
+            "tool_call_id": "call-latest",
+            "content": "latest evidence ".repeat(500),
+        });
+        let original_projection = artifact["content"].clone();
+        let messages = vec![
+            user("inspect the artifact"),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-artifact",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            artifact,
+            plain,
+        ];
+
+        let result =
+            compact_tiered_with_result(&messages, 1, 80, CompactionTier::CompactHistory, 4);
+        let retained = result
+            .messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "call-artifact")
+            .expect("artifact message remains in tiered history");
+        assert_eq!(retained["content"], original_projection);
+        let descriptor =
+            astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(retained)
+                .expect("typed descriptor remains attached");
+        assert_eq!(
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                dir.path(),
+                &descriptor,
+                64 * 1024,
+            )
+            .expect("artifact remains recoverable"),
+            "evidence\n".repeat(400)
         );
     }
 
@@ -1390,25 +1333,57 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_tool_call_name_for_duplicate_read_compaction() {
-        let large = "line\n".repeat(300);
-        let msgs = vec![
-            user("inspect"),
-            asst_call("c1", " read_file ", r#"{"path":"src/lib.rs"}"#),
-            tool_result("c1", &format!("src/lib.rs\n{large}")),
-            asst_call("c2", " read_file ", r#"{"path":"src/lib.rs"}"#),
-            tool_result("c2", &format!("src/lib.rs\n{large}")),
-            asst_call("c3", "read_file", r#"{"path":"src/keep.rs"}"#),
-            tool_result("c3", &format!("src/keep.rs\n{large}")),
-        ];
+    fn compaction_does_not_infer_duplicate_observations_from_a_path() {
+        for second_args in [
+            r#"{"path":"src/lib.rs"}"#,
+            r#"{"path":"src/lib.rs","offset":20,"limit":10}"#,
+        ] {
+            let msgs = vec![
+                user("inspect"),
+                asst_call("c1", "read_file", r#"{"path":"src/lib.rs"}"#),
+                tool_result("c1", "old contents"),
+                asst_call("c2", "read_file", second_args),
+                tool_result("c2", "new contents or a different range"),
+                asst_call("c3", "read_file", r#"{"path":"other.rs"}"#),
+                tool_result("c3", "latest observation"),
+            ];
+            let result =
+                compact_tiered_with_result(&msgs, 10, 100, CompactionTier::CompactHistory, 4);
+            assert_eq!(result.messages[2], msgs[2]);
+            assert_eq!(result.messages[4], msgs[4]);
+            assert_eq!(result.messages[6], msgs[6]);
+        }
+    }
 
-        let result = compact_tiered_with_result(&msgs, 10, 100, CompactionTier::CompactHistory, 4);
-
-        let second = result.messages[4]["content"].as_str().unwrap();
-        assert!(
-            second.contains("duplicate read of `src/lib.rs`"),
-            "expected duplicate read stub, got: {second}"
-        );
+    #[test]
+    fn aggressive_prune_preserves_latest_human_request_after_many_tool_rounds() {
+        for latest in [
+            user("CURRENT-CONSTRAINT: inspect only; do not modify files"),
+            json!({"role":"user", "content":[{"type":"text", "text":"retain this exact constraint"}]}),
+        ] {
+            let mut messages = vec![user("old task"), assistant("old answer"), latest.clone()];
+            for index in 0..12 {
+                messages.push(asst_call(&format!("c{index}"), "custom", "{}"));
+                messages.push(tool_result(&format!("c{index}"), &"evidence\n".repeat(100)));
+            }
+            let result = compact_tiered_with_result(
+                &messages,
+                2_000,
+                100,
+                CompactionTier::AggressivePrune,
+                1,
+            );
+            assert!(result.boundary.is_some());
+            assert_eq!(
+                result
+                    .messages
+                    .iter()
+                    .filter(|message| *message == &latest)
+                    .count(),
+                1,
+                "current user constraints must not depend on a synthetic copy"
+            );
+        }
     }
 
     /// Scenario 6: Needle-in-haystack — a critical API key rotation

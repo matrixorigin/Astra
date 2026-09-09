@@ -514,10 +514,10 @@ pub(super) fn acquire_interactive_turn_admission(
         state.total_cache_read_tokens = restored.session.total_cache_read_tokens;
         state.total_cache_creation_tokens = restored.session.total_cache_creation_tokens;
         state.last_turn_event = restored.last_turn_event;
-        state.activated_deferred_tool_names =
-            crate::cli::session::session_continuation::continuation_activation_names(
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
                 &messages,
-                std::mem::take(&mut state.activated_deferred_tool_names),
+                std::mem::take(&mut state.deferred_tool_activations),
             );
         state.active_conversation = Some(active);
     }

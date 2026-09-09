@@ -626,10 +626,24 @@ class FreshDatabaseContractTests(unittest.TestCase):
                     contract._validate_closed_schema_counts(
                         canonical, canonical, changed
                     )
+        with self.assertRaisesRegex(
+            contract.ContractError, "session_weighted_admission_gates"
+        ):
+            contract._validate_closed_schema_counts(
+                canonical,
+                canonical,
+                {**counts, "session_weighted_admission_gates": 2},
+            )
         with self.assertRaisesRegex(contract.ContractError, "unknown"):
             contract._validate_closed_schema_counts(
                 canonical, canonical | {"unknown_runtime_table"}, counts
             )
+
+    def test_distributed_admission_scope_is_source_owned(self):
+        repo = MODULE_PATH.parents[2]
+        self.assertEqual(
+            contract._distributed_admission_scope(repo), "canonical_turn_v1"
+        )
 
     def test_default_server_schema_allows_only_source_classified_conditional_tables(
         self,
@@ -660,6 +674,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "raw_ref_scheme_registry": len(
                     registries["raw_ref_scheme_registry"]
                 ),
+                "session_weighted_admission_gates": 1,
                 "sweeper_leases": 1,
             }
         )

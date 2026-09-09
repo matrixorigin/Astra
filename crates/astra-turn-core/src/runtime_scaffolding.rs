@@ -137,7 +137,69 @@ fn sanitize_json_except_assistant_tool_arguments(
             }
         }
         Value::Object(values) => {
+            // These fields are only protocol metadata when they occur at the
+            // root of a canonical tool message.  The same names inside user
+            // content, tool output, or an unknown nested object remain
+            // ordinary data and must pass through credential redaction.
+            let tool_result_frame =
+                at_message_root && values.get("role").and_then(Value::as_str) == Some("tool");
+            let tool_result_call_id = values
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let tool_result_run_id = values
+                .get(crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                .and_then(Value::as_str);
+            let tool_result_run_id = tool_result_run_id.map(str::to_owned);
+            let artifact_descriptor_is_bound = tool_result_frame
+                && values
+                    .get(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                    .and_then(crate::tool_result_storage::parse_tool_result_artifact_descriptor)
+                    .is_some_and(|descriptor| {
+                        crate::tool_result_storage::artifact_descriptor_matches_identity(
+                            &descriptor,
+                            tool_result_call_id.as_deref(),
+                            tool_result_run_id.as_deref(),
+                        )
+                    });
+            if tool_result_frame && !artifact_descriptor_is_bound {
+                // A malformed or cross-message descriptor is not ordinary
+                // user data: drop it rather than retaining a plausible but
+                // unauthorised recovery hint in the durable journal.
+                values.remove(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD);
+            }
             for (key, child) in values {
+                if tool_result_frame
+                    && key == crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
+                    && child
+                        .as_str()
+                        .is_some_and(crate::tool_result_storage::is_valid_tool_result_run_id)
+                {
+                    // A validated root run id is canonical ownership metadata,
+                    // not model-visible prose.  Invalid values fall through
+                    // to the generic sanitizer instead of becoming an
+                    // identity exemption.
+                    continue;
+                }
+                if tool_result_frame
+                    && key == crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
+                {
+                    if artifact_descriptor_is_bound {
+                        let descriptor =
+                            crate::tool_result_storage::parse_tool_result_artifact_descriptor(
+                                child,
+                            )
+                            .expect("bound artifact descriptor must remain parseable");
+                        // Rebuild the exact typed descriptor so an otherwise
+                        // valid object cannot smuggle unknown nested fields
+                        // (for example a credential) across the durable
+                        // boundary.
+                        if let Ok(canonical) = serde_json::to_value(descriptor) {
+                            *child = canonical;
+                            continue;
+                        }
+                    }
+                }
                 if assistant_frame
                     && path == AssistantToolPath::FunctionObject
                     && key == "arguments"
@@ -521,6 +583,89 @@ mod tests {
         assert_eq!(
             safe[0]["tool_calls"][0]["function"]["arguments"],
             r#"{"_astra_redaction":"arguments_unavailable"}"#
+        );
+    }
+
+    #[test]
+    fn nested_artifact_metadata_is_not_a_durable_sanitizer_exemption() {
+        let secret = "sk-protocol-nested-secret-abcdefghijklmnopqrstuvwxyz";
+        let descriptor = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 4,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "api_key": secret,
+        });
+        let messages = vec![json!({
+            "role": "user",
+            "content": {
+                "_astra_tool_result_artifact": descriptor,
+                "_astra_tool_result_run_id": secret,
+            }
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).expect("durable messages serialize");
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn valid_root_tool_artifact_metadata_is_canonicalized_and_preserved() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "bounded recovery projection",
+            "tool_call_id": "call-1",
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-1",
+            crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: {
+                "version": 1,
+                "call_id": "call-1",
+                "run_id": "run-1",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        assert_eq!(
+            safe[0][crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD],
+            "run-1"
+        );
+        assert_eq!(
+            safe[0][crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD],
+            json!({
+                "version": 1,
+                "call_id": "call-1",
+                "run_id": "run-1",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_root_tool_artifact_metadata_is_not_preserved_as_authority() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "bounded recovery projection",
+            "tool_call_id": "call-actual",
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-actual",
+            crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: {
+                "version": 1,
+                "call_id": "call-other",
+                "run_id": "run-other",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        assert!(
+            safe[0]
+                .get(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .is_none(),
+            "a descriptor bound to another call/run must not survive durable sanitization"
         );
     }
 }

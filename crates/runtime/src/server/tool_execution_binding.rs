@@ -308,6 +308,16 @@ pub struct SelectedToolOfferSnapshot {
     pub provider_id: String,
     #[serde(default = "default_selected_offer_route")]
     pub route: ToolExecutionRouteKind,
+    /// Full-schema content address used when the selected provider owns a
+    /// dynamic tool name outside the builtin registry. Keeping this proof on
+    /// the offer prevents execution from degrading to name-only admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_digest: Option<String>,
+    /// Provider-native identity carried with the durable offer snapshot. A
+    /// public alias is not an execution identity and must never be recreated
+    /// during replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tool_id: Option<String>,
 }
 
 impl SelectedToolOfferSnapshot {
@@ -317,6 +327,8 @@ impl SelectedToolOfferSnapshot {
             offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
             provider_id,
             route: default_selected_offer_route(),
+            schema_digest: None,
+            native_tool_id: None,
         }
     }
 
@@ -330,6 +342,42 @@ impl SelectedToolOfferSnapshot {
             offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
             provider_id,
             route,
+            schema_digest: None,
+            native_tool_id: None,
+        }
+    }
+
+    pub fn new_with_route_and_digest(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+        schema_digest: Option<String>,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+            schema_digest,
+            native_tool_id: None,
+        }
+    }
+
+    pub fn new_with_route_digest_and_native(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+        schema_digest: Option<String>,
+        native_tool_id: impl Into<String>,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        let native_tool_id = native_tool_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+            schema_digest,
+            native_tool_id: (!native_tool_id.trim().is_empty()).then_some(native_tool_id),
         }
     }
 }

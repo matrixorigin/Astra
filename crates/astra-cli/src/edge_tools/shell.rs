@@ -62,8 +62,10 @@ fn prepare_source_preimages(
     }
     // Inference is a best-effort advisory lane. An unavailable/ambiguous
     // preimage store must not turn normal CLI bash into a hard failure.
+    let execution_dir = executor.effective_project_root();
     Ok(astra_tools::source_preimage::prepare_inferred(
         &executor.project_root,
+        &execution_dir,
         args.get("command")
             .and_then(Value::as_str)
             .unwrap_or_default(),
@@ -127,6 +129,40 @@ fn terminate_environment_background_process(pid: u32) {
     unsafe {
         libc::kill(pgid, libc::SIGKILL);
     }
+}
+
+#[cfg(unix)]
+fn annotate_environment_background_termination(
+    outcome: &mut super::ToolExecutionOutcome,
+    task_id: &str,
+    pid: u32,
+    state: &str,
+) {
+    let fields = outcome
+        .tool_result_fields
+        .get_or_insert_with(serde_json::Map::new);
+    fields.extend([
+        ("execution_started".to_string(), Value::Bool(true)),
+        ("side_effects_maybe".to_string(), Value::Bool(true)),
+        ("retryable".to_string(), Value::Bool(false)),
+        (
+            "background_task_id".to_string(),
+            Value::String(task_id.to_string()),
+        ),
+        (
+            "background_task_state".to_string(),
+            Value::String(state.to_string()),
+        ),
+        (
+            "background_task_ownership".to_string(),
+            Value::String("reclaimed".to_string()),
+        ),
+        (
+            "background_task_process_group_terminated".to_string(),
+            Value::Bool(true),
+        ),
+        ("background_task_pid".to_string(), Value::from(pid)),
+    ]);
 }
 
 fn empty_result_note(command: &str) -> &'static str {
@@ -5214,22 +5250,66 @@ impl ToolExecutor {
             if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 terminate_environment_background_process(pid);
                 let _ = child.wait();
-                return super::cancelled_tool_execution_outcome("bash", true);
+                let mut outcome = super::cancelled_tool_execution_outcome("bash", true);
+                annotate_environment_background_termination(
+                    &mut outcome,
+                    &task_id,
+                    pid,
+                    "cancelled",
+                );
+                return outcome;
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    return super::ToolExecutionOutcome::error(format!(
-                        "Error: background task exited before readiness (status {status}); inspect {} and {}",
-                        stdout_path.display(),
-                        stderr_path.display()
-                    ));
+                    // The supervisor owns the process group from spawn until
+                    // readiness is acknowledged.  A wrapper that exits before
+                    // readiness must not transfer that ownership implicitly:
+                    // commands such as `cmd &` can leave live descendants
+                    // behind even when the wrapper reports status 0.  Reclaim
+                    // the group before returning so a model retry cannot race
+                    // with the first invocation's side effects.
+                    terminate_environment_background_process(pid);
+                    let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                        format!(
+                            "Error: background task exited before readiness (status {status}); its owned process group was terminated because readiness was never established; inspect {} and {}. Do not rerun until the command's possible side effects are checked.",
+                            stdout_path.display(),
+                            stderr_path.display()
+                        ),
+                        astra_core::ToolFailureEvidence::from_error_kind(
+                            astra_core::ErrorKind::ContractViolation,
+                        ),
+                    );
+                    annotate_environment_background_termination(
+                        &mut outcome,
+                        &task_id,
+                        pid,
+                        "failed",
+                    );
+                    let fields = outcome
+                        .tool_result_fields
+                        .as_mut()
+                        .expect("lifecycle annotation creates metadata");
+                    if let Some(code) = status.code() {
+                        fields.insert("exit_code".to_string(), Value::from(code));
+                    }
+                    return outcome;
                 }
                 Err(error) => {
                     terminate_environment_background_process(pid);
                     let _ = child.wait();
-                    return super::ToolExecutionOutcome::error(format!(
-                        "Error: cannot observe background task: {error}"
-                    ));
+                    let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                        format!("Error: cannot observe background task: {error}"),
+                        astra_core::ToolFailureEvidence::from_error_kind(
+                            astra_core::ErrorKind::ContractViolation,
+                        ),
+                    );
+                    annotate_environment_background_termination(
+                        &mut outcome,
+                        &task_id,
+                        pid,
+                        "failed",
+                    );
+                    return outcome;
                 }
                 Ok(None) => {}
             }
@@ -5266,11 +5346,21 @@ impl ToolExecutor {
             if std::time::Instant::now() >= deadline {
                 terminate_environment_background_process(pid);
                 let _ = child.wait();
-                return super::ToolExecutionOutcome::error(format!(
-                    "Error: background task did not become ready within {ready_timeout}s and was stopped; inspect {} and {}",
-                    stdout_path.display(),
-                    stderr_path.display()
-                ));
+                let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                    format!(
+                        "Error: background task did not become ready within {ready_timeout}s and was stopped; inspect {} and {}. Do not rerun until the command's possible side effects are checked.",
+                        stdout_path.display(),
+                        stderr_path.display()
+                    ),
+                    astra_core::ToolFailureEvidence::new(
+                        astra_core::ErrorKind::ToolTimeout,
+                        astra_core::ToolFailureCause::Unknown,
+                        false,
+                        vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+                    ),
+                );
+                annotate_environment_background_termination(&mut outcome, &task_id, pid, "stopped");
+                return outcome;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -6409,6 +6499,229 @@ mod tests {
         assert_eq!(fields["background_task_lifetime"], "environment");
         let pid = fields["background_task_pid"].as_u64().unwrap() as u32;
         super::terminate_environment_background_process(pid);
+
+        // SAFETY: restore the serialized test-only environment mutations.
+        unsafe {
+            match old_auth {
+                Some(value) => std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, value),
+                None => std::env::remove_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH),
+            }
+            match old_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn environment_background_reclaims_descendants_when_wrapper_exits() {
+        let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let old_auth = std::env::var_os(super::ENVIRONMENT_BACKGROUND_TASK_AUTH);
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: this module serializes mutations of these test-only env vars.
+        unsafe {
+            std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, "1");
+            std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
+        }
+        let executor = ToolExecutor::new(temp.path().to_path_buf());
+        let late_marker = temp.path().join("late-marker");
+        let command = format!(
+            "(sleep 0.5; printf late > {}) & exit 0",
+            super::shell_escape(late_marker.to_str().unwrap())
+        );
+        let outcome = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({
+                    "command": command,
+                    "run_in_background": true,
+                    "ready_check": "false",
+                    "background_ttl": 10,
+                    "timeout": 5
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: Some("run"),
+                    turn_chain_id: Some("turn"),
+                    tool_call_id: Some("wrapper-exit"),
+                    admission_source: None,
+                    expected_control_epoch: None,
+                },
+                None,
+            )
+            .await;
+        assert!(outcome.is_error, "wrapper exit must not be reported ready");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("wrapper exit must carry typed lifecycle evidence");
+        assert_eq!(fields["error_kind"], "contract_violation");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["side_effects_maybe"], true);
+        assert!(
+            fields["background_task_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("env-bg-"))
+        );
+        assert_eq!(fields["background_task_state"], "failed");
+        assert_eq!(fields["background_task_ownership"], "reclaimed");
+        assert_eq!(fields["background_task_process_group_terminated"], true);
+        assert_eq!(
+            fields["recovery_evidence"]["retryable"], false,
+            "contract failures must carry the shared non-retryable evidence"
+        );
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !late_marker.exists(),
+            "descendant survived wrapper exit; retry could race with the first invocation"
+        );
+
+        // SAFETY: restore the serialized test-only environment mutations.
+        unsafe {
+            match old_auth {
+                Some(value) => std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, value),
+                None => std::env::remove_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH),
+            }
+            match old_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn environment_background_timeout_reclaims_process_group_with_typed_evidence() {
+        let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let old_auth = std::env::var_os(super::ENVIRONMENT_BACKGROUND_TASK_AUTH);
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: this module serializes mutations of these test-only env vars.
+        unsafe {
+            std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, "1");
+            std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
+        }
+        let executor = ToolExecutor::new(temp.path().to_path_buf());
+        let late_marker = temp.path().join("late-timeout-marker");
+        let command = format!(
+            "(sleep 2; printf late > {}) & while :; do sleep 1; done",
+            super::shell_escape(late_marker.to_str().unwrap())
+        );
+        let outcome = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({
+                    "command": command,
+                    "run_in_background": true,
+                    "ready_check": "false",
+                    "background_ttl": 10,
+                    "timeout": 1
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: Some("run"),
+                    turn_chain_id: Some("turn"),
+                    tool_call_id: Some("timeout"),
+                    admission_source: None,
+                    expected_control_epoch: None,
+                },
+                None,
+            )
+            .await;
+        assert!(outcome.is_error, "readiness timeout must remain an error");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("timeout must carry typed lifecycle evidence");
+        assert_eq!(fields["error_kind"], "tool_timeout");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["side_effects_maybe"], true);
+        assert_eq!(fields["background_task_state"], "stopped");
+        assert_eq!(fields["background_task_ownership"], "reclaimed");
+        assert_eq!(fields["background_task_process_group_terminated"], true);
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert!(
+            !late_marker.exists(),
+            "timed-out descendants must not survive"
+        );
+
+        // SAFETY: restore the serialized test-only environment mutations.
+        unsafe {
+            match old_auth {
+                Some(value) => std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, value),
+                None => std::env::remove_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH),
+            }
+            match old_state {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn environment_background_cancellation_reclaims_process_group_with_typed_evidence() {
+        let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let old_auth = std::env::var_os(super::ENVIRONMENT_BACKGROUND_TASK_AUTH);
+        let old_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: this module serializes mutations of these test-only env vars.
+        unsafe {
+            std::env::set_var(super::ENVIRONMENT_BACKGROUND_TASK_AUTH, "1");
+            std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
+        }
+        let executor = ToolExecutor::new(temp.path().to_path_buf());
+        let late_marker = temp.path().join("late-cancel-marker");
+        let command = format!(
+            "(sleep 2; printf late > {}) & while :; do sleep 1; done",
+            super::shell_escape(late_marker.to_str().unwrap())
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        let trigger_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let outcome = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({
+                    "command": command,
+                    "run_in_background": true,
+                    "ready_check": "false",
+                    "background_ttl": 10,
+                    "timeout": 5
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: Some("run"),
+                    turn_chain_id: Some("turn"),
+                    tool_call_id: Some("cancel"),
+                    admission_source: None,
+                    expected_control_epoch: None,
+                },
+                Some(&cancel),
+            )
+            .await;
+        trigger_task.await.unwrap();
+        assert!(outcome.is_error, "cancellation must remain an error");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("cancellation must carry typed lifecycle evidence");
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["side_effects_maybe"], true);
+        assert_eq!(fields["background_task_state"], "cancelled");
+        assert_eq!(fields["background_task_ownership"], "reclaimed");
+        assert_eq!(fields["background_task_process_group_terminated"], true);
+
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        assert!(
+            !late_marker.exists(),
+            "cancelled descendants must not survive"
+        );
 
         // SAFETY: restore the serialized test-only environment mutations.
         unsafe {

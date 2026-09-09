@@ -10,22 +10,22 @@ description: |
   **Fail means**: Tool results dropped, append failed, or memory_store not called.
   **Note**: setup_cmd force-creates the file fresh before each run.
 prompt: |
-  Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
+  Read the file .astra_harness_mt_test.txt and tell me what's in it.
   Include the file contents in your answer.
 capability: tool_use
 difficulty: 2
 weight: 2.0
 timeout_seconds: 180
 cleanup_memory_records: true
-setup_cmd: "printf 'hello world 42\\n' > /tmp/astra_harness_mt_test.txt"
-teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
+setup_cmd: "printf 'hello world 42\\n' > .astra_harness_mt_test.txt"
+teardown_cmd: "rm -f .astra_harness_mt_test.txt"
 steps:
   - prompt: "Now append the line 'second line' to that same file and confirm it was done."
     criteria:
       - type: tools_count_between
         min: 1
         max: 8
-  - prompt: "Please remember that /tmp/astra_harness_mt_test.txt is our scratch file for integration testing. Store this in your memory."
+  - prompt: "Please remember that .astra_harness_mt_test.txt is our scratch file for integration testing. Store this in your memory."
     criteria:
       - type: tool_called
         name: memory

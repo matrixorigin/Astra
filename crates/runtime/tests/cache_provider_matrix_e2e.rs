@@ -792,7 +792,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn deepseek_required_settlement_stays_in_provider_final_tail() {
+async fn deepseek_required_settlement_keeps_stable_system_prefix() {
     let case = PROVIDER_MATRIX
         .iter()
         .copied()
@@ -826,7 +826,8 @@ async fn deepseek_required_settlement_stays_in_provider_final_tail() {
             json!({
                 "schema": "completion_settlement.v2",
                 "revision": revision,
-                "mode": "text_only"
+                "mode": "text_only",
+                "instruction": "Produce the final answer from the verified evidence."
             }),
         );
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
@@ -839,32 +840,69 @@ async fn deepseek_required_settlement_stays_in_provider_final_tail() {
 
     let guard = capture.lock().unwrap();
     assert_eq!(guard.len(), 2);
-    let first = &guard[0].provider_messages;
-    let second = &guard[1].provider_messages;
+    let first = &guard[0];
+    let second = &guard[1];
     assert_eq!(
-        first[0], second[0],
-        "leading system prefix must stay byte-stable"
+        first.system_primary, second.system_primary,
+        "stable system input must stay byte-stable across settlement revisions"
     );
-    assert!(flatten_content(&first[0]).contains("active_turn_focus_policy.v1"));
-    for (revision, messages) in [(1, first), (2, second)] {
+    assert_eq!(
+        first.provider_messages[0], second.provider_messages[0],
+        "leading provider system prefix must stay byte-stable when only settlement facts change"
+    );
+    assert!(flatten_content(&first.provider_messages[0]).contains("active_turn_focus_policy.v1"));
+    for (revision, captured) in [(1, first), (2, second)] {
+        let internal_settlement_index = captured
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .get("__astra_runtime_volatile_kind")
+                    .and_then(Value::as_str)
+                    == Some("final_answer_settlement")
+            })
+            .expect("canonical settlement remains in the internal runtime tail");
+        assert_eq!(
+            captured.messages[internal_settlement_index]
+                .get("role")
+                .and_then(Value::as_str),
+            Some("system")
+        );
+        assert!(
+            captured.messages[..internal_settlement_index]
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+            "canonical settlement must follow the complete assistant/tool group"
+        );
+
+        let messages = &captured.provider_messages;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1,
+            "OpenAI-compatible projection must expose one leading system message"
+        );
         let settlement_index = messages
             .iter()
             .position(|message| flatten_content(message).contains("completion_settlement.v2"))
             .expect("required settlement remains provider-visible");
         let settlement = &messages[settlement_index];
-        assert_eq!(
-            settlement.get("role").and_then(Value::as_str),
-            Some("system")
-        );
         assert!(
             messages[..settlement_index]
                 .iter()
                 .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
-            "required tail must follow the complete assistant/tool group"
+            "provider facts must follow the complete assistant/tool group"
         );
+        assert_eq!(settlement.get("role").and_then(Value::as_str), Some("user"));
         let text = flatten_content(settlement);
         assert!(text.contains("completion_settlement.v2"));
         assert!(text.contains(&format!("\"revision\":{revision}")));
+        assert!(
+            !text.contains("Produce the final answer from the verified evidence."),
+            "provider facts must not duplicate the trusted instruction"
+        );
         assert!(
             settlement.get("__astra_runtime_system_context").is_none(),
             "internal ownership marker must not reach the provider body"

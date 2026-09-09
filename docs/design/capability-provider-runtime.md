@@ -82,6 +82,16 @@ exact descriptor version identifies the declaration Astra resolved.
 Public tool names, model schemas, prompt order, and client labels are
 deterministic projections. They are not durable execution or replay keys.
 
+Deferred selection records learned contract knowledge, not a permanent lease on
+an executor process. Before a new model request, an already resolved selection
+may bind to the current admitted provider when its compact selection digest,
+native tool identity, and provider descriptor version are unchanged. A missing
+descriptor, changed contract, hidden capability, or unavailable provider cannot
+be repaired from a name alone. After that request's projection, provider changes
+must still fail invocation admission and durable dispatch; post-response policy
+refresh must not rebind selected execution identities. Resident schema bytes and
+durable invocation/replay keys are unaffected by this request-bound revalidation.
+
 ### One fact source
 
 Visibility and execution must originate from the same resolved provider

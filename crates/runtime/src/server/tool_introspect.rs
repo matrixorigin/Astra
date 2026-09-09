@@ -78,6 +78,7 @@ mod tests {
                 model_context_window_tokens: None,
                 effective_input_limit_tokens: None,
                 estimated_input_tokens: None,
+                estimated_cache_eligible_tokens: None,
                 token_pressure: Some(0.0),
                 compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
             },

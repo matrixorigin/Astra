@@ -359,6 +359,10 @@ pub(crate) struct LlmContextManifestTrace {
     pub compaction_tier: String,
     pub system_prompt_tokens: u32,
     pub stable_system_message_count: usize,
+    /// Tokens in the runtime preamble that was selected for this provider
+    /// request.  The stable system lane and this lane are tracked separately
+    /// because only the former is part of the reusable cache prefix.
+    pub volatile_preamble_tokens: u32,
     pub volatile_preamble_count: usize,
     pub tool_schema_count: usize,
     pub runtime_manifest: Option<Value>,
@@ -375,6 +379,7 @@ impl LlmContextManifestTrace {
             "compaction_tier": self.compaction_tier.clone(),
             "system_prompt_tokens": self.system_prompt_tokens,
             "stable_system_message_count": self.stable_system_message_count,
+            "volatile_preamble_tokens": self.volatile_preamble_tokens,
             "volatile_preamble_count": self.volatile_preamble_count,
             "tool_schema_count": self.tool_schema_count,
             "runtime_manifest": self.runtime_manifest.clone(),
@@ -1418,14 +1423,10 @@ pub(crate) fn assemble_context_pipeline(
             let mut volatile_text = String::new();
             for block in &pipeline_output.serialized.system_blocks {
                 // Strict-history providers suppress ordinary volatile text to
-                // keep prior messages byte-stable. Deferred-tool discovery is
-                // different: it is a control-plane contract the model must
-                // see in order to activate a tool. Keep that typed block in
-                // the stable lane; changing it intentionally starts a new
-                // cache epoch instead of silently hiding a capability.
-                if block.scope != CacheScope::None
-                    || block.kind == astra_turn_core::section_types::SectionKind::DeferredTools
-                {
+                // keep prior messages byte-stable. Capability-epoch metadata
+                // (including deferred discovery) is already marked Session by
+                // the canonical planner, so scope alone decides placement.
+                if block.scope != CacheScope::None {
                     stable_text.push_str(&block.text);
                 } else {
                     volatile_text.push_str(&block.text);
@@ -1487,6 +1488,10 @@ pub(crate) fn assemble_context_pipeline(
         .iter()
         .map(estimate_json_tokens)
         .fold(0_u32, u32::saturating_add);
+    let volatile_preamble_tokens = volatile_preamble
+        .iter()
+        .map(estimate_json_tokens)
+        .fold(0_u32, u32::saturating_add);
     breakdown.total_tokens = system_prompt_tokens;
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
     let tier = pipeline_output.plan.compact_tier;
@@ -1511,6 +1516,7 @@ pub(crate) fn assemble_context_pipeline(
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
+            volatile_preamble_tokens,
             volatile_preamble_count,
             tool_schema_count,
             runtime_manifest: runtime_manifest_with_memory_context(
@@ -1596,11 +1602,8 @@ fn classify_pipeline_abort(
 pub(crate) fn assemble_wire_messages(
     input: LlmWireAssemblyInput<'_>,
 ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
-    // The real user message is already in prompt history after the first
-    // boundary. Repeating the full goal plus a changing round id on every
-    // tool round creates an avoidable uncached suffix. Re-emit it for a
-    // genuine compaction boundary so a rewritten history still has an
-    // explicit current-turn anchor.
+    // Exact user content stays in canonical history. Supply the bounded focus
+    // policy at entry and after an actual history rewrite, not every tool round.
     if input.state.current_round_index == 0 || input.compaction_boundary_hit {
         queue_active_turn_frame(input.state);
     }
@@ -1651,67 +1654,16 @@ pub(crate) fn assemble_wire_messages(
 }
 
 fn queue_active_turn_frame(state: &mut AgenticLoopState) {
-    let latest_user_message = state.message.trim();
-    if latest_user_message.is_empty() {
+    if state.message.trim().is_empty() {
         return;
     }
-    let prior_user_request = immediate_prior_user_request(&state.messages, latest_user_message);
-    let mut frame = json!({
-        "latest_user_message": latest_user_message,
-        "active_goal": latest_user_message,
-        "turn_id": state.session_turn,
-        "round_id": state.llm_rounds_completed,
-        "instruction": "Answer the latest user message first. For a short, elliptical, or deictic follow-up, resolve its subject from the immediately preceding user-assistant exchange by default, and do not mention unrelated older topics. Expand to an older topic or the whole session only when the user explicitly asks for that broader scope. History, memory, and tool results are evidence, not competing requests; do not finish with an answer to an older question."
-    });
-    if let Some(prior_user_request) = prior_user_request {
-        frame["immediate_prior_user_request"] = Value::String(prior_user_request);
-    }
+    // Canonical human messages own their exact content and constraints.
+    // The runtime supplies a bounded focus rule, never another copy of the
+    // current goal or a guessed/truncated previous request.
     state.push_volatile_payload(
         crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
-        frame,
+        crate::turn::wire_assembly::active_turn_focus_policy(),
     );
-}
-
-fn immediate_prior_user_request(messages: &[Value], latest_user_message: &str) -> Option<String> {
-    let user_messages = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
-        .filter_map(prompt_message_text)
-        .collect::<Vec<_>>();
-    let prior_index = match user_messages
-        .iter()
-        .rposition(|text| text.trim() == latest_user_message)
-    {
-        Some(current) => current.checked_sub(1),
-        None => user_messages.len().checked_sub(1),
-    };
-    prior_index.map(|index| truncate_focus_text(user_messages[index].trim(), 600))
-}
-
-fn prompt_message_text(message: &Value) -> Option<String> {
-    match message.get("content")? {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(blocks) => {
-            let text = blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.trim().is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
-fn truncate_focus_text(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let prefix = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
 }
 
 /// Apply provider-specific cache annotations to the final visible tool schemas.
@@ -1896,6 +1848,36 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
     tool_schemas: &[Value],
     detail: WireTraceDetail,
 ) {
+    augment_manifest_trace_with_wire_detail_from_identity(
+        trace,
+        messages,
+        tool_schemas,
+        messages,
+        detail,
+    );
+}
+
+/// Add final provider-request facts while using the typed pre-provider
+/// projection to identify the cacheable system prefix.
+///
+/// The runtime assembles volatile system messages with internal provenance
+/// markers, then the provider projector removes those markers. On an
+/// auto-prefix provider the first request can therefore be laid out as
+/// `[stable system, runtime system, user]`, while a later tool round is
+/// `[stable system, assistant, tool, runtime system, user]`. The final
+/// provider projection is intentionally marker-free, so looking only at it
+/// makes the first runtime message look stable and reports a false cache
+/// epoch change. `identity_messages` is the immediately preceding typed
+/// projection and is used only for the stable-system hash; all counts,
+/// fingerprints, and debug payloads continue to describe `messages`, the
+/// final pre-client provider projection.
+pub(crate) fn augment_manifest_trace_with_wire_detail_from_identity(
+    trace: &mut Value,
+    messages: &[Value],
+    tool_schemas: &[Value],
+    identity_messages: &[Value],
+    detail: WireTraceDetail,
+) {
     let message_cache_control_count = messages.iter().map(cache_control_count).sum::<usize>();
     let tool_cache_control_count = tool_schemas.iter().map(cache_control_count).sum::<usize>();
     let mut message_role_counts = BTreeMap::<String, usize>::new();
@@ -1908,30 +1890,69 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
         let role = message_role(message);
         *message_role_counts.entry(role.clone()).or_default() += 1;
         if role == "system" {
-            system_messages.push(message.clone());
-            if leading_system_prefix_open {
-                leading_system_messages.push(message.clone());
+            // The complete system-message sequence is debug-only. Metrics
+            // needs role/cardinality facts and the bounded stable-prefix
+            // hash, not a second history-sized allocation of system content.
+            if detail == WireTraceDetail::Debug {
+                system_messages.push(message.clone());
             }
         } else {
-            leading_system_prefix_open = false;
             conversation_message_count = conversation_message_count.saturating_add(1);
             *conversation_role_counts.entry(role).or_default() += 1;
         }
     }
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
-        &system_messages,
-    );
+    // Runtime-owned system messages are deliberately inserted at the
+    // current-turn boundary after conversation history. They are not part of
+    // the provider's stable system prefix. Use the typed pre-provider view so
+    // the marker is still available even though the final provider
+    // projection strips it. Stop at the first runtime-owned message (or any
+    // non-system message); static system blocks before it remain cache
+    // identity.
+    for message in identity_messages {
+        let role = message_role(message);
+        if role == "system"
+            && leading_system_prefix_open
+            && !crate::turn::wire_assembly::is_runtime_system_context(message)
+        {
+            leading_system_messages.push(message.clone());
+        } else {
+            leading_system_prefix_open = false;
+        }
+    }
+    if detail == WireTraceDetail::Debug {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            &system_messages,
+        );
+    }
     let stable_system_prefix = stable_cache_prefix(&leading_system_messages);
     let stable_tool_prefix = stable_cache_prefix(tool_schemas);
+    // This is an estimate of the provider-visible reusable prefix only. Keep
+    // it separate from provider-reported cache reads: a provider may cache a
+    // longer conversation prefix, and a short stable prefix can legitimately
+    // have a lower share when dynamic history is large. Computing this from
+    // the already-isolated stable slices keeps metrics mode O(prefix), not
+    // another history-sized traversal.
+    let estimated_stable_system_tokens = stable_system_prefix
+        .iter()
+        .map(estimate_json_tokens)
+        .map(u64::from)
+        .sum::<u64>();
+    let estimated_tool_schema_tokens = stable_tool_prefix
+        .iter()
+        .map(estimate_json_tokens)
+        .map(u64::from)
+        .sum::<u64>();
+    let estimated_cache_eligible_tokens =
+        estimated_stable_system_tokens.saturating_add(estimated_tool_schema_tokens);
     let cache_layout = if message_cache_control_count + tool_cache_control_count > 0 {
         "explicit-breakpoints-v1"
     } else {
         "provider-prefix-v1"
     };
     let prompt_cache_identity = astra_turn_types::PromptCacheIdentityV1::from_prefixes(
-        &stable_system_prefix,
-        &stable_tool_prefix,
+        stable_system_prefix,
+        stable_tool_prefix,
         cache_layout,
     )
     .expect("wire prompt cache identity inputs are bounded constants and JSON");
@@ -1953,6 +1974,12 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
             "conversation_projection": {
                 "message_count": conversation_message_count,
                 "role_counts": conversation_role_counts,
+            },
+            "cache_estimate": {
+                "stable_system_tokens": estimated_stable_system_tokens,
+                "tool_schema_tokens": estimated_tool_schema_tokens,
+                "eligible_tokens": estimated_cache_eligible_tokens,
+                "basis": "provider_visible_stable_prefix_only",
             },
             "fingerprint": {
                 "prompt_cache_identity": prompt_cache_identity,
@@ -2024,7 +2051,7 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
     }
 }
 
-fn stable_cache_prefix(values: &[Value]) -> Vec<Value> {
+fn stable_cache_prefix(values: &[Value]) -> &[Value] {
     let prefix = match values
         .iter()
         .rposition(|value| cache_control_count(value) > 0)
@@ -2036,7 +2063,7 @@ fn stable_cache_prefix(values: &[Value]) -> Vec<Value> {
         astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
         prefix,
     );
-    prefix.to_vec()
+    prefix
 }
 
 #[cfg(test)]
@@ -2488,6 +2515,15 @@ mod context_cache_contract_tests {
         );
         assert_eq!(output.manifest_trace.volatile_preamble_count, 1);
         assert_eq!(
+            output.manifest_trace.volatile_preamble_tokens,
+            output
+                .volatile_preamble
+                .iter()
+                .map(estimate_json_tokens)
+                .fold(0_u32, u32::saturating_add),
+            "volatile prompt telemetry must use the same typed JSON estimator"
+        );
+        assert_eq!(
             output.manifest_trace.system_prompt_tokens,
             output.breakdown.total_tokens
         );
@@ -2629,14 +2665,66 @@ mod context_cache_contract_tests {
             .expect("active-turn facts must remain model-visible");
         let runtime_system_text = message_text(runtime_context);
         assert!(runtime_system_text.contains("<runtime-required-context>"));
-        assert!(runtime_system_text.contains("\"turn_id\":7"));
-        assert!(runtime_system_text.contains("\"round_id\":3"));
+        // The active-turn payload is a bounded, canonical policy frame.  The
+        // concrete turn/round identifiers remain in the authoritative
+        // conversation state and must not be duplicated into this frame.
+        assert!(!runtime_system_text.contains("\"turn_id\""));
+        assert!(!runtime_system_text.contains("\"round_id\""));
         assert!(!runtime_system_text.contains("\"instruction\""));
+        assert!(runtime_system_text.contains("active_turn_focus_policy.v1"));
+        assert!(!runtime_system_text.contains(&state.message));
+        assert!(!runtime_system_text.contains("一共多少 changes？"));
         assert!(!message_text(&messages[0]).contains("<runtime-required-context>"));
         assert_eq!(state.volatile_pending.len(), 1);
         assert!(state.volatile_pending[0].attempt_leased);
         state.commit_volatile_attempt_lease();
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn active_focus_cost_is_bounded_independently_of_user_input_size() {
+        for text in [
+            "short request".to_string(),
+            "bounded input data ".repeat(5_000),
+        ] {
+            for compaction_boundary_hit in [false, true] {
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.message = text.clone();
+                state.user_intent = text.clone();
+                state.current_round_index = if compaction_boundary_hit { 3 } else { 0 };
+                state.messages = vec![json!({"role":"user", "content":text})];
+                let original = state.messages.clone();
+                let canonical_bytes = serde_json::to_vec(&original).unwrap().len();
+                let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+                let cache_cfg = PromptCacheConfig::latch("openai");
+                let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                    system_messages: vec![json!({"role":"system", "content":"stable contract"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: original.clone(),
+                    state: &mut state,
+                    compaction_boundary_hit,
+                    thinking: &thinking,
+                    session_id: "focus-bound",
+                    provider: "openai",
+                    model_name: "deployment-alias",
+                    cache_capability: None,
+                    cache_cfg: &cache_cfg,
+                })
+                .unwrap();
+                assert_eq!(state.messages, original);
+                assert_eq!(
+                    wire.iter()
+                        .filter(|m| astra_turn_types::is_human_user_message(m))
+                        .collect::<Vec<_>>(),
+                    original.iter().collect::<Vec<_>>()
+                );
+                assert!(serde_json::to_vec(&wire).unwrap().len() <= canonical_bytes + 2_048);
+                assert_eq!(
+                    state.volatile_pending[0].payload,
+                    crate::turn::wire_assembly::active_turn_focus_policy()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2845,43 +2933,6 @@ mod context_cache_contract_tests {
             message.get("role").and_then(Value::as_str) == Some("user")
                 && message_text(message) == "summarize it"
         }));
-    }
-
-    #[test]
-    fn immediate_prior_user_request_uses_position_when_text_repeats() {
-        let messages = vec![
-            json!({"role": "user", "content": "问题总结？"}),
-            json!({"role": "assistant", "content": "first"}),
-            json!({"role": "user", "content": "CURSOR-BETA review"}),
-            json!({"role": "assistant", "content": "second"}),
-            json!({"role": "user", "content": "问题总结？"}),
-        ];
-
-        assert_eq!(
-            immediate_prior_user_request(&messages, "问题总结？").as_deref(),
-            Some("CURSOR-BETA review")
-        );
-    }
-
-    #[test]
-    fn immediate_prior_user_request_excludes_append_only_runtime_authority() {
-        let mut runtime = json!({"role": "user", "content": "runtime settlement"});
-        astra_turn_types::mark_append_only_required_context(
-            &mut runtime,
-            "final_answer_settlement",
-            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
-        );
-        let messages = vec![
-            json!({"role": "user", "content": "actual prior goal"}),
-            runtime,
-            json!({"role": "assistant", "content": "checked"}),
-            json!({"role": "user", "content": "continue"}),
-        ];
-
-        assert_eq!(
-            immediate_prior_user_request(&messages, "continue").as_deref(),
-            Some("actual prior goal")
-        );
     }
 
     #[test]
@@ -3652,6 +3703,26 @@ mod context_cache_contract_tests {
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);
         assert_eq!(trace["wire"]["total_cache_control_count"], 2);
+        assert_eq!(
+            trace["wire"]["cache_estimate"]["basis"],
+            "provider_visible_stable_prefix_only"
+        );
+        assert!(
+            trace["wire"]["cache_estimate"]["eligible_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 0)
+        );
+        assert_eq!(
+            trace["wire"]["cache_estimate"]["eligible_tokens"],
+            serde_json::json!(
+                trace["wire"]["cache_estimate"]["stable_system_tokens"]
+                    .as_u64()
+                    .unwrap()
+                    + trace["wire"]["cache_estimate"]["tool_schema_tokens"]
+                        .as_u64()
+                        .unwrap()
+            )
+        );
         assert_eq!(trace["wire"]["message_roles"], json!(["system", "user"]));
         assert_eq!(
             trace["wire"]["message_role_counts"],
@@ -3728,6 +3799,11 @@ mod context_cache_contract_tests {
                 .is_none()
         );
         assert!(trace["wire"]["fingerprint"].get("message_hashes").is_none());
+        assert_eq!(
+            trace["wire"]["cache_estimate"]["basis"],
+            "provider_visible_stable_prefix_only"
+        );
+        assert_eq!(trace["wire"]["cache_estimate"]["eligible_tokens"], 0);
         assert!(!trace.to_string().contains(secret));
         assert!(
             trace.to_string().len() < 2_048,
@@ -3764,6 +3840,98 @@ mod context_cache_contract_tests {
         assert_ne!(
             baseline["wire"]["fingerprint"]["system_message_sequence_sha256"],
             with_later_runtime_system["wire"]["fingerprint"]["system_message_sequence_sha256"]
+        );
+    }
+
+    #[test]
+    fn prompt_cache_identity_excludes_runtime_system_suffix_even_when_contiguous() {
+        let mut first_round = json!({});
+        let mut next_round = json!({});
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "round-specific authority",
+            true,
+        )
+        .expect("runtime context message");
+
+        // With an empty history the runtime message is physically adjacent to
+        // the static system message.  Once a tool round exists it moves behind
+        // the assistant/tool history.  The stable identity must describe the
+        // same static prefix in both layouts, rather than turning that valid
+        // placement change into a cache break.
+        augment_manifest_trace_with_wire(
+            &mut first_round,
+            &[
+                json!({"role": "system", "content": "stable"}),
+                runtime.clone(),
+                json!({"role": "user", "content": "work"}),
+            ],
+            &[],
+        );
+        augment_manifest_trace_with_wire(
+            &mut next_round,
+            &[
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "assistant", "content": "tool call"}),
+                json!({"role": "tool", "content": "result"}),
+                runtime,
+                json!({"role": "user", "content": "continue"}),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            first_round["wire"]["fingerprint"]["prompt_cache_identity"]["stable_system_prefix_hash"],
+            next_round["wire"]["fingerprint"]["prompt_cache_identity"]["stable_system_prefix_hash"],
+            "runtime placement must not churn the stable prefix identity"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_identity_uses_typed_projection_before_marker_stripping() {
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "round-specific authority",
+            true,
+        )
+        .expect("runtime context message");
+        let pre_provider = vec![
+            json!({"role": "system", "content": "stable"}),
+            runtime,
+            json!({"role": "user", "content": "work"}),
+        ];
+        let provider_projection =
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &pre_provider,
+                "openai",
+                None,
+            );
+
+        let mut traced = json!({});
+        augment_manifest_trace_with_wire_detail_from_identity(
+            &mut traced,
+            &provider_projection,
+            &[],
+            &pre_provider,
+            WireTraceDetail::Debug,
+        );
+
+        let mut expected = json!({});
+        augment_manifest_trace_with_wire(
+            &mut expected,
+            &[
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "work"}),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            traced["wire"]["fingerprint"]["prompt_cache_identity"],
+            expected["wire"]["fingerprint"]["prompt_cache_identity"],
+            "marker-stripped runtime context must not become stable cache identity"
+        );
+        assert_eq!(
+            traced["wire"]["message_count"], 3,
+            "wire metrics must still describe the final provider projection"
         );
     }
 

@@ -1128,6 +1128,24 @@ pub struct EdgePolicySnapshot {
     pub rules_fingerprint: Option<String>,
 }
 
+/// Current typed descriptor schema for an out-of-line tool result.
+pub const TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION: u32 = 1;
+
+/// Immutable authority for one out-of-line tool result.
+///
+/// The model-facing result remains a compact display envelope. Durable
+/// consumers must use this typed record instead: it binds the bytes to the
+/// producer run and call without interpreting display text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultArtifactDescriptor {
+    pub version: u32,
+    pub call_id: String,
+    pub run_id: String,
+    pub byte_len: u64,
+    pub content_sha256: String,
+}
+
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -1201,6 +1219,11 @@ pub struct ToolCallRecord {
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_full: Option<String>,
+    /// Typed internal authority for `result_full` when its complete bytes are
+    /// stored outside the journal. This field is journal-only metadata and is
+    /// never projected into the provider prompt or tool schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_artifact: Option<ToolResultArtifactDescriptor>,
     /// Dedicated ask_user prompt/response audit payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_user: Option<serde_json::Value>,
@@ -1856,6 +1879,9 @@ pub enum SessionMemoryExtractionSkipReason {
     /// overwrite or delay newer memory.
     Superseded,
     SelectorCooldown,
+    /// The account has no current Memoria write capability. This is an
+    /// intentional capability boundary, not a failed extraction attempt.
+    AccessDisabled,
     /// Memoria endpoint tripped the circuit breaker after consecutive
     /// failures. Emitted synchronously — no spawn, no retry attempted
     /// until the cooldown TTL elapses.
@@ -9841,7 +9867,9 @@ mod tests {
 
     #[test]
     fn list_sessions_by_time_filters_test_prefixes() {
-        std::fs::create_dir_all(journal_dir()).ok();
+        let temp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        std::fs::create_dir_all(journal_dir()).unwrap();
 
         // Create test-prefixed and real session files
         let real_sid = format!("real-session-{}", uuid::Uuid::new_v4());
@@ -9878,7 +9906,9 @@ mod tests {
 
     #[test]
     fn list_sessions_by_time_respects_limit() {
-        std::fs::create_dir_all(journal_dir()).ok();
+        let temp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        std::fs::create_dir_all(journal_dir()).unwrap();
 
         let mut created = Vec::new();
         for i in 0..5 {
@@ -11606,6 +11636,29 @@ mod turn_event_buffer_tests {
             tool_calls[0].args_full.as_deref(),
             Some("{\"action\":\"diff\",\"stat_only\":true}")
         );
+    }
+
+    #[test]
+    fn tool_result_artifact_descriptor_round_trips_as_typed_journal_metadata() {
+        let record = ToolCallRecord {
+            tool_call_id: Some("call-1".into()),
+            name: "agent".into(),
+            result_full: Some("<persisted-output>display only</persisted-output>".into()),
+            result_artifact: Some(ToolResultArtifactDescriptor {
+                version: TOOL_RESULT_ARTIFACT_DESCRIPTOR_VERSION,
+                call_id: "call-1".into(),
+                run_id: "run-1".into(),
+                byte_len: 42,
+                content_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["result_artifact"]["run_id"], "run-1");
+        assert_eq!(encoded["result_artifact"]["byte_len"], 42);
+        let decoded: ToolCallRecord = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.result_artifact, record.result_artifact);
     }
 
     #[test]

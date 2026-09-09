@@ -589,10 +589,12 @@ pub fn checkout_file(project_root: &Path, args: &Value) -> String {
         return "Error: invalid ref".to_string();
     }
 
-    let out = std::process::Command::new("git")
-        .args(["checkout", git_ref, "--", file_path])
-        .current_dir(project_root)
-        .output();
+    let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
+        command
+            .args(["checkout", git_ref, "--", file_path])
+            .output()
+            .map_err(|error| error.to_string())
+    });
 
     match out {
         Ok(o) if o.status.success() => {
@@ -710,6 +712,9 @@ pub(crate) fn worktree_add_with_metadata(
     project_root: &Path,
     args: &Value,
 ) -> super::ToolExecutionOutcome {
+    if let Err(error) = astra_tools::git_gix::validate_exact_repository_binding(project_root) {
+        return super::ToolExecutionOutcome::error(error.message);
+    }
     let branch = match args.get("branch").and_then(Value::as_str) {
         Some(b) if !b.is_empty() => b,
         _ => {
@@ -743,8 +748,10 @@ pub(crate) fn worktree_add_with_metadata(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root);
+    let mut cmd = match astra_tools::git_gix::exact_git_command(project_root) {
+        Ok(command) => command,
+        Err(error) => return super::ToolExecutionOutcome::error(error),
+    };
     cmd.arg("worktree").arg("add");
 
     if create_new {
@@ -802,10 +809,12 @@ pub(crate) fn worktree_add_with_metadata(
 }
 
 pub(crate) fn worktree_list(project_root: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
-        .output();
+    let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
+        command
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .map_err(|error| error.to_string())
+    });
 
     match out {
         Ok(o) if o.status.success() => {
@@ -891,10 +900,12 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
     // First, get the branch name before removal (for optional branch deletion)
     let branch_name = if delete_branch {
-        let out = std::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(project_root)
-            .output();
+        let out = astra_tools::git_gix::exact_git_command(project_root).and_then(|mut command| {
+            command
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+                .map_err(|error| error.to_string())
+        });
         out.ok().and_then(|o| {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let mut found_path = false;
@@ -916,8 +927,11 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
     };
 
     // Remove worktree
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root).arg("worktree").arg("remove");
+    let mut cmd = match astra_tools::git_gix::exact_git_command(project_root) {
+        Ok(command) => command,
+        Err(error) => return error,
+    };
+    cmd.arg("worktree").arg("remove");
     if force {
         cmd.arg("--force");
     }
@@ -929,10 +943,14 @@ pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
 
             // Optionally delete the branch
             if let Some(ref branch) = branch_name {
-                let del = std::process::Command::new("git")
-                    .args(["branch", "-D", branch])
-                    .current_dir(project_root)
-                    .output();
+                let del = astra_tools::git_gix::exact_git_command(project_root).and_then(
+                    |mut command| {
+                        command
+                            .args(["branch", "-D", branch])
+                            .output()
+                            .map_err(|error| error.to_string())
+                    },
+                );
                 match del {
                     Ok(d) if d.status.success() => {
                         msg.push_str(&format!("\n  ✓ Branch '{branch}' deleted"));

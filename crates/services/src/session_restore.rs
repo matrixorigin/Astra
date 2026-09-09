@@ -366,12 +366,10 @@ pub struct RestoredSession {
     /// this instead of independently comparing turn counts and message arrays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_bundle: Option<astra_turn_types::ResumeBundleV1>,
-    /// Deferred schemas materialized in the retained conversation.
-    ///
-    /// This is prompt continuity, not execution authority; consumers must
-    /// intersect it with the current live tool surface.
+    /// Schema-addressed activation evidence; this is the only form that can
+    /// authorize a deferred carrier call after restore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activated_deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Blocked/health-avoidance tools from checkpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
@@ -428,7 +426,7 @@ pub struct CloudHeavyCheckpointState {
     pub messages: Vec<serde_json::Value>,
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    pub activated_deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     pub approval_overrides: Option<serde_json::Value>,
     pub interruption: Option<serde_json::Value>,
     pub compaction_state: Option<serde_json::Value>,
@@ -1327,7 +1325,7 @@ fn build_resume_bundle(
         let projection = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
             source_cursor.clone(),
             astra_turn_types::ResumeActivationProjectionV1 {
-                deferred_tool_names: state.activated_deferred_tool_names.clone(),
+                deferred_tool_activations: state.deferred_tool_activations.clone(),
             },
         );
         projection.is_admissible_at(&cursor).then_some(projection)
@@ -1380,22 +1378,20 @@ fn merge_exact_resume_projections(
             ));
     }
 
-    let mut activated = current.activated_deferred_tool_names().to_vec();
+    let mut activations = current.deferred_tool_activations().to_vec();
     if let Some(other_activation) = other.projections.activation_at(&cursor) {
-        append_unique_names(
-            &mut activated,
-            other_activation
-                .deferred_tool_names
-                .iter()
-                .map(String::as_str),
-        );
+        for activation in &other_activation.deferred_tool_activations {
+            if !activations.contains(activation) {
+                activations.push(activation.clone());
+            }
+        }
     }
-    if !activated.is_empty() {
+    if !activations.is_empty() {
         current.projections.activation =
             Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
                 cursor,
                 astra_turn_types::ResumeActivationProjectionV1 {
-                    deferred_tool_names: activated,
+                    deferred_tool_activations: activations,
                 },
             ));
     }
@@ -1403,7 +1399,7 @@ fn merge_exact_resume_projections(
 
 fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     let Some(bundle) = session.resume_bundle.as_ref() else {
-        session.activated_deferred_tool_names.clear();
+        session.deferred_tool_activations.clear();
         session.recent_tools.clear();
         session.blocked_tools.clear();
         session.approval_overrides = None;
@@ -1419,9 +1415,9 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     let cursor = bundle.cursor.clone();
     let checkpoint = bundle.projections.checkpoint_at(&cursor).cloned();
     let provider = bundle.projections.provider_at(&cursor).cloned();
-    let activated_deferred_tool_names = bundle.activated_deferred_tool_names().to_vec();
+    let deferred_tool_activations = bundle.deferred_tool_activations().to_vec();
 
-    session.activated_deferred_tool_names = activated_deferred_tool_names;
+    session.deferred_tool_activations = deferred_tool_activations;
     session.recent_tools = checkpoint
         .as_ref()
         .map(|projection| projection.recent_tools.clone())
@@ -1935,16 +1931,16 @@ pub fn parse_cloud_heavy_checkpoint_state(
         return Ok(None);
     };
     let recent_tools: Vec<String> = required_cloud_heavy_field(heavy, "recent_tools")?;
-    let activated_deferred_tool_names = heavy
-        .get("activated_deferred_tool_names")
+    let deferred_tool_activations = heavy
+        .get("deferred_tool_activations")
         .cloned()
-        .map(serde_json::from_value::<Vec<String>>)
+        .map(serde_json::from_value::<Vec<astra_turn_types::DeferredToolActivation>>)
         .transpose()
         .map_err(|source| {
             format!(
-                "invalid cloud heavy checkpoint JSON field: field=activated_deferred_tool_names, source={source}"
+                "invalid cloud heavy checkpoint JSON field: field=deferred_tool_activations, source={source}"
             )
-    })?
+        })?
         .unwrap_or_default();
     Ok(Some(CloudHeavyCheckpointState {
         conversation_cursor: heavy
@@ -1972,7 +1968,7 @@ pub fn parse_cloud_heavy_checkpoint_state(
         messages: required_cloud_heavy_field(heavy, "messages")?,
         blocked_tools: required_cloud_heavy_field(heavy, "blocked_tools")?,
         recent_tools: normalize_name_list(recent_tools),
-        activated_deferred_tool_names: normalize_name_list(activated_deferred_tool_names),
+        deferred_tool_activations,
         approval_overrides: heavy
             .get("approval_overrides")
             .cloned()
@@ -3652,7 +3648,6 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "stale local question"}),
                 serde_json::json!({"role": "assistant", "content": "stale local answer"}),
             ],
-            activated_deferred_tool_names: vec!["github".into()],
             restored_from_cloud: false,
             ..Default::default()
         };
@@ -3666,7 +3661,6 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "current cloud question"}),
                 serde_json::json!({"role": "assistant", "content": "current cloud answer"}),
             ],
-            activated_deferred_tool_names: vec!["web_fetch".into()],
             restored_from_cloud: true,
             ..Default::default()
         };
@@ -3691,7 +3685,6 @@ mod tests {
                 .all(|message| message["content"] != "stale local answer"),
             "history from an older turn must not be combined with a newer turn count"
         );
-        assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
     #[test]
@@ -3706,7 +3699,6 @@ mod tests {
                 "stale local",
             )),
             blocked_tools: vec!["stale-block".into()],
-            activated_deferred_tool_names: vec!["stale-provider".into()],
             total_tokens_in: 900,
             ..Default::default()
         };
@@ -3728,7 +3720,6 @@ mod tests {
         assert_eq!(restored.turn_count, 10);
         assert_eq!(restored.resume_messages()[0]["content"], "current cloud");
         assert!(restored.blocked_tools.is_empty());
-        assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
     #[test]
@@ -3895,7 +3886,6 @@ mod tests {
             messages: messages.clone(),
             blocked_tools: vec!["write".into()],
             approval_overrides: Some(serde_json::json!({"bash": "allow"})),
-            activated_deferred_tool_names: vec!["dangerous-skill".into()],
             ..Default::default()
         };
         let bundle = build_resume_bundle(
@@ -3915,7 +3905,6 @@ mod tests {
             permission_mode: Some("plan".into()),
             blocked_tools: heavy.blocked_tools.clone(),
             approval_overrides: heavy.approval_overrides.clone(),
-            activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
             ..Default::default()
         };
         apply_selected_resume_bundle(&mut restored);
@@ -3926,7 +3915,6 @@ mod tests {
         assert_eq!(restored.permission_mode, None);
         assert!(restored.blocked_tools.is_empty());
         assert_eq!(restored.approval_overrides, None);
-        assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
     #[test]
@@ -5191,7 +5179,7 @@ mod tests {
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["rg".into()],
-            activated_deferred_tool_names: vec!["github".into()],
+            deferred_tool_activations: Vec::new(),
             approval_overrides: Some(approval_overrides.clone()),
             interruption: Some(interruption.clone()),
             compaction_state: Some(compaction_state.clone()),
@@ -5205,7 +5193,6 @@ mod tests {
                 "messages": messages,
                 "blocked_tools": ["bash"],
                 "recent_tools": ["rg"],
-                "activated_deferred_tool_names": ["github"],
                 "approval_overrides": approval_overrides,
                 "interruption": interruption,
                 "compaction_state": compaction_state
@@ -5216,7 +5203,6 @@ mod tests {
             "messages": expected.messages.clone(),
             "blocked_tools": expected.blocked_tools.clone(),
             "recent_tools": expected.recent_tools.clone(),
-            "activated_deferred_tool_names": expected.activated_deferred_tool_names.clone(),
             "approval_overrides": expected.approval_overrides.clone(),
             "interruption": expected.interruption.clone(),
             "compaction_state": expected.compaction_state.clone()
@@ -5254,8 +5240,8 @@ mod tests {
             vec!["rg".to_string(), "bash".to_string()]
         );
         assert!(
-            state.activated_deferred_tool_names.is_empty(),
-            "cloud checkpoints written before activation sidecars must remain readable"
+            state.deferred_tool_activations.is_empty(),
+            "cloud checkpoints written before typed activation evidence must remain readable"
         );
     }
 

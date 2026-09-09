@@ -22,6 +22,72 @@ use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
 use crate::session_identity::is_valid_server_session_id;
 
+/// Render the assistant responses in the order in which they were produced.
+///
+/// `RunOutcome.text` is intentionally an aggregate used by deterministic
+/// criteria and report consumers.  It is not a sufficient judging surface for
+/// a multi-turn case: a plain concatenation makes the first answer
+/// indistinguishable from a follow-up answer, so a judge can attribute a
+/// later claim to the wrong user request.  Keep the aggregate untouched and
+/// give only the semantic judge an explicitly labelled transcript.
+fn render_ordered_judger_transcript(
+    outcome: &RunOutcome,
+    attempts: &[AttemptRecord],
+    steps: &[StepResult],
+) -> String {
+    // Preserve the existing single-turn judging surface byte-for-byte.  The
+    // labels are needed only when there is more than one response to
+    // disambiguate, or when a retry produced multiple root attempts.
+    if steps.is_empty() && attempts.len() <= 1 {
+        return outcome.text.clone();
+    }
+
+    let mut transcript = String::new();
+    let mut append_response = |label: &str, text: &str| {
+        if !transcript.is_empty() {
+            transcript.push_str("\n\n");
+        }
+        transcript.push_str(label);
+        transcript.push('\n');
+        if text.is_empty() {
+            transcript.push_str("(no assistant text)");
+        } else {
+            transcript.push_str(text);
+        }
+    };
+
+    if attempts.is_empty() {
+        append_response("### Initial assistant response (turn 0)", &outcome.text);
+    } else if attempts.len() == 1 {
+        append_response(
+            "### Initial assistant response (turn 0)",
+            &attempts[0].outcome.text,
+        );
+    } else {
+        for attempt in attempts {
+            append_response(
+                &format!(
+                    "### Root attempt {} assistant response",
+                    attempt.attempt_index
+                ),
+                &attempt.outcome.text,
+            );
+        }
+    }
+
+    for step in steps {
+        append_response(
+            &format!(
+                "### Follow-up assistant response (step {})",
+                step.step_index
+            ),
+            &step.outcome.text,
+        );
+    }
+
+    transcript
+}
+
 /// What to do with session journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureMode {
@@ -886,6 +952,11 @@ impl<'a> SuiteRunner<'a> {
                 Some(capture.scoped_to_invocation(&invocation_run_ids, invocation_started_at));
         }
         let mut judger_outcome = outcome.clone();
+        // Keep the report/deterministic surface as the aggregate text, but
+        // make multi-turn semantic judging position-aware.  Without this,
+        // the initial response and later follow-ups become one unlabeled
+        // paragraph and a judge may score the wrong turn.
+        judger_outcome.text = render_ordered_judger_transcript(&outcome, &attempts, &step_results);
         if let Some(session) = &session {
             // Preserve complete moderate-sized receipts here; the judger owns
             // the final 8k head+tail prompt bound, which keeps both the start
@@ -939,10 +1010,17 @@ impl<'a> SuiteRunner<'a> {
         let product_passed = lifecycle_errors.is_empty() && hard_passed && steps_passed;
 
         // Classify failure.
+        let mut classification_criteria = det.clone();
+        for step in &step_results {
+            classification_criteria.extend(step.criteria.iter().cloned().map(|mut result| {
+                result.detail = format!("step {}: {}", step.step_index, result.detail);
+                result
+            }));
+        }
         let product_failure_class = if setup_failed {
             Some(crate::classify::FailureClass::PlatformSetupFailed)
         } else if !product_passed {
-            Some(classify(&outcome, &det))
+            Some(classify(&outcome, &classification_criteria))
         } else {
             None
         };
@@ -1372,6 +1450,55 @@ mod tests {
             teardown_cmd: None,
             cleanup_memory_records: false,
         }
+    }
+
+    #[test]
+    fn judger_transcript_labels_multi_turn_responses_without_changing_aggregate() {
+        let root = outcome_ok("m", "initial acknowledgement", &[]);
+        let step = StepResult {
+            step_index: 0,
+            prompt: "follow up".into(),
+            outcome: outcome_ok("m", "follow-up answer", &[]),
+            duration_ms: 12,
+            criteria: vec![],
+            passed: true,
+        };
+        let mut aggregate = root.clone();
+        aggregate.text.push_str("\n\nfollow-up answer");
+
+        assert_eq!(
+            render_ordered_judger_transcript(
+                &aggregate,
+                &[AttemptRecord {
+                    attempt_index: 0,
+                    outcome: root,
+                }],
+                &[step],
+            ),
+            "### Initial assistant response (turn 0)\ninitial acknowledgement\n\n### Follow-up assistant response (step 0)\nfollow-up answer"
+        );
+        assert_eq!(
+            aggregate.text,
+            "initial acknowledgement\n\nfollow-up answer"
+        );
+    }
+
+    #[test]
+    fn judger_transcript_keeps_retry_attempts_distinct() {
+        let first = AttemptRecord {
+            attempt_index: 0,
+            outcome: outcome_ok("m", "abandoned attempt", &[]),
+        };
+        let second = AttemptRecord {
+            attempt_index: 1,
+            outcome: outcome_ok("m", "final attempt", &[]),
+        };
+        let outcome = second.outcome.clone();
+
+        assert_eq!(
+            render_ordered_judger_transcript(&outcome, &[first, second], &[]),
+            "### Root attempt 0 assistant response\nabandoned attempt\n\n### Root attempt 1 assistant response\nfinal attempt"
+        );
     }
 
     #[test]
@@ -2736,6 +2863,11 @@ mod tests {
         assert!(!report.runs[0].steps[0].passed);
         assert_eq!(report.runs[0].steps[0].criteria.len(), 1);
         assert!(!report.runs[0].steps[0].criteria[0].passed);
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(crate::classify::FailureClass::ModelCapability),
+            "step-local hard evidence must participate in failure classification"
+        );
     }
 
     #[tokio::test]

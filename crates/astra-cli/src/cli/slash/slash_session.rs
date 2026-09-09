@@ -5112,7 +5112,7 @@ struct PreparedSessionHistory {
     active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     resume: Option<astra_turn_types::ResumeDescriptorV1>,
     recent_tools: Vec<String>,
-    activated_deferred_tool_names: Vec<String>,
+    deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
 }
 
@@ -5128,7 +5128,7 @@ fn materialize_prepared_session_history(
         &restored_journal.session.history,
     );
     let mut recent_tools = restored_journal.session.recent_tools.clone();
-    let mut activated_deferred_tool_names = Vec::new();
+    let mut deferred_tool_activations = Vec::new();
     let mut active_conversation = None;
     if let Some(ref materialized) = mat {
         let canonical_messages = session_continuation::sanitize_continuation_messages(
@@ -5150,20 +5150,18 @@ fn materialize_prepared_session_history(
         if !materialized.session_state.recent_tools.is_empty() {
             recent_tools = materialized.session_state.recent_tools.clone();
         }
-        activated_deferred_tool_names = session_continuation::continuation_activation_names(
-            &materialized.messages,
-            materialized
-                .session_state
-                .activated_deferred_tool_names
-                .clone(),
-        );
+        deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &materialized.messages,
+                materialized.session_state.deferred_tool_activations.clone(),
+            );
     }
     PreparedSessionHistory {
         history,
         active_conversation,
         resume: None,
         recent_tools,
-        activated_deferred_tool_names,
+        deferred_tool_activations,
         csl_manager: has_csl_materialization.then_some(mgr),
     }
 }
@@ -5200,7 +5198,7 @@ async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHist
         if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
             prepared.history = canonical_history;
         }
-        prepared.activated_deferred_tool_names = continuation.activated_deferred_tool_names;
+        prepared.deferred_tool_activations = continuation.deferred_tool_activations;
         prepared.active_conversation = Some(continuation.active_conversation);
         prepared.resume = Some(continuation.resume);
     }
@@ -5218,7 +5216,7 @@ async fn restore_journal_history_if_available(
     if !restored.recent_tools.is_empty() {
         state.recent_tools = restored.recent_tools;
     }
-    state.activated_deferred_tool_names = restored.activated_deferred_tool_names;
+    state.deferred_tool_activations = restored.deferred_tool_activations;
     state.active_conversation = restored.active_conversation;
     state.csl_manager = restored.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
@@ -5288,7 +5286,6 @@ async fn apply_restored_session(
         // The local canonical generation won causal selection. Do not retain
         // independently persisted cloud/checkpoint controls from a different
         // generation.
-        restored.activated_deferred_tool_names.clear();
         restored.recent_tools.clear();
         restored.blocked_tools.clear();
         restored.approval_overrides = None;
@@ -5310,7 +5307,7 @@ async fn apply_restored_session(
         &[]
     };
     let mut restored_activation = if use_restored_projection {
-        restored.activated_deferred_tool_names.clone()
+        restored.deferred_tool_activations.clone()
     } else {
         Vec::new()
     };
@@ -5482,7 +5479,7 @@ async fn apply_restored_session(
             || restored.interruption.is_some()
             || restored.compaction_state.is_some());
     if let Some(step_restored) = step_restored.as_ref() {
-        restored_activation.extend(step_restored.activated_deferred_tool_names.iter().cloned());
+        restored_activation.extend(step_restored.deferred_tool_activations.iter().cloned());
     }
     let prepared_activation_is_admissible =
         match (selected_cursor.as_ref(), prepared_history.resume.as_ref()) {
@@ -5493,12 +5490,7 @@ async fn apply_restored_session(
             _ => false,
         };
     if prepared_activation_is_admissible {
-        restored_activation.extend(
-            prepared_history
-                .activated_deferred_tool_names
-                .iter()
-                .cloned(),
-        );
+        restored_activation.extend(prepared_history.deferred_tool_activations.iter().cloned());
     }
     let session_memory = super::slash_memory::load_current_session_memory_body_with_profile(
         api,
@@ -5623,10 +5615,11 @@ async fn apply_restored_session(
                 });
         fallback_resume_messages.as_slice()
     };
-    state.activated_deferred_tool_names = session_continuation::continuation_activation_names(
-        canonical_resume_messages,
-        restored_activation,
-    );
+    state.deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+            canonical_resume_messages,
+            restored_activation,
+        );
     session_projection::seed_continuation_objective_from_messages(state, canonical_resume_messages);
     session_projection::rebuild_continuation_anchor_from_live_state(state);
     state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(
@@ -7153,7 +7146,11 @@ mod resume_tests {
             ],
             session_state: SessionStateCompact {
                 recent_tools: vec!["bash".into(), "read_file".into()],
-                activated_deferred_tool_names: vec!["write_file".into()],
+                deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                    name: "write_file".into(),
+                    schema_digest: "sha256:write-file".into(),
+                    descriptor: None,
+                }],
                 ..Default::default()
             },
         };
@@ -7192,11 +7189,7 @@ mod resume_tests {
             vec!["bash".to_string(), "read_file".to_string()],
             "should restore recent_tools from snapshot state"
         );
-        assert_eq!(
-            state.activated_deferred_tool_names,
-            vec!["write_file".to_string()],
-            "should restore pending deferred activations from snapshot state"
-        );
+        assert_eq!(state.deferred_tool_activations.len(), 1);
     }
 
     #[serial_test::serial]

@@ -2733,68 +2733,7 @@ fn strip_internal_schema_extensions(value: &mut Value) {
             // well. Materialize one compact, deterministic description before
             // stripping so the provider sees the same contract the executor
             // enforces without relying on unsupported schema composition.
-            let mut requirements = Vec::new();
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} requires {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ANY_OF_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, alternatives) in per_action {
-                    let alternatives = alternatives
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_array)
-                        .map(|fields| {
-                            fields
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" + ")
-                        })
-                        .filter(|fields| !fields.is_empty())
-                        .collect::<Vec<_>>();
-                    if !alternatives.is_empty() {
-                        requirements.push(format!(
-                            "{action} also requires one of {}",
-                            alternatives.join(" or ")
-                        ));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if !requirements.is_empty() {
-                let contract = format!("Action contract: {}.", requirements.join("; "));
+            if let Some(contract) = astra_tools::schemas::action_contract_description(object) {
                 let description = object
                     .get("description")
                     .and_then(Value::as_str)
@@ -3747,7 +3686,14 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             // useful in runtime history, but are not part of the provider
             // message contract and only add round-specific bytes to the
             // prompt cache suffix.
-            for key in ["_round_index", "_tool_name", "_timestamp", "_synthetic"] {
+            for key in [
+                "_round_index",
+                "_tool_name",
+                "_timestamp",
+                "_synthetic",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            ] {
                 object.remove(key);
             }
         }
@@ -6279,22 +6225,51 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         .into_iter()
         .map(|(_, v)| Value::Object(v))
         .collect();
-
-    // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
-    // tags in content instead of structured tool_calls. Recover them.
-    if let Some(parsed) =
-        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    // A non-empty provider surface is an exact execution authority. Keep an
+    // explicitly tool-less response intact for the private summary adapter so
+    // it can classify a provider-emitted call as invalid structured output;
+    // those calls never enter the agent executor. Ordinary tool-bearing turns
+    // retain only names present in the exact wire surface.
+    if let Some(authorized) = authorized_tool_names
+        && !authorized.is_empty()
     {
-        if tool_calls.is_empty() {
+        tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized.contains(name))
+        });
+    }
+
+    // Degraded tool-call fallback is governed by the same exact wire surface
+    // as native tool-call deltas. In particular, a text-only request carries
+    // `Some(empty)`: it must never manufacture an executable call after the
+    // stream has already passed native authorization.
+    let parsed_degraded =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text);
+    let text_only_degraded_response =
+        authorized_tool_names.is_some_and(HashSet::is_empty) && parsed_degraded.is_some();
+    if let Some(parsed) = parsed_degraded {
+        let admitted = parsed
+            .into_iter()
+            .filter(|call| {
+                let Some(name) = tool_call_name(call).and_then(canonical_valid_tool_name) else {
+                    return false;
+                };
+                authorized_tool_names.is_none_or(|authorized| authorized.contains(name))
+            })
+            .collect::<Vec<_>>();
+        if tool_calls.is_empty() && !admitted.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
-                parsed.len()
+                admitted.len()
             );
-            tool_calls = parsed;
+            tool_calls = admitted;
         }
     }
-    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    if !text_only_degraded_response {
+        full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    }
     reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
         &reasoning,
     );
@@ -7300,6 +7275,19 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         }
     };
     let mut result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    if matches!(tool_choice, RuntimeToolChoice::Auto) {
+        let authorized_tool_names = tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter_map(canonical_valid_tool_name)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        result.tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized_tool_names.contains(name))
+        });
+    }
     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
     if result.response_id.is_none() {
         result.response_id = transport_response_id;
@@ -10668,6 +10656,50 @@ mod tests {
         assert!(!published.contains("DSML"));
         assert!(!published.contains("echo ok"));
         assert!(!published.contains("pwd"));
+    }
+
+    #[tokio::test]
+    async fn degraded_tool_recovery_obeys_the_exact_wire_authority() {
+        let event = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\"><｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke><｜｜DSML｜｜invoke name=\"memory\"><｜｜DSML｜｜parameter name=\"action\" string=\"true\">recall</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"query\" string=\"true\">x</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"}}]});
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+
+        let allowed = HashSet::from(["bash".to_string()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body.clone()))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+        )
+        .await
+        .expect("collect with a partial exact surface");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+
+        let no_tools = HashSet::new();
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &no_tools,
+            None,
+        )
+        .await
+        .expect("collect with an explicitly empty surface");
+        assert!(result.tool_calls.is_empty());
+        assert!(
+            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&result.full_text)
+                .is_some(),
+            "a private no-tool caller must receive typed-invalid content for its bounded repair path"
+        );
     }
 
     #[tokio::test]
@@ -14249,6 +14281,14 @@ mod tests {
             "schema_version": 1,
             "turn_chain_id": "chain-current"
         });
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD] = json!("run-1");
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD] = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 4,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
         runtime["_round_index"] = json!(7);
         runtime["_tool_name"] = json!("read_file");
         runtime["_timestamp"] = json!(1234);
@@ -14273,9 +14313,43 @@ mod tests {
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
-        for key in ["_round_index", "_tool_name", "_timestamp", "_synthetic"] {
+        for key in [
+            "_round_index",
+            "_tool_name",
+            "_timestamp",
+            "_synthetic",
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+        ] {
             assert!(out[0].get(key).is_none(), "internal key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn provider_projection_preserves_nested_tool_result_data() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": {
+                "quoted": {
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-1",
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:
+                        {"unexpected": "nested"},
+                }
+            }
+        })];
+
+        let out = consolidate_system_messages_for_provider(&messages, "openai", None);
+        let quoted = &out[0]["content"]["quoted"];
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                .is_some_and(|value| value == "run-1")
+        );
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .is_some_and(|value| value == &json!({"unexpected": "nested"}))
+        );
     }
 
     #[test]

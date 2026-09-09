@@ -295,14 +295,18 @@ fn git_recent_commits(project_root: &Path, n: usize) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Session-stable environment facts: Platform, Shell, CWD, Home.
+/// Session-stable environment facts: Platform, Shell, workspace manifests, Home.
 ///
-/// Safe to place inside a Session-scoped cache block — the content does
-/// not change during a normal session (OS doesn't swap, shell doesn't
-/// change, cwd is fixed for the lifetime of the runtime).
+/// Safe to place inside a Session-scoped cache block when captured in the base
+/// edge profile at session creation. The caller supplies the already-observed
+/// workspace context so prompt rendering does not scan the same directory a
+/// second time. Re-observing changed manifests intentionally produces a
+/// different session prefix.
+/// The CWD is intentionally omitted: it is a typed `EdgeProfile` field owned
+/// by `RuntimeIdentity`, so rendering it here would duplicate prompt context.
 ///
 /// Returns an empty string if no fields can be populated.
-pub fn build_static_environment_context(project_root: &Path) -> String {
+pub fn build_static_environment_context(workspace_context: &Value) -> String {
     let mut lines = Vec::new();
 
     lines.push(format!(
@@ -322,9 +326,6 @@ pub fn build_static_environment_context(project_root: &Path) -> String {
         lines.push(format!("- Shell: {shell_name}"));
     }
 
-    lines.push(format!("- CWD: {}", project_root.display()));
-
-    let workspace_context = detect_workspace_context(project_root);
     if let Some(manifest_roots) = workspace_context
         .get("manifest_roots")
         .and_then(Value::as_array)
@@ -734,7 +735,7 @@ mod tests {
         assert_eq!(ctx["manifest_roots"][0]["path"], "rust");
         assert_eq!(ctx["manifest_roots"][0]["manifest"], "Cargo.toml");
 
-        let env = build_static_environment_context(tmp.path());
+        let env = build_static_environment_context(&ctx);
         assert!(
             env.contains("Workspace manifests: rust/Cargo.toml (rust)"),
             "{env}"
@@ -786,15 +787,17 @@ mod tests {
     // ── environment context split: static + volatile ─────────────────
 
     #[test]
-    fn static_context_contains_platform_cwd_and_no_git() {
+    fn static_context_contains_platform_but_not_typed_cwd_or_git() {
         let tmp = tempdir().unwrap();
-        let ctx = build_static_environment_context(tmp.path());
+        let workspace = detect_workspace_context(tmp.path());
+        let ctx = build_static_environment_context(&workspace);
         assert!(ctx.contains("## Environment"));
         assert!(ctx.contains("- Platform:"));
         assert!(ctx.contains(std::env::consts::OS));
-        assert!(ctx.contains("- CWD:"));
-        let tmp_str = tmp.path().to_string_lossy();
-        assert!(ctx.contains(&*tmp_str));
+        assert!(
+            !ctx.contains("- CWD:"),
+            "typed CWD belongs to RuntimeIdentity and must not be duplicated: {ctx}"
+        );
         // Static path MUST NOT include git fields — those are the source
         // of cache invalidation.
         assert!(

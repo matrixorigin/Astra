@@ -293,18 +293,125 @@ fn turn_phase_receipt_from_server_event(event: &Value) -> Option<Value> {
     }))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerToolRouteOwner {
+    Server,
+    Client,
+}
+
+#[derive(Clone, Debug)]
 struct ServerToolCallState {
     name: String,
     args: Value,
     render_index: Option<usize>,
     parent_tool_use_id: Option<String>,
+    owner: ServerToolRouteOwner,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerToolTerminalFingerprint {
+    status: String,
+    output: String,
+}
+
+fn completed_server_tool_start_conflicts(
+    completed: &ServerToolCallState,
+    name: &str,
+    args: &Value,
+    parent_tool_use_id: Option<&str>,
+) -> bool {
+    completed.name != name
+        || (server_tool_args_are_informative(&completed.args)
+            && server_tool_args_are_informative(args)
+            && completed.args != *args)
+        || completed
+            .parent_tool_use_id
+            .as_deref()
+            .is_some_and(|parent| {
+                parent_tool_use_id.is_some_and(|replayed_parent| replayed_parent != parent)
+            })
+}
+
+fn unresolved_server_tool_call_ids(
+    calls: &std::collections::HashMap<String, ServerToolCallState>,
+) -> Vec<String> {
+    let mut ids = calls.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    ids.truncate(16);
+    ids
+}
+
+fn server_tool_event_owner(event: &Value) -> Result<Option<ServerToolRouteOwner>, String> {
+    // Provenance is a contract for the canonical tool lifecycle/routing
+    // envelope only.  Other server events may legitimately carry their own
+    // `transport` or `executor` metadata and must not be rejected by the tool
+    // renderer's closed-world route vocabulary.
+    if !server_tool_event_requires_provenance(event) {
+        return Ok(None);
+    }
+    let transport = event
+        .get("transport")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let executor_kind = event
+        .pointer("/executor/kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let transport_owner = transport
+        .map(|value| match value {
+            "edge_ws" | "edge_ledger" => Ok(ServerToolRouteOwner::Client),
+            "server_local" | "mcp_http" | "gateway_relay" | "sandbox_resident_agent" => {
+                Ok(ServerToolRouteOwner::Server)
+            }
+            other => Err(format!(
+                "server tool event carried unknown execution transport `{other}`"
+            )),
+        })
+        .transpose()?;
+    let executor_owner = executor_kind
+        .map(|value| match value {
+            "edge_agent" => Ok(ServerToolRouteOwner::Client),
+            "server_local" | "orchestrator_managed" | "thin_client" | "mcp" => {
+                Ok(ServerToolRouteOwner::Server)
+            }
+            other => Err(format!(
+                "server tool event carried unknown executor kind `{other}`"
+            )),
+        })
+        .transpose()?;
+    if let (Some(transport_owner), Some(executor_owner)) = (transport_owner, executor_owner)
+        && transport_owner != executor_owner
+    {
+        return Err(
+            "server tool event carried contradictory client/server execution provenance"
+                .to_string(),
+        );
+    }
+    Ok(transport_owner.or(executor_owner))
+}
+
+fn server_tool_event_requires_provenance(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(
+            "tool_call"
+                | "tool_call_start"
+                | "tool_call_end"
+                | "tool_routing_decision"
+                | "tool_transport_started"
+                | "tool_transport_completed"
+                | "tool_transport_failed"
+        )
+    )
 }
 
 fn server_tool_event_is_client_owned(event: &Value) -> bool {
-    let transport = event.get("transport").and_then(Value::as_str);
-    let executor_kind = event.pointer("/executor/kind").and_then(Value::as_str);
-    matches!(transport, Some("edge_ws" | "edge_ledger")) || executor_kind == Some("edge_agent")
+    matches!(
+        server_tool_event_owner(event),
+        Ok(Some(ServerToolRouteOwner::Client))
+    )
 }
 
 /// A generic `tool_call` is emitted both when the model requests a tool and
@@ -313,14 +420,19 @@ fn server_tool_event_is_client_owned(event: &Value) -> bool {
 /// that a tool ran and would otherwise double-render Edge calls.  The server
 /// route boundary always supplies at least one of these binding fields.
 fn server_tool_event_has_authoritative_route(event: &Value) -> bool {
-    event
-        .get("transport")
-        .and_then(Value::as_str)
-        .is_some_and(|transport| !transport.trim().is_empty())
-        || event
-            .pointer("/executor/kind")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| !kind.trim().is_empty())
+    server_tool_event_owner(event).ok().flatten().is_some()
+}
+
+fn server_tool_event_is_execution_evidence(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(
+            "tool_transport_started"
+                | "tool_transport_completed"
+                | "tool_transport_failed"
+                | "tool_call_end"
+        )
+    )
 }
 
 fn server_tool_start_fields(event: &Value) -> Option<(Option<String>, String, Value)> {
@@ -424,6 +536,16 @@ fn server_tool_completion_id(event: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(ToString::to_string)
+}
+
+fn normalized_server_tool_completion_status(state: &ServerToolCallState, event: &Value) -> String {
+    if state.name == "agent_fanout"
+        && state.args.get("action").and_then(Value::as_str) == Some("start")
+    {
+        cloud_tool_result_status_label(&server_tool_completion_output(event)).to_string()
+    } else {
+        server_tool_completion_status(event)
+    }
 }
 
 // CLI formatting utilities
@@ -1042,6 +1164,20 @@ struct CliSseStreamHost<'a> {
     /// re-execute them in the CLI.
     server_tool_calls: std::collections::HashMap<String, ServerToolCallState>,
     server_tool_completed_ids: std::collections::HashSet<String>,
+    /// Completed call metadata makes a replayed start idempotent while still
+    /// allowing a conflicting start payload to fail the stream contract.
+    server_tool_completed_calls: std::collections::HashMap<String, ServerToolCallState>,
+    /// Edge-owned execution evidence is kept as an owner-only ledger.  A
+    /// provider-facing edge `tool_call` is intentionally not pinned because
+    /// route selection may move that request to Server; transport start/end
+    /// are the first execution facts that may claim the client owner.
+    server_tool_client_owned_ids: std::collections::HashSet<String>,
+    /// Canonical terminal fingerprints make a second owner observable.  An
+    /// identical replay is harmless; a success/failure (or output) conflict
+    /// is a stream contract violation and must not be hidden by the TUI.
+    server_tool_completed_terminals:
+        std::collections::HashMap<String, ServerToolTerminalFingerprint>,
+    server_tool_protocol_error: Option<String>,
     server_tool_sequence: u64,
     // ── XML tag suppression ────────────────────────────────────────────
     /// Text accumulated while inside an open `<think>`/`<reflect>` tag.
@@ -1474,6 +1610,10 @@ impl<'a> CliSseStreamHost<'a> {
             phase_receipts: Vec::new(),
             server_tool_calls: std::collections::HashMap::new(),
             server_tool_completed_ids: std::collections::HashSet::new(),
+            server_tool_completed_calls: std::collections::HashMap::new(),
+            server_tool_client_owned_ids: std::collections::HashSet::new(),
+            server_tool_completed_terminals: std::collections::HashMap::new(),
+            server_tool_protocol_error: None,
             server_tool_sequence: 0,
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
@@ -3096,6 +3236,39 @@ impl CliSseStreamHost<'_> {
         }
     }
 
+    /// Pin one call id to its first typed execution owner.  A later event
+    /// carrying the opposite route is transport corruption, not a reason to
+    /// erase an unresolved server call or silently accept a second terminal.
+    fn validate_server_tool_event_owner(&self, event: &Value) -> Result<(), String> {
+        let Some(owner) = server_tool_event_owner(event)? else {
+            return Ok(());
+        };
+        let id = server_tool_completion_id(event)
+            .or_else(|| server_tool_start_fields(event).and_then(|(id, _, _)| id));
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let known = self
+            .server_tool_calls
+            .get(&id)
+            .or_else(|| self.server_tool_completed_calls.get(&id));
+        if let Some(known) = known
+            && known.owner != owner
+        {
+            return Err(format!(
+                "server tool call {id} changed execution owner from {:?} to {:?}",
+                known.owner, owner
+            ));
+        }
+        if owner == ServerToolRouteOwner::Server && self.server_tool_client_owned_ids.contains(&id)
+        {
+            return Err(format!(
+                "server tool call {id} changed execution owner from Client to Server"
+            ));
+        }
+        Ok(())
+    }
+
     async fn observe_server_tool_start(&mut self, event: &Value) {
         let Some((event_id, name, args)) = server_tool_start_fields(event) else {
             return;
@@ -3111,8 +3284,43 @@ impl CliSseStreamHost<'_> {
             .get("parent_tool_use_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        if server_tool_event_is_client_owned(event) {
-            self.server_tool_calls.remove(&id);
+        let owner = match server_tool_event_owner(event) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return,
+            Err(error) => {
+                self.server_tool_protocol_error = Some(error);
+                return;
+            }
+        };
+        if owner == ServerToolRouteOwner::Client {
+            if server_tool_event_is_execution_evidence(event) {
+                self.server_tool_client_owned_ids.insert(id.clone());
+            }
+            return;
+        }
+        if self.server_tool_client_owned_ids.contains(&id) {
+            self.server_tool_protocol_error = Some(format!(
+                "server tool call {id} changed execution owner from Client to Server"
+            ));
+            return;
+        }
+
+        // A terminal call id is monotonic for this physical exchange.  A
+        // replayed start after completion is harmless and must not reopen the
+        // call; a different payload is a protocol violation, not a new call.
+        if self.server_tool_completed_ids.contains(&id) {
+            if let Some(completed) = self.server_tool_completed_calls.get(&id)
+                && completed_server_tool_start_conflicts(
+                    completed,
+                    &name,
+                    &args,
+                    parent_tool_use_id.as_deref(),
+                )
+            {
+                self.server_tool_protocol_error = Some(format!(
+                    "server tool call {id} replayed with a conflicting start payload"
+                ));
+            }
             return;
         }
 
@@ -3122,11 +3330,26 @@ impl CliSseStreamHost<'_> {
         // client-delivery topology, and the metadata guard remains defensive.
         if self.server_tool_calls.contains_key(&id) {
             if let Some(existing) = self.server_tool_calls.get_mut(&id) {
-                existing.name = name;
-                if server_tool_args_are_informative(&args) {
+                if completed_server_tool_start_conflicts(
+                    existing,
+                    &name,
+                    &args,
+                    parent_tool_use_id.as_deref(),
+                ) {
+                    self.server_tool_protocol_error = Some(format!(
+                        "server tool call {id} replayed with a conflicting active start payload"
+                    ));
+                    return;
+                }
+                // A replay may carry fields that were absent from the first
+                // delivery, but it may not replace an established identity.
+                // This is monotonic enrichment, not last-writer-wins state.
+                if !server_tool_args_are_informative(&existing.args)
+                    && server_tool_args_are_informative(&args)
+                {
                     existing.args = args;
                 }
-                if parent_tool_use_id.is_some() {
+                if existing.parent_tool_use_id.is_none() && parent_tool_use_id.is_some() {
                     existing.parent_tool_use_id = parent_tool_use_id;
                 }
             }
@@ -3166,6 +3389,7 @@ impl CliSseStreamHost<'_> {
                 args,
                 render_index,
                 parent_tool_use_id,
+                owner,
             },
         );
     }
@@ -3179,16 +3403,61 @@ impl CliSseStreamHost<'_> {
         // but cannot mutate interactive lifecycle state without a call id.
         let id = server_tool_completion_id(event);
         let Some(id) = id else { return };
+        let owner = match server_tool_event_owner(event) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                if !self.server_tool_calls.contains_key(&id) {
+                    return;
+                }
+                ServerToolRouteOwner::Server
+            }
+            Err(error) => {
+                self.server_tool_protocol_error = Some(error);
+                return;
+            }
+        };
+
+        if owner == ServerToolRouteOwner::Client {
+            if self.server_tool_calls.contains_key(&id)
+                || self.server_tool_completed_calls.contains_key(&id)
+            {
+                self.server_tool_protocol_error = Some(format!(
+                    "server tool call {id} changed execution owner from Server to Client"
+                ));
+                return;
+            }
+            self.server_tool_client_owned_ids.insert(id);
+            return;
+        }
+        if self.server_tool_client_owned_ids.contains(&id) {
+            self.server_tool_protocol_error = Some(format!(
+                "server tool call {id} changed execution owner from Client to Server"
+            ));
+            return;
+        }
+
+        // A terminal id is monotonic, but monotonic does not mean that every
+        // replay is accepted.  Compare the typed outcome before ignoring an
+        // already-completed id so two terminal owners cannot hide a
+        // success->failure or failure->success conflict behind the TUI.
+        if self.server_tool_completed_ids.contains(&id) {
+            if let Some(expected) = self.server_tool_completed_terminals.get(&id) {
+                let state = self.server_tool_completed_calls.get(&id);
+                let status = state
+                    .map(|state| normalized_server_tool_completion_status(state, event))
+                    .unwrap_or_else(|| server_tool_completion_status(event));
+                let output = server_tool_completion_output(event);
+                if expected.status != status || expected.output != output {
+                    self.server_tool_protocol_error = Some(format!(
+                        "server tool call {id} replayed with a conflicting terminal outcome"
+                    ));
+                }
+            }
+            return;
+        }
         if !server_tool_event_has_authoritative_route(event)
             && !self.server_tool_calls.contains_key(&id)
         {
-            return;
-        }
-        if server_tool_event_is_client_owned(event) {
-            self.server_tool_calls.remove(&id);
-            return;
-        }
-        if !self.server_tool_completed_ids.insert(id.clone()) {
             return;
         }
         let state = self.server_tool_calls.remove(&id).or_else(|| {
@@ -3197,6 +3466,7 @@ impl CliSseStreamHost<'_> {
                 args,
                 render_index: None,
                 parent_tool_use_id: None,
+                owner,
             })
         });
         let Some(mut state) = state else {
@@ -3240,6 +3510,16 @@ impl CliSseStreamHost<'_> {
             .get("duration_ms")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        self.server_tool_completed_calls
+            .insert(id.clone(), state.clone());
+        self.server_tool_completed_terminals.insert(
+            id.clone(),
+            ServerToolTerminalFingerprint {
+                status: status.clone(),
+                output: output.clone(),
+            },
+        );
+        self.server_tool_completed_ids.insert(id.clone());
         if !self.render_policy.suppress_tool_ui() {
             if let Some(index) = state.render_index {
                 self.render.tool_done(
@@ -3829,16 +4109,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // once live and once again in the final Explain report.
             self.phase_receipts.push(receipt);
         }
+        if let Err(error) = self.validate_server_tool_event_owner(event) {
+            return Err(format!("contract_violation: {error}"));
+        }
         // Server-owned tools are already executed by the server.  Project
         // their lifecycle into the same terminal/stream surface as local
         // tools, but never render edge-owned events a second time: edge
         // execution already goes through `execute_tool` below.
         match event.get("type").and_then(Value::as_str) {
-            Some("tool_call" | "tool_call_start") => {
+            Some("tool_call" | "tool_call_start" | "tool_transport_started") => {
                 self.observe_server_tool_start(event).await;
+                if let Some(error) = self.server_tool_protocol_error.take() {
+                    return Err(format!("contract_violation: {error}"));
+                }
             }
+            // Transport completion/failure is observational route telemetry;
+            // it is not the canonical tool terminal.  Runtime routes emit
+            // that event before the richer `tool_call_end` receipt, so only
+            // the latter may close the TUI correlation and terminal
+            // fingerprint.
             Some("tool_call_end") => {
                 self.observe_server_tool_completion(event).await;
+                if let Some(error) = self.server_tool_protocol_error.take() {
+                    return Err(format!("contract_violation: {error}"));
+                }
             }
             _ => {}
         }
@@ -3885,14 +4179,32 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_sse_done(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
-        // An incomplete/edge-owned call must not leak into the next physical
-        // SSE exchange. Completed IDs are likewise scoped to this stream.
-        self.server_tool_calls.clear();
-        self.server_tool_completed_ids.clear();
-        match self.stream_json_exchange.as_mut() {
+        // `[DONE]` is not a terminal event. A server-owned start must already
+        // have an exact terminal owner before the exchange can be accepted;
+        // silently clearing this map would turn a broken lifecycle into a
+        // successful TUI/CLI response and hide the same defect Harbor catches.
+        let unresolved = unresolved_server_tool_call_ids(&self.server_tool_calls);
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "contract_violation: SSE completed with unresolved server-owned tool calls: {}",
+                unresolved.join(", ")
+            ));
+        }
+        let result = match self.stream_json_exchange.as_mut() {
             Some(exchange) => exchange.finish(accum),
             None => Ok(()),
+        };
+        if result.is_ok() {
+            // State is scoped to one physical SSE exchange and may be cleared
+            // only after the exchange's terminal contract has been validated.
+            self.server_tool_calls.clear();
+            self.server_tool_completed_ids.clear();
+            self.server_tool_completed_calls.clear();
+            self.server_tool_client_owned_ids.clear();
+            self.server_tool_completed_terminals.clear();
+            self.server_tool_protocol_error = None;
         }
+        result
     }
 
     fn on_before_sse_read_loop(&mut self) {
@@ -8204,7 +8516,8 @@ mod tests {
         request_token_usage_from_accum, reusable_speculative_output, sanitize_final_stream_text,
         server_context_window_policy_from_accum, server_tool_completion_id,
         server_tool_completion_output, server_tool_completion_status,
-        server_tool_event_is_client_owned, server_tool_start_fields, style_tool_description,
+        server_tool_event_is_client_owned, server_tool_event_owner,
+        server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
         tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
@@ -8550,6 +8863,25 @@ mod tests {
         assert_eq!(server_tool_completion_output(&failed), "permission denied");
     }
 
+    #[test]
+    fn non_tool_event_metadata_does_not_enter_tool_provenance_validation() {
+        let workspace_bound = serde_json::json!({
+            "type": "workspace_bound",
+            "transport": "future_transport",
+            "executor": {"kind": "future_executor"}
+        });
+        assert!(!server_tool_event_requires_provenance(&workspace_bound));
+        assert_eq!(server_tool_event_owner(&workspace_bound), Ok(None));
+        assert!(!server_tool_event_is_client_owned(&workspace_bound));
+
+        let routing = serde_json::json!({
+            "type": "tool_routing_decision",
+            "transport": "future_transport"
+        });
+        assert!(server_tool_event_requires_provenance(&routing));
+        assert!(server_tool_event_owner(&routing).is_err());
+    }
+
     #[tokio::test]
     async fn server_tool_lifecycle_emits_once_and_edge_route_emits_nothing() {
         let server = MockServer::start().await;
@@ -8627,6 +8959,34 @@ mod tests {
             host.server_tool_calls["server-call"].args["scope"], "current_turn",
             "partial replay must preserve the admitted arguments"
         );
+        let active_owner_conflict = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_start",
+                "call_id": "server-call",
+                "tool": "introspect",
+                "arguments": {"scope": "current_turn"},
+                "transport": "edge_ws",
+                "executor": {"kind": "edge_agent"}
+            }))
+            .await
+            .expect_err("a live server call cannot be reclaimed by an edge owner");
+        assert!(active_owner_conflict.contains("changed execution owner"));
+        assert!(
+            host.server_tool_calls.contains_key("server-call"),
+            "owner conflict must not erase the unresolved server call"
+        );
+        let active_conflict_error = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_start",
+                "call_id": "server-call",
+                "tool": "reflect",
+                "arguments": {"scope": "current_run"},
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect_err("conflicting active start must fail the stream contract");
+        assert!(active_conflict_error.contains("conflicting active start payload"));
 
         // Nested agent events share the same transport. Cardinality is not
         // identity: an incomplete child event must never close the only live
@@ -8650,6 +9010,20 @@ mod tests {
             "the exact parent call must remain live until its own terminal event"
         );
 
+        // A runtime route reports transport completion before the canonical
+        // receipt.  The transport event carries no result and must remain
+        // observational; it cannot claim the TUI terminal or fingerprint.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_transport_completed",
+            "call_id": "server-call",
+            "success": true,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("transport completion is observational");
+        assert!(host.server_tool_calls.contains_key("server-call"));
+
         host.on_accepted_sse_event(&serde_json::json!({
             "type": "tool_call_end",
             "call_id": "server-call",
@@ -8666,6 +9040,46 @@ mod tests {
             rx.recv().await,
             Some(chat_stream::StreamEvent::ToolCompleted { ref name, .. }) if name == "introspect"
         ));
+
+        let completed_owner_conflict = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": "server-call",
+                "tool": "introspect",
+                "success": true,
+                "result": "snapshot",
+                "transport": "edge_ws",
+                "executor": {"kind": "edge_agent"}
+            }))
+            .await
+            .expect_err("a completed server call cannot be replayed by an edge owner");
+        assert!(completed_owner_conflict.contains("changed execution owner"));
+        assert!(
+            host.server_tool_completed_ids.contains("server-call"),
+            "owner conflict must not erase the canonical completed terminal"
+        );
+
+        let provenance_conflict = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_transport_completed",
+                "call_id": "route-conflict",
+                "success": true,
+                "transport": "edge_ws",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect_err("contradictory route provenance must fail closed");
+        assert!(provenance_conflict.contains("contradictory"));
+        let unknown_provenance = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_transport_started",
+                "call_id": "unknown-route",
+                "tool": "introspect",
+                "transport": "future_transport",
+            }))
+            .await
+            .expect_err("unknown transport provenance must fail closed");
+        assert!(unknown_provenance.contains("unknown execution transport"));
 
         // The server may project both transport completion and tool_call_end;
         // only one terminal UI event is allowed for one call id.
@@ -8684,6 +9098,47 @@ mod tests {
             rx.try_recv().is_err(),
             "duplicate terminal must not repaint"
         );
+        let terminal_conflict_error = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": "server-call",
+                "tool": "introspect",
+                "status": "failed",
+                "error": "late failure from a second terminal owner",
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect_err("conflicting terminal outcome must fail the stream contract");
+        assert!(terminal_conflict_error.contains("conflicting terminal outcome"));
+
+        // Reordered/replayed delivery can repeat the start after its terminal.
+        // The completed id is monotonic: the replay is ignored and must not
+        // make the exchange fail the unresolved-call guard at [DONE].
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_start",
+            "call_id": "server-call",
+            "tool": "introspect",
+            "arguments": {"scope": "current_turn"},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("replayed completed start is idempotent");
+        assert!(!host.server_tool_calls.contains_key("server-call"));
+        assert!(rx.try_recv().is_err(), "replayed start must not repaint");
+        let conflict_error = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_call_start",
+                "call_id": "server-call",
+                "tool": "reflect",
+                "arguments": {},
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect_err("a conflicting replayed start must fail closed");
+        assert!(conflict_error.contains("conflicting start payload"));
 
         // A live progress gap may drop the start while the server's terminal
         // convergence replay still arrives at settlement. The terminal event
@@ -8850,6 +9305,136 @@ mod tests {
             rx.try_recv().is_err(),
             "edge execution is rendered by its local executor"
         );
+
+        // A client transport start is execution evidence, even when no
+        // terminal has arrived yet. Once it claims the call id, a later
+        // server route must fail closed instead of letting the TUI silently
+        // switch owners mid-flight.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_transport_started",
+            "call_id": "edge-start-only",
+            "tool": "read_file",
+            "arguments": {},
+            "transport": "edge_ws",
+            "executor": {"kind": "edge_agent"}
+        }))
+        .await
+        .expect("edge transport start accepted");
+        let edge_start_owner_conflict = host
+            .on_accepted_sse_event(&serde_json::json!({
+                "type": "tool_transport_started",
+                "call_id": "edge-start-only",
+                "tool": "read_file",
+                "arguments": {},
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }))
+            .await
+            .expect_err("a client execution start cannot be reclaimed by Server");
+        assert!(edge_start_owner_conflict.contains("changed execution owner"));
+
+        // A complete physical exchange is accepted and its correlation state
+        // is then reset.  A later exchange with a missing terminal is rejected
+        // instead of being silently treated as successful `[DONE]`.
+        host.on_sse_done(&ChatTurnSseAccum {
+            stream_complete: true,
+            ..Default::default()
+        })
+        .await
+        .expect("closed server-owned exchange is valid");
+
+        // The provider-facing request may carry an edge-global binding even
+        // when route selection later moves the same call to a server
+        // executor.  The production route boundary announces that decision
+        // with `tool_routing_decision` followed by the typed
+        // `tool_transport_started`; the latter is the authoritative start
+        // for TUI correlation.  A missing canonical terminal must remain an
+        // unresolved lifecycle, rather than passing [DONE].
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "call_id": "edge-to-server-call",
+            "tool": "introspect",
+            "arguments": {"scope": "current_turn"},
+            "transport": "edge_ws",
+            "executor": {"kind": "edge_agent"}
+        }))
+        .await
+        .expect("edge-bound provider request accepted");
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_routing_decision",
+            "call_id": "edge-to-server-call",
+            "tool": "introspect",
+            "route": "server_runtime",
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("server route decision accepted");
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_transport_started",
+            "call_id": "edge-to-server-call",
+            "tool": "introspect",
+            "arguments": {"scope": "current_turn"},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("server transport start accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolStarted { ref name, .. })
+                if name == "introspect"
+        ));
+        let transport_start_done_error = host
+            .on_sse_done(&ChatTurnSseAccum {
+                stream_complete: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("transport start without canonical end must fail DONE");
+        assert!(transport_start_done_error.contains("edge-to-server-call"));
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "edge-to-server-call",
+            "tool": "introspect",
+            "success": true,
+            "output": "snapshot",
+            "duration_ms": 2,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("server canonical end accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolCompleted { ref name, .. })
+                if name == "introspect"
+        ));
+        host.on_sse_done(&ChatTurnSseAccum {
+            stream_complete: true,
+            ..Default::default()
+        })
+        .await
+        .expect("server canonical end closes the lifecycle");
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_start",
+            "call_id": "unresolved-call",
+            "tool": "introspect",
+            "arguments": {},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("unresolved start is observed before DONE");
+        let done_error = host
+            .on_sse_done(&ChatTurnSseAccum {
+                stream_complete: true,
+                ..Default::default()
+            })
+            .await
+            .expect_err("DONE must reject an unresolved server call");
+        assert!(done_error.contains("unresolved-call"));
     }
 
     #[test]

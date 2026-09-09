@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use serde_json::Value;
@@ -26,7 +26,9 @@ use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
 };
-use super::super::agentic::tool_interception::{PreparedToolRound, prepare_intercepted_tool_round};
+use super::super::agentic::tool_interception::{
+    PreparedToolRound, try_prepare_intercepted_tool_round,
+};
 use super::super::headless_tool_pipeline::CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD;
 use super::execution_phase::{
     TurnExecutionPhase, apply_workspace_observation_quarantine_transition,
@@ -54,7 +56,48 @@ use astra_turn_core::agentic_turn_flow::{
 };
 use astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-use astra_turn_core::tool_result_semantics::tool_dedup_signature;
+
+/// Persist schema-addressed deferred selections at the tool-result boundary.
+///
+/// The history pair is the recovery source, but it is not a durable state
+/// store: compaction may legitimately remove the assistant/tool-search pair
+/// before the next provider round.  Refreshing the typed snapshot immediately
+/// after the result is appended keeps carrier admission independent of whether
+/// the current prompt projection still retains that pair.  This intentionally
+/// consumes only the structured `tool_search` result parser; no result prose or
+/// name matching can grant activation.
+#[cfg(test)]
+fn refresh_deferred_tool_activation_snapshot(state: &mut AgenticLoopState) {
+    let updates =
+        astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_messages(
+            &state.messages,
+        );
+    astra_turn_core::tool::deferred_activation::refresh_deferred_tool_activations(
+        &mut state.deferred_tool_activations,
+        updates,
+    );
+}
+
+/// Refresh only the selection result paired with the current provider round.
+/// The full-history helper remains the recovery path; this bounded projection
+/// lets a host bind newly observed selections to the current provider without
+/// accidentally rebinding an activation restored from an older run.
+fn refresh_deferred_tool_activation_snapshot_from(
+    state: &mut AgenticLoopState,
+    transcript_append_start: usize,
+) -> Vec<astra_turn_types::DeferredToolActivation> {
+    let selection_start = transcript_append_start.saturating_sub(1);
+    let updates = state
+        .messages
+        .get(selection_start..)
+        .map(astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_messages)
+        .unwrap_or_default();
+    astra_turn_core::tool::deferred_activation::refresh_deferred_tool_activations(
+        &mut state.deferred_tool_activations,
+        updates.clone(),
+    );
+    updates
+}
 
 fn record_trusted_client_pipeline_skills(
     state: &mut AgenticLoopState,
@@ -90,13 +133,10 @@ fn record_trusted_client_pipeline_skills(
         {
             continue;
         }
-        let marker = format!(
-            "<skill-loaded name=\"{}\"/>",
-            astra_text_utils::xml_escape::xml_escape_attr(&name)
-        );
-        if !result.output.contains(&marker) {
-            continue;
-        }
+        // The exact admitted call, trusted client-pipeline route, and typed
+        // completed status are the skill-load receipt. The output is model
+        // content and may be wrapped or truncated in transport; it must not
+        // decide whether the successful invocation enters the ledger.
         let execution_topology = result
             .tool_result_fields
             .as_ref()
@@ -117,6 +157,38 @@ fn record_trusted_client_pipeline_skills(
                 execution_topology,
             },
         );
+    }
+}
+
+/// Replace a deferred carrier's physical telemetry label with the logical
+/// operation selected by the canonical invocation.
+///
+/// Provider history must keep the physical call for protocol/cache identity,
+/// but product telemetry answers "which capability was invoked". The canonical
+/// invocation already owns both identities, so do not rediscover the target
+/// from carrier arguments or result text.
+fn reconcile_logical_tool_telemetry(
+    state: &mut AgenticLoopState,
+    admitted: &[astra_turn_core::tool::deferred_activation::CanonicalToolInvocation],
+) {
+    for invocation in admitted {
+        let Some(activation) = invocation.activation() else {
+            continue;
+        };
+        let Some(physical_name) =
+            astra_turn_core::tool::args::shape::tool_call_name(invocation.physical_provider_call())
+        else {
+            continue;
+        };
+        let logical_name = activation.name.as_str();
+        if physical_name == logical_name {
+            continue;
+        }
+        state.telemetry.all_tools_used.remove(physical_name);
+        state
+            .telemetry
+            .all_tools_used
+            .insert(logical_name.to_string());
     }
 }
 
@@ -180,6 +252,65 @@ fn all_requested_calls_rejected_non_retryable(
         })
 }
 
+/// Select the terminal repair boundary for a provider batch that could not
+/// execute any requested call.
+///
+/// A normal turn has no execution owner left at this point, so the only safe
+/// continuation is text-only.  An active primary Work attempt is different:
+/// its executor still owns a durable assignment, and the state machine must
+/// retain one typed settlement transition so the model can report blocked or
+/// failed work truthfully.  Collapsing both cases into `text_only` makes the
+/// settlement tool self-reject and strands the owner until the transport
+/// reports an incomplete run.
+fn engage_non_retryable_admission_boundary(
+    state: &mut AgenticLoopState,
+    active_work_attempt: bool,
+    rejected_tool_calls: usize,
+) {
+    if active_work_attempt {
+        state.hooks.completion_settlement.work_settlement_only = true;
+        state.hooks.completion_settlement.text_only = false;
+        // A Work settlement is the next execution boundary, not the
+        // text-only retry used by ordinary turns.  Do not let an earlier
+        // wrap-up marker reject the one allowed typed settlement call.
+        state.budget_wrapup_injected = false;
+    } else {
+        state.hooks.completion_settlement.work_settlement_only = false;
+        state.hooks.completion_settlement.text_only = true;
+    }
+    if state.hooks.completion_settlement.wrapup_origin.is_none() {
+        state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
+    }
+    state.push_volatile_payload(
+        super::host::VolatileKind::BudgetAdvisory,
+        serde_json::json!({
+            "schema": "completion_settlement.v2",
+            "signal": "non_retryable_admission_rejection",
+            "mode": if active_work_attempt { "work_settlement_only" } else { "text_only" },
+            "allowed_action": if active_work_attempt { serde_json::json!("settle_work_item") } else { serde_json::Value::Null },
+            "execution_authority": if active_work_attempt { "one_matching_action" } else { "none" },
+            "attempts_remaining": if active_work_attempt { 1 } else { 0 },
+            "instruction": if active_work_attempt {
+                "The requested tool calls were rejected before execution. Settle the currently owned WorkItem now with its truthful typed outcome (delivered, blocked, or failed). Do not request another tool."
+            } else {
+                "The requested tool calls were rejected before execution and cannot be retried in this turn. Answer from verified evidence or state the execution gap. Do not request another tool."
+            },
+            "authority": "runtime_admission_boundary",
+        }),
+    );
+    tracing::warn!(
+        target: "astra::loop_guard",
+        tier = if active_work_attempt {
+            "non_retryable_admission_work_settlement"
+        } else {
+            "non_retryable_admission_lockout"
+        },
+        round = state.current_round_index,
+        rejected_tool_calls,
+        "all requested tool calls were rejected before execution; bounded repair boundary engaged"
+    );
+}
+
 fn record_provider_round_observation(
     state: &mut AgenticLoopState,
     turn_result: &super::host::HostTurnResult,
@@ -213,24 +344,51 @@ fn record_provider_round_observation(
 }
 
 fn pre_resolved_server_tool_terminal_records(
-    records: &[ToolCallRecord],
+    pre_execution_records: &[ToolCallRecord],
+    round_records: &[ToolCallRecord],
+    shared_loop_terminal_call_ids: &HashSet<String>,
     edge_tool_round: &[EdgeToolExecResult],
 ) -> Vec<ToolCallRecord> {
     let edge_request_ids = edge_tool_round
         .iter()
         .map(|result| result.request_id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    records
+    let mut projected_ids = HashSet::new();
+    let mut projected = Vec::new();
+
+    // Admission/interception records never cross RuntimeToolExecutor. They
+    // have always been owned by this shared loop's terminal projection.
+    //
+    // A round record is normally selected by the typed owner set returned by
+    // the headless pipeline.  A non-executed record is also unambiguously
+    // shared-loop owned: a runtime route cannot have emitted a completion if
+    // no execution was admitted.  This second condition closes the preflight
+    // validation path (for example an invalid deferred carrier) even when a
+    // caller stopped before the owner set was materialized. Executed records
+    // remain owner-set gated so a RuntimeToolExecutor terminal is never
+    // duplicated.
+    let candidates = pre_execution_records
         .iter()
-        .filter(|record| {
-            record
-                .tool_call_id
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|id| !id.is_empty() && !edge_request_ids.contains(id))
-        })
-        .cloned()
-        .collect()
+        .chain(round_records.iter().filter(|record| {
+            record.tool_call_id.as_deref().is_some_and(|id| {
+                shared_loop_terminal_call_ids.contains(id) || !record.was_executed()
+            })
+        }));
+    for record in candidates {
+        let Some(id) = record
+            .tool_call_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if edge_request_ids.contains(id) || !projected_ids.insert(id.to_string()) {
+            continue;
+        }
+        projected.push(record.clone());
+    }
+    projected
 }
 
 fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<String> {
@@ -1805,15 +1963,21 @@ async fn settle_text_only_provider_attempts<H: AgenticLoopHost>(
     crate::turn::agentic::tool_interception::validate_provider_tool_call_identities(tool_calls)
         .map_err(|error| format!("provider tool-call protocol violation: {error}"))?;
     let attempts = ToolLedgerAttemptBatch::from_validated_provider_calls(tool_calls);
-    let mut admission = host.admit_tool_calls(tool_calls, finish_reason);
-    if !admission.admitted.is_empty() {
-        let forced =
-            crate::turn::agentic::tool_interception::reject_tool_calls_at_text_only_boundary(
-                &admission.admitted,
-                finish_reason,
-            );
-        admission.admitted.clear();
-        admission.rejected.extend(forced.rejected);
+    let admitted = host.admit_tool_calls(tool_calls, finish_reason);
+    let mut admission = host.canonicalize_deferred_tool_admission(state, admitted);
+    for invocation in std::mem::take(&mut admission.admitted) {
+        admission.rejected.push(
+            crate::turn::agentic_loop::host::RejectedToolCall {
+                invocation,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "text_only_settlement_tool_call",
+                    "retryable": false,
+                    "error": "The terminal response boundary is text-only. Produce the final answer without requesting another tool call."
+                })
+                .to_string(),
+            },
+        );
     }
     crate::turn::agentic::tool_interception::validate_tool_call_admission_partition(
         tool_calls, &admission,
@@ -2074,10 +2238,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         provider_tool_calls_returned,
         provider_tool_call_names.clone(),
     );
-    let mut admission = host.admit_tool_calls(
+    let admitted = host.admit_tool_calls(
         &turn_result.accum.tool_calls,
         state.last_finish_reason.as_deref(),
     );
+    let mut admission = host.canonicalize_deferred_tool_admission(state, admitted);
     admission = super::execution_phase::apply_completion_action_admission(
         state,
         admission,
@@ -2089,28 +2254,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     )
     .map_err(|error| format!("tool admission contract violation: {error}"))?;
     if all_requested_calls_rejected_non_retryable(&turn_result.accum.tool_calls, &admission) {
-        state.hooks.completion_settlement.text_only = true;
-        if state.hooks.completion_settlement.wrapup_origin.is_none() {
-            state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
-        }
-        state.push_volatile_payload(
-            super::host::VolatileKind::BudgetAdvisory,
-            serde_json::json!({
-                "schema": "completion_settlement.v2",
-                "signal": "non_retryable_admission_rejection",
-                "mode": "text_only",
-                "execution_authority": "none",
-                "attempts_remaining": 1,
-                "instruction": "The requested tool calls were rejected before execution and cannot be retried in this turn. Answer from verified evidence or state the execution gap. Do not request another tool.",
-                "authority": "runtime_admission_boundary",
-            }),
+        let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
         );
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "non_retryable_admission_lockout",
-            round = state.current_round_index,
-            rejected_tool_calls = admission.rejected.len(),
-            "all requested tool calls were rejected before execution; text-only repair boundary engaged"
+        engage_non_retryable_admission_boundary(
+            state,
+            active_work_attempt,
+            admission.rejected.len(),
         );
     }
 
@@ -2199,24 +2349,24 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         state.hooks.completion_settlement.text_only = true;
     }
-    turn_result.accum.tool_calls = admission.admitted;
+    let admitted_tool_calls = admission.admitted;
+    let admitted_logical_calls = admitted_tool_calls
+        .iter()
+        .map(|call| call.logical_target_call().clone())
+        .collect::<Vec<_>>();
     let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
-    if !turn_result.accum.tool_calls.is_empty() {
+    if !admitted_logical_calls.is_empty() {
         let delivered = host
-            .handle_admitted_tool_calls(state, &turn_result.accum.tool_calls)
+            .handle_admitted_tool_invocations(state, &admitted_tool_calls)
             .await;
         admitted_tool_call_control = delivered.control;
-        record_trusted_client_pipeline_skills(
-            state,
-            &turn_result.accum.tool_calls,
-            &delivered.results,
-        );
+        record_trusted_client_pipeline_skills(state, &admitted_logical_calls, &delivered.results);
         turn_result.edge_tool_round.extend(delivered.results);
     }
 
     agentic_round_stall_preflight(
         turn_index,
-        &turn_result.accum.tool_calls,
+        &admitted_logical_calls,
         &turn_result.edge_tool_round,
         &mut state.stall.turn_sigs,
         &mut state.stall.turn_tool_names,
@@ -2250,26 +2400,37 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         effective_tool_calls,
         pre_resolved_results: delegation_pre_resolved_results,
         intercepted_any: delegation_intercepted,
-    } = intercept_delegations(host, state, &turn_result, prep.quiet, &valid_tool_names).await;
+    } = intercept_delegations(
+        host,
+        state,
+        &admitted_logical_calls,
+        prep.quiet,
+        &valid_tool_names,
+    )
+    .await;
 
     // Capture records produced by interception/admission as part of the same
     // causal LLM round. Previously the round snapshot started *after* this
     // phase, so policy-rejected requests appeared in the transcript but were
     // absent from llm_round/run-event projections.
     let PreparedToolRound {
-        tool_calls,
+        physical_tool_calls,
+        logical_tool_calls,
+        deferred_activations_by_call_id,
+        runtime_control_calls_by_id,
         mut pre_resolved_results,
         mut edge_tool_round,
         communication_events,
-    } = prepare_intercepted_tool_round(
+    } = try_prepare_intercepted_tool_round(
         state,
         &turn_result,
+        &admitted_tool_calls,
         &effective_tool_calls,
         admission.rejected,
         delegation_intercepted,
         &valid_tool_names,
     )
-    .await;
+    .await?;
     pre_resolved_results.extend(delegation_pre_resolved_results);
     for event in communication_events {
         host.on_agent_communication(event);
@@ -2277,15 +2438,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     recover_missing_control_tool_results(
         host,
         state.current_run_id.as_deref(),
-        &tool_calls,
+        &logical_tool_calls,
         &mut pre_resolved_results,
         &mut edge_tool_round,
     )
     .await;
     record_edge_tool_selection(state, &edge_tool_round, turn_index);
-    let all_tool_calls = tool_calls.as_slice();
+    let physical_tool_calls = physical_tool_calls.as_slice();
+    let all_tool_calls = logical_tool_calls.as_slice();
     let edge_round_for_headless = edge_tool_round.as_slice();
-    if all_tool_calls.is_empty()
+    if physical_tool_calls.is_empty()
         && edge_round_for_headless.is_empty()
         && pre_resolved_results.is_empty()
     {
@@ -2316,11 +2478,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
     }
 
-    let edge_callback_outputs: HashMap<String, String> = edge_tool_round
-        .iter()
-        .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
-        .collect();
-
     // Records produced by the actual headless executor are kept separate from
     // pre-resolved/intercepted records because tool-result batches are ordered
     // by execution slots.  The journal record below combines both lists.
@@ -2337,6 +2494,11 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .as_ref()
         .map(|b| b.current_round())
         .unwrap_or(0);
+    // Snapshot the executor-owned external observation scope before borrowing
+    // the rest of loop state mutably for the headless round.  The clone is
+    // bounded to the explicitly declared roots and carries no command text.
+    let external_effect_recovery_paths =
+        super::execution_phase::external_effect_recovery_scope(state);
     // Delegation interception records are created outside the normal
     // pre-resolved helper, so fill the same causal round metadata before
     // taking the immutable journal snapshot. This keeps every record in the
@@ -2356,8 +2518,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         super::host::AdmittedToolCallControl::Superseded
     );
     let mut tool_round_superseded = edge_round_superseded;
-    let mut superseding_guidance_applied = false;
-    {
+    let superseding_guidance_applied = false;
+    let (shared_loop_terminal_call_ids, action_admission_error, superseded_before_action) = {
         let mut term_adapter = HostTerminalAdapter(host);
         struct DurableActionFence {
             run_control: std::sync::Arc<dyn crate::turn::run_control::RunControlProvider>,
@@ -2453,11 +2615,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     }
                 },
             ),
-            tool_calls: all_tool_calls,
+            physical_tool_calls,
+            logical_tool_calls: all_tool_calls,
+            deferred_activations_by_call_id: &deferred_activations_by_call_id,
+            runtime_control_calls_by_id: &runtime_control_calls_by_id,
             edge_tool_round: edge_round_for_headless,
             reasoning_content: turn_result.accum.reasoning_content.as_str(),
             reasoning_signature: turn_result.accum.reasoning_signature.as_str(),
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,
             valid_tool_names: &valid_tool_names,
@@ -2480,32 +2644,31 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             runtime_tool_executor: state.runtime_tool_executor.as_deref(),
+            external_effect_recovery_paths: external_effect_recovery_paths.as_deref(),
             turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
         }, action_fence.as_ref().map(|fence| fence as &dyn super::super::agentic::headless_round::HeadlessActionFence))
         .await;
-        if let Some(error) = headless_outcome.action_admission_error {
-            return Err(format!(
-                "tool action admission failed closed before execution: {error}"
-            ));
-        }
-        if headless_outcome.superseded_before_action {
-            let applied =
-                super::execution_phase::inject_polled_user_intents_before_action(host, state)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            if !applied {
-                return Err(
-                    "tool action authority changed but no durable guidance could be applied"
-                        .to_string(),
-                );
-            }
-            tool_round_superseded = true;
-            superseding_guidance_applied = true;
-        }
+        let action_admission_error = headless_outcome.action_admission_error;
+        let superseded_before_action = headless_outcome.superseded_before_action;
+        (
+            headless_outcome.shared_loop_terminal_call_ids,
+            action_admission_error,
+            superseded_before_action,
+        )
+    };
+    if superseded_before_action {
+        tool_round_superseded = true;
     }
     state.record_appended_prompt_history_from(transcript_append_start);
+    // Freeze schema-addressed selection evidence before post-tool policy or
+    // any compaction/checkpoint can rewrite the just-appended pair.  The
+    // explicit snapshot is recovery state; retained messages remain a
+    // secondary upgrade path for older/replayed turns.
+    let fresh_deferred_activations =
+        refresh_deferred_tool_activation_snapshot_from(state, transcript_append_start);
+    host.bind_deferred_tool_activations(state, &fresh_deferred_activations);
 
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
@@ -2553,13 +2716,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         let snapshot = state.stall.tool_call_records[new_records_start..].to_vec();
         (snapshot, parallel_count_emit)
     };
-    // Pre-resolved/intercepted calls never cross RuntimeToolExecutor's route
+    super::execution_phase::remember_external_effect_recovery_scope(state, &round_tool_calls);
+    reconcile_logical_tool_telemetry(state, &admitted_tool_calls);
+    // Pre-resolved/intercepted calls, including policy rejections discovered
+    // inside the headless round, never cross RuntimeToolExecutor's route
     // boundary, so the shared loop owns their live terminal projection.
-    // Ordinary Server tools are completed by RuntimeToolExecutor and Edge
-    // calls by the callback lane; publishing either here would create two
-    // terminal owners for one call id.
-    let pre_resolved_terminal_records =
-        pre_resolved_server_tool_terminal_records(&pre_execution_tool_calls, &edge_tool_round);
+    // Ordinary Server tools that actually execute are completed by
+    // RuntimeToolExecutor and Edge calls by the callback lane; publishing
+    // either here would create two terminal owners for one call id.
+    let pre_resolved_terminal_records = pre_resolved_server_tool_terminal_records(
+        &pre_execution_tool_calls,
+        &round_tool_calls,
+        &shared_loop_terminal_call_ids,
+        &edge_tool_round,
+    );
     host.on_pre_resolved_tool_calls_terminal(
         state.current_run_id.as_deref(),
         &pre_resolved_terminal_records,
@@ -2707,6 +2877,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             rollback_invocation_authority.as_ref(),
         )
         .await;
+    }
+
+    // Failed-closed action admission is terminal for execution, but not for
+    // this round's facts. The provider-facing start, typed terminal projection,
+    // tool ledger, LLM-round journal, and persisted output batch must all land
+    // before the error is propagated. No later branch may dispatch another tool
+    // or request another model turn.
+    if let Some(error) = action_admission_error {
+        return Err(format!(
+            "tool action admission failed closed before execution: {error}"
+        ));
     }
 
     if tool_round_superseded {
@@ -3230,6 +3411,93 @@ mod tests {
     use crate::turn::agentic_loop::host::{build_introspect_snapshot, introspect_token_pressure};
 
     #[test]
+    fn deferred_invocation_reports_logical_tool_not_carrier() {
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let carrier = json!({
+            "id": "provider-call-1",
+            "type": "function",
+            "function": {
+                "name": astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"memory","arguments":{"action":"recall"}}"#,
+            }
+        });
+        let invocation =
+            astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[astra_turn_types::DeferredToolActivation {
+                    name: "memory".to_string(),
+                    schema_digest: digest.clone(),
+                    descriptor: None,
+                }],
+                |name| (name == "memory").then_some(digest.clone()),
+            )
+            .expect("valid carrier")
+            .expect("deferred invocation");
+        let mut state = make_state();
+        state.telemetry.all_tools_used.extend([
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+                .to_string(),
+            "tool_search".to_string(),
+        ]);
+        reconcile_logical_tool_telemetry(&mut state, &[invocation]);
+
+        assert_eq!(
+            state.telemetry.all_tools_used,
+            HashSet::from(["memory".to_string(), "tool_search".to_string()])
+        );
+    }
+
+    #[test]
+    fn deferred_activation_snapshot_is_frozen_before_history_compaction() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut state = make_state();
+        state.messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "arguments": "{\"query\":\"select:web_fetch\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "search-1",
+                "content": json!({
+                    "mode": "select",
+                    "query": "select:web_fetch",
+                    "requested": ["web_fetch"],
+                    "resolved": ["web_fetch"],
+                    "matches": [{"name": "web_fetch", "schema_digest": digest}],
+                    "missing": []
+                })
+                .to_string()
+            }),
+        ];
+
+        refresh_deferred_tool_activation_snapshot(&mut state);
+
+        assert_eq!(
+            state.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: digest,
+                descriptor: None,
+            }]
+        );
+
+        // A later compaction may remove the paired history. The typed
+        // snapshot remains the recovery source for the stable carrier.
+        state.messages.clear();
+        refresh_deferred_tool_activation_snapshot(&mut state);
+        assert_eq!(state.deferred_tool_activations.len(), 1);
+        assert_eq!(state.deferred_tool_activations[0].name, "web_fetch");
+    }
+
+    #[test]
     fn authenticated_client_pipeline_skill_result_enters_typed_invocation_ledger() {
         let mut state = make_state();
         state
@@ -3262,6 +3530,73 @@ mod tests {
             state.skills.invoked["parallel-review"].content,
             results[0].output
         );
+    }
+
+    #[test]
+    fn authenticated_skill_success_does_not_depend_on_output_marker() {
+        let mut state = make_state();
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("parallel-review".to_string());
+        let calls = vec![json!({
+            "id":"skill-call-1",
+            "function":{
+                "name":"skill",
+                "arguments":"{\"skill_name\":\"parallel-review\"}"
+            }
+        })];
+        let results = vec![EdgeToolExecResult {
+            request_id: "skill-call-1".into(),
+            tool: "skill".into(),
+            args: json!({"skill_name":"parallel-review"}),
+            output: "Use two agents in parallel.".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([(
+                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
+                json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+            )])),
+            status: "completed".into(),
+            duration_ms: 1,
+        }];
+
+        record_trusted_client_pipeline_skills(&mut state, &calls, &results);
+
+        assert_eq!(
+            state.skills.invoked["parallel-review"].content,
+            "Use two agents in parallel."
+        );
+    }
+
+    #[test]
+    fn failed_skill_result_cannot_enter_invocation_ledger() {
+        let mut state = make_state();
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("parallel-review".to_string());
+        let calls = vec![json!({
+            "id":"skill-call-1",
+            "function":{
+                "name":"skill",
+                "arguments":"{\"skill_name\":\"parallel-review\"}"
+            }
+        })];
+        let results = vec![EdgeToolExecResult {
+            request_id: "skill-call-1".into(),
+            tool: "skill".into(),
+            args: json!({"skill_name":"parallel-review"}),
+            output: "<skill-loaded name=\"parallel-review\"/>".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([(
+                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
+                json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+            )])),
+            status: "failed".into(),
+            duration_ms: 1,
+        }];
+
+        record_trusted_client_pipeline_skills(&mut state, &calls, &results);
+
+        assert!(state.skills.invoked.is_empty());
     }
 
     #[test]
@@ -3324,9 +3659,43 @@ mod tests {
             duration_ms: 1,
         }];
 
-        let projected = pre_resolved_server_tool_terminal_records(&records, &edge);
-        assert_eq!(projected.len(), 1);
+        let round_records = vec![
+            ToolCallRecord {
+                tool_call_id: Some("server-rejected-in-round".into()),
+                name: "settle_work_item".into(),
+                ok: false,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                tool_call_id: Some("server-executed-in-round".into()),
+                name: "read_file".into(),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+        ];
+
+        let shared_ids = HashSet::from(["server-rejected-in-round".to_string()]);
+        let projected =
+            pre_resolved_server_tool_terminal_records(&records, &round_records, &shared_ids, &edge);
+        assert_eq!(projected.len(), 2);
         assert_eq!(projected[0].tool_call_id.as_deref(), Some("server-1"));
+        assert_eq!(
+            projected[1].tool_call_id.as_deref(),
+            Some("server-rejected-in-round")
+        );
+
+        let projected_without_owner_snapshot =
+            pre_resolved_server_tool_terminal_records(&[], &round_records, &HashSet::new(), &edge);
+        assert_eq!(
+            projected_without_owner_snapshot
+                .iter()
+                .filter_map(|record| record.tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["server-rejected-in-round"],
+            "a non-executed preflight rejection must still receive a shared terminal"
+        );
     }
 
     fn publish_test_feedback(
@@ -3362,6 +3731,7 @@ mod tests {
                 model_context_window_tokens: Some(1_000_000),
                 effective_input_limit_tokens: Some(800_000),
                 estimated_input_tokens: Some(1_500),
+                estimated_cache_eligible_tokens: None,
                 token_pressure: Some(0.0015),
                 compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
             },
@@ -4378,28 +4748,24 @@ mod tests {
         let admission = super::super::host::ToolCallAdmission {
             admitted: Vec::new(),
             rejected: vec![
-                super::super::host::RejectedToolCall {
-                    id: "call-1".into(),
-                    name: "agent_fanout".into(),
-                    canonical_call: requested[0].clone(),
-                    result: json!({
+                super::super::host::RejectedToolCall::ordinary(
+                    requested[0].clone(),
+                    json!({
                         "status":"rejected",
                         "retryable":false,
                         "error_kind":"work_lifecycle_topology_conflict"
                     })
                     .to_string(),
-                },
-                super::super::host::RejectedToolCall {
-                    id: "call-2".into(),
-                    name: "bash".into(),
-                    canonical_call: requested[1].clone(),
-                    result: json!({
+                ),
+                super::super::host::RejectedToolCall::ordinary(
+                    requested[1].clone(),
+                    json!({
                         "status":"rejected",
                         "retryable":false,
                         "error_kind":"work_lifecycle_topology_conflict"
                     })
                     .to_string(),
-                },
+                ),
             ],
             completion_action_applied: true,
         };
@@ -4417,6 +4783,38 @@ mod tests {
         assert!(!all_requested_calls_rejected_non_retryable(
             &requested, &retryable
         ));
+    }
+
+    #[test]
+    fn non_retryable_rejection_preserves_work_settlement_authority() {
+        let mut state = make_state();
+
+        engage_non_retryable_admission_boundary(&mut state, true, 2);
+
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(!state.budget_wrapup_injected);
+        let advisory = state
+            .volatile_pending
+            .last()
+            .expect("typed Work settlement advisory");
+        assert_eq!(advisory.payload["mode"], "work_settlement_only");
+        assert_eq!(advisory.payload["allowed_action"], "settle_work_item");
+        assert_eq!(advisory.payload["attempts_remaining"], 1);
+    }
+
+    #[test]
+    fn non_retryable_rejection_without_work_uses_text_only_boundary() {
+        let mut state = make_state();
+
+        engage_non_retryable_admission_boundary(&mut state, false, 1);
+
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
+        assert!(state.hooks.completion_settlement.text_only);
+        let advisory = state.volatile_pending.last().expect("text-only advisory");
+        assert_eq!(advisory.payload["mode"], "text_only");
+        assert!(advisory.payload["allowed_action"].is_null());
+        assert_eq!(advisory.payload["attempts_remaining"], 0);
     }
 
     #[test]

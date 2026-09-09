@@ -1894,7 +1894,7 @@ fn format_compression_method(
     use astra_turn_core::context_assembly_trace::CompressionMethod;
     match method {
         CompressionMethod::ToolResultTruncation => "ToolResultTrunc",
-        CompressionMethod::DuplicateReadElimination => "DuplicateReadElim",
+        CompressionMethod::DuplicateToolOutputElimination => "DuplicateToolOutputElim",
         CompressionMethod::LlmSummarization => "LlmSummarize",
         CompressionMethod::TieredCompaction => "TieredCompact",
         CompressionMethod::ReactiveCompact => "ReactiveCompact",

@@ -801,17 +801,17 @@ impl MemoryExtractionService {
 
     // ── internals ─────────────────────────────────────────────────────
 
+    /// Resolve the current write capability for lifecycle classification.
+    /// A denied capability is normal optional-feature state, not evidence of
+    /// a failed extraction. The check is intentionally dynamic so revocation
+    /// takes effect without restarting the server.
+    pub(crate) async fn write_access_enabled(&self) -> Result<bool, String> {
+        self.memoria_client.admits_operation(true).await
+    }
+
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
         // This lightweight admission task must not load snapshots, resolve a
         // model, spend tokens or schedule writes when consent forbids them.
-        match self.memoria_client.admits_operation(true).await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(error) => {
-                tracing::warn!(%error, "memory extraction admission unavailable");
-                return;
-            }
-        }
         let Some((session_id, turn)) = req.session_coordinates() else {
             tracing::error!(
                 scope_kind = req.inference_scope.kind(),
@@ -828,6 +828,31 @@ impl MemoryExtractionService {
             return;
         };
         let messages_count = req.messages.len() as u32;
+        match self.memoria_client.admits_operation(true).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+                    messages_count: Some(messages_count),
+                    selector_model: None,
+                    attempt: None,
+                    llm_reason: None,
+                    llm_detail: None,
+                    persist_detail: None,
+                };
+                self.emit_skip_event(
+                    &user_id,
+                    Some(&session_id),
+                    turn,
+                    SessionMemoryExtractionSkipReason::AccessDisabled,
+                    &breadcrumbs,
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "memory extraction admission unavailable");
+                return;
+            }
+        }
         let started = Instant::now();
         // Process-local admission cannot see a worker that completed in a
         // previous CLI process or server pod. Read the durable snapshot before
@@ -2769,7 +2794,7 @@ mod tests {
                 read,
                 calls: calls.clone(),
             });
-            let (ingestion, _rx) = IngestionSender::for_tests(32);
+            let (ingestion, mut rx) = IngestionSender::for_tests(32);
             let service = Arc::new(MemoryExtractionService::new(
                 Arc::new(Resolver(calls.clone())),
                 port.clone(),
@@ -2779,6 +2804,25 @@ mod tests {
             ));
             service.maybe_spawn(sample_req("consent-session", 50_000, false));
             service.wait_for_pending(Duration::from_secs(2)).await;
+            let saw_access_disabled = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
+                event.event_type == "session_memory_extraction"
+                    && event
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("outcome"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("skipped")
+                    && event
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("reason"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("access_disabled")
+            });
+            assert!(
+                saw_access_disabled,
+                "denied Memoria write capability must emit a typed skipped outcome"
+            );
             crate::turn::cloud::session_end_governance::run_session_end_governance(
                 &Default::default(),
                 "consent-session",

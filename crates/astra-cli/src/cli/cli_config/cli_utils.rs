@@ -1756,7 +1756,7 @@ mod tests {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,

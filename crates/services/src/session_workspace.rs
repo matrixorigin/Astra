@@ -2257,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(process_journal_dir_guard)]
     fn config_postcommit_callbacks_follow_durable_revision_order() {
         let temp = tempfile::tempdir().unwrap();
         let sessions_dir = temp.path().join("sessions");

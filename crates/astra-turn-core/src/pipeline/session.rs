@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_pipeline_keeps_deferred_tools_after_cache_boundary() {
+    fn adaptive_pipeline_keeps_deferred_tools_in_the_capability_cache_epoch() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
         let agent = AgentContext::default();
@@ -1203,10 +1203,28 @@ mod tests {
             .expect("non-empty deferred manifest must reach the provider request");
         assert_eq!(
             deferred.scope,
-            crate::section_types::CacheScope::None,
-            "admission-dependent tool names must not invalidate the session prefix"
+            crate::section_types::CacheScope::Session,
+            "deferred tool names are capability-epoch metadata and should be cacheable until admission changes"
         );
         assert!(deferred.text.contains("web_fetch"));
+
+        let deferred_index = output
+            .serialized
+            .system_blocks
+            .iter()
+            .position(|block| block.kind == crate::section_types::SectionKind::DeferredTools)
+            .expect("deferred tool manifest must be serialized");
+        if let Some(first_volatile_index) = output
+            .serialized
+            .system_blocks
+            .iter()
+            .position(|block| block.scope == crate::section_types::CacheScope::None)
+        {
+            assert!(
+                deferred_index < first_volatile_index,
+                "capability metadata must remain in the stable cache epoch before turn-volatile blocks"
+            );
+        }
     }
 
     #[test]

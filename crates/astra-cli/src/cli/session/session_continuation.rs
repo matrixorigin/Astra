@@ -9,7 +9,7 @@ use serde_json::Value;
 pub(crate) struct SessionContinuation {
     pub(crate) completed_turn_count: Option<u32>,
     pub(crate) messages: Vec<Value>,
-    pub(crate) activated_deferred_tool_names: Vec<String>,
+    pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     pub(crate) active_conversation: astra_turn_core::active_conversation::ActiveConversation,
     pub(crate) resume: astra_turn_types::ResumeDescriptorV1,
 }
@@ -123,9 +123,7 @@ pub(crate) fn continuation_from_resume_bundle(
     let projection_activation = projections
         .activation_at(&cursor)
         .into_iter()
-        .flat_map(|projection| projection.deferred_tool_names.iter().cloned());
-    let activated_deferred_tool_names =
-        continuation_activation_names(&messages, projection_activation);
+        .flat_map(|projection| projection.deferred_tool_activations.iter().cloned());
     let source = match resume_source {
         astra_turn_types::ResumeSourceV1::CanonicalJournal => {
             astra_turn_core::active_conversation::ActiveConversationSource::Journal
@@ -163,7 +161,10 @@ pub(crate) fn continuation_from_resume_bundle(
         .ok()?;
     Some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
-        activated_deferred_tool_names,
+        deferred_tool_activations: continuation_deferred_tool_activations(
+            &messages,
+            projection_activation,
+        ),
         messages,
         active_conversation,
         resume: resume_descriptor(resume_source, cursor, degraded_reasons, repair_actions),
@@ -184,13 +185,12 @@ fn record_session_restore_hydration(messages: &[Value]) {
     );
 }
 
-pub(crate) fn continuation_activation_names(
+fn continuation_deferred_tool_activations(
     messages: &[Value],
-    persisted_names: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
-        messages,
-        persisted_names,
+    persisted: impl IntoIterator<Item = astra_turn_types::DeferredToolActivation>,
+) -> Vec<astra_turn_types::DeferredToolActivation> {
+    astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+        messages, persisted,
     )
 }
 
@@ -213,11 +213,11 @@ pub(crate) fn load_session_continuation_for_recovery(
             let messages = active_conversation.materialize();
             record_session_restore_hydration(&messages);
             let cursor = active_conversation.cursor().clone();
-            let activated_deferred_tool_names = if cursor.conversation_seq == 0 {
+            let deferred_tool_activations = if cursor.conversation_seq == 0 {
                 // The journal file itself is the canonical empty-state marker.
                 // No side projection is allowed to populate either messages
                 // or activation state before the first canonical commit.
-                continuation_activation_names(&messages, Vec::new())
+                continuation_deferred_tool_activations(&messages, [])
             } else {
                 let checkpoint = load_heavy_checkpoint(session_id);
                 let checkpoint_activation = checkpoint
@@ -232,9 +232,7 @@ pub(crate) fn load_session_continuation_for_recovery(
                             })
                     })
                     .into_iter()
-                    .flat_map(|checkpoint| {
-                        checkpoint.activated_deferred_tool_names.iter().cloned()
-                    });
+                    .flat_map(|checkpoint| checkpoint.deferred_tool_activations.iter().cloned());
                 let csl_activation = load_csl_continuation(session_id)
                     .ok()
                     .flatten()
@@ -245,8 +243,8 @@ pub(crate) fn load_session_continuation_for_recovery(
                         ) == astra_turn_types::CursorRelationV1::Exact
                     })
                     .into_iter()
-                    .flat_map(|continuation| continuation.activated_deferred_tool_names);
-                continuation_activation_names(
+                    .flat_map(|continuation| continuation.deferred_tool_activations);
+                continuation_deferred_tool_activations(
                     &messages,
                     checkpoint_activation.chain(csl_activation),
                 )
@@ -263,7 +261,7 @@ pub(crate) fn load_session_continuation_for_recovery(
             )?;
             return Some(SessionContinuation {
                 completed_turn_count: Some(active_conversation.cursor().completed_turn),
-                activated_deferred_tool_names,
+                deferred_tool_activations,
                 messages,
                 active_conversation,
                 resume,
@@ -335,8 +333,8 @@ pub(crate) fn load_session_continuation_for_recovery(
                         astra_turn_core::active_conversation::ActiveConversationSource::Checkpoint,
                     )
                     .ok()?;
-                let activated_deferred_tool_names =
-                    continuation_activation_names(&messages, cp.activated_deferred_tool_names);
+                let deferred_tool_activations =
+                    continuation_deferred_tool_activations(&messages, cp.deferred_tool_activations);
                 let resume = select_single_resume_descriptor(
                     None,
                     resume_descriptor(
@@ -352,7 +350,7 @@ pub(crate) fn load_session_continuation_for_recovery(
                 )?;
                 Some(SessionContinuation {
                     completed_turn_count: Some(cursor.completed_turn),
-                    activated_deferred_tool_names,
+                    deferred_tool_activations,
                     active_conversation,
                     messages,
                     resume,
@@ -525,9 +523,9 @@ pub(crate) fn load_csl_continuation(
         materialized.messages,
     )
     .map_err(|error| error.to_string())?;
-    let activated_deferred_tool_names = continuation_activation_names(
+    let deferred_tool_activations = continuation_deferred_tool_activations(
         &messages,
-        materialized.session_state.activated_deferred_tool_names,
+        materialized.session_state.deferred_tool_activations,
     );
     let active_conversation =
         astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
@@ -550,8 +548,8 @@ pub(crate) fn load_csl_continuation(
     Ok((!messages.is_empty()).then_some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
         active_conversation,
+        deferred_tool_activations,
         messages,
-        activated_deferred_tool_names,
         resume,
     }))
 }
@@ -822,7 +820,11 @@ mod tests {
             .cursor()
             .clone(),
         );
-        heavy.activated_deferred_tool_names = vec!["github".to_string()];
+        heavy.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "github".to_string(),
+            schema_digest: "sha256:stale".to_string(),
+            descriptor: None,
+        }];
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
             &session_id,
@@ -853,8 +855,8 @@ mod tests {
             astra_turn_core::active_conversation::ActiveConversationSource::Journal
         );
         assert_eq!(
-            continuation.activated_deferred_tool_names,
-            Vec::<String>::new(),
+            continuation.deferred_tool_activations,
+            Vec::<astra_turn_types::DeferredToolActivation>::new(),
             "side projections from another cursor must not activate tools on the empty generation"
         );
     }
@@ -991,7 +993,11 @@ mod tests {
             unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
         };
         heavy.conversation_cursor = Some(second.next.cursor().clone());
-        heavy.activated_deferred_tool_names = vec!["github".to_string()];
+        heavy.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "github".to_string(),
+            schema_digest: "sha256:journal".to_string(),
+            descriptor: None,
+        }];
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -1032,8 +1038,12 @@ mod tests {
         assert_eq!(continuation.messages[2]["role"], "tool");
         assert_eq!(continuation.messages[2]["content"], "file body");
         assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
+            continuation.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: "sha256:journal".to_string(),
+                descriptor: None,
+            }],
             "an activation projection at the exact journal cursor is admissible"
         );
     }
@@ -1055,7 +1065,11 @@ mod tests {
             json!({"role": "assistant", "content": "OK, noted."}),
         ];
         heavy.conversation_cursor = Some(exact_test_cursor(&session_id, 2, &heavy.messages));
-        heavy.activated_deferred_tool_names = vec!["github".to_string()];
+        heavy.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "github".to_string(),
+            schema_digest: "sha256:checkpoint".to_string(),
+            descriptor: None,
+        }];
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -1073,8 +1087,12 @@ mod tests {
 
         let continuation = continuation.expect("should load messages from checkpoint");
         assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
+            continuation.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: "sha256:checkpoint".to_string(),
+                descriptor: None,
+            }],
             "heavy fallback must carry activation even when compaction removed its original tool result"
         );
         let messages = continuation.messages;

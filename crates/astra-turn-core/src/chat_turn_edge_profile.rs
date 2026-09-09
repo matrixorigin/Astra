@@ -1,5 +1,7 @@
 //! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, git branch, active skills).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -75,8 +77,7 @@ impl RuntimeVolatileInjection {
     pub fn kind_is_system_instruction(kind: &str) -> bool {
         matches!(
             kind,
-            "final_answer_settlement"
-                | "session_hook_context"
+            "session_hook_context"
                 | "plan_mode_marker"
                 | "harness_boundary"
                 | "output_cap_continuation"
@@ -203,6 +204,36 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 /// later manifest or found by keyword search.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_omitted_names";
 
+/// Protocol key carrying the full, capability-scoped schemas for deferred
+/// provider-owned tools. This is control-plane metadata only: the schemas are
+/// used by server-side admission and carrier digest resolution, and are never
+/// copied into the model-visible `tools[]` surface.
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS: &str = "deferred_tool_schemas";
+
+/// Project the provider-owned contracts selected by one deferred manifest.
+///
+/// This is a control-plane projection only. Keeping it here gives normal chat
+/// and skill sub-runs one deterministic name filter and ordering rule, while
+/// callers retain the full schema out of the model-visible `tools[]` array.
+#[must_use]
+pub fn deferred_provider_schemas_for_names(
+    provider_schemas: &[Value],
+    deferred_names: &HashSet<String>,
+) -> Vec<Value> {
+    let mut schemas = provider_schemas
+        .iter()
+        .filter(|schema| {
+            crate::tool::schema::tool_schema_name(schema).is_some_and(|name| {
+                deferred_names.contains(name)
+                    && name != crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
+    schemas
+}
+
 /// Protocol key carrying the JSON array of always-load (T1) tool names from the
 /// CLI-side [`ToolSurface`]. The runtime uses this to place cache_control
 /// markers at the correct always-load/dynamic boundary so the Anthropic prompt
@@ -287,13 +318,15 @@ pub fn build_base_edge_profile_value(
     workspace: Value,
 ) -> Value {
     // Environment context split into two lanes for prompt caching:
-    //   * `environment_static`  → Platform/Shell/CWD/Home (stable for
+    //   * `environment_static`  → Platform/Shell/manifests/Home (stable for
     //     the session, safe to sit inside the cached Session prefix).
+    //     CWD remains the typed top-level field and is rendered once by
+    //     RuntimeIdentity.
     //   * `environment_volatile` → Git branch dirty state, staged /
     //     unstaged diff stats, recent commits. Churns every edit/commit
     //     and MUST stay out of the cached prefix.
     let project_root = std::path::Path::new(cwd);
-    let env_static = crate::edge_prompt_context::build_static_environment_context(project_root);
+    let env_static = crate::edge_prompt_context::build_static_environment_context(&workspace);
     let env_volatile = crate::edge_prompt_context::build_volatile_environment_context(project_root);
 
     json!({
@@ -337,10 +370,59 @@ mod tests {
                 .unwrap()
                 .contains("Do not modify files.")
         );
+        let settlement = RuntimeVolatileInjection {
+            kind: "final_answer_settlement".into(),
+            delivery_class: VolatileDeliveryClass::RequiredContext,
+            payload: json!({
+                "schema": "completion_settlement.v2",
+                "revision": 2,
+                "instruction": "Answer from verified evidence."
+            }),
+            round_index: 2,
+        };
+        assert!(!settlement.is_system_instruction());
+        assert!(settlement.system_instruction().is_none());
+        assert!(
+            settlement
+                .render_for_prompt()
+                .expect("settlement facts")
+                .contains("completion_settlement.v2")
+        );
         let wire = serde_json::to_value(&policy).unwrap();
         assert_eq!(wire["delivery_class"], "required_context");
         let recovered: RuntimeVolatileInjection = serde_json::from_value(wire).unwrap();
         assert_eq!(recovered, policy);
+    }
+
+    #[test]
+    fn deferred_provider_projection_is_sorted_and_name_bounded() {
+        let provider_schemas = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "zeta_provider",
+                    "description": "z",
+                    "parameters": {"type": "object"}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "alpha_provider",
+                    "description": "a",
+                    "parameters": {"type": "object"}
+                }
+            }),
+        ];
+        let names = HashSet::from(["alpha_provider".to_string()]);
+        let selected = deferred_provider_schemas_for_names(&provider_schemas, &names);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(crate::tool::schema::tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec!["alpha_provider"]
+        );
     }
 
     #[test]
@@ -365,9 +447,35 @@ mod tests {
             !env_static.contains("- Git branch:"),
             "environment_static must not contain git branch (would break cache)"
         );
+        assert!(
+            !env_static.contains("- CWD:"),
+            "environment_static must not duplicate the typed CWD"
+        );
         // environment_volatile may be empty outside a git repo but must
         // be present as a typed field so downstream can always read it.
         assert!(v.get("environment_volatile").is_some());
+    }
+
+    #[test]
+    fn base_profile_reuses_the_supplied_workspace_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"snapshot\"\n").unwrap();
+        let observed = crate::edge_prompt_context::detect_workspace_context(directory.path());
+        std::fs::remove_file(manifest).unwrap();
+
+        let profile = build_base_edge_profile_value(
+            directory.path().to_string_lossy().as_ref(),
+            None,
+            observed.clone(),
+        );
+        assert_eq!(profile["workspace"], observed);
+        assert!(
+            profile["environment_static"]
+                .as_str()
+                .is_some_and(|text| text.contains("Cargo.toml (rust)")),
+            "environment rendering must consume the supplied observation instead of rescanning cwd: {profile}"
+        );
     }
 
     #[test]

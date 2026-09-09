@@ -296,16 +296,16 @@ impl ToolExecutionService {
     }
 
     pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
+        let disabled_tool_offers = self.disabled_tool_offers.try_read().ok();
+        let provider_allowed_tools = self.provider_allowed_tools.try_read().ok();
         ToolAdmissionContext {
             provider_capabilities: self.provider_capabilities.as_ref().clone(),
-            disabled_tool_offers: self
-                .disabled_tool_offers
-                .try_read()
+            policy_snapshot_available: disabled_tool_offers.is_some()
+                && provider_allowed_tools.is_some(),
+            disabled_tool_offers: disabled_tool_offers
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
-            provider_allowed_tools: self
-                .provider_allowed_tools
-                .try_read()
+            provider_allowed_tools: provider_allowed_tools
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
             ..ToolAdmissionContext::default()
@@ -1337,6 +1337,8 @@ mod tests {
                     offer_id: "read_file@provider-a".to_string(),
                     provider_id: "provider-a".to_string(),
                     route: ToolExecutionRouteKind::ServerLocal,
+                    schema_digest: None,
+                    native_tool_id: None,
                 },
             ),
             policy: Default::default(),

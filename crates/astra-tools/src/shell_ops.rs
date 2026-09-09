@@ -11,13 +11,12 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use uuid::Uuid;
 
 use astra_core::work_unit::{
     WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
 };
-use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace};
+use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace_from};
 
 use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{
@@ -728,6 +727,15 @@ pub fn validate_execute_bash_command_in_workspace(
     command: &str,
     workspace_root: &Path,
 ) -> Result<(), String> {
+    validate_execute_bash_command_in_workspace_from(command, workspace_root, workspace_root)
+}
+
+/// Validate a Bash command with separate authority and relative-path roots.
+pub fn validate_execute_bash_command_in_workspace_from(
+    command: &str,
+    workspace_root: &Path,
+    execution_dir: &Path,
+) -> Result<(), String> {
     let cmd = command.trim();
     if cmd.is_empty() {
         return Err("Error: empty bash command".into());
@@ -773,7 +781,7 @@ pub fn validate_execute_bash_command_in_workspace(
         return Err("Error: socat/telnet networking in bash is blocked".into());
     }
 
-    for risk in analyze_command_risks_in_workspace(command, workspace_root) {
+    for risk in analyze_command_risks_in_workspace_from(command, workspace_root, execution_dir) {
         match &risk {
             // Allowed here only — still constrained by local rules + permission layer.
             CommandRisk::PathTraversal | CommandRisk::NetworkAccess => {}
@@ -799,6 +807,264 @@ pub fn validate_execute_bash_command_in_workspace(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedBashWorkdir {
+    path: PathBuf,
+    #[cfg(unix)]
+    workspace_directory: std::sync::Arc<std::fs::File>,
+    #[cfg(unix)]
+    directory: std::sync::Arc<std::fs::File>,
+    identity: String,
+}
+
+impl PreparedBashWorkdir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Return a host-side path that dereferences through the pinned directory
+    /// handle. Policy analysis and inferred source capture must use this path,
+    /// so they inspect the same directory inode that the child will enter.
+    pub fn inspection_path(&self) -> Result<PathBuf, String> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let fd = self.directory.as_raw_fd();
+            for base in ["/proc/self/fd", "/dev/fd"] {
+                let path = PathBuf::from(base).join(fd.to_string());
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+            Err("Error: this platform cannot expose the pinned bash workdir for policy inspection; no command was run".to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(self.path.clone())
+        }
+    }
+
+    /// Pin this prepared identity into the shared process-isolation executor.
+    pub fn install_on_isolation_config(&self, config: &mut astra_sandbox::IsolationConfig) {
+        config.working_dir = self.path.clone();
+        #[cfg(unix)]
+        {
+            config.pinned_workspace_root = Some(self.workspace_directory.clone());
+            config.pinned_working_dir = Some(self.directory.clone());
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let directory = self
+            .directory
+            .try_clone()
+            .map_err(|error| format!("Error: cannot clone bash workdir handle: {error}"))?;
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                if libc::fchdir(directory.as_raw_fd()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+        command.current_dir(&self.path);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_beneath(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut current = root.try_clone()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            if component == std::path::Component::CurDir {
+                continue;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workdir path is not relative and normalized",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workdir component contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+/// Resolve one Bash invocation's execution directory without changing the
+/// workspace authority boundary. The directory must already exist and its
+/// canonical path must remain beneath the canonical workspace root, which
+/// rejects traversal and symlink escapes before a process is spawned.
+pub fn resolve_bash_workdir(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedBashWorkdir, String> {
+    let requested = args
+        .get("workdir")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                "Error: bash `workdir` must be a string; no command was run".to_string()
+            })
+        })
+        .transpose()?
+        .unwrap_or(".");
+    if requested.trim().is_empty() {
+        return Err("Error: bash `workdir` must not be empty; no command was run".to_string());
+    }
+
+    let canonical_root = workspace_root.canonicalize().map_err(|error| {
+        format!(
+            "Error: cannot resolve workspace root for bash `workdir`: {error}; no command was run"
+        )
+    })?;
+    let candidate = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        canonical_root.join(requested)
+    };
+    let resolved = candidate.canonicalize().map_err(|error| {
+        format!("Error: cannot resolve bash `workdir` `{requested}`: {error}; no command was run")
+    })?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "Error: bash `workdir` `{requested}` is not a directory; no command was run"
+        ));
+    }
+    if !resolved.starts_with(&canonical_root) {
+        return Err(format!(
+            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+            workspace_root.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let filesystem_root = std::fs::File::open("/").map_err(|error| {
+            format!(
+                "Error: cannot open filesystem root while pinning bash `workdir`: {error}; no command was run"
+            )
+        })?;
+        let root_relative = canonical_root.strip_prefix("/").map_err(|_| {
+            "Error: canonical workspace root is not absolute; no command was run".to_string()
+        })?;
+        let root_directory =
+            open_directory_beneath(&filesystem_root, root_relative).map_err(|error| {
+                format!(
+                    "Error: cannot pin workspace root for bash `workdir`: {error}; no command was run"
+                )
+            })?;
+        let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+            format!(
+                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+                workspace_root.display()
+            )
+        })?;
+        let directory = open_directory_beneath(&root_directory, relative).map_err(|error| {
+            format!(
+                "Error: cannot pin bash `workdir` `{requested}` beneath workspace root: {error}; no command was run"
+            )
+        })?;
+        let metadata = directory.metadata().map_err(|error| {
+            format!(
+                "Error: cannot identify bash `workdir` `{requested}`: {error}; no command was run"
+            )
+        })?;
+        Ok(PreparedBashWorkdir {
+            identity: format!(
+                "{}:{}:{}",
+                resolved.display(),
+                metadata.dev(),
+                metadata.ino()
+            ),
+            path: resolved,
+            workspace_directory: std::sync::Arc::new(root_directory),
+            directory: std::sync::Arc::new(directory),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        if resolved != canonical_root {
+            return Err(
+                "Error: call-scoped subdirectory workdir requires pinned-directory support on this platform; no command was run"
+                    .to_string(),
+            );
+        }
+        Ok(PreparedBashWorkdir {
+            identity: resolved.to_string_lossy().into_owned(),
+            path: resolved,
+        })
+    }
+}
+
+/// Attach the canonical model-visible execution-directory evidence shared by
+/// local and server Bash executors.
+pub fn attach_bash_workdir_evidence(
+    result: &mut ToolResult,
+    workspace_root: &Path,
+    workdir: &PreparedBashWorkdir,
+    args: &Value,
+) {
+    let requested = args.get("workdir").and_then(Value::as_str).unwrap_or(".");
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let effective_path = workdir
+        .inspection_path()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| workdir.path().to_path_buf());
+    let relative = effective_path
+        .strip_prefix(&canonical_root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| ".".to_string());
+    result
+        .metadata
+        .get_or_insert_with(serde_json::Map::new)
+        .insert(
+            "bash_workdir".to_string(),
+            serde_json::json!({
+                "requested": requested,
+                "resolved_workspace_relative": relative,
+            }),
+        );
 }
 
 /// Returns `true` if an `rm -rf` / `rm -fr` command targets a catastrophic path
@@ -878,6 +1144,19 @@ pub async fn execute_bash_with_environment(
                 .to_string(),
         );
     }
+    let workdir = match resolve_bash_workdir(&ctx.workspace_root, args) {
+        Ok(workdir) => workdir,
+        Err(error) => return ToolResult::error(error),
+    };
+    execute_bash_with_environment_at_workdir(ctx, args, environment, &workdir).await
+}
+
+pub(crate) async fn execute_bash_with_environment_at_workdir(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    environment: &[(String, String)],
+    workdir: &PreparedBashWorkdir,
+) -> ToolResult {
     let explicit_verification =
         crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
     let needs_observation = args
@@ -952,7 +1231,8 @@ pub async fn execute_bash_with_environment(
         return crate::cancelled_tool_result("bash", false);
     }
 
-    let mut result = execute_bash_inner(ctx, args, environment).await;
+    let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
+    attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
     let scope_settled = result
         .metadata
         .as_ref()
@@ -1177,8 +1457,13 @@ async fn execute_bash_inner(
     ctx: &crate::ToolContext,
     args: &Value,
     environment: &[(String, String)],
+    workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
+    let inspection_dir = match workdir.inspection_path() {
+        Ok(path) => path,
+        Err(reason) => return ToolResult::error(reason),
+    };
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c,
         _ => {
@@ -1203,7 +1488,9 @@ async fn execute_bash_inner(
     let detachable_requested = ctx.detach_shell_handle.is_some()
         && crate::workspace_observation::bash_command_is_detachable_safe(command);
 
-    if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
+    if let Err(reason) =
+        validate_execute_bash_command_in_workspace_from(command, workspace_root, &inspection_dir)
+    {
         return ToolResult::error(reason);
     }
 
@@ -1226,6 +1513,7 @@ async fn execute_bash_inner(
     if source_preimages.is_none() && !explicit_source_artifacts && !detachable_requested {
         source_preimages = crate::source_preimage::prepare_inferred(
             workspace_root,
+            &inspection_dir,
             command,
             &format!("{}:{}", ctx.user_id, ctx.session_id),
         )
@@ -1269,7 +1557,12 @@ async fn execute_bash_inner(
         foreground_owner = Some(owner);
         Command::from(command)
     };
-    cmd.current_dir(workspace_root).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.current_dir(workspace_root);
+    if let Err(error) = workdir.install_on_tokio_command(&mut cmd) {
+        return ToolResult::error(error);
+    }
+    cmd.kill_on_drop(true);
     cmd.envs(environment.iter().map(|(key, value)| (key, value)));
     // Never let a caller-controlled shell startup hook execute in the tool
     // process.  Detached commands additionally receive a minimal environment
@@ -1618,6 +1911,28 @@ pub async fn execute_bash_with_filesystem_boundary(
     read_only_paths: &[PathBuf],
 ) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
+    let workdir = match resolve_bash_workdir(workspace_root, args) {
+        Ok(workdir) => workdir,
+        Err(error) => return ToolResult::error(error),
+    };
+    execute_bash_with_filesystem_boundary_at_workdir(ctx, args, read_only_paths, &workdir).await
+}
+
+pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    read_only_paths: &[PathBuf],
+    workdir: &PreparedBashWorkdir,
+) -> ToolResult {
+    let workspace_root = ctx.workspace_root.as_path();
+    let inspection_dir = match workdir.inspection_path() {
+        Ok(path) => path,
+        Err(reason) => return ToolResult::error(reason),
+    };
+    let with_workdir_evidence = |mut result: ToolResult| {
+        attach_bash_workdir_evidence(&mut result, workspace_root, workdir, args);
+        result
+    };
     let command = match args.get("command").and_then(Value::as_str) {
         Some(command) if !command.trim().is_empty() => command,
         _ => {
@@ -1627,15 +1942,38 @@ pub async fn execute_bash_with_filesystem_boundary(
             );
         }
     };
-    if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
+    if let Err(reason) =
+        validate_execute_bash_command_in_workspace_from(command, workspace_root, &inspection_dir)
+    {
         return ToolResult::error(reason);
     }
 
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
+    let boundary_root = match workspace_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return ToolResult::error(format!(
+                "Error: cannot resolve managed workspace boundary: {error}; no command was run"
+            ));
+        }
+    };
+    let mut canonical_read_only_paths = Vec::with_capacity(read_only_paths.len());
+    for path in read_only_paths {
+        match path.canonicalize() {
+            Ok(path) => canonical_read_only_paths.push(path),
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
+                    path.display()
+                ));
+            }
+        }
+    }
     let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
-        workspace_root.to_path_buf(),
-        read_only_paths.to_vec(),
+        boundary_root,
+        canonical_read_only_paths,
     );
+    workdir.install_on_isolation_config(&mut config);
     config.timeout = Duration::from_secs_f64(timeout_secs);
     config.max_output_bytes = per_tool_output_limit("bash");
     let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
@@ -1643,17 +1981,19 @@ pub async fn execute_bash_with_filesystem_boundary(
     let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
     let rendered = output.combined_output();
     if !output.namespace_active {
-        return ToolResult::error(if rendered.is_empty() {
+        return with_workdir_evidence(ToolResult::error(if rendered.is_empty() {
             "Error: managed filesystem write isolation is unavailable".to_string()
         } else {
             rendered
-        });
+        }));
     }
     let exit_code = output.exit_code.unwrap_or(-1);
     if output.timed_out {
-        return ToolResult::error(rendered)
-            .with_exit_semantics(ExitSemantics::TimedOut)
-            .with_exit_code(exit_code);
+        return with_workdir_evidence(
+            ToolResult::error(rendered)
+                .with_exit_semantics(ExitSemantics::TimedOut)
+                .with_exit_code(exit_code),
+        );
     }
     let exit_semantics = classify_exit(command, exit_code);
     let result_class =
@@ -1664,19 +2004,23 @@ pub async fn execute_bash_with_filesystem_boundary(
         } else {
             ToolResult::text(rendered)
         };
-        return result
-            .with_exit_semantics(exit_semantics)
-            .with_result_class(result_class)
-            .with_exit_code(exit_code);
+        return with_workdir_evidence(
+            result
+                .with_exit_semantics(exit_semantics)
+                .with_result_class(result_class)
+                .with_exit_code(exit_code),
+        );
     }
-    ToolResult::text(if rendered.is_empty() {
-        "(command completed with no output)".to_string()
-    } else {
-        rendered
-    })
-    .with_exit_semantics(ExitSemantics::Success)
-    .with_result_class(result_class)
-    .with_exit_code(exit_code)
+    with_workdir_evidence(
+        ToolResult::text(if rendered.is_empty() {
+            "(command completed with no output)".to_string()
+        } else {
+            rendered
+        })
+        .with_exit_semantics(ExitSemantics::Success)
+        .with_result_class(result_class)
+        .with_exit_code(exit_code),
+    )
 }
 
 fn attach_scope_settled(
@@ -2974,9 +3318,14 @@ async fn load_gitignored_search_paths(
         return Ok(std::collections::HashSet::new());
     }
 
-    let mut cmd = Command::new("git");
-    cmd.current_dir(workspace_root)
-        .kill_on_drop(true)
+    // A parent checkout is not part of the selected workspace's search
+    // contract. Only an exact root-local repository may contribute VCS ignore
+    // rules; this structural preflight also supports linked worktrees.
+    let Ok(exact_command) = crate::git_gix::exact_git_command(workspace_root) else {
+        return Ok(std::collections::HashSet::new());
+    };
+    let mut cmd = exact_command.into_tokio();
+    cmd.kill_on_drop(true)
         .arg("check-ignore")
         .arg("--stdin")
         .stdin(Stdio::piped())
@@ -3003,7 +3352,6 @@ async fn load_gitignored_search_paths(
         .map_err(|e| format!("Error: git check-ignore failed: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = exit_code_from_status(&output.status);
     if exit_code == 0 {
         return Ok(stdout.lines().map(strip_current_dir_prefix).collect());
@@ -3011,18 +3359,8 @@ async fn load_gitignored_search_paths(
     if exit_code == 1 {
         return Ok(std::collections::HashSet::new());
     }
-    if exit_code == 128
-        || stderr.contains("not a git repository")
-        || stderr.contains("outside repository")
-    {
-        debug!(
-            "git check-ignore returned {exit_code}, assuming no ignore rules: {}",
-            stderr.lines().next().unwrap_or("")
-        );
-        return Ok(std::collections::HashSet::new());
-    }
-
-    let detail = stderr.trim();
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
     Err(if detail.is_empty() {
         "Error: git check-ignore failed: unknown git error".into()
     } else {
@@ -3059,6 +3397,7 @@ async fn run_grep_with_rg_program(
     cmd.current_dir(request.workspace_root)
         .kill_on_drop(true)
         .arg("--hidden")
+        .arg("--no-ignore-vcs")
         .arg("--color")
         .arg("never")
         .arg("--max-columns")
@@ -3541,7 +3880,8 @@ async fn run_glob_with_rg_program(
     cmd.current_dir(workspace_root)
         .kill_on_drop(true)
         .arg("--files")
-        .arg("--hidden");
+        .arg("--hidden")
+        .arg("--no-ignore-vcs");
     append_default_rg_excludes(&mut cmd);
     cmd.arg("-g").arg(pattern).arg(shell_target);
 
@@ -5556,6 +5896,37 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn search_does_not_inherit_parent_repository_ignore_authority() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("nested-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        assert!(
+            StdCommand::new("git")
+                .current_dir(parent.path())
+                .arg("init")
+                .arg("-q")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(parent.path().join(".gitignore"), "nested-workspace/\n").unwrap();
+        std::fs::write(workspace.join("visible.txt"), "needle\n").unwrap();
+        let ctx = crate::ToolContext::test(&workspace);
+
+        let grep_result = grep(
+            &ctx,
+            &serde_json::json!({"pattern": "needle", "output_mode": "files_with_matches"}),
+        )
+        .await;
+        assert!(!grep_result.is_error, "{}", grep_result.output);
+        assert_eq!(grep_result.output.trim(), "visible.txt");
+
+        let glob_result = glob(&ctx, &serde_json::json!({"pattern": "*.txt"})).await;
+        assert!(!glob_result.is_error, "{}", glob_result.output);
+        assert!(glob_result.output.lines().any(|line| line == "visible.txt"));
+    }
+
+    #[tokio::test]
     async fn glob_skips_default_generated_directories() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -6643,6 +7014,38 @@ printf 'probe.txt:1:needle\n'
             Some("success")
         );
         assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(141));
+    }
+
+    #[tokio::test]
+    async fn bash_curl_write_error_to_head_is_not_tool_error_with_pipefail() {
+        let dir = tempdir().unwrap();
+        // curl reports a downstream EPIPE as exit 23. A payload larger than
+        // the one-byte bounded consumer makes that boundary deterministic
+        // without depending on an external network endpoint.
+        std::fs::write(dir.path().join("payload.bin"), vec![b'x'; 1024 * 1024]).unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let command = format!(
+            "curl -s file://{} | head -c 1",
+            dir.path().join("payload.bin").display()
+        );
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+
+        assert!(
+            !result.is_error,
+            "bounded curl output is a normal truncation outcome: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
+        );
+        let metadata = result.metadata.as_ref().expect("structured metadata");
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(23));
     }
 
     #[tokio::test]
@@ -8210,5 +8613,178 @@ printf 'probe.txt:1:needle\n'
         super::sigkill_process_group(&mut child).await;
         let status = child.wait().await.expect("wait after sigkill");
         assert!(!status.success(), "process should have been killed");
+    }
+}
+#[cfg(test)]
+mod workdir_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn bash_workdir_is_call_scoped_and_confined_to_workspace() {
+        let workspace = tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert_eq!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({}))
+                .unwrap()
+                .path(),
+            workspace.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "nested"}))
+                .unwrap()
+                .path(),
+            nested.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_bash_workdir(
+                workspace.path(),
+                &serde_json::json!({"workdir": nested.display().to_string()})
+            )
+            .unwrap()
+            .path(),
+            nested.canonicalize().unwrap()
+        );
+        std::fs::write(workspace.path().join("file"), b"not a directory").unwrap();
+        assert!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "missing"}))
+                .is_err()
+        );
+        assert!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "file"}))
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": ".."}))
+                .unwrap_err()
+                .contains("SANDBOX_DENIED")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_workdir_rejects_symlink_escape() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
+
+        assert!(
+            resolve_bash_workdir(workspace.path(), &serde_json::json!({"workdir": "escape"}))
+                .unwrap_err()
+                .contains("SANDBOX_DENIED")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_walk_rejects_retargeted_ancestor_symlink() {
+        let workspace = tempdir().unwrap();
+        let original_parent = workspace.path().join("a");
+        let retained_parent = workspace.path().join("retained");
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(original_parent.join("b")).unwrap();
+        std::fs::create_dir(outside.path().join("b")).unwrap();
+        let root = std::fs::File::open(workspace.path()).unwrap();
+
+        std::fs::rename(&original_parent, &retained_parent).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &original_parent).unwrap();
+
+        assert!(open_directory_beneath(&root, Path::new("a/b")).is_err());
+    }
+
+    #[tokio::test]
+    async fn bash_workdir_changes_execution_directory_and_reports_evidence() {
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("nested")).unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "pwd", "workdir": "nested"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["bash_workdir"],
+            serde_json::json!({
+                "requested": "nested",
+                "resolved_workspace_relative": "nested"
+            })
+        );
+        assert_eq!(
+            result.output.trim(),
+            workspace
+                .path()
+                .join("nested")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+
+        let next = execute_bash(&ctx, &serde_json::json!({"command": "pwd"})).await;
+        assert!(!next.is_error, "{next:?}");
+        assert_eq!(
+            next.output.trim(),
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string(),
+            "omitting workdir on the next call must restart at workspace root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_workdir_parent_target_is_resolved_from_pinned_directory() {
+        let workspace = tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("nested")).unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "touch ../sibling.txt", "workdir": "nested"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(workspace.path().join("sibling.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_bash_workdir_handle_survives_path_retarget() {
+        let workspace = tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        let retained = workspace.path().join("retained");
+        let outside = tempdir().unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        let args = serde_json::json!({
+            "command": "printf pinned > marker; pwd",
+            "workdir": "nested"
+        });
+        let prepared = resolve_bash_workdir(workspace.path(), &args).unwrap();
+        std::fs::rename(&nested, &retained).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &nested).unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+
+        let result = execute_bash_with_environment_at_workdir(&ctx, &args, &[], &prepared).await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            result.output.trim(),
+            retained.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained.join("marker")).unwrap(),
+            "pinned"
+        );
+        assert!(!outside.path().join("marker").exists());
     }
 }

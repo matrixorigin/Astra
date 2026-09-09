@@ -121,11 +121,17 @@ impl OneShotSessionRouting {
     /// tool-surface state on the same causal path.
     pub(crate) fn continuation_turn_inputs(
         &mut self,
-    ) -> Result<(Option<Vec<serde_json::Value>>, Vec<String>), String> {
+    ) -> Result<
+        (
+            Option<Vec<serde_json::Value>>,
+            Vec<astra_turn_types::DeferredToolActivation>,
+        ),
+        String,
+    > {
         Ok(match self.take_continuation()? {
             Some(continuation) => (
                 Some(continuation.messages),
-                continuation.activated_deferred_tool_names,
+                continuation.deferred_tool_activations,
             ),
             None => (None, Vec::new()),
         })
@@ -242,7 +248,6 @@ async fn load_one_shot_resume_metadata(
                     local.model = remote.model.clone();
                     local.permission_mode = remote.permission_mode.clone();
                     local.conversation_messages = remote.conversation_messages;
-                    local.activated_deferred_tool_names = remote.activated_deferred_tool_names;
                     local.resume_bundle = remote.resume_bundle;
                 }
             }
@@ -409,7 +414,7 @@ mod tests {
             budget_remaining_rounds: 0,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -436,7 +441,7 @@ mod tests {
         session_id: &str,
         sequence: u64,
         messages: Vec<serde_json::Value>,
-        activated_deferred_tool_names: Vec<String>,
+        deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     ) -> astra_turn_types::ResumeBundleV1 {
         let cursor = astra_turn_types::SessionCursorV1 {
             schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
@@ -454,7 +459,7 @@ mod tests {
         let activation = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
             cursor.clone(),
             astra_turn_types::ResumeActivationProjectionV1 {
-                deferred_tool_names: activated_deferred_tool_names,
+                deferred_tool_activations,
             },
         );
         astra_turn_types::select_resume_bundle(
@@ -611,10 +616,7 @@ mod tests {
                 }),
                 serde_json::json!({"role": "assistant", "content": "done"}),
             ],
-            &astra_turn_core::conversation_log::SessionStateCompact {
-                activated_deferred_tool_names: vec!["github".to_string()],
-                ..Default::default()
-            },
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
         )
         .unwrap();
         let routing = OneShotSessionRouting {
@@ -706,11 +708,7 @@ mod tests {
                 .all(|message| message["content"] != "stale local answer"),
             "an older CSL history must not be paired with a newer restored turn clock"
         );
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "a newer restored projection must reconstruct activation from its own durable tool-search evidence"
-        );
+        assert!(continuation.deferred_tool_activations.is_empty());
     }
 
     #[test]
@@ -979,7 +977,11 @@ mod tests {
                     &session_id,
                     4,
                     remote_messages,
-                    vec!["github".to_string()],
+                    vec![astra_turn_types::DeferredToolActivation {
+                        name: "github".to_string(),
+                        schema_digest: "sha256:remote".to_string(),
+                        descriptor: None,
+                    }],
                 )),
                 restored_from_cloud: true,
                 ..Default::default()
@@ -1168,7 +1170,11 @@ mod tests {
                     &session_id,
                     5,
                     cloud_messages,
-                    vec!["github".to_string()],
+                    vec![astra_turn_types::DeferredToolActivation {
+                        name: "github".to_string(),
+                        schema_digest: "sha256:cloud".to_string(),
+                        descriptor: None,
+                    }],
                 )),
                 restored_from_cloud: true,
                 ..Default::default()
@@ -1193,11 +1199,7 @@ mod tests {
             .continuation()
             .expect("causal selection")
             .expect("cloud resume messages should feed one-shot continuation");
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "cloud checkpoint sidecars must survive even when compaction removed tool-search evidence"
-        );
+        assert_eq!(continuation.deferred_tool_activations.len(), 1);
         assert_eq!(continuation.messages.len(), 2);
         assert_eq!(continuation.messages[0]["content"], "cloud question");
         assert_eq!(continuation.messages[1]["content"], "cloud answer");

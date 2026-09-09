@@ -28,9 +28,9 @@ use astra_runtime::{
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_input_budget,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS,
         EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        read_git_branch_abbrev,
+        deferred_provider_schemas_for_names, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
@@ -62,11 +62,14 @@ use crate::{
 
 use crate::cli::chat_stream::edge_executor::edge_executor_instance_id;
 
-/// Session-control tools injected unconditionally to prevent schema thrashing.
-/// Their combined cost is < 200 tokens but toggling them on/off breaks prompt
-/// caching at every plan-mode transition or tool surface variance.
-const CACHE_STABLE_SESSION_TOOLS: &[&str] =
-    &["enter_plan_mode", "exit_plan_mode", "compress_context"];
+/// Plan-mode escape hatches must remain callable while that policy overlay is
+/// active. Outside plan mode they remain deferred behind `tool_search`: making
+/// rare control transitions part of every coding request turns a workflow
+/// convenience into a fixed provider cost and expands the cacheable prefix.
+///
+/// Context compression is deliberately not included. It is pressure-triggered
+/// recovery, not an operation required to leave an active policy state.
+const PLAN_MODE_ESCAPE_HATCHES: &[&str] = &["exit_plan_mode"];
 const FIRST_CLASS_BROWSER_TOOLS: &[&str] = &["web_fetch", "web_search"];
 
 fn inject_first_class_browser_tools(
@@ -909,6 +912,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 &mut report,
                 ctx.tool_results,
                 ctx.all_schemas,
+                &*ctx.valid_tool_names,
             );
         }
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
@@ -919,7 +923,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // Force-inject any skill allowed_tools that the assembled surface missed.
     let mut turn_schemas = turn_schemas;
     let mut surface_report = surface_report;
-    let mut activated_deferred_tool_names = Vec::new();
     if typed_tool_surface_allowed {
         if let Some(ref allowed) = ctx.skill_allowed_tools {
             astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
@@ -929,32 +932,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 ctx.all_schemas,
             );
         }
-        if !ctx.plan_mode_active {
-            if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
-                let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
-                astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                    &mut turn_schemas,
-                    &mut surface_report,
-                    &required_refs,
-                    ctx.all_schemas,
-                );
-            }
-            // Materialize deferred tools selected in retained conversation
-            // context. A successful call cannot revoke a schema that later turns
-            // may still need; only reset or a real surface change may remove it.
-            let activated = ctx
-                .executor
-                .activated_deferred_tool_names_for_schema_injection();
-            if !activated.is_empty() {
-                let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-                astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                    &mut turn_schemas,
-                    &mut surface_report,
-                    &refs,
-                    ctx.all_schemas,
-                );
-                activated_deferred_tool_names = activated;
-            }
+        if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
+            let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                &mut turn_schemas,
+                &mut surface_report,
+                &required_refs,
+                ctx.all_schemas,
+            );
         }
     }
     let had_tools_before_runtime_filter = runtime_filter_turn_schemas_and_report(
@@ -987,18 +972,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         inject_tools,
         "chat turn tool surface decision"
     );
-    if inject_tools {
-        inject_first_class_browser_tools(&mut turn_schemas, &mut surface_report, ctx.all_schemas);
-        // Keep session-control tools stable once a turn needs tools. An
-        // explicit empty tool surface stays tool-free unless pending
-        // activation, prior context, or structural selection pressure requires
-        // a recovery-capable tool surface.
+    // A plan-mode turn must be able to leave its active policy overlay without
+    // an additional discovery round trip. Keep this independent from the
+    // general tool-surface injection decision: the exit invariant is a policy
+    // requirement, not an incidental consequence of prior tool context.
+    // Ordinary turns keep these rare transitions deferred behind `tool_search`.
+    if ctx.plan_mode_active {
         astra_turn_core::tool_schema_prune::inject_required_tool_names(
             &mut turn_schemas,
             &mut surface_report,
-            CACHE_STABLE_SESSION_TOOLS,
+            PLAN_MODE_ESCAPE_HATCHES,
             ctx.all_schemas,
         );
+    }
+    if inject_tools {
+        inject_first_class_browser_tools(&mut turn_schemas, &mut surface_report, ctx.all_schemas);
         let has_tool_search = turn_schemas
             .iter()
             .filter_map(tool_schema_name)
@@ -1026,6 +1014,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         &mut turn_schemas,
         &mut surface_report,
     );
+
+    // `invoke_tool` is a runtime protocol, not an executor capability, so it
+    // is deliberately appended after capability filtering.  Its logical
+    // target is re-admitted by the shared carrier resolver before policy and
+    // execution.  Keeping this one small schema stable replaces the old
+    // selected-full-schema injection that churned `tools[]` across rounds.
+    if inject_tools {
+        turn_schemas.push(
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
+        );
+    }
 
     // Plan mode is enforced at permission/tool preflight time, not by
     // mutating `restricted_tools` here. Keeping schema filtering out of
@@ -1099,6 +1098,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     {
         omitted_deferred_tool_names = manifest.omitted_names.clone();
         activatable_tool_names = manifest.names.iter().cloned().collect();
+        // Keep the full contract in the edge→server control-plane lane for
+        // provider-owned deferred tools. The model only receives the compact
+        // manifest and the stable carrier schema; these full values are used
+        // later for typed admission/digest resolution and never enter
+        // `tools[]`.
+        let deferred_provider_names: HashSet<&str> =
+            manifest.names.iter().map(String::as_str).collect();
+        let deferred_provider_schemas = deferred_provider_schemas_for_names(
+            &eligible_provider_schemas,
+            &deferred_provider_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
         merge_edge_profile_extensions(
             &mut payload,
             &json!({
@@ -1106,6 +1119,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: manifest.context_window,
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: manifest.names,
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: manifest.omitted_names,
+                EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS: deferred_provider_schemas,
             }),
         );
     }
@@ -1138,22 +1152,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // remains immutable after round zero. Step telemetry is round-level and
     // must use this round's actual final surface.
     let current_surface_report = final_surface_report.clone();
-    let final_visible_tool_names_for_trace = final_visible_tool_names.clone();
     *ctx.valid_tool_names = final_visible_tool_names;
 
     if let Some(collector) = ctx.telem.trace_collector {
-        let mut deferred_active_tools: Vec<String> = activated_deferred_tool_names
-            .into_iter()
-            .filter(|name| final_visible_tool_names_for_trace.contains(name))
-            .collect();
-        deferred_active_tools.sort();
         collector.record_tool_surface_with_deferred(
             astra_runtime::turn::turn_trace_collector::ToolSurfaceDeferredInput {
                 visible_tools: &final_surface_report.visible_tools,
                 per_tool_costs: &visible_tool_costs,
                 tools_available: final_visible_schemas.len() as u32,
                 latency_ms: surface_latency_ms,
-                deferred_active_tools: &deferred_active_tools,
+                // Selected targets are retained as typed activation evidence,
+                // not as additional provider schemas.
+                deferred_active_tools: &[],
                 deferred_available,
                 deferred_omitted_tools: &omitted_deferred_tool_names,
             },
@@ -1922,8 +1932,9 @@ mod tests {
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+        EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS,
+        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
 
     #[test]
@@ -3310,16 +3321,10 @@ mod tests {
             Some(expected_visible_schema_tokens),
             "final surface telemetry schema_budget_used must use the same full visible-tool surface as visible_count"
         );
-        // Plan-mode escape hatches must be present exactly once each.
-        assert!(edge_tool_names.contains(&"enter_plan_mode"));
+        // An active overlay needs only the exit transition; re-entering the
+        // current mode is redundant schema surface.
+        assert!(!edge_tool_names.contains(&"enter_plan_mode"));
         assert!(edge_tool_names.contains(&"exit_plan_mode"));
-        assert_eq!(
-            edge_tool_names
-                .iter()
-                .filter(|name| **name == "enter_plan_mode")
-                .count(),
-            1
-        );
         assert_eq!(
             edge_tool_names
                 .iter()
@@ -3345,7 +3350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_keeps_plan_tools_when_plan_mode_inactive() {
+    async fn prepare_chat_turn_payload_defers_plan_tools_when_plan_mode_inactive() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -3359,12 +3364,13 @@ mod tests {
         let all_schemas = vec![
             schema("read_file"),
             schema("write_file"),
+            schema("tool_search"),
             schema("enter_plan_mode"),
             schema("exit_plan_mode"),
+            schema("compress_context"),
         ];
-        // Budget of 2 would normally expose only the 2 most relevant tools.
-        // Plan-control tools are injected regardless of active mode so the
-        // schema surface stays stable across plan/default transitions.
+        // Plan-control tools are available through the deferred manifest on
+        // ordinary turns; only an active plan overlay gets escape hatches.
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
@@ -3452,15 +3458,36 @@ mod tests {
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
-        // Session-control tools are always injected for cache stability
-        // (prevents schema thrashing on plan-mode transitions).
         assert!(
-            edge_tool_names.contains(&"enter_plan_mode"),
-            "enter_plan_mode should always be injected for cache stability"
+            !edge_tool_names.contains(&"enter_plan_mode"),
+            "ordinary turns must not pay for an inactive plan-mode transition"
         );
         assert!(
-            edge_tool_names.contains(&"exit_plan_mode"),
-            "exit_plan_mode should always be injected for cache stability"
+            !edge_tool_names.contains(&"exit_plan_mode"),
+            "ordinary turns must not pay for an inactive plan-mode transition"
+        );
+        assert!(
+            !edge_tool_names.contains(&"compress_context"),
+            "ordinary turns must not pay for pressure-only context recovery"
+        );
+        let deferred_tool_names: HashSet<String> = payload["edge_profile"]
+            [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+            .as_array()
+            .expect("tool-bearing turns must advertise deferred recovery tools")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+        for name in ["enter_plan_mode", "exit_plan_mode", "compress_context"] {
+            assert!(
+                deferred_tool_names.contains(name),
+                "ordinary-turn recovery tool {name} must remain discoverable"
+            );
+        }
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS],
+            json!([]),
+            "the control-plane schema lane is explicit even when this fixture has no provider-owned deferred tools"
         );
         assert_eq!(
             first_selection_report
@@ -3607,24 +3634,21 @@ mod tests {
             Some(0),
             "surface telemetry must reflect the final no-tool surface"
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "no activation should be recorded before a select/direct-call intent"
-        );
 
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        // Use a capability classified as Deferred by the canonical ToolSpec
+        // registry. `memory` is intentionally AlwaysLoad, so using it here
+        // would test the resident-surface policy rather than activation.
+        executor.set_current_activatable_tool_names(HashSet::from(["reflect".to_string()]));
         let selected = executor
-            .execute("tool_search", &json!({"query": "select:memory"}))
+            .execute("tool_search", &json!({"query": "select:reflect"}))
             .await;
         let selected_json: Value = serde_json::from_str(&selected).unwrap_or_else(|error| {
             panic!("tool_search select should return JSON, got {error}: {selected}")
         });
-        assert_eq!(selected_json["matches"][0]["name"].as_str(), Some("memory"));
         assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
+            selected_json["matches"][0]["name"].as_str(),
+            Some("reflect")
         );
 
         let mut restricted_tools = HashSet::new();
@@ -3711,23 +3735,16 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
         assert!(
-            edge_tool_names.contains(&"memory"),
-            "pending activation must surface the selected schema independent of the otherwise empty tool surface: {edge_tool_names:?}"
+            !edge_tool_names.contains(&"reflect"),
+            "pending selection must not surface a variable deferred schema: {edge_tool_names:?}"
         );
         assert!(
-            valid_tool_names.contains("memory"),
-            "executor admission must mirror the activated schema visible in the payload"
+            edge_tool_names.contains(&"invoke_tool"),
+            "the stable carrier must remain available for the selected target: {edge_tool_names:?}"
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "payload assembly must preserve retained deferred materialization"
-        );
-        let _ = executor.execute("memory", &json!({})).await;
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "a successful call must not revoke retained schema materialization"
+        assert!(
+            !valid_tool_names.contains("reflect"),
+            "direct target admission must not be inferred from selection evidence"
         );
         executor.clear_current_tool_surface_for_tests();
 
@@ -4254,7 +4271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_injects_activated_deferred_tools_into_edge_tools() {
+    async fn prepare_chat_turn_payload_keeps_deferred_selection_off_the_wire_surface() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -4265,13 +4282,17 @@ mod tests {
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let all_schemas = vec![schema("read_file"), schema("tool_search"), schema("memory")];
+        let all_schemas = vec![
+            schema("read_file"),
+            schema("tool_search"),
+            schema("reflect"),
+        ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["reflect".to_string()]));
         let search = executor
-            .execute("tool_search", &json!({"query": "select:memory"}))
+            .execute("tool_search", &json!({"query": "select:reflect"}))
             .await;
         let search_json: Value = serde_json::from_str(&search)
             .unwrap_or_else(|error| panic!("tool_search must return JSON, got {error}: {search}"));
@@ -4281,14 +4302,10 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["name"].as_str())
             .collect();
-        assert_eq!(search_match_names, vec!["memory"]);
+        assert_eq!(search_match_names, vec!["reflect"]);
         assert!(
             search_json["matches"][0].get("parameters").is_some(),
             "tool_search select must return callable parameter shape: {search_json}"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
         );
 
         let messages = vec![json!({"role": "user", "content": "remember this"})];
@@ -4365,7 +4382,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_mode_active: false,
+            plan_mode_active: true,
             lessons_text: None,
         })
         .await;
@@ -4377,25 +4394,27 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .map(ToString::to_string)
             .collect();
-        assert!(edge_tool_names.contains("memory"), "{edge_tool_names:?}");
+        assert!(
+            !edge_tool_names.contains("reflect"),
+            "selection evidence must not reinsert the full deferred schema: {edge_tool_names:?}"
+        );
+        assert!(
+            edge_tool_names.contains("invoke_tool"),
+            "the stable carrier remains available for a selected deferred target: {edge_tool_names:?}"
+        );
         let expected_pinned_tokens: u64 = edge_tool_names
             .iter()
             .map(|name| u64::from(registry.token_cost(name)))
             .sum();
         assert_eq!(
             payload.pinned_tool_schema_tokens, expected_pinned_tokens,
-            "next-round compaction must account for the exact deferred schema materialized in this payload"
+            "next-round compaction must account only for schemas actually materialized in the payload"
         );
         assert!(
-            valid_tool_names.contains("memory"),
-            "activated deferred tool must be admitted only after it is injected"
+            !valid_tool_names.contains("reflect"),
+            "direct deferred calls remain absent; the carrier is the only callable wire tool"
         );
         assert_eq!(valid_tool_names, edge_tool_names);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "payload assembly must preserve retained deferred materialization"
-        );
     }
 
     #[tokio::test]

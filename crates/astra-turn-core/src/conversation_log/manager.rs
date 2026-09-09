@@ -551,7 +551,7 @@ impl SessionStatePatch {
             source_cursor: Some(state.source_cursor.clone()),
             blocked_tools: Some(state.blocked_tools.clone()),
             recent_tools: Some(state.recent_tools.clone()),
-            activated_deferred_tool_names: Some(state.activated_deferred_tool_names.clone()),
+            deferred_tool_activations: Some(state.deferred_tool_activations.clone()),
             approval_overrides: Some(state.approval_overrides.clone()),
             interruption: Some(state.interruption.clone()),
             budget_remaining_tokens: None,
@@ -1083,7 +1083,11 @@ mod tests {
             source_cursor: None,
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read".into()],
-            activated_deferred_tool_names: vec!["write_file".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "write_file".into(),
+                schema_digest: "sha256:write-file".into(),
+                descriptor: None,
+            }],
             approval_overrides: Some(json!({"x": 1})),
             compaction_tracker: Some(json!({"v": 2})),
             budget_remaining_tokens: 42,
@@ -1101,8 +1105,12 @@ mod tests {
         assert_eq!(patch.blocked_tools, Some(vec!["bash".into()]));
         assert_eq!(patch.recent_tools, Some(vec!["read".into()]));
         assert_eq!(
-            patch.activated_deferred_tool_names,
-            Some(vec!["write_file".into()])
+            patch.deferred_tool_activations,
+            Some(vec![astra_turn_types::DeferredToolActivation {
+                name: "write_file".into(),
+                schema_digest: "sha256:write-file".into(),
+                descriptor: None,
+            }])
         );
         assert_eq!(patch.approval_overrides, Some(Some(json!({"x": 1}))));
         assert_eq!(patch.compaction_tracker, Some(Some(json!({"v": 2}))));

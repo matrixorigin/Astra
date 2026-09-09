@@ -80,7 +80,6 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
-
     let mut group = c.benchmark_group("inject_required_tool_names");
     group.bench_function("5_required_into_2_visible", |b| {
         b.iter(|| {
@@ -135,6 +134,14 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
+    let previously_visible = std::collections::HashSet::from([
+        "read_file".to_string(),
+        "web_fetch".to_string(),
+        "github".to_string(),
+        "mo_query".to_string(),
+        "str_replace".to_string(),
+        "bash".to_string(),
+    ]);
 
     let mut group = c.benchmark_group("retain_invoked_tool_schemas");
     group.bench_function("5_results_1_visible", |b| {
@@ -146,6 +153,7 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
                 black_box(&mut r),
                 black_box(&tool_results),
                 black_box(&all_schemas),
+                black_box(&previously_visible),
             )
         })
     });

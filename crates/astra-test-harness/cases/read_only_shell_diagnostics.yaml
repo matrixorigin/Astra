@@ -34,11 +34,17 @@ criteria:
     name: bash
     min: 1
     max: 1
-  - type: text_contains
-    needle: "git version"
   - type: tools_count_between
     min: 1
     max: 1
   - type: turn_rounds_between
     min: 2
     max: 4
+  - type: judger
+    question: |
+      Did the final response faithfully report the single read-only bash result from
+      `command -v git && git --version`? Give full credit when it identifies the git
+      executable path and reports the version value without inventing a different
+      command or claiming a workspace mutation. Do not require the literal adjacent
+      substring "git version" because a faithful report may say "git ... version".
+    threshold: 0.8

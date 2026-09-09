@@ -22,8 +22,6 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: agent
   - type: journal_tool_call_count
     name: agent
     min: 1

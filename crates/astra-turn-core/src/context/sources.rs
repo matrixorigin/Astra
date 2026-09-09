@@ -31,9 +31,9 @@ use crate::working_memory::WorkingMemoryState;
 /// this trait; the [`ChannelAssembler`] collects from all registered providers
 /// and routes output according to each provider's cache scope.
 ///
-/// This eliminates the "forgotten channel" bug where a new channel is loaded
-/// but never injected — the compiler guarantees every registered provider is
-/// iterated.
+/// This makes channel collection explicit and auditable: the assembler walks
+/// the registered provider vector in registration order, and policy filtering
+/// is applied before any provider output is accepted.
 pub trait ContextChannelProvider: Send + Sync {
     /// Unique channel identifier for policy filtering and observability.
     fn channel_id(&self) -> &'static str;
@@ -114,10 +114,17 @@ impl ChannelAssembler {
                 continue;
             }
             if let Some(mut section) = provider.provide(turn_index) {
+                // Read each provider decision once for an emitted section. A
+                // provider is expected to be pure, but evaluating the
+                // decision once keeps routing and metadata assignment
+                // coherent if a future implementation derives it from
+                // mutable configuration, without doing work for `None`.
+                let scope = provider.cache_scope();
+                let token_bucket = provider.token_bucket();
                 // Provider declares scope; override section's scope + bucket
-                section.scope = provider.cache_scope();
-                section.token_bucket = provider.token_bucket();
-                match provider.cache_scope() {
+                section.scope = scope;
+                section.token_bucket = token_bucket;
+                match scope {
                     CacheScope::Global | CacheScope::Session => stable.push(section),
                     CacheScope::None => dynamic.push(section),
                 }
@@ -250,8 +257,10 @@ pub struct AgentContext {
 }
 
 /// Session-level context. Most fields are stable within a session; the
-/// deferred-tool block is intentionally turn-scoped because runtime admission
-/// can change the discoverable surface before the next model call.
+/// deferred-tool block is stable for the current admitted capability epoch.
+/// When runtime admission changes the discoverable surface, the changed bytes
+/// deliberately establish a new cache epoch rather than being treated as
+/// ordinary per-turn prose.
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub session_id: String,
@@ -271,9 +280,9 @@ pub struct SessionContext {
     pub project_context: String,
     pub edge_profile: EdgeProfile,
     pub self_model: Option<String>,
-    /// Pre-rendered `<deferred-tools>` system block. The planner emits this
-    /// field after the session cache boundary because its names follow the
-    /// current runtime admission surface. Empty when no tools are deferred.
+    /// Pre-rendered `<deferred-tools>` system block. The planner keeps this
+    /// field in Session scope for the current runtime admission epoch. Empty
+    /// when no tools are deferred.
     pub deferred_tools_block: String,
     /// Pre-rendered `<available_skills>` system block. Session-scoped.
     /// Empty when no skills are loaded.
@@ -391,7 +400,6 @@ impl StaticSections {
 
 impl StaticSections {
     /// Build a minimal StaticSections for testing.
-    /// Build a minimal StaticSections for testing.
     /// Available in tests (both unit and integration).
     pub fn test_default() -> Self {
         use crate::context_assembly_trace::PromptTraceSignals;
@@ -420,6 +428,36 @@ impl StaticSections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingProvider {
+        scope_calls: Arc<AtomicUsize>,
+        bucket_calls: Arc<AtomicUsize>,
+    }
+
+    impl ContextChannelProvider for CountingProvider {
+        fn channel_id(&self) -> &'static str {
+            "counting"
+        }
+
+        fn cache_scope(&self) -> CacheScope {
+            self.scope_calls.fetch_add(1, Ordering::Relaxed);
+            CacheScope::Session
+        }
+
+        fn token_bucket(&self) -> PromptTokenBucket {
+            self.bucket_calls.fetch_add(1, Ordering::Relaxed);
+            PromptTokenBucket::Environment
+        }
+
+        fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
+            Some(PromptSection::dynamic(
+                "counted",
+                PromptTokenBucket::Environment,
+            ))
+        }
+    }
 
     #[test]
     fn static_sections_as_vec_has_8_entries() {
@@ -456,5 +494,26 @@ mod tests {
         let e = EdgeProfile::default();
         assert!(e.cwd.is_none());
         assert!(e.git_branch.is_none());
+    }
+
+    #[test]
+    fn channel_assembler_evaluates_provider_routing_once() {
+        let provider = CountingProvider {
+            scope_calls: Arc::new(AtomicUsize::new(0)),
+            bucket_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let scope_calls = Arc::clone(&provider.scope_calls);
+        let bucket_calls = Arc::clone(&provider.bucket_calls);
+        let assembler =
+            ChannelAssembler::new(vec![Box::new(provider)], ContextChannelPolicy::default());
+
+        let (stable, dynamic) = assembler.assemble(0);
+
+        assert_eq!(stable.len(), 1);
+        assert!(dynamic.is_empty());
+        assert_eq!(scope_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(bucket_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stable[0].scope, CacheScope::Session);
+        assert_eq!(stable[0].token_bucket, PromptTokenBucket::Environment);
     }
 }

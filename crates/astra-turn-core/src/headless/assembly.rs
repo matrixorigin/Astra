@@ -3,12 +3,11 @@
 //! Shared between the CLI SSE loop and any future server-side handler that consumes the same shape.
 
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::tool::args::shape::canonicalize_tool_call_for_execution;
 use crate::tool::categories::is_file_mutation_tool;
-use crate::tool::result::semantics::tool_dedup_signature;
 
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,79 +337,138 @@ pub trait EdgeToolRoundRow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMatchConflict {
+    /// More than one callback claimed the same provider call identity.
+    DuplicateIdentity,
+    /// The callback identity was found, but that row was already consumed by
+    /// another provider slot in this batch.
+    AlreadyConsumed,
+    /// The callback identity exists, but it claims a different tool name.
+    ToolNameMismatch,
+}
+
+/// Typed result of resolving one provider call against edge callback rows.
+///
+/// `Absent` means there is no callback for this provider identity, so a
+/// server/runtime route may still be considered. `Conflict` means callback
+/// evidence exists but is contradictory; it must fail closed and must never
+/// fall through to another executor. Keeping this distinction typed prevents
+/// transport corruption from being mistaken for a missing callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMatchOutcome {
+    Exact,
+    Absent,
+    Conflict(EdgeMatchConflict),
+}
+
+impl EdgeMatchOutcome {
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+
+    #[must_use]
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    #[must_use]
+    pub const fn conflict(self) -> Option<EdgeMatchConflict> {
+        match self {
+            Self::Conflict(conflict) => Some(conflict),
+            Self::Exact | Self::Absent => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
     pub execution_status: Option<String>,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
+    /// Typed identity result. A conflict is not equivalent to an absent row:
+    /// the former must fail closed instead of being redispatched.
+    pub match_outcome: EdgeMatchOutcome,
 }
 
-fn matched_edge_tool_output<T: EdgeToolRoundRow>(row: &T) -> MatchedEdgeToolOutput {
+fn matched_edge_tool_output<T: EdgeToolRoundRow>(
+    row: &T,
+    match_outcome: EdgeMatchOutcome,
+) -> MatchedEdgeToolOutput {
     MatchedEdgeToolOutput {
         output: row.tool_output().to_string(),
         duration_ms: row.tool_duration_ms(),
         execution_status: row.tool_execution_status().map(ToString::to_string),
         tool_result_fields: row.tool_result_fields().cloned(),
+        match_outcome,
     }
 }
 
-pub fn take_edge_output_for_tool_call_id_or_signature_with_duration<T: EdgeToolRoundRow>(
+pub fn take_edge_output_for_tool_call_id_with_duration<T: EdgeToolRoundRow>(
     tool_call_id: &str,
     name: &str,
-    args: &Value,
     round: &[T],
     consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
 ) -> MatchedEdgeToolOutput {
-    if !tool_call_id.is_empty() {
-        for (i, e) in round.iter().enumerate() {
-            if consumed.get(i).copied().unwrap_or(true) {
-                continue;
-            }
-            if e.has_explicit_assistant_tool_call_id()
-                && e.assistant_tool_call_id(i) == tool_call_id
-                && e.tool_name() == name
-            {
-                consumed[i] = true;
-                return matched_edge_tool_output(e);
+    if tool_call_id.is_empty() {
+        // An id-less provider call has no stable execution identity.  Never
+        // infer custody from a name+arguments signature: another physical
+        // invocation could have the same shape.
+        return unmatched_edge_tool_output(name, EdgeMatchOutcome::Absent);
+    }
+
+    let mut explicit_index = None;
+    for (i, e) in round.iter().enumerate() {
+        if e.has_explicit_assistant_tool_call_id() && e.assistant_tool_call_id(i) == tool_call_id {
+            if explicit_index.replace(i).is_some() {
+                // One provider call id may own at most one edge result.
+                // Duplicate ids are an ambiguous transport state: do not
+                // choose an arbitrary row or grant either row terminal
+                // authority.
+                return unmatched_edge_tool_output(
+                    name,
+                    EdgeMatchOutcome::Conflict(EdgeMatchConflict::DuplicateIdentity),
+                );
             }
         }
     }
-
-    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig)
+    if let Some(i) = explicit_index {
+        let e = &round[i];
+        if consumed.get(i).copied().unwrap_or(true) {
+            return unmatched_edge_tool_output(
+                name,
+                EdgeMatchOutcome::Conflict(EdgeMatchConflict::AlreadyConsumed),
+            );
+        }
+        if e.tool_name() == name {
+            consumed[i] = true;
+            return matched_edge_tool_output(e, EdgeMatchOutcome::Exact);
+        }
+        // An explicit id with a different tool name is still an identity
+        // collision. Never fall through to a name+args match.
+        return unmatched_edge_tool_output(
+            name,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::ToolNameMismatch),
+        );
+    }
+    unmatched_edge_tool_output(name, EdgeMatchOutcome::Absent)
 }
 
-pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
+fn unmatched_edge_tool_output(
     name: &str,
-    args: &Value,
-    round: &[T],
-    consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
+    match_outcome: EdgeMatchOutcome,
 ) -> MatchedEdgeToolOutput {
-    let sig = tool_dedup_signature(name, args);
-    for (i, e) in round.iter().enumerate() {
-        if consumed.get(i).copied().unwrap_or(true) {
-            continue;
-        }
-        if tool_dedup_signature(e.tool_name(), e.tool_args()) == sig {
-            consumed[i] = true;
-            return matched_edge_tool_output(e);
-        }
-    }
     MatchedEdgeToolOutput {
-        output: by_sig.get(&sig).cloned().unwrap_or_else(|| {
-            // IMPORTANT: the prefix "Error: headless edge protocol" is
-            // load-bearing — `execute.rs::execute_tool_pure` keys on it
-            // to trigger server-side re-execution. If this tool has a
-            // ServerToolExecutor available, the error below is replaced
-            // with the real result. Only tools that truly have NO
-            // server-side executor will surface this message to the LLM.
-            no_matching_edge_execution_message(name)
-        }),
+        // The structured resolver provenance is the execution authority;
+        // this body is only the model-facing diagnostic for an unmatched
+        // callback.
+        output: no_matching_edge_execution_message(name),
         duration_ms: 0,
         execution_status: None,
         tool_result_fields: None,
+        match_outcome,
     }
 }
 
@@ -698,6 +756,7 @@ mod tests {
         tool: String,
         args: Value,
         output: String,
+        request_id: String,
         tool_result_fields: serde_json::Map<String, Value>,
     }
 
@@ -714,68 +773,52 @@ mod tests {
         fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
             Some(&self.tool_result_fields)
         }
+        fn assistant_tool_call_id(&self, _index: usize) -> String {
+            self.request_id.clone()
+        }
+        fn has_explicit_assistant_tool_call_id(&self) -> bool {
+            !self.request_id.is_empty()
+        }
     }
 
     #[test]
-    fn take_edge_output_matches_first_unconsumed_row() {
+    fn take_edge_output_matches_exact_id_and_skips_consumed_rows() {
         let rows = vec![
-            Row {
+            RowWithRequestId {
                 tool: "read_file".into(),
                 args: json!({"path": "x.rs"}),
                 output: "one".into(),
-                duration_ms: 7,
+                request_id: "call-x".into(),
             },
-            Row {
+            RowWithRequestId {
                 tool: "read_file".into(),
                 args: json!({"path": "y.rs"}),
                 output: "two".into(),
-                duration_ms: 13,
+                request_id: "call-y".into(),
             },
         ];
-        let mut consumed = vec![false; 2];
-        let by_sig: HashMap<String, String> = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let mut consumed = vec![true, false];
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "call-y",
             "read_file",
-            &json!({"path": "y.rs"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
         assert_eq!(out.output, "two");
-        assert_eq!(out.duration_ms, 13);
-        assert!(!consumed[0]);
-        assert!(consumed[1]);
-    }
-
-    #[test]
-    fn take_edge_output_falls_back_to_callback_map() {
-        let rows: Vec<Row> = vec![];
-        let mut consumed = vec![];
-        let mut by_sig = HashMap::new();
-        let sig = tool_dedup_signature("grep", &json!({"pattern": "foo"}));
-        by_sig.insert(sig, "from-map".into());
-        let out = take_edge_output_for_tool_call_with_duration(
-            "grep",
-            &json!({"pattern": "foo"}),
-            &rows,
-            &mut consumed,
-            &by_sig,
-        );
-        assert_eq!(out.output, "from-map");
         assert_eq!(out.duration_ms, 0);
+        assert!(consumed[0]);
+        assert!(consumed[1]);
     }
 
     #[test]
     fn no_edge_execution_for_file_mutation_does_not_suggest_shell_fallback() {
         let rows: Vec<Row> = vec![];
         let mut consumed = vec![];
-        let by_sig = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "write-call",
             "write_file",
-            &json!({"path": "index.html", "content": "<main></main>"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
 
         let lower = out.output.to_ascii_lowercase();
@@ -803,19 +846,18 @@ mod tests {
             tool: "mo_query".into(),
             args: json!({"sql": "UPDATE t SET v = 1"}),
             output: "OK (no results)".into(),
+            request_id: "mo-query-call".into(),
             tool_result_fields: serde_json::Map::from_iter([(
                 "pre_state_snapshot_id".to_string(),
                 Value::String("moq_snap_1".into()),
             )]),
         }];
         let mut consumed = vec![false];
-        let by_sig: HashMap<String, String> = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "mo-query-call",
             "mo_query",
-            &json!({"sql": "UPDATE t SET v = 1"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
 
         assert_eq!(out.output, "OK (no results)");
@@ -1251,11 +1293,6 @@ mod tests {
             "slots": [{"id": "review", "prompt": "review"}],
             "title": "Review"
         });
-        let server_args = json!({
-            "action": "start",
-            "target_count": 3,
-            "slots": [{"id": "review", "prompt": "review"}]
-        });
         let rows = vec![RowWithRequestId {
             tool: "agent_fanout".into(),
             args: edge_args,
@@ -1264,13 +1301,11 @@ mod tests {
         }];
         let mut consumed = vec![false];
 
-        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
             "call-fanout-1",
             "agent_fanout",
-            &server_args,
             &rows,
             &mut consumed,
-            &HashMap::new(),
         );
 
         assert_eq!(out.output, r#"{"completed":3}"#);
@@ -1278,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn take_edge_output_falls_back_to_signature_when_request_id_differs() {
+    fn take_edge_output_rejects_explicit_id_mismatch_even_when_signature_matches() {
         let args = json!({"pattern": "needle"});
         let rows = vec![RowWithRequestId {
             tool: "grep".into(),
@@ -1288,17 +1323,73 @@ mod tests {
         }];
         let mut consumed = vec![false];
 
-        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
             "call-grep-1",
             "grep",
-            &args,
             &rows,
             &mut consumed,
-            &HashMap::new(),
         );
 
-        assert_eq!(out.output, "matched by args");
-        assert!(consumed[0]);
+        assert!(out.output.starts_with("Error: headless edge protocol"));
+        assert!(!consumed[0]);
+    }
+
+    #[test]
+    fn take_edge_output_rejects_duplicate_explicit_id_even_when_name_matches() {
+        let args = json!({"pattern": "needle"});
+        let rows = vec![
+            RowWithRequestId {
+                tool: "grep".into(),
+                args: args.clone(),
+                output: "first result".into(),
+                request_id: "duplicate-call".into(),
+            },
+            RowWithRequestId {
+                tool: "grep".into(),
+                args: args.clone(),
+                output: "second result".into(),
+                request_id: "duplicate-call".into(),
+            },
+        ];
+        let mut consumed = vec![false, false];
+
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "duplicate-call",
+            "grep",
+            &rows,
+            &mut consumed,
+        );
+
+        assert!(out.output.starts_with("Error: headless edge protocol"));
+        assert_eq!(
+            out.match_outcome,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::DuplicateIdentity)
+        );
+        assert_eq!(consumed, vec![false, false]);
+    }
+
+    #[test]
+    fn take_edge_output_rejects_same_id_with_different_tool_name() {
+        let rows = vec![RowWithRequestId {
+            tool: "read_file".into(),
+            args: json!({"path": "notes.txt"}),
+            output: "contents".into(),
+            request_id: "shared-call".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "shared-call",
+            "bash",
+            &rows,
+            &mut consumed,
+        );
+
+        assert_eq!(
+            out.match_outcome,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::ToolNameMismatch)
+        );
+        assert!(!consumed[0]);
     }
 
     #[test]

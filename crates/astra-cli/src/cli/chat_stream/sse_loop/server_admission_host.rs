@@ -636,6 +636,15 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
     }
 
+    fn injects_round_guidance(&self) -> bool {
+        // This host is the CLI edge of a remote Server-owned provider
+        // boundary.  The server's canonical context pipeline computes the
+        // round guidance from the authoritative server history.  Claiming
+        // local ownership here would enqueue the same BudgetAdvisory on the
+        // edge and send a duplicate dynamic block across the boundary.
+        true
+    }
+
     fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
         self.executor.memory_recall_scope()
     }

@@ -111,6 +111,14 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
         parsed["matches"][0].get("parameters").is_some(),
         "select mode must return callable parameter shape: {parsed}"
     );
+    let properties = parsed["matches"][0]["parameters"]["properties"]
+        .as_object()
+        .expect("select mode must return callable properties");
+    assert!(
+        properties.contains_key("source_artifacts")
+            && properties.contains_key("external_state_paths"),
+        "selection must restore bash's canonical advanced contract, not its resident projection: {parsed}"
+    );
 }
 
 #[tokio::test]
@@ -137,6 +145,43 @@ async fn select_reflect_returns_normalized_observation_schema() {
         !properties.contains_key("focus"),
         "reflect select result must not expose removed focus parameter: {parsed}"
     );
+}
+
+#[tokio::test]
+async fn selecting_introspect_exposes_advanced_observation_contract() {
+    let executor = executor();
+    set_visible(&executor, &["introspect", "tool_search"]);
+
+    let parsed = run_search(&executor, json!({"query": "select:introspect"})).await;
+
+    let properties = parsed["matches"][0]["parameters"]["properties"]
+        .as_object()
+        .expect("introspect selection must include properties");
+    for field in ["artifact", "offset", "max_bytes", "source_policy", "format"] {
+        assert!(
+            properties.contains_key(field),
+            "selection must restore introspect's `{field}` contract: {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn selecting_resident_ask_user_restores_structured_question_contract() {
+    let executor = executor();
+    set_visible(&executor, &["ask_user", "tool_search"]);
+
+    let parsed = run_search(&executor, json!({"query": "select:ask_user"})).await;
+
+    let question_properties =
+        parsed["matches"][0]["parameters"]["properties"]["questions"]["items"]["properties"]
+            .as_object()
+            .expect("ask_user selection must include question properties");
+    for field in ["header", "options", "multi_select", "allow_freeform"] {
+        assert!(
+            question_properties.contains_key(field),
+            "selection must restore ask_user's `{field}` contract: {parsed}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -177,154 +222,6 @@ async fn select_pool_is_visible_union_activatable_not_full_catalog() {
     assert_eq!(match_names(&parsed), strings(&["bash", "web_fetch"]));
     assert_eq!(field_strings(&parsed, "missing"), strings(&["read_file"]));
     assert_eq!(parsed["total_tools"].as_u64(), Some(3));
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        vec!["web_fetch".to_string()],
-        "only activatable selected tools should be recorded as activated"
-    );
-}
-
-#[tokio::test]
-async fn selecting_visible_tool_does_not_record_deferred_activation() {
-    let executor = executor();
-    set_visible(&executor, &["bash", "tool_search"]);
-
-    let parsed = run_search(&executor, json!({"query": "select:bash"})).await;
-
-    assert_eq!(match_names(&parsed), strings(&["bash"]));
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        Vec::<String>::new(),
-        "visible tools are already callable; selecting them must not create deferred activation state"
-    );
-}
-
-#[tokio::test]
-async fn activated_deferred_tool_remains_callable_across_retained_context() {
-    let executor = executor();
-    set_visible(&executor, &["bash", "tool_search"]);
-    executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
-
-    let parsed = run_search(&executor, json!({"query": "select:web_fetch"})).await;
-    assert_eq!(match_names(&parsed), strings(&["web_fetch"]));
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["web_fetch"])
-    );
-
-    set_visible(&executor, &["bash", "tool_search", "web_fetch"]);
-    executor.set_current_activatable_tool_names(HashSet::new());
-
-    assert_eq!(
-        executor.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["web_fetch"]),
-        "schema assembly should surface the selected deferred tool"
-    );
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["web_fetch"]),
-        "schema assembly must preserve retained deferred materialization"
-    );
-
-    set_visible(&executor, &["bash", "tool_search", "web_fetch"]);
-    executor.set_current_activatable_tool_names(HashSet::new());
-    assert_eq!(
-        executor.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["web_fetch"]),
-        "repeated schema assembly must keep the selected tool available"
-    );
-
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["web_fetch"]),
-        "activation must remain available while conversation context retains it"
-    );
-
-    let _ = executor.execute("web_fetch", &json!({})).await;
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["web_fetch"]),
-        "a successful call must not revoke retained schema materialization"
-    );
-
-    let restored = executor.activated_deferred_tool_names();
-    let resume_root = tempfile::tempdir().expect("resume root");
-    let resumed = ToolExecutor::new(resume_root.path());
-    set_visible(&resumed, &["bash", "tool_search", "web_fetch"]);
-    resumed.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
-    resumed.restore_activated_deferred_tool_names_for_session(&restored);
-    assert_eq!(
-        resumed.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["web_fetch"]),
-        "restored conversation context must keep a selected schema callable on a later turn"
-    );
-}
-
-#[tokio::test]
-async fn multi_selected_deferred_tools_remain_available_after_each_is_called() {
-    let executor = executor();
-    set_visible(&executor, &["tool_search"]);
-    executor.set_current_activatable_tool_names(HashSet::from([
-        "web_fetch".to_string(),
-        "memory".to_string(),
-    ]));
-
-    let parsed = run_search(&executor, json!({"query": "select:web_fetch,memory"})).await;
-    assert_eq!(match_names(&parsed), strings(&["web_fetch", "memory"]));
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["memory", "web_fetch"])
-    );
-
-    set_visible(&executor, &["tool_search", "web_fetch", "memory"]);
-    executor.set_current_activatable_tool_names(HashSet::new());
-    assert_eq!(
-        executor.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["memory", "web_fetch"]),
-        "schema assembly should surface every selected deferred tool"
-    );
-
-    let _ = executor.execute("web_fetch", &json!({})).await;
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["memory", "web_fetch"]),
-        "calling one selected tool must not revoke retained selected schemas"
-    );
-    assert_eq!(
-        executor.activated_deferred_tool_names_for_schema_injection(),
-        strings(&["memory", "web_fetch"]),
-        "all selected tools must remain injectable across later turns"
-    );
-
-    let _ = executor.execute("memory", &json!({})).await;
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["memory", "web_fetch"]),
-        "repeated calls must preserve retained schema materialization"
-    );
-}
-
-#[tokio::test]
-async fn activated_deferred_tool_is_pruned_when_no_longer_visible_or_activatable() {
-    let executor = executor();
-    set_visible(&executor, &["bash", "tool_search"]);
-    executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
-
-    let parsed = run_search(&executor, json!({"query": "select:web_fetch"})).await;
-    assert_eq!(match_names(&parsed), strings(&["web_fetch"]));
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        strings(&["web_fetch"])
-    );
-
-    set_visible(&executor, &["bash", "tool_search"]);
-    executor.set_current_activatable_tool_names(HashSet::new());
-
-    assert_eq!(
-        executor.activated_deferred_tool_names(),
-        Vec::<String>::new(),
-        "activation must be scoped to the current surface and disappear when the tool is neither visible nor activatable"
-    );
 }
 
 #[tokio::test]
@@ -358,7 +255,6 @@ async fn natural_language_query_fails_without_guessing_from_the_edge_surface() {
     assert_eq!(parsed["mode"].as_str(), Some("error"));
     assert_eq!(parsed["status"].as_str(), Some("failed"));
     assert!(parsed.get("matches").is_none());
-    assert!(executor.activated_deferred_tool_names().is_empty());
 }
 
 #[tokio::test]

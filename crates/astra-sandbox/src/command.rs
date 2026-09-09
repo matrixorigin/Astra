@@ -211,6 +211,12 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
     analyze_command_risks_with_workspace(command, None)
 }
 
+#[derive(Clone, Copy)]
+struct WorkspaceResolution<'a> {
+    authority_root: &'a Path,
+    execution_dir: &'a Path,
+}
+
 /// Analyze command risks with an explicit workspace boundary.
 ///
 /// This variant improves diagnostics for known writers by resolving absolute
@@ -221,12 +227,29 @@ pub fn analyze_command_risks_in_workspace(
     command: &str,
     workspace_root: &Path,
 ) -> Vec<CommandRisk> {
-    analyze_command_risks_with_workspace(command, Some(workspace_root))
+    analyze_command_risks_in_workspace_from(command, workspace_root, workspace_root)
+}
+
+/// Analyze command risks with separate workspace authority and call-scoped
+/// execution directories. Relative targets resolve from `execution_dir`, while
+/// `workspace_root` remains the boundary that decides whether a write escapes.
+pub fn analyze_command_risks_in_workspace_from(
+    command: &str,
+    workspace_root: &Path,
+    execution_dir: &Path,
+) -> Vec<CommandRisk> {
+    analyze_command_risks_with_workspace(
+        command,
+        Some(WorkspaceResolution {
+            authority_root: workspace_root,
+            execution_dir,
+        }),
+    )
 }
 
 fn analyze_command_risks_with_workspace(
     command: &str,
-    workspace_root: Option<&Path>,
+    workspace: Option<WorkspaceResolution<'_>>,
 ) -> Vec<CommandRisk> {
     let mut risks = Vec::new();
 
@@ -259,7 +282,7 @@ fn analyze_command_risks_with_workspace(
         push_unique(&mut risks, CommandRisk::CredentialAccess(path));
     }
 
-    if let Some(target) = workspace_out_write_target(command, workspace_root) {
+    if let Some(target) = workspace_out_write_target(command, workspace) {
         push_unique(&mut risks, CommandRisk::WorkspaceOutWrite(target));
     }
 
@@ -403,12 +426,15 @@ fn normalize_shell_token(token: &str) -> &str {
     token.trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
 
-fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
-    if let Some(target) = redirected_write_target(command, workspace_root) {
+fn workspace_out_write_target(
+    command: &str,
+    workspace: Option<WorkspaceResolution<'_>>,
+) -> Option<String> {
+    if let Some(target) = redirected_write_target(command, workspace) {
         return Some(target);
     }
 
-    if let Some(target) = download_output_target(command, workspace_root) {
+    if let Some(target) = download_output_target(command, workspace) {
         return Some(target);
     }
 
@@ -447,7 +473,7 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
             return Some(option.to_string());
         }
         for target in write_targets_for_command(executable, &arguments) {
-            if is_workspace_out_path(target, workspace_root) {
+            if is_workspace_out_path(target, workspace) {
                 return Some(target.to_string());
             }
         }
@@ -1009,7 +1035,10 @@ fn rsync_short_option_takes_separate_value(option: &str) -> bool {
     false
 }
 
-fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+fn download_output_target(
+    command: &str,
+    workspace: Option<WorkspaceResolution<'_>>,
+) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
@@ -1026,7 +1055,7 @@ fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Optio
             };
             if let Some(target) = target {
                 let target = normalize_shell_token(target);
-                if is_workspace_out_path(target, workspace_root) {
+                if is_workspace_out_path(target, workspace) {
                     return Some(target.to_string());
                 }
             }
@@ -1036,7 +1065,10 @@ fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Optio
     None
 }
 
-fn redirected_write_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+fn redirected_write_target(
+    command: &str,
+    workspace: Option<WorkspaceResolution<'_>>,
+) -> Option<String> {
     let mut scan_from = 0;
     while let Some(op_index) = next_redirect_operator(command, scan_from) {
         let bytes = command.as_bytes();
@@ -1055,7 +1087,7 @@ fn redirected_write_target(command: &str, workspace_root: Option<&Path>) -> Opti
             .find(|ch: char| ch.is_whitespace() || [';', '&', '|'].contains(&ch))
             .unwrap_or(rest.len());
         let target = rest[..target_end].trim_matches(['"', '\'']);
-        if is_workspace_out_path(target, workspace_root) {
+        if is_workspace_out_path(target, workspace) {
             return Some(target.to_string());
         }
         scan_from = target_index;
@@ -1088,7 +1120,7 @@ fn next_redirect_operator(command: &str, scan_from: usize) -> Option<usize> {
     None
 }
 
-fn is_workspace_out_path(path: &str, workspace_root: Option<&Path>) -> bool {
+fn is_workspace_out_path(path: &str, workspace: Option<WorkspaceResolution<'_>>) -> bool {
     // Standard device sinks are part of the sandbox contract, not host-file
     // writes. Classifying `2>/dev/null` as an external mutation made harmless
     // read-only review commands require approval even though the execution
@@ -1103,15 +1135,15 @@ fn is_workspace_out_path(path: &str, workspace_root: Option<&Path>) -> bool {
         return true;
     }
     let candidate = Path::new(path);
-    let Some(workspace_root) = workspace_root else {
+    let Some(workspace) = workspace else {
         return path.starts_with("../") || path.starts_with("..\\") || candidate.is_absolute();
     };
 
-    let root = canonicalize_existing_or_lexical(workspace_root);
+    let root = canonicalize_existing_or_lexical(workspace.authority_root);
     let requested = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        workspace_root.join(candidate)
+        workspace.execution_dir.join(candidate)
     };
     let requested = canonicalize_existing_ancestor(&requested);
     !requested.starts_with(&root)
@@ -1122,21 +1154,24 @@ fn canonicalize_existing_or_lexical(path: &Path) -> PathBuf {
 }
 
 fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
-    let normalized = lexical_normalize(path);
-    let mut ancestor = normalized.as_path();
+    // Walk the original path before lexical normalization. Magic-link paths
+    // such as `/proc/self/fd/N/..` must be resolved by the filesystem: folding
+    // `..` first would incorrectly turn that into `/proc/self/fd` and detach
+    // policy analysis from the pinned execution directory.
+    let mut ancestor = path;
     while !ancestor.exists() {
         let Some(parent) = ancestor.parent() else {
-            return normalized;
+            return lexical_normalize(path);
         };
         ancestor = parent;
     }
     let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) else {
-        return normalized;
+        return lexical_normalize(path);
     };
-    let Ok(suffix) = normalized.strip_prefix(ancestor) else {
-        return normalized;
+    let Ok(suffix) = path.strip_prefix(ancestor) else {
+        return lexical_normalize(path);
     };
-    canonical_ancestor.join(suffix)
+    lexical_normalize(&canonical_ancestor.join(suffix))
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -1450,6 +1485,39 @@ mod tests {
                     .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
                 "{command}: {risks:?}"
             );
+        }
+    }
+
+    #[test]
+    fn workspace_write_targets_resolve_from_call_scoped_execution_dir() {
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        let inside = analyze_command_risks_in_workspace_from(
+            "touch ../sibling.txt",
+            workspace.path(),
+            &nested,
+        );
+        assert!(
+            !inside
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_)))
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), nested.join("out")).unwrap();
+            let risks = analyze_command_risks_in_workspace_from(
+                "touch out/file.txt",
+                workspace.path(),
+                &nested,
+            );
+            assert!(risks.iter().any(|risk| matches!(
+                risk,
+                CommandRisk::WorkspaceOutWrite(path) if path == "out/file.txt"
+            )));
         }
     }
 

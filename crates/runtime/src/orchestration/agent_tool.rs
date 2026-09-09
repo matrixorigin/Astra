@@ -62,6 +62,7 @@ pub(crate) const MAX_FANOUT_TARGET_COUNT: usize = 50;
 /// parent receives a bounded, UTF-8-safe explanation plus exact byte count.
 const MAX_FANOUT_SPAWN_ERROR_BYTES: usize = 4_096;
 const FANOUT_RESULT_DEFAULT_MAX_BYTES: usize = 8_192;
+const FANOUT_RESULT_MIN_BYTES: usize = 4;
 const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 /// A foreground fanout is one structured operation. It may use the full LLM
 /// call budget, but it must eventually settle even when one child transport
@@ -1483,10 +1484,15 @@ impl FanoutResultReadOptions {
             );
         }
         let requested_max = input.max_bytes.unwrap_or(FANOUT_RESULT_DEFAULT_MAX_BYTES);
+        if !(FANOUT_RESULT_MIN_BYTES..=FANOUT_RESULT_MAX_BYTES).contains(&requested_max) {
+            return Err(format!(
+                "`max_bytes` must be between {FANOUT_RESULT_MIN_BYTES} and {FANOUT_RESULT_MAX_BYTES}"
+            ));
+        }
         Ok(Self {
             slot_index: input.slot_index,
             offset: input.offset.unwrap_or(0),
-            max_bytes: requested_max.clamp(1, FANOUT_RESULT_MAX_BYTES),
+            max_bytes: requested_max,
         })
     }
 }
@@ -1661,7 +1667,14 @@ async fn render_agent_fanout_results(
     // Enforce total aggregate byte budget: if the combined results exceed
     // MAX_FANOUT_AGGREGATE_BYTES, re-truncate per-slot proportionally.
     let serialized_total: usize = results.iter().map(|v| v.to_string().len()).sum();
-    if serialized_total > MAX_FANOUT_AGGREGATE_BYTES && !results.is_empty() {
+    // Aggregate previews may divide a fixed prompt budget across slots. An
+    // explicit slot window already has exactly one pagination owner and must
+    // never be re-windowed here: doing so can reset its cursor to zero and
+    // return the same page forever.
+    if read_options.slot_index.is_none()
+        && serialized_total > MAX_FANOUT_AGGREGATE_BYTES
+        && !results.is_empty()
+    {
         let per_slot_budget = MAX_FANOUT_AGGREGATE_BYTES / results.len();
         for item in &mut results {
             if let Some(result_obj) = item.get("result") {
@@ -2405,6 +2418,16 @@ fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     index
 }
 
+fn ceil_char_boundary(s: &str, mut index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    while index < s.len() && !s.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 fn window_fanout_agent_result(
     value: &mut Value,
     group_id: &str,
@@ -2419,8 +2442,12 @@ fn window_fanout_agent_result(
         structured => serde_json::to_string(structured).ok()?,
     };
     let total_bytes = result_text.len();
-    let start = floor_char_boundary(&result_text, offset.min(total_bytes));
+    // A caller-provided offset inside a UTF-8 scalar advances to the next
+    // valid boundary. Rewinding would replay bytes and make the typed cursor
+    // non-monotonic.
+    let start = ceil_char_boundary(&result_text, offset.min(total_bytes));
     let end = floor_char_boundary(&result_text, (start + max_bytes).min(total_bytes));
+    debug_assert!(end > start || end == total_bytes);
     let truncated = start > 0 || end < total_bytes;
     if truncated || !result_was_string {
         value["result"] = json!(result_text[start..end].to_string());
@@ -4987,6 +5014,29 @@ mod tests {
         assert_eq!(value["result"], serialized[..8]);
     }
 
+    #[test]
+    fn fanout_result_windows_advance_across_multibyte_boundaries() {
+        let mut value = json!({"result": "🔥next"});
+
+        let first = window_fanout_agent_result(&mut value, "group-unicode", 0, 0, 4)
+            .expect("a minimum-sized window must contain one Unicode scalar");
+        assert_eq!(first.start, 0);
+        assert_eq!(first.end, 4);
+        assert_eq!(value["result"], "🔥");
+        assert!(
+            first
+                .next_call
+                .as_deref()
+                .is_some_and(|call| call.contains("offset=4"))
+        );
+
+        let mut value = json!({"result": "🔥next"});
+        let inside_scalar = window_fanout_agent_result(&mut value, "group-unicode", 0, 1, 4)
+            .expect("an unaligned caller offset must advance, never rewind");
+        assert_eq!(inside_scalar.start, 4);
+        assert!(inside_scalar.end > inside_scalar.start);
+    }
+
     #[tokio::test]
     async fn agent_fanout_get_results_reads_requested_slot_window() {
         let output = format!("{}{}", "A".repeat(9000), "B".repeat(9000));
@@ -5042,6 +5092,69 @@ mod tests {
             slot["result"].get("fanout").is_none(),
             "group accounting must appear once in the outer envelope, not once per slot: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_fanout_slot_pages_progress_past_aggregate_preview_budget() {
+        let output = format!("{}{}", "A".repeat(65_536), "🔥tail");
+        let spawner = test_spawner(Arc::new(FixedOutputExecutor { output }));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-explicit-pages",
+                "target_count": 1,
+                "slots": [
+                    {"id": "large", "description": "Review large", "prompt": "Return long output"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&start).unwrap()["status"],
+            "completed"
+        );
+
+        let first = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": "review-explicit-pages",
+                "slot_index": 0,
+                "offset": 0,
+                "max_bytes": 65_536
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let first_slot = &first["results"][0];
+        assert_eq!(first_slot["result_start_offset"], 0);
+        assert_eq!(first_slot["result_end_offset"], 65_536);
+        assert!(
+            first_slot["next_call"]
+                .as_str()
+                .is_some_and(|call| call.contains("offset=65536")),
+            "explicit slot pagination must advance beyond the aggregate preview budget: {first}"
+        );
+
+        let second = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": "review-explicit-pages",
+                "slot_index": 0,
+                "offset": 65_536,
+                "max_bytes": 65_536
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let second: Value = serde_json::from_str(&second).unwrap();
+        let second_slot = &second["results"][0];
+        assert_eq!(second_slot["result_start_offset"], 65_536);
+        assert!(second_slot["result_end_offset"].as_u64().unwrap() > 65_536);
+        assert_eq!(second_slot["result_truncated"], true);
+        assert!(second_slot.get("next_call").is_none());
     }
 
     #[tokio::test]

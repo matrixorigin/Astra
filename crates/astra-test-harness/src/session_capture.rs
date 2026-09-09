@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+const MAX_STRUCTURED_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
 /// A single parsed journal line. The astra journal is jsonl; each
 /// line has a `type` field (e.g. `llm_request_full`, `llm_round`,
 /// `tool_invocation`, `subagent_spawned`) plus type-specific fields.
@@ -39,6 +41,7 @@ pub struct JournalToolCall {
     pub ok: Option<bool>,
     pub arguments: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
+    pub result_artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
 }
 
 /// Loaded session with minimal summary counters the report uses.
@@ -358,107 +361,6 @@ impl SessionCapture {
         (rounds, exposed)
     }
 
-    /// Return the first root provider round that was asked to continue an
-    /// assigned WorkItem without the typed settlement operation on its exact
-    /// wire surface.
-    ///
-    /// Older journals do not persist round-level tool names; those rounds are
-    /// skipped so backward compatibility does not become a false failure.
-    /// New captures record this bounded projection specifically so the
-    /// harness can diagnose a broken lifecycle surface at its first boundary
-    /// instead of only observing the later "assigned but never settled"
-    /// consequence.
-    pub fn first_work_assignment_surface_gap(&self) -> Option<String> {
-        fn tool_result(call: &serde_json::Value) -> Option<serde_json::Value> {
-            call.get("result").cloned().or_else(|| {
-                call.get("result_full")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-            })
-        }
-
-        let mut assignment_active = false;
-        for event in &self.events {
-            if event.event_type != "llm_round"
-                || event
-                    .raw
-                    .get("producer_scope")
-                    .and_then(|scope| scope.get("agent_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
-                || event
-                    .raw
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("purpose"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some("primary_agent")
-            {
-                continue;
-            }
-
-            if assignment_active
-                && let Some(visible_tools) = event
-                    .raw
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("visible_tools"))
-                    .and_then(serde_json::Value::as_array)
-                && !visible_tools
-                    .iter()
-                    .any(|name| name.as_str() == Some("settle_work_item"))
-            {
-                let round = event
-                    .raw
-                    .get("round")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|round| round.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Some(format!(
-                    "provider round {round} had an active WorkItem assignment but its exact wire surface omitted settle_work_item"
-                ));
-            }
-
-            for call in event
-                .raw
-                .get("tool_calls")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if call.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-                    continue;
-                }
-                let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let Some(result) = tool_result(call) else {
-                    continue;
-                };
-                let status = result.get("status").and_then(serde_json::Value::as_str);
-                match name {
-                    "start_work" if status == Some("started") => {
-                        assignment_active = result
-                            .get("initial_task")
-                            .and_then(|task| task.get("status"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some("assigned");
-                    }
-                    "run_next_work_item" if status == Some("assigned") => {
-                        assignment_active = true;
-                    }
-                    "settle_work_item" if status == Some("recorded") => {
-                        assignment_active = result
-                            .get("next_task")
-                            .and_then(|task| task.get("status"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some("assigned");
-                    }
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
     /// True only when `subsystem` settled for the latest canonical turn.
     /// An older marker from a resumed long session is not completion evidence
     /// for the current run.
@@ -635,7 +537,7 @@ impl SessionCapture {
 
     /// Complete, de-duplicated tool calls persisted in turn records.
     pub fn journal_tool_calls(&self) -> Vec<JournalToolCall> {
-        if nested_tool_identity_conflict(&self.events) {
+        if self.has_integrity_errors() {
             return Vec::new();
         }
         let mut calls = Vec::new();
@@ -664,6 +566,10 @@ impl SessionCapture {
                     embedded_json(record.get("args_full").or_else(|| record.get("args")));
                 let result =
                     embedded_json(record.get("result_full").or_else(|| record.get("result")));
+                let result_artifact = record
+                    .get("result_artifact")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok());
                 if let Some(call_id) = &call_id
                     && !seen_ids.insert(nested_tool_identity(event, call_id))
                 {
@@ -675,6 +581,7 @@ impl SessionCapture {
                     ok: record.get("ok").and_then(|value| value.as_bool()),
                     arguments,
                     result,
+                    result_artifact,
                 });
             }
         }
@@ -694,6 +601,7 @@ impl SessionCapture {
                 "ok": call.ok,
                 "arguments": call.arguments,
                 "result": call.result,
+                "result_artifact": call.result_artifact,
             });
             let line = serde_json::to_string(&record).unwrap_or_default();
             if rendered.chars().count() + line.chars().count() + 1 > max_chars {
@@ -762,6 +670,96 @@ impl SessionCapture {
         }
         ids
     }
+}
+
+fn session_artifact_dir_for_path(session_id: &str, journal_path: &Path) -> Option<PathBuf> {
+    let file_name = journal_path.file_name()?.to_str()?;
+    let candidate = if file_name == "step_events.jsonl" {
+        journal_path.parent()?.to_path_buf()
+    } else if file_name == format!("{session_id}.jsonl") {
+        journal_path.parent()?.join(session_id)
+    } else {
+        return None;
+    };
+    candidate.is_dir().then_some(candidate)
+}
+
+/// Resolve persisted results against the exact artifact root that produced
+/// each journal before owner captures are merged. Only the typed journal
+/// descriptor is authority; the provider-facing display envelope is never
+/// parsed to discover a file or identity.
+fn materialize_persisted_tool_results(
+    events: &mut [JournalEvent],
+    session_dir: Option<&Path>,
+) -> u32 {
+    let mut errors = 0_u32;
+    for event in events.iter_mut() {
+        if !matches!(event.event_type.as_str(), "turn" | "llm_round") {
+            continue;
+        }
+        let event_run_id = nested_tool_run_id(event).to_string();
+        let Some(records) = event
+            .raw
+            .get_mut("tool_calls")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for record in records {
+            let Some(descriptor_value) = record.get("result_artifact") else {
+                continue;
+            };
+            let Ok(descriptor) = serde_json::from_value::<
+                astra_services::session_journal::ToolResultArtifactDescriptor,
+            >(descriptor_value.clone()) else {
+                errors = errors.saturating_add(1);
+                continue;
+            };
+            let Some(call_id) = record
+                .get("tool_call_id")
+                .or_else(|| record.get("call_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                errors = errors.saturating_add(1);
+                continue;
+            };
+            if event_run_id == "legacy-unscoped" {
+                errors = errors.saturating_add(1);
+                continue;
+            }
+            let Some(result_key) = (if record.get("result_full").is_some() {
+                Some("result_full")
+            } else if record.get("result").is_some() {
+                Some("result")
+            } else {
+                None
+            }) else {
+                errors = errors.saturating_add(1);
+                continue;
+            };
+            if descriptor.call_id != call_id || descriptor.run_id != event_run_id {
+                errors = errors.saturating_add(1);
+                continue;
+            }
+            let Some(session_dir) = session_dir else {
+                errors = errors.saturating_add(1);
+                continue;
+            };
+            match astra_turn_core::tool::result::storage::read_verified_persisted_result(
+                session_dir,
+                &descriptor,
+                MAX_STRUCTURED_TOOL_RESULT_BYTES as u64,
+            ) {
+                Ok(full) => {
+                    record[result_key] =
+                        serde_json::from_str(&full).unwrap_or(serde_json::Value::String(full));
+                }
+                Err(_) => errors = errors.saturating_add(1),
+            }
+        }
+    }
+    errors
 }
 
 /// Extract the producer-owned invocation binding from either journal family.
@@ -970,34 +968,24 @@ fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
 }
 
 fn nested_tool_identity(event: &JournalEvent, call_id: &str) -> String {
-    let run_id = event
+    format!("{}:{call_id}", nested_tool_run_id(event))
+}
+
+fn nested_tool_run_id(event: &JournalEvent) -> &str {
+    event
         .raw
         .get("producer_scope")
         .and_then(|scope| scope.get("run_id"))
         .or_else(|| event.raw.get("run_id"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("legacy-unscoped");
-    format!("{run_id}:{call_id}")
+        .unwrap_or("legacy-unscoped")
 }
 
-/// Legacy flat session directory (`~/.astra/sessions/`).
-///
-/// Newer Astra versions place artifacts below an owner-scoped `v1/` layout;
-/// use [`load_session_for_owners`] for production reads. This stays public for
-/// tests and for callers that intentionally inspect legacy fixtures.
-pub fn default_sessions_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".astra").join("sessions")
-    } else {
-        PathBuf::from(".astra").join("sessions")
-    }
-}
-
-/// Resolve current owner-scoped artifact paths, then the historic flat paths.
+/// Resolve artifacts only inside the explicitly authorized owner roots.
 ///
 /// The journal writer owns this layout decision. Reusing its public path API
-/// keeps the harness in lock-step with storage migrations instead of copying a
-/// directory convention that will eventually drift again.
+/// keeps the harness in lock-step with storage layout changes without granting
+/// an explicit-owner read access to a global fallback namespace.
 fn session_artifact_paths_for_owners(
     session_id: &str,
     owner_scopes: &[astra_services::OwnerScope],
@@ -1005,7 +993,7 @@ fn session_artifact_paths_for_owners(
     if astra_services::session_journal::validate_session_id(session_id).is_err() {
         return Vec::new();
     }
-    let mut candidates = Vec::with_capacity(owner_scopes.len().saturating_mul(2) + 2);
+    let mut candidates = Vec::with_capacity(owner_scopes.len().saturating_mul(2));
     for owner_scope in owner_scopes {
         let Ok(scoped_journal) =
             astra_services::session_journal::journal_file_path_for_owner(owner_scope, session_id)
@@ -1020,9 +1008,6 @@ fn session_artifact_paths_for_owners(
         candidates.push(scoped_journal);
         candidates.push(scoped_steps);
     }
-    let legacy_dir = default_sessions_dir();
-    candidates.push(legacy_dir.join(format!("{session_id}.jsonl")));
-    candidates.push(legacy_dir.join(session_id).join("step_events.jsonl"));
     let mut unique = Vec::with_capacity(candidates.len());
     for path in candidates {
         if !unique.contains(&path) {
@@ -1239,28 +1224,9 @@ fn valid_step_event_shape(value: &serde_json::Value) -> bool {
     true
 }
 
-/// Load a session journal by id. Merges both layouts when both
-/// exist:
-///
-/// 1. Legacy: `~/.astra/sessions/<id>.jsonl` with `type`
-///    discriminator. Carries `llm_round` (nested tool_calls),
-///    `llm_request_full`, `llm_response_full`, `turn`, etc.
-/// 2. Step-events: `~/.astra/sessions/<id>/step_events.jsonl` with
-///    `event_type` discriminator. Carries `StepCreated`,
-///    `StepStarted`, `ToolCallCompleted`, `StepEvaluated`,
-///    `StepCompleted`.
-///
-/// Both files are complementary — legacy has token and tool_call
-/// detail, step_events has per-step lifecycle. Prior to the R4 fix
-/// this function returned early on the legacy path, so any criterion
-/// asking for a step_events-only event (`ToolCallCompleted`) never
-/// matched on any real session.
-///
-/// Returns `None` only if neither file exists. Malformed lines are
-/// counted in `skipped_lines` — never an error. The returned
-/// `journal_path` points at whichever file existed (legacy
-/// preferred for backward-compatible user-facing hints); the actual
-/// events are the union.
+/// Load the canonical journal and complementary step events for the local
+/// owner. Both paths are resolved through the owner-scoped journal API; this
+/// entrypoint never scans the historic global namespace.
 pub fn load_session(session_id: &str) -> Option<SessionCapture> {
     load_session_for_owners(session_id, &[astra_services::local_owner_scope()])
 }
@@ -1326,6 +1292,9 @@ pub fn load_session_for_owners(
             .integrity_errors
             .saturating_add(additional.integrity_errors);
     }
+    capture.integrity_errors = capture
+        .integrity_errors
+        .saturating_add(u32::from(nested_tool_identity_conflict(&capture.events)));
     Some(capture)
 }
 
@@ -1462,13 +1431,18 @@ pub fn load_session_from_path_with_caps(
              Criteria that look for early events may need the uncapped loader."
         );
     }
-    integrity_errors = integrity_errors.saturating_add(u32::from(nested_tool_identity_conflict(
-        &events.iter().cloned().collect::<Vec<_>>(),
-    )));
+    let mut events = events.into_iter().collect::<Vec<_>>();
+    let artifact_dir = session_artifact_dir_for_path(session_id, path);
+    integrity_errors = integrity_errors.saturating_add(materialize_persisted_tool_results(
+        &mut events,
+        artifact_dir.as_deref(),
+    ));
+    integrity_errors =
+        integrity_errors.saturating_add(u32::from(nested_tool_identity_conflict(&events)));
     Some(SessionCapture {
         session_id: session_id.to_string(),
         journal_path: path.to_path_buf(),
-        events: events.into(),
+        events,
         skipped_lines: skipped,
         dropped_lines: dropped_from_head,
         integrity_errors,
@@ -1497,6 +1471,257 @@ mod tests {
         assert_eq!(cap.count_events("llm_round"), 2);
         assert_eq!(cap.count_events("llm_request_full"), 1);
         assert_eq!(cap.skipped_lines, 0);
+    }
+
+    #[test]
+    fn journal_tool_calls_resolve_same_session_persisted_json_by_call_identity() {
+        let dir = tempdir().unwrap();
+        let session_id = "s1";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let full = serde_json::json!({
+            "fanout": {"accepted": 3, "terminal": 3},
+            "payload": "x".repeat(40_000),
+        })
+        .to_string();
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &session_dir,
+                "run-fanout",
+                "call-fanout",
+                "agent_fanout",
+                &full,
+            )
+            .expect("persisted result descriptor");
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        let event = serde_json::json!({
+            "type": "turn",
+            "ts": "2026-08-09T00:00:00Z",
+            "session_id": session_id,
+            "turn": 1,
+            "producer_scope": {"run_id": "run-fanout"},
+            "tool_calls": [{
+                "tool_call_id": "call-fanout",
+                "name": "agent_fanout",
+                "ok": true,
+                "ms": 1,
+                "args_full": "{\"action\":\"start\"}",
+                "result_full": persisted.replacement,
+                "result_artifact": persisted.descriptor,
+            }],
+        });
+        std::fs::write(&journal, format!("{event}\n")).unwrap();
+        let capture = load_session_from_path(session_id, &journal).expect("loaded capture");
+        let calls = capture.journal_tool_calls();
+        assert_eq!(calls.len(), 1, "capture: {capture:?}");
+        assert_eq!(
+            calls[0]
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/fanout/accepted"))
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn persisted_result_evidence_fails_closed_when_missing_or_cross_run() {
+        let dir = tempdir().unwrap();
+        let session_id = "s-ambiguous";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &session_dir,
+                "run-a",
+                "shared-call",
+                "agent_fanout",
+                r#"{"result":"original"}"#,
+            )
+            .unwrap();
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        let event = |run_id: &str| {
+            serde_json::json!({
+                "type": "turn",
+                "ts": "2026-08-09T00:00:00Z",
+                "session_id": session_id,
+                "turn": 1,
+                "producer_scope": {"run_id": run_id},
+                "tool_calls": [{
+                    "tool_call_id": "shared-call",
+                    "name": "agent_fanout",
+                    "ok": true,
+                    "ms": 1,
+                    "result_full": &persisted.replacement,
+                    "result_artifact": &persisted.descriptor,
+                }],
+            })
+        };
+        std::fs::write(&journal, format!("{}\n", event("run-b"))).unwrap();
+
+        let capture = load_session_from_path(session_id, &journal).expect("capture");
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
+
+        let artifact = only_run_scoped_result_file(&session_dir);
+        std::fs::remove_file(artifact).unwrap();
+        std::fs::write(&journal, format!("{}\n", event("run-a"))).unwrap();
+        let missing = load_session_from_path(session_id, &journal).expect("capture");
+        assert!(missing.has_integrity_errors());
+        assert!(missing.journal_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn persisted_result_evidence_rejects_payload_above_the_structured_limit() {
+        let dir = tempdir().unwrap();
+        let session_id = "s-oversized";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let full = "x".repeat(MAX_STRUCTURED_TOOL_RESULT_BYTES + 1);
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &session_dir,
+                "run-large",
+                "large-call",
+                "bash",
+                &full,
+            )
+            .expect("persisted result descriptor");
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        let event = serde_json::json!({
+            "type": "turn",
+            "ts": "2026-08-09T00:00:00Z",
+            "session_id": session_id,
+            "turn": 1,
+            "producer_scope": {"run_id": "run-large"},
+            "tool_calls": [{
+                "tool_call_id": "large-call",
+                "name": "bash",
+                "ok": true,
+                "ms": 1,
+                "result_full": persisted.replacement,
+                "result_artifact": persisted.descriptor,
+            }],
+        });
+        std::fs::write(&journal, format!("{event}\n")).unwrap();
+
+        let capture = load_session_from_path(session_id, &journal).expect("capture");
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn persisted_result_evidence_rejects_same_length_content_tampering() {
+        let dir = tempdir().unwrap();
+        let session_id = "s-tampered";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let original = serde_json::json!({"owner": "original"}).to_string();
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &session_dir,
+                "run-original",
+                "call-tampered",
+                "agent",
+                &original,
+            )
+            .expect("persisted result descriptor");
+        let artifact = only_run_scoped_result_file(&session_dir);
+        let stored = std::fs::read_to_string(&artifact).unwrap();
+        let tampered = stored.replace("original", "attacker");
+        assert_eq!(
+            stored.len(),
+            tampered.len(),
+            "fixture must preserve byte length"
+        );
+        std::fs::write(artifact, tampered).unwrap();
+
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        let event = serde_json::json!({
+            "type": "turn",
+            "ts": "2026-08-09T00:00:00Z",
+            "session_id": session_id,
+            "turn": 1,
+            "producer_scope": {"run_id": "run-original"},
+            "tool_calls": [{
+                "tool_call_id": "call-tampered",
+                "name": "agent",
+                "ok": true,
+                "ms": 1,
+                "result_full": persisted.replacement,
+                "result_artifact": persisted.descriptor,
+            }],
+        });
+        std::fs::write(&journal, format!("{event}\n")).unwrap();
+
+        let capture = load_session_from_path(session_id, &journal).expect("capture");
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
+    }
+
+    fn only_run_scoped_result_file(session_dir: &Path) -> PathBuf {
+        let mut pending = vec![
+            astra_turn_core::tool::result::storage::tool_results_dir(session_dir).join("runs"),
+        ];
+        let mut files = Vec::new();
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(path).expect("run-scoped result directory") {
+                let path = entry.expect("run-scoped result entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        assert_eq!(
+            files.len(),
+            1,
+            "fixture must contain one authoritative result"
+        );
+        files.pop().unwrap()
+    }
+
+    #[test]
+    fn persisted_display_envelope_is_not_materialization_authority() {
+        let dir = tempdir().unwrap();
+        let session_id = "s-display-only";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let replacement =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_replacement(
+                &session_dir,
+                "call-display-only",
+                "agent",
+                r#"{"private":"artifact bytes"}"#,
+            )
+            .unwrap();
+        let journal = dir.path().join(format!("{session_id}.jsonl"));
+        let event = serde_json::json!({
+            "type": "turn",
+            "ts": "2026-08-09T00:00:00Z",
+            "session_id": session_id,
+            "turn": 1,
+            "producer_scope": {"run_id": "run-display-only"},
+            "tool_calls": [{
+                "tool_call_id": "call-display-only",
+                "name": "agent",
+                "ok": true,
+                "ms": 1,
+                "result_full": replacement,
+            }],
+        });
+        std::fs::write(&journal, format!("{event}\n")).unwrap();
+
+        let capture = load_session_from_path(session_id, &journal).expect("capture");
+        assert!(!capture.has_integrity_errors());
+        let calls = capture.journal_tool_calls();
+        let result = calls[0]
+            .result
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .expect("display-only result remains display text");
+        assert!(result.contains("<persisted-output>"));
     }
 
     #[test]
@@ -2160,35 +2385,22 @@ mod tests {
 
     #[test]
     fn load_session_merges_both_layouts_when_both_exist() {
-        // R4 Blocker follow-up: when both `<id>.jsonl` and
-        // `<id>/step_events.jsonl` exist, the loader must return the
-        // UNION of events. Previously it returned the legacy file
-        // only, which made step-events-only event types
-        // (`ToolCallCompleted`) unmatchable on any session that also
-        // had legacy output (all of them).
-        use std::env;
         let dir = tempdir().unwrap();
-        // Redirect HOME so `default_sessions_dir` points at our tmp.
-        // Safe: single-threaded #[test]; restored after.
-        let prev_home = env::var_os("HOME");
-        // SAFETY: single-threaded test context; restored immediately
-        // after the load. A compile-time `#[serial_test]` would be
-        // better but adding a crate for one test is overkill.
-        unsafe {
-            env::set_var("HOME", dir.path());
-        }
-        let sessions = dir.path().join(".astra").join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
 
         let sid = "merge-test";
-        // Legacy: llm_round with one nested tool_call.
+        let journal = astra_services::session_journal::journal_file_path_for_owner(
+            &astra_services::local_owner_scope(),
+            sid,
+        )
+        .unwrap();
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(
-            sessions.join(format!("{sid}.jsonl")),
+            &journal,
             r#"{"type":"llm_round","ts":"2026-08-09T00:00:01Z","session_id":"merge-test","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":5}]}"#,
         )
         .unwrap();
-        // Step-events: one ToolCallCompleted with a DIFFERENT tool.
-        let step_dir = sessions.join(sid);
+        let step_dir = journal.parent().unwrap().join(sid);
         std::fs::create_dir_all(&step_dir).unwrap();
         std::fs::write(
             step_dir.join("step_events.jsonl"),
@@ -2199,17 +2411,9 @@ mod tests {
         let cap = load_session(sid).expect("both layouts must load");
         let tools = cap.tools_invoked();
 
-        // Restore HOME before asserts so a panic doesn't leak the override.
-        unsafe {
-            match prev_home {
-                Some(h) => env::set_var("HOME", h),
-                None => env::remove_var("HOME"),
-            }
-        }
-
         assert!(
             tools.contains(&"read_file".to_string()),
-            "legacy tool must survive merge: {tools:?}"
+            "journal tool must survive merge: {tools:?}"
         );
         assert!(
             tools.contains(&"list_dir".to_string()),
@@ -2428,6 +2632,169 @@ mod tests {
         let stats = super::load_step_event_stats_for_owners(session_id, &owners).unwrap();
         assert_eq!(stats.turn_rounds, 1);
         assert!(super::load_session_for_owners("../escape", &owners).is_none());
+    }
+
+    #[test]
+    fn owner_scoped_persisted_results_materialize_before_merge() {
+        let dir = tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
+        let first_owner = astra_services::OwnerScope::user("artifact-owner-a").unwrap();
+        let second_owner = astra_services::OwnerScope::user("artifact-owner-b").unwrap();
+        let session_id = "owner-scoped-persisted-results";
+        let call_id = "shared-provider-call";
+
+        let write_owner = |owner: &astra_services::OwnerScope,
+                           run_id: &str,
+                           ts: &str,
+                           payload: serde_json::Value| {
+            let journal =
+                astra_services::session_journal::journal_file_path_for_owner(owner, session_id)
+                    .unwrap();
+            std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+            let artifact_dir = journal.parent().unwrap().join(session_id);
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let persisted =
+                astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                    &artifact_dir,
+                    run_id,
+                    call_id,
+                    "agent",
+                    &payload.to_string(),
+                )
+                .unwrap();
+            let event = serde_json::json!({
+                "type": "turn",
+                "ts": ts,
+                "session_id": session_id,
+                "turn": 1,
+                "producer_scope": {"run_id": run_id},
+                "tool_calls": [{
+                    "tool_call_id": call_id,
+                    "name": "agent",
+                    "ok": true,
+                    "ms": 1,
+                    "result_full": persisted.replacement,
+                    "result_artifact": persisted.descriptor,
+                }],
+            });
+            std::fs::write(journal, format!("{event}\n")).unwrap();
+        };
+
+        write_owner(
+            &first_owner,
+            "run-a",
+            "2026-08-09T00:00:01Z",
+            serde_json::json!({"owner": "a"}),
+        );
+        write_owner(
+            &second_owner,
+            "run-b",
+            "2026-08-09T00:00:02Z",
+            serde_json::json!({"owner": "b"}),
+        );
+        let owners = [first_owner.clone(), second_owner.clone()];
+        let capture = super::load_session_for_owners(session_id, &owners).expect("capture");
+        assert!(!capture.has_integrity_errors());
+        let mut materialized = capture
+            .journal_tool_calls()
+            .into_iter()
+            .filter_map(|call| call.result)
+            .filter_map(|result| {
+                result
+                    .get("owner")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        materialized.sort();
+        assert_eq!(materialized, ["a", "b"]);
+
+        // The same provider call identity cannot legitimately produce two
+        // different results in one run, even when owner namespaces differ.
+        write_owner(
+            &second_owner,
+            "run-a",
+            "2026-08-09T00:00:02Z",
+            serde_json::json!({"owner": "b"}),
+        );
+        let conflicting =
+            super::load_session_for_owners(session_id, &owners).expect("conflicting capture");
+        assert!(conflicting.has_integrity_errors());
+        assert!(conflicting.journal_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn explicit_owner_loader_never_adds_global_legacy_paths() {
+        let dir = tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
+        let owner = astra_services::OwnerScope::user("only-this-owner").unwrap();
+        let session_id = "strict-owner-paths";
+        let journal =
+            astra_services::session_journal::journal_file_path_for_owner(&owner, session_id)
+                .unwrap();
+        let expected = vec![
+            journal.clone(),
+            journal
+                .parent()
+                .unwrap()
+                .join(session_id)
+                .join("step_events.jsonl"),
+        ];
+
+        assert_eq!(
+            session_artifact_paths_for_owners(session_id, &[owner]),
+            expected
+        );
+    }
+
+    #[test]
+    fn persisted_result_cannot_cross_owner_artifact_roots() {
+        let dir = tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
+        let journal_owner = astra_services::OwnerScope::user("journal-owner").unwrap();
+        let foreign_owner = astra_services::OwnerScope::user("foreign-owner").unwrap();
+        let session_id = "wrong-owner-result";
+        let journal = astra_services::session_journal::journal_file_path_for_owner(
+            &journal_owner,
+            session_id,
+        )
+        .unwrap();
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let foreign_journal = astra_services::session_journal::journal_file_path_for_owner(
+            &foreign_owner,
+            session_id,
+        )
+        .unwrap();
+        let foreign_artifact_dir = foreign_journal.parent().unwrap().join(session_id);
+        let persisted =
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
+                &foreign_artifact_dir,
+                "run-owner",
+                "call-owner",
+                "agent",
+                r#"{"owner":"foreign"}"#,
+            )
+            .unwrap();
+        let event = serde_json::json!({
+            "type": "turn",
+            "ts": "2026-08-09T00:00:00Z",
+            "session_id": session_id,
+            "turn": 1,
+            "producer_scope": {"run_id": "run-owner"},
+            "tool_calls": [{
+                "tool_call_id": "call-owner",
+                "name": "agent",
+                "ok": true,
+                "ms": 1,
+                "result_full": persisted.replacement,
+                "result_artifact": persisted.descriptor,
+            }],
+        });
+        std::fs::write(&journal, format!("{event}\n")).unwrap();
+
+        let capture = load_session_for_owners(session_id, &[journal_owner]).expect("capture");
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
     }
 
     #[test]

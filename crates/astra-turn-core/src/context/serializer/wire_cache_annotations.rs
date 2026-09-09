@@ -24,17 +24,6 @@ pub fn anthropic_ephemeral_cache_control() -> Value {
     json!({ "type": "ephemeral" })
 }
 
-/// Place a single `cache_control` marker on the last schema in the contiguous
-/// always-load prefix, ending the static-lib prefix. Later dynamic tools still
-/// appear in the array but do not invalidate the cached prefix.
-///
-/// `always_load_names` is the set of tool names guaranteed present every turn
-/// (the "static lib"). If no always-load tool is present (e.g. a delegated
-/// sub-run with a fully custom toolset), the marker falls back to the last
-/// tool in the array — cache hits on dynamic tail are still a best-effort
-/// win, and the caller is expected to log a warning at the call-site.
-///
-/// No-op when `tool_schemas` is empty.
 /// Annotates tool schemas with `cache_control` on the last tool in the
 /// contiguous always-load prefix. See module-level docs for cache-key rationale.
 ///

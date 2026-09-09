@@ -6,6 +6,9 @@ use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord
 use serde_json::Value;
 
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::tool::deferred_activation::{
+    CanonicalToolInvocation, DeferredToolActivation, RuntimeControlInvocationKind,
+};
 
 use super::super::agentic_loop::host::{
     AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult, RejectedToolCall, ToolCallAdmission,
@@ -21,7 +24,16 @@ pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
 ];
 
 pub(crate) struct PreparedToolRound {
-    pub(crate) tool_calls: Vec<Value>,
+    pub(crate) physical_tool_calls: Vec<Value>,
+    pub(crate) logical_tool_calls: Vec<Value>,
+    /// Schema-addressed evidence for logical targets transported by the stable
+    /// deferred carrier, keyed by their provider-owned call ID. This is not a
+    /// name allowlist: the proof binds this exact call to its selected schema.
+    pub(crate) deferred_activations_by_call_id: HashMap<String, DeferredToolActivation>,
+    /// Runtime-owned control calls retain typed provenance across the same
+    /// physical/logical projection. They are not provider deferred
+    /// activations and must not be admitted by a name-only exception.
+    pub(crate) runtime_control_calls_by_id: HashMap<String, RuntimeControlInvocationKind>,
     pub(crate) pre_resolved_results: Vec<(String, String)>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
@@ -42,8 +54,10 @@ pub(crate) fn record_pre_execution_rejections(
     let mut pre_resolved_results = Vec::with_capacity(rejected_tool_calls.len());
 
     for rejected in rejected_tool_calls {
-        tool_calls.push(rejected.canonical_call);
-        pre_resolved_results.push((rejected.id.clone(), rejected.result.clone()));
+        tool_calls.push(rejected.invocation.physical_provider_call().clone());
+        let call_id = rejected.provider_call_id().to_string();
+        let logical_name = rejected.logical_name().to_string();
+        pre_resolved_results.push((call_id.clone(), rejected.result.clone()));
         let structured_result = serde_json::from_str::<Value>(&rejected.result).ok();
         let rejection_detail = structured_result
             .as_ref()
@@ -51,26 +65,25 @@ pub(crate) fn record_pre_execution_rejections(
             .and_then(Value::as_str)
             .unwrap_or("tool call rejected before execution")
             .to_string();
-        let parsed_args = tool_calls
-            .last()
-            .and_then(|call| {
-                astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).ok()
-            })
-            .unwrap_or(Value::Null);
+        let parsed_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+            rejected.invocation.logical_target_call(),
+        )
+        .ok()
+        .unwrap_or(Value::Null);
         let (args_full, args_preview, _) =
             crate::turn::headless_tool_pipeline::record::safe_tool_arguments_for_record(
-                &rejected.name,
+                &logical_name,
                 &parsed_args,
             );
         state.step_recorder.begin_tool_with_key_and_args_preview(
-            &rejected.name,
-            &rejected.id,
+            &logical_name,
+            &call_id,
             None,
             args_full.as_deref(),
         );
         state.step_recorder.complete_tool_with_result_and_metadata(
-            &rejected.name,
-            &rejected.id,
+            &logical_name,
+            &call_id,
             args_full.as_deref(),
             true,
             0,
@@ -82,8 +95,8 @@ pub(crate) fn record_pre_execution_rejections(
             None => (None, None),
         };
         state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some(rejected.id.clone()),
-            name: rejected.name,
+            tool_call_id: Some(call_id),
+            name: logical_name,
             ok: false,
             ms: 0,
             error: Some(rejection_detail),
@@ -121,29 +134,17 @@ pub(crate) fn admit_tool_calls(
                 let name = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
                     .unwrap_or("unknown")
                     .to_string();
-                let canonical_call =
-                    astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
-                        tool_call,
-                    )
-                    .unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": "{}"},
-                        })
-                    });
-                RejectedToolCall {
-                    id,
-                    name,
+                let canonical_call = canonical_rejection_placeholder(tool_call, &id, &name);
+                RejectedToolCall::ordinary(
                     canonical_call,
-                    result: serde_json::json!({
+                    serde_json::json!({
                         "status": "rejected",
                         "error_kind": "provider_tool_identity_invalid",
                         "retryable": false,
                         "error": identity_error.as_str(),
                     })
                     .to_string(),
-                }
+                )
             })
             .collect();
         return ToolCallAdmission {
@@ -161,7 +162,11 @@ pub(crate) fn admit_tool_calls(
 
     for tool_call in tool_calls {
         match astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call) {
-            Ok(canonical) => executable.push(canonical),
+            Ok(canonical) => executable.push(
+                astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
+                    canonical,
+                ),
+            ),
             Err(detail) => {
                 let id = tool_call
                     .get("id")
@@ -182,32 +187,17 @@ pub(crate) fn admit_tool_calls(
                         "The {name} tool call was not executed because {detail}. Emit one complete JSON argument object, then try again."
                     )
                 };
-                let canonical_call = serde_json::json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": "{}",
-                    },
-                });
-                malformed.push(RejectedToolCall {
-                    id: canonical_call["id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: canonical_call["function"]["name"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string(),
+                let canonical_call = canonical_rejection_placeholder(tool_call, &id, &name);
+                malformed.push(RejectedToolCall::ordinary(
                     canonical_call,
-                    result: serde_json::json!({
+                    serde_json::json!({
                         "status": "rejected",
                         "error_kind": "tool_call_arguments_invalid",
                         "retryable": true,
                         "error": message,
                     })
                     .to_string(),
-                });
+                ));
             }
         }
     }
@@ -217,6 +207,103 @@ pub(crate) fn admit_tool_calls(
         rejected: malformed,
         completion_action_applied: false,
     }
+}
+
+/// Keep malformed provider calls in a deterministic, structured rejection
+/// shape. The original request remains the source of the provider id and is
+/// never guessed from prose; this placeholder only gives downstream journal
+/// and partition code a canonical value to carry for a call that cannot be
+/// executed.
+fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
+    // A call that can be normalized keeps its exact canonical representation.
+    // Only malformed/legacy-shaped calls use the typed empty-arguments
+    // placeholder below.
+    astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call)
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            })
+        })
+}
+
+/// Resolve carrier calls after provider identity admission and before any
+/// semantic policy reads the batch. The returned admission preserves the
+/// exact provider call for history while exposing only the logical target to
+/// policy and execution. Callers supply durable selection evidence and the
+/// current catalog digest; a name-only or descriptor-less activation can
+/// never pass this gate.
+pub(crate) fn resolve_deferred_tool_admission<F>(
+    admission: ToolCallAdmission,
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+) -> ToolCallAdmission
+where
+    F: Fn(&str) -> Option<String>,
+{
+    resolve_deferred_tool_admission_with_identity(
+        admission,
+        activations,
+        current_schema_digest,
+        |activation| activation.descriptor.is_some(),
+    )
+}
+
+/// Resolve deferred carriers while requiring an additional host-owned
+/// descriptor identity proof. The ordinary resolver requires a bound
+/// descriptor; authenticated edge/server hosts use this variant to also
+/// compare that descriptor with the current offer so a same-name,
+/// same-schema tool cannot cross a sequential provider rebind.
+pub(crate) fn resolve_deferred_tool_admission_with_identity<F, G>(
+    mut admission: ToolCallAdmission,
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+    descriptor_is_current: G,
+) -> ToolCallAdmission
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&DeferredToolActivation) -> bool,
+{
+    let mut retained = Vec::with_capacity(admission.admitted.len());
+    for invocation in admission.admitted.drain(..) {
+        if invocation.runtime_control_kind().is_some() {
+            retained.push(invocation);
+            continue;
+        }
+        match astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
+            invocation.physical_provider_call(),
+            activations,
+            &current_schema_digest,
+        ) {
+            Ok(Some(resolved)) if resolved.activation().is_some_and(&descriptor_is_current) => {
+                retained.push(resolved)
+            }
+            Ok(Some(invocation)) => admission.rejected.push(RejectedToolCall {
+                invocation,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "deferred_tool_descriptor_stale",
+                    "retryable": true,
+                    "error": "The selected deferred tool is no longer bound to the same provider descriptor; select it again before invoking it.",
+                })
+                .to_string(),
+            }),
+            Ok(None) => retained.push(invocation),
+            Err(error) => admission.rejected.push(RejectedToolCall {
+                invocation,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "deferred_tool_activation_invalid",
+                    "retryable": true,
+                    "error": error.as_str(),
+                })
+                .to_string(),
+            }),
+        }
+    }
+    admission.admitted = retained;
+    admission
 }
 
 /// Validate the provider-owned identity carrier before any admission policy or
@@ -255,25 +342,69 @@ pub(crate) fn validate_tool_call_admission_partition(
     admission: &ToolCallAdmission,
 ) -> Result<(), String> {
     validate_provider_tool_call_identities(requested)?;
+    let requested_by_id = requested
+        .iter()
+        .map(|requested| {
+            let id = requested
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("validated provider call has an id");
+            let name =
+                astra_turn_core::tool::args::shape::tool_call_name(requested).unwrap_or("unknown");
+            let strict =
+                astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(requested)
+                    .ok();
+            Ok((
+                id.to_string(),
+                (
+                    strict.clone(),
+                    strict.unwrap_or_else(|| canonical_rejection_placeholder(requested, id, name)),
+                ),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
     for call in &admission.admitted {
         let canonical =
             astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(call)
                 .map_err(|detail| format!("admitted tool call is not executable: {detail}"))?;
-        if canonical != *call {
+        let physical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
+            call.physical_provider_call(),
+        )
+        .map_err(|detail| format!("admitted provider carrier is not canonical: {detail}"))?;
+        let id = call
+            .provider_call_id()
+            .ok_or_else(|| "admitted provider carrier is missing an id".to_string())?;
+        if canonical != **call
+            || physical != *call.physical_provider_call()
+            || canonical.get("id").and_then(Value::as_str) != Some(id)
+            || requested_by_id
+                .get(id)
+                .and_then(|(strict, _)| strict.as_ref())
+                != Some(&physical)
+        {
             return Err("admitted tool call is not in exact canonical shape".to_string());
         }
     }
     for call in &admission.rejected {
         let canonical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
-            &call.canonical_call,
+            call.invocation.physical_provider_call(),
         )
         .map_err(|detail| format!("rejected tool carrier is not canonical: {detail}"))?;
         let canonical_id = canonical.get("id").and_then(Value::as_str);
-        let canonical_name =
-            astra_turn_core::tool::args::shape::tool_call_name(&canonical).unwrap_or_default();
-        if canonical != call.canonical_call
-            || canonical_id != Some(call.id.as_str())
-            || canonical_name != call.name
+        let logical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
+            call.invocation.logical_target_call(),
+        )
+        .map_err(|detail| format!("rejected logical target is not canonical: {detail}"))?;
+        let Some((_, requested_canonical)) = requested_by_id.get(call.provider_call_id()) else {
+            return Err(
+                "rejected tool carrier identity or name does not match its disposition".to_string(),
+            );
+        };
+        if canonical != *call.invocation.physical_provider_call()
+            || logical != *call.invocation.logical_target_call()
+            || canonical_id != Some(call.provider_call_id())
+            || logical.get("id").and_then(Value::as_str) != Some(call.provider_call_id())
+            || requested_canonical != &canonical
         {
             return Err(
                 "rejected tool carrier identity or name does not match its disposition".to_string(),
@@ -292,7 +423,7 @@ pub(crate) fn validate_tool_call_admission_partition(
     let rejected_ids = admission
         .rejected
         .iter()
-        .map(|call| call.id.as_str())
+        .map(RejectedToolCall::provider_call_id)
         .collect::<HashSet<_>>();
     if admitted_ids.intersection(&rejected_ids).next().is_some()
         || requested_ids.len() != admission.admitted.len() + admission.rejected.len()
@@ -328,18 +459,8 @@ pub(crate) fn reject_tool_calls_at_text_only_boundary(
     let admitted = admit_tool_calls(tool_calls, finish_reason);
     let mut rejected = admitted.rejected;
     for canonical_call in admitted.admitted {
-        let id = canonical_call
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let name = astra_turn_core::tool::args::shape::tool_call_name(&canonical_call)
-            .unwrap_or("unknown")
-            .to_string();
         rejected.push(RejectedToolCall {
-            id,
-            name,
-            canonical_call,
+            invocation: canonical_call,
             result: serde_json::json!({
                 "status": "rejected",
                 "error_kind": "text_only_settlement_tool_call",
@@ -538,18 +659,110 @@ fn intercept_disallowed_tool_calls(
     (blocked, remaining)
 }
 
-pub(crate) async fn prepare_intercepted_tool_round(
+pub(crate) async fn try_prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
+    admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
     delegation_intercepted: bool,
     _valid_tool_names: &HashSet<String>,
-) -> PreparedToolRound {
+) -> Result<PreparedToolRound, String> {
+    let mut deferred_activations_by_call_id = admitted_tool_calls
+        .iter()
+        .filter_map(|call| {
+            Some((
+                call.provider_call_id()?.to_string(),
+                call.activation()?.clone(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let runtime_control_calls_by_id = admitted_tool_calls
+        .iter()
+        .filter_map(|call| {
+            Some((
+                call.provider_call_id()?.to_string(),
+                call.runtime_control_kind()?,
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let rejected_logical_tool_calls = rejected_tool_calls
+        .iter()
+        .map(|rejected| rejected.invocation.logical_target_call().clone())
+        .collect::<Vec<_>>();
     let (rejected_calls, mut pre_resolved_results) =
         record_pre_execution_rejections(state, rejected_tool_calls);
-    let mut tool_calls = effective_tool_calls.to_vec();
-    tool_calls.extend(rejected_calls);
+    // Rejoin admission dispositions to the original provider order. History
+    // and prompt-cache identity are ordered evidence, not an admitted/rejected
+    // partition. Each entry has both a physical provider call and its logical
+    // target; later interceptors resolve by call id without changing either
+    // view's sequence.
+    let mut physical_by_id = HashMap::<&str, Value>::new();
+    let mut logical_by_id = HashMap::<&str, Value>::new();
+    for call in admitted_tool_calls {
+        if let Some(id) = call.provider_call_id() {
+            physical_by_id.insert(id, call.physical_provider_call().clone());
+            logical_by_id.insert(id, call.logical_target_call().clone());
+        }
+    }
+    for (physical, logical) in rejected_calls.iter().zip(&rejected_logical_tool_calls) {
+        if let Some(id) = physical.get("id").and_then(Value::as_str) {
+            physical_by_id.insert(id, physical.clone());
+            logical_by_id.insert(id, logical.clone());
+        }
+    }
+    let provider_order = turn_result
+        .accum
+        .tool_calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str));
+    let mut physical_tool_calls = Vec::new();
+    let mut logical_tool_calls = Vec::new();
+    for id in provider_order {
+        if let (Some(physical), Some(logical)) =
+            (physical_by_id.remove(id), logical_by_id.remove(id))
+        {
+            physical_tool_calls.push(physical);
+            logical_tool_calls.push(logical);
+        }
+    }
+    if !turn_result.accum.tool_calls.is_empty()
+        && (!physical_by_id.is_empty() || !logical_by_id.is_empty())
+    {
+        return Err(format!(
+            "intercepted tool round lost provider identities while restoring provider order: physical_leftovers={:?}, logical_leftovers={:?}",
+            physical_by_id.keys().collect::<Vec<_>>(),
+            logical_by_id.keys().collect::<Vec<_>>(),
+        ));
+    }
+    // Unit-level callers without a provider transcript still exercise the
+    // interception layer. Production always has the provider order above;
+    // this fallback is deliberately confined to an absent transcript and
+    // preserves the caller's explicit disposition ordering.
+    if physical_tool_calls.is_empty() && !physical_by_id.is_empty() {
+        for call in admitted_tool_calls {
+            if let Some(id) = call.provider_call_id()
+                && let (Some(physical), Some(logical)) =
+                    (physical_by_id.remove(id), logical_by_id.remove(id))
+            {
+                physical_tool_calls.push(physical);
+                logical_tool_calls.push(logical);
+            }
+        }
+        for physical in &rejected_calls {
+            if let Some(id) = physical.get("id").and_then(Value::as_str)
+                && let (Some(physical), Some(logical)) =
+                    (physical_by_id.remove(id), logical_by_id.remove(id))
+            {
+                physical_tool_calls.push(physical);
+                logical_tool_calls.push(logical);
+            }
+        }
+    }
+    // Invalid provider identities cannot be matched to source order; their
+    // canonical rejection still gets a terminal tool result, but never an
+    // executable slot. Valid provider batches (including carriers) must be
+    // fully represented in the ordered views above.
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
@@ -563,7 +776,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
     // Build the id→args lookup once. Without it, the per-result `find` below
     // is O(N²) over `tool_calls`, which a model emitting many simultaneous
     // disallowed calls would exercise.
-    let args_preview_by_id: HashMap<&str, String> = tool_calls
+    let args_preview_by_id: HashMap<&str, String> = logical_tool_calls
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
@@ -663,7 +876,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
     // attempts either, matching the existing skipped/deferred behavior.
 
     // Build id→name lookup so we can preserve the original tool name.
-    let tool_name_by_id: HashMap<&str, &str> = tool_calls
+    let tool_name_by_id: HashMap<&str, &str> = logical_tool_calls
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
@@ -705,17 +918,29 @@ pub(crate) async fn prepare_intercepted_tool_round(
 
     // Surgery: strip tool_calls whose IDs are in surgically_removed_ids.
     // These calls will NOT appear in the assistant message or need tool results.
-    let tool_calls = if surgically_removed_ids.is_empty() {
-        tool_calls
+    let (physical_tool_calls, logical_tool_calls) = if surgically_removed_ids.is_empty() {
+        (physical_tool_calls, logical_tool_calls)
     } else {
-        tool_calls
-            .into_iter()
-            .filter(|tc| {
-                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                !surgically_removed_ids.contains(id)
-            })
-            .collect()
+        (
+            physical_tool_calls
+                .into_iter()
+                .filter(|tc| {
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    !surgically_removed_ids.contains(id)
+                })
+                .collect(),
+            logical_tool_calls
+                .into_iter()
+                .filter(|tc| {
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    !surgically_removed_ids.contains(id)
+                })
+                .collect(),
+        )
     };
+    deferred_activations_by_call_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
+    let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
+    runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
     let edge_tool_round = if delegation_intercepted {
         turn_result
@@ -728,12 +953,38 @@ pub(crate) async fn prepare_intercepted_tool_round(
         turn_result.edge_tool_round.clone()
     };
 
-    PreparedToolRound {
-        tool_calls,
+    Ok(PreparedToolRound {
+        physical_tool_calls,
+        logical_tool_calls,
+        deferred_activations_by_call_id,
+        runtime_control_calls_by_id,
         pre_resolved_results,
         edge_tool_round,
         communication_events,
-    }
+    })
+}
+
+#[cfg(test)]
+async fn prepare_intercepted_tool_round(
+    state: &mut AgenticLoopState,
+    turn_result: &HostTurnResult,
+    admitted_tool_calls: &[CanonicalToolInvocation],
+    effective_tool_calls: &[Value],
+    rejected_tool_calls: Vec<RejectedToolCall>,
+    delegation_intercepted: bool,
+    valid_tool_names: &HashSet<String>,
+) -> PreparedToolRound {
+    try_prepare_intercepted_tool_round(
+        state,
+        turn_result,
+        admitted_tool_calls,
+        effective_tool_calls,
+        rejected_tool_calls,
+        delegation_intercepted,
+        valid_tool_names,
+    )
+    .await
+    .expect("test tool round has an exhaustive provider identity partition")
 }
 
 /// Result of skill interception. `results` are pre-resolved tool results to
@@ -1250,6 +1501,14 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::tests::make_state;
 
+    fn ordinary_calls(calls: &[Value]) -> Vec<CanonicalToolInvocation> {
+        calls
+            .iter()
+            .cloned()
+            .map(CanonicalToolInvocation::ordinary)
+            .collect()
+    }
+
     #[test]
     fn malformed_tool_arguments_become_precise_pre_resolved_error() {
         let calls = vec![json!({
@@ -1265,8 +1524,8 @@ mod tests {
 
         assert!(admission.admitted.is_empty());
         assert_eq!(admission.rejected.len(), 1);
-        assert_eq!(admission.rejected[0].id, "call-python");
-        assert_eq!(admission.rejected[0].name, "python");
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-python");
+        assert_eq!(admission.rejected[0].logical_name(), "python");
         let result: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
         assert_eq!(result["status"], "rejected");
         assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
@@ -1294,15 +1553,15 @@ mod tests {
 
         assert!(admission.rejected.is_empty());
         assert_eq!(
-            admission.admitted,
-            vec![json!({
+            admission.admitted[0].logical_target_call(),
+            &json!({
                 "id": "call-bash",
                 "type": "function",
                 "function": {
                     "name": "bash",
                     "arguments": "{\"command\":\"ls\"}"
                 }
-            })]
+            })
         );
     }
 
@@ -1321,12 +1580,12 @@ mod tests {
 
         assert!(admission.admitted.is_empty());
         assert_eq!(admission.rejected.len(), 1);
-        assert_eq!(admission.rejected[0].id, "call-bash");
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-bash");
         let result: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
         assert_eq!(result["error_kind"], "text_only_settlement_tool_call");
         assert_eq!(result["retryable"], false);
         assert_eq!(
-            admission.rejected[0].canonical_call["function"]["name"],
+            admission.rejected[0].invocation.physical_provider_call()["function"]["name"],
             "bash"
         );
     }
@@ -1386,7 +1645,7 @@ mod tests {
         assert_eq!(admission.admitted.len(), 1);
         assert_eq!(admission.rejected.len(), 1);
         assert_eq!(admission.admitted[0]["id"], "call-valid");
-        assert_eq!(admission.rejected[0].id, "call-broken");
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-broken");
         validate_tool_call_admission_partition(&calls, &admission).unwrap();
     }
 
@@ -1449,11 +1708,18 @@ mod tests {
             "function": {"name": "bash", "arguments": "{}"}
         })];
         let mut admitted = admit_tool_calls(&calls, None);
-        admitted.admitted[0]["function"]["arguments"] = Value::String("{ }".to_string());
+        admitted.admitted[0] = CanonicalToolInvocation::ordinary(json!({
+            "id": "call-a",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "not-json"}
+        }));
         assert!(validate_tool_call_admission_partition(&calls, &admitted).is_err());
 
         let mut rejected = reject_tool_calls_at_text_only_boundary(&calls, None);
-        rejected.rejected[0].canonical_call["id"] = Value::String("other".to_string());
+        rejected.rejected[0] = RejectedToolCall::ordinary(
+            json!({"id":"other","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            rejected.rejected[0].result.clone(),
+        );
         assert!(validate_tool_call_admission_partition(&calls, &rejected).is_err());
     }
 
@@ -1477,16 +1743,17 @@ mod tests {
             &mut state,
             &turn_result,
             &admission.admitted,
+            &[],
             admission.rejected,
             false,
             &valid_tool_names,
         )
         .await;
 
-        assert_eq!(prepared.tool_calls.len(), 1);
-        assert_eq!(prepared.tool_calls[0]["id"], "call-python");
+        assert_eq!(prepared.physical_tool_calls.len(), 1);
+        assert_eq!(prepared.physical_tool_calls[0]["id"], "call-python");
         assert_eq!(
-            prepared.tool_calls[0]["function"]["arguments"],
+            prepared.physical_tool_calls[0]["function"]["arguments"],
             serde_json::Value::String("{}".to_string())
         );
         assert_eq!(prepared.pre_resolved_results.len(), 1);
@@ -1515,14 +1782,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_round_retains_runtime_control_provenance_by_call_id() {
+        let mut state = make_state();
+        let call = json!({
+            "id": "server-work-admission-t1-r0",
+            "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        });
+        let mut turn_result = empty_host_turn_result();
+        turn_result.accum.tool_calls = vec![call.clone()];
+        let invocation = CanonicalToolInvocation::runtime_control(
+            call.clone(),
+            RuntimeControlInvocationKind::WorkEstablishment,
+        )
+        .expect("host-created lifecycle call has matching typed operation");
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &[invocation],
+            std::slice::from_ref(&call),
+            Vec::new(),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(
+            prepared
+                .runtime_control_calls_by_id
+                .get(call["id"].as_str().unwrap()),
+            Some(&RuntimeControlInvocationKind::WorkEstablishment)
+        );
+        assert!(prepared.deferred_activations_by_call_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paired_round_keeps_carrier_in_history_and_logical_target_in_execution_view() {
+        let carrier = json!({
+            "id": "deferred-first",
+            "type": "function",
+            "function": {
+                "name": "invoke_tool",
+                "arguments": "{\"name\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.test\"}}"
+            }
+        });
+        let direct = json!({
+            "id": "direct-second",
+            "type": "function",
+            "function": {"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+        });
+        let activation = astra_turn_types::DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: "sha256:current".to_string(),
+            descriptor: None,
+        };
+        let deferred =
+            astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[activation],
+                |name| (name == "web_fetch").then_some("sha256:current".to_string()),
+            )
+            .expect("valid carrier protocol")
+            .expect("carrier must resolve");
+        let direct = CanonicalToolInvocation::ordinary(direct);
+        let logical = vec![
+            deferred.logical_target_call().clone(),
+            direct.logical_target_call().clone(),
+        ];
+        let mut turn_result = empty_host_turn_result();
+        turn_result.accum.tool_calls = vec![
+            deferred.physical_provider_call().clone(),
+            direct.physical_provider_call().clone(),
+        ];
+        let mut state = make_state();
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &[deferred, direct],
+            &logical,
+            Vec::new(),
+            false,
+            &HashSet::from(["web_fetch".to_string(), "read_file".to_string()]),
+        )
+        .await;
+
+        assert_eq!(
+            prepared
+                .physical_tool_calls
+                .iter()
+                .map(|call| astra_turn_core::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec![Some("invoke_tool"), Some("read_file")]
+        );
+        assert_eq!(
+            prepared
+                .logical_tool_calls
+                .iter()
+                .map(|call| astra_turn_core::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec![Some("web_fetch"), Some("read_file")]
+        );
+    }
+
+    #[tokio::test]
     async fn policy_rejection_preserves_canonical_cause_and_arguments() {
         let mut state = make_state();
         state.step_recorder.begin_turn(1);
         let turn_result = empty_host_turn_result();
-        let rejected = RejectedToolCall {
-            id: "call-web".to_string(),
-            name: "web_fetch".to_string(),
-            canonical_call: json!({
+        let rejected = RejectedToolCall::ordinary(
+            json!({
                 "id": "call-web",
                 "type": "function",
                 "function": {
@@ -1530,18 +1900,19 @@ mod tests {
                     "arguments": "{\"url\":\"https://example.test\"}"
                 }
             }),
-            result: json!({
+            json!({
                 "status": "rejected",
                 "error_kind": "typed_policy_rejection",
                 "retryable": false,
                 "error": "typed policy denied this execution role"
             })
             .to_string(),
-        };
+        );
 
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &turn_result,
+            &[],
             &[],
             vec![rejected],
             false,
@@ -1600,10 +1971,8 @@ mod tests {
     async fn rejected_tool_argument_records_are_display_safe() {
         let mut state = make_state();
         state.step_recorder.begin_turn(1);
-        let rejected = RejectedToolCall {
-            id: "call-bash-secret".to_string(),
-            name: "bash".to_string(),
-            canonical_call: json!({
+        let rejected = RejectedToolCall::ordinary(
+            json!({
                 "id": "call-bash-secret",
                 "type": "function",
                 "function": {
@@ -1611,17 +1980,18 @@ mod tests {
                     "arguments": "{\"command\":\"tool --token hf_abcdefghijklmnopqrstuvwxyz123456\"}"
                 }
             }),
-            result: json!({
+            json!({
                 "status": "rejected",
                 "error_kind": "typed_policy_rejection",
                 "error": "typed policy denied this execution role"
             })
             .to_string(),
-        };
+        );
 
         prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &[],
             &[],
             vec![rejected],
             false,
@@ -1836,6 +2206,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1844,7 +2215,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            prepared.tool_calls.len(),
+            prepared.physical_tool_calls.len(),
             2,
             "assistant tool calls stay intact"
         );
@@ -1894,6 +2265,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1937,6 +2309,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1982,6 +2355,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -2023,6 +2397,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -2064,6 +2439,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -2110,6 +2486,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -2145,6 +2522,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -2355,6 +2733,131 @@ mod tests {
             state.stall.events.len(),
             2,
             "every locked-out call pushes a fresh stall signal"
+        );
+    }
+
+    #[test]
+    fn shared_deferred_resolver_keeps_physical_identity_and_fails_closed() {
+        let carrier = json!({
+            "id": "carrier-1",
+            "type": "function",
+            "function": {
+                "name": "invoke_tool",
+                "arguments": r#"{"name":"web_fetch","arguments":{"url":"https://example.test"}}"#
+            }
+        });
+        let activation = DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: "sha256:current".to_string(),
+            descriptor: Some(
+                astra_turn_types::ResolvedToolDescriptorRef::new(
+                    astra_turn_types::ToolIdentity::new(
+                        astra_turn_types::ProviderBindingRef::new("test-provider").unwrap(),
+                        astra_turn_types::NativeToolId::new("web_fetch").unwrap(),
+                    ),
+                    "sha256:provider-schema".to_string(),
+                )
+                .unwrap(),
+            ),
+        };
+        let admitted = super::admit_tool_calls(std::slice::from_ref(&carrier), Some("tool_calls"));
+        let resolved = super::resolve_deferred_tool_admission(admitted, &[activation], |name| {
+            (name == "web_fetch").then_some("sha256:current".to_string())
+        });
+
+        assert!(resolved.rejected.is_empty());
+        assert_eq!(resolved.admitted.len(), 1);
+        assert_eq!(resolved.admitted[0].provider_call_id(), Some("carrier-1"));
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resolved.admitted[0].physical_provider_call()
+            ),
+            Some("invoke_tool")
+        );
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resolved.admitted[0].logical_target_call()
+            ),
+            Some("web_fetch")
+        );
+
+        // A matching compact digest is not an execution identity.  The
+        // provider-owned descriptor must be present even when the schema has
+        // not changed; otherwise a resumed/name-only projection could cross
+        // a provider rebind merely because its public schema still hashes the
+        // same way.
+        let descriptorless_same_digest = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "carrier-descriptorless",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:current".to_string(),
+                descriptor: None,
+            }],
+            |_| Some("sha256:current".to_string()),
+        );
+        assert!(descriptorless_same_digest.admitted.is_empty());
+        assert_eq!(descriptorless_same_digest.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&descriptorless_same_digest.rejected[0].result,)
+                .expect("structured descriptor rejection")["error_kind"],
+            "deferred_tool_descriptor_stale",
+            "a digest-only activation must never become a dispatch grant"
+        );
+
+        let stale = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "carrier-2",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:selected".to_string(),
+                descriptor: None,
+            }],
+            |_| Some("sha256:changed".to_string()),
+        );
+        assert!(stale.admitted.is_empty());
+        assert_eq!(stale.rejected.len(), 1);
+        assert_eq!(stale.rejected[0].provider_call_id(), "carrier-2");
+        assert_eq!(
+            serde_json::from_str::<Value>(&stale.rejected[0].result).expect("structured rejection")
+                ["error_kind"],
+            "deferred_tool_activation_invalid"
+        );
+
+        let capability_removed = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(&[carrier], Some("tool_calls")),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:current".to_string(),
+                descriptor: None,
+            }],
+            |_| None,
+        );
+        assert!(capability_removed.admitted.is_empty());
+        assert_eq!(capability_removed.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&capability_removed.rejected[0].result)
+                .expect("structured rejection")["error_kind"],
+            "deferred_tool_activation_invalid",
+            "historical evidence must not revive a capability absent from the current surface"
         );
     }
 

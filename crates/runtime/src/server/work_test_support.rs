@@ -3,6 +3,7 @@ use astra_core::SharedPool;
 /// Delete one test owner's complete canonical Work aggregate in dependency order.
 pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
+        ("work_establishment_operations", "owner_id"),
         ("work_events", "owner_id"),
         ("work_attention_receipts", "owner_id"),
         ("work_event_sequences", "owner_id"),

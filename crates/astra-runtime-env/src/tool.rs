@@ -422,24 +422,18 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // Blocking clarification is part of the default safety loop: when the
         // model needs a user decision, ask_user must already be callable.
         control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
-        // Child agents are an execution topology, not a second Work graph.
-        // A selected WorkItem may recursively decompose through this surface;
-        // capability, permission, depth and cancellation policy still apply.
-        // Single-child delegation and parallel fan-out are sibling execution
-        // topologies. Keep both schemas on the stable candidate surface: an
-        // asynchronous semantic admission may refine the recommendation, but
-        // it must not make the correct carrier undiscoverable on the first
-        // provider request. Capability, permission, depth and cancellation
-        // admission still decide whether either call may execute.
-        control_plane("agent", ToolLoadPolicy::AlwaysLoad),
-        control_plane("agent_fanout", ToolLoadPolicy::AlwaysLoad),
+        // Delegation is a workflow decision, not a first-turn primitive. Its
+        // multi-action schema belongs behind discovery alongside fanout.
+        control_plane("agent", ToolLoadPolicy::Deferred),
+        control_plane("agent_fanout", ToolLoadPolicy::Deferred),
         control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
-        // Self-observation and session reflection are control-plane recovery
-        // entrypoints. They must be callable without a discovery round-trip.
+        // Introspection is the recovery path for retained artifacts and must
+        // remain callable without a discovery round-trip. Its resident schema
+        // is separately kept compact; causal reflection remains deferred.
         control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
-        control_plane("reflect", ToolLoadPolicy::AlwaysLoad),
+        control_plane("reflect", ToolLoadPolicy::Deferred),
         // Non-blocking status updates are still part of the user communication
         // path, so keep notify available with ask_user instead of requiring a
         // discovery round-trip.
@@ -459,37 +453,36 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // attempt identity, so the tool can share one surface across primary
         // and explicitly delegated execution without trusting model arguments.
         work_attempt_control_plane("settle_work_item", ToolLoadPolicy::AlwaysLoad),
-        // Work planning is a core continuation surface, not an optional
-        // discovery feature. A bound session must be able to inspect and
-        // revise its durable graph without changing the tool schema epoch (or
-        // spending a model round on tool_search). Keeping these schemas on the
-        // stable candidate surface also makes a second `start_work` request a
-        // typed continuation rather than a discovery detour.
-        // The root run remains the Work coordinator while it executes a
-        // foreground WorkItem. User guidance may change the graph or its
-        // acceptance criteria mid-attempt; forcing the root to settle or
-        // abandon the attempt before it can inspect and revision-pin that
-        // change makes durable Work impossible to steer. Delegated attempts
-        // remain isolated and receive none of these graph-authoring tools.
+        // Work declaration, dispatch, and settlement are the hot lifecycle
+        // path. Graph and criterion maintenance are typed but comparatively
+        // rare workflows, so their schemas are discovered when needed. The
+        // execution-role contract below still prevents delegated attempts from
+        // acquiring graph-authoring authority after activation.
         work_coordinator_or_primary_attempt_control_plane(
             "inspect_work_plan",
-            ToolLoadPolicy::AlwaysLoad,
+            ToolLoadPolicy::Deferred,
         ),
         work_coordinator_or_primary_attempt_control_plane(
             "propose_work_plan",
-            ToolLoadPolicy::AlwaysLoad,
+            ToolLoadPolicy::Deferred,
         ),
         work_coordinator_or_primary_attempt_control_plane(
             "inspect_work_criteria",
-            ToolLoadPolicy::AlwaysLoad,
+            ToolLoadPolicy::Deferred,
         ),
         work_coordinator_or_primary_attempt_control_plane(
             "propose_work_criteria",
-            ToolLoadPolicy::AlwaysLoad,
+            ToolLoadPolicy::Deferred,
         ),
         background_control("task_output", ToolLoadPolicy::Deferred),
         background_control("task_stop", ToolLoadPolicy::Deferred),
         background_control("task_list", ToolLoadPolicy::Deferred),
+        // Memory is useful contextual evidence, but explicit memory operations
+        // are not required to answer or execute an ordinary first turn.
+        // Remember/recall are core persistent-agent primitives. The prompt
+        // surface keeps only that compact ordinary shape resident; advanced
+        // audit, correction, expansion, and profile operations remain
+        // schema-addressable through the private catalog and invoke_tool.
         server_service("memory", ToolLoadPolicy::AlwaysLoad),
         server_service("mo_query", ToolLoadPolicy::Deferred),
         server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
@@ -515,7 +508,12 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         shell("powershell", ToolLoadPolicy::Deferred),
         project_script("run_script", ToolLoadPolicy::Deferred),
         background_shell("background_shell", ToolLoadPolicy::Internal),
-        git_read("git", ToolLoadPolicy::AlwaysLoad),
+        // Git remains a product-level, policy-aware adapter, but its large
+        // action union (history, worktrees, commits, remote mutation) is not
+        // a first-turn primitive. Shell covers ordinary inspection, while an
+        // explicit ToolSearch selection exposes the typed Git contract only
+        // when its audit and branch-protection semantics are actually needed.
+        git_read("git", ToolLoadPolicy::Deferred),
         git_clone("git_clone", ToolLoadPolicy::Internal),
         lsp("lsp", ToolLoadPolicy::Deferred),
         lsp("find_definition", ToolLoadPolicy::Internal),
@@ -1656,6 +1654,16 @@ mod tests {
     #[test]
     fn work_execution_role_controls_attempt_and_coordinator_surfaces() {
         let registry = registry();
+        for name in ["start_work", "run_next_work_item", "settle_work_item"] {
+            assert_eq!(
+                registry
+                    .get(name)
+                    .expect("hot Work lifecycle tool")
+                    .load_policy,
+                ToolLoadPolicy::AlwaysLoad,
+                "{name} must remain directly callable on its eligible Work surface"
+            );
+        }
         let settlement = registry.get("settle_work_item").expect("settlement tool");
         assert!(!settlement.required.work_item_attempt);
         assert_eq!(
@@ -1963,9 +1971,9 @@ mod tests {
     }
 
     #[test]
-    fn observation_control_plane_tools_are_always_load() {
+    fn observation_control_plane_keeps_recovery_eager_and_reflection_deferred() {
         let registry = registry();
-        for name in ["introspect", "reflect", "tool_search"] {
+        for name in ["introspect", "reflect"] {
             let spec = registry
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} registered"));
@@ -1974,16 +1982,29 @@ mod tests {
                 RequiredExecutor::ControlPlane,
                 "{name} must remain a control-plane observation entrypoint"
             );
-            assert_eq!(
-                spec.load_policy,
-                ToolLoadPolicy::AlwaysLoad,
-                "{name} must not require deferred discovery"
-            );
         }
+        assert_eq!(
+            registry.get("introspect").unwrap().load_policy,
+            ToolLoadPolicy::AlwaysLoad,
+            "artifact recovery must be available on the first request"
+        );
+        assert_eq!(
+            registry.get("reflect").unwrap().load_policy,
+            ToolLoadPolicy::Deferred,
+            "persisted reflection should load only for a diagnostic workflow"
+        );
+        assert_eq!(
+            registry
+                .get("tool_search")
+                .expect("tool_search registered")
+                .load_policy,
+            ToolLoadPolicy::AlwaysLoad,
+            "the activation path itself must remain available on the first request"
+        );
     }
 
     #[test]
-    fn execution_topology_entrypoints_are_always_load() {
+    fn execution_topology_is_discoverable_without_a_fixed_schema_tax() {
         let registry = registry();
         for name in ["agent", "agent_fanout"] {
             let spec = registry
@@ -1995,12 +2016,20 @@ mod tests {
                 WorkExecutionRole::Any,
                 "{name} is recursive execution topology, not Work graph authority"
             );
-            assert_eq!(
-                spec.load_policy,
-                ToolLoadPolicy::AlwaysLoad,
-                "{name} must be selectable on the first provider request"
-            );
         }
+        assert_eq!(
+            registry.get("agent").expect("agent registered").load_policy,
+            ToolLoadPolicy::Deferred,
+            "delegation is a workflow decision, not a first-request primitive"
+        );
+        assert_eq!(
+            registry
+                .get("agent_fanout")
+                .expect("agent_fanout registered")
+                .load_policy,
+            ToolLoadPolicy::Deferred,
+            "the larger fixed-fanout workflow should load only when selected"
+        );
     }
 
     #[test]

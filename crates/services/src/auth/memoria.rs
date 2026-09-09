@@ -59,6 +59,21 @@ fn normalize_url(value: &str) -> Result<String, String> {
     }
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
+
+fn is_loopback_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl MemoriaProvider {
     pub fn new(settings: &MemoriaSettings) -> Result<Self, String> {
         let base_url = normalize_url(&settings.base_url)?;
@@ -66,13 +81,7 @@ impl MemoriaProvider {
         let web_url = settings.web_url.as_deref().map(normalize_url).transpose()?;
         if let Some(web) = &web_url {
             let url = reqwest::Url::parse(web).map_err(|e| e.to_string())?;
-            let loopback = url.host_str().is_some_and(|h| {
-                h == "localhost"
-                    || h.trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            });
-            if url.scheme() != "https" && !loopback {
+            if url.scheme() != "https" && !is_loopback_url(web) {
                 return Err("MEMORIA_WEB_URL requires HTTPS except on loopback".into());
             }
         }
@@ -95,9 +104,16 @@ impl MemoriaProvider {
                 "Invalid Memoria connection key",
             ));
         }
-        let response = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10));
+        // A local development/test endpoint must not be sent through a
+        // process-wide HTTP proxy. Keep proxy support for real remote
+        // deployments, where the operator may require an egress proxy.
+        if is_loopback_url(&self.base_url) {
+            client = client.no_proxy();
+        }
+        let response = client
             .build()
             .map_err(|_| unavailable())?
             .get(format!("{}/auth/whoami", self.base_url))
@@ -301,10 +317,15 @@ impl DatabaseAuthService {
         })?;
         // Only the composition-time trusted website may attest fresh authentication.
         // A caller cannot supply a verifier URL or a different identity authority.
-        let mut response = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
-            .build().map_err(|_| unavailable())?
+            .timeout(std::time::Duration::from_secs(10));
+        if is_loopback_url(web) {
+            client = client.no_proxy();
+        }
+        let mut response = client
+            .build()
+            .map_err(|_| unavailable())?
             .post(format!("{web}/api/auth/astra/reauthentication/consume"))
             .json(&serde_json::json!({"proof":proof,"subject":binding.owner,"key_id":binding.generation,"purpose":purpose}))
             .send().await.map_err(|_| unavailable())?;
@@ -668,6 +689,30 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::{Duration, Instant};
+
+    async fn wait_for_fixture(url: &str) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("fixture HTTP client");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if client
+                .get(format!("{url}/auth/whoami"))
+                .send()
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "local Memoria HTTP fixture did not become ready"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
 
     #[tokio::test]
     async fn refresh_identity_rechecks_revocation_owner_and_outages() {
@@ -688,10 +733,11 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        wait_for_fixture(&url).await;
+        let verified = verify_connection(&url, "secret", "owner", "key").await;
         assert!(
-            verify_connection(&url, "secret", "owner", "key")
-                .await
-                .is_ok()
+            verified.is_ok(),
+            "fixture verification failed: {verified:?}"
         );
         assert_eq!(
             verify_connection(&url, "secret", "other-owner", "key")

@@ -7,6 +7,7 @@
 //!
 //! Benefits: no subprocess overhead, no shell injection risk, no `git` binary dependency.
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -25,11 +26,11 @@ const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// leaked threads / zombie processes.
 fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut child = Command::new("git")
+    let mut command = exact_git_command(project_root).ok()?;
+    let mut child = command
         .args(args)
-        .current_dir(project_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -562,9 +563,9 @@ fn validate_push_target(value: Option<&str>, param_name: &str) -> Result<String,
 }
 
 fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
-    std::process::Command::new("git")
+    exact_git_command(project_root)
+        .ok()?
         .args(["rev-parse", "--verify", commit_ref])
-        .current_dir(project_root)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -579,7 +580,8 @@ pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<S
     if count == 0 {
         return Some(Vec::new());
     }
-    std::process::Command::new("git")
+    exact_git_command(project_root)
+        .ok()?
         .args([
             "rev-list",
             "--first-parent",
@@ -587,7 +589,6 @@ pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<S
             &count.to_string(),
             "HEAD",
         ])
-        .current_dir(project_root)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -602,9 +603,8 @@ pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<S
 }
 
 pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
+    let output = exact_git_command(project_root)?
         .args(["status", "--porcelain"])
-        .current_dir(project_root)
         .output()
         .map_err(|error| format!("Error: git status failed: {error}"))?;
     if !output.status.success() {
@@ -617,9 +617,8 @@ pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
 }
 
 fn abort_git_revert(project_root: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
+    let output = exact_git_command(project_root)?
         .args(["revert", "--abort"])
-        .current_dir(project_root)
         .output()
         .map_err(|error| format!("Error: git revert --abort failed: {error}"))?;
     if output.status.success() {
@@ -823,7 +822,395 @@ fn pressure_scaled_limit(base: usize, pressure: f64) -> usize {
 }
 
 fn open_repo(project_root: &Path) -> Result<gix::Repository, String> {
-    gix::discover(project_root).map_err(|e| format!("Error: cannot open git repo: {e}"))
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
+    let repo = gix::open(&canonical_root)
+        .map_err(|e| format!("Error: cannot open bound git repo: {e}"))?;
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| "Error: bound git repository has no working tree".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("Error: cannot resolve bound git working tree: {error}"))?;
+    if work_dir != canonical_root {
+        return Err(format!(
+            "Error: bound git working tree escapes the selected project root ({})",
+            work_dir.display()
+        ));
+    }
+    Ok(repo)
+}
+
+/// Prove that the selected project root itself is a repository/worktree.
+///
+/// Git's default upward discovery is not an authority boundary: a temporary
+/// workspace created below Astra's own checkout must not read or mutate that
+/// parent repository. Linked worktrees remain valid because `gix::open`
+/// accepts their root-local `.git` file without searching any parent.
+pub fn validate_exact_repository_binding(
+    project_root: &Path,
+) -> Result<(), GitRequestValidationError> {
+    open_repo(project_root).map(|_| ()).map_err(|_| {
+        GitRequestValidationError::missing_path(
+            "Error: the bound project root is not a git repository or linked worktree",
+        )
+    })
+}
+
+/// Construct a Git subprocess pinned to the exact bound repository root.
+///
+/// The worktree and root-local `.git` entry are pinned before repository
+/// validation. Clearing repository-location overrides and executing from those
+/// same handles prevents a later rename/replacement from changing the admitted
+/// identity or falling through to a parent repository.
+pub struct ExactGitCommand {
+    command: std::process::Command,
+    #[cfg(unix)]
+    _git_dir: std::fs::File,
+    #[cfg(unix)]
+    _worktree: std::fs::File,
+}
+
+pub struct ExactTokioGitCommand {
+    command: tokio::process::Command,
+    #[cfg(unix)]
+    _git_dir: std::fs::File,
+    #[cfg(unix)]
+    _worktree: std::fs::File,
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected a regular .git file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn fd_root() -> Result<&'static Path, String> {
+    ["/proc/self/fd", "/dev/fd"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .ok_or_else(|| "Error: platform cannot expose pinned git handles".to_string())
+}
+
+#[cfg(unix)]
+fn fd_path(file: &std::fs::File) -> Result<std::path::PathBuf, String> {
+    use std::os::fd::AsRawFd;
+
+    Ok(fd_root()?.join(file.as_raw_fd().to_string()))
+}
+
+#[cfg(unix)]
+fn parse_linked_git_dir(
+    mut dot_git: std::fs::File,
+    pinned_worktree_path: &Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStringExt;
+
+    const MAX_GITDIR_FILE_BYTES: u64 = 64 * 1024;
+    let len = dot_git
+        .metadata()
+        .map_err(|error| format!("Error: cannot inspect bound .git file: {error}"))?
+        .len();
+    if len > MAX_GITDIR_FILE_BYTES {
+        return Err("Error: bound .git file exceeds the 64 KiB limit".to_string());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    dot_git
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Error: cannot read bound .git file: {error}"))?;
+    let Some(path) = bytes.strip_prefix(b"gitdir:") else {
+        return Err("Error: bound .git file has no gitdir directive".to_string());
+    };
+    let path = path
+        .strip_prefix(b" ")
+        .unwrap_or(path)
+        .strip_suffix(b"\n")
+        .unwrap_or(path);
+    let path = path.strip_suffix(b"\r").unwrap_or(path);
+    if path.is_empty() || path.contains(&0) || path.contains(&b'\n') || path.contains(&b'\r') {
+        return Err("Error: bound .git file has an invalid gitdir path".to_string());
+    }
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        pinned_worktree_path.join(path)
+    })
+}
+
+#[cfg(unix)]
+fn pin_exact_repository(canonical_root: &Path) -> Result<(std::fs::File, std::fs::File), String> {
+    // The selected worktree inode is the first authority. Every subsequent
+    // lookup is relative to its descriptor path, so replacing or renaming the
+    // caller-visible pathname cannot redirect the admitted repository.
+    let worktree = open_directory_no_follow(canonical_root)
+        .map_err(|error| format!("Error: cannot pin bound git working tree: {error}"))?;
+    let pinned_worktree_path = fd_path(&worktree)?;
+    let dot_git_path = pinned_worktree_path.join(".git");
+
+    let git_dir = match open_directory_no_follow(&dot_git_path) {
+        Ok(git_dir) => git_dir,
+        Err(directory_error) => {
+            let dot_git = open_regular_file_no_follow(&dot_git_path).map_err(|file_error| {
+                format!(
+                    "Error: bound project root has no exact .git authority ({directory_error}; {file_error})"
+                )
+            })?;
+            let linked_git_dir = parse_linked_git_dir(dot_git, &pinned_worktree_path)?;
+            open_directory_no_follow(&linked_git_dir).map_err(|error| {
+                format!("Error: cannot pin linked-worktree git metadata: {error}")
+            })?
+        }
+    };
+    Ok((git_dir, worktree))
+}
+
+#[cfg(unix)]
+fn configure_pinned_git_command(
+    command: &mut std::process::Command,
+    git_dir: &std::fs::File,
+    worktree: &std::fs::File,
+    force_worktree: bool,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_CEILING_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
+    let child_git_dir = git_dir
+        .try_clone()
+        .map_err(|error| format!("Error: cannot clone bound git metadata handle: {error}"))?;
+    command.env("GIT_DIR", fd_path(&child_git_dir)?);
+    if force_worktree {
+        // The child starts in the pinned worktree inode. An explicit lexical
+        // worktree prevents a later core.worktree edit from redirecting the
+        // already-admitted command.
+        command.env("GIT_WORK_TREE", ".");
+    }
+    command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0");
+    let child_worktree = worktree
+        .try_clone()
+        .map_err(|error| format!("Error: cannot clone bound git worktree handle: {error}"))?;
+    unsafe {
+        command.pre_exec(move || {
+            // Keep the metadata descriptor close-on-exec in the parent. Only
+            // the forked child clears its private copy immediately before
+            // exec, avoiding a process-wide inheritable-FD window in a
+            // multi-threaded runtime.
+            let flags = libc::fcntl(child_git_dir.as_raw_fd(), libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(
+                    child_git_dir.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fchdir(child_worktree.as_raw_fd()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::File, right: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(unix)]
+fn validate_pinned_repository(
+    git_dir: &std::fs::File,
+    worktree: &std::fs::File,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    // Ask Git to interpret the pinned metadata without forcing a worktree.
+    // Its reported top-level must resolve to the already-pinned worktree
+    // inode; this rejects bare repositories, foreign linked metadata, and a
+    // core.worktree redirect without reopening either admitted authority.
+    let mut command = std::process::Command::new("git");
+    configure_pinned_git_command(&mut command, git_dir, worktree, false)?;
+    let output = command
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--is-bare-repository",
+            "--show-toplevel",
+        ])
+        .output()
+        .map_err(|error| format!("Error: cannot validate pinned git repository: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Error: pinned git repository validation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut lines = output.stdout.splitn(3, |byte| *byte == b'\n');
+    if lines.next() != Some(b"true".as_slice()) || lines.next() != Some(b"false".as_slice()) {
+        return Err(
+            "Error: bound git metadata does not describe a working-tree repository".to_string(),
+        );
+    }
+    let Some(top_level) = lines.next() else {
+        return Err("Error: pinned git repository omitted its worktree identity".to_string());
+    };
+    let top_level = top_level.strip_suffix(b"\n").unwrap_or(top_level);
+    if top_level.is_empty() {
+        return Err("Error: pinned git repository has no working tree".to_string());
+    }
+    let top_level = std::path::PathBuf::from(std::ffi::OsString::from_vec(top_level.to_vec()));
+    let reported = open_directory_no_follow(&top_level)
+        .map_err(|error| format!("Error: cannot pin repository-reported working tree: {error}"))?;
+    if !same_file_identity(worktree, &reported)
+        .map_err(|error| format!("Error: cannot compare pinned git identities: {error}"))?
+    {
+        return Err(format!(
+            "Error: bound git working tree escapes the selected project root ({})",
+            top_level.display()
+        ));
+    }
+    Ok(())
+}
+
+impl Deref for ExactGitCommand {
+    type Target = std::process::Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for ExactGitCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+impl ExactGitCommand {
+    #[must_use]
+    pub fn into_tokio(self) -> ExactTokioGitCommand {
+        ExactTokioGitCommand {
+            command: tokio::process::Command::from(self.command),
+            #[cfg(unix)]
+            _git_dir: self._git_dir,
+            #[cfg(unix)]
+            _worktree: self._worktree,
+        }
+    }
+}
+
+impl Deref for ExactTokioGitCommand {
+    type Target = tokio::process::Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for ExactTokioGitCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+#[cfg(unix)]
+fn exact_git_command_with_pin_hook(
+    project_root: &Path,
+    after_pin_before_validation: impl FnOnce(),
+) -> Result<ExactGitCommand, String> {
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
+    let (git_dir, worktree) = pin_exact_repository(&canonical_root)?;
+    after_pin_before_validation();
+    validate_pinned_repository(&git_dir, &worktree)?;
+
+    let mut command = std::process::Command::new("git");
+    configure_pinned_git_command(&mut command, &git_dir, &worktree, true)?;
+    Ok(ExactGitCommand {
+        command,
+        _git_dir: git_dir,
+        _worktree: worktree,
+    })
+}
+
+pub fn exact_git_command(project_root: &Path) -> Result<ExactGitCommand, String> {
+    #[cfg(unix)]
+    {
+        exact_git_command_with_pin_hook(project_root, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        let canonical_root = project_root
+            .canonicalize()
+            .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
+        let repo = open_repo(&canonical_root)?;
+        let canonical_git_dir = repo
+            .path()
+            .canonicalize()
+            .map_err(|error| format!("Error: cannot resolve bound git metadata: {error}"))?;
+        let mut command = std::process::Command::new("git");
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            command.env_remove(variable);
+        }
+        command.current_dir(&canonical_root);
+        command.env("GIT_DIR", canonical_git_dir);
+        command.env("GIT_WORK_TREE", &canonical_root);
+        if let Some(parent) = canonical_root.parent() {
+            command.env("GIT_CEILING_DIRECTORIES", parent);
+        }
+        command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0");
+        Ok(ExactGitCommand { command })
+    }
 }
 
 /// Return the current branch name (like `git branch --show-current`).
@@ -861,6 +1248,10 @@ fn format_author_date(sig: &gix::actor::SignatureRef<'_>) -> String {
 // ─── status ─────────────────────────────────────────────────────────────
 
 pub fn status(project_root: &Path, args: &Value) -> String {
+    let repo = match open_repo(project_root) {
+        Ok(repo) => repo,
+        Err(error) => return error,
+    };
     // staged=true shows staged diff (index vs HEAD) instead of porcelain status
     if let Some(true) = args.get("staged").and_then(Value::as_bool) {
         let stat_only = args
@@ -872,11 +1263,6 @@ pub fn status(project_root: &Path, args: &Value) -> String {
         }
         return diff(project_root, args, 0.0, 0);
     }
-
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
 
     let mut out = String::new();
 
@@ -1538,6 +1924,10 @@ fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
 }
 
 pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
+    let repo = match open_repo(project_root) {
+        Ok(repo) => repo,
+        Err(error) => return error,
+    };
     let mut limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
     // Further reduce limit when aggregate output is already high
     if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
@@ -1551,11 +1941,6 @@ pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
     if stat_only {
         return diff_stat_cli(project_root, args, limit);
     }
-
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
 
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
@@ -2554,6 +2939,9 @@ pub fn commit(project_root: &Path, args: &Value) -> String {
 }
 
 pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    if let Err(error) = validate_exact_repository_binding(project_root) {
+        return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+    }
     let message = match args.get("message").and_then(Value::as_str) {
         Some(m) if !m.trim().is_empty() => m.trim(),
         _ => {
@@ -2580,10 +2968,12 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
 
     if files.is_empty() && !stage_all {
         // Default: stage all changes
-        let add_out = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(project_root)
-            .output();
+        let add_out = exact_git_command(project_root).and_then(|mut command| {
+            command
+                .args(["add", "-A"])
+                .output()
+                .map_err(|e| e.to_string())
+        });
         match add_out {
             Err(e) => {
                 return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
@@ -2598,9 +2988,13 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
         }
     } else if !files.is_empty() {
         // Stage specific files
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("add").args(&files).current_dir(project_root);
-        let add_out = cmd.output();
+        let add_out = exact_git_command(project_root).and_then(|mut command| {
+            command
+                .arg("add")
+                .args(&files)
+                .output()
+                .map_err(|e| e.to_string())
+        });
         match add_out {
             Err(e) => {
                 return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
@@ -2620,10 +3014,12 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
     if stage_all && files.is_empty() {
         commit_args.insert(1, "-a");
     }
-    let commit_out = std::process::Command::new("git")
-        .args(&commit_args)
-        .current_dir(project_root)
-        .output();
+    let commit_out = exact_git_command(project_root).and_then(|mut command| {
+        command
+            .args(&commit_args)
+            .output()
+            .map_err(|e| e.to_string())
+    });
 
     match commit_out {
         Ok(out) if out.status.success() => {
@@ -2678,6 +3074,9 @@ pub fn revert_commit(project_root: &Path, args: &Value) -> String {
 }
 
 pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    if let Err(error) = validate_exact_repository_binding(project_root) {
+        return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+    }
     let commit_ref = match args.get("commit_sha").and_then(Value::as_str) {
         Some(commit_ref) => match validate_commit_ref(commit_ref, "commit_sha") {
             Ok(commit_ref) => commit_ref,
@@ -2694,11 +3093,12 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
         }
     };
 
-    match std::process::Command::new("git")
-        .args(["revert", "--no-edit", target_commit_sha.as_str()])
-        .current_dir(project_root)
-        .output()
-    {
+    match exact_git_command(project_root).and_then(|mut command| {
+        command
+            .args(["revert", "--no-edit", target_commit_sha.as_str()])
+            .output()
+            .map_err(|error| error.to_string())
+    }) {
         Ok(out) if out.status.success() => {
             let revert_commit_sha = resolve_commit_ref(project_root, "HEAD");
             let revert_short_sha = revert_commit_sha
@@ -2770,19 +3170,24 @@ pub fn stash(project_root: &Path, args: &Value) -> String {
 }
 
 pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    if let Err(error) = validate_exact_repository_binding(project_root) {
+        return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+    }
     let action = match crate::git_tool_contract::git_stash_sub_action_from_args(args) {
         Ok(action) => action,
         Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
     };
     let action_name = action.as_str();
 
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root);
+    let mut cmd = match exact_git_command(project_root) {
+        Ok(command) => command,
+        Err(error) => return ToolExecutionOutcome::error(error),
+    };
     let before_stash_oid = matches!(action, crate::git_tool_contract::GitStashSubAction::Push)
         .then(|| {
-            std::process::Command::new("git")
+            exact_git_command(project_root)
+                .ok()?
                 .args(["rev-parse", "--verify", "refs/stash"])
-                .current_dir(project_root)
                 .output()
                 .ok()
                 .filter(|out| out.status.success())
@@ -2838,11 +3243,14 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                 };
                 let mut tool_result_fields = None;
                 if matches!(action, crate::git_tool_contract::GitStashSubAction::Push) {
-                    let after_stash_oid = std::process::Command::new("git")
-                        .args(["rev-parse", "--verify", "refs/stash"])
-                        .current_dir(project_root)
-                        .output()
+                    let after_stash_oid = exact_git_command(project_root)
                         .ok()
+                        .and_then(|mut command| {
+                            command
+                                .args(["rev-parse", "--verify", "refs/stash"])
+                                .output()
+                                .ok()
+                        })
                         .filter(|out| out.status.success())
                         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
                     if let Some(stash_ref) = after_stash_oid
@@ -2898,6 +3306,9 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
 /// - `force_with_lease` (bool, default false): use --force-with-lease
 /// - `set_upstream` (bool, default false): set upstream tracking with -u
 pub fn push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
+    if let Err(error) = validate_exact_repository_binding(project_root) {
+        return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+    }
     let remote = match validate_push_target(args.get("remote").and_then(Value::as_str), "remote") {
         Ok(remote) => remote,
         Err(error) => return ToolExecutionOutcome::error(error),
@@ -2916,8 +3327,10 @@ pub fn push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOut
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root);
+    let mut cmd = match exact_git_command(project_root) {
+        Ok(command) => command,
+        Err(error) => return ToolExecutionOutcome::error(error),
+    };
     cmd.arg("push");
 
     if force_with_lease {
@@ -2974,6 +3387,9 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
             return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
         }
     };
+    if let Err(error) = validate_exact_repository_binding(project_root) {
+        return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+    }
     match action {
         crate::git_tool_contract::GitAction::Status => {
             ToolExecutionOutcome::ok(status(project_root, args))
@@ -3203,6 +3619,130 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn bound_non_repository_never_discovers_or_mutates_parent_repository() {
+        let parent = init_temp_repo();
+        let child = parent.path().join("workspace");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("answer.txt"), "answer\n").unwrap();
+        let head_before = git_stdout(parent.path(), &["rev-parse", "HEAD"]);
+
+        let status = git_dispatch(&child, &json!({"action": "status"}));
+        assert!(
+            status.is_error,
+            "a parent repository is not bound authority"
+        );
+        let commit = commit_with_metadata(&child, &json!({"message": "must not escape"}));
+        assert!(commit.is_error);
+        assert_eq!(
+            git_stdout(parent.path(), &["rev-parse", "HEAD"]),
+            head_before
+        );
+        assert_eq!(
+            git_stdout(parent.path(), &["diff", "--cached", "--name-only"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn exact_repository_binding_accepts_linked_worktree_root() {
+        let container = TempDir::new().unwrap();
+        let repo = container.path().join("repo");
+        let linked = container.path().join("linked");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        run_git(&repo, &["add", "tracked.txt"]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        validate_exact_repository_binding(&linked).expect("linked worktree is exact authority");
+        assert!(!status(&linked, &json!({})).starts_with("Error:"));
+        let mut command = exact_git_command(&linked).expect("pin linked-worktree authority");
+        let output = command
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("execute pinned linked-worktree command");
+        assert!(
+            output.status.success(),
+            "pinned linked-worktree command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            git_stdout(&linked, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn exact_repository_binding_rejects_configured_worktree_outside_root() {
+        let container = TempDir::new().unwrap();
+        let repo = container.path().join("repo");
+        let outside = container.path().join("outside");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        run_git(&repo, &["init"]);
+        run_git(
+            &repo,
+            &["config", "core.worktree", outside.to_str().unwrap()],
+        );
+
+        let error = validate_exact_repository_binding(&repo)
+            .expect_err("core.worktree must not redirect authority outside the selected root");
+        assert!(error.message.contains("not a git repository"));
+        assert!(exact_git_command(&repo).is_err());
+    }
+
+    #[test]
+    fn exact_repository_binding_rejects_bare_repository() {
+        let bare = TempDir::new().unwrap();
+        run_git(bare.path(), &["init", "--bare"]);
+
+        assert!(validate_exact_repository_binding(bare.path()).is_err());
+        assert!(exact_git_command(bare.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_git_command_validates_and_executes_pinned_metadata_after_dot_git_replacement() {
+        let repo = init_temp_repo();
+        let expected_head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        let original_git = repo.path().join(".git-original");
+        let mut command = exact_git_command_with_pin_hook(repo.path(), || {
+            // This hook runs after both authority FDs are pinned but before
+            // repository validation. Replacing the caller-visible metadata
+            // here deterministically exercises the former validation→pin
+            // race: validation and execution must both retain the old inode.
+            std::fs::rename(repo.path().join(".git"), &original_git).unwrap();
+            run_git(repo.path(), &["init"]);
+        })
+        .expect("construct command from pinned authority");
+        command.args(["rev-parse", "HEAD"]);
+
+        let output = command.output().expect("run pinned git command");
+        assert!(
+            output.status.success(),
+            "pinned git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            expected_head,
+            "execution must retain the repository admitted before `.git` replacement"
+        );
     }
 
     fn init_temp_repo_with_ours_merge() -> TempDir {

@@ -74,6 +74,17 @@ When Edge/CLI and Server both provide `web_fetch`, Edge/CLI wins by default. Ser
 
 Unknown executor-gated capability defaults to `Unsupported`.
 
+For workspace-bound shell execution, the workspace root is the capability and
+observation boundary. A Bash invocation may select an existing directory
+within that root through its call-scoped `workdir`; this changes only the
+subprocess starting directory and never persists as session state. Resolution
+and symlink confinement happen at the CLI/User Runner executor before spawn,
+and, on Unix process paths with pinned-cwd support, a root-relative no-symlink
+directory-handle walk pins the identity used by policy, source capture, cache,
+execution, and evidence. Executors that cannot consume that pinned subdirectory
+identity (including the current managed mount boundary and non-Unix process
+path) fail closed instead of falling back to path-based execution.
+
 ## Routes
 
 | Route | Meaning |
@@ -94,6 +105,18 @@ Tool schema order must be deterministic:
 3. deferred tools through the same decision pool.
 
 Dynamic provider state should change compact availability facts, not invalidate the stable prompt prefix.
+
+The built-in default always-load surface is a bounded first-request primitive
+set, not a catalog of every useful workflow. Artifact-result recovery through
+`introspect` remains eager; optional persisted reflection, fan-out, memory
+operations, and graph-maintenance schemas remain discoverable through the
+deferred surface. Its resident compact-JSON schema projection has an 8 KiB
+regression budget; explicit user-pinned tools may exceed it. Deferred entries
+carry only compact discovery metadata and are activated through the typed
+`tool_search`/`invoke_tool` protocol, so a selected full schema never silently
+re-enters the repeated provider `tools[]` prefix. This bounds the fixed
+provider prefix without making cache reuse or capability reachability a
+correctness dependency.
 
 ## Skills
 

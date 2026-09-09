@@ -582,14 +582,14 @@ async fn run_turn(
         .or(developer_instructions)
         .or(ctx.system_prompt.clone());
     let continuation = app_server_continuation(&thread_id);
-    let activated_deferred_tool_names = continuation
+    let deferred_tool_activations = continuation
         .as_ref()
-        .map(|continuation| continuation.activated_deferred_tool_names.clone())
+        .map(|continuation| continuation.deferred_tool_activations.clone())
         .unwrap_or_default();
     let continuation_messages = continuation.map(|continuation| continuation.messages);
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages,
-        activated_deferred_tool_names,
+        deferred_tool_activations,
         append_system_prompt,
         cancel_token: Some(cancel),
         approval_request_tx: Some(approval_tx.clone()),
@@ -1268,7 +1268,6 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("done");
         result.session_id = Some(session_id.clone());
         result.tools_used = vec!["github".to_string()];
-        result.activated_deferred_tool_names = vec!["github".to_string()];
         result.final_messages = vec![
             serde_json::json!({"role": "user", "content": "list pull requests"}),
             serde_json::json!({"role": "assistant", "content": "done"}),
@@ -1289,15 +1288,11 @@ mod tests {
         let csl = crate::cli::session::session_continuation::load_csl_continuation(&session_id)
             .expect("exact CSL projection must parse")
             .expect("exact CSL projection must exist");
-        assert_eq!(csl.activated_deferred_tool_names, vec!["github"]);
+        assert!(csl.deferred_tool_activations.is_empty());
 
         let continuation =
             app_server_continuation(&session_id).expect("next app-server turn continuation");
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "a long-lived app-server must not require tool_search again on every visible turn"
-        );
+        assert!(continuation.deferred_tool_activations.is_empty());
         assert_eq!(
             continuation
                 .messages

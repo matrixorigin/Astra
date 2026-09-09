@@ -756,15 +756,21 @@ impl ToolExecutor {
     ) -> String {
         use serde_json::json;
 
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => match self.resolve_checked(p) {
-                Ok(safe) => safe,
-                Err(e) => return json!({ "success": false, "error": e }).to_string(),
-            },
+        let path_arg = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return json!({ "success": false, "error": "missing 'path'" }).to_string(),
         };
+        let path = match self.resolve_checked(path_arg) {
+            Ok(safe) => safe,
+            Err(e) => return json!({ "success": false, "error": e }).to_string(),
+        };
         let content = match args.get("content").and_then(Value::as_str) {
-            Some(c) => astra_tools::fs_ops::normalize_content_before_write(&path, c),
+            // Normalize from the caller's logical path spelling.  The path
+            // has already been resolved and sandbox-authorized above; using
+            // that resolved path here would make the owner outcome diverge
+            // from the shared convergence contract for explicitly allowed
+            // absolute paths or symlink aliases.
+            Some(c) => astra_tools::fs_ops::normalize_content_before_write(Path::new(path_arg), c),
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
 

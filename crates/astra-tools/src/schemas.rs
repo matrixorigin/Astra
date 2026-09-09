@@ -3,7 +3,7 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -15,6 +15,123 @@ pub const PER_ACTION_ALLOWED_KEY: &str = "x-astra-per-action-allowed";
 pub const ACTION_SURFACES_KEY: &str = "x-astra-action-surfaces";
 pub const SURFACE_DESCRIPTIONS_KEY: &str = "x-astra-surface-descriptions";
 pub const SURFACE_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-surface-discovery-summaries";
+/// Producer-owned compact discovery text for each action. Consumers may
+/// project this map after a typed action subset is selected; they never need
+/// to parse the full function description to discover which action remains.
+pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discovery-summaries";
+
+/// Rebuild the compact discovery summary after a typed action projection.
+///
+/// The retained action order is taken from the executable schema, while the
+/// wording comes only from producer-owned structured metadata. If a producer
+/// has not supplied the map, the existing summary is intentionally preserved.
+pub fn project_action_discovery_summary(
+    parameters: &mut Map<String, Value>,
+    retained_actions: &[String],
+) {
+    let Some(summaries) = parameters
+        .get(PER_ACTION_DISCOVERY_SUMMARIES_KEY)
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let projected = retained_actions
+        .iter()
+        .filter_map(|action| {
+            summaries
+                .get(action)
+                .and_then(Value::as_str)
+                .map(|summary| format!("{action}: {summary}"))
+        })
+        .collect::<Vec<_>>();
+    if projected.is_empty() {
+        parameters.remove("x-astra-discovery-summary");
+    } else {
+        parameters.insert(
+            "x-astra-discovery-summary".to_string(),
+            Value::String(projected.join(". ")),
+        );
+    }
+}
+
+/// Render the producer-declared conditional argument contract in a compact,
+/// provider-neutral form.
+///
+/// The internal `x-astra-*` annotations are useful to Astra's validator and
+/// provider adapters, but a deferred `tool_search` result deliberately strips
+/// those annotations to keep the activation payload small. Keeping this
+/// projection in the schema owner means discovery and provider wire adapters
+/// expose the same required/allowed fields without asking consumers to infer
+/// them from tool names or prose.
+#[must_use]
+pub fn action_contract_description(parameters: &Map<String, Value>) -> Option<String> {
+    let per_action_required = parameters
+        .get(PER_ACTION_REQUIRED_KEY)
+        .and_then(Value::as_object);
+    let per_action_any_of = parameters
+        .get(PER_ACTION_ANY_OF_REQUIRED_KEY)
+        .and_then(Value::as_object);
+    let per_action_allowed = parameters
+        .get(PER_ACTION_ALLOWED_KEY)
+        .and_then(Value::as_object);
+
+    let mut actions = BTreeSet::new();
+    for source in [per_action_required, per_action_any_of, per_action_allowed]
+        .into_iter()
+        .flatten()
+    {
+        actions.extend(source.keys().map(String::as_str));
+    }
+
+    let mut requirements = Vec::new();
+    for action in actions {
+        if let Some(fields) = per_action_required
+            .and_then(|source| source.get(action))
+            .and_then(Value::as_array)
+        {
+            let fields = fields.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if !fields.is_empty() {
+                requirements.push(format!("{action} requires {}", fields.join(" + ")));
+            }
+        }
+
+        if let Some(alternatives) = per_action_any_of
+            .and_then(|source| source.get(action))
+            .and_then(Value::as_array)
+        {
+            let alternatives = alternatives
+                .iter()
+                .filter_map(Value::as_array)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                })
+                .filter(|fields| !fields.is_empty())
+                .collect::<Vec<_>>();
+            if !alternatives.is_empty() {
+                requirements.push(format!(
+                    "{action} also requires one of {}",
+                    alternatives.join(" or ")
+                ));
+            }
+        }
+
+        if let Some(fields) = per_action_allowed
+            .and_then(|source| source.get(action))
+            .and_then(Value::as_array)
+        {
+            let fields = fields.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if !fields.is_empty() {
+                requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
+            }
+        }
+    }
+
+    (!requirements.is_empty()).then(|| format!("Action contract: {}.", requirements.join("; ")))
+}
 
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
@@ -400,6 +517,20 @@ pub fn validate_tool_arguments(
     let Some(schema) = built_in_schema_index().get(tool_name) else {
         return Ok(());
     };
+    validate_tool_arguments_against_schema(tool_name, args, schema)
+}
+
+/// Validate an invocation against the exact provider-owned function schema.
+///
+/// Builtins use [`validate_tool_arguments`], while dynamic provider tools must
+/// use this same validator before approval or dispatch. The schema is supplied
+/// by the authenticated provider contract; unknown names are never accepted
+/// merely because they are absent from Astra's builtin registry.
+pub fn validate_tool_arguments_against_schema(
+    tool_name: &str,
+    args: &Value,
+    schema: &Value,
+) -> Result<(), ToolArgumentValidationError> {
     let Some(parameters) = schema
         .get("function")
         .and_then(|function| function.get("parameters"))
@@ -521,10 +652,11 @@ fn start_work_schema() -> Value {
         "type": "function",
         "function": {
             "name": "start_work",
-            "description": "Establish one canonical Work and its initial ordered task list around the current durable conversation. Use this when the user's goal has multiple independently accepted outcomes or should continue as durable work; decide this from the goal's semantics without requiring the user to request a plan or use a command. Count user acceptance units, not response containers: explicitly requested A and B remain independent even when one final message presents both when each owes its own payload or evidence and either remains useful if the other fails; inputs used only for one combined conclusion are one outcome. An explicit same-turn multi-agent request without tracked lifecycle uses agent_fanout instead of Work. When a canonical Work already exists, use this same typed entrypoint for a follow-up task list; the server extends that branch without creating a second Work or asking the model to author graph identities. Do not use it for a simple question or one-shot response. Set activation=start for ordinary work that should proceed now. Set activation=defer only when the user explicitly wants a visible plan without execution yet. This lifecycle action declares work; it cannot claim completion. Supply the smallest useful sequence of independently executable, evidence-producing outcomes only: task identity, ordering, and execution dependencies are assigned by the server. Preserve staged chronology: when the user says an item should be added, discovered, or decided after a later event, omit it from this initial list and use the typed graph-update path only after that event occurs. If one bounded retrieval, inspection, or mutation produces all requested evidence, keep it as one task; do not split acquisition, extraction, and reporting of the same outcome into separate tasks. Remove any item whose sole expected result is to summarize, format, combine, report, or restate evidence from other items. Preserve explicitly named execution tracks one-for-one: N tracks means exactly N tasks unless the user changes scope. For example, `investigate A, investigate B, then answer` means two tasks (A and B), not a third answer task. The final response is outside the task list. A successful start result normally includes initial_task, the first durable primary-session assignment; execute it directly instead of spending another model round on run_next_work_item. Do not immediately revise a successful initial graph merely to rephrase it; revision requires new user guidance or newly observed evidence that materially changes scope, order, feasibility, or completion.",
+            "description": "Establish or extend the conversation's one canonical Work with an initial ordered task list. For 2+ independently useful deliverables/evidence tracks, call this before repository exploration; activation=start normally. Use it for durable tracking or continuation, or for multiple independently accepted outcomes; infer this from the goal. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses agent_fanout, not Work. For an existing Work, the server extends that branch without creating a second Work. Do not use Work for a simple question or one-shot response. activation=start assigns the first task; activation=defer is only for an explicitly requested visible plan without execution. This call declares work, never completion. Supply the smallest sequence of independently executable evidence outcomes; task identity, ordering, and execution dependencies are assigned by the server. Preserve staged chronology by omitting outcomes meant to be added, discovered, or decided later until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; do not split acquisition, extraction, and reporting of that outcome into separate tasks. Exclude items that only synthesize, format, report, or restate other evidence; the final response is not a task. Preserve N explicitly named execution tracks as exactly N tasks unless the user changes scope. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. Do not immediately revise an accepted graph merely to rephrase it; revision requires new user guidance or newly observed execution evidence that materially changes scope, order, feasibility, or completion.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
+                "x-astra-discovery-summary": "Declare only initial outcomes. Preserve staged chronology: omit outcomes meant to be added later until graph update. Preserve exactly N named initial tracks. start assigns the first task; use its returned assignment.",
                 "properties": {
                     "goal": {
                         "type": "string",
@@ -541,7 +673,7 @@ fn start_work_schema() -> Value {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "description": "Small ordered list of evidence-producing outcomes executable at initial admission. Keep only meaningful independently verifiable units; this is not a transcript checklist. Omit tasks the user explicitly stages for later addition or discovery, and omit final synthesis/reporting items that merely combine other task evidence. Each task must have a narrow objective and an expected result that can end its attempt as soon as sufficient evidence exists. List order is the default primary-session execution order; the server owns IDs and dependency mechanics.",
+                        "description": "Initial ordered evidence outcomes, not a transcript checklist. Each task must be independently verifiable, narrowly objective, and have an expected result that ends its attempt once evidenced. Omit tasks staged for later and final synthesis or reporting that only combines other evidence. List order is the default primary-session sequence; the server owns IDs and dependency mechanics.",
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -993,10 +1125,24 @@ pub fn project_action_schemas_for_surface(schemas: &mut [Value], surface: &str) 
                 properties.retain(|name, _| allowed_properties.contains(name));
             }
         }
+        let retained_actions = parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("action"))
+            .and_then(Value::as_object)
+            .and_then(|action| action.get("enum"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        project_action_discovery_summary(parameters, &retained_actions);
         for key in [
             PER_ACTION_REQUIRED_KEY,
             PER_ACTION_ANY_OF_REQUIRED_KEY,
             PER_ACTION_ALLOWED_KEY,
+            PER_ACTION_DISCOVERY_SUMMARIES_KEY,
         ] {
             if let Some(map) = parameters.get_mut(key).and_then(Value::as_object_mut) {
                 map.retain(|action, _| allowed_actions.contains(action));
@@ -1143,12 +1289,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-            "description": "source_artifacts preserves them before spawn. Checksum alone is not a backup. Foreground calls provide no process-persistence guarantee.",
+            "description": "Workspace root is default; workdir selects a bounded call directory. source_artifacts preserves them before spawn. Checksum alone is not a backup; no process-persistence guarantee.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
+                        "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
                         "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Use only for a foreground verification command after edits. It succeeds only when the command exits zero and the executor proves the bound workspace stayed unchanged; do not use it for commands that write files."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
@@ -1164,7 +1311,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "minItems": 1,
                             "maxItems": 16,
                             "items": {"type": "string", "minLength": 1},
-                            "description": "Optional executor-owned external-effect contract. For a requested change outside the bound workspace, list the smallest absolute external roots whose state must change. Astra captures bounded pre/post fingerprints and issues completion evidence only for an observed delta under authoritative process ownership. Paths inside or overlapping the workspace, relative/traversal paths, unobservable roots, background tasks, and unchanged state fail closed. Do not use this for workspace files."
+                            "description": "Required when this command may change state outside the bound workspace. List the smallest absolute external roots whose state must change. Astra captures bounded pre/post fingerprints and issues completion evidence only for an observed delta under authoritative process ownership. Paths inside or overlapping the workspace, relative/traversal paths, unobservable roots, background tasks, and unchanged state fail closed. Omit this only for workspace-confined work or an explicit read-only verification; do not use it for workspace files."
                         }
                     },
                     "required": ["command"]
@@ -1852,6 +1999,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "x-astra-surface-discovery-summaries": {
                         "server": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. send_message: action+to+message. Durable task lists use start_work."
                     },
+                    "x-astra-per-action-discovery-summaries": {
+                        "spawn": "action+description+prompt; foreground fan-in unless the user backgrounds it",
+                        "get_result": "action+agent_id",
+                        "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
+                        "send_message": "action+to+message"
+                    },
                     "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: local fixed pipeline with action+name+description+steps, never a durable task list. send_message: action+to+message. Durable task lists use the separate start_work tool.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
@@ -1938,6 +2091,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
          Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding; only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `max_turns` unless the user supplied a bound or the slot is small enough to reserve its final model boundary for synthesis. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
+                    "x-astra-per-action-discovery-summaries": {
+                        "start": "target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs",
+                        "get_results": "action+group_id; use bounded result windows and follow next_call",
+                        "stop_slot": "action+group_id+slot_index",
+                        "stop_group": "action+group_id"
+                    },
                      "x-astra-discovery-summary": "start: target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs. Omit agent_type=read-only explore; task/general-purpose=mutation. Child surface authoritative.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
@@ -1981,7 +2140,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},
                         "offset": {"type": "integer", "minimum": 0, "description": "Optional for get_results with slot_index. Byte offset for the slot result window. Default 0."},
-                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Optional for get_results. Maximum result bytes per slot window. Default 8192, max 65536."}
+                        "max_bytes": {"type": "integer", "minimum": 4, "maximum": 65536, "description": "Optional for get_results. Maximum UTF-8 result bytes per slot window. Default 8192; valid range 4-65536."}
                     },
                     "required": ["action"],
                     "additionalProperties": false,
@@ -2004,21 +2163,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read the live observation snapshot for the running turn/session. Call this before answering a user request to audit or reflect on runtime/session state, recent tool use, traces, or agent execution behavior; conversation history and session memory are not substitutes for runtime telemetry. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. Use artifact plus offset to read a bounded window from a persisted tool-result handle. CLI/Edge can also inspect local cache and session_memory artifacts. Introspect is live-only: a historical turn/session/cross-session horizon returns a clearly labeled recent live projection; use reflect for persisted causal evidence.",
+                "description": "Read bounded live runtime/session observations or a persisted tool-result artifact. Use before auditing current token/cache pressure, latency, tool health/errors, rounds, traces, stall/noise, working memory, or lifecycle/resume state. For a retrospective, start once with facet=overview and depth=diagnostic; target another facet only for a reported gap. Live horizons are not historical truth; use deferred reflect for persisted causal evidence. With artifact, read the session-scoped handle from offset for max_bytes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Top-level observation area. Defaults to runtime; use execution for errors/trace and knowledge for session_memory/context artifacts."},
-                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Specific live view. overview is the composite view and should be the single first call for a runtime retrospective: it includes session state, recent rounds/trace timing and tools, stall/noise, and errors. Do not fan out separate facets unless overview reports a concrete gap. cache and session_memory require CLI/Edge-local artifacts; unavailable providers are reported in data_coverage."},
-                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer, including step latency/performance when available. Use diagnostic with facet=overview for one-call retrospective evidence."},
-                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Observation window. now/current_turn/recent return live evidence directly. A historical turn/session/cross_session request returns a labeled recent live projection rather than failing; pair it with reflect for persisted evidence. Choose trace-like content with facet=trace, not by changing horizon."},
-                        "question": {"type": "string", "description": "Optional caller context label. It does not widen the live evidence horizon or replace reflect for persisted causal analysis."},
-                        "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source. Missing or unsatisfied providers are reported instead of fabricated."},
-                        "include_context": {"type": "boolean", "description": "Request visible prompt/context facts when a provider is available; these are observed context, not durable truth."},
-                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format. text is default; json returns a structured read-only observation envelope."},
-                        "artifact": {"type": "string", "description": "An opaque session-scoped artifact://session/tool-result/<token> handle returned for an oversized tool result. When set, reads that result instead of a runtime snapshot."},
-                        "offset": {"type": "integer", "minimum": 0, "description": "Byte offset for artifact recovery. Start at 0 and continue with the returned next_offset."},
-                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Maximum bytes in one artifact window. Defaults to 8192; use returned next_offset to continue."}
+                        "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Area: runtime is default; execution covers errors/trace, knowledge covers context artifacts."},
+                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Live view. Start retrospectives with overview; use another facet only for a reported gap. cache/session_memory may require CLI/Edge data."},
+                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Detail level. diagnostic/forensic include bounded full live data when available."},
+                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Window label. Historical labels return a marked recent live projection; use reflect for persisted history."},
+                        "question": {"type": "string", "description": "Optional context label; it does not widen evidence."},
+                        "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Source preference; unavailable coverage is reported."},
+                        "include_context": {"type": "boolean", "description": "Include available observed prompt/context facts."},
+                        "format": {"type": "string", "enum": ["text","json"], "description": "Output format; default text."},
+                        "artifact": {"type": "string", "description": "Session-scoped artifact handle; when set, read it instead of live state."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Artifact byte offset; default 0."},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Artifact window bytes; default 8192, max 65536."}
                     },
                     "additionalProperties": false
                 }
@@ -2100,9 +2259,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "tool_search",
                 "description":
-                    "Activate deferred tools by explicit catalog name. `select:NAME[,NAME]` \
-                     returns compact callable shape and queues schemas for the next request. \
-                     Natural-language intent matching is deliberately unsupported.",
+                    "Select invocation contracts by catalog name (`select:NAME[,NAME]`). \
+                     Reuse selections across turns via invoke_tool while available. \
+                     Selection does not change tools[] or grant permission.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2450,6 +2609,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn action_discovery_summary_projects_only_retained_typed_actions() {
+        let mut parameters = serde_json::Map::from_iter([
+            (
+                PER_ACTION_DISCOVERY_SUMMARIES_KEY.to_string(),
+                json!({
+                    "start": "target_count+slots",
+                    "get_results": "group_id+bounded window",
+                    "stop_group": "group_id"
+                }),
+            ),
+            (
+                "x-astra-discovery-summary".to_string(),
+                json!("start: target_count+slots"),
+            ),
+        ]);
+        project_action_discovery_summary(
+            &mut parameters,
+            &["get_results".to_string(), "stop_group".to_string()],
+        );
+        assert_eq!(
+            parameters["x-astra-discovery-summary"],
+            "get_results: group_id+bounded window. stop_group: group_id"
+        );
+    }
+
     fn required_fields(schema: &Value) -> Vec<String> {
         schema
             .pointer("/function/parameters/required")
@@ -2565,6 +2750,7 @@ mod tests {
         );
         assert!(params["properties"].get("offset").is_some());
         assert_eq!(params["properties"]["max_bytes"]["maximum"], 65536);
+        assert_eq!(params["properties"]["max_bytes"]["minimum"], 4);
         assert_eq!(
             params["properties"]["slots"]["items"]["required"],
             json!(["description", "prompt"])
@@ -2713,6 +2899,13 @@ mod tests {
     fn start_work_schema_exposes_a_small_server_owned_task_list() {
         let schemas = all_tool_schemas();
         let schema = find_schema(&schemas, "start_work").expect("start_work schema");
+        let serialized_bytes = serde_json::to_vec(schema)
+            .expect("start_work schema must serialize deterministically")
+            .len();
+        assert!(
+            serialized_bytes <= 3_500,
+            "start_work must keep its complete always-load wire schema compact; got {serialized_bytes} bytes"
+        );
         let description = schema["function"]["description"]
             .as_str()
             .expect("start_work description");
@@ -2733,6 +2926,18 @@ mod tests {
             ]
         );
         let parameters = &schema["function"]["parameters"];
+        let selection = crate::tool_search::tool_selection_contract(schema)
+            .expect("start_work must have a discovery contract");
+        assert_eq!(
+            selection["description_truncated"], false,
+            "load-bearing Work chronology must survive deferred discovery"
+        );
+        assert!(
+            selection["description"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("Preserve staged chronology")
+                    && summary.contains("exactly N named initial tracks"))
+        );
         assert!(
             parameters["properties"]["tasks"]["description"]
                 .as_str()
@@ -2803,6 +3008,23 @@ mod tests {
             }),
         ] {
             assert!(validate_tool_arguments("start_work", &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn start_work_schema_is_identical_across_local_and_server_projection() {
+        let schemas = all_tool_schemas();
+        let canonical = find_schema(&schemas, "start_work")
+            .expect("start_work schema")
+            .clone();
+
+        for surface in ["local", "server"] {
+            let mut projected = vec![canonical.clone()];
+            project_action_schemas_for_surface(&mut projected, surface);
+            assert_eq!(
+                projected[0], canonical,
+                "start_work has no surface-specific action union; {surface} projection must preserve its complete wire contract"
+            );
         }
     }
 
@@ -3231,8 +3453,8 @@ mod tests {
         let description = introspect["function"]["description"]
             .as_str()
             .expect("introspect description must be present");
-        assert!(description.contains("recent live projection"));
-        assert!(description.contains("use reflect"));
+        assert!(description.contains("Live horizons are not historical truth"));
+        assert!(description.contains("use deferred reflect"));
         let properties = introspect["function"]["parameters"]["properties"]
             .as_object()
             .expect("introspect parameters properties must be an object");
@@ -3240,7 +3462,7 @@ mod tests {
             properties["horizon"]["description"]
                 .as_str()
                 .expect("introspect horizon description")
-                .contains("rather than failing")
+                .contains("marked recent live projection")
         );
         assert_eq!(
             enum_values(&properties["horizon"]),
@@ -3302,6 +3524,11 @@ mod tests {
                 "introspect schema should expose normalized observation parameter `{key}`"
             );
         }
+        assert_eq!(
+            properties.len(),
+            11,
+            "introspect prose compression must not add or remove parameters"
+        );
         assert!(
             !properties.contains_key("subtopic")
                 && !properties.contains_key("detail")
@@ -3326,6 +3553,16 @@ mod tests {
             "introspect source_policy schema must not regress to old edge/server/cloud aliases"
         );
         assert_eq!(properties["max_bytes"]["maximum"], 65_536);
+        assert_eq!(properties["max_bytes"]["minimum"], 1);
+        assert_eq!(properties["offset"]["minimum"], 0);
+        assert_eq!(enum_values(&properties["format"]), vec!["text", "json"]);
+        let serialized_bytes = serde_json::to_vec(introspect)
+            .expect("introspect schema must serialize")
+            .len();
+        assert!(
+            serialized_bytes <= 2_400,
+            "introspect eager schema uses {serialized_bytes} bytes; keep the fixed-prefix contract at or below 2400 bytes"
+        );
     }
 
     #[test]
@@ -3765,6 +4002,16 @@ mod tests {
                 .and_then(Value::as_f64),
             Some(crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS)
         );
+        assert_eq!(
+            bash.pointer("/function/parameters/properties/workdir/type")
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        validate_tool_arguments(
+            "bash",
+            &json!({"command": "pwd", "workdir": "crates/runtime"}),
+        )
+        .expect("bash must accept a call-scoped workdir");
         assert!(
             bash.pointer("/function/parameters/properties/timeout/description")
                 .and_then(Value::as_str)

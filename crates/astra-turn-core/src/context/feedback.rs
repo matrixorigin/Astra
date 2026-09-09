@@ -63,6 +63,11 @@ pub struct RuntimeContextFeedback {
     pub effective_input_limit_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_input_tokens: Option<u64>,
+    /// Estimated tokens in the provider-visible stable system/tool prefix.
+    /// This is a diagnostic denominator, not a promise that the provider
+    /// caches exactly this many tokens; provider usage remains authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cache_eligible_tokens: Option<u64>,
     /// Ratio of estimated outgoing input to the effective input limit.
     /// Values above 1.0 are meaningful pressure evidence, not invalid data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +314,19 @@ impl RuntimeFeedbackFrame {
         self.request_usage.map(|usage| usage.cache_hit_ratio())
     }
 
+    /// Compare provider-reported cache reads with the estimated stable prefix.
+    /// The value may exceed `1.0` when a provider also caches conversation
+    /// history, so callers must not present it as a hit percentage.
+    #[must_use]
+    pub fn cache_read_vs_eligible_ratio(&self) -> Option<f64> {
+        let eligible = self.context.estimated_cache_eligible_tokens?;
+        let cache_read = self.request_usage?.cache_read;
+        if eligible == 0 {
+            return None;
+        }
+        Some(cache_read as f64 / eligible as f64)
+    }
+
     pub fn detect_cache_break(&mut self, turn: u32, min_creation_threshold: u64) {
         if turn > 1
             && self.request_usage.is_some_and(|usage| {
@@ -429,6 +447,59 @@ mod tests {
         let f = ContextFeedback::from_usage(1000, 0, 0, 500, false);
         assert_eq!(f.cache_hit_ratio, 0.0);
         assert!(!f.cache_hit_ratio.is_nan());
+    }
+
+    #[test]
+    fn stable_prefix_cache_ratio_is_distinct_from_provider_hit_share() {
+        let mut frame = RuntimeFeedbackFrame {
+            schema_version: RuntimeFeedbackFrame::SCHEMA_VERSION,
+            identity: RuntimeFeedbackIdentity {
+                session_id: "session".to_string(),
+                run_id: "run".to_string(),
+                agent_id: "agent".to_string(),
+                model_id: "model".to_string(),
+                topology: astra_services::ModelRequestTopology::CliServer,
+                request: None,
+            },
+            progress: RuntimeFeedbackProgress {
+                session_turn: 1,
+                agentic_round_index: 1,
+                llm_rounds_completed: 1,
+                slice_round_limit: 1,
+                slice_rounds_remaining: 0,
+                absolute_round_ceiling: None,
+            },
+            context: RuntimeContextFeedback {
+                prompt_cache_identity: None,
+                model_context_window_tokens: None,
+                effective_input_limit_tokens: None,
+                estimated_input_tokens: None,
+                estimated_cache_eligible_tokens: None,
+                token_pressure: None,
+                compaction_tier: CompactionTier::Normal,
+            },
+            request_usage: None,
+            run_usage: None,
+            was_truncated: false,
+            cache_break_detected: None,
+            policy_feedback: RuntimePolicyFeedbackSet::NotEvaluated,
+        };
+        frame.context.estimated_cache_eligible_tokens = Some(100);
+        frame.request_usage = Some(TokenAccounting::from_fields(20, 80, 0, 0));
+
+        assert_eq!(frame.cache_read_vs_eligible_ratio(), Some(0.8));
+        assert_eq!(frame.cache_hit_ratio(), Some(0.8));
+
+        // Providers may report conversation-prefix reads beyond the stable
+        // system/tool estimate. Preserve that evidence instead of clamping it
+        // into a misleading percentage.
+        frame.request_usage = Some(TokenAccounting::from_fields(20, 120, 0, 0));
+        assert_eq!(frame.cache_read_vs_eligible_ratio(), Some(1.2));
+
+        frame.context.estimated_cache_eligible_tokens = Some(0);
+        assert_eq!(frame.cache_read_vs_eligible_ratio(), None);
+        frame.context.estimated_cache_eligible_tokens = None;
+        assert_eq!(frame.cache_read_vs_eligible_ratio(), None);
     }
 
     #[test]

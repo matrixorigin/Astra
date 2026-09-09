@@ -212,9 +212,9 @@ pub(crate) struct SessionState {
     /// Most recent non-empty tool usage context — fed into tool-surface
     /// continuity for short follow-up turns.
     pub recent_tools: Vec<String>,
-    /// Deferred schemas materialized in the retained session context.
-    /// Entries remain until reset or invalidation by the live tool surface.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed evidence for stable deferred carrier calls. Tool names
+    /// remain UI continuity only; this field is the recoverable proof.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
@@ -515,7 +515,7 @@ impl Default for SessionState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             perm_manager: PermissionManager::with_workspace_trust(
                 default_auto_approve_from_env(),
                 &std::env::current_dir().unwrap_or_default(),
@@ -663,7 +663,7 @@ impl SessionState {
         // Deferred materialization is evidence from this session's retained
         // conversation. Never carry a selected schema into a newly bound
         // session after the identity is cleared.
-        self.activated_deferred_tool_names.clear();
+        self.deferred_tool_activations.clear();
         self.clear_resume_recovery_state();
         self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
@@ -702,7 +702,7 @@ impl SessionState {
         self.total_session_cost = 0.0;
         self.journal = None;
         self.recent_tools.clear();
-        self.activated_deferred_tool_names.clear();
+        self.deferred_tool_activations.clear();
         self.last_turn_interrupted = false;
         self.last_turn_event = None;
         self.session_persistence_error = None;
@@ -812,7 +812,11 @@ mod default_tests {
             total_cache_creation_tokens: 44,
             total_session_cost: 1.25,
             recent_tools: vec!["bash".into()],
-            activated_deferred_tool_names: vec!["write_file".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "write_file".into(),
+                schema_digest: "sha256:write-file".into(),
+                descriptor: None,
+            }],
             redo_stack: vec![("u".into(), "a".into(), 1)],
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -856,7 +860,7 @@ mod default_tests {
         assert_eq!(state.total_cache_creation_tokens, 0);
         assert_eq!(state.total_session_cost, 0.0);
         assert!(state.recent_tools.is_empty());
-        assert!(state.activated_deferred_tool_names.is_empty());
+        assert!(state.deferred_tool_activations.is_empty());
         assert!(state.redo_stack.is_empty());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
@@ -970,7 +974,11 @@ mod default_tests {
             runtime_pipeline_state: Some(serde_json::json!({"old_session": true})),
             runtime_compaction_state: Some(serde_json::json!({"attempt_count": 3})),
             runtime_consecutive_context_window_errors: 2,
-            activated_deferred_tool_names: vec!["web_fetch".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "web_fetch".into(),
+                schema_digest: "sha256:web-fetch".into(),
+                descriptor: None,
+            }],
             ..Default::default()
         };
 
@@ -984,7 +992,7 @@ mod default_tests {
         assert!(state.runtime_pipeline_state.is_none());
         assert!(state.runtime_compaction_state.is_none());
         assert_eq!(state.runtime_consecutive_context_window_errors, 0);
-        assert!(state.activated_deferred_tool_names.is_empty());
+        assert!(state.deferred_tool_activations.is_empty());
     }
 
     #[test]
@@ -1055,7 +1063,11 @@ mod default_tests {
             session_id: Some("sess-restore".into()),
             history: vec![("u".into(), "a".into())],
             recent_tools: vec!["bash".into()],
-            activated_deferred_tool_names: vec!["write_file".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "write_file".into(),
+                schema_digest: "sha256:write-file".into(),
+                descriptor: None,
+            }],
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             plan_mode_sync_error: Some("sync".into()),
             resume_guidance: Some("resume".into()),
@@ -1070,7 +1082,7 @@ mod default_tests {
         assert!(state.session_id.is_none());
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
-        assert!(state.activated_deferred_tool_names.is_empty());
+        assert!(state.deferred_tool_activations.is_empty());
         assert!(state.discovered_skills.is_empty());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.resume_guidance.is_none());

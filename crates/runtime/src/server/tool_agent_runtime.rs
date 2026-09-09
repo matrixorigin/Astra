@@ -91,6 +91,7 @@ pub(crate) async fn execute_agent_fanout_tool(
     agent_tool_result_from_output(
         crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context).await,
     )
+    .with_source_bounded_model_projection()
 }
 
 fn correlated_agent_arguments(args: &Value, tool_call_id: Option<&str>) -> Value {

@@ -56,6 +56,22 @@ pub(crate) struct RuntimeMcpBundle {
 }
 
 impl RuntimeMcpBundle {
+    /// Return the resolver-owned public-alias to provider-native identity
+    /// projection. Runtime schema installation must carry this exact map so
+    /// an alias is never reinterpreted as an execution name later.
+    pub(crate) fn native_tool_ids_by_public_name(&self) -> HashMap<String, String> {
+        self.provider_snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.alias_index.iter())
+            .map(|(alias, descriptor)| {
+                (
+                    alias.to_string(),
+                    descriptor.identity.native_tool_id.to_string(),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn configure_semantic_read_cache(
         &self,
         executor: &mut crate::server::runtime_tool_executor::RuntimeToolExecutor,

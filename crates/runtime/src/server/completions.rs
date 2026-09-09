@@ -32,7 +32,7 @@ fn completion_admission_estimated_tokens(
     messages: &[serde_json::Value],
     max_output_tokens: u32,
 ) -> u64 {
-    crate::prompts::estimate_tokens(messages, 0, 0)
+    crate::prompts::estimate_wire_input_tokens(messages, 0)
         .saturating_add(max_output_tokens as usize)
         .try_into()
         .unwrap_or(u64::MAX)
@@ -551,8 +551,13 @@ mod tests {
     fn completion_admission_estimate_covers_prompt_and_server_bounded_output() {
         let messages = vec![json!({"role": "user", "content": "classify this request"})];
         let estimate = completion_admission_estimated_tokens(&messages, 64);
+        let expected = (crate::prompts::estimate_wire_input_tokens(&messages, 0) + 64) as u64;
+        assert_eq!(estimate, expected);
         assert!(estimate >= 64);
-        assert!(estimate > 14_000, "shared prompt estimate must be included");
+        assert!(
+            estimate < 14_000,
+            "opaque completion requests must not inherit the agent system-prompt estimate"
+        );
     }
 
     #[test]

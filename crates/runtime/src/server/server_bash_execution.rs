@@ -56,9 +56,19 @@ pub(crate) async fn execute_server_bash(
             );
         }
     };
-    if let Err(reason) =
-        astra_tools::shell_ops::validate_execute_bash_command_in_workspace(command, workspace_root)
-    {
+    let workdir = match astra_tools::shell_ops::resolve_bash_workdir(workspace_root, args) {
+        Ok(workdir) => workdir,
+        Err(error) => return astra_tools::ToolResult::error(error),
+    };
+    let inspection_dir = match workdir.inspection_path() {
+        Ok(path) => path,
+        Err(error) => return astra_tools::ToolResult::error(error),
+    };
+    if let Err(reason) = astra_tools::shell_ops::validate_execute_bash_command_in_workspace_from(
+        command,
+        workspace_root,
+        &inspection_dir,
+    ) {
         return astra_tools::ToolResult::error(reason);
     }
     if command.len() > MAX_COMMAND_LENGTH {
@@ -94,9 +104,13 @@ pub(crate) async fn execute_server_bash(
         // operand, or unavailable durable store must never make ordinary
         // server bash unavailable; only an explicit declaration is fail-closed.
         if let Some(scope) = source_scope {
-            source_preimages =
-                astra_tools::source_preimage::prepare_inferred(workspace_root, command, scope)
-                    .unwrap_or(None);
+            source_preimages = astra_tools::source_preimage::prepare_inferred(
+                workspace_root,
+                &inspection_dir,
+                command,
+                scope,
+            )
+            .unwrap_or(None);
         }
     }
 
@@ -203,6 +217,7 @@ pub(crate) async fn execute_server_bash(
     let result = match server_bash_execution_mode(sandbox_policy) {
         ServerBashExecutionMode::IsolatedProcess => {
             let mut config = IsolationConfig::strict(workspace_root.to_path_buf());
+            workdir.install_on_isolation_config(&mut config);
             apply_policy_limits_to_isolation_config(&mut config, sandbox_policy, timeout_secs);
             config.net_namespace = !sandbox_policy.network_allowed;
             let env = server_process_environment(sandbox_policy, workspace_root);
@@ -225,6 +240,7 @@ pub(crate) async fn execute_server_bash(
         }
         ServerBashExecutionMode::SandboxedProcess => {
             let mut config = IsolationConfig::sandboxed(workspace_root.to_path_buf());
+            workdir.install_on_isolation_config(&mut config);
             apply_policy_limits_to_isolation_config(&mut config, sandbox_policy, timeout_secs);
             let env = server_process_environment(sandbox_policy, workspace_root);
             let output = crate::tool_sandbox::execute_isolated_with_cancel(
@@ -332,6 +348,12 @@ pub(crate) async fn execute_server_bash(
             .get_or_insert_with(Default::default)
             .extend(receipt);
     }
+    astra_tools::shell_ops::attach_bash_workdir_evidence(
+        &mut result,
+        workspace_root,
+        &workdir,
+        args,
+    );
     attach_source_preimage(result, source_preimages)
 }
 
@@ -736,6 +758,43 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("unavailable"));
         assert!(!result.output.contains("should-not-run"));
+    }
+
+    #[tokio::test]
+    async fn server_bash_honors_call_scoped_workdir() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("nested")).unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+
+        let result = execute_server_bash(
+            &policy,
+            workspace.path(),
+            &binding,
+            None,
+            &serde_json::json!({"command": "pwd", "workdir": "nested"}),
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["bash_workdir"],
+            serde_json::json!({
+                "requested": "nested",
+                "resolved_workspace_relative": "nested"
+            })
+        );
+        assert_eq!(
+            result.output.trim(),
+            workspace
+                .path()
+                .join("nested")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ fn runtime_feedback(turn: u32) -> RuntimeFeedbackFrame {
             model_context_window_tokens: Some(200_000),
             effective_input_limit_tokens: Some(160_000),
             estimated_input_tokens: Some(2_000),
+            estimated_cache_eligible_tokens: None,
             token_pressure: Some(0.0125),
             compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
         },

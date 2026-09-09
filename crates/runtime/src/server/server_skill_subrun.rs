@@ -1113,7 +1113,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),

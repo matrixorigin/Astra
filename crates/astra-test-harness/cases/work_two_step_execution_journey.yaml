@@ -103,10 +103,12 @@ criteria:
       - type: pipeline_alert_count
         rule: prompt_cache_break
         max: 0
-      - type: provider_prompt_cache_stable_prefix_reuse_ratio
+      - type: provider_prompt_cache_read_nonregression_ratio
         min: 0.95
         min_pairs: 1
         max_identity_transitions_per_run: 1
-        # Each identity's first request is a typed cold boundary; only later
-        # requests within that same prefix epoch are scored. Legitimate
-        # runtime tool-surface changes are not assigned a fixed round number.
+        # Compare cache-read counts within each system/tool identity epoch,
+        # exempting only its first pair with a zero previous read. Reads can
+        # include history; this does not assert absolute cache-read coverage.
+        # Legitimate tool-surface changes are bounded by identity transitions,
+        # not assigned a fixed round number.

@@ -37,7 +37,7 @@ steps:
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
+  - type: journal_tool_called
     name: memory
   - type: journal_tool_call_count
     name: memory

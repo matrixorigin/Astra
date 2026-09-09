@@ -346,16 +346,15 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     else {
         return;
     };
-    let persisted_activation = state
-        .runtime_tool_executor
-        .as_deref()
-        .map(|executor| executor.activated_deferred_tool_names())
-        .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
-    heavy.activated_deferred_tool_names =
-        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+    // Carrier authority is deliberately reconstructed only from paired
+    // tool_search evidence with a schema digest. Name-only selection state is
+    // neither prompt continuity nor execution authority in this protocol.
+    state.deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &checkpoint_messages,
-            persisted_activation,
+            std::mem::take(&mut state.deferred_tool_activations),
         );
+    heavy.deferred_tool_activations = state.deferred_tool_activations.clone();
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
     // Persist context pipeline state for warm-start on resume (includes emergent context).
@@ -1654,7 +1653,11 @@ mod tests {
         state.context_manifest_user_id = Some(user_id.to_string());
         state.current_session_id = Some(session_id.clone());
         state.step_recorder.begin_turn(0);
-        state.activated_deferred_tool_names = vec!["github".to_string()];
+        state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+            name: "github".to_string(),
+            schema_digest: "sha256:compacted-selection".to_string(),
+            descriptor: None,
+        }];
         state.messages = vec![
             serde_json::json!({"role": "system", "content": "compacted", "_compact_boundary": true}),
             serde_json::json!({"role": "user", "content": "continue"}),
@@ -1668,9 +1671,8 @@ mod tests {
                 .expect("read checkpoint")
                 .expect("heavy checkpoint");
         assert_eq!(
-            heavy.activated_deferred_tool_names,
-            vec!["github"],
-            "compaction may remove tool-search messages but must not erase schema materialization state"
+            heavy.deferred_tool_activations, state.deferred_tool_activations,
+            "compaction may remove tool-search messages but must retain schema-addressed carrier evidence"
         );
     }
 

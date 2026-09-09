@@ -84,7 +84,8 @@ pub struct RestoredSession {
     /// Recently used tools (for selection context)
     pub recent_tools: Vec<String>,
     /// Deferred schemas materialized in the retained prompt context.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed deferred selections usable by the stable carrier.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Turn number to resume from
     pub resume_turn: u32,
     /// Protocol version of the checkpoint
@@ -222,7 +223,7 @@ fn build_restored_session(
         budget_remaining_rounds: heavy.budget_remaining_rounds,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names,
+        deferred_tool_activations: heavy.deferred_tool_activations,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -530,7 +531,7 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools,
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -687,7 +688,7 @@ mod tests {
             budget_remaining_rounds: 5,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             resume_turn: 3,
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),

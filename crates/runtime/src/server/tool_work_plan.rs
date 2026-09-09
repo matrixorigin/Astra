@@ -26,7 +26,7 @@ struct InspectWorkPlanArgs {
     dependency_offset: Option<usize>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposeWorkPlanArgs {
     context_id: String,
@@ -37,7 +37,7 @@ struct ProposeWorkPlanArgs {
     dependency_removals: Vec<ProposedDependency>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposedWorkItem {
     item_id: String,
@@ -46,7 +46,7 @@ struct ProposedWorkItem {
     expected_result: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposedWorkItemRevision {
     item_id: String,
@@ -91,7 +91,7 @@ impl ProposedWorkItemKind {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposedDependency {
     predecessor_item_id: String,
@@ -503,6 +503,14 @@ fn verify_retry_identity(
     Ok(())
 }
 
+fn canonical_plan_identity_arguments(
+    args: &ProposeWorkPlanArgs,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut identity_args = args.clone();
+    identity_args.context_id.clear();
+    serde_json::to_vec(&identity_args)
+}
+
 fn parse_additions(
     additions: Vec<ProposedWorkItem>,
 ) -> Result<Vec<NewWorkItem>, astra_tools::ToolResult> {
@@ -697,7 +705,12 @@ pub(super) async fn propose(
             .cmp(&right.predecessor_item_id)
             .then_with(|| left.successor_item_id.cmp(&right.successor_item_id))
     });
-    let canonical_arguments = match serde_json::to_vec(&args) {
+    // `context_id` is the optimistic-concurrency precondition for the first
+    // commit, not part of the operation's semantic identity.  Once the
+    // proposal is durable, its recorded basis is the WAL: a retry after that
+    // commit must find the same proposal even though the graph context has
+    // advanced.  The exact typed mutations remain identity-bound.
+    let canonical_arguments = match canonical_plan_identity_arguments(&args) {
         Ok(arguments) => arguments,
         Err(_) => {
             return work_plan_error(
@@ -931,6 +944,24 @@ mod tests {
             "dependencies": [],
             "dependency_removals": []
         })
+    }
+
+    #[test]
+    fn proposal_identity_excludes_only_the_optimistic_context_precondition() {
+        let first: ProposeWorkPlanArgs =
+            serde_json::from_value(proposal_args("context-1", "task-1")).expect("typed args");
+        let mut advanced: ProposeWorkPlanArgs =
+            serde_json::from_value(proposal_args("context-2", "task-1")).expect("typed args");
+        assert_eq!(
+            canonical_plan_identity_arguments(&first).expect("identity"),
+            canonical_plan_identity_arguments(&advanced).expect("identity")
+        );
+        advanced.additions[0].expected_result = "Different verified result".to_string();
+        assert_ne!(
+            canonical_plan_identity_arguments(&first).expect("identity"),
+            canonical_plan_identity_arguments(&advanced).expect("identity"),
+            "typed mutation content remains part of retry identity"
+        );
     }
 
     #[test]
@@ -1175,6 +1206,26 @@ mod tests {
         assert_eq!(first_output["status"], "accepted");
         let retry = propose(&executor, &first_args, invocation("call-first"), None).await;
         assert_eq!(retry.output, first.output, "exact retry must be stable");
+
+        let advanced = inspect(&executor, &json!({}), None).await;
+        let advanced: Value =
+            serde_json::from_str(&advanced.output).expect("advanced context JSON");
+        let replay_after_commit = propose(
+            &executor,
+            &proposal_args(
+                advanced["context_id"]
+                    .as_str()
+                    .expect("advanced context id"),
+                "task-first",
+            ),
+            invocation("call-first"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            replay_after_commit.output, first.output,
+            "a durable proposal is the WAL even after its context advances"
+        );
 
         let changed_retry = propose(
             &executor,

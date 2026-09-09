@@ -82,6 +82,11 @@ pub const EXTERNAL_EFFECT_OBSERVED_FIELD: &str = "external_effect_observed";
 pub const EXTERNAL_EFFECT_SCOPE_FIELD: &str = "external_effect_scope";
 pub const EXTERNAL_EFFECT_RECEIPT_FIELD: &str = "external_effect_receipt";
 pub const DECLARED_EXTERNAL_STATE_SCOPE: &str = "declared_external_state";
+/// Ownership marker for non-filesystem tools that return an executor-owned
+/// external mutation receipt.  This is intentionally distinct from the
+/// invocation/fingerprint owners above: a typed service operation proves its
+/// own durable mutation and does not expose a filesystem observation window.
+pub const TYPED_EXTERNAL_TOOL_OWNERSHIP: &str = "typed_external_tool";
 const MAX_EXTERNAL_STATE_PATHS: usize = 16;
 /// Minimal path for the only external helper allowed in a detached command
 /// (`sleep`). Builtins do not consult PATH, and clearing the inherited
@@ -2758,12 +2763,17 @@ fn external_effect_changed_receipt(
 
 /// Validate the durable projection of an executor-owned external delta.
 pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> bool {
-    receipt.get("schema").and_then(serde_json::Value::as_str) == Some("external_effect_receipt.v1")
-        && receipt.get("source").and_then(serde_json::Value::as_str)
-            == Some("post_execution_fingerprint")
+    let common = receipt.get("schema").and_then(serde_json::Value::as_str)
+        == Some("external_effect_receipt.v1")
         && receipt.get("scope").and_then(serde_json::Value::as_str)
             == Some(DECLARED_EXTERNAL_STATE_SCOPE)
-        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(true)
+        && receipt.get("changed").and_then(serde_json::Value::as_bool) == Some(true);
+    if !common {
+        return false;
+    }
+
+    let fingerprint_receipt = receipt.get("source").and_then(serde_json::Value::as_str)
+        == Some("post_execution_fingerprint")
         && matches!(
             receipt.get("ownership").and_then(serde_json::Value::as_str),
             Some(INVOCATION_CGROUP_OWNERSHIP | INVOCATION_SUPERVISOR_OWNERSHIP)
@@ -2777,7 +2787,31 @@ pub fn is_authoritative_external_effect_receipt(receipt: &serde_json::Value) -> 
         && receipt
             .get("observed_roots")
             .and_then(serde_json::Value::as_u64)
-            .is_some_and(|count| (1..=MAX_EXTERNAL_STATE_PATHS as u64).contains(&count))
+            .is_some_and(|count| (1..=MAX_EXTERNAL_STATE_PATHS as u64).contains(&count));
+    if fingerprint_receipt {
+        return true;
+    }
+
+    // Typed service mutations (for example Memoria remember/forget/update)
+    // have no filesystem target to fingerprint.  They are accepted only when
+    // the owning executor stamps the narrow typed-tool shape, including a
+    // bounded operation digest and a known mutation action.  The runtime also
+    // binds this receipt to the canonical tool record before using it as
+    // completion evidence.
+    receipt.get("source").and_then(serde_json::Value::as_str) == Some("typed_external_tool")
+        && receipt.get("ownership").and_then(serde_json::Value::as_str)
+            == Some(TYPED_EXTERNAL_TOOL_OWNERSHIP)
+        && receipt.get("tool").and_then(serde_json::Value::as_str) == Some("memory")
+        && matches!(
+            receipt.get("action").and_then(serde_json::Value::as_str),
+            Some("remember" | "forget" | "update" | "feedback")
+        )
+        && receipt
+            .get("operation_digest")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 impl WorkspaceFingerprint {
@@ -2811,7 +2845,7 @@ impl WorkspaceFingerprint {
             // second full manifest: that only blocks the executor again and
             // still cannot produce trustworthy evidence.
             GitFingerprint::Unknown => None,
-            GitFingerprint::NotGit => manifest_fingerprint(&root),
+            GitFingerprint::UseManifest => manifest_fingerprint(&root),
         }?;
         let epoch_after = writer_state
             .epoch
@@ -2861,7 +2895,10 @@ impl WorkspaceFingerprint {
 
 enum GitFingerprint {
     Captured(u64),
-    NotGit,
+    /// Git is unavailable/non-local to the bound root, or a parent ignore
+    /// rule represented the entire bound root by an ignored ancestor entry.
+    /// In either case the bounded root-local manifest is authoritative.
+    UseManifest,
     Unknown,
 }
 
@@ -2986,7 +3023,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         // Git is optional in minimal agent images.  Falling back to the
         // bounded manifest is safe; it is materially different from
         // executing a program selected through the caller's PATH.
-        return GitFingerprint::NotGit;
+        return GitFingerprint::UseManifest;
     };
     git_root_command.args(["rev-parse", "--show-toplevel"]);
     let Some(git_root_output) =
@@ -2995,7 +3032,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         return GitFingerprint::Unknown;
     };
     if !git_root_output.success {
-        return GitFingerprint::NotGit;
+        return GitFingerprint::UseManifest;
     }
     let Some(git_root) = String::from_utf8(git_root_output.stdout)
         .ok()
@@ -3005,7 +3042,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         return GitFingerprint::Unknown;
     };
     if !root.starts_with(&git_root) {
-        return GitFingerprint::NotGit;
+        return GitFingerprint::Unknown;
     }
     let Ok(relative_root) = root.strip_prefix(&git_root) else {
         return GitFingerprint::Unknown;
@@ -3016,7 +3053,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         format!("HEAD:{}", relative_root.to_string_lossy())
     };
     let Some(mut tree_command) = hardened_git_command(root) else {
-        return GitFingerprint::NotGit;
+        return GitFingerprint::UseManifest;
     };
     tree_command.args(["rev-parse", &tree_spec]);
     let Some(tree_output) = run_bounded_probe(tree_command, 128 * 1024, FINGERPRINT_PROBE_TIMEOUT)
@@ -3030,7 +3067,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         // directory can exist only in the worktree and not in HEAD. Both are
         // deterministic baseline states, not probe failure.
         let Some(mut head_command) = hardened_git_command(root) else {
-            return GitFingerprint::NotGit;
+            return GitFingerprint::UseManifest;
         };
         head_command.args(["rev-parse", "--verify", "HEAD"]);
         let Some(head_output) =
@@ -3045,7 +3082,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         }
     };
     let Some(mut status_command) = hardened_git_command(root) else {
-        return GitFingerprint::NotGit;
+        return GitFingerprint::UseManifest;
     };
     status_command.args([
         "status",
@@ -3117,11 +3154,21 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
             return GitFingerprint::Unknown;
         }
         let path_from_git_root = git_root.join(path);
-        let Ok(path_from_workspace) = path_from_git_root.strip_prefix(root) else {
-            // `-- .` should already enforce this boundary. Keep the check
-            // explicit so a future Git/config change cannot turn a sibling
-            // path into bound-workspace evidence.
-            continue;
+        let path_from_workspace = match path_from_git_root.strip_prefix(root) {
+            Ok(path) => path,
+            Err(_) if status == b"!!" && root.starts_with(&path_from_git_root) => {
+                // A parent repository can collapse an ignored ancestor (for
+                // example `target/`) even when Git was invoked from a deeper
+                // bound workspace. That entry contains no root-local state,
+                // so use the bounded manifest instead of claiming a stable
+                // Git digest from evidence outside the workspace.
+                return GitFingerprint::UseManifest;
+            }
+            Err(_) => {
+                // `-- .` should never return an unrelated outside entry.
+                // Treat that as ambiguous authority, not as ignorable noise.
+                return GitFingerprint::Unknown;
+            }
         };
         // `.astra` is executor/session coordination state, not a user
         // deliverable. The manifest fallback already excludes this exact
@@ -4500,7 +4547,11 @@ pub fn typed_workspace_observation_evidence_for_invocation(
         .then_some(evidence)
 }
 
-fn full_read_file_normalized_target(
+/// Return the canonical bound-workspace target for a complete `read_file`
+/// observation.  The convergence tracker and runtime completion admission
+/// share this exact normalization so the model-facing recovery boundary
+/// cannot accept a path shape that the owner-side lease would reject later.
+pub fn full_read_file_normalized_target(
     name: &str,
     args: &serde_json::Value,
     workspace_root: &Path,
@@ -6879,6 +6930,31 @@ mod tests {
         fs::write(temp.path().join("app/ignored.txt"), "two").unwrap();
         let ignored_changed = WorkspaceFingerprint::capture(&app).expect("git fingerprint");
         assert!(before.changed_from(Some(ignored_changed)));
+    }
+
+    #[test]
+    fn parent_ignored_ancestor_falls_back_to_bound_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-C", temp.path().to_str().unwrap()])
+                    .args(args)
+                    .status()
+                    .expect("git available")
+                    .success()
+            );
+        };
+        run(&["init", "-q"]);
+        fs::write(temp.path().join(".gitignore"), "target/\n").unwrap();
+        let workspace = temp.path().join("target/task-tmp/case");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("result.txt"), "one").unwrap();
+
+        let before = WorkspaceFingerprint::capture(&workspace).expect("bounded fallback");
+        fs::write(workspace.join("result.txt"), "two").unwrap();
+        let after = WorkspaceFingerprint::capture(&workspace).expect("bounded fallback");
+        assert!(before.changed_from(Some(after)));
     }
 
     #[test]

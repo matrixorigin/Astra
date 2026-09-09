@@ -3,8 +3,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CONVERSATION_PROJECTION_SCHEMA_VERSION, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
-    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
+    CONVERSATION_PROJECTION_SCHEMA_VERSION, DeferredToolActivation,
+    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SESSION_CURSOR_SCHEMA_VERSION,
+    SessionCursorV1, canonical_conversation_root,
 };
 
 pub const CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -182,7 +183,7 @@ pub struct ResumeCheckpointProjectionV1 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeActivationProjectionV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<DeferredToolActivation>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,10 +355,10 @@ impl ResumeBundleV1 {
         }
     }
 
-    pub fn activated_deferred_tool_names(&self) -> &[String] {
+    pub fn deferred_tool_activations(&self) -> &[DeferredToolActivation] {
         self.projections
             .activation_at(&self.cursor)
-            .map(|projection| projection.deferred_tool_names.as_slice())
+            .map(|projection| projection.deferred_tool_activations.as_slice())
             .unwrap_or_default()
     }
 }
@@ -737,13 +738,24 @@ mod tests {
             activation: Some(CausalProjectionEnvelopeV1::at_cursor(
                 selected_cursor.clone(),
                 ResumeActivationProjectionV1 {
-                    deferred_tool_names: vec!["github".into()],
+                    deferred_tool_activations: vec![DeferredToolActivation {
+                        name: "github".into(),
+                        schema_digest: "sha256:test".into(),
+                        descriptor: None,
+                    }],
                 },
             )),
         };
 
         let selected = select_resume_bundle(Some(&selected_cursor), [candidate]).unwrap();
-        assert_eq!(selected.activated_deferred_tool_names(), ["github"]);
+        assert_eq!(
+            selected.deferred_tool_activations(),
+            [DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:test".into(),
+                descriptor: None,
+            }]
+        );
         assert!(
             selected
                 .projections

@@ -1,12 +1,455 @@
 //! Helpers for the deferred-tool activation contract.
 //!
 //! Deferred tool entries are discovery metadata. A tool becomes executable
-//! only when it is already visible in `tools[]`, including a later request
-//! after `tool_search(query="select:NAME")` activates its full schema.
+//! only when it is already visible in `tools[]` or its full schema-addressed
+//! contract was selected with `tool_search(query="select:NAME")` and carried
+//! through the stable `invoke_tool` protocol.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use serde_json::Value;
+
+pub use astra_turn_types::DeferredToolActivation;
+
+/// The stable native function exposed for invoking a tool selected from the
+/// deferred catalog. The carrier itself is not a capability; its target is
+/// re-admitted through the ordinary tool path.
+pub const DEFERRED_TOOL_INVOCATION_CARRIER: &str = "invoke_tool";
+
+/// Provenance for a lifecycle call authorized by the runtime control plane.
+/// Runtime ownership is execution-round evidence: it allows a host-created
+/// call or an exact provider carrier at a mandatory state boundary to cross
+/// the common tool pipeline without pretending that the model selected a
+/// deferred schema. The operation is deliberately typed so a host cannot
+/// grant one lifecycle operation for another tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeControlInvocationKind {
+    WorkEstablishment,
+    WorkScheduler,
+    WorkSettlement,
+}
+
+impl RuntimeControlInvocationKind {
+    #[must_use]
+    pub const fn tool_name(self) -> &'static str {
+        match self {
+            Self::WorkEstablishment => "start_work",
+            Self::WorkScheduler => "run_next_work_item",
+            Self::WorkSettlement => "settle_work_item",
+        }
+    }
+}
+
+/// The one stable native schema which transports a selected deferred target.
+///
+/// Keeping this small protocol resident lets the provider's declared tool list
+/// remain byte-for-byte stable after discovery. The selected tool's full
+/// schema never returns to `tools[]`; it is validated from the recorded
+/// selection contract before normal admission and execution.
+#[must_use]
+pub fn deferred_tool_invocation_carrier_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+            "description": "Invoke one tool whose full contract was selected with tool_search, or the exact lifecycle transition required by the runtime. Use this for every deferred tool and for advanced fields absent from a resident tool's current schema.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "arguments"],
+                "properties": {
+                    "name": {"type": "string", "description": "Selected or runtime-required tool name."},
+                    "arguments": {"type": "object", "description": "Arguments for that selected tool."}
+                }
+            }
+        }
+    })
+}
+
+/// Strict, provider-neutral contents of one carrier call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredToolInvocation {
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// One executable invocation with both provider and execution identities.
+///
+/// `physical_provider_call` is the exact canonical provider function call and
+/// stays attached to transcript/call-id/cache identity. `logical_target_call`
+/// is what all existing policy, Work-role, route, and execution machinery
+/// must inspect. For ordinary calls the two values are identical. Neither
+/// identity may be inferred back from the other once a carrier is involved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalToolInvocation {
+    physical_provider_call: Value,
+    target: InvocationTarget,
+}
+
+/// One provider response after canonicalization, retaining provider order.
+///
+/// The two projections are intentionally exposed only as parallel views of
+/// the same ordered records. Callers must never concatenate admitted and
+/// rejected subsets to rebuild history: provider ordering is transcript and
+/// prompt-cache evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalToolInvocationBatch {
+    invocations: Vec<CanonicalToolInvocation>,
+}
+
+impl CanonicalToolInvocationBatch {
+    #[must_use]
+    pub fn new(invocations: Vec<CanonicalToolInvocation>) -> Self {
+        Self { invocations }
+    }
+
+    #[must_use]
+    pub fn invocations(&self) -> &[CanonicalToolInvocation] {
+        &self.invocations
+    }
+
+    #[must_use]
+    pub fn physical_provider_calls(&self) -> Vec<Value> {
+        self.invocations
+            .iter()
+            .map(|call| call.physical_provider_call().clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn logical_target_calls(&self) -> Vec<Value> {
+        self.invocations
+            .iter()
+            .map(|call| call.logical_target_call().clone())
+            .collect()
+    }
+
+    /// The same provider identity must address both views, exactly once and
+    /// in the exact provider sequence. This makes joining execution outcomes
+    /// back to transcript evidence deterministic.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut ids = HashSet::with_capacity(self.invocations.len());
+        for invocation in &self.invocations {
+            let physical_id = invocation
+                .provider_call_id()
+                .ok_or("provider call id is missing")?;
+            let logical_id = invocation
+                .logical_target_call()
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("logical target id is missing")?;
+            if physical_id != logical_id {
+                return Err("physical and logical call ids differ");
+            }
+            if !ids.insert(physical_id) {
+                return Err("provider batch contains duplicate call ids");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum InvocationTarget {
+    Direct,
+    Deferred {
+        logical_target_call: Value,
+        activation: DeferredToolActivation,
+    },
+    RuntimeControl {
+        logical_target_call: Value,
+        kind: RuntimeControlInvocationKind,
+    },
+}
+
+impl CanonicalToolInvocation {
+    /// Preserve the single identity of a normal provider-native call.
+    #[must_use]
+    pub fn ordinary(canonical_call: Value) -> Self {
+        Self {
+            physical_provider_call: canonical_call,
+            target: InvocationTarget::Direct,
+        }
+    }
+
+    /// Construct a host-owned lifecycle invocation after the corresponding
+    /// control-plane decision has been admitted.  This is intentionally not a
+    /// deferred activation: no provider selection or schema-search evidence
+    /// exists for a call synthesized by the runtime.
+    pub fn runtime_control(
+        canonical_call: Value,
+        kind: RuntimeControlInvocationKind,
+    ) -> Result<Self, &'static str> {
+        let actual_name = crate::tool::args::shape::tool_call_name(&canonical_call)
+            .ok_or("runtime control call is missing a tool name")?;
+        if actual_name != kind.tool_name() {
+            return Err("runtime control operation does not match its tool name");
+        }
+        Ok(Self {
+            physical_provider_call: canonical_call.clone(),
+            target: InvocationTarget::RuntimeControl {
+                logical_target_call: canonical_call,
+                kind,
+            },
+        })
+    }
+
+    /// Resolve the stable physical carrier into one runtime-authorized
+    /// lifecycle transition. This is intentionally separate from deferred
+    /// activation: the caller must already own the typed state boundary that
+    /// requires `kind`, and the carrier target must match it exactly.
+    pub fn runtime_control_from_carrier(
+        canonical_call: &Value,
+        kind: RuntimeControlInvocationKind,
+    ) -> Result<Option<Self>, &'static str> {
+        if crate::tool::args::shape::tool_call_name(canonical_call)
+            != Some(DEFERRED_TOOL_INVOCATION_CARRIER)
+        {
+            return Ok(None);
+        }
+        let args = crate::tool::args::shape::parse_tool_call_arguments(canonical_call)
+            .map_err(|_| "runtime control carrier arguments are malformed")?;
+        let invocation = parse_deferred_tool_invocation(&args)?;
+        if invocation.name != kind.tool_name() {
+            return Ok(None);
+        }
+        let id = canonical_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("runtime control carrier is missing its provider call id")?;
+        let arguments = serde_json::to_string(&invocation.arguments)
+            .map_err(|_| "runtime control arguments could not be serialized")?;
+        let logical_target_call = serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": invocation.name,
+                "arguments": arguments,
+            },
+        });
+        Ok(Some(Self {
+            physical_provider_call: canonical_call.clone(),
+            target: InvocationTarget::RuntimeControl {
+                logical_target_call,
+                kind,
+            },
+        }))
+    }
+
+    #[must_use]
+    pub fn provider_call_id(&self) -> Option<&str> {
+        self.physical_provider_call
+            .get("id")
+            .and_then(Value::as_str)
+    }
+
+    #[must_use]
+    pub fn physical_provider_call(&self) -> &Value {
+        &self.physical_provider_call
+    }
+
+    #[must_use]
+    pub fn logical_target_call(&self) -> &Value {
+        match &self.target {
+            InvocationTarget::Direct => &self.physical_provider_call,
+            InvocationTarget::Deferred {
+                logical_target_call,
+                ..
+            } => logical_target_call,
+            InvocationTarget::RuntimeControl {
+                logical_target_call,
+                ..
+            } => logical_target_call,
+        }
+    }
+
+    #[must_use]
+    pub fn activation(&self) -> Option<&DeferredToolActivation> {
+        match &self.target {
+            InvocationTarget::Direct => None,
+            InvocationTarget::Deferred { activation, .. } => Some(activation),
+            InvocationTarget::RuntimeControl { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_control_kind(&self) -> Option<RuntimeControlInvocationKind> {
+        match &self.target {
+            InvocationTarget::RuntimeControl { kind, .. } => Some(*kind),
+            InvocationTarget::Direct | InvocationTarget::Deferred { .. } => None,
+        }
+    }
+}
+
+/// Admission, policy, and execution consume the logical target by default.
+/// Provider history deliberately uses [`CanonicalToolInvocation::physical_provider_call`]
+/// explicitly, so a carrier cannot accidentally leak into an execution path.
+impl std::ops::Deref for CanonicalToolInvocation {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        self.logical_target_call()
+    }
+}
+
+/// Compatibility name for a resolved carrier invocation. New runtime code
+/// should use [`CanonicalToolInvocation`] so normal and deferred calls share
+/// one admission representation.
+pub type CanonicalDeferredToolInvocation = CanonicalToolInvocation;
+
+/// Why a carrier request cannot be converted into its logical target. These
+/// are protocol facts, not policy decisions: after a successful conversion,
+/// normal admission still decides whether the target may execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredToolInvocationError {
+    Malformed,
+    NotActivated,
+    ActivationStale,
+}
+
+impl DeferredToolInvocationError {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "invoke_tool arguments do not match the carrier contract",
+            Self::NotActivated => {
+                "invoke_tool target was not selected from this session's deferred catalog"
+            }
+            Self::ActivationStale => {
+                "invoke_tool target schema changed or is no longer available; select it again"
+            }
+        }
+    }
+}
+
+/// Decode carrier arguments without accepting a second schema or any hidden
+/// routing field. The target name is normalized with the same canonical-name
+/// rule as ordinary function calls; unknown/empty names and non-object target
+/// arguments fail before policy admission.
+pub fn parse_deferred_tool_invocation(
+    args: &Value,
+) -> Result<DeferredToolInvocation, &'static str> {
+    let object = args
+        .as_object()
+        .ok_or("invoke_tool arguments must be a JSON object")?;
+    if object.len() != 2 || !object.contains_key("name") || !object.contains_key("arguments") {
+        return Err("invoke_tool accepts exactly name and arguments");
+    }
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(astra_core::canonical_names::normalize_name)
+        .ok_or("invoke_tool target name is missing")?
+        .to_string();
+    let arguments = object
+        .get("arguments")
+        .filter(|arguments| arguments.is_object())
+        .cloned()
+        .ok_or("invoke_tool target arguments must be a JSON object")?;
+    Ok(DeferredToolInvocation { name, arguments })
+}
+
+/// Resolve one already-canonical provider carrier call into its paired
+/// physical-provider and logical-target identities.
+///
+/// The caller supplies the session's retained activation evidence and the
+/// *current* schema digest lookup. This keeps the transformation independent
+/// of any particular executor while making stale provider/schema bindings fail
+/// before ordinary admission and dispatch. A non-carrier call is returned as
+/// `Ok(None)` so the shared path remains unchanged.
+pub fn canonicalize_deferred_tool_invocation<F>(
+    canonical_call: &Value,
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+) -> Result<Option<CanonicalDeferredToolInvocation>, DeferredToolInvocationError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let name = crate::tool::args::shape::tool_call_name(canonical_call)
+        .ok_or(DeferredToolInvocationError::Malformed)?;
+    if name != DEFERRED_TOOL_INVOCATION_CARRIER {
+        return Ok(None);
+    }
+    let args = crate::tool::args::shape::parse_tool_call_arguments(canonical_call)
+        .map_err(|_| DeferredToolInvocationError::Malformed)?;
+    let invocation = parse_deferred_tool_invocation(&args)
+        .map_err(|_| DeferredToolInvocationError::Malformed)?;
+    // The carrier is transport, never a deferred capability. Permitting it as
+    // a target would create a recursive and ambiguous execution path.
+    if invocation.name == DEFERRED_TOOL_INVOCATION_CARRIER {
+        return Err(DeferredToolInvocationError::NotActivated);
+    }
+    let mut matching_activations = activations
+        .iter()
+        .filter(|activation| activation.name == invocation.name);
+    let activation = matching_activations
+        .next()
+        .ok_or(DeferredToolInvocationError::NotActivated)?;
+    // A session projection with two digest revisions for one logical target
+    // is ambiguous. Never let iteration order decide execution authority.
+    if matching_activations.next().is_some() {
+        return Err(DeferredToolInvocationError::ActivationStale);
+    }
+    if current_schema_digest(&invocation.name).as_deref() != Some(activation.schema_digest.as_str())
+    {
+        return Err(DeferredToolInvocationError::ActivationStale);
+    }
+    let id = canonical_call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or(DeferredToolInvocationError::Malformed)?;
+    let arguments = serde_json::to_string(&invocation.arguments)
+        .map_err(|_| DeferredToolInvocationError::Malformed)?;
+    let logical_target_call = serde_json::json!({
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": invocation.name,
+            "arguments": arguments,
+        },
+    });
+    Ok(Some(CanonicalDeferredToolInvocation {
+        physical_provider_call: canonical_call.clone(),
+        target: InvocationTarget::Deferred {
+            logical_target_call,
+            activation: activation.clone(),
+        },
+    }))
+}
+
+/// Canonicalize one provider batch into paired invocations.
+///
+/// Ordinary calls retain their single canonical value. A carrier is resolved
+/// only from schema-addressed activation evidence supplied by retained
+/// canonical history; callers receive a per-call result so one stale carrier
+/// cannot erase independent calls in a mixed provider batch.
+pub fn canonicalize_tool_invocation_batch<F>(
+    provider_calls: &[Value],
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+) -> Vec<Result<CanonicalToolInvocation, DeferredToolInvocationError>>
+where
+    F: Fn(&str) -> Option<String> + Copy,
+{
+    provider_calls
+        .iter()
+        .map(|provider_call| {
+            let canonical =
+                crate::tool::args::shape::canonicalize_tool_call_for_execution(provider_call)
+                    .map_err(|_| DeferredToolInvocationError::Malformed)?;
+            match canonicalize_deferred_tool_invocation(
+                &canonical,
+                activations,
+                current_schema_digest,
+            )? {
+                Some(invocation) => Ok(invocation),
+                None => Ok(CanonicalToolInvocation::ordinary(canonical)),
+            }
+        })
+        .collect()
+}
 
 /// Current tool surface installed by the runtime for admission/search.
 ///
@@ -47,17 +490,6 @@ impl ToolSurfaceNames {
         match self {
             Self::Uninstalled => None,
             Self::Installed { activatable, .. } => Some(activatable),
-        }
-    }
-
-    #[must_use]
-    pub fn has_any_tool(&self) -> bool {
-        match self {
-            Self::Uninstalled => false,
-            Self::Installed {
-                visible,
-                activatable,
-            } => !visible.is_empty() || !activatable.is_empty(),
         }
     }
 
@@ -124,104 +556,17 @@ where
     Some(runtime_bound_tool_names(names, has_runtime_binding))
 }
 
-/// Record names selected by `tool_search(select:...)` or by the direct
-/// deferred-call recovery path.
+/// Extract typed, schema-addressed activation evidence from a
+/// `tool_search(select:...)` result.
 ///
-/// Activation is a materialization record in the session's retained context.
-/// It remains active after the corresponding full schema reaches `tools[]` and
-/// after the model calls the tool, so schema visibility and admission cannot
-/// drift across later turns. Session reset, context restoration, an installed
-/// non-empty surface, or a missing runtime binding can prove an entry stale.
-pub fn refresh_activated_tool_names<I>(activated: &mut HashSet<String>, names: I)
-where
-    I: IntoIterator<Item = String>,
-{
-    for name in names {
-        activated.insert(name);
-    }
-}
-
-/// Keep pending activated tools that still make sense for the current runtime.
-///
-/// `Uninstalled` fails closed. An installed no-tool surface preserves
-/// runtime-bound activations because no full schema was advertised. A non-empty
-/// surface prunes activations that are neither visible nor activatable.
+/// This fails closed unless every accepted match carries a canonical SHA-256
+/// digest and the producer returns the complete selection envelope. It is the
+/// carrier protocol's boundary: transcript prose, a bare tool name, or a
+/// hand-written/partial result cannot authorize a deferred invocation.
 #[must_use]
-pub fn retained_runtime_bound_activated_tool_names<F>(
-    activated: &HashSet<String>,
-    surface: &ToolSurfaceNames,
-    has_runtime_binding: F,
-) -> Vec<String>
-where
-    F: Fn(&str) -> bool,
-{
-    let Some(searchable) = searchable_runtime_bound_tool_names(surface, &has_runtime_binding)
-    else {
-        return Vec::new();
-    };
-    let surface_has_names = surface.has_any_tool();
-    let mut names: Vec<String> = activated
-        .iter()
-        .filter(|name| has_runtime_binding(name))
-        .filter(|name| !surface_has_names || searchable.contains(*name))
-        .cloned()
-        .collect();
-    names.sort();
-    names
-}
-
-/// Return activated tool names for schema injection and prune stale entries.
-///
-/// This does not consume activation. A selected deferred tool remains visible
-/// while its selection evidence remains in retained conversation context,
-/// including after repeated calls. This matches the user-facing contract: a
-/// schema returned by `tool_search(select:a,b,c)` is callable like a regular
-/// visible schema until context/session reset or the surface becomes invalid.
-pub fn activated_tool_names_for_schema_injection<F>(
-    activated: &mut HashSet<String>,
-    surface: &ToolSurfaceNames,
-    has_runtime_binding: F,
-) -> Vec<String>
-where
-    F: Fn(&str) -> bool,
-{
-    let retained =
-        retained_runtime_bound_activated_tool_names(activated, surface, has_runtime_binding);
-    if matches!(surface, ToolSurfaceNames::Uninstalled) {
-        return retained;
-    }
-    let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
-    activated.retain(|name| retained_set.contains(name.as_str()));
-    retained
-}
-
-/// Extract activation names from a `tool_search(select:...)` result and keep
-/// only names that this turn's deferred manifest advertised.
-#[must_use]
-pub fn recordable_activated_tool_names<F>(
+pub fn deferred_tool_activations_from_tool_search_output(
     output: &str,
-    surface: &ToolSurfaceNames,
-    has_runtime_binding: F,
-) -> Vec<String>
-where
-    F: Fn(&str) -> bool,
-{
-    let Some(activatable) = surface.activatable() else {
-        return Vec::new();
-    };
-    activated_tool_names_from_tool_search_output(output)
-        .into_iter()
-        .filter(|name| activatable.contains(name) && has_runtime_binding(name))
-        .collect()
-}
-
-/// Extract names activated by a `tool_search(select:...)` JSON result.
-///
-/// Keyword search results intentionally do not activate tools; they are only
-/// discovery. Select-mode results return full schemas and are the activation
-/// boundary.
-#[must_use]
-pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String> {
+) -> Vec<DeferredToolActivation> {
     let Ok(value) = serde_json::from_str::<Value>(output) else {
         return Vec::new();
     };
@@ -241,20 +586,24 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
     if !requested_tool_names_match(&requested, &output_requested) {
         return Vec::new();
     }
-
-    let activation_candidates =
-        resolved_tool_names_from_output(&value).unwrap_or_else(|| output_requested.clone());
-
-    let mut names = Vec::new();
-    let Some(matches) = value.get("matches").and_then(Value::as_array) else {
-        return names;
+    // `resolved` is part of the producer-owned selection contract. Do not
+    // infer it from `requested`: a partial/old/hand-written payload must not
+    // silently turn a bare match into execution authority.
+    let Some(activation_candidates) = resolved_tool_names_from_output(&value) else {
+        return Vec::new();
     };
+    let Some(matches) = value.get("matches").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut activations = Vec::new();
     for entry in matches {
         let Some(name) = entry
             .get("name")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|name| !name.is_empty())
+            .and_then(astra_core::canonical_names::normalize_name)
         else {
             continue;
         };
@@ -264,27 +613,89 @@ pub fn activated_tool_names_from_tool_search_output(output: &str) -> Vec<String>
         {
             continue;
         }
-        if !names
+        let Some(schema_digest) = entry
+            .get("schema_digest")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|digest| is_schema_digest(digest))
+        else {
+            continue;
+        };
+        if !activations
             .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+            .any(|existing: &DeferredToolActivation| existing.name.eq_ignore_ascii_case(name))
         {
-            names.push(name.to_string());
+            activations.push(DeferredToolActivation {
+                name: name.to_string(),
+                schema_digest: schema_digest.to_string(),
+                descriptor: None,
+            });
         }
     }
-    names
+    activations
 }
 
-/// Reconstruct deferred-tool activation from canonical conversation history.
-///
-/// Activation is accepted only from a tool result paired by `tool_call_id`
-/// with an assistant `tool_search` call. This deliberately ignores user or
-/// assistant prose and unpaired lookalike JSON. It lets process restarts and
-/// legacy session projections recover the same prompt fact without treating
-/// transient executor memory as the source of truth.
+/// Keep only schema-addressed selections that this turn's deferred manifest
+/// actually offered and that the current runtime can bind. Visible tools
+/// (notably the carrier itself) are searchable for discovery but never become
+/// carrier targets merely because a model selected them.
 #[must_use]
-pub fn activated_tool_names_from_messages(messages: &[Value]) -> Vec<String> {
+pub fn recordable_deferred_tool_activations<F>(
+    output: &str,
+    surface: &ToolSurfaceNames,
+    has_runtime_binding: F,
+) -> Vec<DeferredToolActivation>
+where
+    F: Fn(&str) -> bool,
+{
+    let Some(activatable) = surface.activatable() else {
+        return Vec::new();
+    };
+    deferred_tool_activations_from_tool_search_output(output)
+        .into_iter()
+        .filter(|activation| {
+            activation.name != DEFERRED_TOOL_INVOCATION_CARRIER
+                && activatable.contains(&activation.name)
+                && has_runtime_binding(&activation.name)
+        })
+        .collect()
+}
+
+/// Apply newly selected evidence to a session's carrier activation state.
+///
+/// State is keyed by canonical logical tool name, never by `(name, digest)`:
+/// a later explicit selection replaces the earlier schema revision. This makes
+/// a provider/schema refresh deterministic instead of allowing two otherwise
+/// valid records to make dispatch depend on insertion order.
+pub fn refresh_deferred_tool_activations<I>(
+    activations: &mut Vec<DeferredToolActivation>,
+    updates: I,
+) where
+    I: IntoIterator<Item = DeferredToolActivation>,
+{
+    for update in updates {
+        activations.retain(|existing| existing.name != update.name);
+        activations.push(update);
+    }
+    activations.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn is_schema_digest(value: &str) -> bool {
+    value.len() == "sha256:".len() + 64
+        && value.starts_with("sha256:")
+        && value["sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Reconstruct schema-addressed carrier evidence from canonical paired tool
+/// history. Results without a compact contract digest contribute nothing: a
+/// resumed session can reselect, but never obtains execution authority from
+/// lossy state.
+#[must_use]
+pub fn deferred_tool_activations_from_messages(messages: &[Value]) -> Vec<DeferredToolActivation> {
     let mut pending_tool_search_call_ids = HashSet::new();
-    let mut activated = BTreeSet::new();
+    let mut activations = Vec::new();
     for message in messages {
         match message.get("role").and_then(Value::as_str) {
             Some("assistant") => {
@@ -305,53 +716,67 @@ pub fn activated_tool_names_from_messages(messages: &[Value]) -> Vec<String> {
                         .filter(|id| !id.is_empty())
                         .map(ToOwned::to_owned),
                 );
-                continue;
             }
-            Some("tool") => {}
-            _ => continue,
+            Some("tool") => {
+                let paired = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|id| pending_tool_search_call_ids.remove(id));
+                if !paired {
+                    continue;
+                }
+                let Some(content) = message.get("content") else {
+                    continue;
+                };
+                let serialized;
+                let output = if let Some(content) = content.as_str() {
+                    content
+                } else {
+                    serialized = match serde_json::to_string(content) {
+                        Ok(serialized) => serialized,
+                        Err(_) => continue,
+                    };
+                    serialized.as_str()
+                };
+                refresh_deferred_tool_activations(
+                    &mut activations,
+                    deferred_tool_activations_from_tool_search_output(output),
+                );
+            }
+            _ => {}
         }
-        let paired_tool_search = message
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|id| pending_tool_search_call_ids.remove(id));
-        if !paired_tool_search {
-            continue;
-        }
-        let Some(content) = message.get("content") else {
-            continue;
-        };
-        let serialized;
-        let output = if let Some(content) = content.as_str() {
-            content
-        } else {
-            serialized = match serde_json::to_string(content) {
-                Ok(serialized) => serialized,
-                Err(_) => continue,
-            };
-            serialized.as_str()
-        };
-        activated.extend(activated_tool_names_from_tool_search_output(output));
     }
-    activated.into_iter().collect()
+    activations
 }
 
-/// Merge an explicit session snapshot with activation reconstructed from the
-/// same retained message projection. The explicit snapshot survives
-/// compaction; history reconstruction upgrades older snapshots and remote
-/// projections that did not yet persist this field.
+/// Merge durable schema-addressed activation evidence with evidence still
+/// present in canonical history. An entry without a digest is never
+/// synthesized here: a resumed carrier call must have the exact schema
+/// revision that was selected.
 #[must_use]
-pub fn merged_activated_tool_names(
+pub fn merged_deferred_tool_activations(
     messages: &[Value],
-    persisted_names: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut names: BTreeSet<String> = persisted_names
-        .into_iter()
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect();
-    names.extend(activated_tool_names_from_messages(messages));
-    names.into_iter().collect()
+    persisted_activations: impl IntoIterator<Item = DeferredToolActivation>,
+) -> Vec<DeferredToolActivation> {
+    let mut activations: Vec<DeferredToolActivation> = Vec::new();
+    refresh_deferred_tool_activations(&mut activations, persisted_activations);
+    // Transcript history only carries the compact selection candidate.  It
+    // must never replace a durable activation that has already been bound to
+    // an exact provider descriptor: doing so would erase the identity during
+    // the next turn or after compaction/resume and silently turn a valid
+    // activation into a descriptor-less one.  History may still fill a name
+    // absent from the persisted snapshot, which keeps replay deterministic
+    // for older turns without allowing it to downgrade newer state.
+    for candidate in deferred_tool_activations_from_messages(messages) {
+        let already_bound = activations.iter().any(|existing| {
+            existing.name.eq_ignore_ascii_case(&candidate.name) && existing.descriptor.is_some()
+        });
+        if !already_bound {
+            refresh_deferred_tool_activations(&mut activations, [candidate]);
+        }
+    }
+    activations
 }
 
 fn requested_tool_names_from_select_query(query: &str) -> Vec<String> {
@@ -576,223 +1001,424 @@ mod tests {
     }
 
     #[test]
-    fn activation_survives_explicit_no_tool_surface_without_consuming() {
-        let mut activated = HashSet::new();
-        refresh_activated_tool_names(&mut activated, ["memory".to_string()]);
-        let visible = HashSet::new();
-        let activatable = HashSet::new();
-        let surface = ToolSurfaceNames::installed(visible, activatable);
-
-        assert_eq!(
-            retained_runtime_bound_activated_tool_names(&activated, &surface, |_| true),
-            vec!["memory".to_string()],
-            "explicit no-tool surfaces must not invalidate previous activations"
-        );
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["memory".to_string()]
-        );
-        assert!(activated.contains("memory"));
-    }
-
-    #[test]
-    fn activation_no_tool_surface_prunes_runtime_unbound_orphans() {
-        let mut activated = HashSet::new();
-        refresh_activated_tool_names(
-            &mut activated,
-            ["memory".to_string(), "mcp__stale".to_string()],
-        );
-        let surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
-
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |name| {
-                name != "mcp__stale"
-            }),
-            vec!["memory".to_string()],
-            "explicit no-tool surfaces preserve valid activation but still drop unbound orphans"
-        );
-        assert_eq!(activated, HashSet::from(["memory".to_string()]));
-    }
-
-    #[test]
-    fn activation_repeated_schema_injection_does_not_expire_without_tool_call() {
-        let mut activated = HashSet::new();
-        refresh_activated_tool_names(&mut activated, ["memory".to_string()]);
-        let surface =
-            ToolSurfaceNames::installed(HashSet::from(["memory".to_string()]), HashSet::new());
-
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["memory".to_string()]
-        );
-        assert!(activated.contains("memory"));
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["memory".to_string()]
-        );
-        assert!(activated.contains("memory"));
-        assert!(activated.contains("memory"));
-    }
-
-    #[test]
-    fn activation_remains_stable_after_repeated_calls() {
-        let mut activated = HashSet::new();
-        refresh_activated_tool_names(
-            &mut activated,
-            [
-                "bash".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-                "read_file".to_string(),
-            ],
-        );
-        let surface = ToolSurfaceNames::installed(
-            HashSet::from([
-                "bash".to_string(),
-                "grep".to_string(),
-                "glob".to_string(),
-                "read_file".to_string(),
-            ]),
-            HashSet::new(),
-        );
-
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec![
-                "bash".to_string(),
-                "glob".to_string(),
-                "grep".to_string(),
-                "read_file".to_string()
-            ]
-        );
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec![
-                "bash".to_string(),
-                "glob".to_string(),
-                "grep".to_string(),
-                "read_file".to_string()
-            ],
-            "calls must not revoke schemas that remain valid for this agentic run"
-        );
-    }
-
-    #[test]
-    fn activation_prunes_stale_entries_on_non_empty_surface() {
-        let mut activated = HashSet::new();
-        refresh_activated_tool_names(&mut activated, ["memory".to_string(), "stale".to_string()]);
-        let visible = HashSet::from(["tool_search".to_string()]);
-        let activatable = HashSet::from(["memory".to_string()]);
-        let surface = ToolSurfaceNames::installed(visible, activatable);
-
-        assert_eq!(
-            activated_tool_names_for_schema_injection(&mut activated, &surface, |_| true),
-            vec!["memory".to_string()]
-        );
-        assert!(
-            activated.contains("memory") && !activated.contains("stale"),
-            "non-empty surfaces should prune activations outside visible ∪ activatable"
-        );
-    }
-
-    #[test]
-    fn recordable_activation_names_require_current_deferred_manifest() {
-        let out = json!({
+    fn recordable_carrier_activations_require_deferred_manifest_not_visibility() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let output = json!({
             "mode": "select",
-            "query": "select:web_fetch,bash",
-            "requested": ["web_fetch", "bash"],
+            "query": "select:invoke_tool,read_file,web_fetch",
+            "requested": ["invoke_tool", "read_file", "web_fetch"],
+            "resolved": ["invoke_tool", "read_file", "web_fetch"],
             "matches": [
-                {"name": "web_fetch", "parameters": {"type": "object"}},
-                {"name": "bash", "parameters": {"type": "object"}}
+                {"name": "invoke_tool", "schema_digest": digest},
+                {"name": "read_file", "schema_digest": format!("sha256:{}", "b".repeat(64))},
+                {"name": "web_fetch", "schema_digest": format!("sha256:{}", "c".repeat(64))}
             ],
             "missing": []
         })
         .to_string();
         let surface = ToolSurfaceNames::installed(
-            HashSet::from(["bash".to_string()]),
+            HashSet::from([
+                DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
+                "read_file".to_string(),
+            ]),
             HashSet::from(["web_fetch".to_string()]),
         );
 
         assert_eq!(
-            recordable_activated_tool_names(&out, &surface, |_| true),
-            vec!["web_fetch".to_string()],
-            "visible/non-deferred select results must not create deferred activation"
-        );
-        assert!(
-            recordable_activated_tool_names(&out, &ToolSurfaceNames::Uninstalled, |_| true)
-                .is_empty(),
-            "missing manifest must fail closed"
-        );
-        assert!(
-            recordable_activated_tool_names(&out, &surface, |_| false).is_empty(),
-            "callers can fail closed for names without runtime binding"
+            recordable_deferred_tool_activations(&output, &surface, |_| true),
+            vec![DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: format!("sha256:{}", "c".repeat(64)),
+                descriptor: None,
+            }]
         );
     }
 
     #[test]
-    fn select_result_activates_matched_names() {
-        let out = json!({
-            "mode": "select",
-            "query": "select:agent_fanout",
-            "requested": ["agent_fanout"],
-            "matches": [
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
-            ],
-            "missing": []
-        })
-        .to_string();
-        assert_eq!(
-            activated_tool_names_from_tool_search_output(&out),
-            vec!["agent_fanout".to_string()]
-        );
-    }
-
-    #[test]
-    fn canonical_history_reconstructs_only_paired_tool_search_activation() {
+    fn carrier_activation_requires_schema_addressed_selection_evidence() {
+        let digest = format!("sha256:{}", "a".repeat(64));
         let selected = json!({
             "mode": "select",
             "query": "select:github,web_fetch",
             "requested": ["github", "web_fetch"],
+            "resolved": ["github", "web_fetch"],
             "matches": [
-                {"name": "web_fetch", "parameters": {"type": "object"}},
-                {"name": "github", "parameters": {"type": "object"}}
+                {"name": "github", "schema_digest": digest},
+                {"name": "web_fetch"}
             ],
             "missing": []
         })
         .to_string();
+
+        assert_eq!(
+            deferred_tool_activations_from_tool_search_output(&selected),
+            vec![DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: format!("sha256:{}", "a".repeat(64)),
+                descriptor: None,
+            }],
+            "a carrier must never treat a bare name as authorization"
+        );
+    }
+
+    #[test]
+    fn carrier_activation_rejects_forged_or_malformed_selection_evidence() {
+        let valid_digest = format!("sha256:{}", "b".repeat(64));
+        let base = json!({
+            "mode": "select",
+            "query": "select:github",
+            "requested": ["github"],
+            "resolved": ["github"],
+            "matches": [{"name": "github", "schema_digest": valid_digest}],
+            "missing": []
+        });
+        assert_eq!(
+            deferred_tool_activations_from_tool_search_output(&base.to_string()).len(),
+            1
+        );
+
+        let mut forged = base.clone();
+        forged["requested"] = json!(["web_fetch"]);
+        assert!(deferred_tool_activations_from_tool_search_output(&forged.to_string()).is_empty());
+
+        let mut missing_resolved = base.clone();
+        missing_resolved
+            .as_object_mut()
+            .expect("selection envelope is an object")
+            .remove("resolved");
+        assert!(
+            deferred_tool_activations_from_tool_search_output(&missing_resolved.to_string())
+                .is_empty(),
+            "a selection without producer-resolved names must not authorize a carrier"
+        );
+
+        let mut malformed_digest = base;
+        malformed_digest["matches"][0]["schema_digest"] = json!("sha256:not-a-digest");
+        assert!(
+            deferred_tool_activations_from_tool_search_output(&malformed_digest.to_string())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn carrier_invocation_accepts_one_canonical_target_and_object_arguments() {
+        assert_eq!(
+            parse_deferred_tool_invocation(&json!({
+                "name": " web_fetch ",
+                "arguments": {"url": "https://example.invalid"}
+            })),
+            Ok(DeferredToolInvocation {
+                name: "web_fetch".to_string(),
+                arguments: json!({"url": "https://example.invalid"}),
+            })
+        );
+    }
+
+    #[test]
+    fn carrier_invocation_rejects_hidden_authority_and_malformed_targets() {
+        for args in [
+            json!({"name": "bash", "arguments": {}, "route": "edge"}),
+            json!({"name": "bash", "arguments": []}),
+            json!({"name": " ", "arguments": {}}),
+            json!({"name": "bash"}),
+        ] {
+            assert!(parse_deferred_tool_invocation(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn ordinary_invocation_keeps_one_identity_without_activation() {
+        let call = json!({
+            "id": "provider-call-ordinary",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"README.md"}"#}
+        });
+        let invocation = CanonicalToolInvocation::ordinary(call.clone());
+
+        assert_eq!(invocation.physical_provider_call(), &call);
+        assert_eq!(invocation.logical_target_call(), &call);
+        assert_eq!(
+            invocation.provider_call_id(),
+            Some("provider-call-ordinary")
+        );
+        assert_eq!(invocation.activation(), None);
+    }
+
+    #[test]
+    fn runtime_control_invocation_keeps_typed_host_provenance() {
+        let call = json!({
+            "id": "server-work-admission-t1-r0",
+            "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        });
+        let invocation = CanonicalToolInvocation::runtime_control(
+            call.clone(),
+            RuntimeControlInvocationKind::WorkEstablishment,
+        )
+        .expect("typed operation matches the host-created call");
+
+        assert_eq!(invocation.physical_provider_call(), &call);
+        assert_eq!(invocation.logical_target_call(), &call);
+        assert_eq!(invocation.activation(), None);
+        assert_eq!(
+            invocation.runtime_control_kind(),
+            Some(RuntimeControlInvocationKind::WorkEstablishment)
+        );
+        assert!(
+            CanonicalToolInvocation::runtime_control(
+                call,
+                RuntimeControlInvocationKind::WorkScheduler,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_control_carrier_is_bound_to_the_exact_typed_transition() {
+        let carrier = json!({
+            "id": "provider-settlement-1",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"settle_work_item","arguments":{"outcome":"delivered","summary":"done"}}"#,
+            }
+        });
+        let invocation = CanonicalToolInvocation::runtime_control_from_carrier(
+            &carrier,
+            RuntimeControlInvocationKind::WorkSettlement,
+        )
+        .expect("canonical carrier")
+        .expect("exact settlement target");
+
+        assert_eq!(invocation.physical_provider_call(), &carrier);
+        assert_eq!(
+            crate::tool::args::shape::tool_call_name(invocation.logical_target_call()),
+            Some("settle_work_item")
+        );
+        assert_eq!(
+            invocation.runtime_control_kind(),
+            Some(RuntimeControlInvocationKind::WorkSettlement)
+        );
+        assert!(
+            CanonicalToolInvocation::runtime_control_from_carrier(
+                &carrier,
+                RuntimeControlInvocationKind::WorkScheduler,
+            )
+            .expect("well-formed non-matching carrier")
+            .is_none(),
+            "one state boundary cannot authorize another lifecycle transition"
+        );
+    }
+
+    #[test]
+    fn carrier_canonicalization_preserves_provider_identity_and_reuses_target_path() {
+        let digest = format!("sha256:{}", "c".repeat(64));
+        let carrier = json!({
+            "id": "provider-call-1",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"web_fetch","arguments":{"url":"https://example.invalid"}}"#,
+            }
+        });
+        let invocation = canonicalize_deferred_tool_invocation(
+            &carrier,
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: digest.clone(),
+                descriptor: None,
+            }],
+            |name| (name == "web_fetch").then_some(digest.clone()),
+        )
+        .expect("selected current target rewrites")
+        .expect("carrier rewrites");
+
+        assert_eq!(
+            invocation.physical_provider_call(),
+            &carrier,
+            "provider identity remains intact for transcript/cache pairing"
+        );
+        assert_eq!(invocation.logical_target_call()["id"], "provider-call-1");
+        assert_eq!(
+            invocation.logical_target_call()["function"]["name"],
+            "web_fetch"
+        );
+        assert_eq!(
+            crate::tool::args::shape::parse_tool_call_arguments(invocation.logical_target_call()),
+            Ok(json!({"url": "https://example.invalid"}))
+        );
+    }
+
+    #[test]
+    fn carrier_canonicalization_fails_closed_for_unactivated_or_stale_target() {
+        let carrier = json!({
+            "id": "provider-call-2",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"web_fetch","arguments":{}}"#,
+            }
+        });
+        assert_eq!(
+            canonicalize_deferred_tool_invocation(&carrier, &[], |_| None),
+            Err(DeferredToolInvocationError::NotActivated)
+        );
+        assert_eq!(
+            canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[DeferredToolActivation {
+                    name: "web_fetch".to_string(),
+                    schema_digest: format!("sha256:{}", "d".repeat(64)),
+                    descriptor: None,
+                }],
+                |_| Some(format!("sha256:{}", "e".repeat(64))),
+            ),
+            Err(DeferredToolInvocationError::ActivationStale)
+        );
+    }
+
+    #[test]
+    fn carrier_canonicalization_rejects_self_target_even_with_forged_evidence() {
+        let digest = format!("sha256:{}", "e".repeat(64));
+        let carrier = json!({
+            "id": "provider-call-self",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"invoke_tool","arguments":{}}"#,
+            }
+        });
+        assert_eq!(
+            canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[DeferredToolActivation {
+                    name: DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
+                    schema_digest: digest.clone(),
+                    descriptor: None,
+                }],
+                |_| Some(digest.clone()),
+            ),
+            Err(DeferredToolInvocationError::NotActivated)
+        );
+    }
+
+    #[test]
+    fn carrier_canonicalization_rejects_ambiguous_activation_revisions() {
+        let carrier = json!({
+            "id": "provider-call-3",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"web_fetch","arguments":{}}"#,
+            }
+        });
+        assert_eq!(
+            canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[
+                    DeferredToolActivation {
+                        name: "web_fetch".to_string(),
+                        schema_digest: format!("sha256:{}", "f".repeat(64)),
+                        descriptor: None,
+                    },
+                    DeferredToolActivation {
+                        name: "web_fetch".to_string(),
+                        schema_digest: format!("sha256:{}", "0".repeat(64)),
+                        descriptor: None,
+                    },
+                ],
+                |_| Some(format!("sha256:{}", "f".repeat(64))),
+            ),
+            Err(DeferredToolInvocationError::ActivationStale)
+        );
+    }
+
+    #[test]
+    fn batch_resolution_keeps_independent_direct_calls_when_carrier_is_stale() {
+        let calls = vec![
+            json!({"id":"direct-1","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+            json!({"id":"carrier-1","type":"function","function":{"name":"invoke_tool","arguments":"{\"name\":\"web_fetch\",\"arguments\":{}}"}}),
+        ];
+        let resolved = canonicalize_tool_invocation_batch(
+            &calls,
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: format!("sha256:{}", "a".repeat(64)),
+                descriptor: None,
+            }],
+            |_| Some(format!("sha256:{}", "b".repeat(64))),
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved[0]
+                .as_ref()
+                .expect("direct call survives")
+                .logical_target_call()["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            resolved[1],
+            Err(DeferredToolInvocationError::ActivationStale)
+        );
+    }
+
+    #[test]
+    fn refreshing_carrier_activation_replaces_the_previous_schema_revision() {
+        let mut activations = vec![DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: format!("sha256:{}", "1".repeat(64)),
+            descriptor: None,
+        }];
+        refresh_deferred_tool_activations(
+            &mut activations,
+            [DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: format!("sha256:{}", "2".repeat(64)),
+                descriptor: None,
+            }],
+        );
+
+        assert_eq!(
+            activations,
+            vec![DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: format!("sha256:{}", "2".repeat(64)),
+                descriptor: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn canonical_history_reconstructs_typed_activation_and_replaces_revision() {
+        let selection = |digest: char| {
+            json!({
+                "mode": "select",
+                "query": "select:web_fetch",
+                "requested": ["web_fetch"],
+                "resolved": ["web_fetch"],
+                "matches": [{
+                    "name": "web_fetch",
+                    "schema_digest": format!("sha256:{}", digest.to_string().repeat(64))
+                }],
+                "missing": []
+            })
+            .to_string()
+        };
         let messages = vec![
-            json!({"role": "user", "content": selected}),
-            json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "search-1",
-                    "function": {"name": "tool_search", "arguments": "{}"}
-                }]
-            }),
-            json!({"role": "tool", "tool_call_id": "search-1", "content": selected}),
-            json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "other-1",
-                    "function": {"name": "read_file", "arguments": "{}"}
-                }]
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "other-1",
-                "content": {
-                    "mode": "select",
-                    "query": "select:lookalike",
-                    "requested": ["lookalike"],
-                    "matches": [{"name": "lookalike"}],
-                    "missing": []
-                }
-            }),
+            json!({"role": "assistant", "tool_calls": [{"id": "search-1", "function": {"name": "tool_search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "search-1", "content": selection('a')}),
+            json!({"role": "assistant", "tool_calls": [{"id": "search-2", "function": {"name": "tool_search", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "search-2", "content": selection('b')}),
         ];
 
         assert_eq!(
-            activated_tool_names_from_messages(&messages),
-            vec!["github".to_string(), "web_fetch".to_string()]
+            deferred_tool_activations_from_messages(&messages),
+            vec![DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: format!("sha256:{}", "b".repeat(64)),
+                descriptor: None,
+            }]
         );
     }
 
@@ -836,111 +1462,7 @@ mod tests {
             }),
         ];
 
-        assert!(activated_tool_names_from_messages(&messages).is_empty());
-    }
-
-    #[test]
-    fn select_prefix_is_case_insensitive_for_activation() {
-        let out = json!({
-            "mode": "select",
-            "query": " Select:GitHub",
-            "requested": ["GitHub"],
-            "matches": [
-                {"name": "github", "description": "full", "parameters": {"type": "object"}}
-            ],
-            "missing": []
-        })
-        .to_string();
-        assert_eq!(
-            activated_tool_names_from_tool_search_output(&out),
-            vec!["github".to_string()]
-        );
-    }
-
-    #[test]
-    fn select_result_activates_resolved_canonical_name() {
-        let out = json!({
-            "mode": "select",
-            "query": "select:github",
-            "requested": ["github"],
-            "resolved": ["github"],
-            "matches": [
-                {
-                    "name": "github",
-                    "description": "full",
-                    "matched_by": "exact",
-                    "requested": "github",
-                    "parameters": {"type": "object"}
-                }
-            ],
-            "missing": []
-        })
-        .to_string();
-
-        assert_eq!(
-            activated_tool_names_from_tool_search_output(&out),
-            vec!["github".to_string()]
-        );
-    }
-
-    #[test]
-    fn non_selection_result_does_not_activate_names() {
-        let out = json!({
-            "mode": "error",
-            "status": "failed",
-            "query": "agent",
-            "matches": [{"name": "agent_fanout"}]
-        })
-        .to_string();
-        assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
-    }
-
-    #[test]
-    fn select_without_mode_does_not_activate() {
-        let out = json!({
-            "query": "select:agent_fanout",
-            "requested": ["agent_fanout"],
-            "matches": [
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
-            ],
-            "missing": []
-        })
-        .to_string();
-        assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
-    }
-
-    #[test]
-    fn select_result_with_mismatched_requested_list_does_not_activate() {
-        let out = json!({
-            "mode": "select",
-            "query": "select:agent_fanout",
-            "requested": ["github"],
-            "matches": [
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
-            ],
-            "missing": []
-        })
-        .to_string();
-        assert!(activated_tool_names_from_tool_search_output(&out).is_empty());
-    }
-
-    #[test]
-    fn select_result_ignores_matches_that_were_not_requested() {
-        let out = json!({
-            "mode": "select",
-            "query": "select:agent_fanout",
-            "requested": ["agent_fanout"],
-            "matches": [
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}},
-                {"name": "github", "description": "polluted", "parameters": {"type": "object"}}
-            ],
-            "missing": []
-        })
-        .to_string();
-        assert_eq!(
-            activated_tool_names_from_tool_search_output(&out),
-            vec!["agent_fanout".to_string()]
-        );
+        assert!(deferred_tool_activations_from_messages(&messages).is_empty());
     }
 
     #[test]
@@ -1012,21 +1534,137 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_select_matches_activate_once() {
-        let out = json!({
-            "mode": "select",
-            "query": "select:Agent_Fanout,agent_fanout",
-            "requested": ["Agent_Fanout"],
-            "matches": [
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}},
-                {"name": "agent_fanout", "description": "full", "parameters": {"type": "object"}}
-            ],
-            "missing": []
+    fn paired_batch_preserves_provider_order_and_identity_across_views() {
+        let direct = CanonicalToolInvocation::ordinary(json!({
+            "id": "direct-1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        }));
+        let carrier = json!({
+            "id": "carrier-2", "type": "function",
+            "function": {"name": "invoke_tool", "arguments": "{\"name\":\"web_fetch\",\"arguments\":{}}"}
+        });
+        let activation = DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: "sha256:current".to_string(),
+            descriptor: None,
+        };
+        let deferred = canonicalize_deferred_tool_invocation(&carrier, &[activation], |_| {
+            Some("sha256:current".to_string())
         })
-        .to_string();
+        .expect("carrier is valid")
+        .expect("carrier resolves");
+        let batch = CanonicalToolInvocationBatch::new(vec![direct, deferred]);
+
+        assert!(batch.validate().is_ok());
         assert_eq!(
-            activated_tool_names_from_tool_search_output(&out),
-            vec!["agent_fanout".to_string()]
+            batch
+                .physical_provider_calls()
+                .iter()
+                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec!["read_file", "invoke_tool"]
         );
+        assert_eq!(
+            batch
+                .logical_target_calls()
+                .iter()
+                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec!["read_file", "web_fetch"]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_schema_addressed_evidence_and_replaces_a_stale_revision() {
+        let merged = merged_deferred_tool_activations(
+            &[],
+            [
+                DeferredToolActivation {
+                    name: "web_fetch".to_string(),
+                    schema_digest: "sha256:old".to_string(),
+                    descriptor: None,
+                },
+                DeferredToolActivation {
+                    name: "web_fetch".to_string(),
+                    schema_digest: "sha256:current".to_string(),
+                    descriptor: None,
+                },
+                DeferredToolActivation {
+                    name: "session".to_string(),
+                    schema_digest: "sha256:session".to_string(),
+                    descriptor: None,
+                },
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                DeferredToolActivation {
+                    name: "session".to_string(),
+                    schema_digest: "sha256:session".to_string(),
+                    descriptor: None,
+                },
+                DeferredToolActivation {
+                    name: "web_fetch".to_string(),
+                    schema_digest: "sha256:current".to_string(),
+                    descriptor: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_does_not_downgrade_a_provider_bound_activation_from_history() {
+        let descriptor = astra_turn_types::ResolvedToolDescriptorRef::new(
+            astra_turn_types::ToolIdentity::new(
+                astra_turn_types::ProviderBindingRef::new("provider-current").unwrap(),
+                astra_turn_types::NativeToolId::new("web_fetch").unwrap(),
+            ),
+            "sha256:provider-descriptor",
+        )
+        .unwrap();
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "arguments": "{\"query\":\"select:web_fetch\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "search-1",
+                "content": serde_json::json!({
+                    "mode": "select",
+                    "query": "select:web_fetch",
+                    "requested": ["web_fetch"],
+                    "resolved": ["web_fetch"],
+                    "matches": [{
+                        "name": "web_fetch",
+                        "schema_digest": format!("sha256:{}", "a".repeat(64))
+                    }],
+                    "missing": []
+                })
+                .to_string()
+            }),
+        ];
+
+        let merged = merged_deferred_tool_activations(
+            &messages,
+            [DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:provider-schema".to_string(),
+                descriptor: Some(descriptor.clone()),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].descriptor, Some(descriptor));
+        assert_eq!(merged[0].schema_digest, "sha256:provider-schema");
     }
 }

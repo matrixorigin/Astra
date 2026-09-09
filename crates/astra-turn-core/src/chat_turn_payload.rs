@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use crate::chat_turn_edge_profile::build_base_edge_profile_value;
 use crate::chat_turn_explain_wire::chat_turn_explain_field_json;
 use crate::edge_prompt_context::detect_workspace_context;
-use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
 
 /// Inputs for [`chat_turn_base_payload`] (keeps the arity aligned with the JSON body without a 9-arg function).
 pub struct ChatTurnBasePayloadInput<'a> {
@@ -174,13 +173,25 @@ pub fn set_payload_edge_tools(payload: &mut Value, schemas: Vec<Value>) {
     }
 }
 
-/// Drop schemas whose `function.name` is in `restricted_tools`, then set `edge_tools` on the payload.
+/// Drop schemas whose `function.name` is in `restricted_tools`, then set
+/// `edge_tools` on the payload. The runtime-owned deferred invocation carrier
+/// is a protocol primitive rather than a provider capability, so it remains
+/// available whenever the caller assembled it; otherwise a visible
+/// `tool_search` plus a deferred manifest would have no executable next step.
 pub fn attach_filtered_edge_tools(
     payload: &mut Value,
     turn_schemas: Vec<Value>,
     restricted_tools: &HashSet<String>,
 ) {
-    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, restricted_tools);
+    let final_schemas = turn_schemas
+        .into_iter()
+        .filter(|schema| {
+            crate::tool::schema::tool_schema_name(schema).is_none_or(|name| {
+                name == crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+                    || !restricted_tools.contains(name)
+            })
+        })
+        .collect();
     set_payload_edge_tools(payload, final_schemas);
 }
 
@@ -530,5 +541,26 @@ mod tests {
         let arr = p["edge_tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn attach_filtered_edge_tools_keeps_runtime_carrier_outside_capability_restrictions() {
+        let mut p = json!({});
+        let carrier = crate::tool::deferred_activation::deferred_tool_invocation_carrier_schema();
+        let schemas = vec![json!({"function": {"name": "tool_search"}}), carrier];
+        let restricted = HashSet::from([
+            "tool_search".to_string(),
+            crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
+        ]);
+
+        attach_filtered_edge_tools(&mut p, schemas, &restricted);
+
+        let names = p["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(crate::tool::schema::tool_schema_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["invoke_tool"]);
     }
 }

@@ -15,10 +15,6 @@ use astra_turn_core::tool_result_semantics::{
     ToolErrorSeverity, classify_tool_error, tool_output_has_explicit_success_signal,
 };
 
-/// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
-/// when no edge agent matched the tool call.
-const EDGE_PROTOCOL_ERROR_PREFIX: &str = super::HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX;
-
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessInvocationScope<'a> {
     Durable {
@@ -67,7 +63,7 @@ pub(crate) async fn execute_tool_pure(
 ) -> crate::server::runtime_tool_executor::RuntimeToolDispatchControl {
     let mut dispatch_control =
         crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue;
-    if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+    if execution.edge_result_missing {
         if let Some(executor) = runtime_tool_executor
             && !selected_runtime_provider_tool_missing_edge_result(execution, edge_round_present)
         {
@@ -106,7 +102,7 @@ pub(crate) async fn execute_tool_pure(
             apply_runtime_tool_result(execution, result);
         }
     }
-    if execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+    if execution.edge_result_missing {
         let fields = execution.tool_result_fields.get_or_insert_with(Map::new);
         fields.insert("status".to_string(), Value::String("failed".to_string()));
         fields.insert(
@@ -136,6 +132,7 @@ fn apply_runtime_tool_result(
     result: astra_tools::ToolResult,
 ) {
     execution.authoritative_is_error = Some(result.is_error);
+    execution.edge_result_missing = false;
     let mut fields = result.metadata.unwrap_or_default();
     if result.is_error {
         fields.insert("status".to_string(), Value::String("failed".to_string()));
@@ -177,6 +174,8 @@ mod runtime_tool_result_tests {
             pending_runtime_completion: None,
             edge_duration_ms: 0,
             is_edge_tool: false,
+            edge_result_missing: false,
+            edge_terminal_authority: false,
             early_exit_ms: 0,
         }
     }
@@ -272,6 +271,37 @@ pub(super) fn execution_result_is_error(
     // side effect into a false failure. Body inference is only for local tools
     // whose provider contract has no typed outcome.
     if let Some(is_error) = authoritative_is_error {
+        if is_error
+            && tool_result_fields.is_some_and(|fields| {
+                fields
+                    .get("exit_semantics")
+                    .and_then(Value::as_str)
+                    .and_then(|tag| {
+                        serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
+                            Value::String(tag.to_string()),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|semantics| !semantics.is_tool_error())
+                    || fields
+                        .get("result_class")
+                        .and_then(Value::as_str)
+                        .and_then(|tag| {
+                            serde_json::from_value::<
+                                astra_tools::exit_semantics::CommandResultClass,
+                            >(Value::String(tag.to_string()))
+                            .ok()
+                        })
+                        .is_some_and(|result_class| !result_class.is_tool_error())
+            })
+        {
+            // A provider may carry the shell's generic `failed` status while
+            // preserving the executor's typed process semantics.  Empty
+            // results and domain-negative answers are completed observations,
+            // not execution errors; let that structured producer-owned fact
+            // reconcile a stale boolean status without parsing output text.
+            return false;
+        }
         return is_error;
     }
     let metadata_failed = tool_result_fields.is_some_and(|fields| {
@@ -448,6 +478,50 @@ mod tests {
             "Replaced 1 occurrence\n<<<ASTRA_TOOL_OK>>>",
             Some(&fields),
             None,
+        ));
+    }
+
+    #[test]
+    fn typed_non_error_exit_semantics_override_stale_authoritative_failure() {
+        let fields = Map::from_iter([
+            ("status".to_string(), Value::String("failed".to_string())),
+            (
+                "exit_semantics".to_string(),
+                Value::String("empty_result".to_string()),
+            ),
+            (
+                "result_class".to_string(),
+                Value::String("empty_result".to_string()),
+            ),
+        ]);
+
+        assert!(!execution_result_is_error(
+            "bash",
+            "(exit code: 1)",
+            Some(&fields),
+            Some(true),
+        ));
+    }
+
+    #[test]
+    fn typed_execution_failure_remains_authoritative() {
+        let fields = Map::from_iter([
+            ("status".to_string(), Value::String("failed".to_string())),
+            (
+                "exit_semantics".to_string(),
+                Value::String("execution_error".to_string()),
+            ),
+            (
+                "result_class".to_string(),
+                Value::String("execution_error".to_string()),
+            ),
+        ]);
+
+        assert!(execution_result_is_error(
+            "bash",
+            "Error: command failed",
+            Some(&fields),
+            Some(true),
         ));
     }
 

@@ -15,7 +15,9 @@ use super::lifecycle::{
     tool_record_is_workspace_mutation, wait_for_pause_clear_or_cancel,
 };
 use crate::turn::run_control::{ProviderBoundaryAuthorization, UserIntentAdmissionAuthority};
-use astra_config::user_profile::{MutationCompletionScope, Scenario, WorkspaceMutationIntent};
+use astra_config::user_profile::{
+    MutationCompletionScope, Scenario, TurnIntentDomain, WorkspaceMutationIntent,
+};
 use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore, SessionArtifactStore};
 use astra_turn_core::agentic_turn_ingest::{
@@ -27,6 +29,7 @@ use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, Compact
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 use astra_turn_types::NormalizedPromptCacheUsage;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const USER_INTENT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -355,9 +358,38 @@ fn reconcile_unsettled_work_status(state: &mut AgenticLoopState) {
 /// lifecycle mark the still-owned carrier failed instead of rendering an
 /// uncommitted success claim or leaving it paused.
 fn enforce_typed_work_settlement_before_text_completion(state: &mut AgenticLoopState) -> bool {
-    if !state.hooks.completion_settlement.work_settlement_only {
+    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
+        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+    );
+    enforce_typed_work_settlement_before_text_completion_for_work_state(state, active_work_attempt)
+}
+
+fn enforce_typed_work_settlement_before_text_completion_for_work_state(
+    state: &mut AgenticLoopState,
+    active_work_attempt: bool,
+) -> bool {
+    // The executor's canonical ownership is the terminal invariant. The
+    // settlement-only flag is a provider-facing projection and may not have
+    // been installed yet when a system-owned dispatcher resumed an existing
+    // attempt. Never let that projection become completion authority.
+    if !state.hooks.completion_settlement.work_settlement_only && !active_work_attempt {
         return false;
     }
+
+    // An exact completion-action window owns this boundary. Its admission
+    // guard below will either advance the typed chain or reject prose. Once
+    // the window closes, active ownership becomes settlement-only.
+    if state
+        .hooks
+        .completion_settlement
+        .completion_action_window
+        .is_some()
+    {
+        return false;
+    }
+
+    state.hooks.completion_settlement.work_settlement_only = true;
+    state.hooks.completion_settlement.text_only = false;
 
     state.budget_wrapup_ignored_rounds = state.budget_wrapup_ignored_rounds.saturating_add(1);
     if state.budget_wrapup_ignored_rounds == 1 {
@@ -1194,7 +1226,10 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 "signal": "post_mutation_observation_capability_retry_once",
                 "allowed_action": CompletionAction::PostMutationObservation,
                 "attempts_remaining": 1,
-                "action_hint": completion_action_hint(&CompletionAction::PostMutationObservation),
+                "action_hint": completion_action_hint_for_state(
+                    state,
+                    &CompletionAction::PostMutationObservation,
+                ),
                 "execution_authority": "one_matching_action",
                 "instruction": "The required workspace observation could not run because the selected capability was unavailable. Perform exactly one different available read-only observation or validator under the same post-mutation obligation. Do not mutate the workspace, retry the unavailable capability, or resume exploration.",
                 "authority": "executed_tool_unavailable_outcome",
@@ -1248,7 +1283,10 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 "signal": "failed_post_mutation_observation_repair_once",
                 "allowed_action": CompletionAction::PostMutationRepair,
                 "attempts_remaining": 1,
-                "action_hint": completion_action_hint(&CompletionAction::PostMutationRepair),
+                "action_hint": completion_action_hint_for_state(
+                    state,
+                    &CompletionAction::PostMutationRepair,
+                ),
                 "failed_validation_operation": failed_validation_operation,
                 "execution_authority": "one_matching_action",
                 "instruction": "The required post-mutation validator executed and failed. Make exactly one smallest workspace repair now. That repair must complete successfully with an executor-owned workspace mutation receipt; only then rerun the same failed validator once. Do not substitute a generic workspace read, resume exploration, or make any unrelated tool call.",
@@ -1418,7 +1456,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 "mode": if active_work_attempt { "bounded_completion_then_work_settlement" } else { "bounded_completion_chain" },
                 "allowed_action": next_action,
                 "attempts_remaining": 1,
-                "action_hint": completion_action_hint(&next_action),
+                "action_hint": completion_action_hint_for_state(state, &next_action),
                 "declarations_may_remain_visible_for_cache": true,
                 "execution_authority": "one_matching_action",
                 "instruction": if active_work_attempt {
@@ -1611,6 +1649,10 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
             return false;
         }
         state.hooks.completion_settlement.external_effect_retries = 1;
+        state
+            .hooks
+            .completion_settlement
+            .external_effect_recovery_paths = None;
         state.hooks.completion_settlement.text_only = false;
         state.hooks.completion_settlement.work_settlement_only = false;
         state.hooks.completion_settlement.wrapup_origin = None;
@@ -1624,7 +1666,7 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
                 "schema": "external_completion_required.v1",
                 "signal": "required_external_effect_missing",
                 "evidence": { "authoritative_external_effect_receipts": 0 },
-                "instruction": "The requested state is outside the bound workspace, but no authoritative external delta was observed. Continue with one foreground action using the tool's structured external_state_paths field and list only the smallest absolute external roots that must change. The executor, not your prose or the command exit status, will compare their pre/post state. If no safe bounded root can be observed, report that blocker precisely.",
+                "instruction": "The requested state is outside the bound workspace, but no authoritative external delta was observed. Continue with one foreground action that performs the required external mutation and, on that same Bash call, uses the structured external_state_paths field to list only the smallest absolute external roots that must change. A later read-only probe cannot establish the receipt. The executor, not your prose or the command exit status, will compare their pre/post state. If no safe bounded root can be observed, report that blocker precisely.",
                 "authority": "typed_turn_intent_and_executor_effect_ledger",
             }),
         );
@@ -2691,6 +2733,7 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
         // effect and completion authority until the bounded classifier owns a
         // new value. Otherwise ReadOnly/MustMutate can leak across user
         // steering and make tool admission contradict the current request.
+        state.canonical_turn_chain_id = model_guidance.last().map(|input| input.intent_id.clone());
         state.turn_intent = None;
         state.task_profile.mutates_workspace = false;
         state.task_profile.verification_required = false;
@@ -2754,6 +2797,29 @@ pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
     )
     .total_input_tokens()
     .saturating_add(turn_result.accum.completion_tokens)
+}
+
+fn runtime_feedback_run_usage(
+    state: &AgenticLoopState,
+    accum: &astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum,
+) -> Option<astra_turn_core::token_accounting::TokenAccounting> {
+    accum.has_usage.then(|| {
+        if accum.usage_is_run_total {
+            astra_turn_core::token_accounting::TokenAccounting::from_fields(
+                accum.prompt_tokens,
+                accum.cache_read_tokens,
+                accum.cache_creation_tokens,
+                accum.completion_tokens,
+            )
+        } else {
+            astra_turn_core::token_accounting::TokenAccounting::from_fields(
+                state.total_prompt,
+                state.total_cache_read,
+                state.total_cache_creation,
+                state.total_completion,
+            )
+        }
+    })
 }
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
@@ -3988,36 +4054,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // to overwrite it.
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
-    if matches!(&ingest_outcome, AgenticTurnIngestOutcome::Break)
-        && runtime_retrospective_requires_live_evidence(&state.message)
-        && !state.telemetry.all_tools_used.contains("introspect")
-        && state.hooks.completion_settlement.runtime_evidence_retries == 0
-    {
-        state.hooks.completion_settlement.runtime_evidence_retries = 1;
-        state.messages.truncate(transcript_append_start);
-        state.final_text.clear();
-        state.final_text_streamed = false;
-        state.push_volatile_payload(
-            super::host::VolatileKind::RuntimeEvidenceRequired,
-            serde_json::json!({
-                "schema": "runtime_evidence_required.v1",
-                "reason": "runtime_or_session_retrospective_without_live_observation",
-                "instruction": "Before making runtime, session-state, trace, or tool-ledger claims, call introspect exactly once with facet=overview, depth=diagnostic, horizon=recent. Use reflect at most once only for persisted prior-turn causality. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
-            }),
-        );
-        tracing::warn!(
-            target: "astra::provenance_guard",
-            "retrying runtime retrospective that attempted to settle without introspect evidence"
-        );
-        record_early_exit_llm_round(
-            state,
-            &turn_result,
-            prep.turn_start_time,
-            Some("runtime_evidence_required"),
-        );
-        state.step_recorder.end_turn(false);
-        return Ok(TurnExecutionControl::ContinueLoop);
-    }
     state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
         host.on_session_bound(session_id);
@@ -4104,18 +4140,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     (!turn_result.accum.usage_is_run_total && turn_result.accum.has_usage)
                         .then(aggregate_usage)
                 });
-            let run_usage = turn_result.accum.has_usage.then(|| {
-                if turn_result.accum.usage_is_run_total {
-                    aggregate_usage()
-                } else {
-                    astra_turn_core::token_accounting::TokenAccounting::from_fields(
-                        state.total_prompt,
-                        state.total_cache_read,
-                        state.total_cache_creation,
-                        state.total_completion,
-                    )
-                }
-            });
+            let run_usage = runtime_feedback_run_usage(state, &turn_result.accum);
             let server_execution_summary = turn_result.accum.server_execution_summary.as_ref();
             let forwarded_runtime_feedback = server_execution_summary.and_then(|summary| {
                 authoritative_server_runtime_feedback(
@@ -4152,6 +4177,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     let estimated_input_tokens = wire_budget
                         .and_then(|budget| budget.get("estimated_input_tokens"))
                         .and_then(serde_json::Value::as_u64);
+                    let estimated_cache_eligible_tokens =
+                        prompt_cache_eligible_tokens_from_manifest(
+                            state.last_llm_context_manifest_trace.as_ref(),
+                        );
                     let effective_input_limit_tokens = wire_budget
                         .and_then(|budget| budget.get("effective_input_limit"))
                         .and_then(serde_json::Value::as_u64)
@@ -4192,6 +4221,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             model_context_window_tokens,
                             effective_input_limit_tokens,
                             estimated_input_tokens,
+                            estimated_cache_eligible_tokens,
                             token_pressure,
                             compaction_tier: state.compact_tier_applied,
                         },
@@ -5076,49 +5106,6 @@ pub(crate) fn capture_deferred_candidate_text(
     }
 }
 
-fn runtime_retrospective_requires_live_evidence(message: &str) -> bool {
-    let normalized = message.to_lowercase();
-    let observation_scope = [
-        "runtime",
-        "trace",
-        "telemetry",
-        "运行状态",
-        "运行时",
-        "session:",
-        "session state",
-        "session history",
-        "session trace",
-        "this session",
-        "current session",
-        "会话状态",
-        "会话历史",
-        "这段会话",
-        "这个会话",
-        "工具调用",
-        "调用记录",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    let retrospective_intent = [
-        "retrospect",
-        "reflect",
-        "audit",
-        "diagnos",
-        "inspect",
-        "evidence",
-        "反省",
-        "复盘",
-        "回顾",
-        "审计",
-        "诊断",
-        "分析",
-        "证据",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    observation_scope && retrospective_intent
-}
-
 fn collapse_batched_observation_fanout(tool_calls: &mut Vec<serde_json::Value>) -> usize {
     let mut remove = std::collections::HashSet::new();
     for tool_name in ["introspect", "reflect"] {
@@ -5215,6 +5202,12 @@ fn prompt_cache_identity_from_manifest(
         .and_then(|identity| serde_json::from_value(identity.clone()).ok())
 }
 
+fn prompt_cache_eligible_tokens_from_manifest(manifest: Option<&serde_json::Value>) -> Option<u64> {
+    manifest
+        .and_then(|trace| trace.pointer("/wire/cache_estimate/eligible_tokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
 /// Mid-loop escalation: kicks in while the model is still calling tools but
 /// has spent the first several rounds only on read-only inspection (`cat`,
 /// `grep`, `ls`, `git diff`, etc.) on a task whose profile says it should be
@@ -5262,7 +5255,15 @@ enum LiveDesiredStateConvergence {
     Observed,
 }
 
-fn live_desired_state_convergence_state(state: &AgenticLoopState) -> LiveDesiredStateConvergence {
+#[derive(Debug, Clone)]
+struct LiveDesiredStateConvergenceStatus {
+    state: LiveDesiredStateConvergence,
+    pending_target: Option<String>,
+}
+
+fn live_desired_state_convergence_status(
+    state: &AgenticLoopState,
+) -> LiveDesiredStateConvergenceStatus {
     #[derive(Clone)]
     struct PendingConvergence {
         evidence: astra_tools::workspace_observation::TypedWorkspaceDesiredStateConvergenceEvidence,
@@ -5341,12 +5342,33 @@ fn live_desired_state_convergence_state(state: &AgenticLoopState) -> LiveDesired
         }
     }
     if observed_convergence {
-        LiveDesiredStateConvergence::Observed
-    } else if pending.is_some() {
-        LiveDesiredStateConvergence::PendingObservation
+        LiveDesiredStateConvergenceStatus {
+            state: LiveDesiredStateConvergence::Observed,
+            pending_target: None,
+        }
+    } else if let Some(pending) = pending {
+        LiveDesiredStateConvergenceStatus {
+            state: LiveDesiredStateConvergence::PendingObservation,
+            pending_target: Some(pending.evidence.target),
+        }
     } else {
-        LiveDesiredStateConvergence::None
+        LiveDesiredStateConvergenceStatus {
+            state: LiveDesiredStateConvergence::None,
+            pending_target: None,
+        }
     }
+}
+
+fn live_desired_state_convergence_state(state: &AgenticLoopState) -> LiveDesiredStateConvergence {
+    live_desired_state_convergence_status(state).state
+}
+
+/// Return the normalized workspace-relative target whose complete-state
+/// writer produced a live no-op convergence receipt.  This target is only
+/// exposed while the typed state machine is waiting for its required fresh
+/// observation; it is never inferred from task text or shell output.
+fn pending_live_desired_state_convergence_target(state: &AgenticLoopState) -> Option<String> {
+    live_desired_state_convergence_status(state).pending_target
 }
 
 fn live_desired_state_convergence_evidence(
@@ -5409,13 +5431,136 @@ pub(crate) fn has_concrete_external_effect(state: &AgenticLoopState) -> bool {
         .iter()
         .filter(|record| record.was_executed() && record.ok)
         .any(|record| {
-            record.external_effect_observed == Some(true)
-                && record.external_effect_scope.as_deref()
-                    == Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
-                && record.external_effect_receipt.as_ref().is_some_and(
-                    astra_tools::workspace_observation::is_authoritative_external_effect_receipt,
-                )
+            if record.external_effect_observed != Some(true)
+                || record.external_effect_scope.as_deref()
+                    != Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
+            {
+                return false;
+            }
+            let Some(receipt) = record.external_effect_receipt.as_ref() else {
+                return false;
+            };
+            if !astra_tools::workspace_observation::is_authoritative_external_effect_receipt(
+                receipt,
+            ) {
+                return false;
+            }
+            // A typed service receipt must remain bound to the canonical
+            // record and its action.  Do not let an MCP/provider payload or a
+            // copied metadata field satisfy an unrelated external obligation.
+            if receipt.get("source").and_then(serde_json::Value::as_str)
+                == Some("typed_external_tool")
+            {
+                let Some(args) =
+                    super::lifecycle::extract_tool_args(record.authoritative_args_full())
+                else {
+                    return false;
+                };
+                let expected_digest = format!(
+                    "{:x}",
+                    Sha256::digest(astra_core::canonical_json_string(&args))
+                );
+                return typed_memory_external_effect_is_in_scope(state)
+                    && record.name == "memory"
+                    && receipt.get("action").and_then(serde_json::Value::as_str)
+                        == args.get("action").and_then(serde_json::Value::as_str)
+                    && receipt
+                        .get("operation_digest")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected_digest.as_str())
+                    && matches!(
+                        args.get("action").and_then(serde_json::Value::as_str),
+                        Some("remember" | "forget" | "update" | "feedback")
+                    );
+            }
+            true
         })
+}
+
+/// A memory receipt is authoritative for a memory turn, but it cannot settle
+/// an unrelated external deployment/system mutation.  Memory is available as
+/// a resident housekeeping tool on every turn, so accepting its receipt for
+/// every `External`/`Mixed` scope would let an incidental remember call
+/// masquerade as completion of the requested external state change.
+///
+/// The domain is semantic admission data, not a reconstruction from tool
+/// names or user text.  Missing/other domains fail closed and leave the
+/// external-effect obligation pending for the actual scoped executor action.
+fn typed_memory_external_effect_is_in_scope(state: &AgenticLoopState) -> bool {
+    state.turn_intent.as_ref().and_then(|intent| intent.domain) == Some(TurnIntentDomain::Memory)
+}
+
+/// Read the exact structured external observation scope from one executed
+/// Bash record.  This is deliberately a typed boundary: previews, command
+/// text, exit status, and rejected calls cannot seed recovery authority.
+fn external_effect_scope_from_record(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> Option<Vec<String>> {
+    if record.name != "bash" || !record.was_executed() {
+        return None;
+    }
+    let args = super::lifecycle::extract_tool_args(record.authoritative_args_full())?;
+    if args
+        .get("run_in_background")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return None;
+    }
+    let paths = args
+        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+        .and_then(serde_json::Value::as_array)?;
+    let paths = paths
+        .iter()
+        .map(serde_json::Value::as_str)
+        .map(|path| path.map(str::trim).filter(|path| !path.is_empty()))
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty()).then(|| paths.into_iter().map(ToString::to_string).collect())
+}
+
+/// Remember the last executor-admitted external observation scope for the
+/// bounded recovery sequence.  Once a concrete receipt exists, clear the
+/// carry-over so a later ordinary Bash call cannot inherit stale authority.
+pub(crate) fn remember_external_effect_recovery_scope(
+    state: &mut AgenticLoopState,
+    records: &[astra_services::session_journal::ToolCallRecord],
+) {
+    if state.hooks.completion_settlement.external_effect_retries == 0 {
+        return;
+    }
+    if has_concrete_external_effect(state) {
+        state
+            .hooks
+            .completion_settlement
+            .external_effect_recovery_paths = None;
+        return;
+    }
+    if let Some(paths) = records
+        .iter()
+        .rev()
+        .find_map(external_effect_scope_from_record)
+    {
+        state
+            .hooks
+            .completion_settlement
+            .external_effect_recovery_paths = Some(paths);
+    }
+}
+
+/// Snapshot the typed scope before assembling the next tool round.  The
+/// caller owns the returned clone so it can borrow the rest of loop state
+/// mutably while the headless pipeline executes.
+pub(crate) fn external_effect_recovery_scope(state: &AgenticLoopState) -> Option<Vec<String>> {
+    if state.hooks.completion_settlement.external_effect_retries == 0
+        || has_concrete_external_effect(state)
+    {
+        return None;
+    }
+    state
+        .hooks
+        .completion_settlement
+        .external_effect_recovery_paths
+        .clone()
 }
 
 /// Positive mutation shape is retained even when the command failed: the
@@ -5952,7 +6097,11 @@ fn mutation_completion_scope(state: &AgenticLoopState) -> MutationCompletionScop
         .unwrap_or(MutationCompletionScope::Unknown)
 }
 
-fn requires_external_effect_completion(state: &AgenticLoopState) -> bool {
+/// Whether the typed turn contract requires an executor-owned receipt for a
+/// mutation outside the bound workspace.  This is shared with provider
+/// surface projection: a required completion action must be represented by a
+/// callable schema before the model reaches the terminal recovery boundary.
+pub(crate) fn requires_external_effect_completion(state: &AgenticLoopState) -> bool {
     workspace_mutation_intent(state) == WorkspaceMutationIntent::MustMutate
         && matches!(
             mutation_completion_scope(state),
@@ -6021,8 +6170,14 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
             }
             CompletionAction::RequiredExternalEffect => {
                 accepted_action_shapes.push(serde_json::json!({
-                    "constraint": "one foreground task-facing action carrying a non-empty structured external_state_paths array; the executor must observe a delta under authoritative invocation ownership",
+                    "tool": "bash",
+                    "constraint": "one foreground action that performs the required external mutation and carries a non-empty structured external_state_paths array on that same call; the executor must observe a delta under authoritative invocation ownership; a later read-only probe cannot establish the receipt",
                     "evidence_inference_forbidden": ["assistant_text", "tool_name", "command_text", "exit_code"],
+                }));
+                accepted_action_shapes.push(serde_json::json!({
+                    "tool": "memory",
+                    "constraint": "one mutating memory action (remember, forget, update, or feedback); the memory executor must produce an action-bound authoritative external-effect receipt",
+                    "evidence_inference_forbidden": ["assistant_text", "tool_name_alone", "provider_payload_without_executor_receipt"],
                 }));
                 (
                     "external_effect_receipt_missing",
@@ -6128,17 +6283,44 @@ fn completion_action_requires_complete_state_writer(
         && state.hooks.completion_settlement.workspace_mutation_retries > 0
 }
 
-fn completion_action_hint_for_state(
+pub(crate) fn completion_action_hint_for_state(
     state: &AgenticLoopState,
     action: &CompletionAction,
 ) -> serde_json::Value {
     let mut hint = completion_action_hint(action);
+    if matches!(action, CompletionAction::RequiredExternalEffect)
+        && !typed_memory_external_effect_is_in_scope(state)
+    {
+        // Memory is always resident for session maintenance, but only a
+        // semantically memory-scoped turn may use its typed receipt to settle
+        // an external-effect obligation. Keep the model-facing hint aligned
+        // with the same typed matcher used by admission.
+        if let Some(shapes) = hint["accepted_action_shapes"].as_array_mut() {
+            shapes.retain(|shape| shape["tool"] != "memory");
+        }
+    }
     if completion_action_requires_complete_state_writer(state, action) {
         hint["accepted_action_shapes"] = serde_json::json!([{
             "tool": "write_file",
             "constraint": "one complete-state typed writer containing the target path and full desired bytes",
             "changed_outcome": "an executor-owned workspace mutation receipt advances to a later observation obligation",
             "already_exact_outcome": "an executor-owned no-op convergence receipt advances only to one later separate full read_file of the same target",
+            "evidence_inference_forbidden": ["assistant_text", "bash_output", "bash_exit_status", "server_stat_of_remote_workspace"],
+        }]);
+    }
+    if matches!(action, CompletionAction::PostMutationObservation)
+        && let Some(target) = pending_live_desired_state_convergence_target(state)
+    {
+        // A complete-state no-op writer already established the desired
+        // bytes through an executor-owned receipt. The only remaining edge
+        // is one later full typed observation of that receipt's exact target;
+        // keep the target structural and avoid accepting a shell/prose
+        // approximation that cannot carry the required observer receipt.
+        hint["latest_known_stable_target"] = serde_json::Value::String(target.clone());
+        hint["accepted_action_shapes"] = serde_json::json!([{
+            "tool": "read_file",
+            "target": target,
+            "constraint": "one later separate full read_file observation of this exact target; omit range and outline arguments",
             "evidence_inference_forbidden": ["assistant_text", "bash_output", "bash_exit_status", "server_stat_of_remote_workspace"],
         }]);
     }
@@ -6177,10 +6359,10 @@ fn completion_action_mismatch_instruction(
             "Only one task-facing action from the live admitted tool surface may execute at this boundary; runtime control and self-inspection calls do not match."
         }
         (CompletionAction::RequiredExternalEffect, true) => {
-            "This request did not carry the structured external_state_paths observation contract and was not executed. Correct it with one foreground task action naming only the smallest absolute external roots that must change."
+            "This request did not match an observable external-effect contract and was not executed. Correct it with one foreground Bash action that performs the required mutation and, on that same call, names only the smallest absolute external roots that must change; a later read-only probe cannot establish the receipt. Or use one mutating memory action whose executor produces an action-bound authoritative receipt."
         }
         (CompletionAction::RequiredExternalEffect, false) => {
-            "Only one foreground task action carrying a valid external_state_paths observation contract may execute at this boundary."
+            "Only one foreground Bash action that performs the required mutation and carries a valid external_state_paths observation contract on that same call, or one mutating memory action with an executor-owned receipt contract, may execute at this boundary. A later read-only probe cannot establish the receipt."
         }
         (_, true) => {
             "This request did not match the typed completion obligation and was not executed. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
@@ -6222,17 +6404,61 @@ pub(crate) fn completion_action_match_label(
                     .then(|| "required_workspace_mutation".to_string())
             }
         }
-        CompletionAction::RequiredExternalEffect => args
-            .as_ref()
-            .and_then(|args| {
-                args.get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-            })
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|paths| !paths.is_empty())
-            .then(|| "required_external_effect".to_string()),
+        CompletionAction::RequiredExternalEffect => {
+            let bash_has_observation_scope = name == "bash"
+                && args.as_ref().is_some_and(|args| {
+                    args.get("run_in_background")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                        && args
+                            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|paths| !paths.is_empty())
+                });
+            let typed_memory_mutation = typed_memory_external_effect_is_in_scope(state)
+                && name == "memory"
+                && args.as_ref().is_some_and(|args| {
+                    astra_tools::memory_tool_contract::memory_action_from_args(args).is_ok_and(
+                        |action| {
+                            matches!(
+                                action,
+                                astra_tools::memory_tool_contract::MemoryAction::Remember
+                                    | astra_tools::memory_tool_contract::MemoryAction::Forget
+                                    | astra_tools::memory_tool_contract::MemoryAction::Update
+                                    | astra_tools::memory_tool_contract::MemoryAction::Feedback
+                            )
+                        },
+                    )
+                });
+            // A provider's mutating policy is not by itself a settlement
+            // receipt.  Only capabilities with a runtime producer for an
+            // action-bound authoritative receipt may spend this one-shot
+            // boundary; today that is Bash's structured observation lease and
+            // the built-in memory handler below.  Unknown/provider payloads
+            // remain fail-closed until their executor contract is wired into
+            // the journal record.
+            (bash_has_observation_scope || typed_memory_mutation)
+                .then(|| "required_external_effect".to_string())
+        }
         CompletionAction::CompletionTaskAction => tool_is_terminal_completion_task_action(name)
             .then(|| "completion_task_action".to_string()),
         CompletionAction::PostMutationObservation => {
+            if let Some(expected_target) = pending_live_desired_state_convergence_target(state) {
+                let root = state.hooks.workspace_root_hint.as_deref();
+                let matches_target = name == "read_file"
+                    && root
+                        .and_then(|root| {
+                            args.as_ref().and_then(|args| {
+                                astra_tools::workspace_observation::full_read_file_normalized_target(
+                                    name,
+                                    args,
+                                    std::path::Path::new(root),
+                                )
+                            })
+                        })
+                        .is_some_and(|target| target == expected_target);
+                return matches_target.then(|| "post_mutation_observation".to_string());
+            }
             if let Some(expected_operation) = state
                 .hooks
                 .completion_settlement
@@ -6440,7 +6666,7 @@ pub(crate) fn apply_completion_action_admission(
     });
     let mut matched_labels = Vec::new();
     for call in admission.admitted.drain(..) {
-        let match_label = completion_action_match_label(state, &action, &call);
+        let match_label = completion_action_match_label(state, &action, call.logical_target_call());
         let matches = if is_explicit_verification {
             match_label.as_ref().is_some_and(|label| {
                 if matched_labels.iter().any(|seen| seen == label) {
@@ -6457,18 +6683,8 @@ pub(crate) fn apply_completion_action_admission(
             retained.push(call);
             continue;
         }
-        let name = astra_turn_core::tool::args::shape::tool_call_name(&call)
-            .unwrap_or("unknown")
-            .to_string();
-        let id = call
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
         admission.rejected.push(RejectedToolCall {
-            id,
-            name,
-            canonical_call: call,
+            invocation: call,
             result: serde_json::json!({
                 "status": "rejected",
                 "error_kind": "completion_action_mismatch",
@@ -7094,6 +7310,23 @@ mod tests {
     use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
     use astra_turn_core::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
 
+    fn ordinary_admitted(
+        calls: impl IntoIterator<Item = serde_json::Value>,
+    ) -> Vec<astra_turn_core::tool::deferred_activation::CanonicalToolInvocation> {
+        calls
+            .into_iter()
+            .map(astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary)
+            .collect()
+    }
+
+    fn admitted_logical_calls(admission: &ToolCallAdmission) -> Vec<serde_json::Value> {
+        admission
+            .admitted
+            .iter()
+            .map(|call| call.logical_target_call().clone())
+            .collect()
+    }
+
     fn install_committed_work_synthesis_wire_surface(state: &mut AgenticLoopState) {
         state
             .hooks
@@ -7363,28 +7596,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_retrospective_intent_requires_scope_and_investigation() {
-        assert!(runtime_retrospective_requires_live_evidence(
-            "系统性反省这段 session 的实际运行状态和异常 trace，请基于证据分析"
-        ));
-        assert!(runtime_retrospective_requires_live_evidence(
-            "Audit this runtime session and diagnose its tool calls"
-        ));
-        assert!(!runtime_retrospective_requires_live_evidence(
-            "代码 review 和修改代码有什么区别？"
-        ));
-        assert!(!runtime_retrospective_requires_live_evidence(
-            "系统性分析这个算法的复杂度"
-        ));
-        assert!(!runtime_retrospective_requires_live_evidence(
-            "Inspect the session command surface and give two evidence-based bullets"
-        ));
-        assert!(!runtime_retrospective_requires_live_evidence(
-            "Do not include or invent a session id; explain the proposal evidence boundary"
-        ));
-    }
-
-    #[test]
     fn settlement_candidate_keeps_first_mixed_response_until_text_only_retry() {
         let mut state = make_state();
         state.budget_wrapup_injected = true;
@@ -7531,70 +7742,6 @@ mod tests {
 
         assert_eq!(collapse_batched_observation_fanout(&mut calls), 0);
         assert_eq!(calls.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn runtime_retrospective_without_introspect_gets_one_bounded_evidence_retry() {
-        let unsupported = "我回看了完整运行记录，session 没有异常 trace。";
-        let mut host = MockHost::new(vec![
-            text_result(unsupported, 20, 10, Some(30)),
-            server_tool_result(
-                vec![serde_json::json!({
-                    "id": "call-introspect",
-                    "type": "function",
-                    "function": {
-                        "name": "introspect",
-                        "arguments": serde_json::json!({
-                            "facet": "overview",
-                            "depth": "diagnostic",
-                            "horizon": "recent"
-                        }).to_string()
-                    }
-                })],
-                Vec::new(),
-                20,
-                10,
-                Some(30),
-            ),
-            text_result("基于 live snapshot：没有观测到异常。", 20, 10, Some(30)),
-        ])
-        .with_valid_tools(&["introspect"]);
-        let mut state = make_state();
-        state.message = "请系统性反省这个 session 的运行状态和 trace，并基于证据分析".to_string();
-        state.user_intent = state.message.clone();
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": state.message}));
-        let workspace = tempfile::TempDir::new().expect("workspace");
-        state.runtime_tool_executor = Some(Arc::new(
-            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
-                workspace.path().to_path_buf(),
-                "test-user".into(),
-                "test-session".into(),
-                None,
-                None,
-            ),
-        ));
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(
-            outcome.is_ok(),
-            "bounded evidence retry must complete: {outcome:?}; turns={}; tools={:?}; records={:?}; final={:?}",
-            host.turn_count(),
-            state.telemetry.all_tools_used,
-            state.stall.tool_call_records,
-            state.final_text,
-        );
-        assert_eq!(host.turn_count(), 3);
-        assert!(state.telemetry.all_tools_used.contains("introspect"));
-        assert_eq!(state.final_text, "基于 live snapshot：没有观测到异常。");
-        assert!(state.messages.iter().all(|message| {
-            message
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|content| content != unsupported)
-        }));
     }
 
     #[tokio::test]
@@ -8354,6 +8501,50 @@ mod tests {
                 .any(|entry| { entry.payload["signal"] == "desired_state_observation_missing" })
         );
 
+        let exact_read = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": serde_json::json!({"path": "answer.txt"}).to_string(),
+            }
+        });
+        let ranged_read = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": serde_json::json!({"path": "answer.txt", "start_line": 1}).to_string(),
+            }
+        });
+        let shell_read = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": serde_json::json!({"command": "cat answer.txt"}).to_string(),
+            }
+        });
+        let pending_action = CompletionAction::PostMutationObservation;
+        assert!(completion_action_matches_tool_call(
+            &pending_text_stop,
+            &pending_action,
+            &exact_read,
+        ));
+        assert!(!completion_action_matches_tool_call(
+            &pending_text_stop,
+            &pending_action,
+            &ranged_read,
+        ));
+        assert!(!completion_action_matches_tool_call(
+            &pending_text_stop,
+            &pending_action,
+            &shell_read,
+        ));
+        let pending_hint = completion_action_hint_for_state(&pending_text_stop, &pending_action);
+        assert_eq!(pending_hint["latest_known_stable_target"], "answer.txt");
+        assert_eq!(
+            pending_hint["accepted_action_shapes"][0]["tool"],
+            "read_file"
+        );
+
         let mut same_batch_observation = observed.clone();
         same_batch_observation.round = converged.round;
         same_batch_observation.batch_id = Some("parallel-batch".into());
@@ -8791,6 +8982,39 @@ mod tests {
         }
     }
 
+    fn typed_memory_effect_record() -> ToolCallRecord {
+        let memory_args = serde_json::json!({
+            "action": "remember",
+            "content": "opaque content",
+            "memory_type": "working",
+        });
+        let memory_digest = format!(
+            "{:x}",
+            Sha256::digest(astra_core::canonical_json_string(&memory_args))
+        );
+        ToolCallRecord {
+            name: "memory".into(),
+            ok: true,
+            args_full: Some(memory_args.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            external_effect_observed: Some(true),
+            external_effect_scope: Some(
+                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.to_string(),
+            ),
+            external_effect_receipt: Some(serde_json::json!({
+                "schema": "external_effect_receipt.v1",
+                "source": "typed_external_tool",
+                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
+                "changed": true,
+                "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
+                "tool": "memory",
+                "action": "remember",
+                "operation_digest": memory_digest,
+            })),
+            ..Default::default()
+        }
+    }
+
     fn validation_record(command: &str, result_class: &str) -> ToolCallRecord {
         ToolCallRecord {
             name: "bash".into(),
@@ -8995,7 +9219,7 @@ mod tests {
         let admission = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![quality.clone(), unit.clone()],
+                admitted: ordinary_admitted([quality.clone(), unit.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -9897,6 +10121,138 @@ mod tests {
     }
 
     #[test]
+    fn external_effect_recovery_scope_carries_only_executed_structured_bash_args() {
+        let paths = vec!["/etc/ssh/sshd_config.d/99-gitlab.conf".to_string()];
+        let args = serde_json::json!({
+            "command": "ls -la /etc/ssh",
+            "external_state_paths": paths.clone(),
+        })
+        .to_string();
+        let mut state = make_state();
+        state.hooks.completion_settlement.external_effect_retries = 1;
+
+        let rejected = ToolCallRecord {
+            name: "bash".into(),
+            args_preview: Some("external_state_paths".into()),
+            disposition: Some(ToolCallDisposition::Rejected),
+            ..Default::default()
+        };
+        remember_external_effect_recovery_scope(&mut state, &[rejected]);
+        assert!(external_effect_recovery_scope(&state).is_none());
+
+        let observed = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        remember_external_effect_recovery_scope(&mut state, &[observed]);
+        assert_eq!(
+            external_effect_recovery_scope(&state),
+            Some(paths),
+            "only the executor-visible structured scope may cross the retry"
+        );
+
+        let mut receipt = external_effect_record(
+            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
+        );
+        receipt.args_full = Some(
+            serde_json::json!({
+                "command": "mutate",
+                "external_state_paths": ["/managed/target"],
+            })
+            .to_string(),
+        );
+        receipt.runtime_args_full = receipt.args_full.clone();
+        state.stall.tool_call_records.push(receipt);
+        remember_external_effect_recovery_scope(&mut state, &[]);
+        assert!(external_effect_recovery_scope(&state).is_none());
+    }
+
+    #[test]
+    fn typed_memory_mutation_receipt_is_bound_to_canonical_action() {
+        use astra_config::user_profile::{MutationCompletionScope, TurnIntent, TurnIntentDomain};
+
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_domain(TurnIntentDomain::Memory)
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(MutationCompletionScope::External),
+        );
+
+        let mut record = typed_memory_effect_record();
+        state.stall.tool_call_records.push(record.clone());
+        assert!(has_concrete_external_effect(&state));
+        assert_eq!(pending_completion_action(&state), None);
+
+        record.external_effect_receipt = Some(serde_json::json!({
+            "schema": "external_effect_receipt.v1",
+            "source": "typed_external_tool",
+            "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
+            "changed": true,
+            "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
+            "tool": "memory",
+            "action": "forget",
+            "operation_digest": "00".repeat(32),
+        }));
+        state.stall.tool_call_records.clear();
+        state.stall.tool_call_records.push(record);
+        assert!(!has_concrete_external_effect(&state));
+        assert_eq!(
+            pending_completion_action(&state),
+            Some(CompletionAction::RequiredExternalEffect)
+        );
+    }
+
+    #[test]
+    fn incidental_memory_receipt_cannot_settle_non_memory_external_intent() {
+        use astra_config::user_profile::{MutationCompletionScope, TurnIntent, TurnIntentDomain};
+
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_domain(TurnIntentDomain::System)
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(MutationCompletionScope::External),
+        );
+        state
+            .stall
+            .tool_call_records
+            .push(typed_memory_effect_record());
+
+        assert!(!has_concrete_external_effect(&state));
+        assert_eq!(
+            pending_completion_action(&state),
+            Some(CompletionAction::RequiredExternalEffect)
+        );
+
+        let memory = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "memory",
+                "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"
+            }
+        });
+        assert!(!completion_action_matches_tool_call(
+            &state,
+            &CompletionAction::RequiredExternalEffect,
+            &memory,
+        ));
+        let hint =
+            completion_action_hint_for_state(&state, &CompletionAction::RequiredExternalEffect);
+        assert!(
+            hint["accepted_action_shapes"]
+                .as_array()
+                .is_some_and(|shapes| shapes.iter().all(|shape| shape["tool"] != "memory"))
+        );
+    }
+
+    #[test]
     fn terminal_completion_action_preserves_workspace_intent_tristate() {
         let failed_writer = executed_record(
             "write_file",
@@ -10185,7 +10541,7 @@ mod tests {
         let rejected = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![plain_bash.clone()],
+                admitted: ordinary_admitted([plain_bash.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -10213,13 +10569,13 @@ mod tests {
         let admitted = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![verify_bash.clone()],
+                admitted: ordinary_admitted([verify_bash.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
             std::slice::from_ref(&verify_bash),
         );
-        assert_eq!(admitted.admitted, vec![verify_bash]);
+        assert_eq!(admitted_logical_calls(&admitted), vec![verify_bash]);
         let window = state
             .hooks
             .completion_settlement
@@ -10305,6 +10661,17 @@ mod tests {
                 .as_array()
                 .is_some_and(Vec::is_empty)
         );
+    }
+
+    #[test]
+    fn external_effect_hint_requires_mutation_and_scope_on_same_call() {
+        let hint = completion_action_hint(&CompletionAction::RequiredExternalEffect);
+        let constraint = hint["accepted_action_shapes"][0]["constraint"]
+            .as_str()
+            .expect("external-effect Bash constraint");
+        assert!(constraint.contains("performs the required external mutation"));
+        assert!(constraint.contains("on that same call"));
+        assert!(constraint.contains("later read-only probe cannot establish"));
     }
 
     #[test]
@@ -10568,7 +10935,7 @@ mod tests {
         let rejected = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![opaque.clone()],
+                admitted: ordinary_admitted([opaque.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -10603,14 +10970,14 @@ mod tests {
         let admitted = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![retry.clone()],
+                admitted: ordinary_admitted([retry.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
             std::slice::from_ref(&retry),
         );
 
-        assert_eq!(admitted.admitted, vec![retry]);
+        assert_eq!(admitted_logical_calls(&admitted), vec![retry]);
         assert!(admitted.rejected.is_empty());
         let window = state
             .hooks
@@ -13006,7 +13373,7 @@ mod tests {
             "function": {"name": "github", "arguments": "{}"}
         });
         let admission = ToolCallAdmission {
-            admitted: vec![read.clone(), external_write.clone()],
+            admitted: ordinary_admitted([read.clone(), external_write.clone()]),
             rejected: Vec::new(),
             completion_action_applied: false,
         };
@@ -13016,7 +13383,7 @@ mod tests {
 
         assert_eq!(admission.admitted.len(), 1);
         assert_eq!(
-            admission.admitted[0]["function"]["name"].as_str(),
+            admission.admitted[0].logical_target_call()["function"]["name"].as_str(),
             Some("read_file")
         );
         assert_eq!(admission.rejected.len(), 1);
@@ -13032,6 +13399,166 @@ mod tests {
             !state.hooks.completion_settlement.text_only,
             "pre-execution admission must not make its own legal action look like a wrap-up violation"
         );
+    }
+
+    fn external_effect_admission_state(
+        scope: astra_config::user_profile::MutationCompletionScope,
+    ) -> AgenticLoopState {
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                )
+                .with_mutation_completion_scope(scope),
+        );
+        state
+    }
+
+    #[test]
+    fn external_intent_does_not_preempt_ordinary_bash_admission() {
+        let mut state = external_effect_admission_state(
+            astra_config::user_profile::MutationCompletionScope::Mixed,
+        );
+        let bash = serde_json::json!({
+            "id": "ordinary-bash",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"opaque-operation\"}"}
+        });
+        let max_before = state.max_turns;
+        let remaining_before = state.remaining_turns;
+
+        let admission = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([bash.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&bash),
+        );
+
+        assert_eq!(admitted_logical_calls(&admission), vec![bash]);
+        assert!(admission.rejected.is_empty());
+        assert_eq!(state.max_turns, max_before);
+        assert_eq!(state.remaining_turns, remaining_before);
+    }
+
+    #[test]
+    fn active_external_effect_window_executes_only_typed_external_candidate() {
+        let mut state = external_effect_admission_state(
+            astra_config::user_profile::MutationCompletionScope::Mixed,
+        );
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: CompletionAction::RequiredExternalEffect,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let memory = serde_json::json!({
+            "id": "typed-memory-write",
+            "type": "function",
+            "function": {"name": "memory", "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"}
+        });
+        let mcp = serde_json::json!({
+            "id": "unresolved-mcp-write",
+            "type": "function",
+            "function": {"name": "mcp__service__write", "arguments": "{\"value\":\"fact\"}"}
+        });
+        let read = serde_json::json!({
+            "id": "read-sibling",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"/workspace/input\"}"}
+        });
+        let bash = serde_json::json!({
+            "id": "unobservable-shell-write",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"opaque-operation\",\"external_state_paths\":[\"/managed/state\"]}"}
+        });
+
+        let admission = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([
+                    memory.clone(),
+                    mcp.clone(),
+                    read.clone(),
+                    bash.clone(),
+                ]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            &[memory.clone(), mcp, read, bash.clone()],
+        );
+
+        assert_eq!(admitted_logical_calls(&admission), vec![bash]);
+        assert_eq!(admission.rejected.len(), 3);
+        assert!(admission.rejected.iter().all(|rejection| {
+            serde_json::from_str::<serde_json::Value>(&rejection.result)
+                .is_ok_and(|payload| payload["retryable"] == false)
+        }));
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("typed external action remains auditable until its receipt arrives");
+        assert!(window.consumed);
+        assert!(window.matched);
+        assert_eq!(window.mismatch_corrections_remaining, 1);
+    }
+
+    #[test]
+    fn active_external_effect_window_accepts_typed_memory_receipt_capability() {
+        use astra_config::user_profile::{TurnIntent, TurnIntentDomain};
+
+        let mut state = external_effect_admission_state(
+            astra_config::user_profile::MutationCompletionScope::External,
+        );
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_domain(TurnIntentDomain::Memory)
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
+                .with_mutation_completion_scope(
+                    astra_config::user_profile::MutationCompletionScope::External,
+                ),
+        );
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: CompletionAction::RequiredExternalEffect,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let memory = serde_json::json!({
+            "id": "typed-memory-write",
+            "type": "function",
+            "function": {"name": "memory", "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"}
+        });
+
+        let admission = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([memory.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&memory),
+        );
+
+        assert_eq!(admitted_logical_calls(&admission), vec![memory]);
+        assert!(admission.rejected.is_empty());
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("typed action remains auditable until its executor receipt arrives");
+        assert!(window.consumed && window.matched);
     }
 
     #[test]
@@ -13056,7 +13583,7 @@ mod tests {
         let first = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![wrong.clone()],
+                admitted: ordinary_admitted([wrong.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -13106,13 +13633,13 @@ mod tests {
         let corrected = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![read.clone()],
+                admitted: ordinary_admitted([read.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
             std::slice::from_ref(&read),
         );
-        assert_eq!(corrected.admitted, vec![read]);
+        assert_eq!(admitted_logical_calls(&corrected), vec![read]);
         let window = state
             .hooks
             .completion_settlement
@@ -13148,7 +13675,7 @@ mod tests {
         let _ = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![first_call.clone()],
+                admitted: ordinary_admitted([first_call.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -13160,7 +13687,7 @@ mod tests {
         let second = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![second_call.clone()],
+                admitted: ordinary_admitted([second_call.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -13201,12 +13728,10 @@ mod tests {
         let max_before = state.max_turns;
         let admission = ToolCallAdmission {
             admitted: Vec::new(),
-            rejected: vec![RejectedToolCall {
-                id: "denied-observation".into(),
-                name: "read_file".into(),
-                canonical_call: read.clone(),
-                result: r#"{"status":"rejected","error_kind":"permission_denied"}"#.into(),
-            }],
+            rejected: vec![RejectedToolCall::ordinary(
+                read.clone(),
+                r#"{"status":"rejected","error_kind":"permission_denied"}"#.into(),
+            )],
             completion_action_applied: false,
         };
 
@@ -13616,7 +14141,7 @@ mod tests {
         let read_admission = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![read.clone()],
+                admitted: ordinary_admitted([read.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -13666,7 +14191,7 @@ mod tests {
         let writer_admission = apply_completion_action_admission(
             &mut state,
             ToolCallAdmission {
-                admitted: vec![writer.clone()],
+                admitted: ordinary_admitted([writer.clone()]),
                 rejected: Vec::new(),
                 completion_action_applied: false,
             },
@@ -14145,6 +14670,47 @@ mod tests {
             1,
             "availability must remain coherent with the authoritative summary"
         );
+    }
+
+    #[test]
+    fn local_runtime_feedback_uses_monotonic_ingested_run_usage() {
+        let mut state = make_state();
+        state.total_prompt = 100;
+        state.total_cache_read = 300;
+        state.total_cache_creation = 4;
+        state.total_completion = 20;
+        let first_turn = ChatTurnSseAccum {
+            has_usage: true,
+            prompt_tokens: 100,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 4,
+            completion_tokens: 20,
+            ..Default::default()
+        };
+        let first = runtime_feedback_run_usage(&state, &first_turn).expect("first run usage");
+
+        state.total_prompt += 25;
+        state.total_cache_read += 75;
+        state.total_cache_creation += 1;
+        state.total_completion += 5;
+        let second_turn_with_admission_sidecar = ChatTurnSseAccum {
+            has_usage: true,
+            prompt_tokens: 25,
+            cache_read_tokens: 75,
+            cache_creation_tokens: 1,
+            completion_tokens: 5,
+            ..Default::default()
+        };
+        let second = runtime_feedback_run_usage(&state, &second_turn_with_admission_sidecar)
+            .expect("second run usage");
+
+        assert_eq!(first.prompt, 100);
+        assert_eq!(first.cache_read, 300);
+        assert_eq!(second.prompt, 125);
+        assert_eq!(second.cache_read, 375);
+        assert_eq!(second.cache_creation, 5);
+        assert_eq!(second.completion, 25);
+        assert!(second.total() > first.total());
     }
 
     #[test]
@@ -14850,6 +15416,29 @@ mod tests {
         });
         assert_eq!(prompt_cache_identity_from_manifest(Some(&missing)), None);
         assert_eq!(prompt_cache_identity_from_manifest(Some(&malformed)), None);
+    }
+
+    #[test]
+    fn runtime_feedback_uses_manifest_stable_prefix_estimate_without_inference() {
+        let manifest = serde_json::json!({
+            "wire": {
+                "cache_estimate": {
+                    "eligible_tokens": 7_919,
+                    "basis": "provider_visible_stable_prefix_only"
+                }
+            }
+        });
+        assert_eq!(
+            prompt_cache_eligible_tokens_from_manifest(Some(&manifest)),
+            Some(7_919)
+        );
+        assert_eq!(
+            prompt_cache_eligible_tokens_from_manifest(Some(&serde_json::json!({
+                "wire": {"cache_estimate": {"eligible_tokens": "7919"}}
+            }))),
+            None,
+            "malformed measurements stay unknown instead of being coerced"
+        );
     }
 
     #[test]
@@ -16218,6 +16807,30 @@ mod tests {
         );
         assert!(!state.hooks.completion_settlement.work_settlement_only);
         assert!(!state.hooks.completion_settlement.text_only);
+    }
+
+    #[test]
+    fn canonical_active_work_ownership_blocks_text_without_projection_flag() {
+        let mut state = make_state();
+        state.final_text = "I will settle this task next.".to_string();
+        let original_max_turns = state.max_turns;
+        let original_remaining_turns = state.remaining_turns;
+
+        assert!(
+            enforce_typed_work_settlement_before_text_completion_for_work_state(&mut state, true,)
+        );
+
+        assert!(state.final_text.is_empty());
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert_eq!(state.max_turns, original_max_turns + 1);
+        assert_eq!(state.remaining_turns, original_remaining_turns + 1);
+        assert!(
+            state
+                .volatile_pending
+                .iter()
+                .any(|entry| { entry.payload["signal"] == "owned_work_attempt_unsettled" })
+        );
     }
 
     #[test]

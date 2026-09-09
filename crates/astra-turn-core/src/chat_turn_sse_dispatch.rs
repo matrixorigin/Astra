@@ -1449,60 +1449,59 @@ fn parse_server_loop_execution_summary(event: &Value) -> Option<ServerLoopExecut
         serde_json::from_value::<ToolLedgerReceipt>(event.get("tool_ledger_receipt")?.clone())
             .ok()?;
     tool_ledger_receipt.validate().ok()?;
-    let token_usage_coverage = match event.get("token_usage_coverage") {
-        None => None,
-        Some(coverage) => {
-            let parsed = TokenUsageCoverage {
-                attempts: coverage
-                    .get("attempts")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| u32::try_from(value).ok())?,
-                provider_reported: coverage
-                    .get("provider_reported")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| u32::try_from(value).ok())?,
-                unavailable: coverage
-                    .get("unavailable")
-                    .and_then(Value::as_u64)
-                    .and_then(|value| u32::try_from(value).ok())?,
-            };
-            if coverage.get("scope").and_then(Value::as_str) != Some("logical_provider_calls")
-                || !parsed.is_valid()
-                || parsed.attempts != llm_rounds
-                || coverage.get("status").and_then(Value::as_str) != Some(parsed.status())
-            {
-                return None;
-            }
-            Some(parsed)
-        }
-    };
+    // Usage coverage describes every logical provider call owned by the run,
+    // including admission/settlement sidecars.  It is therefore independent
+    // of `llm_rounds`, which counts only primary agent rounds.  Telemetry is
+    // optional evidence and must never revoke an otherwise valid durable
+    // terminal authority.
+    let token_usage_coverage = event.get("token_usage_coverage").and_then(|coverage| {
+        let parsed = TokenUsageCoverage {
+            attempts: coverage
+                .get("attempts")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())?,
+            provider_reported: coverage
+                .get("provider_reported")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())?,
+            unavailable: coverage
+                .get("unavailable")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())?,
+        };
+        (coverage.get("scope").and_then(Value::as_str) == Some("logical_provider_calls")
+            && parsed.is_valid()
+            && coverage.get("status").and_then(Value::as_str) == Some(parsed.status()))
+        .then_some(parsed)
+    });
     let execution_is_interrupted = event
         .get("execution_state")
         .and_then(Value::as_object)
         .and_then(|state| state.get("status"))
         .and_then(Value::as_str)
         == Some("interrupted");
-    let runtime_feedback = match event.get("runtime_feedback") {
-        Some(value) => Some(serde_json::from_value::<RuntimeFeedbackFrame>(value.clone()).ok()?),
-        None if execution_is_interrupted => None,
-        None => return None,
-    };
-    let feedback_is_coherent = runtime_feedback.as_ref().is_none_or(|feedback| {
-        feedback.is_valid()
-            && if execution_is_interrupted {
-                // The terminal counter includes the failed provider attempt;
-                // runtime feedback describes only the last successfully
-                // ingested round. It is therefore a watermark, not an equal
-                // counter, on interrupted outcomes.
-                feedback.progress.llm_rounds_completed <= llm_rounds
-            } else {
-                feedback.progress.llm_rounds_completed == llm_rounds
-            }
-    });
+    // Runtime feedback is an observation watermark, not terminal authority.
+    // A producer may legitimately have no latest frame (for example after a
+    // restored or sidecar-only path), and malformed/stale telemetry must not
+    // turn a committed terminal into a transport failure.
+    let runtime_feedback = event
+        .get("runtime_feedback")
+        .and_then(|value| serde_json::from_value::<RuntimeFeedbackFrame>(value.clone()).ok())
+        .filter(|feedback| {
+            feedback.is_valid()
+                && if execution_is_interrupted {
+                    // The terminal counter includes the failed provider attempt;
+                    // runtime feedback describes only the last successfully
+                    // ingested round. It is therefore a watermark, not an equal
+                    // counter, on interrupted outcomes.
+                    feedback.progress.llm_rounds_completed <= llm_rounds
+                } else {
+                    feedback.progress.llm_rounds_completed == llm_rounds
+                }
+        });
     if observation_tool_calls_count > tool_calls_count
         || llm_rounds == 0
         || (tool_calls_count == 0) != tools_used.is_empty()
-        || !feedback_is_coherent
     {
         return None;
     }
@@ -2049,7 +2048,7 @@ mod tests {
             &sse(
                 "turn_complete",
                 &format!(
-                    ",\"has_tool_calls\":true,\"continuation_owner\":\"server\",\"tool_calls_count\":1,\"observation_tool_calls_count\":1,\"tools_used\":[\" agent_fanout \",\"agent_fanout\"],\"llm_rounds\":2,\"token_usage_coverage\":{{\"scope\":\"logical_provider_calls\",\"attempts\":2,\"provider_reported\":1,\"unavailable\":1,\"status\":\"partial\"}}{}{}",
+                    ",\"has_tool_calls\":true,\"continuation_owner\":\"server\",\"tool_calls_count\":1,\"observation_tool_calls_count\":1,\"tools_used\":[\" agent_fanout \",\"agent_fanout\"],\"llm_rounds\":2,\"token_usage_coverage\":{{\"scope\":\"logical_provider_calls\",\"attempts\":3,\"provider_reported\":2,\"unavailable\":1,\"status\":\"partial\"}}{}{}",
                     server_runtime_feedback_fragment(2),
                     tool_receipt_fragment("r", 1, 1, 1, true),
                 ),
@@ -2083,8 +2082,8 @@ mod tests {
                     true,
                 ),
                 token_usage_coverage: Some(TokenUsageCoverage {
-                    attempts: 2,
-                    provider_reported: 1,
+                    attempts: 3,
+                    provider_reported: 2,
                     unavailable: 1,
                 }),
                 runtime_feedback: Some(crate::introspect::test_runtime_feedback(1, 2, 8)),
@@ -2250,13 +2249,13 @@ mod tests {
     }
 
     #[test]
-    fn server_owned_terminal_rejects_incoherent_token_usage_coverage() {
+    fn server_owned_terminal_ignores_incoherent_optional_token_usage_coverage() {
         let mut accum = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "turn_complete",
                 &format!(
-                    ",\"continuation_owner\":\"server\",\"tool_calls_count\":0,\"observation_tool_calls_count\":0,\"tools_used\":[],\"llm_rounds\":3,\"token_usage_coverage\":{{\"scope\":\"logical_provider_calls\",\"attempts\":2,\"provider_reported\":2,\"unavailable\":0,\"status\":\"complete\"}}{}{}",
+                    ",\"continuation_owner\":\"server\",\"tool_calls_count\":0,\"observation_tool_calls_count\":0,\"tools_used\":[],\"llm_rounds\":3,\"token_usage_coverage\":{{\"scope\":\"logical_provider_calls\",\"attempts\":2,\"provider_reported\":2,\"unavailable\":1,\"status\":\"complete\"}}{}{}",
                     server_runtime_feedback_fragment(3),
                     tool_receipt_fragment("r", 1, 0, 0, true),
                 ),
@@ -2265,11 +2264,14 @@ mod tests {
             &mut vec![],
         );
 
+        assert_eq!(accum.error_kind, None);
         assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::ContractViolation)
+            accum
+                .server_execution_summary
+                .expect("tool receipt remains terminal authority")
+                .token_usage_coverage,
+            None
         );
-        assert!(accum.server_execution_summary.is_none());
     }
 
     #[test]
@@ -2594,7 +2596,7 @@ mod tests {
     }
 
     #[test]
-    fn server_owned_terminal_requires_coherent_canonical_runtime_feedback() {
+    fn server_owned_terminal_authority_is_independent_of_optional_runtime_feedback() {
         for suffix in [
             format!(
                 ",\"continuation_owner\":\"server\",\"tool_calls_count\":0,\"observation_tool_calls_count\":0,\"tools_used\":[],\"llm_rounds\":2{}",
@@ -2613,11 +2615,11 @@ mod tests {
                 &mut vec![],
             );
             assert!(accum.server_loop_terminal);
-            assert!(accum.server_execution_summary.is_none());
-            assert_eq!(
-                accum.error_kind,
-                Some(astra_core::ErrorKind::ContractViolation)
-            );
+            let summary = accum
+                .server_execution_summary
+                .expect("durable terminal authority must survive absent or stale telemetry");
+            assert!(summary.runtime_feedback.is_none());
+            assert_eq!(accum.error_kind, None);
         }
     }
 

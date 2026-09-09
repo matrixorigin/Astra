@@ -35,7 +35,16 @@ pub struct AgentToolBudgetRecordProjection {
     pub action: AgentToolRecordActionKind,
     pub agent_id: Option<String>,
     pub display_name_hint: Option<String>,
+    /// Typed wire outcome.  Lifecycle consumers must use this instead of
+    /// inferring liveness from whether a result string happens to exist.
+    pub outcome: AgentToolWireOutcomeKind,
+    /// A terminal child has released its execution ownership even when its
+    /// outcome is failed/cancelled/interrupted.  This is deliberately
+    /// independent from `successful`.
+    pub terminal: bool,
+    pub successful: bool,
     pub completed_result: Option<String>,
+    pub partial_result: Option<String>,
     pub incomplete_reason: Option<String>,
     pub control_error_summary: Option<String>,
 }
@@ -88,21 +97,70 @@ pub fn project_agent_tool_budget_record(
     record: &ToolCallRecord,
 ) -> AgentToolBudgetRecordProjection {
     let projection = project_agent_tool_record(record);
+    let action_name = match projection.action {
+        AgentToolRecordActionKind::Spawn => "spawn",
+        AgentToolRecordActionKind::GetResult => "get_result",
+        AgentToolRecordActionKind::Other => "other",
+    };
+    // A control-plane/tool-call error without a structured child receipt is
+    // not proof that the child itself terminated.  Duplicate/restricted
+    // retries are especially common after a live `get_result`; keep that
+    // child live until its registry or a typed result closes the ownership.
+    let wire = if projection.parsed_result.is_none() && record.error.is_some() {
+        project_agent_tool_wire(action_name, true, None)
+    } else {
+        project_agent_tool_wire(action_name, record.ok, projection.parsed_result.as_ref())
+    };
+    let terminal = matches!(
+        wire.outcome,
+        AgentToolWireOutcomeKind::Completed
+            | AgentToolWireOutcomeKind::Failed
+            | AgentToolWireOutcomeKind::TimedOut
+            | AgentToolWireOutcomeKind::Cancelled
+            | AgentToolWireOutcomeKind::Interrupted
+    );
     let mut completed_result = None;
+    let mut partial_result = None;
     let mut incomplete_reason = None;
     if let Some(parsed) = projection.parsed_result.as_ref() {
-        if let Some(result) = agent_tool_completed_result_text(parsed) {
-            completed_result = Some(result);
-        } else {
-            incomplete_reason = agent_tool_incomplete_reason(parsed);
+        match wire.outcome {
+            AgentToolWireOutcomeKind::Completed => {
+                if let Some(result) = agent_tool_completed_result_text(parsed)
+                    .filter(|result| !result.trim().is_empty())
+                {
+                    completed_result = Some(result);
+                } else {
+                    incomplete_reason = Some(
+                        "child reported a completed status without a non-empty result".to_string(),
+                    );
+                }
+            }
+            AgentToolWireOutcomeKind::Interrupted => {
+                partial_result = agent_tool_completed_result_text(parsed)
+                    .filter(|result| !result.trim().is_empty());
+                incomplete_reason = Some(agent_tool_interrupted_message(true, wire.finish_reason));
+            }
+            AgentToolWireOutcomeKind::Failed
+            | AgentToolWireOutcomeKind::TimedOut
+            | AgentToolWireOutcomeKind::Cancelled
+            | AgentToolWireOutcomeKind::Running => {
+                incomplete_reason = agent_tool_incomplete_reason(parsed);
+            }
+            AgentToolWireOutcomeKind::NoChange => {}
         }
+    } else if wire.outcome == AgentToolWireOutcomeKind::Failed {
+        incomplete_reason = Some("agent tool execution failed".to_string());
     }
 
     AgentToolBudgetRecordProjection {
         action: projection.action,
         agent_id: projection.agent_id,
         display_name_hint: projection.display_name_hint,
+        outcome: wire.outcome,
+        terminal,
+        successful: terminal && completed_result.is_some(),
         completed_result,
+        partial_result,
         incomplete_reason,
         control_error_summary: record
             .error
@@ -548,7 +606,11 @@ mod tests {
             projection.display_name_hint.as_deref(),
             Some("Architecture review")
         );
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
+        assert!(!projection.terminal);
+        assert!(!projection.successful);
         assert!(projection.completed_result.is_none());
+        assert!(projection.partial_result.is_none());
         assert_eq!(
             projection.incomplete_reason.as_deref(),
             Some("launched and has not produced a child result yet")
@@ -556,6 +618,98 @@ mod tests {
         assert_eq!(
             projection.control_error_summary.as_deref(),
             Some("same-turn retries hit duplicate_within_turn")
+        );
+    }
+
+    #[test]
+    fn budget_record_projection_separates_terminal_failure_from_live_control_error() {
+        let failed = ToolCallRecord {
+            name: "agent".into(),
+            ok: true,
+            ms: 0,
+            args_full: Some(
+                json!({
+                    "action": "get_result",
+                    "agent_id": "failed-child"
+                })
+                .to_string(),
+            ),
+            result_full: Some(
+                json!({
+                    "status": "failed",
+                    "agent_id": "failed-child",
+                    "error": "child exploded"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        let projection = project_agent_tool_budget_record(&failed);
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
+        assert!(projection.terminal);
+        assert!(!projection.successful);
+        assert_eq!(
+            projection.incomplete_reason.as_deref(),
+            Some("child exploded")
+        );
+
+        let retry_error = ToolCallRecord {
+            name: "agent".into(),
+            ok: false,
+            ms: 0,
+            args_full: Some(
+                json!({
+                    "action": "get_result",
+                    "agent_id": "failed-child"
+                })
+                .to_string(),
+            ),
+            error: Some("duplicate_within_turn: blocked".into()),
+            ..Default::default()
+        };
+        let projection = project_agent_tool_budget_record(&retry_error);
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
+        assert!(!projection.terminal);
+        assert!(!projection.successful);
+    }
+
+    #[test]
+    fn budget_record_projection_keeps_interrupted_partial_result_as_terminal_issue() {
+        let record = ToolCallRecord {
+            name: "agent".into(),
+            ok: true,
+            ms: 0,
+            args_full: Some(
+                json!({
+                    "action": "get_result",
+                    "agent_id": "interrupted-child"
+                })
+                .to_string(),
+            ),
+            result_full: Some(
+                json!({
+                    "status": "interrupted",
+                    "agent_id": "interrupted-child",
+                    "finish_reason": "budget_exhausted",
+                    "result": "partial findings"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        let projection = project_agent_tool_budget_record(&record);
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Interrupted);
+        assert!(projection.terminal);
+        assert!(!projection.successful);
+        assert_eq!(
+            projection.partial_result.as_deref(),
+            Some("partial findings")
+        );
+        assert!(
+            projection
+                .incomplete_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("budget"))
         );
     }
 

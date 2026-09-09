@@ -2107,6 +2107,8 @@ mod tests {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     text: text.clone(),
                     is_ptl_error: false,
+                    finish_reason: Some("stop".to_string()),
+                    usage: serde_json::Map::new(),
                 }),
                 None => Err("mock failure".to_string()),
             }

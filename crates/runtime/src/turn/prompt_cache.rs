@@ -429,22 +429,13 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
     );
 
     // Build ExternalSources from ephemeral-side signals. Cross-tool guidance
-    // is versioned by the exact visible surface: an unchanged surface reuses
-    // the session prefix, while a real capability transition starts a new
-    // epoch. It must not enter the volatile lane because strict-history
-    // providers suppress ordinary volatile prose from their wire prompt.
-    let self_model_text = if tool_names.is_empty() {
-        None
-    } else {
-        Some(prompts::self_model_section(tool_names))
-    };
-    let profile_for_tc = edge_profile_cwd
-        .map(|cwd| format!("cwd: {cwd}"))
-        .unwrap_or_default();
+    // is keyed by typed capability classes rather than schema order. It stays
+    // in the stable lane because strict-history providers suppress ordinary
+    // volatile prose from their wire prompt.
     let tool_conditional = if tool_names.is_empty() {
         None
     } else {
-        let text = prompts::tool_conditional_section(tool_names, &profile_for_tc);
+        let text = prompts::tool_conditional_section(tool_names);
         if text.is_empty() { None } else { Some(text) }
     };
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
@@ -477,12 +468,6 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
                 },
             )
     });
-    if let Some(ref text) = self_model_text {
-        volatile.push(prompts::PromptSection::dynamic(
-            text.clone(),
-            prompts::PromptTokenBucket::BasePersona,
-        ));
-    }
     if let Some(ref text) = tool_conditional {
         stable.push(prompts::PromptSection {
             text: text.clone(),
@@ -740,10 +725,10 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
 /// Annotate tool schemas using an explicit always_load set.
 ///
 /// Runtime-side adapter: decides whether to annotate (`cache_cfg.should_annotate`),
-/// logs the fallback path for triage, then delegates to the pure
+/// clears stale top-level markers, then delegates to the pure
 /// [`astra_turn_core::context_serializer::annotate_always_load_tool_schema`] for
-/// the actual wire mutation. The pure primitive lives in the pipeline so all
-/// provider-specific cache logic has exactly one implementation.
+/// the actual wire mutation. The core primitive owns fallback observability and
+/// all provider-specific cache annotation logic has exactly one implementation.
 pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
@@ -753,22 +738,7 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    let marker_idx = match always_load_prefix_marker_index(tools, always_load_names) {
-        Some(idx) => idx,
-        None => {
-            // Fallback path: no always_load prefix is present in this tool
-            // list. Legit for delegated sub-runs that pass a fully custom
-            // toolset, but a cache-hit regression triage needs to see it.
-            tracing::debug!(
-                tool_count = tools.len(),
-                "cache marker fallback: no always_load prefix present; placing on last tool. \
-                 Static-prefix caching unavailable for this request."
-            );
-            tools.len() - 1
-        }
-    };
-    tools[marker_idx]["cache_control"] =
-        astra_turn_core::context_serializer::anthropic_ephemeral_cache_control();
+    astra_turn_core::context_serializer::annotate_always_load_tool_schema(tools, always_load_names);
 }
 
 fn clear_tool_cache_controls(tools: &mut [Value]) {
@@ -777,31 +747,6 @@ fn clear_tool_cache_controls(tools: &mut [Value]) {
             object.remove("cache_control");
         }
     }
-}
-
-fn always_load_prefix_marker_index(
-    tools: &[Value],
-    always_load_names: &std::collections::HashSet<String>,
-) -> Option<usize> {
-    if always_load_names.is_empty() {
-        return None;
-    }
-
-    let mut last_prefix_idx = None;
-    for (idx, tool) in tools.iter().enumerate() {
-        let Some(name) = tool
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-        else {
-            break;
-        };
-        if !always_load_names.contains(name) {
-            break;
-        }
-        last_prefix_idx = Some(idx);
-    }
-    last_prefix_idx
 }
 
 /// Runtime-configured always_load tool names for fallback paths that do not receive
@@ -941,10 +886,11 @@ mod tests {
 
     // ── always_load-tool audit ────────────────────────────────────────────────
     //
-    // The cache marker belongs at the end of the always_load/static prefix, not at
-    // the end of the whole tool list. Deferred/dynamic tools may become
-    // visible for a turn, but they should not silently enlarge the static
-    // cache prefix.
+    // The tool-schema cache marker belongs at the end of the always_load/static
+    // prefix, not at the end of the whole catalog. Deferred tool *schemas* may
+    // become callable for a turn, but they must not silently enlarge that
+    // repeated schema prefix. Their compact name manifest is separate
+    // capability-epoch metadata and is tested below.
     #[test]
     fn default_always_load_tool_names_tracks_runtime_surface_not_deferred_catalog() {
         let always_load = default_test_always_load_tool_names();
@@ -954,13 +900,14 @@ mod tests {
                 "{name} is part of the runtime default surface and must be cache-always_load"
             );
         }
-        for name in ["agent", "agent_fanout"] {
-            assert!(
-                always_load.contains(name),
-                "{name} is a stable execution topology and must remain in the cached tool prefix"
-            );
-        }
         for name in [
+            "agent",
+            "agent_fanout",
+            "reflect",
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
             "lsp",
             "github",
             "web_fetch",
@@ -1073,10 +1020,6 @@ mod tests {
         assert!(always_load.contains("bash"));
         assert!(always_load.contains("read_file"));
         assert!(always_load.contains("skill"));
-        assert_eq!(
-            always_load_prefix_marker_index(&tools, &always_load),
-            Some(prefix_len - 1)
-        );
 
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -1196,9 +1139,13 @@ mod tests {
                 })
             })
             .collect();
+        let introspect = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "introspect")
+            .expect("canonical introspect schema must exist");
         let outcome = assemble_ephemeral_pipeline_outcome_with_messages(
-            &[],
-            &[],
+            &["introspect"],
+            std::slice::from_ref(&introspect),
             &[],
             &[],
             &[],
@@ -1229,6 +1176,13 @@ mod tests {
             outcome.messages, messages,
             "the ephemeral's downstream semantic compactor is the sole lossy history owner"
         );
+        let pressured_properties = &outcome.tool_schemas[0]["function"]["parameters"]["properties"];
+        for field in ["artifact", "offset", "max_bytes"] {
+            assert!(
+                pressured_properties.get(field).is_some(),
+                "aggressive pipeline pressure must retain recovery field `{field}`"
+            );
+        }
     }
 
     #[test]
@@ -1585,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_pipeline_outcome_keeps_deferred_tools_block_after_cache_boundary() {
+    fn ephemeral_pipeline_outcome_keeps_deferred_tools_in_capability_cache_epoch() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1627,8 +1581,11 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        assert!(!primary_text.contains("<deferred-tools>"));
-        assert!(dynamic_text.contains("<deferred-tools>"));
+        assert!(primary_text.contains("<deferred-tools>"));
+        assert!(
+            !dynamic_text.contains("<deferred-tools>"),
+            "capability metadata must not be relegated to the per-turn volatile lane"
+        );
 
         let changed = assemble_ephemeral_pipeline_outcome(
             &["bash"],
@@ -1662,8 +1619,71 @@ mod tests {
             .and_then(|msg| msg.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        assert_eq!(primary_text, changed_primary_text);
-        assert_ne!(dynamic_text, changed_dynamic_text);
+        assert_ne!(
+            primary_text, changed_primary_text,
+            "a changed admission surface must start a new capability cache epoch"
+        );
+        assert_eq!(
+            dynamic_text, changed_dynamic_text,
+            "changing capability metadata must not churn unrelated turn-volatile context"
+        );
+
+        // The same contract must hold on the Anthropic/Bedrock block path,
+        // where cache_control is attached to a system block rather than a
+        // flattened OpenAI-style string.  A regression here would make the
+        // capability epoch look stable in the core planner while still
+        // pushing the manifest into the per-turn dynamic message.
+        let anthropic_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let anthropic = assemble_ephemeral_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &anthropic_cfg,
+            None,
+            "sid-deferred-tools-anthropic",
+            "claude-sonnet-4-6",
+            None,
+            "anthropic",
+            None,
+            None,
+            None,
+            "<deferred-tools>\ngithub\n</deferred-tools>",
+            "",
+            "2026-05-25",
+        );
+        let anthropic_primary = anthropic
+            .primary_system
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("anthropic primary system must use content blocks");
+        let anthropic_primary_text = anthropic_primary
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(anthropic_primary_text.contains("<deferred-tools>"));
+        assert!(
+            anthropic_primary
+                .iter()
+                .any(|block| block.get("cache_control").is_some()),
+            "the stable Anthropic system prefix must retain its cache marker"
+        );
+        let anthropic_dynamic_text = anthropic
+            .dynamic_system
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !anthropic_dynamic_text.contains("<deferred-tools>"),
+            "capability metadata must not move to the Anthropic volatile message"
+        );
     }
 
     #[test]
@@ -1725,11 +1745,10 @@ mod tests {
             "runtime model identity must stay out of the reusable prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
+        let expected_tool_guidance = prompts::tool_conditional_section(&["bash", "start_work"]);
         assert!(
-            primary_text.contains("## Tool Availability Protocol")
-                && primary_text.contains("## Durable Work")
-                && primary_text.contains("`start_work` is the first tool call"),
-            "surface-versioned tool guidance must remain visible in the strict-history prompt: {primary_text}"
+            primary_text.contains(&expected_tool_guidance),
+            "canonical tool guidance must remain visible in the strict-history prompt: {primary_text}"
         );
         assert!(
             !primary_text.contains("must be suppressed"),
@@ -2493,12 +2512,12 @@ mod cache_stability_regression {
     /// The marker always lands on the LAST always_load tool — even if the always_load
     /// count shrinks or dynamic tools are interleaved by a buggy caller.
 
-    /// Default always_load set must contain the static-lib tools; losing one
-    /// drops cache hit rate proportional to its token cost.
+    /// The default cached prefix keeps ordinary first-request primitives and
+    /// hot Work transitions while excluding optional workflows whose full
+    /// schemas load on demand.
     #[test]
-    fn default_always_load_set_contains_static_lib() {
+    fn default_always_load_set_contains_primitives_not_optional_workflows() {
         let always_load = default_test_always_load_tool_names();
-        // TOOL_CATALOG-declared always_load tools
         for name in [
             "bash",
             "read_file",
@@ -2507,14 +2526,22 @@ mod cache_stability_regression {
             "list_dir",
             "grep",
             "glob",
-            "git",
-            "memory",
+            "tool_search",
             "introspect",
-            "reflect",
+            "memory",
+            "start_work",
+            "run_next_work_item",
+            "settle_work_item",
         ] {
             assert!(
                 always_load.contains(name),
-                "{name} must stay in default always_load set (static-lib guarantee)"
+                "{name} must stay in the default first-request prefix"
+            );
+        }
+        for name in ["agent", "agent_fanout", "reflect", "git"] {
+            assert!(
+                !always_load.contains(name),
+                "{name} must load on demand instead of extending the default cache prefix"
             );
         }
         // Runtime-injected, not in TOOL_CATALOG, but structurally part of the
@@ -2524,6 +2551,35 @@ mod cache_stability_regression {
             always_load.contains(name),
             "{name} is auto-always_load at runtime; default set must mirror that"
         );
+    }
+
+    #[test]
+    fn deferred_invocation_carrier_can_close_the_stable_tool_prefix() {
+        let carrier =
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema();
+        let carrier_name =
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER;
+        let mut tools = vec![
+            schema("bash"),
+            schema("tool_search"),
+            carrier,
+            schema("github"),
+        ];
+        let mut always_load = default_test_always_load_tool_names();
+        always_load.insert(carrier_name.to_string());
+
+        annotate_tool_schemas_for_caching_with_always_load(
+            &mut tools,
+            &cfg_anthropic(),
+            &always_load,
+        );
+
+        assert_eq!(
+            tools[2]["cache_control"],
+            astra_turn_core::context_serializer::anthropic_ephemeral_cache_control(),
+            "the stable carrier, not a dynamic deferred target, owns the breakpoint"
+        );
+        assert!(tools[3].get("cache_control").is_none());
     }
 
     /// `default_test_always_load_tool_names()` must return the same set across calls —

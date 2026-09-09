@@ -116,6 +116,526 @@ async fn session_creation_returns_database_generated_fields_after_commit() {
     }
 }
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_establishment_admission_is_idempotent_on_matrixone() {
+    use astra_services::work::{
+        DatabaseWorkEstablishmentService, InternalSessionId, WorkBranchId,
+        WorkEstablishmentActivation, WorkEstablishmentRequest, WorkId, WorkOwnerId,
+    };
+
+    let (shared, _) = setup_pool_and_settings().await;
+    let service = DatabaseWorkEstablishmentService::new(shared.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = WorkOwnerId::parse(format!("it-work-owner-{suffix}")).expect("owner id");
+    let operation_id = format!("it-work-operation-{suffix}");
+    let session_id = format!("it-session-{suffix}");
+    let request = WorkEstablishmentRequest {
+        operation_id: operation_id.clone(),
+        request_hash: format!("it-work-request-hash-{suffix}"),
+        payload_json: r#"{"goal":"matrixone admission probe"}"#.to_string(),
+        owner_id: owner_id.clone(),
+        work_id: WorkId::parse(format!("it-work-{suffix}")).expect("work id"),
+        branch_id: WorkBranchId::parse(format!("it-branch-{suffix}")).expect("branch id"),
+        session_id: InternalSessionId::parse(&session_id).expect("session id"),
+        run_id: format!("it-run-{suffix}"),
+        activation: WorkEstablishmentActivation::Start,
+    };
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'it Work admission', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(owner_id.as_str())
+    .execute(shared.get())
+    .await
+    .expect("insert canonical session admission fence");
+
+    let first = service
+        .admit_with_disposition(&request)
+        .await
+        .expect("first admission");
+    assert_eq!(
+        first.disposition,
+        astra_services::work::WorkEstablishmentAdmissionDisposition::Created
+    );
+    let second = service
+        .admit_with_disposition(&request)
+        .await
+        .expect("repeated admission must remain idempotent");
+    assert_eq!(
+        second.disposition,
+        astra_services::work::WorkEstablishmentAdmissionDisposition::Existing
+    );
+    assert_eq!(
+        first.operation, second.operation,
+        "duplicate admission must return the immutable row"
+    );
+    assert!(!second.operation.is_complete());
+
+    sqlx::query(
+        "DELETE FROM work_establishment_operations
+         WHERE owner_id = ? AND operation_id = ?",
+    )
+    .bind(owner_id.as_str())
+    .bind(operation_id)
+    .execute(shared.get())
+    .await
+    .expect("cleanup admission probe");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup canonical session admission fence");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_establishment_terminal_cancel_releases_session_for_new_turn() {
+    use astra_services::work::{
+        DatabaseWorkEstablishmentService, InternalSessionId, WorkBranchId,
+        WorkEstablishmentActivation, WorkEstablishmentPhase, WorkEstablishmentRequest,
+        WorkEstablishmentState, WorkId, WorkOwnerId,
+    };
+
+    let (shared, _) = setup_pool_and_settings().await;
+    let service = DatabaseWorkEstablishmentService::new(shared.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = WorkOwnerId::parse(format!("it-work-owner-cancel-{suffix}")).expect("owner id");
+    let session_id = format!("it-session-cancel-{suffix}");
+    let session = InternalSessionId::parse(&session_id).expect("session id");
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'it Work cancellation', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(owner_id.as_str())
+    .execute(shared.get())
+    .await
+    .expect("insert canonical session admission fence");
+
+    let make_request = |ordinal: &str, turn_chain_id: &str| WorkEstablishmentRequest {
+        operation_id: format!("it-work-operation-cancel-{ordinal}-{suffix}"),
+        request_hash: format!("it-work-request-hash-cancel-{ordinal}-{suffix}"),
+        payload_json: format!(
+            r#"{{"schema_version":2,"turn_chain_id":"{turn_chain_id}","goal":"cancel probe {ordinal}"}}"#
+        ),
+        owner_id: owner_id.clone(),
+        work_id: WorkId::parse(format!("it-work-cancel-{ordinal}-{suffix}")).expect("work id"),
+        branch_id: WorkBranchId::parse(format!("it-branch-cancel-{ordinal}-{suffix}"))
+            .expect("branch id"),
+        session_id: session.clone(),
+        run_id: format!("it-run-cancel-{ordinal}-{suffix}"),
+        activation: WorkEstablishmentActivation::Start,
+    };
+
+    let request_admit = make_request("admit", "turn-admit");
+    let admitted = service
+        .admit(&request_admit)
+        .await
+        .expect("admit operation");
+    let cancelled = service
+        .cancel(&request_admit, "user cancelled before genesis")
+        .await
+        .expect("cancel after admission");
+    assert_eq!(cancelled.state, WorkEstablishmentState::Cancelled);
+    assert!(cancelled.is_aborted());
+
+    let request_genesis = make_request("genesis", "turn-genesis");
+    service
+        .admit(&request_genesis)
+        .await
+        .expect("admit genesis operation");
+    service
+        .advance_phase(
+            &request_genesis,
+            WorkEstablishmentPhase::AwaitingGenesis,
+            WorkEstablishmentPhase::AwaitingPlan,
+        )
+        .await
+        .expect("record genesis");
+    let cancelled = service
+        .cancel(&request_genesis, "user cancelled after genesis")
+        .await
+        .expect("cancel after genesis");
+    assert_eq!(cancelled.state, WorkEstablishmentState::Cancelled);
+
+    let request_plan = make_request("plan", "turn-plan");
+    service
+        .admit(&request_plan)
+        .await
+        .expect("admit plan operation");
+    service
+        .advance_phase(
+            &request_plan,
+            WorkEstablishmentPhase::AwaitingGenesis,
+            WorkEstablishmentPhase::AwaitingPlan,
+        )
+        .await
+        .expect("record plan genesis");
+    service
+        .advance_phase(
+            &request_plan,
+            WorkEstablishmentPhase::AwaitingPlan,
+            WorkEstablishmentPhase::AwaitingAssignment,
+        )
+        .await
+        .expect("record plan");
+    let cancelled = service
+        .cancel(&request_plan, "user cancelled after plan")
+        .await
+        .expect("cancel after plan");
+    assert_eq!(cancelled.state, WorkEstablishmentState::Cancelled);
+
+    // A newer turn can replace an abandoned pending carrier without a manual
+    // repair operation, while the exact cancelled operation remains
+    // idempotently replayable as a terminal fact.
+    let request_stale = make_request("stale", "turn-stale");
+    service
+        .admit(&request_stale)
+        .await
+        .expect("admit stale carrier");
+    assert!(
+        service
+            .cancel_pending_for_new_turn(
+                &owner_id,
+                &session,
+                "turn-new",
+                "new user turn replaced stale carrier",
+            )
+            .await
+            .expect("cancel stale carrier")
+    );
+    let request_new = make_request("new", "turn-new");
+    let new_admission = service
+        .admit_with_disposition(&request_new)
+        .await
+        .expect("new turn admission");
+    assert_eq!(
+        new_admission.disposition,
+        astra_services::work::WorkEstablishmentAdmissionDisposition::Created
+    );
+    assert_eq!(admitted.state, WorkEstablishmentState::Pending);
+
+    sqlx::query("DELETE FROM work_establishment_operations WHERE owner_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup cancellation operations");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup cancellation session fence");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_establishment_admission_serializes_concurrent_sessions_on_matrixone() {
+    use astra_services::work::{
+        DatabaseWorkEstablishmentService, InternalSessionId, WorkBranchId,
+        WorkEstablishmentActivation, WorkEstablishmentAdmissionDisposition,
+        WorkEstablishmentRequest, WorkId, WorkOwnerId,
+    };
+
+    let (shared, _) = setup_pool_and_settings().await;
+    let service = DatabaseWorkEstablishmentService::new(shared.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id =
+        WorkOwnerId::parse(format!("it-work-owner-concurrent-{suffix}")).expect("owner id");
+    let session_id = format!("it-session-concurrent-{suffix}");
+    let session = InternalSessionId::parse(&session_id).expect("session id");
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'it Work concurrent admission', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(owner_id.as_str())
+    .execute(shared.get())
+    .await
+    .expect("insert canonical session admission fence");
+
+    let make_request = |ordinal: &str| WorkEstablishmentRequest {
+        operation_id: format!("it-work-operation-concurrent-{ordinal}-{suffix}"),
+        request_hash: format!("it-work-request-hash-concurrent-{ordinal}-{suffix}"),
+        payload_json: format!(r#"{{"goal":"concurrent admission {ordinal}"}}"#),
+        owner_id: owner_id.clone(),
+        work_id: WorkId::parse(format!("it-work-concurrent-{ordinal}-{suffix}")).expect("work id"),
+        branch_id: WorkBranchId::parse(format!("it-branch-concurrent-{ordinal}-{suffix}"))
+            .expect("branch id"),
+        session_id: session.clone(),
+        run_id: format!("it-run-concurrent-{ordinal}-{suffix}"),
+        activation: WorkEstablishmentActivation::Start,
+    };
+    let request_a = make_request("a");
+    let request_b = make_request("b");
+    let service_a = service.clone();
+    let service_b = service.clone();
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let start_a = start.clone();
+    let start_b = start.clone();
+    let task_a = tokio::spawn(async move {
+        start_a.wait().await;
+        service_a.admit_with_disposition(&request_a).await
+    });
+    let task_b = tokio::spawn(async move {
+        start_b.wait().await;
+        service_b.admit_with_disposition(&request_b).await
+    });
+    let (result_a, result_b) = tokio::join!(task_a, task_b);
+    let result_a = result_a.expect("concurrent admission task A");
+    let result_b = result_b.expect("concurrent admission task B");
+
+    let dispositions = [result_a.as_ref(), result_b.as_ref()]
+        .into_iter()
+        .filter_map(|result| result.as_ref().ok().map(|admission| admission.disposition))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dispositions
+            .iter()
+            .filter(|disposition| {
+                **disposition == WorkEstablishmentAdmissionDisposition::Created
+            })
+            .count(),
+        1,
+        "exactly one concurrent admission may create the session owner: {result_a:?}; {result_b:?}"
+    );
+    assert!(
+        [result_a.as_ref(), result_b.as_ref()]
+            .into_iter()
+            .any(|result| matches!(
+                result,
+                Err(astra_services::work::WorkEstablishmentError::PendingSessionConflict)
+            )),
+        "the losing concurrent admission must be a typed session conflict: {result_a:?}; {result_b:?}"
+    );
+
+    sqlx::query("DELETE FROM work_establishment_operations WHERE owner_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup concurrent admission operations");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup concurrent session admission fence");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_establishment_same_operation_concurrent_admission_is_one_create_one_existing() {
+    use astra_services::work::{
+        DatabaseWorkEstablishmentService, InternalSessionId, WorkBranchId,
+        WorkEstablishmentActivation, WorkEstablishmentAdmissionDisposition,
+        WorkEstablishmentRequest, WorkId, WorkOwnerId,
+    };
+
+    let (shared, _) = setup_pool_and_settings().await;
+    let service = DatabaseWorkEstablishmentService::new(shared.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = WorkOwnerId::parse(format!("it-work-owner-same-{suffix}")).expect("owner id");
+    let session_id = format!("it-session-same-{suffix}");
+    let request = WorkEstablishmentRequest {
+        operation_id: format!("it-work-operation-same-{suffix}"),
+        request_hash: format!("it-work-request-hash-same-{suffix}"),
+        payload_json: r#"{"goal":"same operation admission"}"#.to_string(),
+        owner_id: owner_id.clone(),
+        work_id: WorkId::parse(format!("it-work-same-{suffix}")).expect("work id"),
+        branch_id: WorkBranchId::parse(format!("it-branch-same-{suffix}")).expect("branch id"),
+        session_id: InternalSessionId::parse(&session_id).expect("session id"),
+        run_id: format!("it-run-same-{suffix}"),
+        activation: WorkEstablishmentActivation::Start,
+    };
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'it Work same-operation admission', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(owner_id.as_str())
+    .execute(shared.get())
+    .await
+    .expect("insert canonical session admission fence");
+
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let start_a = start.clone();
+    let start_b = start.clone();
+    let service_a = service.clone();
+    let service_b = service.clone();
+    let request_a = request.clone();
+    let request_b = request.clone();
+    let task_a = tokio::spawn(async move {
+        start_a.wait().await;
+        service_a.admit_with_disposition(&request_a).await
+    });
+    let task_b = tokio::spawn(async move {
+        start_b.wait().await;
+        service_b.admit_with_disposition(&request_b).await
+    });
+    let (result_a, result_b) = tokio::join!(task_a, task_b);
+    let result_a = result_a.expect("same-operation admission task A");
+    let result_b = result_b.expect("same-operation admission task B");
+    let admissions = [result_a.as_ref(), result_b.as_ref()]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        admissions.len(),
+        2,
+        "both identical admissions must succeed"
+    );
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|admission| {
+                admission.disposition == WorkEstablishmentAdmissionDisposition::Created
+            })
+            .count(),
+        1,
+        "same operation must have exactly one creator: {result_a:?}; {result_b:?}"
+    );
+    assert_eq!(
+        admissions
+            .iter()
+            .filter(|admission| {
+                admission.disposition == WorkEstablishmentAdmissionDisposition::Existing
+            })
+            .count(),
+        1,
+        "same operation must have exactly one replay: {result_a:?}; {result_b:?}"
+    );
+    let pending_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_establishment_operations \
+         WHERE owner_id = ? AND session_id = ? AND operation_state = 'pending'",
+    )
+    .bind(owner_id.as_str())
+    .bind(&session_id)
+    .fetch_one(shared.get())
+    .await
+    .expect("count same-operation pending rows");
+    assert_eq!(pending_count, 1, "one durable pending row is the authority");
+
+    sqlx::query("DELETE FROM work_establishment_operations WHERE owner_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup same-operation admission");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup same-operation session fence");
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_establishment_replays_exact_operation_while_another_is_pending() {
+    use astra_services::work::{
+        DatabaseWorkEstablishmentService, InternalSessionId, WorkBranchId,
+        WorkEstablishmentActivation, WorkEstablishmentAdmissionDisposition, WorkEstablishmentPhase,
+        WorkEstablishmentRequest, WorkId, WorkOwnerId,
+    };
+
+    let (shared, _) = setup_pool_and_settings().await;
+    let service = DatabaseWorkEstablishmentService::new(shared.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let owner_id = WorkOwnerId::parse(format!("it-work-owner-replay-{suffix}")).expect("owner id");
+    let session_id = format!("it-session-replay-{suffix}");
+    let session = InternalSessionId::parse(&session_id).expect("session id");
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'it Work replay admission', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(owner_id.as_str())
+    .execute(shared.get())
+    .await
+    .expect("insert canonical session admission fence");
+
+    let make_request = |ordinal: &str| WorkEstablishmentRequest {
+        operation_id: format!("it-work-operation-replay-{ordinal}-{suffix}"),
+        request_hash: format!("it-work-request-hash-replay-{ordinal}-{suffix}"),
+        payload_json: format!(r#"{{"goal":"replay operation {ordinal}"}}"#),
+        owner_id: owner_id.clone(),
+        work_id: WorkId::parse(format!("it-work-replay-{ordinal}-{suffix}")).expect("work id"),
+        branch_id: WorkBranchId::parse(format!("it-branch-replay-{ordinal}-{suffix}"))
+            .expect("branch id"),
+        session_id: session.clone(),
+        run_id: format!("it-run-replay-{ordinal}-{suffix}"),
+        activation: WorkEstablishmentActivation::Start,
+    };
+    let request_a = make_request("a");
+    let request_b = make_request("b");
+    let admitted_a = service.admit(&request_a).await.expect("admit operation A");
+    let mut completed_a = admitted_a.clone();
+    for (expected, next) in [
+        (
+            WorkEstablishmentPhase::AwaitingGenesis,
+            WorkEstablishmentPhase::AwaitingPlan,
+        ),
+        (
+            WorkEstablishmentPhase::AwaitingPlan,
+            WorkEstablishmentPhase::AwaitingAssignment,
+        ),
+        (
+            WorkEstablishmentPhase::AwaitingAssignment,
+            WorkEstablishmentPhase::Complete,
+        ),
+    ] {
+        completed_a = service
+            .advance_phase(&request_a, expected, next)
+            .await
+            .expect("complete operation A");
+    }
+    let admitted_b = service
+        .admit_with_disposition(&request_b)
+        .await
+        .expect("admit pending operation B");
+    assert_eq!(
+        admitted_b.disposition,
+        WorkEstablishmentAdmissionDisposition::Created
+    );
+
+    let replayed_a = service
+        .admit_with_disposition(&request_a)
+        .await
+        .expect("completed operation A must remain replayable");
+    assert_eq!(
+        replayed_a.disposition,
+        WorkEstablishmentAdmissionDisposition::Existing
+    );
+    assert_eq!(replayed_a.operation, completed_a);
+
+    let mut mismatched_a = request_a.clone();
+    mismatched_a.request_hash = format!("it-work-request-hash-replay-mismatch-{suffix}");
+    mismatched_a.payload_json = r#"{"goal":"mutated operation identity"}"#.to_string();
+    assert!(matches!(
+        service.admit_with_disposition(&mismatched_a).await,
+        Err(astra_services::work::WorkEstablishmentError::IdempotencyMismatch)
+    ));
+
+    sqlx::query("DELETE FROM work_establishment_operations WHERE owner_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup replay admission operations");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(owner_id.as_str())
+        .bind(&session_id)
+        .execute(shared.get())
+        .await
+        .expect("cleanup replay session fence");
+}
+
 async fn cleanup_skills_by_ids(pool: &sqlx::Pool<sqlx::MySql>, ids: &[String]) {
     for id in ids {
         let _ = sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")

@@ -232,7 +232,7 @@ pub(crate) fn is_settled_stdout_closure(failure: &TurnFailure) -> bool {
 #[derive(Clone, Default)]
 pub(crate) struct BasicCliTurnOptions {
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
-    pub(crate) activated_deferred_tool_names: Vec<String>,
+    pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     pub(crate) append_system_prompt: Option<String>,
     pub(crate) cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     pub(crate) execution_time_budget: Option<crate::cli::chat_stream::ExecutionTimeBudgetClock>,
@@ -250,7 +250,7 @@ pub(crate) struct BasicCliTurnOptions {
 
 struct BasicCliTurnAttempt<'a> {
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
-    activated_deferred_tool_names: &'a mut Vec<String>,
+    deferred_tool_activations: &'a mut Vec<astra_turn_types::DeferredToolActivation>,
 }
 
 fn build_basic_cli_turn_params<'a>(
@@ -265,7 +265,7 @@ fn build_basic_cli_turn_params<'a>(
     let mut params =
         ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager, skill_quality_tracker);
     params.pre_loaded_messages = attempt.pre_loaded_messages;
-    params.activated_deferred_tool_names = Some(attempt.activated_deferred_tool_names);
+    params.deferred_tool_activations = Some(attempt.deferred_tool_activations);
     params.append_system_prompt = options.append_system_prompt.clone();
     params.cancel_token = options.cancel_token.clone();
     params.execution_time_budget = options.execution_time_budget.clone();
@@ -311,8 +311,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
 ) -> Result<StreamResult, TurnFailure> {
     let pre_loaded_messages = options.pre_loaded_messages.take();
     let retry_messages = retry_pre_loaded_messages(&pre_loaded_messages);
-    let mut activated_deferred_tool_names =
-        std::mem::take(&mut options.activated_deferred_tool_names);
+    let mut deferred_tool_activations = std::mem::take(&mut options.deferred_tool_activations);
     let params = build_basic_cli_turn_params(
         ctx,
         token,
@@ -322,7 +321,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
         &options,
         BasicCliTurnAttempt {
             pre_loaded_messages,
-            activated_deferred_tool_names: &mut activated_deferred_tool_names,
+            deferred_tool_activations: &mut deferred_tool_activations,
         },
     );
     let first = settle_request_session_binding_failure(
@@ -361,7 +360,7 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
                 &options,
                 BasicCliTurnAttempt {
                     pre_loaded_messages: retry_messages,
-                    activated_deferred_tool_names: &mut activated_deferred_tool_names,
+                    deferred_tool_activations: &mut deferred_tool_activations,
                 },
             ))
             .await;

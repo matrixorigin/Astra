@@ -103,8 +103,9 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
         registry,
         &admission_context,
     );
-    resolve_tool_visibility_for_providers_with_context(
+    resolve_tool_visibility_for_providers_with_context_and_schemas(
         tool_name,
+        schemas,
         workspace,
         executor,
         runtime,
@@ -116,6 +117,28 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
 
 pub(crate) fn resolve_tool_visibility_for_providers_with_context(
     tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+    admission_context: &ToolAdmissionContext,
+) -> ToolAdmissionDecision {
+    resolve_tool_visibility_for_providers_with_context_and_schemas(
+        tool_name,
+        &[],
+        workspace,
+        executor,
+        runtime,
+        providers,
+        registry,
+        admission_context,
+    )
+}
+
+fn resolve_tool_visibility_for_providers_with_context_and_schemas(
+    tool_name: &str,
+    schemas: &[Value],
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
@@ -135,12 +158,14 @@ pub(crate) fn resolve_tool_visibility_for_providers_with_context(
     if admission.visible
         && !runtime_surface_allows_selected_decision(
             &admission,
+            schemas,
             workspace,
             executor,
             runtime,
             &ToolPolicySnapshot::default(),
             providers,
             registry,
+            admission_context,
         )
     {
         admission.visible = false;
@@ -151,14 +176,41 @@ pub(crate) fn resolve_tool_visibility_for_providers_with_context(
 
 fn runtime_surface_allows_selected_decision(
     admission: &ToolAdmissionDecision,
+    schemas: &[Value],
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     policy: &ToolPolicySnapshot,
     providers: &[astra_runtime_env::CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
+    context: &ToolAdmissionContext,
 ) -> bool {
     let tool_name = admission.tool_name.as_str();
+    // A capability-scoped runtime provider may own a schema that is not in the
+    // server builtin registry. It is admitted only when the exact full schema
+    // carried by the provider matches the digest bound into the selected
+    // runtime declaration. A selected offer or tool name by itself is not an
+    // authorization bypass.
+    if registry.get(tool_name).is_none() {
+        if let Some(expected_digest) = context.runtime_declared_tool_schema_digests.get(tool_name) {
+            let schema_matches = schemas.iter().any(|schema| {
+                tool_schema_name(schema) == Some(tool_name)
+                    && astra_runtime_env::canonical_tool_schema_digest(schema) == *expected_digest
+            });
+            if !schema_matches
+                || !admission.selected_offer.as_ref().is_some_and(|offer| {
+                    offer.provider_type.is_runtime_executor()
+                        && !matches!(offer.route, ToolExecutionRouteKind::Unsupported)
+                        && providers
+                            .iter()
+                            .any(|provider| provider.provider_id == offer.provider_id)
+                })
+            {
+                return false;
+            }
+            return true;
+        }
+    }
     // Validate the surface against the provider selected by admission, not
     // against the request's original executor. Shared tools can legitimately
     // select server service while the workspace executor is edge-bound, and
@@ -1686,7 +1738,15 @@ mod provider_decision_projection_tests {
         policy.network_policy = Some("disabled".to_string());
         assert!(
             !runtime_surface_allows_selected_decision(
-                &admission, &workspace, &executor, None, &policy, &providers, &registry,
+                &admission,
+                &[],
+                &workspace,
+                &executor,
+                None,
+                &policy,
+                &providers,
+                &registry,
+                &ToolAdmissionContext::default(),
             ),
             "route selection must not bypass runtime capability or policy checks"
         );

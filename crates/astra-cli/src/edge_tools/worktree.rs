@@ -4,7 +4,6 @@
 //! change counting, and safe cleanup.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -122,52 +121,46 @@ pub(super) fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
 
 /// Count uncommitted changes and new commits in a worktree since a baseline commit.
 /// Returns (changed_files, commits). Used by `exit_worktree` to warn before discarding work.
-fn count_worktree_changes(worktree_path: &Path, original_head: Option<&str>) -> (usize, usize) {
+fn count_worktree_changes(
+    worktree_path: &Path,
+    original_head: Option<&str>,
+) -> Result<(usize, usize), String> {
     // Count uncommitted files
-    let status = Command::new("git")
-        .args([
-            "-C",
-            &worktree_path.display().to_string(),
-            "status",
-            "--porcelain",
-        ])
-        .output();
-    let changed_files = status
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count()
-        })
-        .unwrap_or(0);
+    let status = astra_tools::git_gix::exact_git_command(worktree_path)?
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("failed to inspect worktree status: {error}"))?;
+    if !status.status.success() {
+        return Err("failed to inspect the exact bound worktree status".to_string());
+    }
+    let changed_files = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
 
     // Count commits since baseline
-    let commits = original_head
-        .and_then(|base| {
-            Command::new("git")
-                .args([
-                    "-C",
-                    &worktree_path.display().to_string(),
-                    "rev-list",
-                    "--count",
-                    &format!("{base}..HEAD"),
-                ])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        })
-        .unwrap_or(0);
+    let commits = if let Some(base) = original_head {
+        let output = astra_tools::git_gix::exact_git_command(worktree_path)?
+            .args(["rev-list", "--count", &format!("{base}..HEAD")])
+            .output()
+            .map_err(|error| format!("failed to inspect worktree commits: {error}"))?;
+        if !output.status.success() {
+            return Err("failed to inspect commits in the exact bound worktree".to_string());
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .map_err(|_| "git returned an invalid structural commit count".to_string())?
+    } else {
+        0
+    };
 
-    (changed_files, commits)
+    Ok((changed_files, commits))
 }
 
 fn delete_worktree_branch(original_root: &Path, branch_name: &str) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = astra_tools::git_gix::exact_git_command(original_root)?
         .args(["branch", "-D", branch_name])
-        .current_dir(original_root)
         .output()
         .map_err(|error| format!("failed to delete worktree branch '{branch_name}': {error}"))?;
     if output.status.success() {
@@ -332,7 +325,7 @@ impl ToolExecutor {
         }
 
         let (changed_files, commits) =
-            count_worktree_changes(&entry.worktree_path, entry.original_head_commit.as_deref());
+            count_worktree_changes(&entry.worktree_path, entry.original_head_commit.as_deref())?;
         if changed_files > 0 || commits > 0 {
             return Err(format!(
                 "recorded worktree at {} is no longer clean ({} changed file(s), {} commit(s) since creation)",
@@ -342,10 +335,9 @@ impl ToolExecutor {
             ));
         }
 
-        let output = Command::new("git")
+        let output = astra_tools::git_gix::exact_git_command(&entry.original_root)?
             .args(["worktree", "remove", "--force"])
             .arg(&entry.worktree_path)
-            .current_dir(&entry.original_root)
             .output()
             .map_err(|error| {
                 format!(
@@ -567,10 +559,9 @@ impl ToolExecutor {
         }
 
         // Create the worktree with a new branch
-        let output = Command::new("git")
+        let output = astra_tools::git_gix::exact_git_command(&self.project_root)?
             .args(["worktree", "add", "-b", branch])
             .arg(&worktree_path)
-            .current_dir(&self.project_root)
             .output()
             .map_err(|e| format!("Failed to create worktree: {e}"))?;
 
@@ -616,7 +607,7 @@ impl ToolExecutor {
         let (changed_files, commits) = count_worktree_changes(
             &session.worktree_path,
             session.original_head_commit.as_deref(),
-        );
+        )?;
 
         if action == "remove" && (changed_files > 0 || commits > 0) && !discard_changes {
             let mut parts = Vec::new();
@@ -635,6 +626,14 @@ impl ToolExecutor {
         let worktree_path_str = session.worktree_path.display().to_string();
         let branch_name = session.branch_name.clone();
         let original_root = session.original_root.clone();
+        let cleanup_commands = if action == "remove" {
+            Some((
+                astra_tools::git_gix::exact_git_command(&original_root)?,
+                astra_tools::git_gix::exact_git_command(&original_root)?,
+            ))
+        } else {
+            None
+        };
 
         // Clear session state first
         if let Ok(mut guard) = self.worktree_session.lock() {
@@ -646,18 +645,16 @@ impl ToolExecutor {
             state.clear();
         }
 
-        if action == "remove" {
+        if let Some((mut remove_command, mut delete_branch_command)) = cleanup_commands {
             // Remove the worktree
-            let _ = Command::new("git")
+            let _ = remove_command
                 .args(["worktree", "remove", "--force"])
                 .arg(&session.worktree_path)
-                .current_dir(&original_root)
                 .output();
 
             // Also delete the branch
-            let _ = Command::new("git")
+            let _ = delete_branch_command
                 .args(["branch", "-D", &branch_name])
-                .current_dir(&original_root)
                 .output();
 
             let discard_note = if changed_files > 0 || commits > 0 {

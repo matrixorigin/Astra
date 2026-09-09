@@ -258,8 +258,6 @@ pub(crate) struct StreamResult {
     pub(crate) selected_skills: Vec<String>,
     /// Tool names with material execution across all turns.
     pub(crate) tools_used: Vec<String>,
-    /// Deferred schemas materialized in the retained session context.
-    pub(crate) activated_deferred_tool_names: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.
     pub(crate) tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     /// Token budget used by selected dynamic tools.
@@ -321,6 +319,11 @@ pub(crate) struct StreamResult {
     pub(crate) tool_record_coverage_partial: bool,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
+    /// Verified deferred-tool selection evidence. This is carried separately
+    /// from `final_messages` because compaction may remove the originating
+    /// tool-search response; it never grants authority without the current
+    /// capability-scoped catalog accepting its schema digest.
+    pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Exact prompt-history items appended by this root execution run.
     ///
     /// This is captured at the runtime append boundary before compaction may
@@ -617,7 +620,6 @@ impl Default for StreamResult {
             visible_tools: vec![],
             selected_skills: vec![],
             tools_used: vec![],
-            activated_deferred_tool_names: vec![],
             tool_call_records: vec![],
             budget_used: 0,
             budget_pressure: 0.0,
@@ -642,6 +644,7 @@ impl Default for StreamResult {
             server_terminal_authoritative: false,
             tool_record_coverage_partial: false,
             final_messages: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),

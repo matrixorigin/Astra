@@ -70,6 +70,57 @@ class AstraRuntimeEnvTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
                 validate_stream_event_jsonl(path)
 
+    def test_preflight_rejection_terminal_does_not_require_executor_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "tool_completed",
+                        "name": "run_next_work_item",
+                        "description": "run next work item",
+                        "status": "rejected",
+                        "duration_ms": 0,
+                        "output": json.dumps(
+                            {
+                                "status": "rejected",
+                                "error_kind": "text_only_settlement_tool_call",
+                                "retryable": False,
+                            }
+                        ),
+                        "tool_use_id": "system-work-dispatch-1-13",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_stream_event_jsonl(path), 1)
+
+    def test_unpaired_non_rejection_terminal_remains_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            for status, output in (
+                ("completed", '{"status":"completed"}'),
+                ("failed", '{"status":"failed"}'),
+                ("rejected", "not-json"),
+                ("rejected", '{"status":"failed"}'),
+            ):
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "tool_completed",
+                            "status": status,
+                            "output": output,
+                            "tool_use_id": "call-unpaired",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(status=status, output=output):
+                    with self.assertRaisesRegex(RuntimeError, "unknown tool"):
+                        validate_stream_event_jsonl(path)
+
     def test_uploaded_build_info_is_exact_and_closed(self):
         value = validate_embedded_build_info(embedded_build_info(), "a" * 40)
         self.assertEqual(value["profile"], "debug")
@@ -750,6 +801,45 @@ class AstraRunClassificationTests(unittest.IsolatedAsyncioTestCase):
             self._write_trial_lock(directory)
             with self.assertRaises(NonZeroAgentExitCodeError):
                 await agent.run("task", environment, AgentContext())
+
+    async def test_run_reads_strict_partial_envelope_when_stdout_is_noisy(self):
+        outcome = {
+            "exit_code": 5,
+            "final_state": "interrupted",
+            "completion_disposition": "interrupted",
+            "interruption_kind": "execution_incomplete",
+            "success": False,
+            "error_kind": "partial",
+        }
+        environment = SimpleNamespace(
+            default_user=1000,
+            exec=AsyncMock(
+                side_effect=[
+                    ExecResult(
+                        stdout="safety warning\n" + json.dumps(outcome),
+                        stderr=None,
+                        return_code=5,
+                    ),
+                    ExecResult(
+                        stdout=json.dumps(outcome),
+                        stderr=None,
+                        return_code=0,
+                    ),
+                ]
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Astra(Path(directory) / "agent", model_name="deepseek-v4-flash")
+            self._write_trial_lock(directory)
+            await agent.run("task", environment, AgentContext())
+
+        self.assertEqual(environment.exec.await_count, 2)
+        envelope_call = environment.exec.await_args_list[1].kwargs
+        self.assertEqual(
+            envelope_call["command"], "cat /logs/agent/astra-output.json"
+        )
+        self.assertEqual(envelope_call["user"], 1000)
 
 
 if __name__ == "__main__":

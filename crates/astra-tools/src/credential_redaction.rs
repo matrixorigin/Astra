@@ -504,6 +504,17 @@ fn is_high_confidence_secret_key(key: Option<&str>, value: &str) -> bool {
         return false;
     };
     let normalized = normalize_json_key(key);
+    // Internal artifact ownership fields are reserved protocol metadata. They
+    // are exempt only when a canonical tool-message boundary has validated
+    // them; any nested/invalid occurrence must be treated as sensitive data,
+    // rather than becoming a bypass merely because the key is implementation
+    // specific.
+    if matches!(
+        normalized.as_str(),
+        "_astra_tool_result_run_id" | "_astra_tool_result_artifact"
+    ) {
+        return true;
+    }
     if normalized.is_empty() || is_metadata_key(&normalized) {
         return false;
     }

@@ -441,7 +441,7 @@ async fn forward_memoria_for_user(
         resolver.provider.base_url.trim_end_matches('/'),
         endpoint
     );
-    let request = reqwest::Client::builder()
+    let request = astra_core::net::client_builder_for_target(&url)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Memoria HTTP client unavailable")?

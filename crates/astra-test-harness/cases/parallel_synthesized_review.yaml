@@ -11,18 +11,20 @@ description: |
   **Pass means**: One three-slot fanout settles and the parent synthesizes it;
   no durable Work is created and no generic child-spawn fallback is used.
 prompt: |
-  Deep-review the latest commit from three independent angles: correctness and
-  data integrity; cancellation/concurrency/lifecycle; and tests plus public
-  API contracts. Use exactly one three-agent fanout, then return one
-  synthesized review report for me. The three perspectives are evidence for
-  that one report, not separately accepted deliverables. Do not edit files.
+  Review only the repository-root Cargo.toml workspace metadata from three independent angles:
+  workspace/package structure; dependency declarations; and public build metadata. Use exactly
+  one three-agent fanout, then return one synthesized review report for me. Each child must stay
+  within Cargo.toml, use at most two focused evidence reads, and return a concise result. The three
+  perspectives are evidence for that one report, not separately accepted deliverables. Do not
+  inspect git history or other files, and do not edit files.
 prompt_variants:
   - id: chinese_user_boundary
     prompt: |
-      请用三个独立视角 deep review 最新 commit：正确性和数据完整性；
-      取消、并发与生命周期；测试和公开 API 契约。只做一次三 agent fanout，最后给我
+      请只审查仓库根目录 Cargo.toml 的 workspace 元数据，并使用三个独立视角：
+      workspace/package 结构、依赖声明、公开构建元数据。只做一次三 agent fanout，
+      每个 child 限定在 Cargo.toml 内，最多做两次聚焦证据读取并返回简洁结果，最后给我
       一份综合 review 报告。三个视角只是这份报告的证据，不是三个需要分别验收的交付物。
-      不要修改文件。
+      不要查看 git 历史或其他文件，不要修改文件。
 models:
   - deepseek-v4-flash
 capability: delegation
@@ -78,6 +80,11 @@ criteria:
     max: 0
   - type: journal_tool_call_count
     name: tool_search
+    min: 0
+    max: 1
+  - type: journal_tool_outcome_count
+    name: tool_search
+    ok: false
     min: 0
     max: 0
   - type: session_event_count

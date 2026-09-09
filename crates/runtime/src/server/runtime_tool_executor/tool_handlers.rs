@@ -4,6 +4,7 @@ use astra_services::{OwnerScope, SessionArtifactStore};
 use astra_turn_core::tool::schema::tool_schema_name;
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use astra_tools::ToolExecutor;
@@ -265,12 +266,110 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         let pool = context.current_tool_search_pool_schemas();
-        tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
+        let output = astra_tools::tool_search::tool_search(&pool, args);
+        if let Some(query) = args.get("query").and_then(Value::as_str) {
+            let selected = serde_json::from_str::<Value>(&output).ok();
+            let selected_digests = selected
+                .as_ref()
+                .and_then(|value| value.get("matches"))
+                .and_then(Value::as_array)
+                .map(|matches| {
+                    matches
+                        .iter()
+                        .filter_map(|entry| {
+                            Some((
+                                entry.get("name")?.as_str()?.to_string(),
+                                entry.get("schema_digest")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "astra::deferred_tools",
+                query,
+                pool_size = pool.len(),
+                selected_digests = ?selected_digests,
+                "deferred discovery contract selected"
+            );
+        }
+        tool_result_from_output(output)
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MemoryToolHandler;
+
+/// Build executor-owned evidence for a successful mutation in the external
+/// Memoria service.  Filesystem fingerprinting cannot observe a database
+/// mutation, so this typed handler records a narrow action-specific receipt
+/// instead.  The receipt is only projected after the structured backend
+/// response proves a positive effect; assistant text, tool names, and exit
+/// status are never used as evidence.
+fn memory_external_mutation_receipt(
+    action: astra_tools::memory_tool_contract::MemoryAction,
+    args: &Value,
+    output: &str,
+) -> Option<serde_json::Map<String, Value>> {
+    let response = serde_json::from_str::<Value>(output).ok()?;
+    let successful_effect = match action {
+        astra_tools::memory_tool_contract::MemoryAction::Remember => response
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty()),
+        astra_tools::memory_tool_contract::MemoryAction::Forget => response
+            .get("purged")
+            .or_else(|| response.get("deleted_count"))
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        astra_tools::memory_tool_contract::MemoryAction::Update
+        | astra_tools::memory_tool_contract::MemoryAction::Feedback => {
+            let status = response.get("status").and_then(Value::as_str);
+            status.is_some_and(|status| {
+                matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "completed" | "complete" | "ok" | "success" | "successful"
+                )
+            }) || response
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        }
+        _ => false,
+    };
+    if !successful_effect {
+        return None;
+    }
+
+    let operation_digest = format!(
+        "{:x}",
+        Sha256::digest(astra_core::canonical_json_string(args))
+    );
+    let scope = astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE;
+    Some(serde_json::Map::from_iter([
+        (
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD.to_string(),
+            Value::Bool(true),
+        ),
+        (
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD.to_string(),
+            Value::String(scope.to_string()),
+        ),
+        (
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD.to_string(),
+            serde_json::json!({
+                "schema": "external_effect_receipt.v1",
+                "source": "typed_external_tool",
+                "scope": scope,
+                "changed": true,
+                "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
+                "tool": "memory",
+                "action": action.as_str(),
+                "operation_digest": operation_digest,
+            }),
+        ),
+    ]))
+}
 
 impl MemoryToolHandler {
     async fn execute_for_producer(
@@ -337,11 +436,20 @@ impl MemoryToolHandler {
             .memoria_client
             .call(action.as_str(), &isolated_args)
             .await;
-        if output.starts_with("Error") {
+        let mut result = if output.starts_with("Error") {
             astra_tools::ToolResult::error(output)
         } else {
             astra_tools::ToolResult::text(output)
+        };
+        if !result.is_error
+            && let Some(receipt) = memory_external_mutation_receipt(action, args, &result.output)
+        {
+            result
+                .metadata
+                .get_or_insert_with(Default::default)
+                .extend(receipt);
         }
+        result
     }
 }
 
@@ -707,7 +815,8 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     Err("introspect artifact recovery request was not recognized".to_string())
                 })
                 .unwrap_or_else(|error| format!("Error: {error}")),
-            );
+            )
+            .with_source_bounded_model_projection();
         }
         let mut snapshot = current_introspect_snapshot(
             &context.session_id,
@@ -770,6 +879,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             ),
         }
         tool_result_from_output(render_introspect_snapshot(args, &snapshot))
+            .with_native_recovery_model_projection()
     }
 }
 
@@ -1357,5 +1467,57 @@ mod tests {
                 "server-specific wrapper `{wrapped}` must still have a runtime handler"
             );
         }
+    }
+
+    #[test]
+    fn memory_receipt_requires_positive_structured_effect() {
+        let remember_args = serde_json::json!({
+            "action": "remember",
+            "content": "opaque test content",
+            "memory_type": "working",
+        });
+        let fields = memory_external_mutation_receipt(
+            astra_tools::memory_tool_contract::MemoryAction::Remember,
+            &remember_args,
+            r#"{"memory_id":"m-1","is_active":true}"#,
+        )
+        .expect("remember identity is an executor-owned positive receipt");
+        let receipt = fields
+            .get(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
+            .expect("external receipt")
+            .clone();
+        assert!(
+            astra_tools::workspace_observation::is_authoritative_external_effect_receipt(&receipt)
+        );
+        assert_eq!(receipt["action"], "remember");
+        assert_eq!(receipt["tool"], "memory");
+        assert!(receipt["operation_digest"].as_str().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
+
+        assert!(
+            memory_external_mutation_receipt(
+                astra_tools::memory_tool_contract::MemoryAction::Remember,
+                &remember_args,
+                "memory stored, m-1",
+            )
+            .is_none()
+        );
+        assert!(
+            memory_external_mutation_receipt(
+                astra_tools::memory_tool_contract::MemoryAction::Forget,
+                &serde_json::json!({"action":"forget", "memory_id":"m-1"}),
+                r#"{"purged":0}"#,
+            )
+            .is_none()
+        );
+        assert!(
+            memory_external_mutation_receipt(
+                astra_tools::memory_tool_contract::MemoryAction::Update,
+                &serde_json::json!({"action":"update", "memory_id":"m-1"}),
+                r#"{"status":"failed"}"#,
+            )
+            .is_none()
+        );
     }
 }

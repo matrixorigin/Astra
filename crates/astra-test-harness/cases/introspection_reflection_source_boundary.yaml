@@ -2,9 +2,10 @@ name: introspection_reflection_source_boundary
 description: |
   **What**: In one real session, inspect live execution state and then reflect on durable
   session evidence.
-  **Tests**: The agent can invoke both diagnostic tools, their calls are present in both the
-  CLI envelope and the canonical durable turn journal, and the model is asked not to conflate a
-  fresh process snapshot with the session journal.
+  **Tests**: The agent can invoke both diagnostic tools, their calls are present in the
+  canonical durable turn journal even when a deferred tool is selected through the typed
+  discovery/dispatch path, and the model is asked not to conflate a fresh process snapshot
+  with the session journal.
   **Why**: `introspect` and `reflect` answer adjacent but different questions. Treating a
   process-local zero as a durable-session zero hides history and produces misleading diagnosis.
   **Pass means**: Both tools execute in order and their durable tool records are readable after
@@ -28,11 +29,11 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_sequence
+  - type: journal_tool_sequence
     tools: [introspect, reflect]
   - type: tools_count_between
     min: 2
-    max: 2
+    max: 4
   - type: journal_tool_call_count
     name: introspect
     min: 1

@@ -501,49 +501,64 @@ fn compact_tool_results_gated(
     }
 }
 
-/// Cache-align sections: sort within reorderable groups by cache scope.
+/// Cache-align sections within contiguous reorderable groups by cache scope.
+///
+/// Identity and Constraints are semantic anchors and therefore delimit those
+/// groups. They stay at their original indices, and sections on opposite sides
+/// of an anchor are never compared or exchanged. This keeps cache alignment a
+/// layout optimization rather than an implicit rewrite of prompt semantics.
 /// Returns the total displaced positions required by the proposed reorder. If
 /// that count exceeds `max_moves`, no reorder is applied and the returned value
 /// still reports the skipped work for optimizer stats/explainability.
 fn cache_align_sections(sections: &mut [BoundSection], max_moves: u32) -> u32 {
-    // Only reorder within groups that have the same scope
-    // Don't reorder Identity and Constraints (they're semantic anchors)
-    let reorderable: Vec<usize> = sections
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| {
-            !matches!(
-                s.plan.kind,
-                SectionKind::Identity | SectionKind::Constraints
-            )
-        })
-        .map(|(i, _)| i)
-        .collect();
-
-    if reorderable.len() < 2 {
+    if sections.len() < 2 {
         return 0;
     }
 
-    // Compute desired order by cache scope
-    let mut sorted_indices = reorderable.clone();
-    sorted_indices.sort_by_key(|&i| sections[i].plan.scope.order());
+    let mut desired_indices: Vec<usize> = (0..sections.len()).collect();
+    let mut moves = 0_u32;
+    let mut run_start = 0;
 
-    // Count displacements
-    let mut moves = 0u32;
-    for (pos, &target_idx) in sorted_indices.iter().enumerate() {
-        if reorderable[pos] != target_idx {
-            moves += 1;
+    while run_start < sections.len() {
+        if matches!(
+            sections[run_start].plan.kind,
+            SectionKind::Identity | SectionKind::Constraints
+        ) {
+            run_start += 1;
+            continue;
         }
+
+        let run_end = sections[run_start..]
+            .iter()
+            .position(|section| {
+                matches!(
+                    section.plan.kind,
+                    SectionKind::Identity | SectionKind::Constraints
+                )
+            })
+            .map_or(sections.len(), |offset| run_start + offset);
+        if run_end - run_start < 2 {
+            run_start = run_end;
+            continue;
+        }
+
+        let mut sorted_indices: Vec<usize> = (run_start..run_end).collect();
+        sorted_indices.sort_by_key(|&index| sections[index].plan.scope.order());
+        for (target_index, source_index) in (run_start..run_end).zip(sorted_indices) {
+            desired_indices[target_index] = source_index;
+            if target_index != source_index {
+                moves = moves.saturating_add(1);
+            }
+        }
+        run_start = run_end;
     }
 
     if moves <= max_moves && moves > 0 {
-        let sorted_sections: Vec<BoundSection> = sorted_indices
+        let reordered: Vec<BoundSection> = desired_indices
             .iter()
-            .map(|&idx| sections[idx].clone())
+            .map(|&source_index| sections[source_index].clone())
             .collect();
-        for (target_idx, sorted_section) in reorderable.iter().zip(sorted_sections) {
-            sections[*target_idx] = sorted_section;
-        }
+        sections.clone_from_slice(&reordered);
     }
 
     moves
@@ -572,11 +587,16 @@ fn place_cache_markers(
     let mut last_scope = None;
 
     for (i, section) in sections.iter().enumerate() {
-        cumulative_tokens += section.actual_tokens;
+        cumulative_tokens = cumulative_tokens.saturating_add(section.actual_tokens);
         let scope = section.plan.scope;
 
         if let Some(prev_scope) = last_scope {
-            if prev_scope != scope && markers.len() < policy.max_markers as usize {
+            // A marker is meaningful only at a monotonic stable→volatile
+            // boundary. Never mark after a volatile section, and do not try to
+            // repair an already-invalid scope order by placing a marker in the
+            // middle of it. The planner normally emits monotonic scopes; this
+            // guard keeps malformed/custom input fail-closed.
+            if prev_scope < scope && markers.len() < policy.max_markers as usize {
                 // Skip None-scope markers if a latch flipped (content unstable)
                 if latch_flipped && scope == CacheScope::None {
                     // Don't place marker before volatile content
@@ -779,14 +799,44 @@ mod tests {
 
         let moves = cache_align_sections(&mut sections, 5);
 
-        assert!(moves > 0);
+        assert_eq!(moves, 0, "anchors must block cross-boundary movement");
         assert_eq!(sections[1].plan.kind, SectionKind::Identity);
         assert_eq!(sections[1].text(), Some("identity"));
         assert_eq!(sections[3].plan.kind, SectionKind::Constraints);
         assert_eq!(sections[3].text(), Some("constraints"));
-        assert_eq!(sections[0].text(), Some("global"));
+        assert_eq!(sections[0].text(), Some("none-a"));
         assert_eq!(sections[2].text(), Some("session"));
-        assert_eq!(sections[4].text(), Some("none-a"));
+        assert_eq!(sections[4].text(), Some("global"));
+    }
+
+    #[test]
+    fn reorder_sorts_each_run_without_crossing_anchors() {
+        let mut sections = vec![
+            test_bound_section(SectionKind::Skills, CacheScope::None, "none-before"),
+            test_bound_section(
+                SectionKind::ProjectContext,
+                CacheScope::Global,
+                "global-before",
+            ),
+            test_bound_section(SectionKind::Identity, CacheScope::Global, "identity"),
+            test_bound_section(SectionKind::Skills, CacheScope::None, "none-after"),
+            test_bound_section(
+                SectionKind::RuntimeIdentity,
+                CacheScope::Session,
+                "session-after",
+            ),
+            test_bound_section(SectionKind::Constraints, CacheScope::Global, "constraints"),
+        ];
+
+        let moves = cache_align_sections(&mut sections, 10);
+
+        assert_eq!(moves, 4);
+        assert_eq!(sections[0].text(), Some("global-before"));
+        assert_eq!(sections[1].text(), Some("none-before"));
+        assert_eq!(sections[2].text(), Some("identity"));
+        assert_eq!(sections[3].text(), Some("session-after"));
+        assert_eq!(sections[4].text(), Some("none-after"));
+        assert_eq!(sections[5].text(), Some("constraints"));
     }
 
     fn tool_result_messages(count: usize, content_len: usize) -> Vec<Value> {
@@ -928,6 +978,24 @@ mod tests {
         // The exact count depends on section layout
         // Just verify the mechanism runs
         assert!(result.cache_markers.len() <= policy.max_markers as usize);
+    }
+
+    #[test]
+    fn cache_markers_fail_closed_for_non_monotonic_scope_order() {
+        let sections = vec![
+            test_bound_section(SectionKind::RuntimeVolatile, CacheScope::None, "volatile"),
+            test_bound_section(SectionKind::RuntimeIdentity, CacheScope::Session, "session"),
+            test_bound_section(SectionKind::ProjectContext, CacheScope::Global, "global"),
+        ];
+        let policy = ProviderCachePolicy::anthropic();
+        let latches = SessionLatches::default();
+
+        let markers = place_cache_markers(&sections, &policy, &latches, 1);
+
+        assert!(
+            markers.is_empty(),
+            "cache markers must not be placed after volatile content or across a scope decrease"
+        );
     }
 
     #[test]
@@ -1558,7 +1626,7 @@ mod tests {
     // These lock invariants that the optimizer MUST uphold for any input:
     //  1. `cache_align_sections` never repositions Identity / Constraints.
     //  2. After a successful reorder, scope order is non-decreasing within
-    //     the reorderable group.
+    //     each contiguous reorderable run; anchors are barriers.
     //  3. `compact_tool_results_gated` never exceeds `max_clear_tokens`.
     //  4. `spill_oversized_sections` never touches Identity / Constraints /
     //     WorkingMemory, regardless of size.
@@ -1699,10 +1767,9 @@ mod tests {
             }
 
             /// Invariant 2: when `cache_align_sections` applies its reorder,
-            /// the reorderable group (everything except anchors) must end up
-            /// with non-decreasing scope order (Global < Session < None). If
-            /// it doesn't apply (moves > max_moves), the original order is
-            /// preserved — but this test only checks the "applied" case.
+            /// each contiguous reorderable run must end up with non-decreasing
+            /// scope order (Global < Session < None). Identity and Constraints
+            /// are barriers; a section must never cross either one.
             #[test]
             fn reorder_yields_non_decreasing_scope_when_applied(
                 kinds in prop::collection::vec(kind_strategy(), 1..10),
@@ -1715,21 +1782,29 @@ mod tests {
                 // Generous max_moves so reorder always applies.
                 let _moves = cache_align_sections(&mut sections, 1_000);
 
-                let reorderable_scopes: Vec<u8> = sections
-                    .iter()
-                    .filter(|s| !matches!(
-                        s.plan.kind,
+                let mut run_scopes = Vec::new();
+                for section in &sections {
+                    if matches!(
+                        section.plan.kind,
                         SectionKind::Identity | SectionKind::Constraints
-                    ))
-                    .map(|s| s.plan.scope.order())
-                    .collect();
-
-                for pair in reorderable_scopes.windows(2) {
+                    ) {
+                        for pair in run_scopes.windows(2) {
+                            prop_assert!(
+                                pair[0] <= pair[1],
+                                "run scope order is not non-decreasing: {:?}",
+                                run_scopes
+                            );
+                        }
+                        run_scopes.clear();
+                    } else {
+                        run_scopes.push(section.plan.scope.order());
+                    }
+                }
+                for pair in run_scopes.windows(2) {
                     prop_assert!(
                         pair[0] <= pair[1],
-                        "reorderable scope order is not non-decreasing: \
-                         got {:?}, violates Global<Session<None",
-                        reorderable_scopes
+                        "run scope order is not non-decreasing: {:?}",
+                        run_scopes
                     );
                 }
             }
@@ -1932,6 +2007,18 @@ mod tests {
                         marker.after_section_index,
                         sections.len()
                     );
+                    let marked_scope = sections[marker.after_section_index].plan.scope;
+                    prop_assert_ne!(
+                        marked_scope,
+                        CacheScope::None,
+                        "markers must never cache a volatile section"
+                    );
+                    if marker.after_section_index + 1 < sections.len() {
+                        prop_assert!(
+                            marked_scope < sections[marker.after_section_index + 1].plan.scope,
+                            "marker must sit at a monotonic stable-to-volatile boundary"
+                        );
+                    }
                 }
 
                 // P4: When latch flipped, no marker sits just before a None-scope section

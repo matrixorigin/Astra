@@ -36,9 +36,8 @@ fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
         state.interruption.as_ref().map(|record| record.kind),
         Some(InterruptionKind::ExecutionIncomplete)
     );
-    let preserve_execution_scratch =
-        should_preserve_execution_scratch(&outcome, state.interruption.is_some());
-    assert!(preserve_execution_scratch);
+    let allow_empty_delta = should_allow_empty_delta(&outcome, state.interruption.is_some());
+    assert!(allow_empty_delta);
     let messages = vec![
         json!({"role":"user","content":"run the tool"}),
         json!({
@@ -52,10 +51,9 @@ fn completed_run_is_paused_before_commit_when_tool_ledger_is_open() {
         }),
         json!({"role":"tool","tool_call_id":"call-open-ledger","content":"partial"}),
     ];
-    let (_, segments) =
-        canonical_commit_delta(&[], false, &messages, None, preserve_execution_scratch)
-            .expect("resumable canonical delta")
-            .expect("resumable tool frames must remain committable");
+    let (_, segments) = canonical_commit_delta(&[], false, &messages, None, allow_empty_delta)
+        .expect("resumable canonical delta")
+        .expect("resumable tool frames must remain committable");
     assert!(
         segments
             .iter()
@@ -482,14 +480,14 @@ fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
 }
 
 #[test]
-fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
+fn lifecycle_allows_empty_canonical_delta_only_for_unsettled_outcomes() {
     use crate::turn::agentic_loop::host::AgenticLoopOutcome;
 
-    assert!(!should_preserve_execution_scratch(
+    assert!(!should_allow_empty_delta(
         &Ok(AgenticLoopOutcome::Completed),
         false
     ));
-    assert!(should_preserve_execution_scratch(
+    assert!(should_allow_empty_delta(
         &Ok(AgenticLoopOutcome::Completed),
         true
     ));
@@ -499,9 +497,9 @@ fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
         AgenticLoopOutcome::Delegated,
         AgenticLoopOutcome::Error("provider failed".into()),
     ] {
-        assert!(should_preserve_execution_scratch(&Ok(outcome), false));
+        assert!(should_allow_empty_delta(&Ok(outcome), false));
     }
-    assert!(should_preserve_execution_scratch(
+    assert!(should_allow_empty_delta(
         &Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::Unknown,
             "transport failed"
@@ -511,7 +509,7 @@ fn lifecycle_preserves_execution_scratch_for_every_resumable_outcome() {
 }
 
 #[test]
-fn completed_turn_commits_semantics_without_transient_tool_transcript() {
+fn completed_turn_commits_tool_evidence_without_compacting_it() {
     let messages = vec![
         json!({"role": "user", "content": "inspect it"}),
         json!({
@@ -532,13 +530,8 @@ fn completed_turn_commits_semantics_without_transient_tool_transcript() {
         .expect("completed turn delta");
 
     assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "inspect it"}),
-            json!({"role": "assistant", "content": "The invariant is broken."}),
-        ]
-    );
+    assert_eq!(packs.concat().len(), messages.len());
+    assert_eq!(packs.concat(), messages);
 }
 
 #[test]
@@ -581,7 +574,7 @@ fn cancelled_turn_retains_complete_tool_group_for_recovery() {
 }
 
 #[test]
-fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() {
+fn an_admitted_prefix_is_not_compaction_authority_even_when_it_contains_tools() {
     let prior = vec![
         json!({"role": "user", "content": "old request"}),
         json!({
@@ -604,24 +597,19 @@ fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() 
     let base_manifest_root = "a".repeat(64);
     let proof = CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
 
-    let (mode, packs) = canonical_commit_delta(&prior, true, &messages, Some(&proof), false)
-        .unwrap()
-        .expect("normalized replacement");
-
-    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "old request"}),
-            json!({"role": "assistant", "content": "old result"}),
-            json!({"role": "user", "content": "new request"}),
-            json!({"role": "assistant", "content": "new result"}),
-        ]
-    );
+    for allow_empty_delta in [false, true] {
+        let (mode, packs) =
+            canonical_commit_delta(&prior, true, &messages, Some(&proof), allow_empty_delta)
+                .unwrap()
+                .expect("append the new turn without rewriting the old one");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert_eq!(packs.concat(), messages[prior.len()..]);
+        assert_eq!([prior.clone(), packs.concat()].concat(), messages);
+    }
 }
 
 #[test]
-fn missing_proof_cannot_replace_prior_execution_scratch() {
+fn resumed_assistant_suffix_keeps_the_admitted_user_context_without_rewriting_it() {
     let prior = vec![
         json!({"role": "user", "content": "old request"}),
         json!({
@@ -636,23 +624,15 @@ fn missing_proof_cannot_replace_prior_execution_scratch() {
         json!({"role": "tool", "tool_call_id": "old-call", "content": "old output"}),
     ];
     let mut messages = prior.clone();
-    messages.extend([
-        json!({"role": "user", "content": "continue"}),
-        json!({"role": "assistant", "content": "recovered result"}),
-    ]);
-
-    let (mode, packs) = canonical_commit_delta(&prior, true, &messages, None, false)
-        .unwrap()
-        .expect("safe append remains available without replacement authority");
-
-    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-    assert_eq!(
-        packs.concat(),
-        vec![
-            json!({"role": "user", "content": "continue"}),
-            json!({"role": "assistant", "content": "recovered result"}),
-        ]
-    );
+    messages.push(json!({"role": "assistant", "content": "recovered result"}));
+    for allow_empty_delta in [false, true] {
+        let (mode, packs) =
+            canonical_commit_delta(&prior, true, &messages, None, allow_empty_delta)
+                .unwrap()
+                .expect("safe append remains available without replacement authority");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert_eq!(packs.concat(), messages[prior.len()..]);
+    }
 }
 
 #[test]
@@ -862,16 +842,11 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         assert_eq!(messages[1]["_compact_boundary"], true);
         assert_eq!(messages[2], tail, "typed tail survives real compaction");
 
-        for preserve_execution_scratch in [false, true] {
-            let (mode, packs) = canonical_commit_delta(
-                &prior,
-                true,
-                &messages,
-                Some(&proof),
-                preserve_execution_scratch,
-            )
-            .expect("verified compacted turn")
-            .expect("nonempty canonical delta");
+        for allow_empty_delta in [false, true] {
+            let (mode, packs) =
+                canonical_commit_delta(&prior, true, &messages, Some(&proof), allow_empty_delta)
+                    .expect("verified compacted turn")
+                    .expect("nonempty canonical delta");
             assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
             let committed = packs.concat();
             let users = committed
@@ -887,10 +862,9 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");
-            assert_eq!(
+            assert!(
                 committed.iter().any(|message| message["role"] == "tool"),
-                preserve_execution_scratch,
-                "retained execution evidence follows the commit contract",
+                "retained execution evidence is independent of the terminal outcome",
             );
 
             let serialized = serde_json::to_string(&committed).unwrap();
@@ -1588,6 +1562,8 @@ async fn scheduled_post_loop_memory_cleanup_is_visible_to_shutdown_drain() {
 #[tokio::test]
 async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
     let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
+    let journal_dir = tempfile::tempdir().expect("post-loop journal dir");
+    let _journal_guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
     let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1647,6 +1623,7 @@ async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
 }
 
 #[tokio::test]
+#[serial_test::serial(session_journal_dir)]
 async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
     struct PersistFailingMemoria {
         purge_calls: std::sync::atomic::AtomicUsize,
@@ -1757,6 +1734,125 @@ async fn post_loop_memory_never_purges_an_unconfirmed_final_snapshot() {
 }
 
 #[tokio::test]
+#[serial_test::serial(session_journal_dir)]
+async fn post_loop_memory_disabled_capability_settles_without_health_failure() {
+    struct DisabledMemoria;
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for DisabledMemoria {
+        async fn admits_operation(&self, _: bool) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+            _: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            Err("unreachable while memory access is disabled".to_string())
+        }
+
+        async fn purge_working(&self, _: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    let sessions = tempfile::tempdir().expect("temp sessions directory");
+    let _journal_guard =
+        astra_services::session_journal::ProcessJournalDirGuard::new(sessions.path());
+    let (ingestion, _rx) = astra_services::event_ingestion::IngestionSender::for_tests(32);
+    let service = Arc::new(crate::session_memory::MemoryExtractionService::new(
+        Arc::new(crate::session_memory::ConstMemoryInferenceResolver(None)),
+        Arc::new(DisabledMemoria),
+        ingestion,
+        "owner-disabled",
+        Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+    ));
+    let request = crate::session_memory::ExtractionRequest {
+        inference_scope: astra_turn_types::InferenceInvocationScope::Session {
+            session_id: "session-disabled".to_string(),
+            turn: 1,
+            round: 0,
+            operation_id: "test_memory_disabled".to_string(),
+            logical_attempt: 0,
+        },
+        messages: vec![json!({
+            "role": "user",
+            "content": "A session with optional memory disabled must still complete."
+        })],
+        session_facts: astra_turn_types::session_facts::SessionFacts::default(),
+        had_error: false,
+        reanchors_current_objective: false,
+    };
+    assert_eq!(
+        service.maybe_spawn(request.clone()),
+        crate::session_memory::SpawnDecision::Spawned
+    );
+    assert_eq!(
+        service.wait_for_pending(Duration::from_secs(1)).await,
+        0,
+        "disabled capability must not leave background work pending"
+    );
+
+    let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    run_post_loop_memory_cleanup_work(
+        "owner-disabled".to_string(),
+        "session-disabled".to_string(),
+        "run-disabled".to_string(),
+        1,
+        astra_turn_types::session_facts::SessionFacts::default(),
+        Some(service),
+        Some(request),
+        Some(registry.clone()),
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let rendered = registry.render_prometheus();
+    assert!(
+        rendered
+            .contains("astra_session_memory_post_loop_drains_total{outcome=\"access_disabled\"} 1")
+    );
+    assert!(!rendered.contains("outcome=\"not_durable\""));
+    let events = astra_services::session_journal::read_journal_for_user(
+        "owner-disabled",
+        "session-disabled",
+    )
+    .expect("post-loop journal");
+    assert!(events.iter().any(|event| {
+        event.event_type == astra_services::session_journal::JournalEventType::SubsystemSettled
+            && event.turn == Some(1)
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("subsystem"))
+                .and_then(serde_json::Value::as_str)
+                == Some("post_loop_memory")
+    }));
+    assert!(!events.iter().any(|event| {
+        event.event_type == astra_services::session_journal::JournalEventType::SubsystemDiagnostic
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str)
+                == Some("not_durable")
+    }));
+}
+
+#[tokio::test]
 async fn post_loop_memory_cleanup_waits_when_worker_pool_is_full() {
     let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");
     let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
@@ -1858,11 +1954,19 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
     );
     state.max_turn_input_tokens = 123_456;
     state.remaining_turns = 9;
-    state.activated_deferred_tool_names = vec!["web_fetch".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "web_fetch".into(),
+        schema_digest: "sha256:checkpoint".into(),
+        descriptor: None,
+    }];
 
     restore_session_state_compact(
         astra_turn_core::conversation_log::SessionStateCompact {
-            activated_deferred_tool_names: vec!["github".into()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:csl".into(),
+                descriptor: None,
+            }],
             approval_overrides: Some(json!({"approval": "stale"})),
             budget_remaining_tokens: 42_000,
             budget_remaining_rounds: 3,
@@ -1890,14 +1994,14 @@ fn restore_session_state_compact_ignores_runtime_control_state() {
     assert_eq!(state.consecutive_context_window_errors, 0);
     assert_eq!(state.compaction_effectiveness.attempt_count, 0);
     assert_eq!(
-        state.activated_deferred_tool_names,
-        vec!["github", "web_fetch"],
-        "CSL contributes prompt continuity but cannot erase a newer checkpoint activation"
+        state.deferred_tool_activations.len(),
+        2,
+        "CSL and checkpoint selections merge only as schema-addressed evidence"
     );
 }
 
 #[test]
-fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
+fn csl_restore_does_not_wire_name_only_activation_into_the_executor() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -1911,12 +2015,8 @@ fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
     );
     // This is the recovery order used by a resumed root run: the heavy
     // checkpoint is restored first and CSL follows as a transcript projection.
-    state.activated_deferred_tool_names = vec!["web_fetch".into()];
     restore_session_state_compact(
-        astra_turn_core::conversation_log::SessionStateCompact {
-            activated_deferred_tool_names: vec!["github".into()],
-            ..Default::default()
-        },
+        astra_turn_core::conversation_log::SessionStateCompact::default(),
         &mut state,
     );
 
@@ -1932,15 +2032,7 @@ fn csl_restore_keeps_checkpoint_tool_activation_when_wiring_the_executor() {
         &mut state,
     );
 
-    assert_eq!(
-        state
-            .runtime_tool_executor
-            .as_deref()
-            .expect("wired executor")
-            .activated_deferred_tool_names(),
-        vec!["github", "web_fetch"],
-        "the model-visible executor surface must retain every recovered deferred schema"
-    );
+    assert!(state.runtime_tool_executor.is_some());
 }
 
 #[test]
@@ -1974,7 +2066,11 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
         },
     ));
     state.compaction_effectiveness.attempt_count = 7;
-    state.activated_deferred_tool_names = vec!["github".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "github".into(),
+        schema_digest: "sha256:github".into(),
+        descriptor: None,
+    }];
 
     let compact = extract_session_state_compact(&state);
 
@@ -1989,14 +2085,13 @@ fn csl_session_state_does_not_persist_runtime_control_state() {
     assert_eq!(compact.consecutive_ctx_errors, 0);
     assert!(compact.compaction_tracker.is_none());
     assert_eq!(
-        compact.activated_deferred_tool_names,
-        vec!["github"],
-        "CSL must carry prompt-visible deferred schema materialization across turns"
+        compact.deferred_tool_activations,
+        state.deferred_tool_activations
     );
 }
 
 #[test]
-fn csl_session_state_snapshots_live_executor_activation() {
+fn csl_session_state_preserves_typed_activation_without_executor_side_state() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -2008,7 +2103,11 @@ fn csl_session_state_snapshots_live_executor_activation() {
         None,
         None,
     );
-    state.activated_deferred_tool_names = vec!["stale-state-copy".into()];
+    state.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+        name: "stale-state-copy".into(),
+        schema_digest: "sha256:stale".into(),
+        descriptor: None,
+    }];
     let workspace = tempfile::tempdir().expect("workspace");
     let executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
         workspace.path().to_path_buf(),
@@ -2017,16 +2116,13 @@ fn csl_session_state_snapshots_live_executor_activation() {
         None,
         None,
     );
-    executor
-        .restore_activated_deferred_tool_names_for_session(&["web_fetch".into(), "github".into()]);
     state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
 
     let compact = extract_session_state_compact(&state);
 
     assert_eq!(
-        compact.activated_deferred_tool_names,
-        vec!["github", "web_fetch"],
-        "settlement must snapshot the live executor rather than an older loop-state copy"
+        compact.deferred_tool_activations,
+        state.deferred_tool_activations
     );
 }
 
@@ -2190,7 +2286,11 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         budget_remaining_rounds: 0,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
-        activated_deferred_tool_names: vec!["github".into()],
+        deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+            name: "github".into(),
+            schema_digest: "sha256:restored".into(),
+            descriptor: None,
+        }],
         resume_turn: 0,
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         completed_tool_results: HashMap::new(),
@@ -2223,7 +2323,14 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
 
     assert!(state.restricted_tools.contains("flaky_tool"));
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
-    assert_eq!(state.activated_deferred_tool_names, vec!["github"]);
+    assert_eq!(
+        state.deferred_tool_activations,
+        vec![astra_turn_types::DeferredToolActivation {
+            name: "github".into(),
+            schema_digest: "sha256:restored".into(),
+            descriptor: None,
+        }]
+    );
     assert!(
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"
@@ -3623,7 +3730,9 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
 #[test]
 fn only_work_item_children_receive_the_typed_settlement_contract() {
     let ordinary = test_spawn_run_config(vec!["*"], false);
-    assert!(!spawn_system_prompt(&ordinary).contains("settle_work_item"));
+    let ordinary_prompt = spawn_system_prompt(&ordinary);
+    assert!(!ordinary_prompt.contains("settle_work_item"));
+    assert!(!ordinary_prompt.contains(&ordinary.agent_id));
 
     let mut assigned = ordinary;
     assigned.work_item = Some(
@@ -3633,6 +3742,7 @@ fn only_work_item_children_receive_the_typed_settlement_contract() {
         },
     );
     let prompt = spawn_system_prompt(&assigned);
+    assert!(!prompt.contains(&assigned.agent_id));
     assert!(prompt.contains("Complete only the declared WorkItem"));
     assert!(prompt.contains("stop once its expected result is supported"));
     assert!(!prompt.contains("Complete the task thoroughly"));

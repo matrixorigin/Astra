@@ -1053,7 +1053,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     // native calls are already in accum.tool_calls and the XML stays in
     // full_text. The CLI strips that residual XML in consume_turn_sse
     // (stream_render.rs) when has_tool_calls is true.
-    if accum.tool_calls.is_empty() {
+    // A Server-owned terminal has already executed and settled its tool
+    // ledger. Its final text is display data, never a new client-side action
+    // carrier. Re-parsing that text would violate the single continuation
+    // owner invariant and can replay examples or quoted XML as real work.
+    if !accum.server_loop_terminal && accum.tool_calls.is_empty() {
         if let Some(parsed) =
             crate::xml_tool_call_fallback::parse_degraded_tool_calls(&accum.full_text)
         {
@@ -4098,6 +4102,38 @@ mod tests {
             result.accum.full_text
         );
         assert!(result.accum.full_text.contains("create the file"));
+    }
+
+    #[tokio::test]
+    async fn server_owned_terminal_text_never_reopens_client_tool_execution() {
+        let receipt = crate::tool_ledger_receipt::ToolLedgerReceipt::empty("run-1", 0);
+        let assistant_text = "The remote run is complete. Example: <invoke name=\"bash\"></invoke>";
+        let terminal = serde_json::json!({
+            "type": "turn_complete",
+            "continuation_owner": "server",
+            "assistant_text": assistant_text,
+            "tool_calls_count": 0,
+            "observation_tool_calls_count": 0,
+            "tools_used": [],
+            "llm_rounds": 1,
+            "tool_ledger_receipt": receipt,
+        });
+        let events = format!("data: {terminal}\n\n");
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = NoopSseStreamHost;
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(result.accum.server_loop_terminal);
+        assert!(result.accum.tool_calls.is_empty());
+        assert!(!result.accum.has_tool_calls);
+        assert_eq!(result.accum.full_text, assistant_text);
     }
 
     /// REGRESSION (reviewer L2-4): approval-before-tool ordering MUST

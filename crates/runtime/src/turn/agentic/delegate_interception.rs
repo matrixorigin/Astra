@@ -62,15 +62,13 @@ async fn execute_delegation(
 pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_result: &HostTurnResult,
+    tool_calls: &[Value],
     quiet: bool,
     valid_tool_names: &HashSet<String>,
 ) -> DelegationInterceptionResult {
-    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
-        && !valid_tool_names.contains(DELEGATE_TOOL_NAME)
-    {
+    if tool_calls.iter().any(is_delegation_call) && !valid_tool_names.contains(DELEGATE_TOOL_NAME) {
         return DelegationInterceptionResult {
-            effective_tool_calls: turn_result.accum.tool_calls.clone(),
+            effective_tool_calls: tool_calls.to_vec(),
             pre_resolved_results: Vec::new(),
             intercepted_any: false,
         };
@@ -79,7 +77,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     // Per-turn delegation limit: prevent runaway delegation loops where the
     // parent agent keeps delegating without synthesizing results.
     const MAX_DELEGATIONS_PER_TURN: u32 = 3;
-    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
+    if tool_calls.iter().any(is_delegation_call)
         && state.delegations_this_turn >= MAX_DELEGATIONS_PER_TURN
     {
         if !quiet {
@@ -90,66 +88,36 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 ),
             );
         }
-        // Return delegate calls as errors so the model sees the refusal.
-        let mut effective = Vec::new();
-        for tc in &turn_result.accum.tool_calls {
-            if is_delegation_call(tc) {
-                // Skip delegation calls — they'll be returned as error tool_results below.
-            } else {
-                effective.push(tc.clone());
-            }
-        }
-        // Inject error tool_results for the refused delegate calls.
-        let delegate_calls: Vec<&Value> = turn_result
-            .accum
-            .tool_calls
+        // Keep every provider call in its original round. The headless round
+        // owns the one assistant carrier and one terminal tool result for each
+        // call ID; removing calls here made the later paired-round join put
+        // them back into the executable queue and also duplicated history.
+        // Provider identities were validated before this interceptor, so a
+        // refusal may use the original ID without minting a synthetic one.
+        let pre_resolved_results = tool_calls
             .iter()
-            .filter(|tc| is_delegation_call(tc))
-            .collect();
-        if !delegate_calls.is_empty() {
-            let tc_entries: Vec<Value> = delegate_calls
-                .iter()
-                .map(|tc| {
-                    let id = tc
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": DELEGATE_TOOL_NAME,
-                            "arguments": "{}",
-                        }
+            .filter(|tool_call| is_delegation_call(tool_call))
+            .filter_map(|tool_call| {
+                tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| {
+                        (
+                            id.to_string(),
+                            format!(
+                                "ERROR: Delegation limit reached ({} delegations already executed this turn). \
+                                 You must synthesize the results from previous delegations and respond to the user directly. \
+                                 Do NOT delegate again.",
+                                state.delegations_this_turn
+                            ),
+                        )
                     })
-                })
-                .collect();
-            let assistant_msg = serde_json::json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": tc_entries,
-            });
-            state.push_prompt_history_message(assistant_msg);
-            for tc in &delegate_calls {
-                let id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                let tool_msg = serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": format!(
-                        "ERROR: Delegation limit reached ({} delegations already executed this turn). \
-                         You must synthesize the results from previous delegations and respond to the user directly. \
-                         Do NOT delegate again.",
-                        state.delegations_this_turn
-                    ),
-                });
-                state.push_prompt_history_message(tool_msg);
-            }
-        }
+            })
+            .collect();
         return DelegationInterceptionResult {
-            effective_tool_calls: effective,
-            pre_resolved_results: Vec::new(),
+            effective_tool_calls: tool_calls.to_vec(),
+            pre_resolved_results,
             intercepted_any: true,
         };
     }
@@ -168,7 +136,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                         state.telemetry.observability_hub.as_deref(),
                     )
                 });
-        if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
+        if tool_calls.iter().any(is_delegation_call) {
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -185,7 +153,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             .await;
         }
         partition_and_execute_delegations(
-            &turn_result.accum.tool_calls,
+            tool_calls,
             engine,
             state.current_run_id.as_deref().unwrap_or("unknown"),
             state.current_session_id.as_deref().unwrap_or("unknown"),
@@ -206,7 +174,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         )
         .await
     } else {
-        (Vec::new(), turn_result.accum.tool_calls.clone())
+        (Vec::new(), tool_calls.to_vec())
     };
 
     if let Some(hub) = &state.telemetry.observability_hub {
@@ -274,7 +242,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         // the same pre-resolved terminal lane as every other runtime-owned
         // control result. This preserves one assistant carrier and one tool
         // terminal per provider call without dispatching delegation twice.
-        effective_tool_calls: turn_result.accum.tool_calls.clone(),
+        effective_tool_calls: tool_calls.to_vec(),
         pre_resolved_results,
         intercepted_any: !delegation_results.is_empty(),
     }
@@ -2214,9 +2182,14 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(
             !result.intercepted_any,
@@ -2257,9 +2230,14 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(result.intercepted_any);
         assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
@@ -2300,20 +2278,25 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(result.intercepted_any);
-        // Delegate call should NOT be in effective_tool_calls.
-        assert!(result.effective_tool_calls.is_empty());
-        // Error message injected into messages.
-        let last_msg = state.messages.last().unwrap();
-        let content = last_msg["content"].as_str().unwrap_or_default();
+        assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
+        assert_eq!(result.pre_resolved_results.len(), 1);
+        assert_eq!(result.pre_resolved_results[0].0, "call_4th");
+        let content = &result.pre_resolved_results[0].1;
         assert!(
             content.contains("Delegation limit reached"),
             "expected refusal message, got: {content}"
         );
+        assert!(state.messages.is_empty(), "headless owns round history");
         // Counter should NOT have incremented (delegation was refused).
         assert_eq!(state.delegations_this_turn, 3);
     }

@@ -680,6 +680,23 @@ pub(crate) async fn load_current_session_memory_snapshot(
     if session_id.is_empty() {
         return None;
     }
+
+    // Session memory is optional context. A missing or revoked user
+    // capability is a normal no-op, not a failed typed retrieval; admit the
+    // read before calling the provider so disabled accounts do not emit
+    // misleading warning-level diagnostics on every turn.
+    match memoria.admits_operation(false).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "session memory admission check unavailable"
+            );
+            return None;
+        }
+    }
     let query = format!("{SESSION_MEMORY_PREFIX} {session_id} session memory");
 
     match memoria
@@ -3718,6 +3735,48 @@ mod tests {
         assert!(loaded.content.contains("- newer remote snapshot wins"));
         assert!(!loaded.content.contains("- local snapshot wins"));
         assert_eq!(loaded.updated_turn, Some(3));
+    }
+
+    #[tokio::test]
+    async fn disabled_memory_read_is_a_noop_without_provider_warning_path() {
+        struct DisabledMemoria;
+
+        #[async_trait::async_trait]
+        impl MemoriaPort for DisabledMemoria {
+            async fn admits_operation(&self, _: bool) -> Result<bool, String> {
+                Ok(false)
+            }
+
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<MemoriaMemory>, String> {
+                panic!("disabled memory must not reach provider retrieval")
+            }
+
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                panic!("disabled memory must not reach provider storage")
+            }
+
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                panic!("disabled memory must not reach provider cleanup")
+            }
+        }
+
+        assert!(
+            load_current_session_memory_snapshot(&DisabledMemoria, "disabled-session")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

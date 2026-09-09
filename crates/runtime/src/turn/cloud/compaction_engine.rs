@@ -5,7 +5,7 @@
 //! after each layer so later layers see accurate pressure.
 //!
 //! Layers (cheapest first):
-//! 1. **DuplicateReadElimination** — stub duplicate file reads (cheapest, no content loss).
+//! 1. **DuplicateToolOutputElimination** — reference identical tool output (no content loss).
 //! 2. **ToolResultTruncation** — shorten old tool-result content bodies.
 //! 3. **TieredCompaction** — drop middle messages, keep system + first user + recent.
 //! 4. **ReactiveCompact** — emergency: keep system + first user + last 4.
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use super::compaction::{CompactResult, compact_tiered_impl};
 use super::layers::{
-    DuplicateReadElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
+    DuplicateToolOutputElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
 };
 
 // ───────────────────────────── Pipeline ──────────────────────────────────
@@ -196,7 +196,7 @@ impl CompactionEngine {
         let base = CompactionTier::pre_turn_trigger(max_tokens);
         let mut p = Self::new();
         // Layer cascade (light → heavy) with CompactionTier-derived base.
-        p.add_layer(Box::new(DuplicateReadElimination::new(
+        p.add_layer(Box::new(DuplicateToolOutputElimination::new(
             (base * 0.625).clamp(0.0, 1.0),
         )));
         p.add_layer(Box::new(ToolResultTruncation::new(
@@ -228,7 +228,7 @@ impl CompactionEngine {
     /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn aggressive_pipeline() -> Self {
         let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(300),
             512,
@@ -243,7 +243,7 @@ impl CompactionEngine {
     /// All thresholds set to 0.0 so every layer fires unconditionally.
     pub fn emergency_pipeline() -> Self {
         let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(0),
             128,
@@ -256,13 +256,13 @@ impl CompactionEngine {
 
     /// Micro-compact pipeline for manual `/compact` preprocessing.
     ///
-    /// Runs only DuplicateReadElimination + ToolResultTruncation (no
+    /// Runs only DuplicateToolOutputElimination + ToolResultTruncation (no
     /// message-dropping layers). Designed to reduce input tokens before
     /// the LLM summary call without losing conversation structure.
     /// All thresholds are 0.0 so layers fire unconditionally.
     pub fn micro_pipeline() -> Self {
         let mut p = Self::new();
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        p.add_layer(Box::new(DuplicateToolOutputElimination::new(0.0)));
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(0),
             2000,
@@ -273,9 +273,9 @@ impl CompactionEngine {
 
     /// Tier-aware compaction that returns a [`CompactResult`] with rich metadata.
     ///
-    /// Delegates to the pipeline's `compress_if_needed` and constructs a
-    /// `CompactResult` with `CompactBoundary` from the pipeline outcome.
-    /// Replaces the monolithic `compact_tiered_with_result` from `compaction.rs`.
+    /// Runs the shared budget-based pass used by Memoria and request assembly.
+    /// This is distinct from the ordered preprocessing/recovery layers in
+    /// `compress_if_needed`; it does not implement another deduplication policy.
     ///
     /// Creates a fresh engine configured for the given tier and turn preservation,
     /// then runs the pipeline.

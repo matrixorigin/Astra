@@ -32,8 +32,6 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_called
-    name: agent_fanout
   - type: journal_tool_called
     name: agent_fanout
   - type: journal_tool_called
