@@ -2,9 +2,9 @@
 
 # Astra
 
-### The self-hosted runtime for agents that must act inside private systems
+### See what your agent saw. Fix it where the work lives.
 
-**Durable work on fewer tokens. Agent changes you can trace and roll back. Work that moves with you.**
+**Inspectable context. Evidence you can roll back. Execution in your environment.**
 
 [![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
@@ -21,30 +21,46 @@
 
 ---
 
-Astra is not another coding agent or a library for wrapping one model call. It
-is the open-source, self-hosted runtime behind CLI, Web, and application agents
-that must keep long-running Work alive without replaying an ever-growing
-context, make captured changes inspectable and reversible, and reconnect Work
-to authorized execution wherever the relevant tools and private systems live.
+Astra is a self-hosted runtime for long-running agent Work. Every model
+request is assembled by a budgeted pipeline you can EXPLAIN, every attempt
+leaves evidence you can inspect, diff, and roll back, and execution runs
+through a Runner inside your own environment.
 
-| Durable work on fewer tokens | Agent changes you can trace and roll back | Work that moves with you |
+| What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
-| ContextPipe budgets and compresses context while checkpoints keep long-running Work resumable. | Trace links captured file, session, and database changes to evidence and scoped rollback. | The Server keeps the Work; a user-bound Runner reconnects it to private repositories, tools, credentials, and networks. |
+| `EXPLAIN ANALYZE` shows every context source, its budget, its actual cost, and what was dropped and why. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
+| **Understand what happened.** | **Know what changed and what still needs verification.** | **Keep code and credentials where they are.** |
 
-Astra includes the Server, CLI/TUI, Web dashboard, APIs, and TypeScript SDK. You
-bring the LLM and embedding endpoints, then connect tools and data through a
-Runner or MCP.
+```bash
+astra chat --explain verbose -m "Run the shell command: ls *.sh | wc -l and answer with just the number."
+```
 
-**Codex starts with the agent experience. DeepSeek Harness starts with the
-plugin graph. Astra starts with durable enterprise Work: context is budgeted,
-captured changes carry rollback evidence, and execution reconnects to the
-identity and environment allowed to perform it.**
+```text
+Explain Analyze DAG — turn-1
+  tokens fresh_in=928 cache_read=82688 cache_write=0 out=44
+├─ context_assembly ms=187ms budget=41783/102400 (40.8%)
+│  ├─ prompt system=6294 history=0 memory=0 tool_schemas=11269 user=18
+│  ├─ tool_surface selected=28/28 [agent, agent_fanout, bash, git, glob, grep, +22]
+│  └─ memory query="Run the shell command: ls *.sh | wc -l …" considered=0 selected=0 tokens=0 ms=0ms
+├─ preflight semantic admission outcome=unavailable ms=2ms
+├─ round[1] request preparation outcome=succeeded ms=564ms
+├─ round[1] model inference outcome=succeeded ms=1.2s
+├─ round[1] tool execution outcome=succeeded ms=1.4s
+├─ preflight semantic admission outcome=decided ms=1.8s
+├─ round[2] request preparation outcome=succeeded ms=478ms
+├─ round[2] model inference outcome=succeeded ms=1.7s
+└─ assistant out_tokens=44 chars=1
+   └─ preview 2
+```
+
+<sub>Abbreviated output of a real one-shot turn against a hosted Astra Server with `deepseek-v4-flash`. Every line answers a question a database engineer already knows how to ask: what was the budget, what did each source cost, what was dropped, and did the cache hit.</sub>
+
+Astra ships as one binary (CLI, TUI, and Server), plus a Web dashboard and a
+TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 
 <div align="center">
   <img alt="Illustrative 20-second Astra flow: ContextPipe keeps durable Work within a smaller token budget, a user-bound Runner makes a captured change inside a private environment, and Astra traces and rolls the change back before the Work continues." src="docs/assets/astra-cli-demo.gif" width="900">
 </div>
-
-<p align="center"><sub>Less context to carry. Changes you can recover from. The same Work wherever you continue.</sub></p>
 
 ### Pick the layer you need
 
