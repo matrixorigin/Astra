@@ -1,0 +1,72 @@
+/* Reference memoria-website's AstraConnect card; preserve the higher-contrast
+   colors and lighter heading here. Loopback cannot read its saved theme/fonts. */
+:root {
+  color-scheme: light dark;
+  --page: #ffffff;
+  --card: #eceef2;
+  --border: rgba(0, 0, 0, 0.09);
+  --text: #111827;
+  --heading: #1f2937;
+  --muted: #4b5563;
+  --success: #047857;
+  --success-bg: rgba(5, 150, 105, 0.1);
+  --error: #b45309;
+  --error-bg: rgba(180, 83, 9, 0.1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #05070a;
+    --card: #10141d;
+    --border: rgba(255, 255, 255, 0.08);
+    --text: #e2e8f0;
+    --heading: #e2e8f0;
+    --muted: #94a3b8;
+    --success: #34d399;
+    --success-bg: rgba(52, 211, 153, 0.1);
+    --error: #fbbf24;
+    --error-bg: rgba(251, 191, 36, 0.1);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100svh;
+  padding: 24px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--page);
+  color: var(--text);
+  font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+}
+.card {
+  width: 100%;
+  max-width: 448px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--card);
+  text-align: center;
+  overflow-wrap: break-word;
+}
+.brand { margin: 0 0 24px; font-size: 14px; font-weight: 700; }
+.status-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  margin: 0 auto;
+  border-radius: 50%;
+  color: var(--muted);
+  background: var(--card);
+}
+.success .status-icon { color: var(--success); background: var(--success-bg); }
+.failure .status-icon { color: var(--error); background: var(--error-bg); }
+h1 { margin: 20px 0 0; color: var(--heading); font-size: 20px; font-weight: 600; line-height: 1.4; }
+.description { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.625; }
+.next-step { margin: 24px 0 0; color: var(--muted); font-size: 14px; }
+@media (min-width: 640px) { .card { padding: 32px; } }
+@media (forced-colors: active) { .status-icon { outline: 1px solid; } }

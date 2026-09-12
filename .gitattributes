@@ -3,6 +3,8 @@
 # Keep source, configuration, and executable scripts consistent across platforms.
 *.bash text eol=lf
 *.cff text eol=lf
+*.css text eol=lf
+*.html text eol=lf
 *.js text eol=lf
 *.json text eol=lf
 *.jsx text eol=lf

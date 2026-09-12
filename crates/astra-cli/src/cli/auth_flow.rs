@@ -221,6 +221,7 @@ async fn do_memoria_browser_login_with_opener(
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut rejected = 0_u8;
+    let mut requests = 0_u8;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -230,22 +231,67 @@ async fn do_memoria_browser_login_with_opener(
             .await
             .map_err(|_| "browser login timed out; run `astra login` to try again".to_string())?
             .map_err(|error| format!("local login callback failed: {error}"))?;
+        // Bound even harmless-looking traffic (OPTIONS/favicon/unknown paths).
+        // This is resource containment, not protection against a hostile local host.
+        requests += 1;
+        // Read the bounded request before replying, including at the request
+        // limit: closing a socket with unread request bytes can reset the peer
+        // and discard the error response on some platforms.
         let request = tokio::time::timeout_at(deadline, read_callback_request(&mut stream))
             .await
             .map_err(|_| "browser login timed out; run `astra login` to try again")?;
-        let Ok(request) = request else {
-            rejected = rejected.saturating_add(1);
-            write_callback_response(&mut stream, "400 Bad Request", None, "invalid request").await;
-            if rejected >= 3 {
-                return Err("too many invalid browser login callbacks".to_string());
+        if requests > 64 {
+            write_callback_response(
+                &mut stream,
+                "429 Too Many Requests",
+                None,
+                "too many requests",
+                deadline,
+            )
+            .await;
+            return Err("too many browser login requests; run `astra login` again".into());
+        }
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                rejected = rejected.saturating_add(1);
+                if error.is_navigation {
+                    browser_code::write_result(&mut stream, false, deadline).await;
+                } else {
+                    write_callback_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        None,
+                        "invalid request",
+                        deadline,
+                    )
+                    .await;
+                }
+                if rejected >= 3 {
+                    return Err("too many invalid browser login callbacks".to_string());
+                }
+                continue;
             }
-            continue;
         };
         if request.method == "GET" {
+            let path = request.path.split('?').next().unwrap_or_default();
+            if path != "/callback" {
+                let (status, body) = if path == "/favicon.ico" {
+                    ("204 No Content", "")
+                } else {
+                    ("404 Not Found", "not found")
+                };
+                write_callback_response(&mut stream, status, None, body, deadline).await;
+                continue;
+            }
             let code = match browser_code::callback_code(&request.path, &expected_state) {
                 Ok(code) if request.body.is_empty() => code,
                 _ => {
-                    browser_code::write_result(&mut stream, false).await;
+                    rejected = rejected.saturating_add(1);
+                    browser_code::write_result(&mut stream, false, deadline).await;
+                    if rejected >= 3 {
+                        return Err("too many invalid browser login callbacks".into());
+                    }
                     continue;
                 }
             };
@@ -257,13 +303,13 @@ async fn do_memoria_browser_login_with_opener(
             })
             .await
             .map_err(|_| "Browser login timed out; run astra login again".to_string())?;
-            browser_code::write_result(&mut stream, result.is_ok()).await;
+            browser_code::write_result(&mut stream, result.is_ok(), deadline).await;
             return result;
         }
         if request.method == "OPTIONS" {
             let origin = (request.origin.as_deref() == Some(allowed_origin.as_str()))
                 .then_some(allowed_origin.as_str());
-            write_callback_response(&mut stream, "204 No Content", origin, "").await;
+            write_callback_response(&mut stream, "204 No Content", origin, "", deadline).await;
             continue;
         }
         if request.method != "POST"
@@ -272,7 +318,14 @@ async fn do_memoria_browser_login_with_opener(
             || request.content_type.as_deref() != Some("application/json")
         {
             rejected = rejected.saturating_add(1);
-            write_callback_response(&mut stream, "403 Forbidden", None, "callback rejected").await;
+            write_callback_response(
+                &mut stream,
+                "403 Forbidden",
+                None,
+                "callback rejected",
+                deadline,
+            )
+            .await;
             if rejected >= 3 {
                 return Err("too many invalid browser login callbacks".to_string());
             }
@@ -287,6 +340,7 @@ async fn do_memoria_browser_login_with_opener(
                     "400 Bad Request",
                     Some(&allowed_origin),
                     "invalid callback",
+                    deadline,
                 )
                 .await;
                 if rejected >= 3 {
@@ -305,6 +359,7 @@ async fn do_memoria_browser_login_with_opener(
                 "403 Forbidden",
                 Some(&allowed_origin),
                 "callback rejected",
+                deadline,
             )
             .await;
             if rejected >= 3 {
@@ -312,13 +367,20 @@ async fn do_memoria_browser_login_with_opener(
             }
             continue;
         }
-        match do_memoria_login_with_key(api, profile, &callback.memoria_connection_key).await {
+        match tokio::time::timeout_at(
+            deadline,
+            do_memoria_login_with_key(api, profile, &callback.memoria_connection_key),
+        )
+        .await
+        .map_err(|_| "Browser login timed out; run astra login again".to_string())?
+        {
             Ok(token) => {
                 write_callback_response(
                     &mut stream,
                     "200 OK",
                     Some(&allowed_origin),
                     r#"{"status":"connected"}"#,
+                    deadline,
                 )
                 .await;
                 return Ok(token);
@@ -329,6 +391,7 @@ async fn do_memoria_browser_login_with_opener(
                     "502 Bad Gateway",
                     Some(&allowed_origin),
                     "Astra could not verify the connection key.",
+                    deadline,
                 )
                 .await;
                 return Err(error);
@@ -337,6 +400,7 @@ async fn do_memoria_browser_login_with_opener(
     }
 }
 
+#[derive(Debug)]
 struct CallbackRequest {
     method: String,
     path: String,
@@ -345,16 +409,28 @@ struct CallbackRequest {
     body: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct CallbackReadError {
+    // Presentation hint only, never used to accept or authorize a callback.
+    is_navigation: bool,
+}
+
 async fn read_callback_request(
     stream: &mut tokio::net::TcpStream,
-) -> Result<CallbackRequest, String> {
-    tokio::time::timeout(Duration::from_secs(5), read_callback_request_inner(stream))
-        .await
-        .map_err(|_| "callback read timed out".to_string())?
+) -> Result<CallbackRequest, CallbackReadError> {
+    let mut is_navigation = false;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        read_callback_request_inner(stream, &mut is_navigation),
+    )
+    .await
+    .unwrap_or_else(|_| Err("callback read timed out".into()))
+    .map_err(|_| CallbackReadError { is_navigation })
 }
 
 async fn read_callback_request_inner(
     stream: &mut tokio::net::TcpStream,
+    is_navigation: &mut bool,
 ) -> Result<CallbackRequest, String> {
     let mut data = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 1024];
@@ -364,6 +440,7 @@ async fn read_callback_request_inner(
             return Err("callback request is incomplete".into());
         }
         data.extend_from_slice(&chunk[..read]);
+        *is_navigation = data.starts_with(b"GET /callback?") || data.starts_with(b"GET /callback ");
         if data.len() > 8192 {
             return Err("callback request is too large".into());
         }
@@ -453,6 +530,7 @@ async fn write_callback_response(
     status: &str,
     origin: Option<&str>,
     body: &str,
+    deadline: tokio::time::Instant,
 ) {
     let cors = origin
         .map(|origin| {
@@ -461,11 +539,42 @@ async fn write_callback_response(
             )
         })
         .unwrap_or_default();
+    let body = if body.is_empty() {
+        String::new()
+    } else {
+        serde_json::from_str::<serde_json::Value>(body)
+            .unwrap_or_else(|_| serde_json::json!({"error": body}))
+            .to_string()
+    };
     let response = format!(
-        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes()).await;
+    if write_callback_bytes(stream, response.as_bytes(), deadline)
+        .await
+        .is_err()
+    {
+        tracing::warn!("could not deliver browser login callback response");
+    }
+}
+
+async fn write_callback_bytes<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    response: &[u8],
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
+    let write_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(2));
+    tokio::time::timeout_at(write_deadline, async {
+        stream.write_all(response).await?;
+        stream.shutdown().await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "callback write timed out",
+        ))
+    })
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -722,6 +831,9 @@ pub(crate) async fn do_register_for_session(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     #[serial_test::serial]
     #[tokio::test]
     async fn browser_login_entrypoint_supports_local_codes_and_legacy_without_remote_polling() {
@@ -755,6 +867,38 @@ mod tests {
                 let callback = format!("http://127.0.0.1:{}/callback", fields["port"]);
                 let code = super::browser_code::verifier();
                 let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                for (path, status) in [("/favicon.ico", 204), ("/wrong", 404)] {
+                    let response = client
+                        .get(format!("http://127.0.0.1:{}{path}", fields["port"]))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), status);
+                    assert!(!response.text().await.unwrap().contains("<html"));
+                }
+                // Cookies are shared across loopback ports. Oversized browser
+                // headers must fail closed with a card, not echoed plaintext.
+                let mut stream =
+                    tokio::net::TcpStream::connect(format!("127.0.0.1:{}", fields["port"]))
+                        .await
+                        .unwrap();
+                let request = format!(
+                    "GET /callback?code={code}&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: secret-cookie={}\r\n\r\n",
+                    fields["state"],
+                    "x".repeat(8200)
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut malformed_response = String::new();
+                stream
+                    .read_to_string(&mut malformed_response)
+                    .await
+                    .unwrap();
+                assert!(malformed_response.starts_with("HTTP/1.1 400"));
+                assert!(malformed_response.contains("Content-Type: text/html; charset=utf-8"));
+                assert!(malformed_response.contains("class=\"card failure\""));
+                for secret in [&code, &fields["state"], "secret-cookie"] {
+                    assert!(!malformed_response.contains(secret));
+                }
                 // Unrelated/wrong-state requests must not cause credential exchange
                 // or prevent the valid local browser from finishing afterwards.
                 let invalid = client
@@ -764,6 +908,21 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(invalid.status(), 400);
+                assert_eq!(
+                    invalid.headers()["content-type"],
+                    "text/html; charset=utf-8"
+                );
+                let failure_body = invalid.text().await.unwrap();
+                assert!(failure_body.contains("class=\"card failure\""));
+                for secret in [
+                    &code,
+                    &fields["state"],
+                    "test-access",
+                    "test-refresh",
+                    "test-connection-key",
+                ] {
+                    assert!(!failure_body.contains(secret));
+                }
                 assert!(website.received_requests().await.unwrap().is_empty());
                 assert!(server.received_requests().await.unwrap().is_empty());
                 let response = if legacy {
@@ -802,9 +961,37 @@ mod tests {
                 };
                 assert!(response.status().is_success());
                 assert_eq!(response.headers()["cache-control"], "no-store");
-                if !legacy {
+                if legacy {
+                    assert_eq!(
+                        response.headers()["content-type"],
+                        "application/json; charset=utf-8"
+                    );
+                    assert_eq!(
+                        response.headers()["access-control-allow-origin"],
+                        website.uri()
+                    );
+                    assert_eq!(
+                        response.json::<serde_json::Value>().await.unwrap(),
+                        json!({"status":"connected"})
+                    );
+                } else {
                     assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-                    assert!(response.text().await.unwrap().contains("signed in"));
+                    assert_eq!(
+                        response.headers()["content-type"],
+                        "text/html; charset=utf-8"
+                    );
+                    let body = response.text().await.unwrap();
+                    assert!(body.contains("You are signed in to Astra"));
+                    assert!(body.contains("Return to your terminal to continue."));
+                    for secret in [
+                        &code,
+                        &fields["state"],
+                        "test-access",
+                        "test-refresh",
+                        "test-connection-key",
+                    ] {
+                        assert!(!body.contains(secret));
+                    }
                 }
                 assert_eq!(
                     website.received_requests().await.unwrap().len(),
@@ -818,6 +1005,235 @@ mod tests {
             assert_eq!(profile.access_token.as_deref(), Some("test-access"));
             assert_eq!(profile.refresh_token.as_deref(), Some("test-refresh"));
         }
+    }
+
+    #[tokio::test]
+    async fn callback_rejections_and_unrelated_traffic_are_bounded() {
+        for invalid_callback in [true, false] {
+            let website = MockServer::start().await;
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let website_url = website.uri();
+            let login =
+                super::do_memoria_browser_login_with_opener(&api, None, &website_url, |url| {
+                    sender.send(url.to_string()).unwrap();
+                });
+            let browser = async {
+                let url = url::Url::parse(&receiver.await.unwrap()).unwrap();
+                let port = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "port")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let count = if invalid_callback { 3 } else { 65 };
+                for attempt in 1..=count {
+                    if attempt == 65 {
+                        let mut stream =
+                            tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                                .await
+                                .unwrap();
+                        let mut byte = [0_u8; 1];
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), stream.read(&mut byte))
+                                .await
+                                .is_err(),
+                            "the limit response must wait for the bounded request read"
+                        );
+                        stream
+                            .write_all(b"GET /wrong HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            .await
+                            .unwrap();
+                        let mut response = String::new();
+                        stream.read_to_string(&mut response).await.unwrap();
+                        assert!(response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+                        assert!(response.contains("too many requests"));
+                        continue;
+                    }
+                    let path = if invalid_callback {
+                        "/callback?state=wrong"
+                    } else {
+                        "/wrong"
+                    };
+                    let response = client
+                        .get(format!("http://127.0.0.1:{port}{path}"))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status().as_u16(),
+                        if invalid_callback { 400 } else { 404 }
+                    );
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(login, browser)
+            })
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().contains("too many"));
+            assert!(website.received_requests().await.unwrap().is_empty());
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn browser_login_exchange_failure_returns_card_without_saving_or_echoing_secrets() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let website = MockServer::start().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/astra/browser-login/redeem"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"detail":"private-upstream-error"})),
+            )
+            .expect(1)
+            .mount(&website)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let website_url = website.uri();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let login = super::do_memoria_browser_login_with_opener(&api, None, &website_url, |url| {
+            sender.send(url.to_string()).unwrap();
+        });
+        let browser = async {
+            let url = url::Url::parse(&receiver.await.unwrap()).unwrap();
+            let fields: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            let code = super::browser_code::verifier();
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://127.0.0.1:{}/callback", fields["port"]))
+                .query(&[("code", &code), ("state", &fields["state"])])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/html; charset=utf-8"
+            );
+            let body = response.text().await.unwrap();
+            assert!(body.contains("class=\"card failure\""));
+            assert!(body.contains("Couldn’t complete sign-in"));
+            for secret in [&code, &fields["state"], "private-upstream-error"] {
+                assert!(!body.contains(secret));
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(login, browser)
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("unavailable"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(
+            load_credentials()
+                .profiles
+                .values()
+                .all(|profile| profile.access_token.is_none() && profile.refresh_token.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_writes_bound_stalled_peers_and_report_io_errors() {
+        // A one-byte buffer deterministically stalls write_all without relying
+        // on platform TCP window sizes or timing a real browser.
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = super::write_callback_bytes(
+            &mut writer,
+            b"response",
+            tokio::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::write_callback_bytes(
+                &mut writer,
+                b"response",
+                tokio::time::Instant::now() + Duration::from_secs(300),
+            ),
+        )
+        .await
+        .expect("the two-second write cap must apply independently of the login deadline")
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let (mut writer, reader) = tokio::io::duplex(1);
+        drop(reader);
+        let error = super::write_callback_bytes(
+            &mut writer,
+            b"response",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        super::write_callback_bytes(
+            &mut writer,
+            b"complete",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        // Shutdown delivers EOF even while the writer remains in scope.
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, "complete");
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_request_still_receives_json_without_echoing_input() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let error = super::read_callback_request(&mut stream).await.unwrap_err();
+            assert!(!error.is_navigation);
+            super::write_callback_response(
+                &mut stream,
+                "400 Bad Request",
+                None,
+                "invalid request",
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        };
+        let client = async {
+            let mut stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            stream
+                .write_all(b"POST /callback HTTP/1.1\r\nX-Secret: private-cookie\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.contains("application/json; charset=utf-8"));
+            assert!(headers.contains("X-Content-Type-Options: nosniff"));
+            assert!(headers.contains("Referrer-Policy: no-referrer"));
+            assert!(!response.contains("private-cookie"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                json!({"error":"invalid request"})
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

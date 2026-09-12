@@ -145,15 +145,49 @@ forwarding the final secret authorization code.
 
 After redemption, the CLI uses the existing `/auth/memoria` exchange and saves
 the existing Astra profile tokens. Only then does the local page report
-successful login. The response has no external resources, uses `no-store`
-and `no-referrer`, and contains no credentials. No Astra Server schema, identity
-mapping or session-lifecycle change is needed.
+successful login. No Astra Server schema, identity mapping or session-lifecycle
+change is needed.
+
+The CLI's GET authorization-code callback serves a self-contained HTML card:
+200 on successful login, 400 on invalid callbacks or failed exchange. A malformed
+request whose prefix identifies a GET `/callback` navigation also receives the
+failure card, including oversized cookie headers; unknown/malformed methods
+receive JSON errors. Legacy POST callbacks remain JSON (including valid JSON
+error bodies), and OPTIONS remains an empty 204 response. Unrelated GET paths
+return a small 404; `/favicon.ico` returns an empty 204, not a login failure card.
+Responses use `no-store`, `no-referrer`, and `nosniff`. CSP blocks scripts,
+external resources, base URLs, form submissions and framing. The HTML response
+authorizes only its embedded stylesheet by an exact SHA-256 hash. Only static
+application copy enters the page, never callback fields, identity, credentials
+or upstream error text. There is no close button or additional approval step.
+
+The card references the website's AstraConnect layout and palette, but is not a
+pixel-identical copy. Intentional differences include the Astra Cloud label,
+terminal-specific instructions, no interactive controls, a 600-weight deep-gray
+heading, higher-contrast dark-mode secondary text (`#94a3b8`) and a darker
+light-mode success icon (`#047857`). Do not reduce contrast to match website
+tokens. It follows the system color scheme and locally available fonts, including
+`system-ui`; the loopback origin cannot read the website's saved theme or load
+its web fonts. The standalone assets are
+`crates/astra-cli/src/cli/auth_flow/result_page.html` and
+`crates/astra-cli/src/cli/auth_flow/result_page.css`. They are maintained separately
+from the website and need visual comparison when either design changes. CSS
+changes need no manual CSP update: the hash is calculated from embedded CSS at
+runtime. Both assets use LF even on Windows to avoid browser newline
+normalization changing the hashed style text. Only the CLI binary needs updating.
 
 Website HTTPS is required except explicit loopback development URLs. Code
 exchange does not follow redirects, bounds response size and duration, and is
 not automatically replayed after failure: consumption may already have
 succeeded. Invalid/mismatched GET callbacks do not trigger token exchange.
-The five-minute local listener deadline remains in effect.
+The five-minute local listener deadline remains in effect, including response
+writes and both exchange paths. Each response write/shutdown is additionally
+bounded to two seconds; delivery errors are reported without sensitive contents
+and never undo a persisted login. Three invalid callback attempts end the login;
+favicon, OPTIONS and unknown GET paths do not consume that rejection allowance,
+but an overall 64-request allowance bounds unrelated traffic too. These bounds
+contain resources; they do not guarantee availability against a hostile local
+process, which can also exhaust the existing invalid-attempt allowance.
 
 Compatibility is explicit in the CLI link. An old website can ignore the
 capability fields and use the unchanged JSON POST callback, which still checks
