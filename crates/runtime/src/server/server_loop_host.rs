@@ -6510,17 +6510,10 @@ impl ServerAgenticLoopHost {
                 let mut schema = schema.clone();
                 let name = tool_schema_name(&schema).map(str::to_string);
                 match (topology, name.as_deref()) {
-                    // Once the semantic judge has admitted a fixed parallel
-                    // group, direct single-agent creation is not an
-                    // executable offer. Keep get_result/send_message visible
-                    // for already-created children, but do not advertise a
-                    // spawn shape that the terminal gate must reject.
-                    (
-                        Some(astra_services::WorkExecutionTopology::ParallelSubruns),
-                        Some("agent"),
-                    ) if !remove_tool_action_branches(&mut schema, &["spawn", "run_chain"]) => {
-                        return None;
-                    }
+                    // A semantic topology vote does not erase a concrete
+                    // one-child carrier. `agent.spawn` is structurally
+                    // serial; admission rejects only two direct lifecycles in
+                    // one provider batch, or a direct call mixed with fanout.
                     // In a primary topology, a new fanout group is likewise
                     // not an executable offer. Unresolved topology remains
                     // policy-neutral until the typed decision settles.
@@ -9208,10 +9201,6 @@ impl ServerAgenticLoopHost {
             return admission;
         }
         let work_is_required = self.work_lifecycle_is_required(state);
-        let parallel_subruns_requested = matches!(
-            self.work_admission_execution_topology,
-            astra_services::WorkExecutionTopology::ParallelSubruns
-        );
         let parallel_topology_admitted = self.work_admission_topology_authoritative
             && self.work_admission_execution_topology
                 == astra_services::WorkExecutionTopology::ParallelSubruns;
@@ -9428,15 +9417,7 @@ impl ServerAgenticLoopHost {
                 )),
                 "agent"
                     if matches!(action, Some("spawn" | "run_chain"))
-                        && parallel_topology_admitted =>
-                {
-                    Some(direct_parallel_rejection)
-                }
-                "agent"
-                    if matches!(action, Some("spawn" | "run_chain"))
-                        && (parallel_subruns_requested
-                            || direct_parallel_batch
-                            || fanout_start_in_batch) =>
+                        && (direct_parallel_batch || fanout_start_in_batch) =>
                 {
                     Some(direct_parallel_rejection)
                 }
@@ -26134,6 +26115,18 @@ mod tests {
             "a fallible semantic topology prediction must not replace an explicit typed single-child carrier"
         );
 
+        let single_child_terminal = direct_parallel_bound.admit_terminal_tool_calls(
+            &create_test_state(),
+            &direct_parallel_calls[..1],
+            Some("tool_calls"),
+        );
+        assert_eq!(
+            single_child_terminal.len(),
+            1,
+            "an admitted one-child carrier must survive terminal lifecycle projection"
+        );
+        assert_eq!(single_child_terminal[0]["function"]["name"], "agent");
+
         let direct_parallel_terminal = direct_parallel_bound.admit_terminal_tool_calls(
             &create_test_state(),
             &direct_parallel_calls,
@@ -36373,8 +36366,7 @@ mod tests {
         let agent_actions = agent["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("agent action enum");
-        assert!(!agent_actions.iter().any(|action| action == "spawn"));
-        assert!(!agent_actions.iter().any(|action| action == "run_chain"));
+        assert!(agent_actions.iter().any(|action| action == "spawn"));
         assert!(agent_actions.iter().any(|action| action == "get_result"));
 
         let fanout = discovery
@@ -36398,10 +36390,10 @@ mod tests {
                 .is_some_and(|description| description.contains("get_result:"))
         );
         assert!(
-            !selected_agent["description"]
+            selected_agent["description"]
                 .as_str()
-                .unwrap_or_default()
-                .contains("spawn:")
+                .is_some_and(|description| description.contains("spawn:")),
+            "a one-child carrier remains usable when the auxiliary topology vote over-predicts fanout"
         );
     }
 
