@@ -19,15 +19,10 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use crate::lock_recovery::LockRecovery;
-#[cfg(test)]
-use astra_services::session_journal::ToolCallRecord;
-use astra_services::session_journal::{JournalEvent, JournalEventType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use crossterm::style::Stylize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
-
-use crate::explain_dag::{ExplainTurnMeta, render_explain_dag};
 
 use super::app_event::TuiAppEvent;
 use super::bottom_pane::view::BottomPaneViewAction;
@@ -2711,17 +2706,6 @@ fn apply_active_turn_tui_control_event(
     }
 }
 
-fn context_trace_count(state: &crate::cli::session::session_state::SessionState) -> usize {
-    state
-        .observability_session
-        .as_ref()
-        .map(|session| {
-            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-            guard.context_traces.len()
-        })
-        .unwrap_or(0)
-}
-
 fn context_window_from_trace(
     trace: &ContextAssemblyTrace,
 ) -> Option<astra_turn_types::ContextWindowUsage> {
@@ -2731,6 +2715,17 @@ fn context_window_from_trace(
         limit_tokens: limit,
         source: trace.token_budget.usage_source,
     })
+}
+
+fn context_trace_count(state: &crate::cli::session::session_state::SessionState) -> usize {
+    state
+        .observability_session
+        .as_ref()
+        .map(|session| {
+            let guard = astra_core::sync_poison::recover_rwlock_read(session);
+            guard.context_traces.len()
+        })
+        .unwrap_or(0)
 }
 
 fn latest_context_trace(
@@ -2760,37 +2755,8 @@ fn latest_context_trace_since(
         .flatten()
 }
 
-fn current_turn_event(
-    state: &crate::cli::session::session_state::SessionState,
-) -> Option<&JournalEvent> {
-    state.last_turn_event.as_ref().filter(|event| {
-        event.event_type == JournalEventType::Turn && event.turn == Some(state.turn)
-    })
-}
-
-fn commit_explain_dag(
-    state: &crate::cli::session::session_state::SessionState,
-    explain_items: &[serde_json::Value],
-    baseline_cached_turn_id: Option<&str>,
-    baseline_context_traces: usize,
-    chat_widget: &mut chat_widget::ChatWidget,
-) -> bool {
-    if state.explain == crate::cli::session::session_state::ExplainMode::Off {
-        return false;
-    }
-    let trace = latest_context_trace_since(state, baseline_cached_turn_id, baseline_context_traces);
-    let turn_event = current_turn_event(state);
-    let meta = turn_event.map(ExplainTurnMeta::from_journal_event);
-    let Some(text) = render_explain_dag(
-        trace.as_ref(),
-        meta.as_ref(),
-        explain_items,
-        state.explain == crate::cli::session::session_state::ExplainMode::Verbose,
-    ) else {
-        return false;
-    };
-    chat_widget.commit_system(history_cell::system::SystemCell::info(text));
-    true
+fn explain_mode_observes_graph(mode: crate::cli::session::session_state::ExplainMode) -> bool {
+    mode != crate::cli::session::session_state::ExplainMode::Off
 }
 
 #[derive(Debug)]
@@ -4865,8 +4831,12 @@ async fn replay_session_into_widget(
     guard: &mut TerminalGuard,
     session_id: &str,
     width: u16,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    restore_explain_analyze: bool,
 ) -> chat_widget::ChatWidget {
-    let mut widget = chat_widget::load_resume(session_id).await;
+    let mut widget =
+        chat_widget::load_resume(session_id, api, profile, restore_explain_analyze).await;
     let restored = widget.history().len();
     if restored == 0 {
         return widget;
@@ -5161,7 +5131,15 @@ pub(crate) async fn run_tui_session(
     let mut chat_widget = match state.session_id.as_deref() {
         Some(sid) if !sid.is_empty() => {
             let w0 = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-            replay_session_into_widget(&mut guard, sid, w0).await
+            replay_session_into_widget(
+                &mut guard,
+                sid,
+                w0,
+                api,
+                profile,
+                state.explain != crate::ExplainMode::Off,
+            )
+            .await
         }
         _ => chat_widget::ChatWidget::new(String::new()),
     };
@@ -5714,7 +5692,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                 }
 
                                 // Browsing the model catalog is remote I/O, but the command
@@ -5894,6 +5872,9 @@ pub(crate) async fn run_tui_session(
                                             &mut guard,
                                             new_sid,
                                             w,
+                                            api,
+                                            profile,
+                                            state.explain != crate::ExplainMode::Off,
                                         )
                                         .await;
                                         rebind_workbench_observers(
@@ -5963,6 +5944,9 @@ pub(crate) async fn run_tui_session(
                                     let turn_start = std::time::Instant::now();
                                     bottom_pane.footer.clear_context_window_for_new_request();
                                     let pre_prompt_tokens = state.total_prompt_tokens;
+                                    // Explain mode is snapshotted for this turn so toggling it
+                                    // while a request is in flight affects the next turn only.
+                                    let turn_explain_mode = state.explain;
                                     let pre_completion_tokens = state.total_completion_tokens;
                                     let _pre_cost = state.total_session_cost;
                                     let pre_cache_read = state.total_cache_read_tokens;
@@ -5977,7 +5961,6 @@ pub(crate) async fn run_tui_session(
                                     let mut output_settled_at: Option<std::time::Instant> = None;
                                     let mut turn_projection_drained = false;
                                     let mut exit_after_turn_settlement = false;
-                                    let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
                                     // we keep the listener so a Ctrl+B keypress can
@@ -6849,7 +6832,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
                                                         event @ (TuiEvent::Resize | TuiEvent::Draw) => {
@@ -6876,7 +6859,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
                                                         TuiEvent::Paste(text) => {
@@ -6894,7 +6877,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                                            let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                            let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                         }
                                                         TuiEvent::RuntimeNotificationTurn => {
@@ -7155,10 +7138,6 @@ pub(crate) async fn run_tui_session(
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
                                                         }
-                                                        TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
-                                                            explain_items.extend(items.clone());
-                                                            continue;
-                                                        }
                                                         _ => {}
                                                     }
                                                     match &ae {
@@ -7186,10 +7165,21 @@ pub(crate) async fn run_tui_session(
                                                     // Shadow mirror into ChatWidget.
                                                     // Clone the event because handle_app_event
                                                     // consumes it by value on the app-event path.
-                                                    if let Some(new_ev) = chat_widget::translate(
-                                                        ae.clone(),
-                                                        chat_widget::TurnContext::default(),
-                                                    ) {
+                                                    let observes_explain_graph =
+                                                        !matches!(
+                                                            &ae,
+                                                            TuiAppEvent::ExplainAnalyze(_)
+                                                                | TuiAppEvent::ExplainAnalyzeGap
+                                                        )
+                                                            || explain_mode_observes_graph(
+                                                                turn_explain_mode,
+                                                            );
+                                                    if observes_explain_graph
+                                                        && let Some(new_ev) = chat_widget::translate(
+                                                            ae.clone(),
+                                                            chat_widget::TurnContext::default(),
+                                                        )
+                                                    {
                                                         chat_widget.handle_event(new_ev);
                                                         refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                                                     }
@@ -7288,7 +7278,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
                                                 Some(req) = approval_rx.recv() => {
@@ -7335,7 +7325,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
@@ -7362,7 +7352,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
                                                 }
                                                 Some(req) = plan_review_rx.recv() => {
@@ -7379,7 +7369,7 @@ pub(crate) async fn run_tui_session(
                                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                                     );
                                                     board_expanded = frame.resolved_board_expanded;
-                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                                 }
                                                 discovery = &mut external_skill_discovery, if external_skill_discovery_pending => {
                                                     external_skill_discovery_pending = false;
@@ -7596,7 +7586,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                                     board_expanded = frame.resolved_board_expanded;
-                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                                 }
                                             }
                                         };
@@ -7698,18 +7688,6 @@ pub(crate) async fn run_tui_session(
                                                 "Queued input was not started because the run did not settle normally; draft restored: {preview}",
                                             )),
                                         );
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                    }
-
-                                    if turn_result.is_ok()
-                                        && commit_explain_dag(
-                                            &state,
-                                            &explain_items,
-                                            pre_cached_context_trace_turn_id.as_deref(),
-                                            pre_context_trace_count,
-                                            &mut chat_widget,
-                                        )
-                                    {
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
@@ -8222,6 +8200,9 @@ pub(crate) async fn run_tui_session(
                                                 &mut guard,
                                                 new_sid,
                                                 w,
+                                                api,
+                                                profile,
+                                                state.explain != crate::ExplainMode::Off,
                                             )
                                             .await;
                                             rebind_workbench_observers(
@@ -8344,7 +8325,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                 }
                     }
                     TuiEvent::Draw => {
@@ -8360,7 +8341,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
+                                    do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board)?;
                                 }
                     }
                     TuiEvent::Paste(text) => {
@@ -8898,6 +8879,7 @@ pub(crate) async fn run_tui_session(
             &mut guard,
             frame.active,
             frame.multi_agent,
+            frame.explain_analyze,
             &mut bottom_pane,
             Some((&*task_board, board_expanded)),
             frame.task_board,
@@ -9186,7 +9168,8 @@ fn handle_app_event(
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::Compaction(_)
-        | TuiAppEvent::ExplainReport(_)
+        | TuiAppEvent::ExplainAnalyze(_)
+        | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
         | TuiAppEvent::SystemInfo(_)
@@ -9248,6 +9231,47 @@ fn event_may_have_committed_work_graph(event: &TuiAppEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn explain_analyze_fact() -> astra_turn_types::ExplainAnalyzeEventV1 {
+        astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:1".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn-1".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "server-loop".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            elapsed_ms: 0,
+            start_elapsed_ms: None,
+            duration_ms: None,
+            outcome: None,
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn explain_mode_controls_typed_graph_visibility() {
+        assert!(!explain_mode_observes_graph(
+            crate::cli::session::session_state::ExplainMode::Off
+        ));
+        assert!(explain_mode_observes_graph(
+            crate::cli::session::session_state::ExplainMode::On
+        ));
+        assert!(explain_mode_observes_graph(
+            crate::cli::session::session_state::ExplainMode::Verbose
+        ));
+        let event = TuiAppEvent::ExplainAnalyze(explain_analyze_fact());
+        assert!(matches!(event, TuiAppEvent::ExplainAnalyze(_)));
+    }
 
     #[test]
     fn primary_guidance_durable_disposition_maps_only_exact_identity() {
@@ -14694,221 +14718,6 @@ mod tests {
             !rendered.contains("live-line-0\n"),
             "the transcript live suffix must not materialize the full reply: {rendered:?}"
         );
-    }
-
-    #[test]
-    fn render_explain_dag_formats_rounds_cache_and_batches() {
-        let mut trace = ContextAssemblyTrace {
-            turn_id: "turn-2".into(),
-            session_id: "sess-1".into(),
-            ..Default::default()
-        };
-        trace.system_prompt.total_tokens = 3943;
-        trace.token_budget.total_used = 7658;
-        trace.token_budget.max_tokens = 160_000;
-        trace.token_budget.history_tokens = 7;
-        trace.token_budget.tool_schema_tokens = 3708;
-        trace
-            .history
-            .turns_retained
-            .push(astra_turn_core::context_assembly_trace::TurnRetention {
-                turn_index: 0,
-                role: "assistant".into(),
-                tokens: 7,
-                has_tool_calls: false,
-                content_preview: String::new(),
-            });
-        trace.memory.candidates_considered = 5;
-        trace.memory.retrieval_latency_ms = 51;
-        trace.tools.tools_available = 27;
-        trace
-            .tools
-            .visible_tools
-            .push(astra_turn_core::context_assembly_trace::VisibleTool {
-                tool_name: "bash".into(),
-                tokens: 243,
-            });
-        trace
-            .tools
-            .visible_tools
-            .push(astra_turn_core::context_assembly_trace::VisibleTool {
-                tool_name: "read_file".into(),
-                tokens: 128,
-            });
-        let mut turn_event = astra_services::session_journal::JournalEvent::turn(
-            Some("sess-1"),
-            2,
-            Some("gpt-5"),
-            "hi",
-            "done",
-            2,
-            10_023,
-            32,
-            2_930,
-        )
-        .with_cache_tokens(900, 200)
-        .with_tool_calls(vec![
-            ToolCallRecord {
-                tool_call_id: Some("call-1".into()),
-                name: "bash".into(),
-                ok: true,
-                ms: 3000,
-                batch_id: Some("parallel-1".into()),
-                parallel: Some(true),
-                round: Some(0),
-                start_offset_ms: Some(40),
-                args_preview: Some("{\"command\":\"git status\"}".into()),
-                ..Default::default()
-            },
-            ToolCallRecord {
-                tool_call_id: Some("call-2".into()),
-                name: "read_file".into(),
-                ok: true,
-                ms: 48,
-                batch_id: Some("parallel-1".into()),
-                parallel: Some(true),
-                round: Some(0),
-                file_path: Some("README.md".into()),
-                ..Default::default()
-            },
-        ]);
-        turn_event.ttft_ms = Some(1900);
-        turn_event.context_ms = Some(88);
-        turn_event.memoria_ms = Some(51);
-        turn_event.total_llm_ms = Some(2930);
-        turn_event.total_tool_ms = Some(3048);
-        turn_event.llm_rounds = Some(1);
-        let explain_items = vec![serde_json::json!({
-            "total_ms": 2930,
-            "prompt_tokens": 10023,
-            "completion_tokens": 32,
-            "steps": [{
-                "step": "llm",
-                "duration_ms": 2930,
-                "in": 10023,
-                "cached_in": 900,
-                "cache_write": 200,
-                "out": 32,
-                "tool_calls": 2
-            }],
-            "routing": {
-                "intent": "default",
-                "confidence": 0.0,
-                "tier": 0,
-                "skipped": false,
-                "reason": ""
-            }
-        })];
-
-        let meta = ExplainTurnMeta::from_journal_event(&turn_event);
-        let text =
-            render_explain_dag(Some(&trace), Some(&meta), &explain_items, false).expect("text");
-        assert!(text.contains("Explain Analyze DAG — turn-2"));
-        assert!(text.contains("context_assembly ms=88ms budget=7658/160000 (4.8%)"));
-        assert!(text.contains(
-            "llm ms=2.9s fresh_in=10023 cache_read=900 cache_write=200 out=32 tool_calls=2"
-        ));
-        assert!(text.contains("batch[parallel-1] parallel tools=2"));
-        assert!(text.contains("bash ok ms=3.0s offset=40ms id=call-1"));
-        assert!(text.contains("read_file ok ms=48ms id=call-2 path=README.md"));
-    }
-
-    #[test]
-    fn commit_explain_dag_commits_trace_to_history() {
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.explain = crate::cli::session::session_state::ExplainMode::On;
-        state.turn = 9;
-        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
-            turn_id: "turn-9".into(),
-            session_id: "sid-trace".into(),
-            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-                total_used: 1024,
-                max_tokens: 4096,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
-            Some("sid-trace"),
-            9,
-            Some("gpt-5"),
-            "hi",
-            "hello",
-            0,
-            12,
-            8,
-            1200,
-        ));
-        let mut widget = chat_widget::ChatWidget::new("");
-
-        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
-
-        let sys = widget
-            .history()
-            .last()
-            .and_then(|cell| {
-                cell.as_any_ref()
-                    .downcast_ref::<history_cell::system::SystemCell>()
-            })
-            .expect("expected a committed system cell");
-        assert!(sys.message().contains("Explain Analyze DAG — turn-9"));
-    }
-
-    #[test]
-    fn commit_explain_dag_skips_unchanged_cached_trace() {
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.explain = crate::cli::session::session_state::ExplainMode::On;
-        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
-            turn_id: "turn-9".into(),
-            session_id: "sid-trace".into(),
-            ..Default::default()
-        });
-        let mut widget = chat_widget::ChatWidget::new("");
-
-        assert!(!commit_explain_dag(
-            &state,
-            &[],
-            Some("turn-9"),
-            0,
-            &mut widget,
-        ));
-        assert!(widget.history().is_empty());
-    }
-
-    #[test]
-    fn commit_explain_dag_preserves_unknown_cache_write_marker() {
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.explain = crate::cli::session::session_state::ExplainMode::On;
-        state.turn = 4;
-        state.last_turn_event = Some(astra_services::session_journal::JournalEvent::turn(
-            Some("sid-trace"),
-            4,
-            Some("gpt-5"),
-            "hi",
-            "hello",
-            0,
-            12,
-            8,
-            1200,
-        ));
-        state
-            .last_turn_event
-            .as_mut()
-            .expect("turn event")
-            .cache_read_tokens = Some(144);
-        let mut widget = chat_widget::ChatWidget::new("");
-
-        assert!(commit_explain_dag(&state, &[], None, 0, &mut widget));
-
-        let sys = widget
-            .history()
-            .last()
-            .and_then(|cell| {
-                cell.as_any_ref()
-                    .downcast_ref::<history_cell::system::SystemCell>()
-            })
-            .expect("expected a committed system cell");
-        assert!(sys.message().contains("cache_write=?"));
     }
 
     #[test]

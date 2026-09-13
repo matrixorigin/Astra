@@ -229,7 +229,6 @@ mod tests {
                         cache_creation_tokens: 0,
                         has_usage: true,
                         has_tool_calls: false,
-                        explain_turns: vec![],
                         error_message: None,
                         system_prompt_tokens: None,
                         system_prompt_breakdown: None,

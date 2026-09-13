@@ -1,5 +1,6 @@
 import type {
   ExplainAnalyzeEventV1,
+  ExplainAnalyzeCoverageGapV1,
   ExplainAnalyzeUsageV1,
   ExplainAnalyzeContextMetricsV1,
 } from "./types";
@@ -21,6 +22,7 @@ export type ExplainAnalyzeNodeV1 = {
   outcome?: ExplainAnalyzeEventV1["outcome"];
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
+  coverageGaps: ExplainAnalyzeCoverageGapV1[];
   startObserved: boolean;
   terminalObserved: boolean;
   conflicted: boolean;
@@ -46,6 +48,7 @@ export type ExplainAnalyzeGraphV1 = {
   nodes: ExplainAnalyzeNodeV1[];
   duplicateEventCount: number;
   conflictedNodeIds: string[];
+  coverageGaps: ExplainAnalyzeCoverageGapV1[];
 };
 
 const nodeKinds = new Set([
@@ -102,6 +105,14 @@ const allowedEventKeys = new Set([
   "outcome",
   "usage",
   "context",
+  "coverage_gaps",
+]);
+const coverageGaps = new Set<ExplainAnalyzeCoverageGapV1>([
+  "approval_wait_intervals",
+  "user_input_wait_intervals",
+  "provider_retry_backoff",
+  "first_token_latency",
+  "child_run_intervals",
 ]);
 
 /** Runtime validation for events received over SSE or restored from storage. */
@@ -132,6 +143,11 @@ export function isExplainAnalyzeEventV1(
   ) {
     return false;
   }
+  if (value.coverage_gaps !== undefined &&
+    (value.kind !== "turn" || value.transition !== "finished" ||
+      !isCoverageGapList(value.coverage_gaps))) {
+    return false;
+  }
   if (
     (value.kind === "model_round" && value.round_index === undefined) ||
     (value.kind === "provider_attempt" &&
@@ -144,7 +160,7 @@ export function isExplainAnalyzeEventV1(
       value.start_elapsed_ms === undefined &&
       value.duration_ms === undefined &&
       value.outcome === undefined &&
-      value.usage === undefined && value.context === undefined
+      value.usage === undefined && value.context === undefined && value.coverage_gaps === undefined
     );
   }
   if (
@@ -159,7 +175,17 @@ export function isExplainAnalyzeEventV1(
   }
   return (value.usage === undefined || isExplainAnalyzeUsage(value.usage)) &&
     (value.context === undefined ||
-      ((value.kind === "context_assembly" || value.kind === "preparation") && isExplainContext(value.context, value.kind)));
+      (value.usage === undefined && (value.kind === "context_assembly" || value.kind === "preparation") && isExplainContext(value.context, value.kind)));
+}
+
+function isCoverageGapList(value: unknown): value is ExplainAnalyzeCoverageGapV1[] {
+  if (!Array.isArray(value) || value.length > coverageGaps.size ||
+    !value.every((gap): gap is ExplainAnalyzeCoverageGapV1 =>
+      typeof gap === "string" && coverageGaps.has(gap as ExplainAnalyzeCoverageGapV1))) {
+    return false;
+  }
+  return new Set(value).size === value.length &&
+    value.every((gap, index) => index === 0 || value[index - 1] < gap);
 }
 
 const contextSourceKinds = new Set([
@@ -303,6 +329,7 @@ export function reduceExplainAnalyzeEvents(
           value.transition === "started"
             ? value.elapsed_ms
             : (value.start_elapsed_ms ?? value.elapsed_ms),
+        coverageGaps: value.coverage_gaps ?? [],
         ...(value.transition === "finished"
           ? {
               endElapsedMs: value.elapsed_ms,
@@ -351,7 +378,8 @@ export function reduceExplainAnalyzeEvents(
         node.durationMs !== value.duration_ms ||
         node.outcome !== value.outcome ||
         stableJson(node.usage ?? null) !== stableJson(value.usage ?? null) ||
-        stableJson(node.context ?? null) !== stableJson(value.context ?? null)
+        stableJson(node.context ?? null) !== stableJson(value.context ?? null) ||
+        stableJson(node.coverageGaps) !== stableJson(value.coverage_gaps ?? [])
       ) {
         node.conflicted = true;
       }
@@ -366,6 +394,7 @@ export function reduceExplainAnalyzeEvents(
       node.outcome = value.outcome;
       node.usage = value.usage;
       node.context = value.context;
+      node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
     if (node.conflicted) conflictedNodeIds.add(node.nodeId);
@@ -411,7 +440,18 @@ export function reduceExplainAnalyzeEvents(
     nodes: orderedNodes,
     duplicateEventCount,
     conflictedNodeIds: [...conflictedNodeIds].sort(),
+    coverageGaps: [...new Set(orderedNodes.flatMap((node) => node.coverageGaps))].sort(),
   };
+}
+
+export function explainAnalyzeCoverageGapLabel(gap: ExplainAnalyzeCoverageGapV1): string {
+  switch (gap) {
+    case "approval_wait_intervals": return "approval waits";
+    case "user_input_wait_intervals": return "user input waits";
+    case "provider_retry_backoff": return "provider retry backoff";
+    case "first_token_latency": return "time to first token";
+    case "child_run_intervals": return "child-run timing";
+  }
 }
 
 /** Iterative DFS avoids overflowing the JS stack on long histories. */
@@ -454,9 +494,17 @@ export function explainAnalyzeFactFingerprint(value: unknown): string | null {
 
 function validatedFactFingerprint(value: ExplainAnalyzeEventV1): string {
   // The durable stream cursor belongs to transport, not to event identity.
-  // A replay adds `index`; the same fact must remain idempotent.
+  // A replay adds `index`; the same fact must remain idempotent. Rust's typed
+  // wire decoder also canonicalizes an omitted dependency list to an empty
+  // array, so both spellings of that no-edge fact share one fingerprint.
   const canonicalFact: Record<string, unknown> = { ...value };
   delete canonicalFact.index;
+  if (
+    Array.isArray(canonicalFact.dependency_node_ids) &&
+    canonicalFact.dependency_node_ids.length === 0
+  ) {
+    delete canonicalFact.dependency_node_ids;
+  }
   return stableJson(canonicalFact);
 }
 
@@ -545,6 +593,9 @@ export function renderExplainAnalyzeHtml(
   const activeTurn = graph.nodes.some((node) => node.kind === "turn" && !node.terminalObserved);
   const hasConflict = graph.conflictedNodeIds.length > 0;
   const isDegraded = options.degraded || graph.integrity === "unknown" || hasConflict;
+  const coverageNotice = graph.coverageGaps.length > 0
+    ? `<aside style="margin:14px 22px 0;padding:10px 13px;border:1px solid #e4eaf4;border-radius:10px;background:#f8faff;color:#62728d;font-size:10px"><strong>Not measured separately:</strong> ${escapeHtml(graph.coverageGaps.map(explainAnalyzeCoverageGapLabel).join(" · "))}. Visible intervals are recorded work, not a claim that every boundary is covered.</aside>`
+    : "";
   const warning =
     isDegraded
       ? `<aside class="warning" role="status"><span class="warning-icon" aria-hidden="true">!</span><span><strong>Some execution facts are missing or conflict.</strong><br>Refresh this run's saved event history to repair the graph.</span></aside>`
@@ -558,7 +609,9 @@ export function renderExplainAnalyzeHtml(
     ["Turn time", turnDuration === undefined ? "Not recorded" : formatMs(turnDuration), "From first turn event to its terminal event"],
     ["Slowest model request", slowestRequest?.durationMs === undefined ? "Not recorded" : formatMs(slowestRequest.durationMs), slowestRequest ? `${requestIdentity(slowestRequest)} · ${humanOutcome(slowestRequest.outcome ?? "unavailable")}` : "Appears when a request completes"],
     ["Provider requests", String(providerAttempts.length), failedAttempts > 0 ? `${failedAttempts} failed or interrupted` : "Physical requests, including retries"],
-    ["Peak parallel work", concurrency === null ? "Not recorded" : `${concurrency} at once`, "Measured within each worker timeline"],
+    [graph.coverageGaps.length > 0 ? "Observed overlap" : "Peak parallel work",
+      concurrency === null ? "Not recorded" : graph.coverageGaps.length > 0 ? `At least ${concurrency} at once` : `${concurrency} at once`,
+      graph.coverageGaps.length > 0 ? "Lower bound from recorded spans; per clock domain" : "Measured within each worker timeline"],
   ];
   const metricCards = metrics.map(([label, value, note], index) =>
     `<article class="metric${index === 0 ? " metric-primary" : ""}"><span class="metric-label">${label}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(note)}</small></article>`,
@@ -570,7 +623,7 @@ export function renderExplainAnalyzeHtml(
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>${title} · Explain Analyze</title><style>
   :root{color-scheme:light;--ink:#16233b;--muted:#71809a;--line:#e6ebf2;--panel:#fff;--canvas:#f4f7fb;--blue:#5278e7;--blue-soft:#edf2ff;--green:#16836d;--green-soft:#e8f7f2;--red:#c6495a;--red-soft:#fff0f1;--amber:#a36b13;--amber-soft:#fff7e6;font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 12% 0%,#e7edff 0,transparent 30%),var(--canvas);color:var(--ink)}.shell{max-width:1280px;margin:0 auto;padding:36px 32px 56px}.topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:38px}.brand{display:flex;align-items:center;gap:10px;color:#344463;font-size:12px;font-weight:750;letter-spacing:.11em;text-transform:uppercase}.brand-mark{display:grid;width:30px;height:30px;place-items:center;border-radius:9px;background:linear-gradient(145deg,#668af5,#4663d2);color:#fff;font-size:16px;box-shadow:0 5px 14px #4663d233}.snapshot{border:1px solid #dfe5ee;border-radius:999px;background:#ffffffa8;color:var(--muted);padding:6px 11px;font-size:11px}.report-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{margin:0 0 8px;color:var(--blue);font-size:11px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}.report-head h1{margin:0;font-size:clamp(25px,3vw,36px);line-height:1.15;letter-spacing:-.04em}.subtitle{margin:9px 0 0;color:var(--muted);font-size:14px}.state{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}.state:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}.state-complete{border-color:#cbe9de;background:var(--green-soft);color:var(--green)}.state-failed{border-color:#f3cfd3;background:var(--red-soft);color:var(--red)}.state-running{border-color:#d9e2ff;background:var(--blue-soft);color:var(--blue)}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.metric{min-width:0;padding:17px 18px 15px;border:1px solid #e5eaf2;border-radius:15px;background:linear-gradient(155deg,#fff,#fbfcff);box-shadow:0 4px 14px #23345108}.metric-primary{border-color:#d9e2ff;background:linear-gradient(145deg,#f5f7ff,#fff)}.metric-label{display:block;margin-bottom:10px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.04em}.metric strong{display:block;overflow:hidden;color:var(--ink);font-size:24px;line-height:1.1;letter-spacing:-.04em;text-overflow:ellipsis;white-space:nowrap}.metric small{display:block;overflow:hidden;margin-top:8px;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.panel{border:1px solid #e2e8f0;border-radius:17px;background:var(--panel);box-shadow:0 8px 25px #21345109}.token-panel{margin-bottom:16px;padding:19px 21px 17px}.panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.panel-head h2{margin:0;font-size:15px;letter-spacing:-.015em}.panel-head p{margin:4px 0 0;color:var(--muted);font-size:11px}.source-tag{flex:0 0 auto;border:1px solid #dce5f6;border-radius:999px;background:#f7f9ff;color:#526a9e;padding:5px 9px;font-size:10px;font-weight:700}.token-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin-top:16px}.token-metric{padding:2px 16px;border-left:1px solid var(--line)}.token-metric:first-child{padding-left:0;border-left:0}.token-metric span{display:block;color:var(--muted);font-size:11px}.token-metric strong{display:block;margin-top:5px;font-size:20px;letter-spacing:-.035em}.token-metric small{color:var(--muted);font-size:10px}.graph-panel{overflow:hidden}.graph-head{padding:20px 22px 16px;border-bottom:1px solid var(--line)}.graph-head h2{margin:0;font-size:16px;letter-spacing:-.02em}.graph-head p{margin:5px 0 0;color:var(--muted);font-size:11px}.legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:13px}.legend-item{display:inline-flex;align-items:center;gap:6px;color:#697893;font-size:10px}.legend-dot{width:8px;height:8px;border-radius:50%;background:#9aabc8}.legend-dot.complete{background:#1a9a7e}.legend-dot.failed{background:#d95364}.legend-dot.running{background:#5278e7;box-shadow:0 0 0 3px #5278e71a}.legend-dot.waiting{background:#d19733}.bar-key{display:inline-block;width:18px;height:8px;border-radius:3px}.bar-key.group{border:1px dashed #8492a8;background:#e8edf5}.bar-key.work{background:#16836d}.warning{display:flex;align-items:flex-start;gap:10px;margin:16px 22px 0;padding:12px 14px;border:1px solid #f0ddb4;border-radius:11px;background:var(--amber-soft);color:#785311;font-size:12px}.warning-icon{display:grid;flex:0 0 auto;width:18px;height:18px;place-items:center;border-radius:50%;background:#f3dfb4;font-weight:800}.graph-scroll{overflow-x:auto;padding:4px 20px 22px}.timeline{min-width:850px}.axis-row,.graph-row{display:grid;grid-template-columns:minmax(235px,290px) minmax(290px,1fr) 112px 66px;gap:14px;align-items:center}.axis-row{height:42px;border-bottom:1px solid var(--line)}.axis-track{position:relative;height:100%;border-bottom:1px solid #dfe5ed}.axis-tick{position:absolute;bottom:4px;transform:translateX(-50%);color:#8090a9;font-size:10px;font-variant-numeric:tabular-nums;white-space:nowrap}.axis-tick:first-child{transform:none}.axis-tick:last-child{transform:translateX(-100%)}.axis-tick:after{position:absolute;top:19px;left:50%;width:1px;height:8px;background:#dfe5ed;content:""}.axis-tick:first-child:after{left:0}.axis-tick:last-child:after{left:100%}.axis-side{color:#93a0b4;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.domain{margin-top:12px}.domain:first-of-type{margin-top:0}.domain-label{margin:0 0 1px;padding:12px 0 4px;color:#586987;font-size:10px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}.graph-tree{position:relative}.node-group{display:block}.node-group>summary{display:grid;width:100%;list-style:none;cursor:pointer}.node-group>summary::-webkit-details-marker{display:none}.node-group>summary::marker{content:""}.node-group>summary:focus-visible{outline:2px solid #7897f3;outline-offset:2px;border-radius:7px}.node-group:not([open])>.node-children{display:none}.graph-row{display:grid;width:100%;min-height:62px;padding:9px 0;border-bottom:1px solid #f0f2f6;transition:background .15s}.graph-row:hover{background:#fafbfe}.graph-row.is-group{background:linear-gradient(90deg,#f7f8ff 0,transparent 70%)}.node-copy{min-width:0;padding-left:calc(var(--depth,0)*14px);position:relative}.node-copy.nested:before{position:absolute;top:8px;left:calc(var(--indent,0px) - 7px);width:12px;border-top:1px solid #d8e0ea;content:"";pointer-events:none}.node-titleline{display:flex;min-width:0;align-items:center;gap:7px}.node-title{overflow:hidden;color:#263650;font-size:12px;font-weight:700;text-overflow:ellipsis;white-space:nowrap}.request-chip{flex:0 0 auto;border:1px solid #e4e9f1;border-radius:6px;background:#f8f9fc;color:#64738e;padding:2px 5px;font-size:9px;font-weight:700}.toggle{display:inline-grid;flex:0 0 auto;width:16px;height:16px;place-items:center;border:1px solid #e2e7ef;border-radius:5px;background:#fff;color:#74839c;font-size:11px;transition:transform .15s}.node-group[open]>summary .toggle{transform:rotate(90deg)}.node-leaf-mark{display:inline-block;flex:0 0 auto;width:7px;height:7px;margin:0 4.5px;border-radius:2px;background:#b5c0d1}.node-meta{display:flex;min-width:0;align-items:center;gap:7px;overflow:hidden;margin-top:5px;color:#77859b;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.node-status{display:inline-flex;flex:0 0 auto;align-items:center;gap:4px;color:#73819a}.node-status:before{width:6px;height:6px;border-radius:50%;background:#9aabc8;content:""}.status-complete .node-status:before{background:#1a9a7e}.status-failed .node-status{color:#b54555}.status-failed .node-status:before{background:#d95364}.status-running .node-status:before{background:#5278e7;box-shadow:0 0 0 3px #5278e71a}.status-waiting .node-status:before{background:#d19733}.status-conflicted .node-status{color:#9a6817}.status-conflicted .node-status:before{background:#d19733}.node-usage{overflow:hidden;color:#61718e;text-overflow:ellipsis}.node-dependencies{overflow:hidden;margin-top:3px;color:#72819a;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.node-children{position:relative;display:block}.node-children:before{position:absolute;top:0;bottom:30px;left:calc(var(--child-indent,0px) + 7px);border-left:1px solid #d8e0ea;content:"";pointer-events:none}.plot{position:relative;height:18px;overflow:hidden;border-radius:5px;background-color:#f1f4f8;background-image:linear-gradient(90deg,transparent calc(25% - .5px),#e0e6ef calc(25% - .5px),#e0e6ef calc(25% + .5px),transparent calc(25% + .5px),transparent calc(50% - .5px),#e0e6ef calc(50% - .5px),#e0e6ef calc(50% + .5px),transparent calc(50% + .5px),transparent calc(75% - .5px),#e0e6ef calc(75% - .5px),#e0e6ef calc(75% + .5px),transparent calc(75% + .5px))}.bar{position:absolute;top:3px;height:12px;min-width:4px;border:1px solid #4971e2;border-radius:4px;background:linear-gradient(90deg,#6c8cf0,#5278e7);box-shadow:0 2px 4px #5278e733}.bar.status-complete{border-color:#16836d;background:linear-gradient(90deg,#37b799,#16836d);box-shadow:0 2px 4px #16836d24}.bar.status-failed{border-color:#c6495a;background:linear-gradient(90deg,#ea8290,#c6495a);box-shadow:0 2px 4px #c6495a24}.bar.status-waiting{border-color:#be841e;background:linear-gradient(90deg,#edbd61,#c48b29);box-shadow:0 2px 4px #c48b2924}.bar.status-conflicted{border-color:#be841e;background:linear-gradient(90deg,#edbd61,#c48b29)}.bar.status-running{background:linear-gradient(90deg,#88a5ff,#5278e7);animation:pulse 1.8s ease-in-out infinite}.bar.is-group{opacity:.35;box-shadow:none;border-style:dashed;animation:none}@keyframes pulse{50%{opacity:.65}}.interval,.duration{text-align:right;color:#75839a;font-size:10px;font-variant-numeric:tabular-nums;white-space:nowrap}.duration{color:#33425d;font-weight:700}.tree-count{margin-left:auto;color:#8896ab;font-size:9px;white-space:nowrap}.empty{padding:42px 20px;text-align:center;color:var(--muted);font-size:12px}.footnote{margin:14px 2px 0;color:#8996aa;font-size:10px}.footer{display:flex;justify-content:space-between;gap:15px;margin:18px 2px 0;color:#96a1b3;font-size:10px}.footer strong{color:#65738a}@media(max-width:900px){.shell{padding:28px 20px 42px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.timeline{min-width:760px}.axis-row,.graph-row{grid-template-columns:minmax(190px,235px) minmax(270px,1fr) 92px 55px;gap:10px}}@media(max-width:560px){.shell{padding:20px 12px 32px}.topline{margin-bottom:26px}.snapshot{font-size:9px}.report-head{align-items:flex-start}.report-head h1{font-size:25px}.state{padding:6px 9px;font-size:10px}.metrics{gap:8px}.metric{padding:13px 12px}.metric strong{font-size:20px}.token-panel{padding:16px}.token-grid{grid-template-columns:repeat(2,minmax(0,1fr));row-gap:15px}.token-metric:nth-child(3){padding-left:0;border-left:0}.graph-head{padding:17px 16px 13px}.legend{gap:8px}.graph-scroll{padding:2px 12px 18px}.timeline{min-width:740px}.axis-row,.graph-row{grid-template-columns:180px minmax(265px,1fr) 85px 48px;gap:8px}.footer{flex-direction:column}}
-</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>Astra · Run insights</span></div><span class="snapshot">Offline snapshot · ${graph.nodes.length} stages</span></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">A visual account of what ran, when it ran, and what overlapped.</p></div><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></header><section class="metrics" aria-label="Run measurements">${metricCards}</section><section class="panel token-panel" aria-labelledby="tokens-heading"><div class="panel-head"><div><h2 id="tokens-heading">Model token usage</h2><p>Values are attributed to individual physical model requests.</p></div><span class="source-tag">${!isDegraded && providerAttempts.length > 0 && providerAttempts.every((node) => node.terminalObserved && !node.conflicted && node.usage?.basis === "provider_exact") ? "Provider reported" : "Partial or unavailable"}</span></div><div class="token-grid">${tokenCards}</div><p class="footnote">Reported subtotal from ${reportedAttempts.length} of ${providerAttempts.length} observed requests, including failed attempts that reported usage. Unknown lanes stay unknown.</p></section><section class="panel graph-panel" aria-labelledby="graph-heading"><div class="graph-head"><div class="panel-head"><div><h2 id="graph-heading">Execution graph</h2><p>Time runs left to right. Solid bars are work; faded bars frame nested stages. Overlap means parallel work.</p></div></div><div class="legend" aria-label="Timeline status legend"><span class="legend-item"><i class="legend-dot complete"></i>Completed</span><span class="legend-item"><i class="legend-dot failed"></i>Failed</span><span class="legend-item"><i class="legend-dot running"></i>End not recorded</span><span class="legend-item"><i class="legend-dot waiting"></i>Waiting</span><span class="legend-item"><i class="bar-key group"></i>Parent stage</span><span class="legend-item"><i class="bar-key work"></i>Work stage</span></div></div>${warning}<div class="graph-scroll">${domains || "<div class=\"empty\">No execution facts were captured.</div>"}</div></section><footer class="footer"><span>Saved snapshot; this file does not receive new events. Overlapping bars show parallel work; nested stages preserve execution structure.</span><strong>Explain Analyze · bounded runtime facts</strong></footer></main></body></html>`;
+</style></head><body><main class="shell"><div class="topline"><div class="brand"><span class="brand-mark" aria-hidden="true">A</span><span>Astra · Run insights</span></div><span class="snapshot">Offline snapshot · ${graph.nodes.length} stages</span></div><header class="report-head"><div><p class="eyebrow">Explain Analyze</p><h1>${title}</h1><p class="subtitle">A visual account of what ran, when it ran, and what overlapped.</p></div><span class="state ${statusClass}">${escapeHtml(statusLabel)}</span></header><section class="metrics" aria-label="Run measurements">${metricCards}</section><section class="panel token-panel" aria-labelledby="tokens-heading"><div class="panel-head"><div><h2 id="tokens-heading">Model token usage</h2><p>Values are attributed to individual physical model requests.</p></div><span class="source-tag">${!isDegraded && providerAttempts.length > 0 && providerAttempts.every((node) => node.terminalObserved && !node.conflicted && node.usage?.basis === "provider_exact") ? "Provider reported" : "Partial or unavailable"}</span></div><div class="token-grid">${tokenCards}</div><p class="footnote">Reported subtotal from ${reportedAttempts.length} of ${providerAttempts.length} observed requests, including failed attempts that reported usage. Unknown lanes stay unknown.</p></section><section class="panel graph-panel" aria-labelledby="graph-heading"><div class="graph-head"><div class="panel-head"><div><h2 id="graph-heading">Execution graph</h2><p>Time runs left to right. Solid bars are work; faded bars frame nested stages. Overlap means parallel work.</p></div></div><div class="legend" aria-label="Timeline status legend"><span class="legend-item"><i class="legend-dot complete"></i>Completed</span><span class="legend-item"><i class="legend-dot failed"></i>Failed</span><span class="legend-item"><i class="legend-dot running"></i>End not recorded</span><span class="legend-item"><i class="legend-dot waiting"></i>Waiting</span><span class="legend-item"><i class="bar-key group"></i>Parent stage</span><span class="legend-item"><i class="bar-key work"></i>Work stage</span></div></div>${warning}${coverageNotice}<div class="graph-scroll">${domains || "<div class=\"empty\">No execution facts were captured.</div>"}</div></section><footer class="footer"><span>Saved snapshot; this file does not receive new events. Overlapping bars show parallel work; nested stages preserve execution structure.</span><strong>Explain Analyze · bounded runtime facts</strong></footer></main></body></html>`;
 }
 
 function renderHtmlTimelineDomain(

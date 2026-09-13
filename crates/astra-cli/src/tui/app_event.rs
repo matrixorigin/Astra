@@ -103,7 +103,10 @@ pub(crate) enum TuiAppEvent {
     TurnError(String),
     SystemWarning(String),
     SystemInfo(String),
-    ExplainReport(Vec<serde_json::Value>),
+    /// One canonical measured Explain Analyze fact from the active run stream.
+    ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    /// Explain Analyze facts were truncated by an unrecovered stream gap.
+    ExplainAnalyzeGap,
     VerdictReport(Vec<crate::VerdictEvent>),
 
     // ── Context compaction (real-time UX) ───────────────────────────────

@@ -4,9 +4,9 @@
 //! The main loop lives under [`sse_loop`] (`mod.rs` entry + `agentic_sse_loop` / `agentic_loop_turn`).
 
 mod edge_executor;
-mod explain_reports;
 mod params;
 mod sse_loop;
+mod verdict_reports;
 
 #[cfg(test)]
 mod tests;

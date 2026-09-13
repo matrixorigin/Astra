@@ -1872,6 +1872,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_md,
         term_width,
         render_policy,
+        explain != crate::ExplainMode::Off,
         Some(edge_ctx),
         pre_clear_lines,
         auth_profile,

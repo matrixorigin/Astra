@@ -46,7 +46,6 @@ pub mod emergent_context;
 pub mod error_recovery;
 pub mod evaluation;
 pub mod execution_state;
-pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;

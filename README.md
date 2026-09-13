@@ -28,7 +28,7 @@ through a Runner inside your own environment.
 
 | What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
-| `EXPLAIN ANALYZE` shows every context source, its budget, its actual cost, and what was dropped and why. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
+| `EXPLAIN ANALYZE` shows context-source estimates, request-budget estimates, provider usage, execution timing, and which boundaries were not measured. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
 | **Understand what happened.** | **Know what changed and what still needs verification.** | **Keep code and credentials where they are.** |
 
 ```bash
@@ -36,30 +36,29 @@ astra chat --explain verbose -m "Run the shell command: ls *.sh | wc -l and answ
 ```
 
 ```text
-Explain Analyze DAG — turn-1
-  tokens fresh_in=928 cache_read=82688 cache_write=0 out=44
-├─ context_assembly ms=187ms budget=41783/102400 (40.8%)
-│  ├─ prompt system=6294 history=0 memory=0 tool_schemas=11269 user=18
-│  ├─ tool_surface selected=28/28 [agent, agent_fanout, bash, git, glob, grep, +22]
-│  └─ memory query="Run the shell command: ls *.sh | wc -l …" considered=0 selected=0 tokens=0 ms=0ms
-├─ preflight semantic admission outcome=unavailable ms=2ms
-├─ round[1] request preparation outcome=succeeded ms=564ms
-├─ round[1] model inference outcome=succeeded ms=1.2s
-├─ round[1] tool execution outcome=succeeded ms=1.4s
-├─ preflight semantic admission outcome=decided ms=1.8s
-├─ round[2] request preparation outcome=succeeded ms=478ms
-├─ round[2] model inference outcome=succeeded ms=1.7s
-└─ assistant out_tokens=44 chars=1
-   └─ preview 2
+Explain Analyze · recorded · 10 stages · 10/10 timed spans · 1 clock domains
+  Observed overlap · at least 2 overlapping recorded spans
+  Not timed separately · approval waits · child-run timing · time to first token · provider retry backoff · user input waits
+  Provider tokens · in 83,200 · cache read 0 · cache write 0 · out 54
+User turn · 2.4s · Completed · clock A +0ms
+├─ Understand requested outcome · 25ms · Resolved · round 1 · clock A +0ms
+├─ Prepare model request · 65ms · Succeeded · round 1 · attempt 1 · clock A +25ms
+│  └─ Assemble context sources · 55ms · Succeeded · round 1 · clock A +28ms
+├─ Generate model response · 1.1s · Succeeded · round 1 · clock A +95ms
+│  └─ Model request · 1.0s · Succeeded · round 1 · attempt 1 · clock A +100ms
+├─ Execute selected tools · 700ms · Succeeded · round 1 · attempt 1 · clock A +1.2s
+│  ├─ Run read_file · 600ms · Succeeded · round 1 · clock A +1.25s
+│  └─ Run search_repository · 450ms · Succeeded · round 1 · clock A +1.25s
+└─ Deliver final answer · 100ms · Completed · clock A +2.29s
 ```
 
-<sub>Abbreviated output of a real one-shot turn against a hosted Astra Server with `deepseek-v4-flash`. Every line answers a question a database engineer already knows how to ask: what was the budget, what did each source cost, what was dropped, and did the cache hit.</sub>
+<sub>Illustrative Explain Analyze tree. Runtime facts carry provider token lanes and measured intervals; context costs remain estimates, and known unmeasured boundaries stay visible.</sub>
 
 Astra ships as one binary (CLI, TUI, and Server), plus a Web dashboard and a
 TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 
 <div align="center">
-  <img alt="Recorded terminal session: astra chat --explain verbose answers a question, then prints the Explain Analyze DAG for the turn — token counts, context assembly budget, prompt breakdown by source, tool surface, memory retrieval, and per-round timing." src="docs/assets/astra-cli-demo.gif" width="900">
+  <img alt="Animated Explain Analyze web graph: a readable execution tree switches to a replayable timeline with overlapping provider and tool spans, a moving playhead, measured durations, and token usage." src="docs/assets/explain-analyze-demo.gif" width="1100">
 </div>
 
 ### Pick the layer you need
@@ -263,8 +262,8 @@ astra chat -y --explain verbose -m "Count the .sh files here with a shell comman
 File, shell, and Git tools run on this machine inside the current directory;
 the Server only sees tool results. One-shot `chat` cannot ask for approval,
 so pass `-y` (or `--permission-mode auto`) when the task needs tools; the
-TUI prompts instead. `--explain verbose` prints the Explain Analyze DAG for
-the turn.
+TUI prompts instead. `--explain verbose` prints the runtime-recorded Explain
+Analyze execution tree for the turn, with known unmeasured boundaries shown.
 
 If a command returns `401`, the access token has expired: run
 `astra refresh`. `astra doctor` checks the install, Server, and login in

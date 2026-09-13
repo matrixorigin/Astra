@@ -478,9 +478,9 @@ fn stream_event_to_agent_live_kind(
         | StreamEvent::AgentLive(_)
         | StreamEvent::AgentLiveGap(_)
         | StreamEvent::Compaction(_)
+        | StreamEvent::ExplainAnalyze(_)
+        | StreamEvent::ExplainAnalyzeGap
         | StreamEvent::WorkTaskBoardUpdate(_)
-        | StreamEvent::ExplainReport(_)
-        | StreamEvent::ExplainText(_)
         | StreamEvent::VerdictReport(_) => None,
     }
 }

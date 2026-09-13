@@ -369,59 +369,13 @@ fn work_task_board_update_from_server_event(event: &Value) -> Option<Value> {
     .flatten()
 }
 
-/// Extract a completed server-owned phase receipt. The event envelope is
-/// checked separately from the versioned payload so unrelated internal
-/// fields can never become Explain input merely by sharing an SSE `type`.
-fn turn_phase_receipt_from_server_event(event: &Value) -> Option<Value> {
-    if event.get("type").and_then(Value::as_str) != Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
-    {
-        return None;
-    }
-    const ALLOWED_KEYS: [&str; 7] = [
-        "type",
-        "schema_version",
-        "phase",
-        "round_index",
-        "attempt_index",
-        "outcome",
-        "duration_ms",
-    ];
-    if event
-        .as_object()?
-        .keys()
-        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
-    {
-        return None;
-    }
-    let mut payload = serde_json::Map::from_iter([
-        (
-            "schema_version".to_string(),
-            event.get("schema_version")?.clone(),
-        ),
-        ("phase".to_string(), event.get("phase")?.clone()),
-        ("round_index".to_string(), event.get("round_index")?.clone()),
-        ("outcome".to_string(), event.get("outcome")?.clone()),
-        ("duration_ms".to_string(), event.get("duration_ms")?.clone()),
-    ]);
-    if let Some(attempt_index) = event.get("attempt_index") {
-        payload.insert("attempt_index".to_string(), attempt_index.clone());
-    }
-    let receipt = serde_json::from_value::<astra_server_types::TurnPhaseReceiptV1>(
-        serde_json::Value::Object(payload),
-    )
-    .ok()?;
-    if !receipt.is_valid() {
-        return None;
-    }
-    Some(serde_json::json!({
-        "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-        "schema_version": receipt.schema_version,
-        "phase": receipt.phase,
-        "round_index": receipt.round_index,
-        "attempt_index": receipt.attempt_index,
-        "outcome": receipt.outcome,
-        "duration_ms": receipt.duration_ms,
-    }))
+/// Decode the canonical Explain Analyze wire event. The envelope's `type`
+/// discriminator is removed before closed-schema decoding so it cannot be
+/// mistaken for an extension field on [`astra_turn_types::ExplainAnalyzeEventV1`].
+fn explain_analyze_event_from_server_event(
+    event: &Value,
+) -> Result<astra_turn_types::ExplainAnalyzeEventV1, String> {
+    astra_turn_types::decode_explain_analyze_wire(event).map_err(str::to_string)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1300,11 +1254,6 @@ struct CliSseStreamHost<'a> {
     tool_work_detected: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
-    /// Completed server-owned timing boundaries accepted from this SSE stream.
-    /// They are collected here, then committed to the loop telemetry once the
-    /// stream result is accepted, so terminal and TUI Explain consume one
-    /// common observation rather than separate live and final copies.
-    pub(crate) phase_receipts: Vec<Value>,
     /// Server-owned tool calls are already executed remotely.  Keep only the
     /// typed display identity needed to pair their start/end events; never
     /// re-execute them in the CLI.
@@ -1335,6 +1284,9 @@ struct CliSseStreamHost<'a> {
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     stream_event_tx: Option<chat_stream::StreamEventTx>,
+    /// Whether this turn is collecting Explain Analyze facts. Generic stream
+    /// gaps should not create an Explain warning when observation is disabled.
+    explain_analyze_enabled: bool,
     /// Last context-meta value forwarded to observers. The SSE accumulator is
     /// replayed on each frame, so deduplicate rather than flooding the TUI.
     last_context_system_prompt_tokens: Option<u32>,
@@ -1754,7 +1706,6 @@ impl<'a> CliSseStreamHost<'a> {
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
             tool_work_detected: buffer_from_start,
             edge_tool_round: Vec::new(),
-            phase_receipts: Vec::new(),
             server_tool_calls: std::collections::HashMap::new(),
             server_tool_completed_ids: std::collections::HashSet::new(),
             server_tool_completed_calls: std::collections::HashMap::new(),
@@ -1765,6 +1716,7 @@ impl<'a> CliSseStreamHost<'a> {
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
+            explain_analyze_enabled: false,
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
@@ -4272,17 +4224,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.emit_stream_event(chat_stream::StreamEvent::RuntimeFeedback(Box::new(frame)))
                 .await;
         }
+        if event.get("type").and_then(Value::as_str)
+            == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+        {
+            let fact = explain_analyze_event_from_server_event(event).map_err(|error| {
+                format!("contract_violation: invalid explain_analyze event: {error}")
+            })?;
+            self.emit_stream_event(chat_stream::StreamEvent::ExplainAnalyze(fact))
+                .await;
+        }
+        if self.explain_analyze_enabled
+            && event.get("type").and_then(Value::as_str) == Some("stream_gap")
+            && event
+                .get("explain_analyze_recovered")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            self.emit_stream_event(chat_stream::StreamEvent::ExplainAnalyzeGap)
+                .await;
+        }
         if let Some(update) = work_task_board_update_from_server_event(event) {
             // This is a durable lifecycle edge, so use the backpressured
             // stream path rather than best-effort progress forwarding.
             self.emit_stream_event(chat_stream::StreamEvent::WorkTaskBoardUpdate(update))
                 .await;
-        }
-        if let Some(receipt) = turn_phase_receipt_from_server_event(event) {
-            // Keep one accepted copy for the owning loop's telemetry. Sending
-            // it directly here as well would make TUI receive the same receipt
-            // once live and once again in the final Explain report.
-            self.phase_receipts.push(receipt);
         }
         if let Err(error) = self.validate_server_tool_event_owner(event) {
             return Err(format!("contract_violation: {error}"));
@@ -6666,8 +6631,6 @@ pub(crate) struct TurnResult {
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
     pub(crate) refreshed_token: Option<String>,
-    /// Server-owned phase receipts accepted during this physical request.
-    pub(crate) phase_receipts: Vec<Value>,
     /// A server-requested edge callback exhausted its bounded identical
     /// retry. The outer turn owner must cancel the durable server run; closing
     /// this local stream alone is not a terminal control-plane transition.
@@ -6703,7 +6666,6 @@ impl TurnResult {
             ttft_ms: None,
             edge_tool_round: Vec::new(),
             refreshed_token: None,
-            phase_receipts: Vec::new(),
             callback_delivery_failed: false,
             callback_failure_run_id: None,
             output_transport_failure: None,
@@ -8421,6 +8383,7 @@ pub(crate) async fn consume_turn_sse(
     render_md: bool,
     term_width: usize,
     render_policy: RenderPolicy,
+    explain_analyze_enabled: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
     auth_profile: Option<&str>,
@@ -8450,7 +8413,6 @@ pub(crate) async fn consume_turn_sse(
         callback_failure_run_id,
         request_session_lease_failure,
         refreshed_token,
-        phase_receipts,
         output_transport_failure,
     ) = if let Some(mut ctx) = edge {
         // The stream owns a child scope even when the caller supplies a
@@ -8469,6 +8431,7 @@ pub(crate) async fn consume_turn_sse(
             render_md && !render_policy.suppress_text(),
             auth_profile,
         );
+        host.explain_analyze_enabled = explain_analyze_enabled;
         host.stream_json_exchange = stream_json_exchange;
         // pre_clear_lines only applies to non-md fallback path.
         if host.render.md.is_none() {
@@ -8509,7 +8472,6 @@ pub(crate) async fn consume_turn_sse(
             callback_failure_run_id,
             request_session_lease_failure,
             refreshed_token,
-            host.phase_receipts,
             output_transport_failure,
         )
     } else {
@@ -8542,7 +8504,6 @@ pub(crate) async fn consume_turn_sse(
             None,
             None,
             None,
-            Vec::new(),
             None,
         )
     };
@@ -8567,7 +8528,6 @@ pub(crate) async fn consume_turn_sse(
         ttft_ms: sse_result.ttft_ms,
         edge_tool_round,
         refreshed_token,
-        phase_receipts,
         callback_delivery_failed,
         callback_failure_run_id,
         output_transport_failure,
@@ -8770,7 +8730,7 @@ mod tests {
         terminal_output_failure_for_event, theme, tool_completion_icon,
         tool_completion_is_authoritative, tool_dedup_signature,
         tool_failure_requires_turn_rollback, tool_output_event_text, turn_has_tool_work,
-        turn_phase_receipt_from_server_event, work_task_board_update_from_server_event,
+        work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -9751,63 +9711,115 @@ mod tests {
     }
 
     #[test]
-    fn server_turn_phase_receipt_rejects_extensions_and_invalid_contracts() {
-        let event = serde_json::json!({
-            "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+    fn explain_analyze_wire_event_requires_a_closed_valid_schema() {
+        let valid = serde_json::json!({
+            "type": "explain_analyze",
             "schema_version": 1,
-            "phase": "turn_intent_admission",
-            "round_index": 0,
-            "attempt_index": 0,
-            "outcome": "decided",
-            "duration_ms": 5_021,
-            "internal_model": "must not cross the Explain boundary",
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "turn",
+            "label": "User turn",
+            "transition": "started",
+            "elapsed_ms": 0,
         });
-        assert!(turn_phase_receipt_from_server_event(&event).is_none());
-        assert_eq!(
-            turn_phase_receipt_from_server_event(&serde_json::json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": 1,
-                "phase": "turn_intent_admission",
-                "round_index": 0,
-                "attempt_index": 0,
-                "outcome": "decided",
-                "duration_ms": 5_021,
-            })),
-            Some(serde_json::json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": 1,
-                "phase": "turn_intent_admission",
-                "round_index": 0,
-                "attempt_index": 0,
-                "outcome": "decided",
-                "duration_ms": 5_021,
-            }))
-        );
+        let fact = super::explain_analyze_event_from_server_event(&valid).expect("typed fact");
+        assert_eq!(fact.event_id, "clock-1:1");
+        assert!(fact.is_valid());
+
+        let mut extended = valid.clone();
+        extended["internal_reasoning"] = serde_json::json!("not a protocol fact");
         assert!(
-            turn_phase_receipt_from_server_event(&serde_json::json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": 1,
-                "phase": "unknown",
-                "round_index": 0,
-                "attempt_index": 0,
-                "outcome": "decided",
-                "duration_ms": 1,
-            }))
-            .is_none()
+            super::explain_analyze_event_from_server_event(&extended)
+                .expect_err("closed schema rejects extension")
+                .contains("does not match")
         );
+
+        let mut invalid = valid;
+        invalid["schema_version"] = serde_json::json!(99);
         assert!(
-            turn_phase_receipt_from_server_event(&serde_json::json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": 1,
-                "phase": "model_inference",
-                "round_index": 0,
-                "attempt_index": 0,
-                "outcome": "decided",
-                "duration_ms": 1,
-            }))
-            .is_none(),
-            "a syntactically valid but semantically impossible receipt is not Explain evidence"
+            super::explain_analyze_event_from_server_event(&invalid)
+                .expect_err("unsupported version is rejected")
+                .contains("validation")
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_explain_analyze_fact_reaches_the_typed_stream_channel() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
+        let workspace = tempdir().expect("workspace");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(10);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ctx = EdgeSseContext {
+            api: &api,
+            token: "test-token",
+            executor_id: "edge-test",
+            executor,
+            render_policy: RenderPolicy::Silent,
+            perm_manager: None,
+            cancel_token: None,
+            stream_event_tx: Some(tx),
+            stream_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            skill_resolver: None,
+            skill_continuation: false,
+            turn_rollback_on_failure: false,
+            tool_cache: &mut tool_cache,
+            observability_hub: None,
+            incremental_state: None,
+            request_session_execution_lease: None,
+        };
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, 80, false);
+        host.explain_analyze_enabled = true;
+        let event = serde_json::json!({
+            "type": "explain_analyze",
+            "schema_version": 1,
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "turn",
+            "label": "User turn",
+            "transition": "started",
+            "elapsed_ms": 0,
+        });
+
+        host.on_accepted_sse_event(&event)
+            .await
+            .expect("valid Explain Analyze event is accepted");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ExplainAnalyze(fact))
+                if fact.event_id == "clock-1:1" && fact.is_valid()
+        ));
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "stream_gap",
+            "explain_analyze_recovered": false,
+        }))
+        .await
+        .expect("delivery gap remains observable");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ExplainAnalyzeGap)
+        ));
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "stream_gap",
+            "explain_analyze_recovered": true,
+        }))
+        .await
+        .expect("recovered Explain Analyze gap is complete");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

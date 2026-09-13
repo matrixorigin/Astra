@@ -51,9 +51,7 @@ use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
     map_post_tool_policy_outcome, policy_advisory_bundle_value,
 };
-use astra_turn_core::agentic_turn_flow::{
-    agentic_round_stall_preflight, append_explain_turn_batch,
-};
+use astra_turn_core::agentic_turn_flow::agentic_round_stall_preflight;
 use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
@@ -3083,11 +3081,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             }
         }
     }
-
-    append_explain_turn_batch(
-        &mut state.telemetry.explain_turns,
-        turn_result.accum.explain_turns.as_slice(),
-    );
 
     record_edge_tool_observability(state, &edge_tool_round);
 

@@ -1066,9 +1066,17 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
                 }
             }),
         )),
-        StreamEvent::ExplainText(text) if !text.trim().is_empty() => Some((
-            "turn/explain",
-            serde_json::json!({"format": "dag", "text": text}),
+        StreamEvent::ExplainAnalyze(event) => {
+            let mut params = serde_json::to_value(event).ok()?;
+            params.as_object_mut()?.insert(
+                "type".to_string(),
+                Value::String(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE.to_string()),
+            );
+            Some(("turn/explainAnalyze", params))
+        }
+        StreamEvent::ExplainAnalyzeGap => Some((
+            "turn/explainAnalyzeGap",
+            serde_json::json!({"recovered": false}),
         )),
         StreamEvent::UserIntentApplied {
             intent_id,
@@ -1878,14 +1886,38 @@ mod tests {
     }
 
     #[test]
-    fn stream_event_notification_maps_explain_text() {
-        let (method, params) = stream_event_notification(&StreamEvent::ExplainText(
-            "Explain Analyze DAG — turn-1".into(),
-        ))
-        .expect("notification");
-        assert_eq!(method, "turn/explain");
-        assert_eq!(params["format"], "dag");
-        assert_eq!(params["text"], "Explain Analyze DAG — turn-1");
+    fn stream_event_notification_maps_typed_explain_analyze_fact() {
+        let fact = astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:1".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn-1".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "server-loop".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            elapsed_ms: 0,
+            start_elapsed_ms: None,
+            duration_ms: None,
+            outcome: None,
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        };
+        let (method, params) =
+            stream_event_notification(&StreamEvent::ExplainAnalyze(fact.clone()))
+                .expect("notification");
+        assert_eq!(method, "turn/explainAnalyze");
+        assert_eq!(params["type"], "explain_analyze");
+        assert_eq!(params["event_id"], fact.event_id);
+        assert_eq!(params["schema_version"], 1);
+        assert!(params.get("text").is_none());
     }
 
     #[test]

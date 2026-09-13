@@ -288,7 +288,6 @@ pub use astra_turn_core::{
     cloud_summary::{SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
     execution_state::normalize_execution_state,
-    explain::build_explain_event,
     history::{
         RecoveredEventRow, append_recovered_events, find_tool_call_safe_split,
         merge_tool_results_into_history,

@@ -1620,6 +1620,28 @@ impl ThinClient {
         last_index: u32,
         bearer_override: Option<&str>,
     ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
+        self.stream_run_with_replay(run_id, last_index, bearer_override, false)
+    }
+
+    /// `GET /chat/runs/{run_id}/stream?replay_only=true` — read the durable
+    /// run history and return without attaching to a live producer. This is
+    /// for restoring a saved graph; interactive reconnects use [`Self::stream_run`].
+    pub fn stream_run_replay(
+        &self,
+        run_id: &str,
+        last_index: u32,
+        bearer_override: Option<&str>,
+    ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
+        self.stream_run_with_replay(run_id, last_index, bearer_override, true)
+    }
+
+    fn stream_run_with_replay(
+        &self,
+        run_id: &str,
+        last_index: u32,
+        bearer_override: Option<&str>,
+        replay_only: bool,
+    ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
         let url = match self.url(&paths::chat_run_stream(run_id)) {
             Ok(u) => u,
             Err(e) => {
@@ -1629,11 +1651,15 @@ impl ThinClient {
                 .boxed();
             }
         };
+        let mut query = vec![("last_index", last_index.to_string())];
+        if replay_only {
+            query.push(("replay_only", "true".to_string()));
+        }
         let req = self
             .http
             .get(url)
             .headers(self.auth_headers_for(bearer_override))
-            .query(&[("last_index", last_index)]);
+            .query(&query);
         let fut = async move {
             let resp = req.send().await?;
             if !resp.status().is_success() {
@@ -1696,6 +1722,21 @@ impl ThinClient {
         let mut stream = self.stream_run(run_id, last_index, bearer_override);
         let mut s = Pin::new(&mut stream);
         while let Some(item) = s.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    pub async fn stream_run_replay_collect(
+        &self,
+        run_id: &str,
+        last_index: u32,
+        bearer_override: Option<&str>,
+    ) -> Result<Vec<StreamEvent>, ThinClientError> {
+        let mut out = Vec::new();
+        let mut stream = self.stream_run_replay(run_id, last_index, bearer_override);
+        let mut stream = Pin::new(&mut stream);
+        while let Some(item) = stream.next().await {
             out.push(item?);
         }
         Ok(out)
@@ -2995,6 +3036,50 @@ mod tests {
             } if run_id.as_deref() == Some("run-1")
                 && status.as_deref() == Some("completed")
                 && error.is_none()
+        ));
+    }
+
+    #[tokio::test]
+    async fn wiremock_stream_run_replay_is_finite_and_uses_the_durable_cursor() {
+        let srv = MockServer::start().await;
+        let event = serde_json::json!({
+            "type": "explain_analyze",
+            "index": 7,
+            "schema_version": 1,
+            "event_id": "clock-1:2",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1",
+            "producer_id": "runtime",
+            "clock_domain_id": "clock-1",
+            "kind": "turn",
+            "label": "User turn",
+            "transition": "finished",
+            "elapsed_ms": 35,
+            "start_elapsed_ms": 0,
+            "duration_ms": 35,
+            "outcome": "completed"
+        });
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1/stream"))
+            .and(query_param("last_index", "6"))
+            .and(query_param("replay_only", "true"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!("data: {}\n\n", event)),
+            )
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let events = client
+            .stream_run_replay_collect("run-1", 6, Some("tok"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ExplainAnalyze(fact)]
+                if fact.event_id == "clock-1:2" && fact.duration_ms == Some(35)
         ));
     }
 

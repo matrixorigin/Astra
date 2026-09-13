@@ -3230,9 +3230,49 @@ impl ExplainAnalyzeContext {
         outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
     ) -> Option<Value> {
+        self.event_with_context(node, transition, instant, duration_ms, outcome, usage, None)
+    }
+
+    fn event_with_context(
+        &self,
+        node: &ExplainAnalyzeNode,
+        transition: astra_turn_types::ExplainAnalyzeTransitionV1,
+        instant: Instant,
+        duration_ms: Option<u64>,
+        outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+    ) -> Option<Value> {
+        self.event_with_context_and_coverage(
+            node,
+            transition,
+            instant,
+            duration_ms,
+            outcome,
+            usage,
+            context_metrics,
+            Vec::new(),
+        )
+    }
+
+    fn event_with_context_and_coverage(
+        &self,
+        node: &ExplainAnalyzeNode,
+        transition: astra_turn_types::ExplainAnalyzeTransitionV1,
+        instant: Instant,
+        duration_ms: Option<u64>,
+        outcome: Option<astra_turn_types::ExplainAnalyzeOutcomeV1>,
+        usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+        coverage_gaps: Vec<astra_turn_types::ExplainAnalyzeCoverageGapV1>,
+    ) -> Option<Value> {
         let (start_elapsed_ms, duration_ms, outcome, usage) = match transition {
             astra_turn_types::ExplainAnalyzeTransitionV1::Started => {
-                if duration_ms.is_some() || outcome.is_some() || usage.is_some() {
+                if duration_ms.is_some()
+                    || outcome.is_some()
+                    || usage.is_some()
+                    || context_metrics.is_some()
+                {
                     return None;
                 }
                 (None, None, None, None)
@@ -3261,6 +3301,8 @@ impl ExplainAnalyzeContext {
             duration_ms,
             outcome,
             usage,
+            context: context_metrics,
+            coverage_gaps,
         };
         if !fact.is_valid() {
             return None;
@@ -3532,6 +3574,9 @@ pub struct ServerAgenticLoopHost {
     /// Analyze graph. Trace spans keep their own diagnostic lifecycle.
     explain_analyze_context: Option<ExplainAnalyzeContext>,
     explain_analyze_open_nodes: HashMap<String, ExplainAnalyzeNode>,
+    explain_analyze_tool_nodes: HashMap<String, String>,
+    pending_request_preparation_context:
+        Option<(u32, u32, astra_turn_types::ExplainAnalyzeContextMetricsV1)>,
     /// First event-lane contract violation observed during this host turn.
     ///
     /// Ordinary event producers are intentionally infallible at the call site,
@@ -4515,7 +4560,7 @@ impl crate::turn::llm::client::ProviderAttemptObserver
             format!("{parent_node_id}/physical/{attempt_index}"),
             Some(parent_node_id.clone()),
             astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt,
-            format!("Model request attempt {}", attempt_index.saturating_add(1)),
+            "Model request",
             started_at,
             Some(self.model_round_index),
             Some(attempt_index),
@@ -4581,6 +4626,44 @@ fn explain_analyze_token_usage(
         output_tokens: measured(usage.output_tokens, presence.output_tokens),
     };
     usage.is_valid().then_some(usage)
+}
+
+fn explain_analyze_context_budget(
+    status: crate::turn::wire_assembly::WireBudgetStatus,
+    visible_tool_count: usize,
+) -> Option<astra_turn_types::ExplainAnalyzeContextMetricsV1> {
+    let token_count = |value: usize| u64::try_from(value).ok();
+    let budget = astra_turn_types::ExplainAnalyzeContextBudgetV1 {
+        basis: astra_turn_types::ExplainAnalyzeContextBudgetBasisV1::PreProviderEstimate,
+        estimated_input_tokens: token_count(status.estimated_input_tokens)?,
+        estimated_system_tokens: token_count(status.estimated_system_tokens)?,
+        tool_schema_tokens: token_count(status.tool_schema_tokens)?,
+        requested_output_tokens: token_count(status.requested_output_tokens)?,
+        reserved_protocol_tokens: token_count(status.reserved_protocol_tokens)?,
+        effective_input_limit_tokens: token_count(status.effective_input_limit)?,
+        model_context_limit_tokens: token_count(status.model_limit)?,
+        visible_tool_count: u32::try_from(visible_tool_count).ok()?,
+    };
+    budget
+        .is_valid()
+        .then_some(astra_turn_types::ExplainAnalyzeContextMetricsV1 {
+            budget: Some(budget),
+            assembly: None,
+        })
+}
+
+fn explain_analyze_outcome_for_error(
+    error: &astra_core::ClassifiedError,
+) -> astra_turn_types::ExplainAnalyzeOutcomeV1 {
+    match error.kind {
+        astra_core::ErrorKind::Cancelled => astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled,
+        astra_core::ErrorKind::ProviderDeadline
+        | astra_core::ErrorKind::StreamTransport
+        | astra_core::ErrorKind::StreamIdle => {
+            astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+        }
+        _ => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+    }
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -5370,6 +5453,8 @@ impl ServerAgenticLoopHostBuilder {
             emitted_events: Vec::new(),
             explain_analyze_context: None,
             explain_analyze_open_nodes: HashMap::new(),
+            explain_analyze_tool_nodes: HashMap::new(),
+            pending_request_preparation_context: None,
             event_protocol_fault: None,
             event_tx: None,
             streaming_turn_started: false,
@@ -9527,9 +9612,30 @@ impl ServerAgenticLoopHost {
         recorded_attempts: &mut HashSet<u32>,
         outcome: TurnPhaseOutcome,
     ) {
+        self.complete_request_preparation_phase_with_context(
+            state,
+            started_at,
+            attempt_index,
+            recorded_attempts,
+            outcome,
+            None,
+        );
+    }
+
+    fn complete_request_preparation_phase_with_context(
+        &mut self,
+        state: &mut AgenticLoopState,
+        started_at: Instant,
+        attempt_index: u32,
+        recorded_attempts: &mut HashSet<u32>,
+        outcome: TurnPhaseOutcome,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
+    ) {
         if !recorded_attempts.insert(attempt_index) {
             return;
         }
+        self.pending_request_preparation_context =
+            context_metrics.map(|context| (state.current_round_index, attempt_index, context));
         complete_turn_phase(
             self,
             state,
@@ -9543,6 +9649,7 @@ impl ServerAgenticLoopHost {
                 state.current_round_index, attempt_index
             ),
         );
+        self.pending_request_preparation_context = None;
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -10032,6 +10139,189 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    fn start_explain_analyze_tool_call(&mut self, tool_call: &Value, round_index: u32) {
+        let Some(call_id) = tool_call
+            .get("id")
+            .or_else(|| tool_call.get("call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|call_id| !call_id.is_empty())
+        else {
+            return;
+        };
+        if self.explain_analyze_tool_nodes.contains_key(call_id) {
+            return;
+        }
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let tool_name = tool_call
+            .pointer("/function/name")
+            .or_else(|| tool_call.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("tool");
+        let mut label = format!("Run {tool_name}");
+        if label.len() > 160 {
+            let mut boundary = 157;
+            while !label.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            label.truncate(boundary);
+            label.push('…');
+        }
+        let parent_node_id = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ToolBatch
+                    && node.round_index == Some(round_index)
+            })
+            .max_by_key(|(_, node)| node.started_at)
+            .map(|(node_id, _)| node_id.clone())
+            .or_else(|| Some(context.root_node_id.clone()));
+        let node_id = format!("{}/tool/{}", context.root_node_id, context.next_event_id());
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall,
+            label,
+            Instant::now(),
+            Some(round_index),
+            None,
+        );
+        self.explain_analyze_tool_nodes
+            .insert(call_id.to_string(), node_id);
+        self.start_explain_analyze_node(node);
+    }
+
+    fn finish_explain_analyze_tool_call(&mut self, event: &Value) {
+        if event.get("type").and_then(Value::as_str) != Some("tool_call_end") {
+            return;
+        }
+        let Some(call_id) = event
+            .get("call_id")
+            .or_else(|| event.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|call_id| !call_id.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) else {
+            return;
+        };
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let disposition = event
+            .get("disposition")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let outcome = match disposition {
+            "reused" => astra_turn_types::ExplainAnalyzeOutcomeV1::Reused,
+            "suppressed" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
+            "deferred" => astra_turn_types::ExplainAnalyzeOutcomeV1::Deferred,
+            _ => match status {
+                "completed" | "succeeded" | "success" => {
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+                }
+                "rejected" => astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected,
+                "blocked" => astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked,
+                "waiting" => astra_turn_types::ExplainAnalyzeOutcomeV1::Waiting,
+                "skipped" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
+                _ => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
+            },
+        };
+        let Some(node) = self.explain_analyze_open_nodes.get(&node_id) else {
+            return;
+        };
+        let finished_at = Instant::now();
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.finish_explain_analyze_node_at(
+            &node_id,
+            duration_ms,
+            outcome,
+            None,
+            finished_at,
+            None,
+        );
+    }
+
+    fn start_explain_analyze_context_assembly(
+        &mut self,
+        state: &AgenticLoopState,
+        started_at: Instant,
+    ) -> Option<String> {
+        let context = self.explain_analyze_context.clone()?;
+        let node_id = format!(
+            "{}/context_assembly/{}",
+            context.root_node_id, state.current_round_index
+        );
+        let preparation_node_id = Self::explain_phase_node(
+            &context,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            0,
+            started_at,
+        )
+        .node_id;
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            Some(preparation_node_id),
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ContextAssembly,
+            "Assemble context sources",
+            started_at,
+            Some(state.current_round_index),
+            None,
+        );
+        self.start_explain_analyze_node(node);
+        Some(node_id)
+    }
+
+    fn finish_explain_analyze_context_assembly(
+        &mut self,
+        node_id: &str,
+        finished_at: Instant,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        assembly: Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1>,
+    ) {
+        let Some(node) = self.explain_analyze_open_nodes.get(node_id) else {
+            return;
+        };
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let context_metrics =
+            assembly.map(
+                |assembly| astra_turn_types::ExplainAnalyzeContextMetricsV1 {
+                    budget: None,
+                    assembly: Some(assembly),
+                },
+            );
+        self.finish_explain_analyze_node_at(
+            node_id,
+            duration_ms,
+            outcome,
+            None,
+            finished_at,
+            context_metrics,
+        );
+    }
+
     fn finish_explain_analyze_node_at(
         &mut self,
         node_id: &str,
@@ -10039,6 +10329,7 @@ impl ServerAgenticLoopHost {
         outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
         usage: Option<astra_turn_types::ExplainAnalyzeTokenUsageV1>,
         finished_at: Instant,
+        context_metrics: Option<astra_turn_types::ExplainAnalyzeContextMetricsV1>,
     ) {
         let Some(context) = self.explain_analyze_context.clone() else {
             return;
@@ -10076,13 +10367,14 @@ impl ServerAgenticLoopHost {
                 }
                 node
             });
-        if let Some(event) = context.event(
+        if let Some(event) = context.event_with_context(
             &node,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
             finished_at,
             Some(duration_ms),
             Some(outcome),
             usage,
+            context_metrics,
         ) {
             self.emit_progress_event(event);
         }
@@ -10195,6 +10487,7 @@ impl ServerAgenticLoopHost {
     }
 
     fn emit_validated_progress_event(&mut self, mut event: Value) {
+        self.finish_explain_analyze_tool_call(&event);
         if let Some(object) = event.as_object_mut() {
             // Settlement authority is lifecycle-owned. Never trust or expose
             // a producer-supplied copy of its private durable watermark.
@@ -10286,6 +10579,7 @@ impl ServerAgenticLoopHost {
         if self.validate_progress_event_lane(&event).is_err() {
             return;
         }
+        self.finish_explain_analyze_tool_call(&event);
         self.attach_execution_metadata_to_tool_event(&mut event);
         let sender = self
             .event_tx
@@ -11458,7 +11752,7 @@ impl ServerAgenticLoopHost {
             .map(std::borrow::Cow::into_owned)
     }
 
-    fn emit_admitted_tool_call_events(&mut self, tool_calls: &[Value]) {
+    fn emit_admitted_tool_call_events(&mut self, round_index: u32, tool_calls: &[Value]) {
         let mut round_seen = std::collections::HashSet::new();
         for tool_call in tool_calls {
             let key = tool_call
@@ -11470,6 +11764,7 @@ impl ServerAgenticLoopHost {
             if !round_seen.insert(key.clone()) {
                 continue;
             }
+            self.start_explain_analyze_tool_call(tool_call, round_index);
             #[cfg(feature = "e2e-hooks")]
             {
                 let mut shared =
@@ -15348,7 +15643,6 @@ impl ServerAgenticLoopHost {
             finish_reason: result.lifecycle_finish_reason().map(str::to_string),
             session_id: None,
             run_id: None,
-            explain_turns: Vec::new(),
             error_message: None,
             system_prompt_tokens: None,
             system_prompt_breakdown: None,
@@ -15887,6 +16181,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let Some(run_id) = state.current_run_id.clone() else {
             self.explain_analyze_context = None;
             self.explain_analyze_open_nodes.clear();
+            self.explain_analyze_tool_nodes.clear();
             return;
         };
         let started_at = Instant::now();
@@ -15902,6 +16197,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             next_event_id: Arc::new(AtomicU64::new(1)),
         };
         self.explain_analyze_open_nodes.clear();
+        self.explain_analyze_tool_nodes.clear();
         self.explain_analyze_context = Some(context.clone());
         self.start_explain_analyze_node(ExplainAnalyzeNode::new(
             &context,
@@ -15956,6 +16252,69 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             Err(_) => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
         };
         let finished_at = Instant::now();
+        let unfinished_context_assemblies = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::ContextAssembly
+            })
+            .map(|(node_id, node)| (node_id.clone(), node.parent_node_id.clone()))
+            .collect::<Vec<_>>();
+        let mut unfinished_preparation_parents = HashSet::new();
+        for (node_id, parent_node_id) in unfinished_context_assemblies {
+            // Cancellation or an early preparation error can leave this
+            // measurement open. Close it with the terminal outcome and no
+            // context payload; never attach a source breakdown from a partial
+            // assembly or invent a successful span.
+            self.finish_explain_analyze_context_assembly(&node_id, finished_at, outcome, None);
+            if let Some(parent_node_id) = parent_node_id {
+                unfinished_preparation_parents.insert(parent_node_id);
+            }
+        }
+        for parent_node_id in unfinished_preparation_parents {
+            let Some(parent) = self.explain_analyze_open_nodes.get(&parent_node_id) else {
+                continue;
+            };
+            if parent.kind != astra_turn_types::ExplainAnalyzeNodeKindV1::Preparation {
+                continue;
+            }
+            let duration_ms = u64::try_from(
+                finished_at
+                    .saturating_duration_since(parent.started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            self.finish_explain_analyze_node_at(
+                &parent_node_id,
+                duration_ms,
+                outcome,
+                None,
+                finished_at,
+                None,
+            );
+        }
+        let unfinished_settlements = self
+            .explain_analyze_open_nodes
+            .iter()
+            .filter(|(_, node)| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Settlement)
+            .map(|(node_id, node)| (node_id.clone(), node.started_at))
+            .collect::<Vec<_>>();
+        for (node_id, started_at) in unfinished_settlements {
+            let duration_ms = u64::try_from(
+                finished_at
+                    .saturating_duration_since(started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            self.finish_explain_analyze_node_at(
+                &node_id,
+                duration_ms,
+                outcome,
+                None,
+                finished_at,
+                None,
+            );
+        }
         let root = self
             .explain_analyze_open_nodes
             .remove(&context.root_node_id)
@@ -15977,13 +16336,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
-        if let Some(event) = context.event(
+        let coverage_gaps = vec![
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ProviderRetryBackoff,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
+        ];
+        if let Some(event) = context.event_with_context_and_coverage(
             &root,
             astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
             finished_at,
             Some(duration_ms),
             Some(outcome),
             None,
+            None,
+            coverage_gaps,
         ) {
             self.emit_progress_event(event);
         }
@@ -16031,12 +16399,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             TurnPhaseOutcome::Succeeded => astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded,
             TurnPhaseOutcome::Failed => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
         };
+        let context_metrics = if receipt.phase == TurnPhaseKind::RequestPreparation {
+            self.pending_request_preparation_context
+                .as_ref()
+                .filter(|(round, attempt, _)| {
+                    *round == receipt.round_index && *attempt == receipt.attempt_index
+                })
+                .map(|(_, _, context)| context.clone())
+        } else {
+            None
+        };
         self.finish_explain_analyze_node_at(
             &node_id,
             receipt.duration_ms,
             outcome,
             None,
             receipt.finished_at,
+            context_metrics,
         );
     }
 
@@ -16276,6 +16655,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
+        if let Some(context) = self.explain_analyze_context.clone() {
+            let node_id = format!("{}/settlement", context.root_node_id);
+            self.start_explain_analyze_node(ExplainAnalyzeNode::new(
+                &context,
+                node_id,
+                Some(context.root_node_id.clone()),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Settlement,
+                "Deliver final answer",
+                Instant::now(),
+                None,
+                None,
+            ));
+        }
         self.emit_progress_event(json!({ "type": "assistant_output_settled" }));
     }
 
@@ -16740,6 +17132,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
+        let context_assembly_node_id =
+            self.start_explain_analyze_context_assembly(state, Instant::now());
         let (prompt_memory_recall, initial_session_memory_entry) = self
             .memory_context_for_turn(
                 state.session_turn,
@@ -16770,6 +17164,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
                 self.complete_request_preparation_phase(
                     state,
                     turn_started,
@@ -16788,8 +17190,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             breakdown: system_prompt_breakdown,
             tier,
             tool_schemas: pipeline_tool_schemas,
+            explain_analyze_context_assembly: initial_context_assembly,
             manifest_trace,
         } = turn_pipeline;
+        let mut final_context_assembly = initial_context_assembly;
         let mut final_system_messages = system_messages;
         let mut final_volatile_preamble = volatile_preamble;
         let mut final_system_prompt_breakdown = system_prompt_breakdown;
@@ -16876,6 +17280,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             Ok(rerun) => rerun,
             Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
                 self.complete_request_preparation_phase(
                     state,
                     turn_started,
@@ -16888,6 +17300,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         if let Some(rerun) = rerun {
             debug_assert_eq!(rerun.tier, tier);
+            final_context_assembly = crate::turn::llm::context::final_explain_analyze_context_assembly(
+                final_context_assembly,
+                Some(rerun.explain_analyze_context_assembly),
+            );
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
             final_system_prompt_breakdown = rerun.breakdown;
@@ -16982,7 +17398,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
         let mut durable_canonical_cursor = state.messages.len();
-        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = self
+        let (mut llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
                 final_volatile_preamble,
@@ -16993,7 +17409,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 max_output_tokens,
                 compaction_boundary_hit,
-            )?;
+            ) {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                if let Some(node_id) = context_assembly_node_id.as_deref() {
+                    self.finish_explain_analyze_context_assembly(
+                        node_id,
+                        Instant::now(),
+                        explain_analyze_outcome_for_error(&error),
+                        None,
+                    );
+                }
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
+            }
+        };
         // ── 3. Call LLM ─────────────────────────────────────────────────
         // A text-only settlement keeps the provider-visible schema prefix.
         // Marker/uncached protocols also receive their native no-tool choice;
@@ -17054,6 +17490,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     max_output_tokens,
                 )
             };
+        if let Some(node_id) = context_assembly_node_id.as_deref() {
+            self.finish_explain_analyze_context_assembly(
+                node_id,
+                Instant::now(),
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded,
+                final_context_assembly,
+            );
+        }
         if let Some(boundary) = final_wire_compaction_boundary {
             // Keep the emergency final-wire boundary visible in the same
             // manifest that records the measured payload.  The boundary is
@@ -17222,6 +17666,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // execution deadline) was added before the final wire budget was
             // measured; projecting it again here would create a second,
             // unbudgeted request shape.
+            let attempt_wire_budget_status =
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            let attempt_context_metrics =
+                explain_analyze_context_budget(attempt_wire_budget_status, final_tools.len());
             let admission_estimated_tokens = crate::prompts::estimate_wire_input_tokens(
                 &llm_messages,
                 state.pinned_tool_schema_tokens as usize,
@@ -17248,19 +17696,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         llm_main_error_outcome(&error),
                         admission_estimated_tokens as u64,
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
             }
             let prompt_round = next_provider_request_round(state);
-            let attempt_wire_budget_status =
-                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::wire_assembly::set_manifest_wire_budget(
                     trace,
@@ -17295,22 +17742,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "durable inference admission failed: Server execution has no durable run authority",
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -17318,12 +17767,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let durable_ledger = match self.required_inference_ledger(Some(run_authority)) {
                 Ok(ledger) => ledger,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -17335,12 +17785,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "durable inference admission failed: Server execution has no durable run identity",
                     );
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(error);
                 }
@@ -17372,12 +17823,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Ok(invocation) => invocation,
                 Err(failure) => {
                     attempt_in_round = failure.logical_attempt;
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     return Err(failure.error);
                 }
@@ -17388,12 +17840,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ) {
                 Ok(admitted_attempt) => admitted_attempt,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         requested_logical_attempt,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
@@ -17417,12 +17870,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ) {
                 Ok(budget) => budget,
                 Err(error) => {
-                    self.complete_request_preparation_phase(
+                    self.complete_request_preparation_phase_with_context(
                         state,
                         request_attempt_started_at,
                         attempt_in_round,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
                     );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
@@ -17445,6 +17899,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         "provider canonical transition cursor exceeds canonical history",
                     );
+                    self.complete_request_preparation_phase_with_context(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                        attempt_context_metrics.clone(),
+                    );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
                 }
@@ -17458,6 +17920,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             astra_core::ErrorKind::ContractViolation,
                             "provider request does not preserve its staged canonical append suffix",
                         );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
+                        );
                         durable_invocation.finish_error(&error).await?;
                         return Err(error);
                     }
@@ -17465,6 +17935,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::ContractViolation,
                             "provider canonical transition has no admitted durable base",
+                        );
+                        self.complete_request_preparation_phase_with_context(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
                         );
                         durable_invocation.finish_error(&error).await?;
                         return Err(error);
@@ -17491,6 +17969,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                     "failed to plan a bounded provider canonical transition: {source}"
                                 ),
                             );
+                            self.complete_request_preparation_phase_with_context(
+                                state,
+                                request_attempt_started_at,
+                                attempt_in_round,
+                                &mut request_preparation_recorded_attempts,
+                                TurnPhaseOutcome::Failed,
+                                attempt_context_metrics.clone(),
+                            );
                             durable_invocation.finish_error(&error).await?;
                             return Err(error);
                         }
@@ -17513,6 +17999,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
             {
+                self.complete_request_preparation_phase_with_context(
+                    state,
+                    request_attempt_started_at,
+                    attempt_in_round,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                    attempt_context_metrics.clone(),
+                );
                 durable_invocation.finish_error(&error).await?;
                 return Err(error);
             }
@@ -17540,12 +18034,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }) {
                     Ok(plan) => plan,
                     Err(error) => {
-                        self.complete_request_preparation_phase(
+                        self.complete_request_preparation_phase_with_context(
                             state,
                             request_attempt_started_at,
                             attempt_in_round,
                             &mut request_preparation_recorded_attempts,
                             TurnPhaseOutcome::Failed,
+                            attempt_context_metrics.clone(),
                         );
                         // Durable admission already owns this authoritative
                         // attempt. If attempt-keyed artifact planning fails
@@ -17591,12 +18086,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 model_round_node_id,
                 state.current_round_index,
             );
-            self.complete_request_preparation_phase(
+            self.complete_request_preparation_phase_with_context(
                 state,
                 request_attempt_started_at,
                 attempt_in_round,
                 &mut request_preparation_recorded_attempts,
                 TurnPhaseOutcome::Succeeded,
+                attempt_context_metrics,
             );
             if state.messaging.progress_emitter.is_none() {
                 self.emit_progress_event(json!({
@@ -18972,7 +19468,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 control: AdmittedToolCallControl::FailedClosed,
             };
         }
-        self.emit_admitted_tool_call_events(tool_calls);
+        self.emit_admitted_tool_call_events(state.current_round_index, tool_calls);
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let externally_dispatchable = tool_calls
             .iter()
@@ -30277,6 +30773,278 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explain_analyze_tracks_tool_calls_and_final_settlement_with_explicit_coverage() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-explain-tools".to_string(),
+            "s-explain-tools".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-explain-tools".to_string());
+        host.on_turn_started(&state);
+
+        let batch_started = Instant::now();
+        host.on_turn_phase_started(&state, TurnPhaseKind::ToolExecution, 0, 0, batch_started);
+        host.emit_admitted_tool_call_events(
+            0,
+            &[json!({
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "private arguments"}
+            })],
+        );
+        host.emit_progress_event(json!({
+            "type": "tool_call_end",
+            "call_id": "call-1",
+            "tool": "read_file",
+            "status": "completed",
+            "success": true,
+            "output": "private output",
+        }));
+        let batch_finished = Instant::now();
+        host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
+            phase: TurnPhaseKind::ToolExecution,
+            round_index: 0,
+            attempt_index: 0,
+            started_at: batch_started,
+            finished_at: batch_finished,
+            duration_ms: u64::try_from(
+                batch_finished
+                    .saturating_duration_since(batch_started)
+                    .as_millis(),
+            )
+            .unwrap(),
+            outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
+        });
+        host.on_final_output_ready(&state).await;
+        host.on_turn_terminal(&state, &Ok(AgenticLoopOutcome::Completed));
+
+        let explain_facts = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| event["type"] == "explain_analyze")
+            .collect::<Vec<_>>();
+        let tool_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_call" && event["transition"] == "started")
+            .expect("tool call start fact");
+        let batch_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_batch" && event["transition"] == "started")
+            .expect("tool batch start fact");
+        let tool_finish = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "tool_call" && event["transition"] == "finished")
+            .expect("tool call terminal fact");
+        assert_eq!(tool_start["label"], "Run read_file");
+        assert_eq!(tool_start["parent_node_id"], batch_start["node_id"]);
+        assert_eq!(tool_finish["outcome"], "succeeded");
+        assert!(tool_finish["duration_ms"].as_u64().is_some());
+        assert!(tool_finish.get("output").is_none());
+        assert!(!tool_finish.to_string().contains("private"));
+
+        let settlement = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "settlement" && event["transition"] == "finished")
+            .expect("answer settlement node");
+        assert_eq!(settlement["label"], "Deliver final answer");
+        assert_eq!(settlement["transition"], "finished");
+        let turn_terminal = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "turn" && event["transition"] == "finished")
+            .expect("turn terminal fact");
+        assert_eq!(
+            turn_terminal["coverage_gaps"],
+            json!([
+                "approval_wait_intervals",
+                "child_run_intervals",
+                "first_token_latency",
+                "provider_retry_backoff",
+                "user_input_wait_intervals"
+            ])
+        );
+    }
+
+    #[test]
+    fn explain_preparation_budget_uses_each_attempts_effective_output_cap() {
+        let final_status = crate::turn::wire_assembly::WireBudgetStatus {
+            estimated_input_tokens: 1_200,
+            estimated_system_tokens: 480,
+            tool_schema_tokens: 120,
+            requested_output_tokens: 256,
+            reserved_protocol_tokens: 32,
+            effective_input_limit: 7_000,
+            model_limit: 8_192,
+        };
+        let first_metrics =
+            explain_analyze_context_budget(final_status.with_requested_output_tokens(256), 3)
+                .expect("first request metrics");
+        let retry_metrics =
+            explain_analyze_context_budget(final_status.with_requested_output_tokens(512), 3)
+                .expect("retry request metrics");
+
+        assert_eq!(
+            first_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .requested_output_tokens,
+            256
+        );
+        assert_eq!(
+            retry_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .requested_output_tokens,
+            512
+        );
+        assert_eq!(
+            retry_metrics
+                .budget
+                .as_ref()
+                .unwrap()
+                .estimated_input_tokens,
+            1_200
+        );
+        assert_eq!(retry_metrics.budget.as_ref().unwrap().visible_tool_count, 3);
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-context-budget".to_string(),
+            "s-context-budget".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-context-budget".to_string());
+        host.on_turn_started(&state);
+        let mut recorded_attempts = HashSet::new();
+        for (attempt_index, context_metrics) in [(0, first_metrics), (1, retry_metrics)] {
+            let started_at = Instant::now();
+            host.on_turn_phase_started(
+                &state,
+                TurnPhaseKind::RequestPreparation,
+                0,
+                attempt_index,
+                started_at,
+            );
+            host.complete_request_preparation_phase_with_context(
+                &mut state,
+                started_at,
+                attempt_index,
+                &mut recorded_attempts,
+                TurnPhaseOutcome::Succeeded,
+                Some(context_metrics),
+            );
+        }
+
+        let terminals = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| {
+                event["type"] == "explain_analyze"
+                    && event["kind"] == "preparation"
+                    && event["transition"] == "finished"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(
+            terminals[0]["context"]["budget"]["requested_output_tokens"],
+            256
+        );
+        assert_eq!(
+            terminals[1]["context"]["budget"]["requested_output_tokens"],
+            512
+        );
+        assert_eq!(terminals[1]["context"]["budget"]["visible_tool_count"], 3);
+    }
+
+    #[test]
+    fn failed_or_cancelled_context_assembly_closes_without_partial_metrics() {
+        for (suffix, error_kind, expected_outcome) in [
+            ("cancel", astra_core::ErrorKind::Cancelled, "cancelled"),
+            (
+                "failure",
+                astra_core::ErrorKind::ContractViolation,
+                "failed",
+            ),
+        ] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                format!("u-context-{suffix}"),
+                format!("s-context-{suffix}"),
+            )
+            .build();
+            let mut state = create_test_state();
+            state.current_run_id = Some(format!("run-context-{suffix}"));
+            host.on_turn_started(&state);
+            let started_at = Instant::now();
+            let expected_parent_node_id = ServerAgenticLoopHost::explain_phase_node(
+                host.explain_analyze_context
+                    .as_ref()
+                    .expect("Explain Analyze context should be active"),
+                TurnPhaseKind::RequestPreparation,
+                state.current_round_index,
+                0,
+                started_at,
+            )
+            .node_id;
+            host.on_turn_phase_started(
+                &state,
+                TurnPhaseKind::RequestPreparation,
+                state.current_round_index,
+                0,
+                started_at,
+            );
+            let node_id = host
+                .start_explain_analyze_context_assembly(&state, started_at)
+                .expect("Explain Analyze context should be active");
+
+            let error = astra_core::ClassifiedError::new(error_kind, "test early exit");
+            host.on_turn_terminal(&state, &Err(error));
+
+            let events = host.take_emitted_events();
+            let terminal = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == node_id
+                        && event["transition"] == "finished"
+                })
+                .expect("context assembly terminal");
+            let assembly_start = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == node_id
+                        && event["transition"] == "started"
+                })
+                .expect("context assembly start");
+            assert_eq!(assembly_start["parent_node_id"], expected_parent_node_id);
+            assert_eq!(terminal["kind"], "context_assembly");
+            assert_eq!(terminal["outcome"], expected_outcome);
+            assert!(terminal.get("context").is_none());
+            assert!(
+                events.iter().any(|event| {
+                    event["node_id"] == node_id && event["transition"] == "started"
+                })
+            );
+            let preparation_terminal = events
+                .iter()
+                .find(|event| {
+                    event["type"] == "explain_analyze"
+                        && event["node_id"] == expected_parent_node_id
+                        && event["transition"] == "finished"
+                })
+                .expect("failed or cancelled preparation terminal");
+            assert_eq!(preparation_terminal["outcome"], expected_outcome);
+        }
+    }
+
+    #[tokio::test]
     async fn explain_analyze_host_boundaries_survive_full_and_closed_live_lanes() {
         for (disconnected, emitter) in [false, true]
             .into_iter()
@@ -30397,7 +31165,7 @@ mod tests {
     }
 
     #[test]
-    fn post_response_work_admission_receipt_is_projected_with_distinct_attempt() {
+    fn post_response_work_admission_is_projected_into_the_typed_graph() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -30406,8 +31174,10 @@ mod tests {
         )
         .build();
         let mut state = create_test_state();
+        state.current_run_id = Some("run-work-phase".to_string());
         state.turn_event_buffer =
             Some(astra_services::session_journal::TurnEventBuffer::begin_turn(None, 3));
+        host.on_turn_started(&state);
         host.completed_work_admission_phase = Some((
             Instant::now(),
             3,
@@ -30418,19 +31188,17 @@ mod tests {
         host.flush_completed_work_admission_phase(&mut state);
 
         let events = host.take_emitted_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0],
-            json!({
-                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
-                "schema_version": astra_server_types::TURN_PHASE_SCHEMA_VERSION,
-                "phase": "turn_intent_admission",
-                "round_index": 3,
-                "attempt_index": 1,
-                "outcome": "decided",
-                "duration_ms": events[0]["duration_ms"],
-            })
-        );
+        assert_eq!(events.len(), 3, "root plus one typed stage span");
+        assert_eq!(events[0]["kind"], "turn");
+        assert_eq!(events[0]["transition"], "started");
+        assert_eq!(events[1]["type"], "explain_analyze");
+        assert_eq!(events[1]["kind"], "admission");
+        assert_eq!(events[1]["round_index"], 3);
+        assert_eq!(events[1]["attempt_index"], 1);
+        assert_eq!(events[1]["transition"], "started");
+        assert_eq!(events[2]["node_id"], events[1]["node_id"]);
+        assert_eq!(events[2]["transition"], "finished");
+        assert_eq!(events[2]["outcome"], "resolved");
         let trace_events = state
             .turn_event_buffer
             .as_mut()
@@ -30463,6 +31231,8 @@ mod tests {
         )))
         .build();
         let mut state = create_test_state();
+        state.current_run_id = Some("run-phase-resolution".to_string());
+        host.on_turn_started(&state);
 
         assert!(
             host.execute_turn(&mut state).await.is_err(),
@@ -30473,11 +31243,12 @@ mod tests {
             .into_iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str)
-                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+                    == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+                    && event.get("kind").and_then(Value::as_str) == Some("preparation")
+                    && event.get("transition").and_then(Value::as_str) == Some("finished")
             })
             .collect();
         assert_eq!(phases.len(), 1);
-        assert_eq!(phases[0]["phase"], "request_preparation");
         assert_eq!(phases[0]["outcome"], "failed");
     }
 
@@ -40830,6 +41601,7 @@ mod tests {
             .push(json!({"role": "user", "content": "capture this failed turn"}));
         state.message = "capture this failed turn".to_string();
         state.user_intent = state.message.clone();
+        host.on_turn_started(&state);
 
         let error = match host.execute_turn(&mut state).await {
             Ok(_) => panic!("execute turn should fail"),
@@ -40842,11 +41614,13 @@ mod tests {
             .into_iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str)
-                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+                    == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+                    && event.get("transition").and_then(Value::as_str) == Some("finished")
+                    && event.get("kind").and_then(Value::as_str) != Some("turn")
             })
             .map(|event| {
                 (
-                    event["phase"].as_str().unwrap_or_default().to_string(),
+                    event["kind"].as_str().unwrap_or_default().to_string(),
                     event["outcome"].as_str().unwrap_or_default().to_string(),
                 )
             })
@@ -40854,8 +41628,8 @@ mod tests {
         assert_eq!(
             phase_outcomes,
             vec![
-                ("request_preparation".to_string(), "succeeded".to_string()),
-                ("model_inference".to_string(), "failed".to_string()),
+                ("preparation".to_string(), "succeeded".to_string()),
+                ("model_round".to_string(), "failed".to_string()),
             ],
             "a provider failure must retain both the completed pre-provider boundary and the failed model boundary"
         );

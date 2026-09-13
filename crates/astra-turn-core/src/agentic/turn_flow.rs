@@ -31,11 +31,6 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
     });
 }
 
-/// Append server `explain_turn` JSON values into the session accumulator.
-pub fn append_explain_turn_batch(dst: &mut Vec<Value>, src: &[Value]) {
-    dst.extend(src.iter().cloned());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,12 +79,5 @@ mod tests {
         assert_eq!(turn_sigs.len(), 1);
         assert_eq!(turn_sigs[0].len(), 1);
         assert!(turn_tool_names[0].contains("bash"));
-    }
-
-    #[test]
-    fn append_explain_batch_extends() {
-        let mut v = vec![json!(1)];
-        append_explain_turn_batch(&mut v, &[json!(2), json!(3)]);
-        assert_eq!(v.len(), 3);
     }
 }

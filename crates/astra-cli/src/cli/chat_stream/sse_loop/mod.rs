@@ -35,13 +35,12 @@ use astra_runtime::{
 };
 
 use crate::{
-    ExplainMode, StreamResult,
+    StreamResult,
     cli::cli_config::cli_utils::{cli_user_id, terminal_width_usize},
     edge_tools,
 };
 
 use crate::cli::chat_stream::ChatTurnParams;
-use crate::cli::chat_stream::explain_reports;
 use crate::cli::chat_stream::params::StreamEvent;
 use crate::cli::session::session_runtime::{self, ServerDefaultModel};
 use agentic_sse_loop::{
@@ -898,7 +897,8 @@ pub(crate) async fn stream_chat_sse(
             stall
         },
         telemetry: TelemetryState {
-            explain_turns: Vec::new(),
+            explain_analyze_events: Vec::new(),
+            explain_analyze_degraded: false,
             first_ttft_ms: None,
             all_tools_used: HashSet::new(),
             authoritative_llm_rounds: None,
@@ -1219,18 +1219,8 @@ pub(crate) async fn stream_chat_sse(
         verbose_mode: p.verbose_mode,
         start,
         model: p.model,
-        explain_turns: &state.telemetry.explain_turns,
-        pending_context_assembly_trace: state
-            .telemetry
-            .pending_context_assembly_trace
-            .as_ref()
-            .map(|(_, trace_json)| trace_json),
-        tool_call_records: &state.stall.tool_call_records,
-        assistant_output: &state.final_text,
-        ttft_ms: state.telemetry.first_ttft_ms,
-        context_ms: state.telemetry.first_context_assembly_ms,
-        memoria_ms: state.telemetry.first_memoria_ms,
-        llm_rounds: Some(state.llm_rounds_completed),
+        explain_analyze_events: &state.telemetry.explain_analyze_events,
+        explain_analyze_degraded: state.telemetry.explain_analyze_degraded,
         verdict_events: &state.stall.verdict_events,
         has_any_usage: state.has_any_usage,
         total_prompt: state.total_prompt,
@@ -1248,58 +1238,11 @@ pub(crate) async fn stream_chat_sse(
         .and_then(|intent| intent.domain)
         .map(|domain| domain.as_str().to_string());
 
-    // Forward explain / verdict to TUI stream (if wired).
+    // Typed Explain Analyze facts have already flowed through the live event
+    // channel. Emit only the independent verdict surface here; rebuilding an
+    // explanation from trace records would duplicate or contradict the graph.
     if let Some(ref tx) = p.stream_event_tx {
-        let explain_turns = state.telemetry.explain_turns.clone();
         let verdict_events = state.stall.verdict_events.clone();
-        let _ = tx.send(StreamEvent::ExplainReport(explain_turns)).await;
-        if p.explain != ExplainMode::Off {
-            let tool_count = resolved_tool_metrics(
-                0,
-                std::iter::empty::<String>(),
-                &state.stall.tool_call_records,
-            )
-            .0;
-            let meta = crate::explain_dag::ExplainTurnMeta {
-                turn_label: None,
-                duration_ms: Some(start.elapsed().as_millis() as u64),
-                ttft_ms: state.telemetry.first_ttft_ms,
-                context_ms: state.telemetry.first_context_assembly_ms,
-                memoria_ms: state.telemetry.first_memoria_ms,
-                total_llm_ms: None,
-                total_tool_ms: Some(
-                    state
-                        .stall
-                        .tool_call_records
-                        .iter()
-                        .filter(|record| !record.is_synthetic_placeholder())
-                        .map(|record| record.ms)
-                        .sum(),
-                ),
-                prompt_tokens: Some(state.total_prompt),
-                completion_tokens: Some(state.total_completion),
-                cache_read_tokens: Some(state.total_cache_read),
-                cache_creation_tokens: Some(state.total_cache_creation),
-                tool_count: Some(tool_count),
-                llm_rounds: Some(state.llm_rounds_completed),
-                routing_domain_hint: routing_domain_hint.clone(),
-                assistant_output: Some(&state.final_text),
-                tool_call_records: &state.stall.tool_call_records,
-                visible_tools: Vec::new(),
-            };
-            if let Some(text) = explain_reports::render_explain_report_text(
-                &state.telemetry.explain_turns,
-                Some(&meta),
-                state
-                    .telemetry
-                    .pending_context_assembly_trace
-                    .as_ref()
-                    .map(|(_, trace_json)| trace_json),
-                p.explain == ExplainMode::Verbose,
-            ) {
-                let _ = tx.send(StreamEvent::ExplainText(text)).await;
-            }
-        }
         let _ = tx.send(StreamEvent::VerdictReport(verdict_events)).await;
     }
 

@@ -478,9 +478,9 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             TuiAppEvent::PermissionAutoApproved { tool, reason }
         }
-        StreamEvent::ExplainReport(items) => TuiAppEvent::ExplainReport(items),
+        StreamEvent::ExplainAnalyze(event) => TuiAppEvent::ExplainAnalyze(event),
+        StreamEvent::ExplainAnalyzeGap => TuiAppEvent::ExplainAnalyzeGap,
         StreamEvent::VerdictReport(items) => TuiAppEvent::VerdictReport(items),
-        StreamEvent::ExplainText(_) => return None,
     })
 }
 
@@ -496,6 +496,32 @@ mod tests {
             run_id: "test-run".into(),
             agent_id: agent_id.into(),
             kind: AgentLiveEventKind::OutputDelta(text.into()),
+        }
+    }
+
+    fn explain_analyze_event() -> astra_turn_types::ExplainAnalyzeEventV1 {
+        astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:1".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn-1".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "server-loop".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            elapsed_ms: 0,
+            start_elapsed_ms: None,
+            duration_ms: None,
+            outcome: None,
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
         }
     }
 
@@ -587,6 +613,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn explain_analyze_stream_event_maps_to_the_typed_tui_event() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::ExplainAnalyze(explain_analyze_event())),
+            Some(TuiAppEvent::ExplainAnalyze(event)) if event.event_id == "clock-1:1"
+        ));
+    }
+
+    #[test]
+    fn explain_analyze_gap_maps_to_the_tui_event() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::ExplainAnalyzeGap),
+            Some(TuiAppEvent::ExplainAnalyzeGap)
+        ));
+    }
+
     #[tokio::test]
     async fn controlled_close_drains_accepted_events_before_terminal_projection_barrier() {
         let (tui_tx, mut tui_rx) = create_channels();
@@ -600,12 +642,9 @@ mod tests {
             .await
             .expect("visible settlement is not the terminal turn drain");
         stream_tx
-            .send(StreamEvent::ExplainReport(vec![serde_json::json!({
-                "after_visible_settlement": true
-            })]))
+            .send(StreamEvent::ExplainAnalyze(explain_analyze_event()))
             .await
-            .expect("post-loop report is still part of the same turn");
-
+            .expect("Explain Analyze fact remains part of the same turn");
         control.close_and_drain();
 
         assert!(matches!(
@@ -618,9 +657,7 @@ mod tests {
         ));
         assert!(matches!(
             tui_rx.recv().await,
-            Some(TuiAppEvent::ExplainReport(items))
-                if items.first().and_then(|item| item["after_visible_settlement"].as_bool())
-                    == Some(true)
+            Some(TuiAppEvent::ExplainAnalyze(event)) if event.event_id == "clock-1:1"
         ));
         assert!(matches!(
             tui_rx.recv().await,

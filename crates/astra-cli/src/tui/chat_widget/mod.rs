@@ -42,8 +42,9 @@ use super::agent_run_projection::{
     AgentProjectionConfidence, AgentProjectionSource, AgentRunState, AgentRunStatus,
 };
 use super::history_cell::{
-    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell,
-    task::TaskCell, tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
+    HistoryCell, assistant::AssistantCell, explain_analyze::ExplainAnalyzeCell,
+    reasoning::ReasoningCell, system::SystemCell, task::TaskCell, tool::ToolCell,
+    turn_summary::TurnSummaryCell, user::UserCell,
 };
 use super::turn_event::TurnEvent;
 use crate::VerdictEvent;
@@ -54,6 +55,7 @@ use astra_turn_core::{
         agent_fanout_control_receipt_kind,
     },
 };
+use ratatui::text::Line;
 
 /// Events the ChatWidget knows how to route. Grouped by origin so
 /// `handle_event` can scale to more variants without bloating a
@@ -162,7 +164,8 @@ pub(crate) enum WireEvent {
     SystemWarning(String),
     /// System-level informational message. Rendered as `SystemCell::info` in scrollback.
     SystemInfo(String),
-    ExplainReport(Vec<serde_json::Value>),
+    ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    ExplainAnalyzeGap,
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event — renders as a system info cell
     /// so the user sees live context-health feedback in scrollback.
@@ -1700,6 +1703,10 @@ pub(crate) struct ChatWidget {
     history_cell_ids: Vec<u64>,
     active_cell: Option<Box<dyn HistoryCell>>,
     active_cell_id: Option<u64>,
+    /// Mutable canonical Explain projection is independent of active answer/tool cells.
+    explain_analyze_projection: Option<astra_turn_types::ExplainAnalyzeGraphV1>,
+    /// Transport coverage for the active Explain Analyze projection.
+    explain_analyze_delivery_degraded: bool,
     /// Identity of the non-Task ToolCell in `active_cell`. Tool completion
     /// must match this id; a late completion for some other tool must never
     /// finalize the currently visible command by name or position alone.
@@ -1772,6 +1779,8 @@ impl ChatWidget {
             history_cell_ids: Vec::new(),
             active_cell: None,
             active_cell_id: None,
+            explain_analyze_projection: None,
+            explain_analyze_delivery_degraded: false,
             active_tool_use_id: None,
             parked_tools: std::collections::HashMap::new(),
             parked_tool_order: Vec::new(),
@@ -2463,6 +2472,50 @@ impl ChatWidget {
         &self.session_id
     }
 
+    pub(crate) fn explain_analyze_live_lines(
+        &self,
+        width: u16,
+        rows: u16,
+    ) -> Option<Vec<Line<'static>>> {
+        if let Some(graph) = self
+            .explain_analyze_projection
+            .as_ref()
+            .filter(|graph| !graph.nodes().is_empty())
+        {
+            Some(ExplainAnalyzeCell::live_lines(
+                graph,
+                width,
+                rows,
+                self.explain_analyze_delivery_degraded,
+            ))
+        } else if self.explain_analyze_delivery_degraded {
+            Some(ExplainAnalyzeCell::live_lines(
+                &Default::default(),
+                width,
+                rows,
+                true,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn commit_explain_analyze_projection(&mut self) {
+        let delivery_degraded = std::mem::take(&mut self.explain_analyze_delivery_degraded);
+        let Some(mut graph) = self.explain_analyze_projection.take() else {
+            if delivery_degraded {
+                self.commit_cell(Box::new(SystemCell::warning(
+                    "Explain Analyze · incomplete · stream delivery was interrupted before runtime facts could be recovered.",
+                )));
+            }
+            return;
+        };
+        graph.finish_ingest();
+        if !graph.nodes().is_empty() {
+            self.commit_cell(Box::new(ExplainAnalyzeCell::new(graph, delivery_degraded)));
+        }
+    }
+
     pub fn history(&self) -> &[Arc<dyn HistoryCell>] {
         &self.history
     }
@@ -2682,7 +2735,8 @@ impl ChatWidget {
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
             WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
             WireEvent::SystemInfo(msg) => self.on_system_info(msg),
-            WireEvent::ExplainReport(items) => self.on_explain_report(items),
+            WireEvent::ExplainAnalyze(fact) => self.on_explain_analyze(fact),
+            WireEvent::ExplainAnalyzeGap => self.explain_analyze_delivery_degraded = true,
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
                 self.commit_system(SystemCell::info(event.summary));
@@ -2703,6 +2757,7 @@ impl ChatWidget {
         // orphans would persist into the new turn and be misattributed to
         // that turn's transcript snapshot.
         self.commit_transcript_boundary();
+        self.commit_explain_analyze_projection();
         self.drain_all_live_tasks();
         self.end_turn_agent_observation();
         let cell = UserCell::new(text);
@@ -3945,6 +4000,7 @@ impl ChatWidget {
         self.commit_transcript_boundary();
         self.drain_all_live_tasks();
         self.end_turn_agent_observation();
+        self.commit_explain_analyze_projection();
 
         let summary = TurnSummaryCell {
             elapsed_ms: stats.elapsed_ms,
@@ -3985,6 +4041,7 @@ impl ChatWidget {
         self.commit_transcript_boundary();
         self.drain_all_live_tasks();
         self.end_turn_agent_observation();
+        self.commit_explain_analyze_projection();
         self.commit_cell(Box::new(SystemCell::error(msg)));
     }
 
@@ -3996,44 +4053,11 @@ impl ChatWidget {
         self.commit_cell(Box::new(SystemCell::info(msg)));
     }
 
-    fn on_explain_report(&mut self, items: Vec<serde_json::Value>) {
-        if items.is_empty() {
-            return;
-        }
-        let mut parts = Vec::new();
-        for item in &items {
-            let mut line = String::new();
-            if let Some(ms) = item.get("total_ms").and_then(|v| v.as_i64()) {
-                line.push_str(&format!("⏱ {:.1}s", ms as f64 / 1000.0));
-            }
-            if let Some(selected) = item.get("visible_tools").and_then(|v| v.as_u64()) {
-                if let Some(available) = item.get("tools_available").and_then(|v| v.as_u64()) {
-                    if !line.is_empty() {
-                        line.push_str(" | ");
-                    }
-                    line.push_str(&format!("🛠 {}/{} tools", selected, available));
-                }
-            }
-            if let Some(steps) = item.get("steps").and_then(|v| v.as_array()) {
-                if !line.is_empty() {
-                    line.push_str(" | ");
-                }
-                line.push_str(&format!("📋 {} steps", steps.len()));
-            }
-            if !line.is_empty() {
-                parts.push(line);
-                continue;
-            }
-            if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
-                let content = content.trim();
-                if !content.is_empty() {
-                    parts.push(content.to_string());
-                }
-            }
-        }
-        if !parts.is_empty() {
-            let text = format!("Context Explain\n{}", parts.join("\n"));
-            self.commit_cell(Box::new(SystemCell::info(text)));
+    fn on_explain_analyze(&mut self, fact: astra_turn_types::ExplainAnalyzeEventV1) {
+        if fact.is_valid() {
+            self.explain_analyze_projection
+                .get_or_insert_with(Default::default)
+                .apply(fact);
         }
     }
 
@@ -4518,6 +4542,19 @@ fn cell_from_persist(ev: TurnEvent) -> Option<Box<dyn HistoryCell>> {
         TurnEvent::TurnSummary { .. } => {
             TurnSummaryCell::from_persist(ev).map(|c| Box::new(c) as Box<dyn HistoryCell>)
         }
+        TurnEvent::ExplainAnalyze {
+            events,
+            delivery_degraded,
+        } => {
+            let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+            for event in events {
+                graph.apply(event);
+            }
+            graph.finish_ingest();
+            (!graph.nodes().is_empty()).then(|| {
+                Box::new(ExplainAnalyzeCell::new(graph, delivery_degraded)) as Box<dyn HistoryCell>
+            })
+        }
     }
 }
 
@@ -4540,6 +4577,148 @@ mod tests {
         // A local widget has no durable transcript until the runtime commits
         // canonical journal items. This keeps reducer tests filesystem-free.
         ChatWidget::new("")
+    }
+
+    fn explain_turn_start() -> astra_turn_types::ExplainAnalyzeEventV1 {
+        astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:turn-start".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn-1".into(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "server-loop".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            elapsed_ms: 0,
+            start_elapsed_ms: None,
+            duration_ms: None,
+            outcome: None,
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        }
+    }
+
+    fn history_cell_text(cell: &dyn HistoryCell, width: u16) -> String {
+        cell.display_lines(width)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn explain_tree_streams_beside_the_answer_and_commits_after_it_once() {
+        let mut widget = fresh();
+        let fact = explain_turn_start();
+        widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
+            "answer in progress".into(),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(fact.clone())));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(fact)));
+
+        let answer = widget
+            .active_cell()
+            .and_then(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>())
+            .expect("Explain Analyze must leave the streamed answer active");
+        assert_eq!(answer.source(), "answer in progress");
+        let live = widget
+            .explain_analyze_live_lines(80, 10)
+            .expect("the independent live graph should render");
+        let live_text = live
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(live_text.contains("recording"), "{live_text}");
+        assert!(!live_text.contains("incomplete"), "{live_text}");
+
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        assert_eq!(
+            widget.history.len(),
+            3,
+            "answer, explain graph, then turn summary"
+        );
+        assert!(widget.history[0].as_any_ref().is::<AssistantCell>());
+        let explain = widget.history[1]
+            .as_any_ref()
+            .downcast_ref::<ExplainAnalyzeCell>()
+            .expect("typed facts commit as the Explain Analyze history cell");
+        let frozen = history_cell_text(explain, 100);
+        assert!(frozen.contains("incomplete"), "{frozen}");
+        assert!(frozen.contains("End not recorded"), "{frozen}");
+        assert_eq!(
+            frozen.matches("User turn").count(),
+            1,
+            "duplicate replay is idempotent"
+        );
+        assert!(widget.history[2].as_any_ref().is::<TurnSummaryCell>());
+    }
+
+    #[test]
+    fn explain_gap_without_facts_is_visible_live_and_at_turn_end() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeGap));
+
+        let live = widget
+            .explain_analyze_live_lines(80, 10)
+            .expect("a gap before the first fact must still be visible");
+        let live_text = live
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(live_text.contains("incomplete · stream gap"), "{live_text}");
+
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+        assert!(widget.history[0].as_any_ref().is::<SystemCell>());
+        let warning = history_cell_text(widget.history[0].as_ref(), 100);
+        assert!(warning.contains("incomplete"), "{warning}");
+        assert!(widget.history[1].as_any_ref().is::<TurnSummaryCell>());
+    }
+
+    #[test]
+    fn explain_tree_survives_turn_error_without_fabricating_a_terminal_fact() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
+            "partial answer".into(),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(
+            explain_turn_start(),
+        )));
+
+        widget.handle_event(AppEvent::wire(WireEvent::TurnError(
+            "provider disconnected".into(),
+        )));
+
+        assert_eq!(widget.history.len(), 3, "partial answer, graph, and error");
+        assert!(widget.history[0].as_any_ref().is::<AssistantCell>());
+        let explain = widget.history[1]
+            .as_any_ref()
+            .downcast_ref::<ExplainAnalyzeCell>()
+            .expect("failed turns keep the measurement tree");
+        let rendered = history_cell_text(explain, 100);
+        assert!(rendered.contains("End not recorded"), "{rendered}");
+        assert!(!rendered.contains("Completed"), "{rendered}");
     }
 
     fn local_agent_info(
@@ -5694,30 +5873,6 @@ mod tests {
             detail.status,
             crate::tui::history_cell::task::TaskStatus::Completed
         ));
-    }
-
-    #[test]
-    fn explain_report_with_content_fallback_commits_system_cell() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::wire(WireEvent::ExplainReport(vec![
-            serde_json::json!(
-                {
-                    "type": "explain",
-                    "content": "why this happened"
-                }
-            ),
-        ])));
-
-        let sys = w
-            .history
-            .last()
-            .and_then(|cell| cell.as_any_ref().downcast_ref::<SystemCell>())
-            .expect("explain report should append a system cell");
-        assert!(
-            sys.message().contains("why this happened"),
-            "content fallback should render the explain text: {}",
-            sys.message()
-        );
     }
 
     #[test]

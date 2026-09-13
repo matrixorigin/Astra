@@ -78,14 +78,6 @@ pub const WORK_TASK_BOARD_TEXT_MAX_BYTES: usize = 512;
 pub const WORK_TASK_BOARD_MAX_UNAVAILABLE_CAPABILITIES: usize = 16;
 pub const WORK_TASK_BOARD_CAPABILITY_MAX_BYTES: usize = 128;
 
-/// Shared turn-lifecycle receipt protocol. It lives in `astra-turn-types` so
-/// the server, durable replay service, and clients validate one definition
-/// without a dependency cycle.
-pub use astra_turn_types::{
-    TURN_PHASE_EVENT_TYPE, TURN_PHASE_SCHEMA_VERSION, TurnPhaseKindV1, TurnPhaseOutcomeV1,
-    TurnPhaseReceiptV1,
-};
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WorkTaskBoardUpdateV1 {
     pub schema_version: u16,

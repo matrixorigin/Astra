@@ -18,10 +18,9 @@ use crossterm::style::Stylize;
 use serde_json::Value;
 
 use crate::cli::stream::streaming_types::AppliedStreamUserIntent;
-use crate::explain_dag::ExplainTurnMeta;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 
-use crate::cli::chat_stream::explain_reports::{print_explain_report, print_verdict_report};
+use crate::cli::chat_stream::verdict_reports::print_verdict_report;
 
 pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) explain: ExplainMode,
@@ -29,14 +28,8 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) verbose_mode: bool,
     pub(crate) start: Instant,
     pub(crate) model: Option<&'a str>,
-    pub(crate) explain_turns: &'a [Value],
-    pub(crate) pending_context_assembly_trace: Option<&'a serde_json::Value>,
-    pub(crate) tool_call_records: &'a [ToolCallRecord],
-    pub(crate) assistant_output: &'a str,
-    pub(crate) ttft_ms: Option<u64>,
-    pub(crate) context_ms: Option<u64>,
-    pub(crate) memoria_ms: Option<u64>,
-    pub(crate) llm_rounds: Option<u32>,
+    pub(crate) explain_analyze_events: &'a [astra_turn_types::ExplainAnalyzeEventV1],
+    pub(crate) explain_analyze_degraded: bool,
     pub(crate) verdict_events: &'a [VerdictEvent],
     pub(crate) has_any_usage: bool,
     pub(crate) total_prompt: u64,
@@ -53,14 +46,8 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         verbose_mode,
         start,
         model,
-        explain_turns,
-        pending_context_assembly_trace,
-        tool_call_records,
-        assistant_output,
-        ttft_ms,
-        context_ms,
-        memoria_ms,
-        llm_rounds,
+        explain_analyze_events,
+        explain_analyze_degraded,
         verdict_events,
         has_any_usage,
         total_prompt,
@@ -71,38 +58,13 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     } = ctx;
 
     if explain != ExplainMode::Off && !quiet {
-        let tool_count =
-            resolved_tool_metrics(0, std::iter::empty::<String>(), tool_call_records).0;
-        let meta = ExplainTurnMeta {
-            turn_label: None,
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            ttft_ms,
-            context_ms,
-            memoria_ms,
-            total_llm_ms: None,
-            total_tool_ms: Some(
-                tool_call_records
-                    .iter()
-                    .filter(|record| !record.is_synthetic_placeholder())
-                    .map(|record| record.ms)
-                    .sum(),
-            ),
-            prompt_tokens: Some(total_prompt),
-            completion_tokens: Some(total_completion),
-            cache_read_tokens: Some(total_cache_read),
-            cache_creation_tokens: Some(total_cache_creation),
-            tool_count: Some(tool_count),
-            llm_rounds,
-            routing_domain_hint: None,
-            assistant_output: Some(assistant_output),
-            tool_call_records,
-            visible_tools: Vec::new(),
-        };
-        print_explain_report(
-            explain_turns,
-            Some(&meta),
-            pending_context_assembly_trace,
-            explain == ExplainMode::Verbose,
+        eprintln!(
+            "{}",
+            crate::explain_analyze_report::render(
+                explain_analyze_events,
+                explain == ExplainMode::Verbose,
+                explain_analyze_degraded,
+            )
         );
     }
     if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {

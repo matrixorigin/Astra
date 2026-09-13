@@ -328,6 +328,8 @@ fn render_primary_workspace(
 ///   3. Nothing → `Empty`. Idle REPL shows nothing above the composer.
 pub(crate) struct ViewportFrame {
     pub active: ActiveView,
+    /// Independent bounded Explain observer beside the streamed answer.
+    pub explain_analyze: Option<Vec<Line<'static>>>,
     /// Parallel agents to render ABOVE the active cell. Rendered as
     /// a stack of `LiveFramedCell`s with a "▶ N parallel agents"
     /// header. Co-exists with `active` (which usually holds an
@@ -579,8 +581,10 @@ pub(crate) fn active_viewport(
         _ => None,
     };
     let active = pick_active_view(active, status_line, next_hint);
+    let explain_analyze = chat_widget.explain_analyze_live_lines(inner_w, rows.saturating_sub(8));
     ViewportFrame {
         active,
+        explain_analyze,
         multi_agent: multi_agent_active,
         task_board,
         resolved_board_expanded: resolved_expanded,
@@ -662,6 +666,7 @@ pub(crate) fn do_draw(
     guard: &mut TerminalGuard,
     active: ActiveView,
     multi_agent: Option<Vec<MultiAgentEntry>>,
+    explain_analyze: Option<Vec<Line<'static>>>,
     bottom_pane: &mut BottomPane,
     task_board: Option<(&TaskBoardObserver, bool)>,
     task_board_lines: Option<Vec<Line<'static>>>,
@@ -774,6 +779,12 @@ pub(crate) fn do_draw(
     flex.push(1, ac_renderable);
     if let Some(item) = multi_agent_renderable {
         flex.push(0, item);
+    }
+    if let Some(lines) = explain_analyze.filter(|lines| !lines.is_empty()) {
+        flex.push(
+            0,
+            RenderableItem::Owned(Box::new(LiveFramedCell { lines, live: true })),
+        );
     }
     let board_rendered = task_board_lines
         .as_ref()

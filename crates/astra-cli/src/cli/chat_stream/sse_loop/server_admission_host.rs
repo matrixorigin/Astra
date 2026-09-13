@@ -987,8 +987,9 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // side-channel that only exists while a TUI receiver is attached.
         state
             .telemetry
-            .explain_turns
-            .extend(turn_result.phase_receipts.iter().cloned());
+            .explain_analyze_events
+            .extend(turn_result.core.explain_analyze_events.iter().cloned());
+        state.telemetry.explain_analyze_degraded |= turn_result.core.explain_analyze_degraded;
 
         if turn_result.core.server_loop_terminal {
             // Server-owned runs execute their tools remotely, so the thin

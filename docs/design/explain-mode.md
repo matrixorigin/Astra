@@ -191,6 +191,13 @@ parallel graph formats. The version field is part of this schema's evolution,
 not a request to preserve superseded event shapes. Trace event schemas remain
 owned and versioned by the observation plane.
 
+A terminal `turn` fact carries the producer's known `coverage_gaps`. Schema v1
+currently reports approval-wait intervals, user-input waits, provider retry
+backoff, time to first token, and child-run intervals as unmeasured boundaries.
+Coverage gaps do not make observed facts structurally inconsistent, but they
+do prevent a renderer from presenting observed overlap as total concurrency.
+Render the measured overlap as a lower bound and name the unmeasured boundaries.
+
 ## Presentation contract
 
 - **CLI/TUI:** show live stage, elapsed wall time, completed stages, active

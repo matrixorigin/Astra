@@ -1670,8 +1670,12 @@ fn serialize_invoked_skills<S: serde::Serializer>(
 /// Telemetry and observability state for the agentic loop.
 #[derive(Default)]
 pub struct TelemetryState {
-    /// Explain data collected per turn.
-    pub explain_turns: Vec<Value>,
+    /// Canonical runtime Explain Analyze facts. Trace records remain in their
+    /// own observation pipeline and are never merged into this graph.
+    pub explain_analyze_events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+    /// True when the event stream contained a gap or invalid fact that may
+    /// have truncated the Explain Analyze projection.
+    pub explain_analyze_degraded: bool,
     /// Time-to-first-token for the first LLM turn (ms).
     pub first_ttft_ms: Option<u64>,
     /// All tool names used across all turns.

@@ -346,7 +346,103 @@ pub(crate) struct LlmContextAssemblyOutput {
     pub breakdown: astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     pub tool_schemas: Vec<Value>,
+    /// Source-level text estimates from the final serialized pipeline output.
+    /// This excludes later request-envelope assembly and provider usage.
+    pub explain_analyze_context_assembly: Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1>,
     pub manifest_trace: LlmContextManifestTrace,
+}
+
+const EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER: [astra_turn_types::ExplainAnalyzeContextSourceKindV1;
+    15] = [
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::Identity,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::SelfModel,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::ProjectContext,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::DeferredTools,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::AvailableSkills,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::Memory,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::WorkingMemory,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::History,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::Constraints,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::Skills,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeIdentity,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeVolatile,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSkills,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentMemory,
+    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSummary,
+];
+
+fn explain_analyze_source_kind(
+    kind: astra_turn_core::section_types::SectionKind,
+) -> astra_turn_types::ExplainAnalyzeContextSourceKindV1 {
+    use astra_turn_core::section_types::SectionKind;
+    use astra_turn_types::ExplainAnalyzeContextSourceKindV1 as SourceKind;
+
+    match kind {
+        SectionKind::Identity => SourceKind::Identity,
+        SectionKind::SelfModel => SourceKind::SelfModel,
+        SectionKind::ProjectContext => SourceKind::ProjectContext,
+        SectionKind::DeferredTools => SourceKind::DeferredTools,
+        SectionKind::AvailableSkills => SourceKind::AvailableSkills,
+        SectionKind::Memory => SourceKind::Memory,
+        SectionKind::WorkingMemory => SourceKind::WorkingMemory,
+        SectionKind::History => SourceKind::History,
+        SectionKind::Constraints => SourceKind::Constraints,
+        SectionKind::Skills => SourceKind::Skills,
+        SectionKind::RuntimeIdentity => SourceKind::RuntimeIdentity,
+        SectionKind::RuntimeVolatile => SourceKind::RuntimeVolatile,
+        SectionKind::EmergentSkills => SourceKind::EmergentSkills,
+        SectionKind::EmergentMemory => SourceKind::EmergentMemory,
+        SectionKind::EmergentSummary => SourceKind::EmergentSummary,
+    }
+}
+
+/// Aggregate only the final serializer's non-empty section blocks. Text stays
+/// inside the runtime; the event receives bounded source names, counts, and
+/// coarse token estimates only.
+fn explain_analyze_context_assembly_metrics(
+    blocks: &[astra_turn_core::context_serializer::SerializedSystemBlock],
+) -> Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1> {
+    let mut sources = EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER
+        .iter()
+        .copied()
+        .map(|kind| astra_turn_types::ExplainAnalyzeContextSourceV1 {
+            kind,
+            section_count: 0,
+            estimated_tokens: 0,
+        })
+        .collect::<Vec<_>>();
+
+    for block in blocks {
+        let source_kind = explain_analyze_source_kind(block.kind);
+        let source = sources
+            .iter_mut()
+            .find(|source| source.kind == source_kind)?;
+        source.section_count = source.section_count.checked_add(1)?;
+        source.estimated_tokens = source.estimated_tokens.checked_add(u64::from(
+            astra_turn_core::section_types::estimate_text_tokens(&block.text),
+        ))?;
+        if source.estimated_tokens > astra_turn_types::EXPLAIN_ANALYZE_MAX_SAFE_INTEGER {
+            return None;
+        }
+    }
+
+    let assembly = astra_turn_types::ExplainAnalyzeContextAssemblyV1 {
+        basis: astra_turn_types::ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
+        sources: sources
+            .into_iter()
+            .filter(|source| source.section_count > 0)
+            .collect(),
+    };
+    assembly.is_valid().then_some(assembly)
+}
+
+/// A compaction rerun is the authoritative final assembly even if it cannot
+/// produce metrics. `None` for the outer option means there was no rerun.
+pub(crate) fn final_explain_analyze_context_assembly(
+    initial: Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1>,
+    rerun: Option<Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1>>,
+) -> Option<astra_turn_types::ExplainAnalyzeContextAssemblyV1> {
+    rerun.unwrap_or(initial)
 }
 
 #[derive(Clone, Debug)]
@@ -1364,6 +1460,8 @@ pub(crate) fn assemble_context_pipeline(
         }
     }
 
+    let explain_analyze_context_assembly =
+        explain_analyze_context_assembly_metrics(&pipeline_output.serialized.system_blocks);
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
     );
@@ -1508,6 +1606,7 @@ pub(crate) fn assemble_context_pipeline(
         breakdown,
         tier,
         tool_schemas: pipeline_output.optimized.tool_schemas,
+        explain_analyze_context_assembly,
         manifest_trace: LlmContextManifestTrace {
             source: "llm_context",
             provider: input.provider.to_string(),
@@ -2116,6 +2215,107 @@ mod context_cache_contract_tests {
             .iter()
             .filter_map(|tool| tool_name(tool).map(str::to_string))
             .collect()
+    }
+
+    fn explain_context_block(
+        kind: astra_turn_core::section_types::SectionKind,
+        text: &str,
+    ) -> astra_turn_core::context_serializer::SerializedSystemBlock {
+        astra_turn_core::context_serializer::SerializedSystemBlock {
+            kind,
+            scope: astra_turn_core::section_types::CacheScope::Global,
+            text: text.to_string(),
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn explain_context_assembly_aggregates_only_bounded_source_costs() {
+        let private_identity = "private prompt text that must never leave the runtime";
+        let private_memory = "private retrieved memory that is not a protocol field";
+        let blocks = [
+            explain_context_block(
+                astra_turn_core::section_types::SectionKind::Identity,
+                private_identity,
+            ),
+            explain_context_block(
+                astra_turn_core::section_types::SectionKind::Identity,
+                "additional identity rules",
+            ),
+            explain_context_block(
+                astra_turn_core::section_types::SectionKind::Memory,
+                private_memory,
+            ),
+        ];
+
+        let assembly = explain_analyze_context_assembly_metrics(&blocks).expect("metrics");
+        let identity = assembly
+            .sources
+            .iter()
+            .find(|source| {
+                source.kind == astra_turn_types::ExplainAnalyzeContextSourceKindV1::Identity
+            })
+            .expect("identity source");
+        let memory = assembly
+            .sources
+            .iter()
+            .find(|source| {
+                source.kind == astra_turn_types::ExplainAnalyzeContextSourceKindV1::Memory
+            })
+            .expect("memory source");
+        assert_eq!(identity.section_count, 2);
+        assert_eq!(memory.section_count, 1);
+        assert!(identity.estimated_tokens > 0);
+        assert!(memory.estimated_tokens > 0);
+
+        let encoded = serde_json::to_string(&assembly).expect("wire metrics");
+        assert!(encoded.contains("runtime_text_estimate"));
+        assert!(encoded.contains("identity"));
+        assert!(encoded.contains("memory"));
+        assert!(!encoded.contains(private_identity));
+        assert!(!encoded.contains(private_memory));
+    }
+
+    #[test]
+    fn compaction_rerun_metrics_replace_sources_removed_from_final_assembly() {
+        let initial = explain_analyze_context_assembly_metrics(&[
+            explain_context_block(
+                astra_turn_core::section_types::SectionKind::Identity,
+                "identity",
+            ),
+            explain_context_block(
+                astra_turn_core::section_types::SectionKind::Memory,
+                "removed retrieval",
+            ),
+        ])
+        .expect("initial metrics");
+        let rerun = explain_analyze_context_assembly_metrics(&[explain_context_block(
+            astra_turn_core::section_types::SectionKind::Identity,
+            "identity",
+        )])
+        .expect("rerun metrics");
+
+        let final_assembly =
+            final_explain_analyze_context_assembly(Some(initial), Some(Some(rerun)))
+                .expect("final assembly");
+        assert!(final_assembly.sources.iter().all(|source| {
+            source.kind != astra_turn_types::ExplainAnalyzeContextSourceKindV1::Memory
+        }));
+
+        assert!(
+            final_explain_analyze_context_assembly(Some(final_assembly), Some(None)).is_none(),
+            "an unmeasurable rerun must not fall back to stale pre-rerun costs"
+        );
+    }
+
+    #[test]
+    fn explain_context_source_mapping_covers_every_pipeline_section_kind() {
+        let mapped = astra_turn_core::section_types::SectionKind::all_planned()
+            .iter()
+            .copied()
+            .map(explain_analyze_source_kind)
+            .collect::<HashSet<_>>();
+        assert_eq!(mapped.len(), 15);
     }
 
     #[test]

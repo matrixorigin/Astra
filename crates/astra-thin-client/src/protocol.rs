@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+pub use astra_turn_types::ExplainAnalyzeEventV1;
 pub use astra_turn_types::ModelSelection;
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
@@ -697,10 +698,8 @@ pub enum StreamEvent {
         claims_failed: Option<u64>,
         raw: Value,
     },
-    Explain {
-        content: String,
-        raw: Value,
-    },
+    /// Canonical measured execution fact used by Explain Analyze consumers.
+    ExplainAnalyze(ExplainAnalyzeEventV1),
     Ping,
     Done {
         tokens_used: Option<u64>,
@@ -968,10 +967,11 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             claims_failed: obj.get("claims_failed").and_then(|v| v.as_u64()),
             raw,
         },
-        "explain" => StreamEvent::Explain {
-            content: get_str(&obj, "content"),
-            raw,
-        },
+        astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE => {
+            let fact = astra_turn_types::decode_explain_analyze_wire(&raw)
+                .map_err(|reason| crate::error::ThinClientError::SseParse(reason.to_string()))?;
+            StreamEvent::ExplainAnalyze(fact)
+        }
         "ping" => StreamEvent::Ping,
         "done" => StreamEvent::Done {
             tokens_used: obj.get("tokens_used").and_then(|v| v.as_u64()).or_else(|| {
@@ -1641,16 +1641,105 @@ mod tests {
         }
 
         match classify_stream_event(serde_json::json!({
-            "type": "explain",
+            "type": "unrecognized_event",
             "content": "why this happened"
         }))
         .unwrap()
         {
-            StreamEvent::Explain { content, raw } => {
-                assert_eq!(content, "why this happened");
-                assert_eq!(raw["type"], "explain");
+            StreamEvent::Other { event_type, raw } => {
+                assert_eq!(event_type, "unrecognized_event");
+                assert_eq!(raw["type"], "unrecognized_event");
             }
             other => panic!("unexpected {other:?}"),
+        }
+
+        let explain_analyze = serde_json::json!({
+            "type": "explain_analyze",
+            "schema_version": 1,
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1/provider/0",
+            "parent_node_id": "turn-1",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "provider_attempt",
+            "round_index": 0,
+            "attempt_index": 0,
+            "label": "Provider attempt",
+            "transition": "finished",
+            "elapsed_ms": 82,
+            "start_elapsed_ms": 12,
+            "duration_ms": 70,
+            "outcome": "succeeded",
+            "usage": {
+                "basis": "provider_exact",
+                "fresh_input_tokens": 30,
+                "output_tokens": 4
+            }
+        });
+        match classify_stream_event(explain_analyze).unwrap() {
+            StreamEvent::ExplainAnalyze(fact) => {
+                assert_eq!(fact.event_id, "clock-1:1");
+                assert_eq!(fact.duration_ms, Some(70));
+                assert_eq!(
+                    fact.usage.as_ref().and_then(|usage| usage.output_tokens),
+                    Some(4)
+                );
+                assert!(fact.is_valid());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_analyze_classification_rejects_invalid_or_extended_facts() {
+        for fact in [
+            serde_json::json!({
+                "type": "explain_analyze",
+                "schema_version": 1,
+                "event_id": "clock-1:1",
+                "run_id": "run-1",
+                "turn_id": "turn-1",
+                "node_id": "turn-1/provider/0",
+                "parent_node_id": "turn-1",
+                "producer_id": "server-loop",
+                "clock_domain_id": "clock-1",
+                "kind": "provider_attempt",
+                "round_index": 0,
+                "attempt_index": 0,
+                "label": "Provider attempt",
+                "transition": "finished",
+                "elapsed_ms": 82,
+                "start_elapsed_ms": 12,
+                "duration_ms": 70,
+                "outcome": "succeeded",
+                "usage": {"basis": "provider_exact", "output_tokens": 4},
+                "unreviewed_payload": "drop"
+            }),
+            serde_json::json!({
+                "type": "explain_analyze",
+                "schema_version": 99,
+                "event_id": "clock-1:1",
+                "run_id": "run-1",
+                "turn_id": "turn-1",
+                "node_id": "turn-1/provider/0",
+                "parent_node_id": "turn-1",
+                "producer_id": "server-loop",
+                "clock_domain_id": "clock-1",
+                "kind": "provider_attempt",
+                "round_index": 0,
+                "attempt_index": 0,
+                "label": "Provider attempt",
+                "transition": "finished",
+                "elapsed_ms": 82,
+                "start_elapsed_ms": 12,
+                "duration_ms": 70,
+                "outcome": "succeeded",
+                "usage": {"basis": "provider_exact", "output_tokens": 4}
+            }),
+        ] {
+            assert!(classify_stream_event(fact).is_err());
         }
     }
 

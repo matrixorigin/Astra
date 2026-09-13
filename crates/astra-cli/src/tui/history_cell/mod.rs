@@ -27,6 +27,7 @@
 
 pub(crate) mod approval;
 pub(crate) mod assistant;
+pub(crate) mod explain_analyze;
 pub(crate) mod reasoning;
 pub(crate) mod system;
 pub(crate) mod task;

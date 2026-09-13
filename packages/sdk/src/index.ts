@@ -297,6 +297,7 @@ export {
   explainAnalyzeContextSections,
   formatExplainAnalyzeContext,
   explainAnalyzeTurnOutcome,
+  explainAnalyzeCoverageGapLabel,
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
 } from "./explain-analyze";
@@ -305,6 +306,7 @@ export type {
   ExplainAnalyzeDiagnosticV1,
   ExplainAnalyzeNodeV1,
 } from "./explain-analyze";
+export type { ExplainAnalyzeCoverageGapV1 } from "./types";
 
 export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {

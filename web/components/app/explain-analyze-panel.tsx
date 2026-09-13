@@ -6,6 +6,7 @@ import type { CSSProperties, ReactNode } from "react";
 import {
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
+  explainAnalyzeCoverageGapLabel,
   explainAnalyzeContextSections,
   formatExplainAnalyzeContext,
   formatMs,
@@ -225,10 +226,22 @@ export function ExplainAnalyzePanel({
         </div>
       ) : null}
 
+      {graph.coverageGaps.length > 0 ? (
+        <div role="note" aria-label="Explain Analyze coverage gaps" className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border bg-surface-muted/40 px-5 py-2.5 text-[11px] text-text-muted">
+          <span className="rounded-full border border-warning/20 bg-warning/5 px-2 py-0.5 font-semibold text-warning">Partial capture</span>
+          <span>Not timed separately:</span>
+          <span>{graph.coverageGaps.map(explainAnalyzeCoverageGapLabel).join(" · ")}</span>
+        </div>
+      ) : null}
+
       <div className="explain-analyze-summary" aria-label="Execution summary">
         {finishedTurns.length > 0 ? <Metric label="Turn time" value={turnTime} detail="Runtime measured" /> : null}
         {slowestRequest?.durationMs !== undefined ? <Metric label="Slowest model request" value={formatMs(slowestRequest.durationMs)} detail={requestIdentity(slowestRequest)} /> : null}
-        {maxConcurrency !== null ? <Metric label="Peak parallel work" value={`${maxConcurrency} at once`} detail="Within the same worker timeline" /> : null}
+        {maxConcurrency !== null ? <Metric
+          label={graph.coverageGaps.length > 0 ? "Observed overlap" : "Peak parallel work"}
+          value={graph.coverageGaps.length > 0 ? `At least ${maxConcurrency} at once` : `${maxConcurrency} at once`}
+          detail={graph.coverageGaps.length > 0 ? "Lower bound from recorded spans, evaluated per clock domain" : "Measured within each worker timeline"}
+        /> : null}
         {live && activeCount > 0 ? <Metric label="Active stages" value={String(activeCount)} detail="Includes parent stages" /> : null}
         <span className="explain-analyze-summary-count">{graph.nodes.length} stages</span>
       </div>

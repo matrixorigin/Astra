@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  explainAnalyzeFactFingerprint,
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
   isExplainAnalyzeEventV1,
@@ -58,6 +59,49 @@ function finished(
 }
 
 describe("Explain Analyze graph reducer", () => {
+  it("canonicalizes empty dependencies the same way for live and indexed replay facts", () => {
+    const live = started("attempt", "provider_attempt", 0, {
+      round_index: 0,
+      attempt_index: 0,
+    });
+    const replay = { ...live, dependency_node_ids: [], index: 7 };
+
+    expect(explainAnalyzeFactFingerprint(live)).toBe(explainAnalyzeFactFingerprint(replay));
+    const graph = reduceExplainAnalyzeEvents([live, replay]);
+    expect(graph.duplicateEventCount).toBe(1);
+    expect(graph.conflictedNodeIds).toEqual([]);
+  });
+
+  it("surfaces measured coverage gaps without treating them as graph corruption", () => {
+    const gaps: NonNullable<ExplainAnalyzeEventV1["coverage_gaps"]> = [
+      "approval_wait_intervals",
+      "child_run_intervals",
+    ];
+    const turn = finished("turn", "turn", 0, 100, {
+      outcome: "completed",
+      coverage_gaps: gaps,
+    });
+    const graph = reduceExplainAnalyzeEvents([turn]);
+
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.coverageGaps).toEqual(gaps);
+    expect(graph.nodes[0].coverageGaps).toEqual(gaps);
+    expect(renderExplainAnalyzeHtml([turn])).toContain(
+      "approval waits · child-run timing",
+    );
+    expect(isExplainAnalyzeEventV1({
+      ...started("turn", "turn", 0),
+      coverage_gaps: gaps,
+    })).toBe(false);
+    expect(isExplainAnalyzeEventV1({
+      ...finished("attempt", "provider_attempt", 0, 5, {
+        round_index: 0,
+        attempt_index: 0,
+      }),
+      coverage_gaps: gaps,
+    })).toBe(false);
+  });
+
   it("rebuilds a missing start, deduplicates replay, and measures same-clock overlap", () => {
     const first = finished("attempt-0", "provider_attempt", 10, 80, {
       parent_node_id: "round-0",
@@ -399,6 +443,7 @@ describe("context facts", () => {
 
   it("rejects wrong stage scope, duplicate sources, previews and unsafe counts", () => {
     expect(isExplainAnalyzeEventV1({ ...started("p", "preparation", 0), context: { budget } })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), context: { budget }, usage: { basis: "provider_exact" } })).toBe(false);
     expect(isExplainAnalyzeEventV1({ ...finished("c", "context_assembly", 0, 10), context: { budget } })).toBe(false);
     expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), context: { assembly } })).toBe(false);
     for (const sources of [
@@ -492,4 +537,14 @@ it("does not promise live updates in an empty or started-only exported snapshot"
     expect(html).not.toContain("as the run advances");
     expect(html).toContain("Saved snapshot");
   }
+});
+
+it("does not count context assembly inside request preparation as parallel work", () => {
+  const graph = reduceExplainAnalyzeEvents([
+    finished("turn", "turn", 0, 100),
+    finished("preparation", "preparation", 0, 90, { parent_node_id: "turn" }),
+    finished("assembly", "context_assembly", 5, 80, { parent_node_id: "preparation" }),
+  ]);
+  expect(graph.integrity).toBe("consistent");
+  expect(explainAnalyzeMaxConcurrency(graph)).toBe(1);
 });

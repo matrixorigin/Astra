@@ -141,6 +141,29 @@ describe("ExplainAnalyzePanel", () => {
     expect(screen.getByText(/delivery gap or unresolved stages/i)).toBeTruthy();
   });
 
+  it("labels known instrumentation gaps separately from delivery failures", () => {
+    render(
+      <ExplainAnalyzePanel events={[{
+        ...identity,
+        event_id: "turn:finish",
+        node_id: "turn",
+        kind: "turn",
+        label: "User turn",
+        transition: "finished",
+        elapsed_ms: 100,
+        start_elapsed_ms: 0,
+        duration_ms: 100,
+        outcome: "completed",
+        coverage_gaps: ["approval_wait_intervals", "child_run_intervals"],
+      }]} />,
+    );
+    expect(screen.getByText("Complete")).toBeTruthy();
+    expect(screen.getByLabelText("Explain Analyze coverage gaps").textContent).toContain(
+      "approval waits · child-run timing",
+    );
+    expect(screen.getByText("Observed overlap")).toBeTruthy();
+  });
+
   it("shows a warning when every Explain fact was invalid", () => {
     renderTimeline(<ExplainAnalyzePanel live events={[{ type: "explain_analyze", schema_version: 1 }]} />);
     expect(screen.getByText("Incomplete")).toBeTruthy();

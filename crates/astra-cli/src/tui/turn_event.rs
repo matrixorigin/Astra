@@ -125,6 +125,16 @@ pub(crate) enum TurnEvent {
         #[serde(default)]
         cumulative_cost_usd: Option<f64>,
     },
+
+    /// Canonical runtime facts fetched from the durable run stream while
+    /// restoring a session. This is a UI projection of C2 run events; it is
+    /// never written into the transcript as a second source of truth.
+    ExplainAnalyze {
+        events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+        /// Replay found a stream gap or connection failure after these facts.
+        #[serde(default)]
+        delivery_degraded: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

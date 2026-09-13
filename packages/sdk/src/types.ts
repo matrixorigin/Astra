@@ -341,6 +341,13 @@ export type ExplainAnalyzeOutcomeV1 =
   | "unavailable"
   | "delegated";
 
+export type ExplainAnalyzeCoverageGapV1 =
+  | "approval_wait_intervals"
+  | "user_input_wait_intervals"
+  | "provider_retry_backoff"
+  | "first_token_latency"
+  | "child_run_intervals";
+
 export type ExplainAnalyzeUsageV1 = {
   basis: "provider_exact" | "provider_partial" | "runtime_estimated";
   fresh_input_tokens?: number;
@@ -409,6 +416,7 @@ export type ExplainAnalyzeEventV1 = {
   outcome?: ExplainAnalyzeOutcomeV1;
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
+  coverage_gaps?: ExplainAnalyzeCoverageGapV1[];
 };
 
 export type PlanCreatedEvent = {

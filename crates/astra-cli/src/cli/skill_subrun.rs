@@ -631,6 +631,7 @@ impl AgenticLoopHost for SubRunHost {
             false, // render_md
             80,    // term_width
             RenderPolicy::Silent,
+            false, // Explain Analyze is owned by the parent turn.
             Some(edge_ctx),
             0,                                              // pre_clear_lines
             None,                                           // auth_profile

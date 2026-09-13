@@ -331,10 +331,23 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             serde_json::json!({"type": "permission_auto_approved", "tool": tool, "reason": reason})
         }
-        StreamEvent::ExplainText(text) => {
-            serde_json::json!({"type": "explain", "format": "dag", "text": text})
+        StreamEvent::ExplainAnalyze(event) => {
+            let mut value = serde_json::to_value(event).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "type".to_string(),
+                    serde_json::Value::String(
+                        astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE.to_string(),
+                    ),
+                );
+            }
+            value
         }
-        StreamEvent::ExplainReport(_) | StreamEvent::VerdictReport(_) => {
+        StreamEvent::ExplainAnalyzeGap => serde_json::json!({
+            "type": "stream_gap",
+            "explain_analyze_recovered": false,
+        }),
+        StreamEvent::VerdictReport(_) => {
             serde_json::json!({"type": "ignored"})
         }
         StreamEvent::Compaction(event) => {
@@ -495,14 +508,39 @@ mod tests {
     }
 
     #[test]
-    fn explain_text_event_serializes() {
-        let json = event_to_json(&StreamEvent::ExplainText(
-            "Explain Analyze DAG — turn-1".into(),
-        ));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "explain");
-        assert_eq!(v["format"], "dag");
-        assert_eq!(v["text"], "Explain Analyze DAG — turn-1");
+    fn explain_analyze_event_serializes_as_the_typed_wire_fact() {
+        let fact = astra_turn_types::ExplainAnalyzeEventV1 {
+            schema_version: astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:1".into(),
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            node_id: "turn-1/provider/0".into(),
+            parent_node_id: Some("turn-1".into()),
+            dependency_node_ids: Vec::new(),
+            producer_id: "server-loop".into(),
+            clock_domain_id: "clock-1".into(),
+            kind: astra_turn_types::ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            round_index: Some(0),
+            attempt_index: Some(0),
+            label: "Provider attempt".into(),
+            transition: astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            elapsed_ms: 82,
+            start_elapsed_ms: Some(12),
+            duration_ms: Some(70),
+            outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&event_to_json(&StreamEvent::ExplainAnalyze(fact.clone())))
+                .expect("valid JSONL event");
+        assert_eq!(value["type"], "explain_analyze");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["event_id"], fact.event_id);
+        assert_eq!(value["kind"], "provider_attempt");
+        assert_eq!(value["duration_ms"], 70);
+        assert!(value.get("text").is_none());
     }
 
     #[test]

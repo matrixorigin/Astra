@@ -6,6 +6,7 @@
 
 use astra_core::canonical_names::{normalize_name, normalize_name_list};
 use astra_thin_client::ApprovalKind;
+use astra_turn_types::ExplainAnalyzeEventV1;
 use serde_json::Value;
 use std::time::Instant;
 
@@ -214,7 +215,13 @@ pub struct ChatTurnSseAccum {
     pub tool_calls: Vec<Value>,
     /// Index from tool_call id -> position in `tool_calls` for O(1) merges.
     pub tool_call_id_index: std::collections::HashMap<String, usize>,
-    pub explain_turns: Vec<Value>,
+    /// Canonical, versioned Explain Analyze facts accepted from this stream.
+    pub explain_analyze_events: Vec<ExplainAnalyzeEventV1>,
+    /// Stable event identity index keeps replay deduplication linear in stream size.
+    pub explain_analyze_event_index: std::collections::HashMap<String, usize>,
+    /// True when the Explain Analyze event stream reported an unrecovered
+    /// delivery gap or an invalid fact, so measured spans may be incomplete.
+    pub explain_analyze_degraded: bool,
     pub has_tool_calls: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -619,6 +626,18 @@ fn record_invalid_tool_call(accum: &mut ChatTurnSseAccum, reason: &'static str) 
     }
 }
 
+fn explain_analyze_event_from_sse(event: &Value) -> Result<ExplainAnalyzeEventV1, &'static str> {
+    astra_turn_types::decode_explain_analyze_wire(event)
+}
+
+fn record_invalid_explain_analyze(accum: &mut ChatTurnSseAccum, reason: &'static str) {
+    accum.explain_analyze_degraded = true;
+    accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+    if accum.error_message.is_none() {
+        accum.error_message = Some(format!("Invalid SSE explain_analyze event: {reason}"));
+    }
+}
+
 fn approval_kind_from_event(event: &Value) -> ApprovalKind {
     event
         .get("approval_kind")
@@ -988,8 +1007,34 @@ fn apply_one_event(
                 });
             }
         }
-        "explain" => {
-            accum.explain_turns.push(event.clone());
+        astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE => {
+            match explain_analyze_event_from_sse(event) {
+                Ok(fact) => {
+                    if let Some(&index) = accum.explain_analyze_event_index.get(&fact.event_id) {
+                        if accum.explain_analyze_events.get(index) != Some(&fact) {
+                            record_invalid_explain_analyze(
+                                accum,
+                                "event_id was reused with different fact content",
+                            );
+                        }
+                    } else {
+                        accum
+                            .explain_analyze_event_index
+                            .insert(fact.event_id.clone(), accum.explain_analyze_events.len());
+                        accum.explain_analyze_events.push(fact);
+                    }
+                }
+                Err(reason) => record_invalid_explain_analyze(accum, reason),
+            }
+        }
+        "stream_gap" => {
+            if event
+                .get("explain_analyze_recovered")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                accum.explain_analyze_degraded = true;
+            }
         }
         "turn_complete" | "turn_done" => {
             let mut receipt_failure = None;
@@ -1243,6 +1288,12 @@ fn apply_one_event(
             }
         }
         "error" => {
+            // Indexed errors are durable historical events. An error without
+            // a replay index is a transport/connection failure and may have
+            // cut off later Explain Analyze facts.
+            if event.get("index").and_then(Value::as_u64).is_none() {
+                accum.explain_analyze_degraded = true;
+            }
             // Identity and protocol violations describe the stream itself,
             // not one provider attempt. They are sticky and must never be
             // downgraded by a later attempt-shaped error.
@@ -3914,14 +3965,192 @@ mod tests {
     }
 
     #[test]
-    fn explain_event_collected() {
+    fn unknown_sse_payload_does_not_become_analyze_evidence() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("explain", ",\"detail\":\"selection took 5ms\""),
+            &sse("unrecognized_event", ",\"detail\":\"opaque payload\""),
             &mut a,
             &mut vec![],
         );
-        assert_eq!(a.explain_turns.len(), 1);
+        assert!(a.explain_analyze_events.is_empty());
+        assert!(a.error_message.is_none());
+    }
+
+    #[test]
+    fn explain_analyze_event_is_collected_as_a_validated_typed_fact() {
+        let mut a = ChatTurnSseAccum::default();
+        let event = serde_json::json!({
+            "type": "explain_analyze",
+            "schema_version": 1,
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1/admission",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "admission",
+            "label": "Semantic admission",
+            "transition": "started",
+            "elapsed_ms": 12,
+        });
+        let block = format!("data: {}\n\n", serde_json::to_string(&event).unwrap());
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+
+        assert_eq!(
+            a.explain_analyze_events.len(),
+            1,
+            "identical stable event IDs are idempotent"
+        );
+        let fact = &a.explain_analyze_events[0];
+        assert_eq!(fact.event_id, "clock-1:1");
+        assert_eq!(
+            fact.kind,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Admission
+        );
+        assert!(fact.is_valid());
+    }
+
+    #[test]
+    fn explain_analyze_gap_health_distinguishes_recovered_and_missing_coverage() {
+        let mut recovered = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"stream_gap\",\"explain_analyze_recovered\":true}\n\n",
+            &mut recovered,
+            &mut vec![],
+        );
+        assert!(!recovered.explain_analyze_degraded);
+
+        let mut missing = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"stream_gap\"}\n\n",
+            &mut missing,
+            &mut vec![],
+        );
+        assert!(missing.explain_analyze_degraded);
+
+        let mut invalid_fact = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"explain_analyze\",\"schema_version\":99}\n\n",
+            &mut invalid_fact,
+            &mut vec![],
+        );
+        assert!(invalid_fact.explain_analyze_degraded);
+    }
+
+    #[test]
+    fn indexed_historical_error_does_not_degrade_explain_analyze_capture() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"index\":7,\"message\":\"historical\"}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert!(!accum.explain_analyze_degraded);
+
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"message\":\"connection failed\"}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert!(accum.explain_analyze_degraded);
+    }
+
+    #[test]
+    fn explain_analyze_event_rejects_extensions_and_invalid_facts() {
+        let mut a = ChatTurnSseAccum::default();
+        let event = serde_json::json!({
+            "type": "explain_analyze",
+            "schema_version": 1,
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1/admission",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "admission",
+            "label": "Semantic admission",
+            "transition": "started",
+            "elapsed_ms": 12,
+            "unreviewed_payload": "must not cross the typed contract",
+        });
+        dispatch_chat_turn_sse_event_block(
+            &format!("data: {}\n\n", serde_json::to_string(&event).unwrap()),
+            &mut a,
+            &mut vec![],
+        );
+
+        assert!(a.explain_analyze_events.is_empty());
+        assert_eq!(a.error_kind, Some(astra_core::ErrorKind::ContractViolation));
+        assert!(
+            a.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Invalid SSE explain_analyze event"))
+        );
+    }
+
+    #[test]
+    fn explain_analyze_replay_preserves_first_observed_order_and_deduplicates() {
+        let blocks: Vec<_> = (0..1024)
+            .map(|index| {
+                let event = serde_json::json!({
+                    "type": "explain_analyze", "schema_version": 1,
+                    "event_id": format!("clock:{index}"), "node_id": format!("node:{index}"),
+                    "run_id": "run", "turn_id": "turn", "producer_id": "server",
+                    "clock_domain_id": "clock", "kind": "admission", "label": "Admission",
+                    "transition": "started", "elapsed_ms": index,
+                });
+                format!("data: {event}\n\n")
+            })
+            .collect();
+        let mut accum = ChatTurnSseAccum::default();
+        for block in &blocks {
+            dispatch_chat_turn_sse_event_block(block, &mut accum, &mut vec![]);
+        }
+        for (index, block) in blocks.iter().enumerate().rev() {
+            let mut replay: Value =
+                serde_json::from_str(block.trim().strip_prefix("data: ").unwrap()).unwrap();
+            replay["index"] = serde_json::json!(index);
+            let block = format!("data: {replay}\n\n");
+            dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut vec![]);
+        }
+        assert_eq!(accum.explain_analyze_events.len(), 1024);
+        assert!(accum.error_kind.is_none());
+        for (index, event) in accum.explain_analyze_events.iter().enumerate() {
+            assert_eq!(event.event_id, format!("clock:{index}"));
+        }
+    }
+
+    #[test]
+    fn explain_analyze_event_rejects_conflicting_reuse_of_stable_id() {
+        let event = serde_json::json!({
+            "type": "explain_analyze",
+            "schema_version": 1,
+            "event_id": "clock-1:1",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1/admission",
+            "producer_id": "server-loop",
+            "clock_domain_id": "clock-1",
+            "kind": "admission",
+            "label": "Semantic admission",
+            "transition": "started",
+            "elapsed_ms": 12,
+        });
+        let mut conflicting = event.clone();
+        conflicting["label"] = serde_json::json!("Changed label");
+        let blocks = [event, conflicting]
+            .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).unwrap()));
+        let mut a = ChatTurnSseAccum::default();
+        for block in blocks {
+            dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        }
+
+        assert_eq!(a.explain_analyze_events.len(), 1);
+        assert_eq!(a.error_kind, Some(astra_core::ErrorKind::ContractViolation));
+        assert!(a.error_message.as_deref().is_some_and(|message| {
+            message.contains("event_id was reused with different fact content")
+        }));
     }
 
     #[test]
