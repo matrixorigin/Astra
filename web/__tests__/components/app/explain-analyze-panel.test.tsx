@@ -4,7 +4,8 @@ import { ExplainAnalyzePanel } from "@/components/app/explain-analyze-panel";
 
 function renderTimeline(element: Parameters<typeof render>[0]) {
   const view = render(element);
-  fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+  const viewSwitch = screen.getByRole("group", { name: "Execution graph view" });
+  fireEvent.click(within(viewSwitch).getByRole("button", { name: "Timeline" }));
   return view;
 }
 
@@ -361,13 +362,17 @@ describe("Explain Analyze multi-domain lifecycle and windowing", () => {
     const { container } = renderTimeline(<ExplainAnalyzePanel live events={facts} />);
     expect(container.querySelectorAll(".explain-analyze-bar").length).toBe(500);
     expect(screen.queryByRole("slider", { name: "Timeline 11 position" })).toBeNull();
-    const selected = screen.getByRole("button", { name: /Inspect Call 0\/0,/ });
+    // Query this worker's 50 stages rather than computing accessible names
+    // for every button in all 12 worker timelines under JSDOM.
+    const firstTimeline = container.querySelector<HTMLElement>(".explain-analyze-domain")!;
+    const selected = within(firstTimeline).getByRole("button", { name: /Inspect Call 0\/0,/ });
     fireEvent.click(selected);
-    fireEvent.click(screen.getByRole("button", { name: "Show more stages" }));
+    const showMore = screen.getByText("Show more stages", { selector: "button" });
+    fireEvent.click(showMore);
     expect(container.querySelectorAll(".explain-analyze-bar").length).toBe(600);
     expect(selected.getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByRole("slider", { name: "Timeline 12 position" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Show more stages" })).toBeNull();
+    expect(screen.queryByText("Show more stages", { selector: "button" })).toBeNull();
   });
 });
 
