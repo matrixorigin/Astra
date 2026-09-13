@@ -13,6 +13,12 @@ prompt: |
 timeout_seconds: 180
 debug_log: true
 criteria:
+  - type: exit_code
+    code: 5
+  - type: final_state
+    expect: interrupted
+  - type: interruption_kind
+    expect: execution_incomplete
   - type: journal_tool_outcome_count
     name: bash
     ok: false
@@ -35,3 +41,14 @@ criteria:
   - type: turn_rounds_between
     min: 3
     max: 10
+  - type: hard_judger
+    threshold: 0.9
+    question: |
+      Does the durable tool evidence show exactly one unavailable-reader probe
+      of README.md, no retry or alternative read of README.md, and a separate
+      successful observation of the Cargo.toml workspace resolver? Does the
+      final report accurately state that observed Cargo fact and explicitly
+      leave the README first-line check NOT_VERIFIED without guessing it?
+      This is a negative verification test: an interrupted/partial report is
+      expected and is not itself a violation. A success on the unrelated Cargo
+      observation must not be represented as successful README verification.

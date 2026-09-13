@@ -783,6 +783,61 @@ pub fn evaluate_deterministic_with_session(
         .collect()
 }
 
+/// A declaration can suppress automatic retry before its evidence is loaded.
+/// This is not permission to pass: acceptance additionally needs a passing
+/// branch and a real terminal outcome below.
+pub(crate) fn has_exit_code_expectation(criteria: &[Criterion], code: i32) -> bool {
+    code > 0
+        && criteria.iter().any(|criterion| match criterion {
+            Criterion::ExitCode { code: expected } => *expected == code,
+            Criterion::AllOf { criteria } | Criterion::AnyOf { criteria } => {
+                has_exit_code_expectation(criteria, code)
+            }
+            _ => false,
+        })
+}
+
+/// Permit an explicitly expected negative terminal without treating it as
+/// successful task completion. An unused ExitCode leaf in a failed alternative
+/// is not a witness. Executor/protocol failures and outer timeouts remain fatal.
+pub(crate) fn accepts_negative_terminal(
+    criteria: &[Criterion],
+    outcome: &RunOutcome,
+    session: Option<&SessionCapture>,
+) -> bool {
+    let terminal_present = match (
+        outcome.final_state.as_deref(),
+        outcome.interruption_kind.as_deref(),
+    ) {
+        (Some("completed"), None) => true,
+        (Some("interrupted"), Some(kind)) => !kind.trim().is_empty() && kind != "timeout",
+        _ => false,
+    };
+    if outcome.exit_code <= 0
+        || outcome
+            .run_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        || !terminal_present
+    {
+        return false;
+    }
+    fn witness(c: &Criterion, outcome: &RunOutcome, session: Option<&SessionCapture>) -> bool {
+        match c {
+            Criterion::ExitCode { code } => *code == outcome.exit_code,
+            Criterion::AllOf { criteria } => {
+                evaluate_one(c, outcome, session).passed
+                    && criteria.iter().any(|c| witness(c, outcome, session))
+            }
+            Criterion::AnyOf { criteria } => criteria
+                .iter()
+                .any(|c| evaluate_one(c, outcome, session).passed && witness(c, outcome, session)),
+            _ => false,
+        }
+    }
+    criteria.iter().any(|c| witness(c, outcome, session))
+}
+
 /// Whether any criterion in the tree requires a loaded session capture.
 pub fn requires_session_capture(criteria: &[Criterion]) -> bool {
     criteria.iter().any(criterion_requires_session_capture)

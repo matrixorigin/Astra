@@ -63,6 +63,17 @@ An inconclusive quality judgment caused by omitted evidence is not proof that
 the agent's claimed result is false, and a passing exit code is not a substitute
 for inspecting quality failures.
 
+Live agent cases require exit 0 by default. A negative test can explicitly
+expect a nonzero terminal code using `exit_code`, together with the expected
+`final_state`, `interruption_kind`, and evidence assertions. Passing means the
+negative behavior matched the test; the report retains the actual interrupted
+state and nonzero code. Only a passing composite branch containing a matching
+`exit_code` can authorize it. Root and follow-up expectations apply to their
+own invocations, not another turn's accumulated output. Protocol failures,
+missing terminal identity, and outer harness timeouts cannot be accepted this
+way. An explicitly expected nonzero code suppresses automatic rate-limit retry;
+session identity, durable evidence, and subsystem-health checks still apply.
+
 `journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
 delivered item counts using canonical Work and branch identities. It allows any
 unexecuted initial item to be cancelled, requires fresh addition identities, and

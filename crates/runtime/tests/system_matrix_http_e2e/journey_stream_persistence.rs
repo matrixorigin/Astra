@@ -1731,13 +1731,33 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
     let first_delta_tasks = first_delta["tasks"]
         .as_array()
         .unwrap_or_else(|| panic!("first settlement omitted live-board transitions: {raw_sse}"));
-    assert_eq!(first_delta_tasks.len(), 2, "first settlement: {raw_sse}");
-    assert_eq!(first_delta_tasks[0]["execution_status"], "completed");
-    assert_eq!(first_delta_tasks[0]["delivery_status"], "delivered");
     assert_eq!(
-        first_delta_tasks[1]["execution_status"], "running",
+        first_delta_tasks.len(),
+        declared_tasks.len() + 1,
+        "settlement must publish the complete canonical board: {raw_sse}"
+    );
+    assert_eq!(first_delta["work_id"], initial_board["work_id"]);
+    assert_eq!(first_delta["branch_id"], initial_board["branch_id"]);
+    let settled_board_task = |item_id: &str| {
+        first_delta_tasks
+            .iter()
+            .find(|task| task["item_id"].as_str() == Some(item_id))
+            .unwrap_or_else(|| panic!("settlement omitted board item {item_id}: {raw_sse}"))
+    };
+    assert_eq!(
+        settled_board_task("root")["execution_status"],
+        "not_started"
+    );
+    assert_eq!(settled_board_task("root")["delivery_status"], "unreported");
+    let settled_first = settled_board_task(first_declared_id);
+    assert_eq!(settled_first["execution_status"], "completed");
+    assert_eq!(settled_first["delivery_status"], "delivered");
+    let settled_second = settled_board_task(second_declared_id);
+    assert_eq!(
+        settled_second["execution_status"], "running",
         "the successor must become visible in the same durable settlement receipt: {raw_sse}"
     );
+    assert_eq!(settled_second["delivery_status"], "unreported");
     let runnable_items = start_receipt["runnable_items"]
         .as_array()
         .unwrap_or_else(|| panic!("start receipt omitted runnable tasks: {raw_sse}"));
