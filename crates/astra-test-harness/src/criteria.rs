@@ -20,6 +20,8 @@ use crate::pipeline_analysis::analyze_pipeline_health;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
+mod work_replacement;
+
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +375,18 @@ pub enum Criterion {
         min_distinct_items: usize,
     },
 
+    /// Verify cancel/add execution against canonical identities, without
+    /// guessing which initial item a natural-language request meant to cancel.
+    /// Counts are exact; the optional timing bound is a minimum.
+    JournalWorkReplacementLifecycle {
+        initial_items: usize,
+        cancelled_items: usize,
+        added_items: usize,
+        delivered_items: usize,
+        #[serde(default)]
+        cancellation_after_deliveries: usize,
+    },
+
     /// Proves a successful canonical graph patch was committed after Work was
     /// established. The requested mutation dimensions are read from typed tool
     /// arguments and the accepted receipt, never from model prose or item
@@ -618,6 +632,7 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalToolPrecedence { .. }
         | Criterion::JournalTurnToolHidden { .. }
         | Criterion::JournalWorkItemExecutionFromStart { .. }
+        | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::ForkCacheOutcome { .. }
         | Criterion::HardJudger { .. }
@@ -800,6 +815,7 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::JournalToolSequence { .. }
         | Criterion::JournalToolPrecedence { .. }
         | Criterion::JournalWorkItemExecutionFromStart { .. }
+        | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::JournalArtifactConsumed { .. }
         | Criterion::JournalToolValueFlow { .. }
@@ -2311,6 +2327,33 @@ fn evaluate_one(
                         )
                     }
                 },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::JournalWorkReplacementLifecycle {
+            initial_items,
+            cancelled_items,
+            added_items,
+            delivered_items,
+            cancellation_after_deliveries,
+        } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "journal_work_replacement_lifecycle");
+            };
+            let result = work_replacement::verify(
+                session,
+                *initial_items,
+                *cancelled_items,
+                *added_items,
+                *delivered_items,
+                *cancellation_after_deliveries,
+            );
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed: result.is_ok(),
+                detail: result.unwrap_or_else(|error| error),
                 full_detail: None,
                 score: None,
             }
@@ -3944,6 +3987,26 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                     "JournalWorkItemExecutionFromStart.min_distinct_items must be at least 1"
                         .into(),
                 );
+            }
+            Ok(())
+        }
+        Criterion::JournalWorkReplacementLifecycle {
+            initial_items,
+            cancelled_items,
+            added_items,
+            delivered_items,
+            cancellation_after_deliveries,
+        } => {
+            if *initial_items == 0
+                || *cancelled_items == 0
+                || *added_items == 0
+                || initial_items
+                    .checked_sub(*cancelled_items)
+                    .and_then(|remaining| remaining.checked_add(*added_items))
+                    != Some(*delivered_items)
+                || *cancellation_after_deliveries > *delivered_items
+            {
+                return Err("JournalWorkReplacementLifecycle requires consistent positive initial/cancel/add counts and a reachable delivery bound".into());
             }
             Ok(())
         }

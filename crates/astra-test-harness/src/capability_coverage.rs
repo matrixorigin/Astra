@@ -81,6 +81,7 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::JournalToolSequence { .. }
         | Criterion::JournalToolPrecedence { .. }
         | Criterion::JournalWorkItemExecutionFromStart { .. }
+        | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::CacheRateAbove { .. }

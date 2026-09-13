@@ -351,6 +351,7 @@ fn timeout_has_execution_progress(
                 | Criterion::JournalToolSequence { .. }
                 | Criterion::JournalToolPrecedence { .. }
                 | Criterion::JournalWorkItemExecutionFromStart { .. }
+                | Criterion::JournalWorkReplacementLifecycle { .. }
                 | Criterion::JournalWorkGraphPatch { .. } => true,
                 Criterion::TurnRoundsBetween { min, .. } => *min > 0,
                 _ => false,
