@@ -17,6 +17,11 @@ criteria:
     code: 0
   - type: text_contains
     needle: astra-harness-ok
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 0
+        max: 0
   - type: duration_between
     min_ms: 0
     max_ms: 30000

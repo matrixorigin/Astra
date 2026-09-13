@@ -53,7 +53,9 @@ Truncated, filtered, or unknown completion endings are rejected even if their
 text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
 
 Live quality judging uses a bounded projection of the durable tool
-journal. It reserves room for call identities and statuses before sharing the
+journal. It preserves canonical run, turn, round, batch, and parallel metadata
+when present; missing identity stays unknown and cannot prove batching. It
+reserves room for call identities and statuses before sharing the
 remaining budget across arguments and results, so a large early response does
 not hide later verification. Truncated fields report their original and omitted
 character counts; if even the call identities exceed the budget, the envelope

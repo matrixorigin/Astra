@@ -20,7 +20,8 @@ prompt: |
 
   Then give a concise answer that explicitly distinguishes live-process evidence from
   durable-session evidence. Do not say their counts are identical unless the tool outputs
-  establish that. Do not call any other tool.
+  establish that. Necessary typed tool discovery is allowed to expose these two
+  diagnostics; do not perform any other diagnostic or task tool calls.
 capability: "custom:diagnostic_observability"
 difficulty: 4
 weight: 2.0
@@ -42,7 +43,7 @@ criteria:
     name: reflect
     min: 1
     max: 1
-  - type: judger
+  - type: hard_judger
     question: |
       Did the response accurately distinguish the scopes of the two diagnostics?
       `introspect` reports a recent live process/runtime projection, while `reflect`

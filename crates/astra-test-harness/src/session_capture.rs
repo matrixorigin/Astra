@@ -43,6 +43,12 @@ pub struct JournalToolCall {
     /// this field lets lifecycle criteria prove cross-turn value flow without
     /// inferring order from rendered text.
     pub turn: Option<u32>,
+    /// Canonical producer identity; absent legacy identity stays unknown.
+    pub run_id: Option<String>,
+    /// Provider round from the tool record (or enclosing llm_round event).
+    pub round: Option<u32>,
+    pub batch_id: Option<String>,
+    pub parallel: Option<bool>,
     pub ok: Option<bool>,
     pub arguments: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
@@ -588,6 +594,28 @@ impl SessionCapture {
                         .get("turn")
                         .and_then(|value| value.as_u64())
                         .and_then(|turn| turn.try_into().ok()),
+                    run_id: event
+                        .raw
+                        .get("producer_scope")
+                        .and_then(|scope| scope.get("run_id"))
+                        .or_else(|| event.raw.get("run_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                    round: record
+                        .get("round")
+                        .or_else(|| {
+                            (event.event_type == "llm_round")
+                                .then(|| event.raw.get("round"))
+                                .flatten()
+                        })
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|round| round.try_into().ok()),
+                    batch_id: record
+                        .get("batch_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    parallel: record.get("parallel").and_then(serde_json::Value::as_bool),
                     ok: record.get("ok").and_then(|value| value.as_bool()),
                     arguments,
                     result,
@@ -613,6 +641,10 @@ impl SessionCapture {
                     "call_id": call.call_id,
                     "name": call.name,
                     "turn": call.turn,
+                    "run_id": call.run_id,
+                    "round": call.round,
+                    "batch_id": call.batch_id,
+                    "parallel": call.parallel,
                     "ok": call.ok,
                 })
             })
@@ -3105,6 +3137,49 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn evidence_projection_distinguishes_same_turn_serial_and_parallel_calls() {
+        let capture = SessionCapture {
+            events: vec![JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({
+                    "turn": 1, "producer_scope": {"run_id": "root-run"},
+                    "tool_calls": [
+                        {"tool_call_id":"a", "name":"read_file", "round":0,
+                         "batch_id":"batch-0", "parallel":true},
+                        {"tool_call_id":"b", "name":"read_file", "round":0,
+                         "batch_id":"batch-0", "parallel":true},
+                        {"tool_call_id":"c", "name":"read_file", "round":1,
+                         "batch_id":"batch-1", "parallel":false}
+                    ]
+                }),
+            }],
+            ..Default::default()
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&capture.render_tool_evidence(4096)).unwrap();
+        let calls = value["calls"].as_array().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|call| call["turn"] == 1 && call["run_id"] == "root-run")
+        );
+        assert_eq!(calls[0]["round"], calls[1]["round"]);
+        assert_ne!(calls[1]["round"], calls[2]["round"]);
+        assert_eq!(calls[0]["batch_id"], calls[1]["batch_id"]);
+        assert_ne!(calls[1]["batch_id"], calls[2]["batch_id"]);
+        assert_eq!(calls[2]["parallel"], false);
+
+        let unknown = evidence_capture(serde_json::json!([
+            {"tool_call_id":"call-round-99", "name":"read_file"}
+        ]));
+        let value: serde_json::Value =
+            serde_json::from_str(&unknown.render_tool_evidence(4096)).unwrap();
+        assert!(value["calls"][0]["run_id"].is_null());
+        assert!(value["calls"][0]["round"].is_null());
+        assert!(value["calls"][0]["batch_id"].is_null());
     }
 
     #[test]

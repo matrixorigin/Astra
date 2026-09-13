@@ -66,9 +66,10 @@ criteria:
     min: 7
     max: 22
   - type: session_subsystem_healthy
-  - type: judger
+  - type: hard_judger
     question: |
-      Evaluate only the user-visible outcome. Pass only if the answer provides two distinct,
+      Verify the user-visible outcome against the provided tool arguments and results;
+      do not trust the final answer alone. Pass only if the answer provides two distinct,
       concrete news articles: one from Sina and one from NetEase, each with a real article
       headline and an item-level article URL. A portal root/homepage, channel/category page,
       special index, or merely HTTP 200 is not a news article and must fail. Also require a clear
