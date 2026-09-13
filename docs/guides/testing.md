@@ -74,6 +74,23 @@ missing terminal identity, and outer harness timeouts cannot be accepted this
 way. An explicitly expected nonzero code suppresses automatic rate-limit retry;
 session identity, durable evidence, and subsystem-health checks still apply.
 
+Capability probes distinguish a disabled optional capability from an enabled
+capability without owner credentials. A child allowlist cannot enable a parent
+capability: the disabled GitHub case expects admission rejection before a child
+runs. A separate discovery-only case requires a real child and its causally
+attributed discovery result. Validate the complete allowlist, not just selected
+array positions; parent discovery of the delegation tool is a separate call.
+User-required exact replies and requested observations remain quality criteria,
+even when capability enforcement itself succeeds.
+
+The Work planning and observation cases make their explicit no-tools constraint
+and core semantic requirements hard checks. `text_json_dag.existing_node_ids`
+can supply nodes already declared in the input: output nodes cannot redeclare
+them, and output edges referencing them participate in the same cycle check.
+This field supplies identities only, not existing edges. The DAG check covers
+the supplied output edges, so a context with prior dependencies requires those
+edges too before claiming the entire combined graph is acyclic.
+
 `journal_work_replacement_lifecycle` checks exact initial, cancelled, added, and
 delivered item counts using canonical Work and branch identities. It allows any
 unexecuted initial item to be cancelled, requires fresh addition identities, and

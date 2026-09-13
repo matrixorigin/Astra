@@ -58,9 +58,11 @@ timeout_seconds: 240
 criteria:
   - type: exit_code
     code: 0
-  - type: tools_count_between
-    min: 0
-    max: 0
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 0
+        max: 0
   - type: text_json_value
     path: /context_id
     equals: "work-plan-context-v1:7f2a"
@@ -80,11 +82,12 @@ criteria:
   - type: text_json_dag
     nodes_path: /additions
     node_id_path: /item_id
+    existing_node_ids: [root]
     node_required_string_paths: [/kind, /objective, /expected_result]
     edges_path: /dependencies
     predecessor_path: /predecessor_item_id
     successor_path: /successor_item_id
-  - type: judger
+  - type: hard_judger
     question: |
       Score the response as a typed long-task planning proposal. Give 1.0 only if all are true:
       (1) it preserves context_id `work-plan-context-v1:7f2a`; (2) it proposes 3-6 concrete,

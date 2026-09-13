@@ -313,7 +313,7 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
             "Model lacks capability for this task; try a more capable model"
         }
         FailureClass::ModelQualityLow => {
-            "Model completed the task but judger scored quality below threshold"
+            "Execution evidence scored below the required task-quality threshold"
         }
         FailureClass::EfficiencyBoundsExceeded => {
             "Execution exceeded its efficiency bound; inspect task scope and round pacing before increasing the limit"

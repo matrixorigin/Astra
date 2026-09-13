@@ -54,10 +54,12 @@ timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
-  - type: tools_count_between
-    min: 0
-    max: 0
-  - type: judger
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 0
+        max: 0
+  - type: hard_judger
     question: |
       Score whether the answer consumes the typed Work observation without inventing authority.
       Give 1.0 only if all are true: (1) it says the Work is not ready because exactly one of

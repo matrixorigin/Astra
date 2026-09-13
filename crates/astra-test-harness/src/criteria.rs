@@ -94,6 +94,10 @@ pub enum Criterion {
         /// are relative RFC 6901 pointers, just like `node_id_path`.
         #[serde(default)]
         node_required_string_paths: Vec<String>,
+        /// Nodes already declared by the case's input context. They may be
+        /// edge endpoints but must not be redeclared among output nodes.
+        #[serde(default)]
+        existing_node_ids: Vec<String>,
         edges_path: String,
         predecessor_path: String,
         successor_path: String,
@@ -1063,22 +1067,34 @@ fn required_relative_string<'a>(
         .ok_or_else(|| format!("{label} pointer {path:?} is not a non-empty string"))
 }
 
+fn validate_existing_dag_nodes(ids: &[String]) -> Result<BTreeSet<String>, String> {
+    let mut unique = BTreeSet::new();
+    for id in ids {
+        if id.trim().is_empty() || !unique.insert(id.clone()) {
+            return Err(format!(
+                "existing DAG node id is empty or duplicated: {id:?}"
+            ));
+        }
+    }
+    Ok(unique)
+}
+
 fn validate_text_json_dag(
     document: &serde_json::Value,
     nodes_path: &str,
     node_id_path: &str,
     node_required_string_paths: &[String],
-    edges_path: &str,
-    predecessor_path: &str,
-    successor_path: &str,
+    existing_node_ids: &[String],
+    edge_paths: [&str; 3],
 ) -> Result<(usize, usize), String> {
+    let [edges_path, predecessor_path, successor_path] = edge_paths;
     let nodes = required_json_array(document, nodes_path, "nodes")?;
     let edges = required_json_array(document, edges_path, "edges")?;
-    if nodes.is_empty() {
+    if nodes.is_empty() && existing_node_ids.is_empty() {
         return Err("nodes array is empty".into());
     }
 
-    let mut node_ids = BTreeSet::new();
+    let mut node_ids = validate_existing_dag_nodes(existing_node_ids)?;
     for (index, node) in nodes.iter().enumerate() {
         let id = required_relative_string(node, node_id_path, &format!("nodes[{index}]"))?;
         for path in node_required_string_paths {
@@ -1418,6 +1434,7 @@ fn evaluate_one(
             nodes_path,
             node_id_path,
             node_required_string_paths,
+            existing_node_ids,
             edges_path,
             predecessor_path,
             successor_path,
@@ -1428,9 +1445,8 @@ fn evaluate_one(
                     nodes_path,
                     node_id_path,
                     node_required_string_paths,
-                    edges_path,
-                    predecessor_path,
-                    successor_path,
+                    existing_node_ids,
+                    [edges_path, predecessor_path, successor_path],
                 )
             });
             CriterionResult {
@@ -4421,6 +4437,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             nodes_path,
             node_id_path,
             node_required_string_paths,
+            existing_node_ids,
             edges_path,
             predecessor_path,
             successor_path,
@@ -4434,6 +4451,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             ] {
                 validate_json_pointer(label, path)?;
             }
+            validate_existing_dag_nodes(existing_node_ids)?;
             let mut unique_required_paths = BTreeSet::new();
             for path in node_required_string_paths {
                 validate_json_pointer("TextJsonDag.node_required_string_paths[]", path)?;
@@ -4665,6 +4683,7 @@ mod tests {
                     nodes_path: "/nodes".into(),
                     node_id_path: "/id".into(),
                     node_required_string_paths: vec![],
+                    existing_node_ids: vec![],
                     edges_path: "/edges".into(),
                     predecessor_path: "/from".into(),
                     successor_path: "/to".into(),
@@ -4687,6 +4706,7 @@ mod tests {
             nodes_path: "/nodes".into(),
             node_id_path: "/id".into(),
             node_required_string_paths: vec!["/result".into()],
+            existing_node_ids: vec![],
             edges_path: "/edges".into(),
             predecessor_path: "/from".into(),
             successor_path: "/to".into(),
@@ -4701,6 +4721,58 @@ mod tests {
             out.text = text.into();
             let result = evaluate_deterministic(std::slice::from_ref(&criterion), &out);
             assert!(!result[0].passed, "{text}");
+        }
+    }
+
+    #[test]
+    fn text_json_dag_includes_context_nodes_without_allowing_redeclaration_or_cycles() {
+        let criterion = Criterion::TextJsonDag {
+            nodes_path: "/nodes".into(),
+            node_id_path: "/id".into(),
+            node_required_string_paths: vec!["/result".into()],
+            existing_node_ids: vec!["root".into()],
+            edges_path: "/edges".into(),
+            predecessor_path: "/from".into(),
+            successor_path: "/to".into(),
+        };
+        validate_criterion(&criterion).unwrap();
+        for (document, expected, detail) in [
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"verify","to":"root"}]}),
+                true,
+                "2 nodes",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"root","to":"verify"},{"from":"verify","to":"root"}]}),
+                false,
+                "cycle",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"root","result":"replacement"}],
+                "edges":[]}),
+                false,
+                "duplicate node",
+            ),
+            (
+                serde_json::json!({"nodes":[{"id":"verify","result":"verified"}],
+                "edges":[{"from":"verify","to":"unknown"}]}),
+                false,
+                "undeclared endpoint",
+            ),
+        ] {
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.text = document.to_string();
+            let results = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            assert_eq!(results[0].passed, expected, "{results:?}");
+            assert!(results[0].detail.contains(detail), "{results:?}");
+        }
+        for ids in [vec!["root", "root"], vec![" "]] {
+            let mut raw = serde_json::to_value(&criterion).unwrap();
+            raw["existing_node_ids"] = serde_json::json!(ids);
+            let invalid: Criterion = serde_json::from_value(raw).unwrap();
+            assert!(validate_criterion(&invalid).is_err());
         }
     }
 
