@@ -26,6 +26,10 @@ describe("ExplainAnalyzePanel", () => {
     ]} />);
     expect(screen.getByRole("button", { name: /Inspect Waiting to dispatch bash.*Awaiting dispatch/ }).className).toContain("bg-text-muted");
     expect(screen.getByRole("button", { name: /Inspect Waiting for approval to run bash.*Waiting$/ }).className).toContain("bg-warning");
+    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+    const waitingLane = screen.getByText("Waiting for approval to run bash").closest(".explain-analyze-lane");
+    expect(waitingLane?.className).not.toContain("explain-analyze-tree-active");
+    expect(waitingLane?.querySelector(".explain-analyze-mini-span")?.className).toContain("bg-warning");
   });
 
   it("shows a plain-language overview, honest token lanes, and an expandable timeline", () => {

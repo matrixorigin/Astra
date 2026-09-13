@@ -651,7 +651,7 @@ function renderTimelineNode({
       <div className={cn(
         "explain-analyze-lane relative items-center border-b border-border/60",
         graphView === "tree" ? "explain-analyze-tree-columns" : "explain-analyze-grid",
-        graphView === "tree" && canEstimate && "explain-analyze-tree-active",
+        graphView === "tree" && canEstimate && node.kind !== "wait" && node.kind !== "admission" && "explain-analyze-tree-active",
         selectedNodeId === node.nodeId && "explain-analyze-lane-selected",
         graphView === "timeline" && cursorMs !== null && node.startElapsedMs > cursorMs && "explain-analyze-lane-future",
         children.length > 0 && "explain-analyze-group-row",

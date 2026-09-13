@@ -1287,7 +1287,7 @@ textarea {
   .explain-analyze-duration { display: flex; flex-direction: column; gap: 7px; align-items: stretch; }
   .explain-analyze-mini-track { position: relative; display: block; height: 4px; overflow: hidden; border-radius: 4px; background: rgb(var(--color-text-muted) / 0.1); }
   .explain-analyze-mini-span { position: absolute; inset-block: 0; border-radius: inherit; transition: left 240ms linear, width 240ms linear; opacity: 0.65; }
-  .explain-analyze-mini-live { opacity: 1; background: rgb(var(--color-accent)); }
+  .explain-analyze-mini-live { opacity: 1; }
   .explain-analyze-mini-live::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, #ffffffaa, transparent); transform: translateX(-100%); animation: explain-analyze-rail-flow 1.4s linear infinite; }
   .explain-analyze-tree-view .explain-analyze-lane { transition: background-color 300ms ease, box-shadow 300ms ease; }
   .explain-analyze-tree-view .explain-analyze-tree-active { background: linear-gradient(90deg, rgb(var(--color-accent) / 0.12), rgb(var(--color-accent) / 0.02)); box-shadow: inset 2px 0 rgb(var(--color-accent)); }
