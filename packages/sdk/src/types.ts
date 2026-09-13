@@ -346,7 +346,8 @@ export type ExplainAnalyzeCoverageGapV1 =
   | "user_input_wait_intervals"
   | "provider_retry_backoff"
   | "first_token_latency"
-  | "child_run_intervals";
+  | "child_run_intervals"
+  | "tool_io_wait_intervals";
 
 export type ExplainAnalyzeUsageV1 = {
   basis: "provider_exact" | "provider_partial" | "runtime_estimated";

@@ -74,8 +74,8 @@ describe("Explain Analyze graph reducer", () => {
 
   it("surfaces measured coverage gaps without treating them as graph corruption", () => {
     const gaps: NonNullable<ExplainAnalyzeEventV1["coverage_gaps"]> = [
-      "approval_wait_intervals",
       "child_run_intervals",
+      "tool_io_wait_intervals",
     ];
     const turn = finished("turn", "turn", 0, 100, {
       outcome: "completed",
@@ -87,7 +87,7 @@ describe("Explain Analyze graph reducer", () => {
     expect(graph.coverageGaps).toEqual(gaps);
     expect(graph.nodes[0].coverageGaps).toEqual(gaps);
     expect(renderExplainAnalyzeHtml([turn])).toContain(
-      "approval waits · child-run timing",
+      "child-run timing · tool I/O wait breakdown",
     );
     expect(isExplainAnalyzeEventV1({
       ...started("turn", "turn", 0),
@@ -341,7 +341,7 @@ describe("Explain Analyze graph reducer", () => {
     expect(html).toContain("class=\"node-children\"");
     expect(html).toContain("Parent stage</span>");
     expect(html).toContain("Work stage</span>");
-    expect(html).toContain('class="bar is-group status-complete"');
+    expect(html).toContain('class="bar kind-turn is-group status-complete"');
     expect(html).toContain(".node-children:before");
     expect(html).toContain("Reported subtotal from 2 of 2 observed requests");
   });
@@ -472,7 +472,7 @@ describe("saved Explain snapshots", () => {
     ]);
     expect(html).not.toContain("Some execution facts are missing or conflict.");
     expect(html).toContain("Open at capture");
-    expect(html).toContain("Saved snapshot; this file does not receive new events.");
+    expect(html).toContain("Offline snapshot");
     expect(html).toContain("End not recorded");
     expect(html).not.toContain(" – Now");
   });
@@ -535,7 +535,7 @@ it("does not promise live updates in an empty or started-only exported snapshot"
     const html = renderExplainAnalyzeHtml(events);
     expect(html).not.toContain("In progress");
     expect(html).not.toContain("as the run advances");
-    expect(html).toContain("Saved snapshot");
+    expect(html).toContain("Offline snapshot");
   }
 });
 
@@ -547,4 +547,35 @@ it("does not count context assembly inside request preparation as parallel work"
   ]);
   expect(graph.integrity).toBe("consistent");
   expect(explainAnalyzeMaxConcurrency(graph)).toBe(1);
+});
+
+it("shows approval wait intervals without counting them as parallel work", () => {
+  const events = [
+    finished("turn", "turn", 0, 180, {
+      coverage_gaps: ["tool_io_wait_intervals"],
+    }),
+    finished("batch", "tool_batch", 0, 180, { parent_node_id: "turn" }),
+    finished("admission-a", "admission", 0, 70, { parent_node_id: "batch" }),
+    finished("approval-a", "wait", 10, 70, {
+      label: "Waiting for approval to run command A",
+      parent_node_id: "admission-a",
+    }),
+    finished("tool-a", "tool_call", 70, 120, { parent_node_id: "batch" }),
+    finished("admission-b", "admission", 0, 120, { parent_node_id: "batch" }),
+    finished("approval-b", "wait", 80, 120, {
+      label: "Waiting for approval to run command B",
+      parent_node_id: "admission-b",
+    }),
+    finished("tool-b", "tool_call", 120, 170, { parent_node_id: "batch" }),
+  ];
+  const graph = reduceExplainAnalyzeEvents(events);
+  const html = renderExplainAnalyzeHtml(events);
+
+  expect(graph.integrity).toBe("consistent");
+  expect(explainAnalyzeMaxConcurrency(graph)).toBe(1);
+  expect(html).toContain("Measured wait time");
+  expect(html).toContain("100 ms");
+  expect(html).toContain("kind-wait");
+  expect(html).toContain("kind-admission");
+  expect(html).toContain("tool I/O wait breakdown");
 });

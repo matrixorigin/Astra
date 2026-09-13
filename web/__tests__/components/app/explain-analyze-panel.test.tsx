@@ -18,6 +18,16 @@ const identity = {
 };
 
 describe("ExplainAnalyzePanel", () => {
+  it("distinguishes live approval and dispatch waits from running work", () => {
+    renderTimeline(<ExplainAnalyzePanel live events={[
+      { ...identity, event_id: "turn:start", node_id: "turn", kind: "turn", label: "User turn", transition: "started", elapsed_ms: 0 },
+      { ...identity, event_id: "queue:start", node_id: "queue", parent_node_id: "turn", kind: "admission", label: "Waiting to dispatch bash", transition: "started", elapsed_ms: 1 },
+      { ...identity, event_id: "approval:start", node_id: "approval", parent_node_id: "queue", kind: "wait", label: "Waiting for approval to run bash", transition: "started", elapsed_ms: 2 },
+    ]} />);
+    expect(screen.getByRole("button", { name: /Inspect Waiting to dispatch bash.*Awaiting dispatch/ }).className).toContain("bg-text-muted");
+    expect(screen.getByRole("button", { name: /Inspect Waiting for approval to run bash.*Waiting$/ }).className).toContain("bg-warning");
+  });
+
   it("shows a plain-language overview, honest token lanes, and an expandable timeline", () => {
     renderTimeline(
       <ExplainAnalyzePanel live
@@ -154,12 +164,12 @@ describe("ExplainAnalyzePanel", () => {
         start_elapsed_ms: 0,
         duration_ms: 100,
         outcome: "completed",
-        coverage_gaps: ["approval_wait_intervals", "child_run_intervals"],
+        coverage_gaps: ["child_run_intervals", "tool_io_wait_intervals"],
       }]} />,
     );
     expect(screen.getByText("Complete")).toBeTruthy();
     expect(screen.getByLabelText("Explain Analyze coverage gaps").textContent).toContain(
-      "approval waits · child-run timing",
+      "child-run timing · tool I/O wait breakdown",
     );
     expect(screen.getByText("Observed overlap")).toBeTruthy();
   });

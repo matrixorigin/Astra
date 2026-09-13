@@ -833,6 +833,12 @@ function nodeStatus(node: ExplainAnalyzeNodeV1) {
     return { label: "Conflicting facts", textClass: "text-warning", dotClass: "bg-warning", barClass: "bg-warning" };
   }
   if (!node.terminalObserved) {
+    if (node.kind === "wait") {
+      return { label: "Waiting", textClass: "text-warning", dotClass: "bg-warning", barClass: "bg-warning" };
+    }
+    if (node.kind === "admission") {
+      return { label: "Awaiting dispatch", textClass: "text-text-muted", dotClass: "bg-text-muted", barClass: "bg-text-muted" };
+    }
     return { label: "In progress", textClass: "text-accent", dotClass: "bg-accent", barClass: "bg-accent" };
   }
   if (node.outcome === "failed" || node.outcome === "interrupted") {
