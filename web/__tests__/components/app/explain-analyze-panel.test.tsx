@@ -9,6 +9,11 @@ function renderTimeline(element: Parameters<typeof render>[0]) {
   return view;
 }
 
+function selectView(name: "Tree" | "Timeline" | "Graph") {
+  const viewSwitch = screen.getByRole("group", { name: "Execution graph view" });
+  fireEvent.click(within(viewSwitch).getByRole("button", { name }));
+}
+
 const identity = {
   type: "explain_analyze" as const,
   schema_version: 1 as const,
@@ -27,7 +32,7 @@ describe("ExplainAnalyzePanel", () => {
     ]} />);
     expect(screen.getByRole("button", { name: /Inspect Waiting to dispatch bash.*Awaiting dispatch/ }).className).toContain("bg-text-muted");
     expect(screen.getByRole("button", { name: /Inspect Waiting for approval to run bash.*Waiting$/ }).className).toContain("bg-warning");
-    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+    selectView("Tree");
     const waitingLane = screen.getByText("Waiting for approval to run bash").closest(".explain-analyze-lane");
     expect(waitingLane?.className).not.toContain("explain-analyze-tree-active");
     expect(waitingLane?.querySelector(".explain-analyze-tree-status")?.className).toContain("text-warning");
@@ -400,13 +405,13 @@ describe("Explain Analyze tree view", () => {
 
   it("preserves selection and collapsed branches when switching views", () => {
     render(<ExplainAnalyzePanel live events={facts} />);
-    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+    selectView("Tree");
     fireEvent.click(screen.getByRole("button", { name: /Inspect Read project configuration/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    selectView("Timeline");
     expect(screen.getByRole("slider")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Inspect Read project configuration/ }).getAttribute("aria-pressed")).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "Collapse User turn" }));
-    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+    selectView("Tree");
     expect(screen.queryByRole("slider")).toBeNull();
     expect(screen.queryByRole("button", { name: /Inspect Read project configuration/ })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Expand User turn" }));
@@ -425,20 +430,20 @@ describe("Explain Analyze tree view", () => {
       ...recordedStage("hidden-dependency", "Dependency result", 1_000, 1_500),
     ];
     const { container, rerender } = render(<ExplainAnalyzePanel live events={facts} />);
-    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
-    fireEvent.click(screen.getByRole("button", { name: /Inspect Inspect result,/ }));
+    fireEvent.click(screen.getByText("Inspect result", { selector: "button" }));
     fireEvent.click(within(screen.getByRole("complementary")).getByRole("button", { name: "Dependency result" }));
     const details = screen.getByRole("complementary", { name: "Stage details: Dependency result" });
     expect(within(details).getByText("500 ms")).toBeTruthy();
     expect(screen.getByText(/Selected stage is outside the visible rows/)).toBeTruthy();
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
-    fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    selectView("Timeline");
     rerender(<ExplainAnalyzePanel live events={[...facts]} />);
     expect(screen.getByRole("complementary", { name: "Stage details: Dependency result" })).toBeTruthy();
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
-    fireEvent.click(screen.getByRole("button", { name: "Show more stages" }));
-    const selected = screen.getByRole("button", { name: /Inspect Dependency result,/ });
+    fireEvent.click(screen.getByText("Show more stages", { selector: "button" }));
+    const dependencyRow = container.querySelector<HTMLElement>('[data-tree-node-id="hidden-dependency"]')!;
+    const selected = within(dependencyRow).getByRole("button", { name: /Inspect Dependency result,/ });
     expect(selected.getAttribute("aria-pressed")).toBe("true");
     expect(selected.closest(".explain-analyze-tree-node")?.contains(screen.getByRole("complementary"))).toBe(true);
     expect(screen.queryByText(/Selected stage is outside the visible rows/)).toBeNull();
@@ -456,7 +461,7 @@ describe("Explain Analyze graph view", () => {
       }),
     ];
     const { container } = render(<ExplainAnalyzePanel events={facts} />);
-    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    selectView("Graph");
     expect(screen.getByRole("button", { name: "Graph" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByLabelText("Graph legend")).toBeTruthy();
     const edges = [...container.querySelectorAll(".explain-analyze-graph-edge")];
@@ -487,7 +492,7 @@ describe("Explain Analyze graph view", () => {
       kind: "turn", clock_domain_id: "child-clock", run_id: "child-run", turn_id: "child-turn",
     });
     const { container } = render(<ExplainAnalyzePanel live events={[...wait, ...child]} />);
-    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    selectView("Graph");
     expect(container.querySelector('[data-node-id="wait"]')?.className).toContain("graph-card-wait");
     expect(container.querySelectorAll(".explain-analyze-graph-domain")).toHaveLength(2);
     expect(screen.getByText("Measured wait time")).toBeTruthy();
@@ -510,7 +515,7 @@ describe("Compact execution tree presentation", () => {
     }).map((fact) => fact.transition === "finished" ? { ...fact, usage: {
       basis: "provider_partial", fresh_input_tokens: 100, output_tokens: 12,
     } } : fact)} />);
-    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+    selectView("Tree");
     const node = screen.getByRole("button", { name: /Inspect Model request/ }).closest(".explain-analyze-tree-node")!;
     expect(node.querySelector(".explain-analyze-tree-usage")?.textContent).toContain("in 100");
     expect(node.querySelector(".explain-analyze-tree-status")?.textContent).toBe("Completed");
@@ -550,7 +555,6 @@ it("shows request budget and assembly source estimates without claiming provider
   expect(screen.getByText("Token usage not reported")).toBeTruthy();
 });
 
-
 it("keeps a historical started-only node static until live observation is explicit", () => {
   const facts = [{
     type: "explain_analyze", schema_version: 1, event_id: "open-start",
@@ -562,7 +566,7 @@ it("keeps a historical started-only node static until live observation is explic
   expect(screen.getByText("Snapshot")).toBeInTheDocument();
   expect(screen.queryByText("Active stages")).toBeNull();
   expect(screen.getByText("End not recorded")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+  selectView("Tree");
   expect(container.querySelector(".explain-analyze-tree-active")).toBeNull();
   rerender(<ExplainAnalyzePanel events={facts} live />);
   expect(screen.getByText("Live")).toBeInTheDocument();
@@ -582,10 +586,9 @@ it("keeps another turn live on the same clock after the first turn ends", () => 
   ]} />);
   expect(screen.getByText("Live")).toBeInTheDocument();
   expect(screen.queryByText("End not recorded")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+  selectView("Tree");
   expect(container.querySelectorAll(".explain-analyze-tree-active")).toHaveLength(1);
 });
-
 
 it("shows coverage for input/output-only reports even when another request omits usage", () => {
   render(<ExplainAnalyzePanel events={[
@@ -655,7 +658,6 @@ describe("Text tree navigation and sharing", () => {
   });
 });
 
-
 it("retains visible descendants, focus and inline selection when live siblings cross the old expansion threshold", () => {
   const facts = [
     ...recordedStage("root", "Large run", 0, 2_000, { kind: "turn" }),
@@ -664,16 +666,15 @@ it("retains visible descendants, focus and inline selection when live siblings c
     ...Array.from({ length: 248 }, (_, i) => recordedStage(`sibling-${i}`, `Sibling ${i}`, 900, 1000, { parent_node_id: "root" })).flat(),
   ];
   const { rerender } = render(<ExplainAnalyzePanel events={facts} />);
-  const child = screen.getByRole("button", { name: /Inspect Focused test/ });
+  const child = screen.getByText("Focused test", { selector: "button" });
   child.focus();
   fireEvent.click(child);
   rerender(<ExplainAnalyzePanel events={[...facts, ...recordedStage("new", "New sibling", 1100, 1200, { parent_node_id: "root" })]} />);
-  expect(screen.getByRole("button", { name: /Inspect Focused test/ })).toBe(child);
+  expect(screen.getByText("Focused test", { selector: "button" })).toBe(child);
   expect(document.activeElement).toBe(child);
   expect(child.getAttribute("aria-pressed")).toBe("true");
   expect(screen.getByRole("complementary", { name: "Stage details: Focused test" })).toBeTruthy();
 });
-
 
 it("retains known token subtotals when another request omits the lane", () => {
   const attempts = [
@@ -695,4 +696,15 @@ it("labels the maximum of independent turns without claiming a run wall time", (
   expect(screen.getByText("Longest turn")).toBeTruthy();
   expect(screen.queryByText("Turn time")).toBeNull();
   expect(screen.getByTitle("3.0 s")).toBeTruthy();
+});
+
+it("keeps the external replay gap warning in copied text even when surviving facts are consistent", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  render(<ExplainAnalyzePanel degraded events={recordedStage("turn", "Completed root", 0, 100, { kind: "turn" })} />);
+  expect(screen.getByText("Incomplete")).toBeTruthy();
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Copy tree" })); });
+  expect(writeText).toHaveBeenCalledOnce();
+  expect(writeText.mock.calls[0][0]).toContain("Incomplete observation: delivery gap");
+  expect(writeText.mock.calls[0][0]).toContain("Structural integrity: consistent");
 });

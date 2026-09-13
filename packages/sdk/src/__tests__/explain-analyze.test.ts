@@ -483,7 +483,6 @@ describe("saved Explain snapshots", () => {
   });
 });
 
-
 it("aggregates independent turn outcomes without sorting clocks into execution order", () => {
   for (const clocks of [["a", "z"], ["z", "a"]]) {
     const events = [
@@ -603,4 +602,11 @@ it("discloses graph layout limits while retaining all stages in the tree", () =>
     finished(`tool-${index}`, "tool_call", index * 2, index * 2 + 1)));
   expect(html).toContain("Showing 500 of 501 stages");
   expect(html).toContain('class="node-title" title="tool-500"');
+});
+
+it("keeps external delivery gaps inside the HTML report's copyable text", () => {
+  const html = renderExplainAnalyzeHtml([], { degraded: true });
+  const copyable = html.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/)?.[1];
+  expect(copyable).toContain("Incomplete observation: delivery gap");
+  expect(copyable).toContain("No execution facts recorded");
 });

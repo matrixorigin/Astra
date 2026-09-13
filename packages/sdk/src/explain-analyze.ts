@@ -1,5 +1,6 @@
 import { EXPLAIN_ANALYZE_HTML_STYLE } from "./explain-analyze-html-style";
 import { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
+import { renderExplainAnalyzeText } from "./explain-analyze-text";
 import type {
   ExplainAnalyzeEventV1,
   ExplainAnalyzeCoverageGapV1,
@@ -592,7 +593,7 @@ export function renderExplainAnalyzeHtml(
     .join("");
   const nodeGraph = renderHtmlNodeGraph(graph);
   const graphDetails = renderHtmlGraphDetails(graph);
-  const plainTree = renderPlainTextTree(clockDomains);
+  const plainTree = renderExplainAnalyzeText(events, { degraded: options.degraded });
   const providerAttempts = graph.nodes.filter(
     (node) => node.kind === "provider_attempt",
   );
@@ -785,73 +786,6 @@ function renderHtmlInlineContext(context: ExplainAnalyzeContextMetricsV1): strin
   ).join("");
 }
 
-function renderPlainTextTree(
-  domains: readonly (readonly [string, ExplainAnalyzeNodeV1[]])[],
-): string {
-  if (domains.length === 0) return "No execution facts were captured.";
-  return domains.map(([clockDomainId, nodes], domainIndex) => {
-    const timelineNodes = new Map(nodes.map((node) => [node.nodeId, node]));
-    const children = htmlChildrenByParent(nodes, timelineNodes);
-    const nodeById = new Map(nodes.map((node) => [node.nodeId, node]));
-    const visited = new Set<string>();
-    const roots = nodes
-      .filter((node) => !node.parentNodeId || !timelineNodes.has(node.parentNodeId))
-      .sort(compareHtmlNodes);
-    const lines = roots.flatMap((node, index) => renderPlainTextTreeNode(
-      node,
-      children,
-      nodeById,
-      visited,
-      0,
-      [],
-      index === roots.length - 1,
-    ));
-    for (const node of [...nodes].sort(compareHtmlNodes)) {
-      if (!visited.has(node.nodeId)) {
-        lines.push(...renderPlainTextTreeNode(node, children, nodeById, visited, 0, [], true));
-      }
-    }
-    const label = domains.length > 1
-      ? `Clock domain ${domainIndex + 1} · ${plainLine(clockDomainId)}`
-      : `Clock domain · ${plainLine(clockDomainId)}`;
-    return [label, ...lines].join("\n");
-  }).join("\n\n");
-}
-
-function renderPlainTextTreeNode(
-  node: ExplainAnalyzeNodeV1,
-  childrenByParent: ReadonlyMap<string, readonly ExplainAnalyzeNodeV1[]>,
-  nodeById: ReadonlyMap<string, ExplainAnalyzeNodeV1>,
-  visited: Set<string>,
-  depth: number,
-  ancestorLast: readonly boolean[],
-  isLast: boolean,
-): string[] {
-  if (visited.has(node.nodeId)) return [];
-  visited.add(node.nodeId);
-  const children = [...(childrenByParent.get(node.nodeId) ?? [])]
-    .filter((child) => !visited.has(child.nodeId))
-    .sort(compareHtmlNodes);
-  const guide = depth === 0 ? "" : asciiTreeGuide(ancestorLast, isLast);
-  const dependencyIds = node.dependencyNodeIds.slice(0, 3);
-  const dependencyNames = dependencyIds.map((dependencyId) => {
-    const dependency = nodeById.get(dependencyId);
-    if (!dependency) return dependencyId;
-    return dependency.kind === "provider_attempt"
-      ? `${dependency.label} (${requestIdentity(dependency)})`
-      : dependency.label;
-  });
-  const dependencySuffix = dependencyNames.length > 0
-    ? ` · after ${dependencyNames.map((dependency) => `“${plainLine(dependency)}”`).join(", ")}${node.dependencyNodeIds.length > dependencyNames.length ? ` and ${node.dependencyNodeIds.length - dependencyNames.length} more` : ""}`
-    : "";
-  const lines = [`${guide}${plainLine(node.label)} · ${plainLine(htmlNodeDetails(node))}${dependencySuffix}`];
-  const childAncestors = depth === 0 ? ancestorLast : [...ancestorLast, isLast];
-  for (const [index, child] of children.entries()) {
-    lines.push(...renderPlainTextTreeNode(child, childrenByParent, nodeById, visited, depth + 1, childAncestors, index === children.length - 1));
-  }
-  return lines;
-}
-
 function htmlChildrenByParent(
   nodes: readonly ExplainAnalyzeNodeV1[],
   nodeById: ReadonlyMap<string, ExplainAnalyzeNodeV1>,
@@ -875,10 +809,6 @@ function compareHtmlNodes(left: ExplainAnalyzeNodeV1, right: ExplainAnalyzeNodeV
 
 function asciiTreeGuide(ancestorLast: readonly boolean[], isLast: boolean): string {
   return `${ancestorLast.map((last) => last ? "   " : "│  ").join("")}${isLast ? "└─ " : "├─ "}`;
-}
-
-function plainLine(value: string): string {
-  return value.replace(/[\r\n\t]+/g, " ").replace(/ +/g, " ").trim();
 }
 
 function renderHtmlNodeGraph(graph: ExplainAnalyzeGraphV1): string {

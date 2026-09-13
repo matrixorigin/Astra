@@ -42211,44 +42211,145 @@ mod tests {
         assert_eq!(error.kind, astra_core::ErrorKind::ServerError);
         let emitted_events = host.take_emitted_events();
         assert_root_llm_progress_pairs(&emitted_events, 1);
-        let phase_outcomes: Vec<_> = emitted_events
-            .into_iter()
+        let phase_events: Vec<_> = emitted_events
+            .iter()
             .filter(|event| {
                 event.get("type").and_then(Value::as_str)
                     == Some(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
                     && event.get("transition").and_then(Value::as_str) == Some("finished")
                     && event.get("kind").and_then(Value::as_str) != Some("turn")
             })
+            .collect();
+        let root_node_id = emitted_events
+            .iter()
+            .find(|event| {
+                event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE
+                    && event["kind"] == "turn"
+                    && event["transition"] == "started"
+            })
+            .and_then(|event| event["node_id"].as_str())
+            .expect("Explain Analyze turn root");
+
+        let context_assembly = phase_events
+            .iter()
+            .find(|event| event["kind"] == "context_assembly")
+            .expect("source assembly phase");
+        assert_eq!(context_assembly["outcome"], "succeeded");
+        let context_parent_id = context_assembly["parent_node_id"]
+            .as_str()
+            .expect("context assembly parent");
+
+        let preparations: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "preparation")
+            .collect();
+        assert!(
+            !preparations.is_empty(),
+            "the pre-provider boundary must be recorded"
+        );
+        assert!(
+            preparations.iter().all(|event| {
+                event["outcome"] == "succeeded"
+                    && event["parent_node_id"].as_str() == Some(root_node_id)
+            }),
+            "every preparation phase must complete under the Explain Analyze turn root: {preparations:?}"
+        );
+        assert!(
+            preparations
+                .iter()
+                .any(|event| event["node_id"].as_str() == Some(context_parent_id)),
+            "context assembly must attach to its recorded preparation phase"
+        );
+
+        let model_rounds: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "model_round")
+            .collect();
+        assert!(
+            !model_rounds.is_empty(),
+            "the model boundary must retain the provider failure"
+        );
+        assert!(
+            model_rounds.iter().all(|event| {
+                event["outcome"] == "failed"
+                    && event["parent_node_id"].as_str() == Some(root_node_id)
+            }),
+            "every model round must retain its failed outcome under the turn root: {model_rounds:?}"
+        );
+        let model_round_ids: HashSet<&str> = model_rounds
+            .iter()
+            .map(|event| event["node_id"].as_str().expect("model round node id"))
+            .collect();
+        assert_eq!(
+            model_round_ids.len(),
+            model_rounds.len(),
+            "model round identities must remain unique across retries"
+        );
+
+        let provider_attempts: Vec<_> = phase_events
+            .iter()
+            .filter(|event| event["kind"] == "provider_attempt")
+            .collect();
+        assert!(
+            !provider_attempts.is_empty(),
+            "at least one physical provider attempt must be recorded"
+        );
+        assert!(
+            provider_attempts
+                .iter()
+                .all(|event| event["outcome"] == "failed"),
+            "every physical retry must retain a failed provider-attempt outcome: {provider_attempts:?}"
+        );
+        let attempt_ids: HashSet<&str> = provider_attempts
+            .iter()
+            .map(|event| event["node_id"].as_str().expect("provider attempt node id"))
+            .collect();
+        let attempt_keys: HashSet<(&str, u64)> = provider_attempts
+            .iter()
             .map(|event| {
                 (
-                    event["kind"].as_str().unwrap_or_default().to_string(),
-                    event["outcome"].as_str().unwrap_or_default().to_string(),
+                    event["parent_node_id"]
+                        .as_str()
+                        .expect("provider attempt parent"),
+                    event["attempt_index"]
+                        .as_u64()
+                        .expect("provider attempt index"),
                 )
             })
             .collect();
         assert_eq!(
-            phase_outcomes.first(),
-            Some(&("context_assembly".to_string(), "succeeded".to_string())),
-            "the source assembly remains visible before the provider request"
+            attempt_ids.len(),
+            provider_attempts.len(),
+            "physical provider attempts must have unique node identities"
         );
         assert_eq!(
-            phase_outcomes.get(1),
-            Some(&("preparation".to_string(), "succeeded".to_string())),
-            "the pre-provider boundary must complete before inference"
+            attempt_keys.len(),
+            provider_attempts.len(),
+            "physical provider attempts must have unique model-round/index identities"
         );
-        assert_eq!(
-            phase_outcomes.last(),
-            Some(&("model_round".to_string(), "failed".to_string())),
-            "the model boundary must retain the provider failure"
-        );
-        let provider_attempts = &phase_outcomes[2..phase_outcomes.len().saturating_sub(1)];
-        assert!(
-            !provider_attempts.is_empty()
-                && provider_attempts
-                    .iter()
-                    .all(|(kind, outcome)| { kind == "provider_attempt" && outcome == "failed" }),
-            "every physical retry must remain a failed provider-attempt fact: {phase_outcomes:?}"
-        );
+        for attempt in &provider_attempts {
+            let node_id = attempt["node_id"]
+                .as_str()
+                .expect("provider attempt node id");
+            let attempt_index = attempt["attempt_index"]
+                .as_u64()
+                .expect("provider attempt index");
+            assert!(
+                node_id.ends_with(&format!("/physical/{attempt_index}")),
+                "physical attempt identity must include its durable index: {node_id}"
+            );
+            let parent_node_id = attempt["parent_node_id"]
+                .as_str()
+                .expect("provider attempt parent");
+            let parent_model_round = model_rounds
+                .iter()
+                .find(|round| round["node_id"].as_str() == Some(parent_node_id))
+                .expect("provider attempt must attach to a model round");
+            assert_eq!(
+                attempt["round_index"], parent_model_round["round_index"],
+                "provider attempt and model round must share the recorded round index"
+            );
+        }
 
         state
             .turn_event_buffer

@@ -192,3 +192,12 @@ describe("Explain Analyze text export", () => {
     expect(text.length).toBeLessThan(256_100);
   });
 });
+
+it("preserves external delivery gaps independently of structural consistency", () => {
+  const events = [finished("turn", "turn", 0, 100, { outcome: "completed" })];
+  const text = renderExplainAnalyzeText(events, { degraded: true });
+  expect(text).toContain("Incomplete observation: delivery gap");
+  expect(text).toContain("Structural integrity: consistent");
+  expect(text).toContain("turn · 100 ms · Completed");
+  expect(renderExplainAnalyzeText(events)).not.toContain("Incomplete observation");
+});

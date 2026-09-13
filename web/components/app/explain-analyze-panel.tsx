@@ -200,7 +200,7 @@ export function ExplainAnalyzePanel({
 
   const copyTree = async () => {
     try {
-      await navigator.clipboard.writeText(renderExplainAnalyzeText(events));
+      await navigator.clipboard.writeText(renderExplainAnalyzeText(events, { degraded }));
       setCopyStatus("Tree copied");
     } catch {
       setCopyStatus("Could not access the clipboard. Save the report instead.");

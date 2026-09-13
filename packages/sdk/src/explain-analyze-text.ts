@@ -37,14 +37,20 @@ type TreeFrame = {
  * label. The traversal is iterative so a damaged or unusually deep history
  * cannot overflow the JavaScript call stack.
  */
-export function renderExplainAnalyzeText(events: readonly unknown[]): string {
+export function renderExplainAnalyzeText(
+  events: readonly unknown[],
+  options: { degraded?: boolean } = {},
+): string {
   const graph = reduceExplainAnalyzeEvents(events);
   const state: RenderState = { characters: 0, renderedNodes: 0, truncated: false };
   const lines: string[] = [];
 
   appendLine(lines, "# Explain Analyze", state);
   appendLine(lines, "", state);
-  appendLine(lines, `Integrity: ${graph.integrity}`, state);
+  if (options.degraded) {
+    appendLine(lines, "Incomplete observation: delivery gap. Some execution facts may be missing.", state);
+  }
+  appendLine(lines, `Structural integrity: ${graph.integrity}`, state);
   if (graph.diagnostics.length > 0) {
     appendLine(lines, `Recorded graph diagnostics: ${graph.diagnostics.length}`, state);
   }
