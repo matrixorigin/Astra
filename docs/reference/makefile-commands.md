@@ -12,7 +12,7 @@
 | `make dev-status` | Show dependency and API status |
 | `make dev-api-restart` | Restart the source-mode API server |
 | `make dev-api-restart-debug` | Rebuild and restart the source-mode API server in debug mode |
-| `make dev-seed` | Reset the local database and reseed the admin account and configured models; the initial schema bootstrap gets an extended readiness window |
+| `make dev-seed` | Stop the local API, reset the local database, and reseed the admin account and configured models; the initial schema bootstrap gets an extended readiness window |
 | `make dev-start-docker` | Start the app stack in Docker mode |
 
 ## Testing

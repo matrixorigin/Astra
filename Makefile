@@ -847,6 +847,9 @@ dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@echo "Stopping API server before dropping the database..."
+	@$(MAKE) dev-api-stop
+	@sleep 2
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
