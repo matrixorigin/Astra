@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   explainAnalyzeMaxConcurrency,
+  explainAnalyzeTurnOutcome,
   isExplainAnalyzeEventV1,
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
@@ -298,7 +299,7 @@ describe("Explain Analyze graph reducer", () => {
     expect(html).toContain("Work stage</span>");
     expect(html).toContain('class="bar is-group status-complete"');
     expect(html).toContain(".node-children:before");
-    expect(html).toContain("Totals include every request");
+    expect(html).toContain("Reported subtotal from 2 of 2 observed requests");
   });
 });
 
@@ -362,4 +363,133 @@ describe("Explain Analyze integrity", () => {
       active, finished("other-turn", "turn", 0, 100, { turn_id: "turn-2" }),
     ]).integrity).toBe("consistent");
   });
+});
+
+describe("context facts", () => {
+  const budget = { basis: "pre_provider_estimate" as const, estimated_input_tokens: 4200,
+    estimated_system_tokens: 1400, tool_schema_tokens: 900, requested_output_tokens: 2000,
+    reserved_protocol_tokens: 300, effective_input_limit_tokens: 12000,
+    model_context_limit_tokens: 16000, visible_tool_count: 8 };
+  const assembly = { basis: "runtime_text_estimate" as const,
+    sources: [{ kind: "memory" as const, section_count: 2, estimated_tokens: 210 }] };
+
+  it("preserves separately scoped request budgets and assembly estimates through replay/export", () => {
+    const prepared = finished("prepared", "preparation", 0, 20, { context: { budget } });
+    const assembled = finished("context", "context_assembly", 0, 10, { context: { assembly } });
+    const graph = reduceExplainAnalyzeEvents([prepared, assembled, { ...prepared, index: 12 }]);
+    expect(graph.duplicateEventCount).toBe(1);
+    expect(graph.nodes.find((n) => n.nodeId === "prepared")?.context?.budget).toEqual(budget);
+    expect(graph.nodes.find((n) => n.nodeId === "context")?.context?.assembly).toEqual(assembly);
+    expect(graph.nodes.every((n) => n.usage === undefined)).toBe(true);
+    const html = renderExplainAnalyzeHtml([prepared, assembled]);
+    expect(html).toContain("4,200 tokens");
+    expect(html).toContain("Retrieved memory");
+    expect(html).toContain("Not billed usage");
+  });
+
+  it.each([
+    { budget: { ...budget, raw_prompt: "private" } },
+    { budget: { ...budget, estimated_input_tokens: Number.MAX_SAFE_INTEGER + 1 } },
+    { budget: { ...budget, visible_tool_count: 0x1_0000_0000 } },
+    { budget: { ...budget, basis: "provider_exact" } },
+    {},
+  ])("rejects malformed or content-bearing request metrics", (context) => {
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), context })).toBe(false);
+  });
+
+  it("rejects wrong stage scope, duplicate sources, previews and unsafe counts", () => {
+    expect(isExplainAnalyzeEventV1({ ...started("p", "preparation", 0), context: { budget } })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...finished("c", "context_assembly", 0, 10), context: { budget } })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), context: { assembly } })).toBe(false);
+    for (const sources of [
+      [assembly.sources[0], assembly.sources[0]],
+      [{ ...assembly.sources[0], content_preview: "private memory" }],
+      [{ ...assembly.sources[0], section_count: 0x1_0000_0000 }],
+      [{ ...assembly.sources[0], kind: "raw_trace" }],
+      [{ ...assembly.sources[0], kind: ["memory"] }],
+      [{ ...assembly.sources[0], kind: { toString: null } }],
+    ]) expect(isExplainAnalyzeEventV1({ ...finished("c", "context_assembly", 0, 10), context: { assembly: { ...assembly, sources } } })).toBe(false);
+  });
+
+  it("flags changed context on a repeated terminal as a conflicting fact", () => {
+    const event = finished("p", "preparation", 0, 10, { context: { budget } });
+    const graph = reduceExplainAnalyzeEvents([event, { ...event, event_id: "other", context: { budget: { ...budget, requested_output_tokens: 4000 } } }]);
+    expect(graph.integrity).toBe("unknown");
+    expect(graph.conflictedNodeIds).toContain("p");
+  });
+});
+
+describe("saved Explain snapshots", () => {
+  it("does not let a closed turn imply a missing end in another clock domain", () => {
+    const html = renderExplainAnalyzeHtml([
+      finished("closed", "turn", 0, 100),
+      started("open", "turn", 0, { turn_id: "child-turn", clock_domain_id: "child-clock" }),
+    ]);
+    expect(html).not.toContain("Some execution facts are missing or conflict.");
+    expect(html).toContain("Open at capture");
+    expect(html).toContain("Saved snapshot; this file does not receive new events.");
+    expect(html).toContain("End not recorded");
+    expect(html).not.toContain(" – Now");
+  });
+  it("reports an unfinished child of a closed turn as incomplete", () => {
+    const html = renderExplainAnalyzeHtml([
+      finished("closed", "turn", 0, 100),
+      started("tool", "tool_call", 10, { parent_node_id: "closed" }),
+    ]);
+    expect(html).toContain("Some execution facts are missing or conflict.");
+    expect(html).toContain("End not recorded");
+    expect(html).toContain('width:2px');
+  });
+  it.each([["preparation"], { toString: null }])("rejects non-string event enums without coercion", (kind) => {
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), kind })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), outcome: kind })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...finished("p", "preparation", 0, 10), usage: { basis: kind } })).toBe(false);
+  });
+});
+
+
+it("aggregates independent turn outcomes without sorting clocks into execution order", () => {
+  for (const clocks of [["a", "z"], ["z", "a"]]) {
+    const events = [
+      finished("one", "turn", 0, 10, { outcome: "failed", clock_domain_id: clocks[0] }),
+      finished("two", "turn", 0, 20, { outcome: "succeeded", turn_id: "other", clock_domain_id: clocks[1] }),
+    ];
+    for (const input of [events, [...events].reverse()]) {
+      expect(explainAnalyzeTurnOutcome(reduceExplainAnalyzeEvents(input).nodes)).toBe("Mixed outcomes");
+      expect(renderExplainAnalyzeHtml(input)).toContain(">Mixed outcomes</span>");
+    }
+  }
+});
+
+it("counts started-only requests and labels known usage as a reported subtotal", () => {
+  const html = renderExplainAnalyzeHtml([
+    finished("turn", "turn", 0, 100),
+    finished("first", "provider_attempt", 0, 20, { round_index: 0, attempt_index: 0,
+      usage: { basis: "provider_exact", fresh_input_tokens: 40, output_tokens: 2 } }),
+    started("second", "provider_attempt", 30, { round_index: 0, attempt_index: 1 }),
+  ]);
+  expect(html).toContain('Provider requests</span><strong>2</strong>');
+  expect(html).toContain("Reported subtotal from 1 of 2 observed requests");
+  expect(html).toContain('<span>Fresh input</span><strong>40</strong>');
+  expect(html).not.toContain('<span class="source-tag">Provider reported</span>');
+});
+
+it("retains reported lanes when another terminal request omits usage entirely", () => {
+  const html = renderExplainAnalyzeHtml([
+    finished("a", "provider_attempt", 0, 10, { round_index: 0, attempt_index: 0,
+      usage: { basis: "provider_partial", fresh_input_tokens: 40, output_tokens: 2 } }),
+    finished("b", "provider_attempt", 10, 20, { round_index: 0, attempt_index: 1 }),
+  ]);
+  expect(html).toContain("Reported subtotal from 1 of 2 observed requests");
+  expect(html).toContain('<span>Fresh input</span><strong>40</strong>');
+  expect(html).toContain('<span>Cache read</span><strong>Not fully reported</strong>');
+});
+
+it("does not promise live updates in an empty or started-only exported snapshot", () => {
+  for (const events of [[], [started("open", "turn", 0)]]) {
+    const html = renderExplainAnalyzeHtml(events);
+    expect(html).not.toContain("In progress");
+    expect(html).not.toContain("as the run advances");
+    expect(html).toContain("Saved snapshot");
+  }
 });

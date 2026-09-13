@@ -285,6 +285,7 @@ export const MessageBubble = memo(function MessageBubble({
         <ExplainAnalyzePanel
           events={message.explainAnalyzeEvents ?? []}
           degraded={message.explainAnalyzeDegraded}
+          live={assistantStillStreaming}
         />
       ) : null}
       {hasArtifacts ? <ArtifactList artifacts={artifacts} /> : null}

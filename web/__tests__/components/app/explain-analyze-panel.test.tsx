@@ -20,7 +20,7 @@ const identity = {
 describe("ExplainAnalyzePanel", () => {
   it("shows a plain-language overview, honest token lanes, and an expandable timeline", () => {
     renderTimeline(
-      <ExplainAnalyzePanel
+      <ExplainAnalyzePanel live
         events={[
           {
             ...identity,
@@ -137,12 +137,12 @@ describe("ExplainAnalyzePanel", () => {
   });
 
   it("makes delivery gaps visible instead of presenting a complete graph", () => {
-    renderTimeline(<ExplainAnalyzePanel events={[]} degraded />);
+    renderTimeline(<ExplainAnalyzePanel live events={[]} degraded />);
     expect(screen.getByText(/delivery gap or unresolved stages/i)).toBeTruthy();
   });
 
   it("shows a warning when every Explain fact was invalid", () => {
-    renderTimeline(<ExplainAnalyzePanel events={[{ type: "explain_analyze", schema_version: 1 }]} />);
+    renderTimeline(<ExplainAnalyzePanel live events={[{ type: "explain_analyze", schema_version: 1 }]} />);
     expect(screen.getByText("Incomplete")).toBeTruthy();
     expect(screen.getByText(/delivery gap or unresolved stages/i)).toBeTruthy();
   });
@@ -151,7 +151,7 @@ describe("ExplainAnalyzePanel", () => {
     vi.useFakeTimers();
     try {
       renderTimeline(
-        <ExplainAnalyzePanel
+        <ExplainAnalyzePanel live
           events={[
             {
               ...identity,
@@ -199,10 +199,10 @@ describe("ExplainAnalyzePanel", () => {
         { ...identity, event_id: "turn:start", node_id: "turn", kind: "turn", label: "User turn", transition: "started", elapsed_ms: 0 },
         { ...identity, event_id: "attempt:start", node_id: "attempt", parent_node_id: "turn", kind: "provider_attempt", round_index: 0, attempt_index: 0, label: "Model request", transition: "started", elapsed_ms: 100 },
       ];
-      const view = renderTimeline(<ExplainAnalyzePanel events={events} />);
+      const view = renderTimeline(<ExplainAnalyzePanel live events={events} />);
       act(() => vi.advanceTimersByTime(1_000));
       expect(screen.getByRole("button", { name: /Model request/ }).getAttribute("aria-label")).toContain("estimated elapsed so far");
-      view.rerender(<ExplainAnalyzePanel events={[...events, {
+      view.rerender(<ExplainAnalyzePanel live events={[...events, {
         ...identity, event_id: "turn:finish", node_id: "turn", kind: "turn", label: "User turn", transition: "finished", elapsed_ms: 2_000, start_elapsed_ms: 0, duration_ms: 2_000, outcome: "completed",
       }]} />);
       const track = screen.getByRole("button", { name: /Model request/ });
@@ -240,7 +240,7 @@ describe("Explain Analyze timeline inspection", () => {
   ];
 
   it("preserves measured parallel intervals and selection while scrubbing and receiving facts", () => {
-    const view = renderTimeline(<ExplainAnalyzePanel events={facts} />);
+    const view = renderTimeline(<ExplainAnalyzePanel live events={facts} />);
     const cart = screen.getByRole("button", { name: /Inspect Read cart/ });
     const stock = screen.getByRole("button", { name: /Inspect Read stock/ });
     expect(cart.style.left).toBe("25%");
@@ -256,7 +256,7 @@ describe("Explain Analyze timeline inspection", () => {
     expect(stock.closest(".explain-analyze-lane")?.classList.contains("explain-analyze-lane-future")).toBe(true);
     expect(cart.style.width).toBe("50%");
     expect(screen.getByRole("complementary", { name: "Stage details: Read cart" })).toBeTruthy();
-    view.rerender(<ExplainAnalyzePanel events={[...facts, ...recordedStage("saved", "Save", 2_000, 2_100)]} />);
+    view.rerender(<ExplainAnalyzePanel live events={[...facts, ...recordedStage("saved", "Save", 2_000, 2_100)]} />);
     expect(screen.getByRole("button", { name: /Inspect Read cart/ }).getAttribute("aria-pressed")).toBe("true");
     expect((screen.getByRole("slider") as HTMLInputElement).value).toBe("600");
   });
@@ -264,7 +264,7 @@ describe("Explain Analyze timeline inspection", () => {
   it("plays only on request, pauses and resets, and keeps separate clock-domain cursors", () => {
     vi.useFakeTimers();
     try {
-      renderTimeline(<ExplainAnalyzePanel events={[...facts, ...recordedStage("child-turn", "Child turn", 0, 8_000, {
+      renderTimeline(<ExplainAnalyzePanel live events={[...facts, ...recordedStage("child-turn", "Child turn", 0, 8_000, {
         kind: "turn", clock_domain_id: "z-child-clock", run_id: "child-run", turn_id: "child-turn",
       })]} />);
       const first = screen.getByRole("slider", { name: "Timeline 1 position" }) as HTMLInputElement;
@@ -292,7 +292,7 @@ describe("Explain Analyze timeline inspection", () => {
 
 describe("Explain Analyze multi-domain lifecycle and windowing", () => {
   it("keeps a healthy child timeline live after the parent turn finishes", () => {
-    renderTimeline(<ExplainAnalyzePanel events={[
+    renderTimeline(<ExplainAnalyzePanel live events={[
       ...recordedStage("parent-turn", "Parent turn", 0, 2_000, { kind: "turn" }),
       {
         ...identity, event_id: "child:start", node_id: "child-turn", kind: "turn",
@@ -321,7 +321,7 @@ describe("Explain Analyze multi-domain lifecycle and windowing", () => {
         )).flat(),
       ];
     }).flat();
-    const { container } = renderTimeline(<ExplainAnalyzePanel events={facts} />);
+    const { container } = renderTimeline(<ExplainAnalyzePanel live events={facts} />);
     expect(container.querySelectorAll(".explain-analyze-bar").length).toBe(500);
     expect(screen.queryByRole("slider", { name: "Timeline 11 position" })).toBeNull();
     const selected = screen.getByRole("button", { name: /Inspect Call 0\/0,/ });
@@ -342,7 +342,7 @@ describe("Explain Analyze tree view", () => {
   ];
 
   it("defaults to a readable execution tree with nearby measured details", () => {
-    render(<ExplainAnalyzePanel events={facts} />);
+    render(<ExplainAnalyzePanel live events={facts} />);
     expect(screen.getByRole("button", { name: "Tree" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.queryByRole("slider")).toBeNull();
     expect(screen.queryByRole("button", { name: /Play timeline/ })).toBeNull();
@@ -356,7 +356,7 @@ describe("Explain Analyze tree view", () => {
   });
 
   it("preserves selection and collapsed branches when switching views", () => {
-    render(<ExplainAnalyzePanel events={facts} />);
+    render(<ExplainAnalyzePanel live events={facts} />);
     fireEvent.click(screen.getByRole("button", { name: /Inspect Read project configuration/ }));
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
     expect(screen.getByRole("slider")).toBeTruthy();
@@ -380,7 +380,7 @@ describe("Explain Analyze tree view", () => {
       )).flat(),
       ...recordedStage("hidden-dependency", "Dependency result", 1_000, 1_500),
     ];
-    const { container, rerender } = render(<ExplainAnalyzePanel events={facts} />);
+    const { container, rerender } = render(<ExplainAnalyzePanel live events={facts} />);
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
     fireEvent.click(screen.getByRole("button", { name: /Inspect Inspect result,/ }));
     fireEvent.click(within(screen.getByRole("complementary")).getByRole("button", { name: "Dependency result" }));
@@ -389,7 +389,7 @@ describe("Explain Analyze tree view", () => {
     expect(screen.getByText(/Selected stage is outside the visible rows/)).toBeTruthy();
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
-    rerender(<ExplainAnalyzePanel events={[...facts]} />);
+    rerender(<ExplainAnalyzePanel live events={[...facts]} />);
     expect(screen.getByRole("complementary", { name: "Stage details: Dependency result" })).toBeTruthy();
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
     fireEvent.click(screen.getByRole("button", { name: "Show more stages" }));
@@ -402,7 +402,7 @@ describe("Explain Analyze tree view", () => {
 
 describe("Compact execution tree presentation", () => {
   it("shows one usage uncertainty note without four placeholder cards", () => {
-    render(<ExplainAnalyzePanel events={recordedStage("turn", "User turn", 0, 2_000, { kind: "turn" })} />);
+    render(<ExplainAnalyzePanel live events={recordedStage("turn", "User turn", 0, 2_000, { kind: "turn" })} />);
     expect(screen.getAllByText("Token usage not reported")).toHaveLength(1);
     expect(screen.queryByText("Not fully reported")).toBeNull();
     expect(screen.queryByText("Slowest model request")).toBeNull();
@@ -410,7 +410,7 @@ describe("Compact execution tree presentation", () => {
   });
 
   it("renders token and outcome columns from reported request facts", () => {
-    render(<ExplainAnalyzePanel events={recordedStage("request", "Model request", 0, 1_000, {
+    render(<ExplainAnalyzePanel live events={recordedStage("request", "Model request", 0, 1_000, {
       kind: "provider_attempt", round_index: 0, attempt_index: 0,
     }).map((fact) => fact.transition === "finished" ? { ...fact, usage: {
       basis: "provider_partial", fresh_input_tokens: 100, output_tokens: 12,
@@ -421,4 +421,85 @@ describe("Compact execution tree presentation", () => {
     fireEvent.click(within(node as HTMLElement).getByRole("button", { name: /Inspect Model request/ }));
     expect(screen.getByRole("complementary").textContent).toContain("Partial provider report");
   });
+});
+
+it("shows request budget and assembly source estimates without claiming provider usage", () => {
+  const terminal = { ...identity, transition: "finished", start_elapsed_ms: 0,
+    elapsed_ms: 100, duration_ms: 100, outcome: "completed" };
+  render(<ExplainAnalyzePanel live events={[
+    { ...terminal, event_id: "t", node_id: "turn", kind: "turn", label: "Answer" },
+    { ...terminal, event_id: "p", node_id: "prep", parent_node_id: "turn", kind: "preparation", label: "Prepare request",
+      context: { budget: { basis: "pre_provider_estimate", estimated_input_tokens: 4200,
+        estimated_system_tokens: 1400, tool_schema_tokens: 900, requested_output_tokens: 2000,
+        reserved_protocol_tokens: 300, effective_input_limit_tokens: 12000,
+        model_context_limit_tokens: 16000, visible_tool_count: 8 } } },
+    { ...terminal, event_id: "c", node_id: "context", parent_node_id: "turn", kind: "context_assembly", label: "Prepare context",
+      context: { assembly: { basis: "runtime_text_estimate", sources: [
+        { kind: "memory", section_count: 2, estimated_tokens: 210 },
+        { kind: "project_context", section_count: 1, estimated_tokens: 340 },
+      ] } } },
+  ]}/>);
+  expect(screen.getByText("Token usage not reported")).toBeTruthy();
+  expect(screen.getByText("Input ≈4,200 / 12,000")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /Inspect Prepare request,/ }));
+  const budget = screen.getByRole("region", { name: "Request budget" });
+  expect(within(budget).getByText("4,200 tokens")).toBeTruthy();
+  expect(within(budget).getByText("Output allowance")).toBeTruthy();
+  expect(within(budget).getByText(/Not billed usage/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /Inspect Prepare context,/ }));
+  const sources = screen.getByRole("region", { name: "Context sources" });
+  expect(within(sources).getByText("Retrieved memory")).toBeTruthy();
+  expect(within(sources).getByText("210 tokens · 2 sections")).toBeTruthy();
+  expect(within(sources).getByText(/Later request preparation may change/)).toBeTruthy();
+  expect(screen.getByText("Token usage not reported")).toBeTruthy();
+});
+
+
+it("keeps a historical started-only node static until live observation is explicit", () => {
+  const facts = [{
+    type: "explain_analyze", schema_version: 1, event_id: "open-start",
+    run_id: "run", turn_id: "turn", node_id: "open", producer_id: "worker",
+    clock_domain_id: "clock", kind: "turn", label: "Unfinished turn",
+    transition: "started", elapsed_ms: 0,
+  }];
+  const { container, rerender } = render(<ExplainAnalyzePanel events={facts} />);
+  expect(screen.getByText("Snapshot")).toBeInTheDocument();
+  expect(screen.queryByText("Active stages")).toBeNull();
+  expect(screen.getByText("End not recorded")).toBeInTheDocument();
+  expect(container.querySelector(".explain-analyze-mini-live")).toBeNull();
+  rerender(<ExplainAnalyzePanel events={facts} live />);
+  expect(screen.getByText("Live")).toBeInTheDocument();
+  expect(container.querySelector(".explain-analyze-mini-live")).not.toBeNull();
+  rerender(<ExplainAnalyzePanel events={facts} />);
+  expect(container.querySelector(".explain-analyze-mini-live")).toBeNull();
+});
+
+it("keeps another turn live on the same clock after the first turn ends", () => {
+  const base = { type: "explain_analyze", schema_version: 1, run_id: "run",
+    producer_id: "worker", clock_domain_id: "shared", kind: "turn" };
+  const { container } = render(<ExplainAnalyzePanel live events={[
+    { ...base, event_id: "a-end", node_id: "a", turn_id: "a", label: "Closed turn",
+      transition: "finished", elapsed_ms: 100, start_elapsed_ms: 0, duration_ms: 100, outcome: "completed" },
+    { ...base, event_id: "b-start", node_id: "b", turn_id: "b", label: "Active turn",
+      transition: "started", elapsed_ms: 110 },
+  ]} />);
+  expect(screen.getByText("Live")).toBeInTheDocument();
+  expect(screen.queryByText("End not recorded")).toBeNull();
+  expect(container.querySelectorAll(".explain-analyze-mini-live")).toHaveLength(1);
+});
+
+
+it("shows coverage for input/output-only reports even when another request omits usage", () => {
+  render(<ExplainAnalyzePanel events={[
+    ...recordedStage("with-usage", "First request", 0, 100, {
+      kind: "provider_attempt", round_index: 0, attempt_index: 0,
+      usage: { basis: "provider_partial", fresh_input_tokens: 40, output_tokens: 2 },
+    }),
+    ...recordedStage("without-usage", "Second request", 100, 200, {
+      kind: "provider_attempt", round_index: 0, attempt_index: 1,
+    }),
+  ]} />);
+  expect(screen.getByText("Reported subtotal · 1/2 requests · partial or estimated")).toBeInTheDocument();
+  expect(screen.getByText("40")).toBeInTheDocument();
+  expect(screen.getByText("Token usage partly reported")).toBeInTheDocument();
 });

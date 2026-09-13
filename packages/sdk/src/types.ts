@@ -349,6 +349,42 @@ export type ExplainAnalyzeUsageV1 = {
   output_tokens?: number;
 };
 
+export type ExplainAnalyzeContextSourceKindV1 =
+  | "identity" | "self_model" | "project_context" | "deferred_tools"
+  | "available_skills" | "memory" | "working_memory" | "history" | "constraints"
+  | "skills" | "runtime_identity" | "runtime_volatile" | "emergent_skills"
+  | "emergent_memory" | "emergent_summary";
+
+export type ExplainAnalyzeContextBudgetV1 = {
+  basis: "pre_provider_estimate";
+  estimated_input_tokens: number;
+  estimated_system_tokens: number;
+  tool_schema_tokens: number;
+  requested_output_tokens: number;
+  reserved_protocol_tokens: number;
+  effective_input_limit_tokens: number;
+  model_context_limit_tokens: number;
+  visible_tool_count: number;
+};
+
+export type ExplainAnalyzeContextSourceV1 = {
+  kind: ExplainAnalyzeContextSourceKindV1;
+  section_count: number;
+  estimated_tokens: number;
+};
+
+export type ExplainAnalyzeContextAssemblyV1 = {
+  basis: "runtime_text_estimate";
+  sources: ExplainAnalyzeContextSourceV1[];
+};
+
+/** Assembly observations and final request estimates have different scopes.
+ * Neither is provider-billed usage; their values must not be summed together. */
+export type ExplainAnalyzeContextMetricsV1 = {
+  budget?: ExplainAnalyzeContextBudgetV1;
+  assembly?: ExplainAnalyzeContextAssemblyV1;
+};
+
 /** One versioned, bounded execution fact. Missing token lanes are unavailable,
  * not zero; indexes are explicit and are never parsed from labels. */
 export type ExplainAnalyzeEventV1 = {
@@ -372,6 +408,7 @@ export type ExplainAnalyzeEventV1 = {
   duration_ms?: number;
   outcome?: ExplainAnalyzeOutcomeV1;
   usage?: ExplainAnalyzeUsageV1;
+  context?: ExplainAnalyzeContextMetricsV1;
 };
 
 export type PlanCreatedEvent = {

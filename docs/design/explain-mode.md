@@ -74,12 +74,25 @@ retries under their actual owners, with explicit dependency details. Do not
 replace meaningful context information with a sparse list of timed stages.
 
 Web adds subtle active-state and new-node animation, keyboard navigation, and
-an inspector that remains visible when selecting nodes in long trees. A
+an inspector that remains visible when selecting nodes in long trees. Aligned
+miniature time bars in the duration column expose overlap without leaving the
+tree; active bars grow with explicitly estimated elapsed time, then settle to
+measured intervals when terminal facts arrive. Their shared scale is per clock
+domain and can expand while a run is live. A
 switchable timeline is a complementary view of the same facts: one axis per
 clock domain, with overlapping bars for concurrency. Use a stable status
 palette with text labels as well as color: green for completed, red for failed,
 amber for waits or blocked work, and blue for active work. Respect reduced
 motion and keep both views calm while execution advances.
+
+Live animation requires an explicit active observation from the host surface.
+Missing terminal facts alone do not establish that execution is still running.
+Saved HTML and historical messages remain static and label unrecorded ends.
+Independent turn outcomes aggregate without imposing order on clock identifiers;
+different outcomes remain mixed. Token subtotals state how many observed
+requests supplied usage, retain known lanes, and leave unreported lanes unknown.
+Context assembly and request budget estimates remain separate from provider
+usage and identify their estimation scope.
 
 The quality fixture includes at least: a long provider wait followed by a fast
 answer, a retried request with per-attempt token usage, parallel tools whose
