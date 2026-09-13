@@ -25,6 +25,7 @@ These documents describe target contracts. They should not be read as proof that
 | Prompt lifecycle | [prompt-lifecycle.md](prompt-lifecycle.md) | Prompt assembly, versioning, stable prefix, cache and evolution boundary. |
 | Context window | [context-window-management.md](context-window-management.md) | Token budgets, compaction, eviction, and context preservation. |
 | Observation | [observation-plane.md](observation-plane.md) | Trace, audit, introspect, reflect, status, diagnostics. |
+| Explain mode | [explain-mode.md](explain-mode.md) | Execution-graph projection, metric definitions, and Explain product experience; runtime facts and durable replay remain with their canonical owners. |
 | Artifacts/debug bundles | [artifacts-and-debug-bundles.md](artifacts-and-debug-bundles.md) | Artifact manifests, large output handling, raw diagnostic bundle lifecycle. |
 | Introspect/reflect | [introspect-and-reflect.md](introspect-and-reflect.md) | Agent self-observation, reflection boundaries, and introspection dimensions. |
 | Session observability | [session-observability.md](session-observability.md) | User/support visible status, stream projection, stuck diagnosis, reconnect. |
