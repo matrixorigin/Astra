@@ -341,6 +341,23 @@ impl ToolSpec {
         self.load_policy == ToolLoadPolicy::Deferred
             && !matches!(self.required.network, RequiredNetwork::None)
     }
+
+    /// Whether this tool is a network capability whose declared effects fit a
+    /// read-only delegation scope. This only qualifies it as a candidate:
+    /// parent constraints, provider availability, and runtime policy still
+    /// decide whether a particular child may invoke it.
+    pub fn is_read_only_network_capability(&self) -> bool {
+        self.effect.uses_network
+            && !self.effect.writes_workspace
+            && !self.effect.spawns_process
+            && !self.effect.uses_credentials
+            && !self.effect.mutates_external_state
+            && !self.required.filesystem_write
+            && !self.required.process_spawn
+            && !self.required.credentials
+            && self.required.network != RequiredNetwork::None
+            && self.required.workspace != RequiredWorkspace::ReadWrite
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1654,6 +1671,34 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn read_only_network_capability_is_derived_from_effect_contract() {
+        let registry = registry();
+        let fetch = registry.get("web_fetch").expect("web_fetch");
+        assert!(fetch.is_read_only_network_capability());
+
+        // Classification is contract-based, so a future tool with the same
+        // declared effects does not need to be added to a name allowlist.
+        let mut future_reader = fetch.clone();
+        future_reader.name = "future_research_reader".to_string();
+        assert!(future_reader.is_read_only_network_capability());
+
+        let mut credentialed = future_reader.clone();
+        credentialed.effect.uses_credentials = true;
+        credentialed.required.credentials = true;
+        assert!(!credentialed.is_read_only_network_capability());
+
+        let mut mutating = future_reader.clone();
+        mutating.effect.mutates_external_state = true;
+        assert!(!mutating.is_read_only_network_capability());
+
+        let mut workspace_writer = future_reader;
+        workspace_writer.effect.writes_workspace = true;
+        workspace_writer.required.filesystem_write = true;
+        workspace_writer.required.workspace = RequiredWorkspace::ReadWrite;
+        assert!(!workspace_writer.is_read_only_network_capability());
     }
 
     #[test]
