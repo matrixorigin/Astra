@@ -42,6 +42,19 @@
 #                             "tools" — model supports function/tool calling
 #                           Currently only "tools" is checked by the runtime.
 #
+# Prompt-cache layout is explicit deployment metadata. For a prefix-caching
+# OpenAI-compatible deployment that supports appended runtime context (validated
+# locally with DeepSeek V4 Flash), add this block to its model entry:
+#   prompt_cache_capability:
+#     schema_version: 2
+#     protocol: openai_auto_prefix
+#     volatile_placement: append_only_user_tail
+#     volatile_delivery: required_only
+#     reuse_scope: conversation_turns
+# Required runtime instructions remain visible with typed authority/lifetimes;
+# optional volatile advisories are omitted. No model-name heuristic enables it.
+# Reload with: astra admin model load .models.yaml --update-existing
+#
 # Thinking/reasoning capability is auto-detected at load time via provider-aware
 # probe. No YAML declaration needed.
 #
