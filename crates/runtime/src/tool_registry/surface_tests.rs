@@ -1097,6 +1097,9 @@ fn observation_recovery_and_reflection_are_eager() {
         .into_iter()
         .find(|schema| schema["function"]["name"] == "reflect")
         .expect("reflect observation schema must be eager");
+    let description = reflect["function"]["description"].as_str().unwrap();
+    assert!(description.contains("tool_search select:reflect"));
+    assert!(description.contains("invoke_tool"));
     let reflect_properties = reflect["function"]["parameters"]["properties"]
         .as_object()
         .expect("resident reflect properties");

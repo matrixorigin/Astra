@@ -782,16 +782,22 @@ criteria:
         let criteria: Vec<_> = case
             .criteria
             .into_iter()
-            .filter(|criterion| matches!(criterion, Criterion::JournalToolCallCount { .. }))
+            .filter(|criterion| {
+                matches!(
+                    criterion,
+                    Criterion::JournalToolCallCount { .. }
+                        | Criterion::JournalToolOutcomeCount { .. }
+                )
+            })
             .collect();
-        let evaluate = |reflect_args: serde_json::Value| {
+        let evaluate = |reflect_args: serde_json::Value, reflect_ok: bool| {
             let session = SessionCapture {
                 events: vec![JournalEvent {
                     event_type: "turn".into(),
                     raw: serde_json::json!({"tool_calls": [
                         {"tool_call_id":"i", "name":"introspect", "ok":true,
                          "args_full":{"facet":"overview","depth":"diagnostic","horizon":"recent"}},
-                        {"tool_call_id":"r", "name":"reflect", "ok":true,
+                        {"tool_call_id":"r", "name":"reflect", "ok":reflect_ok,
                          "args_full":reflect_args}
                     ]}),
                 }],
@@ -803,15 +809,32 @@ criteria:
                 Some(&session),
             )
         };
-        let misleading = evaluate(serde_json::json!({
-            "question":"facet=overview depth=diagnostic horizon=session"
-        }));
+        let misleading = evaluate(
+            serde_json::json!({
+                "question":"facet=overview depth=diagnostic horizon=session"
+            }),
+            true,
+        );
         assert_eq!(misleading.iter().filter(|result| !result.passed).count(), 3);
-        let explicit = evaluate(serde_json::json!({
-            "facet":"overview", "depth":"diagnostic", "horizon":"session",
-            "question":"Which durable evidence exists?"
-        }));
+        let explicit = evaluate(
+            serde_json::json!({
+                "facet":"overview", "depth":"diagnostic", "horizon":"session",
+                "question":"Which durable evidence exists?"
+            }),
+            true,
+        );
         assert!(explicit.iter().all(|result| result.passed));
+        let rejected = evaluate(
+            serde_json::json!({
+                "facet":"overview", "depth":"diagnostic", "horizon":"session"
+            }),
+            false,
+        );
+        assert!(
+            rejected.iter().any(|result| !result.passed
+                && matches!(result.criterion, Criterion::JournalToolOutcomeCount { .. })),
+            "correct arguments do not prove a rejected diagnostic executed"
+        );
     }
 
     #[test]

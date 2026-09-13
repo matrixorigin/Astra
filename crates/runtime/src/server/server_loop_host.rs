@@ -25380,6 +25380,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_reflect_requires_selected_carrier_and_retains_validation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-reflect".into(),
+            "s-reflect".into(),
+        )
+        .with_server_sandbox_workspace(dir.path())
+        .build();
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(runtime_tool_executor_with_agent_context(
+            dir.path(),
+        )));
+        state.sticky_tool_schemas = host.visible_turn_tools(&mut state);
+        let before = state.sticky_tool_schemas.clone();
+        let args = json!({"facet":"overview","depth":"diagnostic","horizon":"session"});
+        let direct = json!({"id":"direct-reflect","type":"function","function":{
+            "name":"reflect","arguments":args.to_string()
+        }});
+        assert!(
+            host.admit_terminal_tool_calls(&state, &[direct], Some("tool_calls"))
+                .is_empty()
+        );
+        let rejected = host.pending_tool_call_admission.take().unwrap();
+        assert!(rejected.rejected[0].result.contains("tool_invalid_args"));
+
+        let carrier = |arguments: Value| {
+            json!({"id":"typed-reflect","type":"function","function":{
+                "name":"invoke_tool","arguments":json!({"name":"reflect","arguments":arguments}).to_string()
+            }})
+        };
+        let admit = |host: &ServerAgenticLoopHost, state: &AgenticLoopState, arguments: Value| {
+            host.resolve_deferred_tool_admission(
+                state,
+                crate::turn::agentic::tool_interception::admit_tool_calls(
+                    &[carrier(arguments)],
+                    Some("tool_calls"),
+                ),
+            )
+        };
+        assert!(
+            admit(&host, &state, args.clone()).admitted.is_empty(),
+            "a carrier without selection cannot grant the full contract"
+        );
+        let contracts = host.current_deferred_tool_contract_schemas(&state);
+        let selected =
+            astra_tools::tool_search::tool_search(&contracts, &json!({"query":"select:reflect"}));
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&selected);
+        assert_eq!(state.deferred_tool_activations.len(), 1);
+        let activations = state.deferred_tool_activations.clone();
+        host.bind_deferred_tool_activations(&mut state, &activations);
+        let admitted = admit(&host, &state, args.clone());
+        assert_eq!(
+            admitted.admitted.len(),
+            1,
+            "selected reflection must be admitted"
+        );
+        let target = admitted.admitted[0].logical_target_call();
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(target),
+            Some("reflect")
+        );
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_arguments_value(target),
+            args
+        );
+        let invalid = admit(&host, &state, json!({"depth":"invented"}));
+        assert_eq!(invalid.admitted.len(), 1);
+        let invalid_target = invalid.admitted[0].logical_target_call();
+        assert!(matches!(
+            crate::server::tool_local_execution::validate_local_tool_arguments(
+                "reflect",
+                &astra_turn_core::tool::args::shape::tool_call_arguments_value(invalid_target),
+            ),
+            crate::server::tool_local_execution::LocalToolPreflight::ShortCircuit(_)
+        ));
+        assert!(matches!(
+            crate::server::tool_local_execution::validate_local_tool_arguments("reflect", &args),
+            crate::server::tool_local_execution::LocalToolPreflight::Continue
+        ));
+        assert_eq!(
+            host.visible_turn_tools(&mut state),
+            before,
+            "selecting full reflection must preserve resident tools[] identity"
+        );
+    }
+
+    #[tokio::test]
     async fn edge_declared_deferred_runtime_tool_activates_without_widening_provider_inventory() {
         let mut edge_profile = Map::new();
         edge_profile.insert(

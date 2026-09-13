@@ -431,7 +431,10 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
             ][..],
             "Read bounded live runtime/session observations or a retained result artifact. Use reflect for persisted causal history.",
         ),
-        "reflect" => (&["question"][..], "Reflect persisted causal history."),
+        "reflect" => (
+            &["question"][..],
+            "History; typed: tool_search select:reflect;invoke_tool.",
+        ),
         "memory" => (
             &["action", "content", "query", "memory_type", "scope"][..],
             "Store or recall persistent memory. remember requires content; recall requires query; use scope=session for strict current-session isolation. Select memory with tool_search first for advanced operations.",

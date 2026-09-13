@@ -74,6 +74,14 @@ refs[]
 
 Facts should be concise and attributable. Raw logs should not be returned by default.
 
+The resident `reflect` schema accepts a concrete `question` for its default
+summary view. For typed options such as `facet`, `depth`, or `horizon`, select
+`reflect` with `tool_search(query="select:reflect")`, then call `invoke_tool`
+with the selected contract. Selection preserves the resident schema and its
+prompt-cache identity. A diagnostic succeeds only when its tool outcome
+succeeds; requesting valid parameters alone does not prove observations were
+obtained.
+
 Routine self-diagnosis starts with a summary overview (or hint for a quick
 check), reusing applicable observations. System guidance, tool descriptions,
 and bundled workflows must agree on this default. A concrete evidence gap or
