@@ -159,7 +159,9 @@ Not required: {"work_lifecycle":"not_required","execution_topology":"primary"|"p
 
 Required:
 {"work_lifecycle":"required","domain":<domain|null>,"workspace_mutation":<same>,"mutation_completion_scope":<same>,"activation":"start"|"defer","goal":"<outcomes and mutations>","initial_tasks":[{"objective":"<outcome>","expected_result":"<payload plus source/verification>"}],"mutations":[<mutation>]}
-`Required` activation: defer for tracking without execution or pending approval; start for execution. Mutations encode user-requested graph changes, not later execution phases. Else mutations=[]. Never duplicate mutations in initial_tasks. User task-count constraints cover the whole plan including additions. At most 8 combined initial tasks and mutations; add has task; cancel/replace use 1-based `target_initial_task`; replace has both; Cancel+add stay separate. Omit ambiguous targets. Task `after_initial_tasks`: explicit 1-based initial prerequisites, acyclic/no self; empty/omitted=independent, never list-order precedence. Mutation `after_initial_tasks` waits for ALL listed deliveries, not task dependencies. "After task 1 delivers, cancel task 2 and add C" means BOTH mutations after_initial_tasks:[1]; [] only for immediate changes. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
+`Required`: defer for tracking without execution or pending approval; start for execution. Encode graph changes in mutations, not initial_tasks or goal alone; [] only when none. Honor each count's stated scope: initial, final, concurrent, or total created. At most 8 combined initial tasks and mutations.
+Mutations: {"kind":"add","task":{"objective":"...","expected_result":"..."}}, {"kind":"cancel","target_initial_task":2}, or {"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}. Cancel+add stay separate. Omit ambiguous targets.
+Task after_initial_tasks: 1-based initial prerequisites, acyclic/no self; []=independent, not list order. Mutation after_initial_tasks waits for ALL listed deliveries. "After task 1 delivers, cancel task 2 and add C" sets [1] on BOTH mutations; [] is immediate. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
 
 /// LLM-authored, bounded declaration of one initial canonical Work item.
 ///
@@ -1353,13 +1355,15 @@ mod tests {
         assert!(!system.contains("durable_continuation"));
         assert!(!system.contains("explicit_lifecycle_control"));
         assert!(
-            system.contains(
-                "Mutations encode user-requested graph changes, not later execution phases"
-            )
+            system.contains("Encode graph changes in mutations, not initial_tasks or goal alone")
         );
-        assert!(system.contains("User task-count constraints cover the whole plan"));
+        assert!(system.contains("Honor each count's stated scope"));
         assert!(system.contains("independent reports may be tasks"));
-        assert!(system.contains("replace has both"));
+        assert!(
+            system.contains(r#"{"kind":"add","task":{"objective":"...","expected_result":"..."}}"#)
+        );
+        assert!(system.contains(r#"{"kind":"cancel","target_initial_task":2}"#));
+        assert!(system.contains(r#"{"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}"#));
         assert!(system.contains("Cancel+add stay separate"));
         assert!(system.contains("first matching rule wins"));
         assert!(system.contains("Count outcomes surviving peer failure"));
