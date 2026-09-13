@@ -43,6 +43,7 @@ pub mod preferences_client;
 pub mod project_instructions;
 pub mod self_command;
 pub mod session;
+pub(crate) mod session_judge;
 pub mod skill_catalog;
 pub mod skill_subrun;
 pub mod slash;

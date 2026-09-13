@@ -360,7 +360,7 @@ Main options:
 
 Judger:
   --judger-model <MODEL>       scoring model (default claude-sonnet-4-6)
-  --judger-timeout <SEC>       hard timeout per judger call
+  --judger-timeout <SEC>       built-in provider deadline (1–120s); external judge process timeout
   --judger-n <N>               run N times and aggregate (default 1)
   --judger-agg median|mean|min|max   aggregation for --judger-n
   --no-judger                  skip advisory judger criteria; required hard_judger fails closed

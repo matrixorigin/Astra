@@ -111,6 +111,7 @@ astra session list [--agent-id AGENT] [--status open] [--limit 20] [--offset 0]
 astra session show <session_id>
 astra session close <session_id>
 astra session delete <session_id>
+astra session judge --model MODEL --message 'Rubric and evidence' [--timeout-seconds 120]
 
 # Replay (reserved; currently unavailable for owned sessions and returns HTTP 501)
 
@@ -125,6 +126,14 @@ astra skill status [--per-group 50]
 ```
 
 `astra login --username alice` explicitly selects password login. `astra login --manual` accepts a scoped connection key when browser handoff is unavailable. Older Servers returning 404 for `/auth/methods` retain the password journey; network errors do not silently select another provider. Browser addresses come from the target Server's `MEMORIA_WEB_URL`, not the CLI environment.
+
+`astra session judge` returns JSON from one governed, tool-free evaluation in a
+separate session. It does not execute the quoted task. The response includes
+text, session/completion identities, Offering, usage, and finish reason. Only a
+normally completed response exits successfully; errors preserve diagnostic
+identity. The provider deadline accepts 1–120 seconds. Evaluation sessions are
+closed after definite results; uncertain delivery retains a session for
+inspection. See [quality judgment behavior](../guides/testing.md).
 
 ## astra admin
 

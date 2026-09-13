@@ -1978,6 +1978,32 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Session(SessionCmd::Judge(args))) => {
+            if args.message.trim().is_empty() {
+                return Err("judgment message must not be empty".to_string());
+            }
+            let token = fresh_access_token_or_error(&api, profile.as_deref()).await?;
+            let selection =
+                session_runtime::resolve_server_model_selection(&api, &token, &args.model).await?;
+            let result = crate::cli::session_judge::execute(
+                &api,
+                &token,
+                &selection.offering_id,
+                &args.message,
+                args.timeout_seconds,
+            )
+            .await;
+            if let Some(warning) = result.get("cleanup_warning") {
+                eprintln!("judge session cleanup: {warning}");
+            }
+            print_json_or_raw(&result.to_string());
+            Ok(if result["ok"] == true {
+                ExitCode::Success
+            } else {
+                ExitCode::ApiError
+            })
+        }
+
         Some(Command::Session(SessionCmd::List(args))) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let mut q: Vec<(&str, String)> = vec![

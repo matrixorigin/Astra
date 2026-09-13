@@ -868,6 +868,8 @@ pub(crate) enum BugSubcommand {
     after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session cancel 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
 )]
 pub(crate) enum SessionCmd {
+    /// Evaluate supplied evidence with one governed, tool-free model invocation
+    Judge(SessionJudgeArgs),
     /// List sessions
     List(SessionListArgs),
     /// Show session details
@@ -881,6 +883,19 @@ pub(crate) enum SessionCmd {
     /// Inspect or download session-scoped LLM captures
     #[command(subcommand)]
     Capture(SessionCaptureCmd),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionJudgeArgs {
+    /// Rubric and evidence to evaluate (not an agent task to execute)
+    #[arg(short, long)]
+    pub message: String,
+    /// Active Server model selector
+    #[arg(long)]
+    pub model: String,
+    /// Server-owned provider deadline in seconds
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=120))]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1410,6 +1425,30 @@ pub(crate) struct ConfigShowPolicyArgs {
 mod tests {
     use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::Parser;
+
+    #[test]
+    fn session_judge_is_an_explicit_command_with_a_bounded_provider_deadline() {
+        let args = [
+            "astra",
+            "session",
+            "judge",
+            "--model",
+            "judge-model",
+            "-m",
+            "evaluate evidence",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session(SessionCmd::Judge(_)))
+        ));
+        for invalid in ["0", "121"] {
+            assert!(
+                Cli::try_parse_from(args.into_iter().chain(["--timeout-seconds", invalid]))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn session_cancel_is_a_distinct_lifecycle_command() {

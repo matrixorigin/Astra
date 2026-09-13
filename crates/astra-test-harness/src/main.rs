@@ -83,7 +83,8 @@ struct Args {
     #[arg(long, value_name = "MODEL", default_value = "claude-sonnet-4-6")]
     judger_model: String,
 
-    /// Judger timeout in seconds.
+    /// Provider deadline for the built-in judge (1–120 seconds); process
+    /// timeout for --judger-cmd, which retains its external command contract.
     #[arg(long, default_value_t = 120)]
     judger_timeout: u64,
 
@@ -320,6 +321,10 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if !args.no_judger && args.judger_cmd.is_none() {
+        astra_test_harness::judger::validate_builtin_judger_timeout(args.judger_timeout)
+            .map_err(anyhow::Error::msg)?;
+    }
 
     if args.audit_capabilities {
         let suite_path = args

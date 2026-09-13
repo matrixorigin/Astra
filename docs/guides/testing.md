@@ -37,7 +37,22 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 `cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
 target triple, and profile. Test processes do not run nested Cargo builds.
 
-Live `astra-test` quality judging uses a bounded projection of the durable tool
+Live `astra-test` quality judging invokes `astra session judge --model MODEL
+--message RUBRIC_AND_EVIDENCE`. This is one tool-free `VerificationJudge`
+completion through the existing authenticated Offering and durable inference
+owners. Each judgment, quorum vote, and bounded format repair creates its own
+session; its real usage is separate from the measured agent session. The CLI
+closes the evaluation session after a completed response or client-error rejection.
+Uncertain gateway and transport failures retain the session identity for diagnosis without
+automatically retrying. Session closure is not inference cancellation. The
+Server owns the provider deadline (`--timeout-seconds`, 1–120 seconds); the
+harness subprocess watchdog allows an additional 60 seconds for transport and
+session bookkeeping. Failed subprocess stdout and stderr are retained as
+bounded diagnostic data in report details, never interpreted as a valid score.
+Truncated, filtered, or unknown completion endings are rejected even if their
+text contains a score. External `--judger-cmd` process timeout behavior is unchanged.
+
+Live quality judging uses a bounded projection of the durable tool
 journal. It reserves room for call identities and statuses before sharing the
 remaining budget across arguments and results, so a large early response does
 not hide later verification. Truncated fields report their original and omitted

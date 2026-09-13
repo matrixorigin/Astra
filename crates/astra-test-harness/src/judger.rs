@@ -6,8 +6,8 @@
 //!
 //! - [`Judger`] trait — injectable scoring backend. Tests use
 //!   `FakeJudger`; production uses [`AstraCliJudger`].
-//! - [`AstraCliJudger`] — shells out to `astra chat -m <prompt>
-//!   --model <m> --json --quiet` and parses the response.
+//! - [`AstraCliJudger`] — shells out to `astra session judge -m <prompt>
+//!   --model <m>` and parses the JSON response.
 //! - [`parse_score_from_response`] — pure parser for `SCORE: <f>`.
 //!   Separated so a flaky judger response can be debugged without
 //!   re-invoking the provider.
@@ -15,8 +15,9 @@
 //! ## Why a subprocess judger?
 //!
 //! No new HTTP client, no new auth surface — the judger inherits the
-//! same tool-restriction gate as the regular CLI, so it can't
-//! accidentally spawn sub-agents or mutate state while scoring.
+//! canonical profile authentication and Offering admission as the CLI. The
+//! governed auxiliary completion has no tools or agent lifecycle to execute
+//! the quoted task while scoring it.
 
 use std::path::PathBuf;
 
@@ -61,7 +62,7 @@ pub struct JudgerConfig {
     /// Default model to use when a Judger criterion doesn't
     /// specify its own.
     pub default_model: String,
-    /// Timeout for each judger call.
+    /// Server-owned provider deadline for each built-in judgment (1–120s).
     pub timeout_seconds: u64,
 }
 
@@ -74,6 +75,13 @@ impl JudgerConfig {
             timeout_seconds: 120,
         }
     }
+}
+
+pub fn validate_builtin_judger_timeout(seconds: u64) -> Result<(), String> {
+    if !(1..=120).contains(&seconds) {
+        return Err("built-in --judger-timeout must be between 1 and 120 seconds".into());
+    }
+    Ok(())
 }
 
 /// Injectable scoring backend. Tests use a fake impl; production uses
@@ -152,8 +160,8 @@ pub async fn evaluate_judger(
             criterion: criterion.clone(),
             severity: crate::criteria::criterion_severity(criterion),
             passed: false,
-            detail: format!("judger call failed: {e}"),
-            full_detail: None,
+            detail: format!("judger call failed: {}", truncate_for_judger(&e, 200)),
+            full_detail: Some(format!("judger call failed: {e}")),
             score: None,
         }),
     }
@@ -299,18 +307,20 @@ async fn run_judger_call(
     use std::time::Duration;
     use tokio::process::Command;
 
+    validate_builtin_judger_timeout(cfg.timeout_seconds)?;
+
     let mut cmd = Command::new(&cfg.astra_bin);
     if let Some(profile) = &cfg.profile {
         cmd.arg("--profile").arg(profile);
     }
-    cmd.arg("chat")
+    cmd.arg("session")
+        .arg("judge")
         .arg("-m")
         .arg(prompt)
-        .arg("--no-resume")
         .arg("--model")
         .arg(model)
-        .arg("--json")
-        .arg("--quiet")
+        .arg("--timeout-seconds")
+        .arg(cfg.timeout_seconds.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Capture stderr too (was previously discarded to Stdio::null)
@@ -321,7 +331,9 @@ async fn run_judger_call(
         .kill_on_drop(true);
 
     let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-    let timeout = Duration::from_secs(cfg.timeout_seconds);
+    // The Server owns the inference deadline. Leave transport, profile/model
+    // resolution and session closure room to settle before this process watchdog.
+    let timeout = Duration::from_secs(cfg.timeout_seconds.saturating_add(60));
 
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
@@ -332,14 +344,10 @@ async fn run_judger_call(
     let stderr_body = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code();
     if !output.status.success() {
-        let stderr_preview = truncate_for_judger(stderr_body.trim(), 1_500);
-        return Err(if stderr_preview.is_empty() {
-            format!("judger subprocess failed (exit_code={exit_code:?}; stderr empty)")
-        } else {
-            format!(
-                "judger subprocess failed (exit_code={exit_code:?}; subprocess stderr:\n{stderr_preview})"
-            )
-        });
+        return Err(format!(
+            "judger subprocess failed (exit_code={exit_code:?})\n{}",
+            judger_failure_output(&stdout_body, &stderr_body)
+        ));
     }
     parse_score_from_response(&stdout_body).map_err(|parse_err| {
         // Carry the subprocess's stderr + exit code into the error
@@ -354,6 +362,35 @@ async fn run_judger_call(
             format!("{parse_err} (exit_code={exit_code:?}; subprocess stderr:\n{stderr_preview})")
         }
     })
+}
+
+/// Failed processes can put their typed interruption in stdout. Preserve it as
+/// diagnostic data, never parse a score from a non-successful subprocess.
+fn judger_failure_output(stdout: &str, stderr: &str) -> String {
+    let envelope = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    let mut identity = serde_json::Map::new();
+    if let Some(envelope) = envelope {
+        for key in [
+            "session_id",
+            "run_id",
+            "completion_id",
+            "final_state",
+            "interruption_kind",
+        ] {
+            if let Some(value) = envelope.get(key).filter(|v| v.is_string()) {
+                identity.insert(
+                    key.into(),
+                    serde_json::Value::String(truncate_for_judger(value.as_str().unwrap(), 300)),
+                );
+            }
+        }
+    }
+    format!(
+        "subprocess identity (data): {}\nsubprocess stdout (data):\n{}\nsubprocess stderr (data):\n{}",
+        serde_json::Value::Object(identity),
+        truncate_for_judger(stdout.trim(), 4_000),
+        truncate_for_judger(stderr.trim(), 1_500),
+    )
 }
 
 /// Extract `SCORE: <f>` from a judger response. We parse the
@@ -814,6 +851,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn failed_judge_preserves_stdout_identity_but_never_accepts_its_score() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("fake-astra");
+        crate::test_support::write_executable_shim(&shim,
+            "#!/bin/sh\nprintf '%s\\n' '{\"session_id\":\"judge-session\",\"run_id\":\"judge-run\",\"interruption_kind\":\"execution_incomplete\",\"text\":\"SCORE: 1.0\"}'\nexit 5\n").unwrap();
+        let judger = AstraCliJudger::new(JudgerConfig::new(shim, "judge-model"));
+        let criterion = Criterion::Judger {
+            question: "Did the task finish?".into(),
+            threshold: 0.8,
+            model: None,
+        };
+        let result = evaluate_judger(&judger, &criterion, &dummy_outcome())
+            .await
+            .unwrap();
+        assert!(!result.passed);
+        assert!(result.score.is_none());
+        let detail = result.full_detail.unwrap();
+        assert!(detail.contains("exit_code=Some(5)"));
+        assert!(detail.contains("judge-session"));
+        assert!(detail.contains("execution_incomplete"));
+        assert!(detail.contains("subprocess stdout (data)"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn judger_repairs_only_a_score_line_format_failure_once() {
         use crate::test_support::write_executable_shim;
 
@@ -872,7 +934,9 @@ mod tests {
         assert_eq!(score.score, 1.0);
         let args = std::fs::read_to_string(log).unwrap();
         assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
-        assert!(args.contains("--no-resume\n"), "{args}");
+        assert!(args.contains("session\njudge\n"), "{args}");
+        assert!(args.contains("--timeout-seconds\n120\n"), "{args}");
+        assert!(!args.lines().any(|arg| arg == "chat"), "{args}");
     }
 
     fn dummy_outcome() -> RunOutcome {
