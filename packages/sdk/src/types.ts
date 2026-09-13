@@ -29,7 +29,7 @@ export type StreamEventType =
   | "turn_complete"
   | "error"
   | "warning"
-  | "explain"
+  | "explain_analyze"
   | "plan_created"
   | "plan_revised"
   | "plan_step_start"
@@ -310,9 +310,68 @@ export type WarningEvent = {
   claims_failed?: number;
 };
 
-export type ExplainEvent = {
-  type: "explain";
-  content: string;
+export type ExplainAnalyzeNodeKindV1 =
+  | "run"
+  | "turn"
+  | "admission"
+  | "preparation"
+  | "context_assembly"
+  | "model_round"
+  | "provider_attempt"
+  | "tool_batch"
+  | "tool_call"
+  | "wait"
+  | "child_run"
+  | "settlement";
+
+export type ExplainAnalyzeOutcomeV1 =
+  | "completed"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "blocked"
+  | "waiting"
+  | "rejected"
+  | "reused"
+  | "suppressed"
+  | "deferred"
+  | "resolved"
+  | "fallback"
+  | "unavailable"
+  | "delegated";
+
+export type ExplainAnalyzeUsageV1 = {
+  basis: "provider_exact" | "provider_partial" | "runtime_estimated";
+  fresh_input_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  output_tokens?: number;
+};
+
+/** One versioned, bounded execution fact. Missing token lanes are unavailable,
+ * not zero; indexes are explicit and are never parsed from labels. */
+export type ExplainAnalyzeEventV1 = {
+  type: "explain_analyze";
+  schema_version: 1;
+  event_id: string;
+  run_id: string;
+  turn_id: string;
+  node_id: string;
+  parent_node_id?: string;
+  dependency_node_ids?: string[];
+  producer_id: string;
+  clock_domain_id: string;
+  kind: ExplainAnalyzeNodeKindV1;
+  round_index?: number;
+  attempt_index?: number;
+  label: string;
+  transition: "started" | "finished";
+  elapsed_ms: number;
+  start_elapsed_ms?: number;
+  duration_ms?: number;
+  outcome?: ExplainAnalyzeOutcomeV1;
+  usage?: ExplainAnalyzeUsageV1;
 };
 
 export type PlanCreatedEvent = {
@@ -431,6 +490,8 @@ export type StreamGapEvent = {
   run_id: string;
   dropped_event_count: number;
   repair: "refresh_run_snapshot";
+  /** True when the bounded host lane replayed every dropped graph fact first. */
+  explain_analyze_recovered?: boolean;
 };
 
 export type AgentCompletedEvent = {
@@ -682,7 +743,7 @@ export type StreamEvent = (
   | TurnCompleteEvent
   | StreamErrorEvent
   | WarningEvent
-  | ExplainEvent
+  | ExplainAnalyzeEventV1
   | PlanCreatedEvent
   | PlanRevisedEvent
   | PlanStepStartEvent

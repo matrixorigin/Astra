@@ -72,6 +72,38 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it.each(["failed", "cancelled", "completed"])("repairs observations for a %s run without replaying its lifecycle", async (status) => {
+    const onRunUpdated = vi.fn();
+    const onText = vi.fn();
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      ': heartbeat\n\n',
+      'data: {"type":"text_delta","content":"old text"}\n\n',
+      ...(status === "failed" ? ['data: {"type":"error","message":"historical provider failure","index":12}\n\n'] : []),
+      `data: ${JSON.stringify({ type: "run_finished", run_id: "r", status })}\n\n`,
+      'data: [DONE]\n\n',
+    ]) });
+    await expect(streamExistingChatRun("chat", "r", { onRunUpdated, onText }, { replayOnly: true })).resolves.toBe("");
+    expect(onRunUpdated).not.toHaveBeenCalled();
+    expect(onText).not.toHaveBeenCalled();
+  });
+
+  it("still rejects an unindexed replay connection error", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"error","message":"Replay connection failed"}\n\n',
+    ]) });
+    await expect(streamExistingChatRun("chat", "r", {}, { replayOnly: true }))
+      .rejects.toThrow("Replay connection failed");
+  });
+
+  it("rejects a truncated replay frame even after valid events", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, body: sseBody([
+      'data: {"type":"run_finished","run_id":"r","status":"completed"}\n\n',
+      'data: {"type":"explain_analyze","node_id":',
+    ]) });
+    await expect(streamExistingChatRun("chat", "r", {}, { replayOnly: true }))
+      .rejects.toThrow("Incomplete or malformed replay event");
+  });
+
   it('surfaces durable plan approval and clears it when the run resumes', async () => {
     const onApprovalRequired = vi.fn();
     const onInteractionResolved = vi.fn();
@@ -113,10 +145,12 @@ describe('streamChatMessage cancellation semantics', () => {
 
   it('forwards live-gap repair evidence to the work-surface consumer', async () => {
     const onWorkSurfaceEvent = vi.fn();
+    const onStreamGap = vi.fn();
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"agent_live_gap","run_id":"child-run-1","agent_id":"reviewer","dropped_event_count":4,"repair":"refresh_run_snapshot"}\n\n',
+        'data: {"type":"run_started","run_id":"run-123","index":7}\n\n',
         'data: {"type":"stream_gap","run_id":"run-123","dropped_event_count":9,"repair":"refresh_run_snapshot"}\n\n',
         'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
@@ -124,6 +158,7 @@ describe('streamChatMessage cancellation semantics', () => {
 
     await streamChatMessage('chat-123', defaultPayload, {
       onWorkSurfaceEvent,
+      onStreamGap,
     });
 
     expect(onWorkSurfaceEvent).toHaveBeenCalledWith({
@@ -138,6 +173,70 @@ describe('streamChatMessage cancellation semantics', () => {
       run_id: 'run-123',
       dropped_event_count: 9,
       repair: 'refresh_run_snapshot',
+    });
+    expect(onStreamGap).toHaveBeenCalledWith({
+      runId: 'run-123',
+      nextEventIndex: 8,
+    });
+  });
+
+  it('reports invalid Explain facts without passing unsafe data to graph consumers', async () => {
+    const onExplainAnalyzeEvent = vi.fn();
+    const onExplainAnalyzeInvalid = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"explain_analyze","schema_version":1,"label":"invalid"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+    await streamChatMessage('chat-123', defaultPayload, { onExplainAnalyzeEvent, onExplainAnalyzeInvalid });
+    expect(onExplainAnalyzeInvalid).toHaveBeenCalledOnce();
+    expect(onExplainAnalyzeEvent).not.toHaveBeenCalled();
+  });
+
+  it('forwards versioned Explain Analyze facts as typed execution data', async () => {
+    const onExplainAnalyzeEvent = vi.fn();
+    const event = {
+      type: 'explain_analyze',
+      schema_version: 1,
+      event_id: 'clock-1:2',
+      run_id: 'run-123',
+      turn_id: 'turn-1',
+      node_id: 'turn-1/provider/0',
+      parent_node_id: 'turn-1/model/0',
+      dependency_node_ids: [],
+      producer_id: 'worker-1',
+      clock_domain_id: 'clock-1',
+      kind: 'provider_attempt',
+      round_index: 0,
+      attempt_index: 0,
+      label: 'Model request',
+      transition: 'finished',
+      elapsed_ms: 40,
+      start_elapsed_ms: 10,
+      duration_ms: 30,
+      outcome: 'succeeded',
+      usage: {
+        basis: 'provider_partial',
+        fresh_input_tokens: 18,
+        output_tokens: 0,
+      },
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        `data: ${JSON.stringify(event)}\n\n`,
+        'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, { onExplainAnalyzeEvent });
+
+    expect(onExplainAnalyzeEvent).toHaveBeenCalledTimes(1);
+    expect(onExplainAnalyzeEvent).toHaveBeenCalledWith({
+      ...event,
+      dependency_node_ids: [],
     });
   });
 
@@ -757,6 +856,25 @@ describe('streamChatMessage cancellation semantics', () => {
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       '/api/chats/chat%20123/stream?runId=run%2F123&last_index=9&assistantMessageId=assistant-queued',
+      { method: 'GET', signal: undefined },
+    );
+  });
+
+  it('requests a finite durable replay for a reported stream gap', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([]),
+    });
+
+    await expect(
+      streamExistingChatRun('chat 123', 'run/123', {}, {
+        nextEventIndex: 8,
+        replayOnly: true,
+      }),
+    ).resolves.toBe('');
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      '/api/chats/chat%20123/stream?runId=run%2F123&last_index=8&replay_only=true',
       { method: 'GET', signal: undefined },
     );
   });

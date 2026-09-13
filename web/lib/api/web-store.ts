@@ -1,3 +1,4 @@
+import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
   artifactsFromValues,
@@ -1483,6 +1484,10 @@ export function updateStreamingAssistantMessage(
     reasoningStatus?: ChatMessage["reasoningStatus"];
     status?: ChatMessage["status"];
     artifacts?: ChatMessage["artifacts"];
+    explainAnalyzeEvent?: NonNullable<ChatMessage["explainAnalyzeEvents"]>[number];
+    explainAnalyzeDegraded?: boolean;
+    explainAnalyzeUnrecoverable?: boolean;
+    explainAnalyzeRepair?: { token: string; complete: boolean };
   },
 ) {
   const store = getStore(ownerUserId);
@@ -1515,9 +1520,22 @@ export function updateStreamingAssistantMessage(
       patch.artifacts,
     );
   }
-  chat.lastMessageAt = nowIso();
-  if (chat.projectId) {
-    touchProjectInStore(store, chat.projectId);
+  if (patch.explainAnalyzeEvent !== undefined) {
+    Object.assign(message, appendExplainFact(message, patch.explainAnalyzeEvent));
+  }
+  if (patch.explainAnalyzeDegraded === true) {
+    Object.assign(message, markExplainGap(message, patch.explainAnalyzeUnrecoverable));
+  }
+  if (patch.explainAnalyzeRepair) {
+    const { token, complete } = patch.explainAnalyzeRepair;
+    Object.assign(message, complete ? finishExplainRepair(message, token) : beginExplainRepair(message, token));
+  }
+  // Observation repair must not reorder chats/projects or resemble new output.
+  if (patch.content !== undefined || patch.reasoning !== undefined ||
+    patch.reasoningStatus !== undefined || patch.status !== undefined ||
+    patch.artifacts !== undefined) {
+    chat.lastMessageAt = nowIso();
+    if (chat.projectId) touchProjectInStore(store, chat.projectId);
   }
   return message;
 }

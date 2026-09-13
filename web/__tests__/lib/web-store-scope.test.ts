@@ -120,6 +120,32 @@ describe("web store user scoping", () => {
     );
   });
 
+  it("keeps transcript and chat ordering unchanged when replay repairs graph facts", () => {
+    const timestamp = "2026-06-07T00:00:00.000Z";
+    const message = { id: "assistant-observation", role: "assistant" as const,
+      content: "live answer", createdAt: timestamp, status: "streaming" as const };
+    const chat = { id: "chat-observation", title: "Observation", projectId: null,
+      createdAt: timestamp, lastMessageAt: timestamp, lastMessagePreview: "live answer",
+      model: "sonnet-4.6-adaptive", messages: [message] };
+    getStore("user-a").chats.push(chat);
+    const fact = { type: "explain_analyze" as const, schema_version: 1 as const,
+      event_id: "clock:1", run_id: "run-1", turn_id: "turn-1", node_id: "turn-1",
+      producer_id: "worker", clock_domain_id: "clock", kind: "turn" as const,
+      label: "Answer", transition: "started" as const, elapsed_ms: 0 };
+    updateStreamingAssistantMessage("user-a", chat.id, message.id, { explainAnalyzeDegraded: true });
+    updateStreamingAssistantMessage("user-a", chat.id, message.id,
+      { explainAnalyzeRepair: { token: "full-replay", complete: false } });
+    updateStreamingAssistantMessage("user-a", chat.id, message.id, { explainAnalyzeEvent: fact });
+    updateStreamingAssistantMessage("user-a", chat.id, message.id, { explainAnalyzeEvent: fact });
+    updateStreamingAssistantMessage("user-a", chat.id, message.id,
+      { explainAnalyzeRepair: { token: "full-replay", complete: true } });
+    const saved = getStore("user-a").chats.find((item) => item.id === chat.id)!;
+    expect(saved.lastMessageAt).toBe(timestamp);
+    expect(saved.lastMessagePreview).toBe("live answer");
+    expect(saved.messages[0]).toMatchObject({ content: "live answer", status: "streaming",
+      explainAnalyzeEvents: [fact], explainAnalyzeDegraded: false });
+  });
+
   it("preserves persisted artifacts when a resumed stream adds another artifact", () => {
     getStore("user-a").chats.push({
       id: "chat-artifacts",

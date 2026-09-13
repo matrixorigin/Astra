@@ -31,7 +31,10 @@ export type {
   TurnCompleteEvent,
   StreamErrorEvent,
   WarningEvent,
-  ExplainEvent,
+  ExplainAnalyzeEventV1,
+  ExplainAnalyzeNodeKindV1,
+  ExplainAnalyzeOutcomeV1,
+  ExplainAnalyzeUsageV1,
   PlanCreatedEvent,
   PlanRevisedEvent,
   PlanStepStartEvent,
@@ -277,6 +280,23 @@ export type {
   WorkRetentionState,
   WorkRevisionAlignment,
 } from "./types";
+
+export {
+  explainAnalyzeFactFingerprint,
+  explainAnalyzeMaxConcurrency,
+  explainAnalyzeNodeIsActive,
+  formatMs,
+  formatUsageDetail,
+  formatUsage,
+  isExplainAnalyzeEventV1,
+  reduceExplainAnalyzeEvents,
+  renderExplainAnalyzeHtml,
+} from "./explain-analyze";
+export type {
+  ExplainAnalyzeGraphV1,
+  ExplainAnalyzeDiagnosticV1,
+  ExplainAnalyzeNodeV1,
+} from "./explain-analyze";
 
 export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {

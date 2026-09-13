@@ -23,6 +23,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { SkillMentionText } from "@/components/app/skill-mention-text";
+import { ExplainAnalyzePanel } from "@/components/app/explain-analyze-panel";
 import { IconButton } from "@/components/ui/icon-button";
 import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
@@ -198,7 +199,9 @@ export const MessageBubble = memo(function MessageBubble({
     message.status !== "streaming" &&
     !content.trim() &&
     !hasReasoning &&
-    !hasArtifacts;
+    !hasArtifacts &&
+    !message.explainAnalyzeEvents?.length &&
+    !message.explainAnalyzeDegraded;
   const { addToast } = useToast();
   const [copied, setCopied] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -278,6 +281,12 @@ export const MessageBubble = memo(function MessageBubble({
       ) : (
         <MarkdownContent content={content} />
       )}
+      {message.explainAnalyzeEvents?.length || message.explainAnalyzeDegraded ? (
+        <ExplainAnalyzePanel
+          events={message.explainAnalyzeEvents ?? []}
+          degraded={message.explainAnalyzeDegraded}
+        />
+      ) : null}
       {hasArtifacts ? <ArtifactList artifacts={artifacts} /> : null}
       {message.status !== "streaming" ? (
         <div className="mt-3 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">

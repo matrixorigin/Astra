@@ -720,6 +720,133 @@ describe("chat stream route proxy cancellation", () => {
     );
   });
 
+  it.each([
+    {
+      label: "with a truncated final frame",
+      fromOrigin: true,
+      malformed: true,
+      frames: [
+        `data: ${JSON.stringify({ type: "explain_analyze", schema_version: 1,
+          event_id: "clock:1", run_id: "run-1", turn_id: "turn-1", node_id: "turn-1",
+          producer_id: "worker", clock_domain_id: "clock", kind: "turn", label: "Answer",
+          transition: "started", elapsed_ms: 0 })}\n\n`,
+        'data: {"type":"explain_analyze","node_id":',
+      ],
+    },
+    {
+      label: "with recovered graph facts and a stale terminal",
+      fromOrigin: true,
+      frames: [
+        `data: ${JSON.stringify({ type: "explain_analyze", schema_version: 1,
+          event_id: "clock-1:2", run_id: "run-1", turn_id: "turn-1",
+          node_id: "turn-1", producer_id: "worker-1", clock_domain_id: "clock-1",
+          kind: "turn", label: "Answer request", transition: "finished",
+          elapsed_ms: 30, start_elapsed_ms: 0, duration_ms: 30, outcome: "completed" })}\n\n`,
+        'data: {"type":"text_delta","content":"stale text","index":9}\n\n',
+        'data: {"type":"error","message":"historical provider failure","index":12}\n\n',
+        'data: {"type":"run_finished","run_id":"run-1","status":"failed"}\n\n',
+      ],
+    },
+    {
+      label: "with a transcript delta",
+      frames: [
+        'data: {"type":"stream_gap","run_id":"run-1","dropped_event_count":2,"repair":"replay"}\n\n',
+        'data: {"type":"text_delta","content":"suffix","index":9}\n\n',
+      ],
+    },
+    {
+      label: "without a transcript delta",
+      frames: [
+        'data: {"type":"stream_gap","run_id":"run-1","dropped_event_count":2,"repair":"replay"}\n\n',
+      ],
+    },
+  ])(
+    "forwards finite replay-only repair requests $label without changing live state",
+    async ({ frames, fromOrigin, malformed }) => {
+      const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+      const backend = makeBackendFrameStream(frames);
+      const runtime = {
+        sdk: {
+          listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+        },
+        fetchResponse: vi.fn().mockResolvedValue({
+          ok: true,
+          headers: backend.headers,
+          body: backend.body,
+        }),
+      };
+      mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+      mockGetChat.mockReturnValue({
+        chat: {
+          id: "chat-1",
+          title: "Chat",
+          projectId: null,
+          createdAt: "2026-06-07T00:00:00.000Z",
+          updatedAt: "2026-06-07T00:00:00.000Z",
+          archivedAt: null,
+          model: "sonnet-4.6-adaptive",
+        },
+        session: {
+          chatId: "chat-1",
+          backendSessionId: "runtime-session-1",
+          persisted: true,
+          messageCount: 2,
+        },
+        messages: [
+          {
+            id: "assistant-1",
+            role: "assistant",
+            content: "already persisted prefix",
+            createdAt: "2026-06-07T00:00:01.000Z",
+            status: "streaming",
+          },
+        ],
+        activeRun: {
+          runId: "run-1",
+          status: "running",
+          waitingFor: null,
+          assistantMessageId: "assistant-1",
+          nextEventIndex: 9,
+        },
+      } as never);
+
+      const request = new Request(
+        `http://web.test/api/chats/chat-1/stream?runId=run-1&last_index=${fromOrigin ? 0 : 8}&replay_only=true`,
+        { method: "GET" },
+      );
+      Object.defineProperty(request, "nextUrl", {
+        value: new URL(request.url),
+      });
+      const response = await GET(request as never, {
+        params: Promise.resolve({ chatId: "chat-1" }),
+      });
+      const responseText = await response.text();
+      if (malformed) {
+        expect(responseText).toContain("Incomplete or malformed replay event");
+      } else expect(responseText).toBe(frames.join(""));
+
+      expect(runtime.fetchResponse).toHaveBeenCalledWith(
+        `/chat/runs/run-1/stream?last_index=${fromOrigin ? 0 : 8}&replay_only=true`,
+        expect.objectContaining({ method: "GET" }),
+      );
+      expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+      const facts = frames.flatMap((frame) => { try { return [JSON.parse(frame.slice(6))]; } catch { return []; } })
+        .filter((event) => event.type === "explain_analyze");
+      expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledTimes(facts.length + (fromOrigin ? 2 : 0));
+      if (fromOrigin) {
+        const begin = mockUpdateStreamingAssistantMessage.mock.calls[0]?.[3].explainAnalyzeRepair;
+        expect(begin).toEqual({ token: expect.any(String), complete: false });
+        expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+          "user-a", "chat-1", "assistant-1", malformed ? { explainAnalyzeDegraded: true }
+            : { explainAnalyzeRepair: { token: begin?.token, complete: true } });
+      }
+      for (const event of facts) {
+        expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+          "user-a", "chat-1", "assistant-1", { explainAnalyzeEvent: event });
+      }
+    },
+  );
+
   it("returns an existing-run SSE response before the backend stream connection resolves", async () => {
     const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
     let fetchResolved = false;

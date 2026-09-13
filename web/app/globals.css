@@ -1038,3 +1038,246 @@ textarea {
     display: none;
   }
 }
+
+@layer components {
+  .explain-analyze-group-row {
+    background: linear-gradient(
+      90deg,
+      rgb(var(--color-accent) / 0.035),
+      transparent 70%
+    );
+  }
+
+  .explain-analyze-tree-children {
+    position: relative;
+  }
+
+  .explain-analyze-tree-children::before {
+    position: absolute;
+    top: 0;
+    bottom: 24px;
+    left: calc(var(--explain-tree-parent-indent, 0px) + 6px);
+    border-left: 1px solid rgb(var(--color-border-strong) / 0.62);
+    content: "";
+    pointer-events: none;
+  }
+
+  .explain-analyze-node-copy {
+    position: relative;
+  }
+
+  .explain-analyze-node-copy-nested::before {
+    position: absolute;
+    top: 8px;
+    left: calc(var(--explain-tree-indent, 0px) - 6px);
+    width: 12px;
+    border-top: 1px solid rgb(var(--color-border-strong) / 0.62);
+    content: "";
+    pointer-events: none;
+  }
+
+  .explain-analyze-parent-bar {
+    border: 1px dashed rgb(var(--color-text-muted) / 0.55);
+    box-shadow: none;
+    opacity: 0.35;
+  }
+}
+
+@layer components {
+  .explain-analyze-grid {
+    display: grid;
+    grid-template-columns: minmax(185px, 240px) minmax(250px, 1fr) 90px 62px;
+    gap: 12px;
+  }
+
+  .explain-analyze-lane {
+    min-height: 62px;
+    transition: background-color 180ms ease, opacity 180ms ease;
+  }
+
+  .explain-analyze-lane:hover,
+  .explain-analyze-lane-selected {
+    background-color: rgb(var(--color-accent) / 0.065);
+  }
+
+  .explain-analyze-lane-future {
+    opacity: 0.38;
+  }
+
+  .explain-analyze-bar {
+    border: 1px solid rgb(var(--color-bg) / 0.25);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), 0 3px 9px rgb(var(--color-text) / 0.1);
+    transition: width 220ms linear, left 220ms linear, box-shadow 180ms ease;
+  }
+
+  .explain-analyze-bar:hover,
+  .explain-analyze-bar[aria-pressed="true"] {
+    outline: 2px solid rgb(var(--color-accent));
+    outline-offset: 3px;
+    z-index: 2;
+  }
+
+  .explain-analyze-bar-active {
+    background-image: linear-gradient(110deg, transparent 25%, rgb(255 255 255 / 0.28) 50%, transparent 75%);
+    background-size: 220% 100%;
+    animation: explain-analyze-flow 2.4s linear infinite;
+  }
+
+  .explain-analyze-elapsed {
+    background: linear-gradient(90deg, transparent, rgb(var(--color-accent) / 0.055));
+  }
+
+  .explain-analyze-playhead {
+    width: 1px;
+    background: rgb(var(--color-accent) / 0.8);
+    box-shadow: 0 0 8px rgb(var(--color-accent) / 0.3);
+    z-index: 3;
+  }
+
+  .explain-analyze-playhead::before {
+    content: "";
+    position: absolute;
+    top: -4px;
+    left: -3px;
+    width: 7px;
+    height: 7px;
+    background: rgb(var(--color-accent));
+    transform: rotate(45deg);
+  }
+
+  .explain-analyze-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 30px;
+    min-height: 30px;
+    border: 1px solid rgb(var(--color-border));
+    border-radius: 8px;
+    color: rgb(var(--color-accent));
+    background: rgb(var(--color-surface));
+    font-size: 11px;
+  }
+
+  .explain-analyze-domain button:focus-visible,
+  .explain-analyze-domain input:focus-visible {
+    outline: 2px solid rgb(var(--color-accent));
+    outline-offset: 3px;
+  }
+}
+
+@keyframes explain-analyze-flow {
+  from { background-position: 220% 0; }
+  to { background-position: -220% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .explain-analyze-domain *,
+  .explain-analyze-domain *::before,
+  .explain-analyze-domain *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@layer components {
+  .explain-analyze-view-switch {
+    display: inline-flex;
+    gap: 3px;
+    padding: 3px;
+    border: 1px solid rgb(var(--color-border));
+    border-radius: 10px;
+    background: rgb(var(--color-bg));
+  }
+  .explain-analyze-view-switch button {
+    padding: 6px 16px;
+    border-radius: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: rgb(var(--color-text-muted));
+  }
+  .explain-analyze-view-switch button[aria-pressed="true"] {
+    background: rgb(var(--color-surface));
+    color: rgb(var(--color-accent));
+    box-shadow: 0 1px 4px rgb(var(--color-text) / 0.1);
+  }
+  .explain-analyze-tree-columns {
+    display: grid;
+    grid-template-columns: minmax(200px, 1fr) minmax(100px, 190px) 94px 76px;
+    gap: 14px;
+    padding: 9px 8px;
+  }
+  .explain-analyze-tree-view .explain-analyze-lane {
+    min-height: 44px;
+    border-radius: 8px;
+  }
+  .explain-analyze-stage-title {
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 600;
+    color: rgb(var(--color-text));
+    overflow-wrap: anywhere;
+  }
+  .explain-analyze-stage-title:hover,
+  .explain-analyze-stage-title[aria-pressed="true"] {
+    color: rgb(var(--color-accent));
+  }
+  .explain-analyze-tree-view .explain-analyze-node-copy {
+    gap: 10px;
+  }
+  .explain-analyze-tree-view .explain-analyze-node-copy > div > div:nth-child(2) {
+    margin-top: 5px;
+    font-size: 11px;
+  }
+  .explain-analyze-tree-view .explain-analyze-lane > span:last-child {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .explain-analyze-tree-active {
+    background: linear-gradient(90deg, rgb(var(--color-accent) / 0.055), transparent);
+  }
+  .explain-analyze-tree-active .explain-analyze-stage-title::after {
+    content: "";
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-left: 9px;
+    border-radius: 50%;
+    background: rgb(var(--color-accent));
+    animation: explain-analyze-tree-pulse 2s ease-in-out infinite;
+  }
+  .explain-analyze-inspector {
+    margin-bottom: 12px;
+  }
+}
+@keyframes explain-analyze-tree-pulse {
+  50% { opacity: 0.3; }
+}
+
+@layer components {
+  .explain-analyze-summary {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px;
+    padding: 12px 20px 4px; font-size: 11px; color: rgb(var(--color-text-muted));
+  }
+  .explain-analyze-summary-metric { display: inline-flex; align-items: baseline; gap: 7px; }
+  .explain-analyze-summary-metric strong { color: rgb(var(--color-text)); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .explain-analyze-summary-count { margin-left: auto; }
+  .explain-analyze-token-summary { display: flex; flex-wrap: wrap; gap: 14px; padding: 5px 20px 11px; font-size: 10px; color: rgb(var(--color-text-muted)); border-bottom: 1px solid rgb(var(--color-border)); }
+  .explain-analyze-token-summary strong { color: rgb(var(--color-text-secondary)); font-weight: 600; }
+  .explain-analyze-tree-usage { display: flex; flex-direction: column; line-height: 1.4; overflow-wrap: anywhere; font-size: 10px; font-variant-numeric: tabular-nums; color: rgb(var(--color-text-muted)); }
+  .explain-analyze-tree-status { font-size: 10px; font-weight: 500; }
+  .explain-analyze-column-head { color: rgb(var(--color-text-muted)); font-size: 10px; letter-spacing: 0.03em; border-bottom: 1px solid rgb(var(--color-border)); }
+  .explain-analyze-tree-view .explain-analyze-tree-children::before { left: calc(var(--explain-tree-parent-indent, 0px) + 16px); bottom: 22px; border-color: rgb(var(--color-text-muted) / 0.45); }
+  .explain-analyze-tree-view .explain-analyze-node-copy-nested::before { top: 10px; left: calc(var(--explain-tree-indent, 0px) - 12px); width: 16px; border-color: rgb(var(--color-text-muted) / 0.45); }
+  .explain-analyze-tree-view .explain-analyze-group-row { background: rgb(var(--color-accent) / 0.025); }
+  .explain-analyze-tree-view .explain-analyze-lane { border-bottom-color: rgb(var(--color-border) / 0.32); border-radius: 4px; }
+  .explain-analyze-tree-view .explain-analyze-lane-selected { background: rgb(var(--color-accent) / 0.075); box-shadow: inset 2px 0 rgb(var(--color-accent) / 0.7); }
+  .explain-analyze-tree-active { box-shadow: inset 2px 0 rgb(var(--color-accent) / 0.5); }
+  .explain-analyze-tree-view .explain-analyze-tree-node { animation: explain-analyze-node-enter 180ms ease-out; }
+  @media (max-width: 680px) {
+    .explain-analyze-tree-columns { grid-template-columns: minmax(140px, 1fr) 78px 64px; gap: 8px; }
+    .explain-analyze-tree-usage, .explain-analyze-column-head > :nth-child(2) { display: none; }
+    .explain-analyze-stage-title { font-size: 12px; }
+  }
+}
+@keyframes explain-analyze-node-enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }

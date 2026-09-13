@@ -4051,7 +4051,7 @@ const WORK_TURN_RUNTIME_EVENT_TYPES: Record<
   turn_complete: true,
   error: true,
   warning: true,
-  explain: true,
+  explain_analyze: true,
   plan_created: true,
   plan_revised: true,
   plan_step_start: true,

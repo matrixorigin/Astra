@@ -38,6 +38,57 @@ describe("applyStreamEvent", () => {
     vi.clearAllMocks();
   });
 
+  it("persists validated Explain Analyze facts and records a stream gap", () => {
+    const state = makeState();
+    const event = {
+      type: "explain_analyze" as const,
+      schema_version: 1 as const,
+      event_id: "clock-1:1",
+      run_id: "run-1",
+      turn_id: "turn-1",
+      node_id: "turn-1/model/0",
+      producer_id: "worker-1",
+      clock_domain_id: "clock-1",
+      kind: "model_round" as const,
+      round_index: 0,
+      attempt_index: 0,
+      label: "Generate model response",
+      transition: "started" as const,
+      elapsed_ms: 4,
+    };
+
+    applyStreamEvent(event, ctx, state);
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      { explainAnalyzeEvent: event },
+    );
+
+    applyStreamEvent(
+      {
+        type: "stream_gap",
+        run_id: "run-1",
+        dropped_event_count: 2,
+        repair: "refresh_run_snapshot",
+      },
+      ctx,
+      state,
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      { explainAnalyzeDegraded: true },
+    );
+  });
+
+  it("does not persist a false warning for a fully recovered Explain gap", () => {
+    applyStreamEvent({ type: "stream_gap", run_id: "run-1", dropped_event_count: 2,
+      explain_analyze_recovered: true, repair: "refresh_run_snapshot" }, ctx, makeState());
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
+  });
+
   it("clears active run before throwing on session mismatch", () => {
     const state = makeState();
 
