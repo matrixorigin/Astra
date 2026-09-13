@@ -4,16 +4,12 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use astra_turn_core::headless_tool_postprocess::{
-    HeadlessOutputEnrichCtx, HeadlessOutputEnrichRequest, HeadlessOutputEnrichSignal,
+    HeadlessExecutionDisposition, HeadlessOutputEnrichCtx, HeadlessOutputEnrichRequest,
+    HeadlessOutputEnrichSignal, HeadlessResultQualityRequest,
     append_headless_result_quality_feedback, enrich_headless_tool_output_for_errors_and_limits,
 };
-use astra_turn_core::headless_tool_stderr_lines::{
-    headless_stderr_resource_limit_in_output, headless_stderr_resource_limit_observed,
-};
+use astra_turn_core::headless_tool_stderr_lines::headless_stderr_resource_limit_observed;
 use astra_turn_core::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
-use astra_turn_core::tool_result_semantics::{
-    ToolErrorSeverity, classify_tool_error, tool_output_has_explicit_success_signal,
-};
 
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessInvocationScope<'a> {
@@ -54,6 +50,9 @@ pub(crate) async fn execute_tool_pure(
     durable_dispatch_admission: Option<
         crate::server::tool_invocation_runtime::DurableDispatchAdmission,
     >,
+    task_resolution_authority: Option<
+        &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
+    >,
     resolved_provider_policy: Option<
         &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
     >,
@@ -83,6 +82,7 @@ pub(crate) async fn execute_tool_pure(
                             resolved_provider_policy,
                             permission_grant,
                             durable_dispatch_admission,
+                            task_resolution_authority,
                         )
                         .await;
                     dispatch_control = deferred.dispatch_control;
@@ -199,8 +199,6 @@ mod runtime_tool_result_tests {
             Some("failed")
         );
         assert!(execution_result_is_error(
-            &execution.name,
-            &execution.result_str,
             execution.tool_result_fields.as_ref(),
             execution.authoritative_is_error,
         ));
@@ -214,7 +212,7 @@ mod runtime_tool_result_tests {
         apply_runtime_tool_result(
             &mut execution,
             astra_tools::ToolResult {
-                output: "ok".to_string(),
+                output: "Error: this text came from a successful read".to_string(),
                 metadata: Some(metadata),
                 is_error: false,
                 exit_semantics: None,
@@ -229,8 +227,6 @@ mod runtime_tool_result_tests {
             Some(&json!("request-1"))
         );
         assert!(!execution_result_is_error(
-            &execution.name,
-            &execution.result_str,
             execution.tool_result_fields.as_ref(),
             execution.authoritative_is_error,
         ));
@@ -253,8 +249,6 @@ mod runtime_tool_result_tests {
 
         assert_eq!(execution.authoritative_is_error, Some(false));
         assert!(!execution_result_is_error(
-            &execution.name,
-            &execution.result_str,
             execution.tool_result_fields.as_ref(),
             execution.authoritative_is_error,
         ));
@@ -262,102 +256,70 @@ mod runtime_tool_result_tests {
 }
 
 pub(super) fn execution_result_is_error(
-    name: &str,
-    result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
     authoritative_is_error: Option<bool>,
 ) -> bool {
-    // Runtime execution already returned a typed outcome. Reclassifying its
-    // domain payload (for example `status: recorded`) as an execution error
-    // conflates business state with transport state and can turn a committed
-    // side effect into a false failure. Body inference is only for local tools
-    // whose provider contract has no typed outcome.
-    if let Some(is_error) = authoritative_is_error {
-        if is_error
-            && !tool_result_fields
-                .is_some_and(crate::turn::agentic_loop::tool_support::has_typed_executor_failure)
-            && tool_result_fields.is_some_and(|fields| {
-                fields
-                    .get("exit_semantics")
-                    .and_then(Value::as_str)
-                    .and_then(|tag| {
-                        serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
-                            Value::String(tag.to_string()),
-                        )
-                        .ok()
-                    })
-                    .is_some_and(|semantics| !semantics.is_tool_error())
-                    || fields
-                        .get("result_class")
-                        .and_then(Value::as_str)
-                        .and_then(|tag| {
-                            serde_json::from_value::<
-                                astra_tools::exit_semantics::CommandResultClass,
-                            >(Value::String(tag.to_string()))
-                            .ok()
-                        })
-                        .is_some_and(|result_class| !result_class.is_tool_error())
-            })
-        {
-            // A provider may carry the shell's generic `failed` status while
-            // preserving the executor's typed process semantics.  Empty
-            // results and domain-negative answers are completed observations,
-            // not execution errors; let that structured producer-owned fact
-            // reconcile a stale boolean status without parsing output text.
-            return false;
-        }
+    let fields = tool_result_fields;
+
+    // Producer-owned executor failures outrank generic status fields. Result
+    // prose is never execution authority: it is arbitrary tool/user content.
+    if fields.is_some_and(|fields| fields.contains_key("runtime_error"))
+        || fields.is_some_and(|fields| fields.get("blocked").and_then(Value::as_bool) == Some(true))
+        || fields.is_some_and(crate::turn::agentic_loop::tool_support::has_typed_executor_failure)
+    {
+        return true;
+    }
+
+    // The command executor can publish a more specific process result than
+    // the enclosing edge terminal status (for example grep-no-match or a
+    // benign bounded-pipeline close). This is still structured evidence.
+    if let Some(is_error) = fields.and_then(structured_command_is_error) {
         return is_error;
     }
-    let metadata_failed = tool_result_fields.is_some_and(|fields| {
-        let status_exit_code = fields
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .and_then(edge_tool_status_exit_code);
-        let failed_status = status_exit_code.is_some_and(|exit_code| exit_code != 0);
-        let successful_status = status_exit_code == Some(0);
-        let runtime_error = fields.get("runtime_error").is_some();
-        let blocked = fields
-            .get("blocked")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let explicit_error_kind = fields.get("error_kind").is_some();
-
-        failed_status || runtime_error || blocked || (explicit_error_kind && !successful_status)
-    });
-
-    match classify_tool_error(name, result_str) {
-        ToolErrorSeverity::HardError => true,
-        ToolErrorSeverity::InfrastructureError => true,
-        ToolErrorSeverity::SoftError => metadata_failed,
-        // Success arm — body-wins reconciliation contract:
-        //
-        // When edge metadata says the call failed (non-zero exit status) but
-        // the visible result body says it succeeded, the body MUST win. This
-        // prevents a real mutation (e.g. a successful `str_replace`) from
-        // being recorded as a failed tool call when transport metadata is
-        // stale or inconsistent.
-        //
-        // The signal we trust is `tool_output_has_explicit_success_signal`,
-        // which keys on the stable `TOOL_SUCCESS_SENTINEL` emitted by
-        // file-mutation tools. A mutation emitter that does NOT emit the
-        // sentinel falls back to local-tool prose matching, and if neither
-        // matches, a stale failed status will be recorded. Therefore any new
-        // mutation emitter MUST append the sentinel on success.
-        ToolErrorSeverity::Success => {
-            metadata_failed && !tool_output_has_explicit_success_signal(result_str)
-        }
+    if let Some(is_error) = authoritative_is_error {
+        return is_error;
     }
+
+    // Without a typed terminal fact the outcome is unknown, not successful.
+    fields
+        .and_then(|fields| fields.get("status"))
+        .and_then(Value::as_str)
+        .and_then(edge_tool_status_exit_code)
+        .is_none_or(|exit_code| exit_code != 0)
+}
+
+fn structured_command_is_error(fields: &Map<String, Value>) -> Option<bool> {
+    if let Some(semantics) = fields
+        .get("exit_semantics")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
+                tag.to_string(),
+            ))
+            .ok()
+        })
+    {
+        return Some(semantics.is_tool_error());
+    }
+    fields
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
+                Value::String(tag.to_string()),
+            )
+            .ok()
+        })
+        .map(astra_tools::exit_semantics::CommandResultClass::is_tool_error)
 }
 
 pub(super) fn execution_error_kind(
-    result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> Option<astra_core::ErrorKind> {
     tool_result_fields
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(parse_execution_error_kind_tag)
-        .or_else(|| structured_output_error_kind(result_str))
 }
 
 fn execution_recovery_evidence(
@@ -388,17 +350,6 @@ fn execution_recovery_evidence(
     // that producer-owned fact instead of deriving retryability from kind.
     evidence.retryable = retryable;
     Some(evidence)
-}
-
-fn structured_output_error_kind(result_str: &str) -> Option<astra_core::ErrorKind> {
-    serde_json::from_str::<Value>(result_str)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error_kind")
-                .and_then(Value::as_str)
-                .and_then(parse_execution_error_kind_tag)
-        })
 }
 
 fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
@@ -454,35 +405,20 @@ mod tests {
         );
         fields.insert("blocked".to_string(), Value::Bool(true));
 
-        assert!(execution_result_is_error(
-            "list_dir",
-            "Error: transport 'edge_ws' disconnected or timed out while executing tool 'list_dir'",
-            Some(&fields),
-            None,
-        ));
+        assert!(execution_result_is_error(Some(&fields), None,));
     }
 
     #[test]
-    fn plain_read_only_timeout_without_runtime_metadata_stays_soft() {
-        assert!(!execution_result_is_error(
-            "grep",
-            "Error: command timed out after 30s",
-            None,
-            None,
-        ));
+    fn missing_terminal_execution_fact_fails_closed() {
+        assert!(execution_result_is_error(None, None));
     }
 
     #[test]
-    fn explicit_success_body_can_override_stale_failed_status() {
+    fn failed_status_without_command_semantics_is_failure() {
         let mut fields = Map::new();
         fields.insert("status".to_string(), Value::String("failed".to_string()));
 
-        assert!(!execution_result_is_error(
-            "str_replace",
-            "Replaced 1 occurrence\n<<<ASTRA_TOOL_OK>>>",
-            Some(&fields),
-            None,
-        ));
+        assert!(execution_result_is_error(Some(&fields), None));
     }
 
     #[test]
@@ -499,12 +435,7 @@ mod tests {
             ),
         ]);
 
-        assert!(!execution_result_is_error(
-            "bash",
-            "(exit code: 1)",
-            Some(&fields),
-            Some(true),
-        ));
+        assert!(!execution_result_is_error(Some(&fields), Some(true),));
     }
 
     #[test]
@@ -518,12 +449,7 @@ mod tests {
                 astra_tools::workspace_observation::explicit_workspace_verification_unavailable_evidence(),
             ).unwrap()),
         ]);
-        assert!(execution_result_is_error(
-            "bash",
-            "",
-            Some(&fields),
-            Some(true)
-        ));
+        assert!(execution_result_is_error(Some(&fields), Some(true)));
     }
 
     #[test]
@@ -540,12 +466,7 @@ mod tests {
             ),
         ]);
 
-        assert!(execution_result_is_error(
-            "bash",
-            "Error: command failed",
-            Some(&fields),
-            Some(true),
-        ));
+        assert!(execution_result_is_error(Some(&fields), Some(true),));
     }
 
     #[test]
@@ -557,12 +478,7 @@ mod tests {
             Value::String("transport_disconnected".to_string()),
         );
 
-        assert!(!execution_result_is_error(
-            "list_dir",
-            "ok",
-            Some(&fields),
-            None,
-        ));
+        assert!(!execution_result_is_error(Some(&fields), None,));
     }
 
     #[test]
@@ -574,12 +490,7 @@ mod tests {
             serde_json::json!({"kind": "transport_disconnected"}),
         );
 
-        assert!(execution_result_is_error(
-            "list_dir",
-            "ok",
-            Some(&fields),
-            None,
-        ));
+        assert!(execution_result_is_error(Some(&fields), None,));
     }
 
     #[test]
@@ -598,9 +509,9 @@ mod tests {
                 Value::String(wire_kind.to_string()),
             )]);
             assert_eq!(
-                execution_error_kind("opaque transport output", Some(&fields)),
+                execution_error_kind(Some(&fields)),
                 Some(canonical),
-                "wire alias {wire_kind} must not fall through to prose classification"
+                "wire alias {wire_kind} must normalize from typed metadata"
             );
         }
     }
@@ -655,6 +566,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.current_run_id,
             self.ctx.current_turn_chain_id,
             self.ctx.durable_dispatch_admission,
+            self.ctx.task_resolution_authority,
             resolved_provider_policy.as_ref(),
             permission_grant.as_ref(),
             self.ctx.session_turn,
@@ -705,24 +617,24 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.result_str,
             );
         execution.result_str = redacted_result;
-        // P1 (tool-design-gaps plan): use `classify_tool_error` so that
-        // soft errors (read_file ENOENT, str_replace not-unique, grep
-        // no-match) are NOT counted as ToolCallFailed. Only HardError
-        // (permission denied, disk full, sandbox violation) is a real
-        // failure. Before this fix, any result starting with "Error:"
-        // was marked as failed via `is_tool_error`, which inflated
-        // ToolHealthTracker failure rates and caused CLI exit code 1
-        // even on expected-negative tool outcomes.
         let mut is_err = execution_result_is_error(
-            &execution.name,
-            &execution.result_str,
             execution.tool_result_fields.as_ref(),
             execution.authoritative_is_error,
         );
-        let source_error_kind =
-            execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref());
+        let source_error_kind = execution_error_kind(execution.tool_result_fields.as_ref());
         let source_recovery_evidence =
             execution_recovery_evidence(execution.tool_result_fields.as_ref());
+        let execution_disposition = if execution.tool_result_fields.as_ref().is_some_and(|fields| {
+            astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+                fields.get("disposition"),
+                fields.get("execution_started").and_then(Value::as_bool),
+                astra_services::session_journal::ToolCallDisposition::Executed,
+            ) == astra_services::session_journal::ToolCallDisposition::Rejected
+        }) {
+            HeadlessExecutionDisposition::RejectedBeforeExecution
+        } else {
+            HeadlessExecutionDisposition::Executed
+        };
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
@@ -739,6 +651,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 source_error_kind,
                 source_recovery_evidence: source_recovery_evidence.as_ref(),
                 tool_already_restricted,
+                execution_disposition,
             },
             &mut enrich_ctx,
             |sig| {
@@ -752,21 +665,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             headless_stderr_resource_limit_observed(&tool),
                         );
                     }
-                    HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput { tool } => {
-                        term.emit_line(
-                            HeadlessStderrStyle::Dim,
-                            headless_stderr_resource_limit_in_output(&tool),
-                        );
-                    }
                 }
             },
         );
         let result_quality = append_headless_result_quality_feedback(
-            &execution.name,
-            &execution.result_str,
-            source_error_kind,
-            is_err,
-            resource_limit_recorded,
+            HeadlessResultQualityRequest {
+                name: &execution.name,
+                result_str: &execution.result_str,
+                source_error_kind,
+                execution_failed: is_err,
+                execution_disposition,
+                resource_limit_recorded,
+            },
             self.ctx.turn_guard,
             &mut advisories,
         );
@@ -793,13 +703,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.name,
             &execution.args,
         );
-        self.ctx.turn_guard.record_tool_outcome(
-            &outcome_sig,
-            result_quality,
-            executed_ms,
-            &execution.result_str,
-            source_error_kind,
-        );
+        if execution_disposition == HeadlessExecutionDisposition::Executed {
+            self.ctx.turn_guard.record_tool_outcome(
+                &outcome_sig,
+                result_quality,
+                executed_ms,
+                &execution.result_str,
+                source_error_kind,
+            );
+        }
 
         ExecutedExecution {
             execution,

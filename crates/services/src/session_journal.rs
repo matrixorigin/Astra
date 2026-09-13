@@ -1169,7 +1169,7 @@ pub struct ToolCallRecord {
     /// Runtime-only ledger binding; restored evidence must be checked against
     /// the authoritative invocation ledger, never reconstructed from display.
     #[serde(skip)]
-    pub invocation_completion: Option<astra_turn_types::ToolInvocationCompletionRef>,
+    pub execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
     /// Runtime-authored presentation guidance, never appended to result_full.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_advisories: Vec<String>,
@@ -1355,6 +1355,26 @@ pub enum ToolCallDisposition {
     /// The request was intentionally postponed pending activation or a later
     /// retry opportunity.
     Deferred,
+}
+
+impl ToolCallDisposition {
+    /// Shared projection of executor-owned metadata. A route dispatch is not
+    /// proof that the requested operation started; explicit non-execution must
+    /// not be promoted to execution by a caller's fallback.
+    pub fn from_execution_metadata(
+        disposition: Option<&serde_json::Value>,
+        execution_started: Option<bool>,
+        fallback: Self,
+    ) -> Self {
+        let disposition = disposition
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        match (disposition, execution_started) {
+            (None | Some(Self::Executed), Some(false)) => Self::Rejected,
+            (Some(disposition), _) => disposition,
+            (None, _) => fallback,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

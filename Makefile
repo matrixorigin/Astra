@@ -1062,8 +1062,8 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::subrun_turn_budget
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks cli_thin_client_single_admission_completes_server_owned_multi_round_loop
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks cli_thin_client_single_admission_completes_server_owned_multi_round_loop
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/chat-input-route.test.ts \
@@ -1090,7 +1090,7 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch
 	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/work-surface.test.ts \

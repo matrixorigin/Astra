@@ -53,6 +53,20 @@ const READ_FILE_ALLOWED_FIELDS: &[&str] = &[
     // and work-surface deduplication.
     "_tool_call_id",
 ];
+
+/// Mark only validation failures that are known to happen before any file
+/// mutation. Unknown I/O/commit failures remain untyped and conservative.
+fn caller_correctable_no_effect(
+    message: String,
+    action: astra_core::ToolRecoveryAction,
+) -> ToolResult {
+    ToolResult::error(message).with_failure_evidence(astra_core::ToolFailureEvidence::new(
+        astra_core::ErrorKind::ToolInvalidArgs,
+        astra_core::ToolFailureCause::InvalidArguments,
+        false,
+        vec![action],
+    ))
+}
 const READ_FILE_VISIBLE_FIELDS: &[&str] = &["path", "start_line", "end_line", "outline"];
 
 pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
@@ -1481,6 +1495,18 @@ pub fn prepare_multi_edit(
     workspace_root: &Path,
     args: &Value,
 ) -> Result<PreparedMultiEdit, ToolResult> {
+    // This phase only resolves and validates inputs and reads preimages. It
+    // cannot mutate the workspace; its boundary is therefore the source of
+    // the no-effect fact for every preparation failure, including failures
+    // that do not have a caller-recovery classification.
+    prepare_multi_edit_inner(workspace_root, args)
+        .map_err(ToolResult::with_workspace_mutation_not_applied)
+}
+
+fn prepare_multi_edit_inner(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedMultiEdit, ToolResult> {
     let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
     let args = &args;
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
@@ -1540,11 +1566,14 @@ pub fn prepare_multi_edit(
                 .map_err(ToolResult::error)?;
         let old_str = redaction_reference.as_deref().unwrap_or(old_str);
         if old_str == new_str {
-            return Err(ToolResult::error(str_replace_fail(
-                &format!("edit[{i}] is a no-op."),
-                "old_str and new_str are byte-for-byte identical.",
-                "Remove this edit, or fix new_str to reflect the intended change.",
-            )));
+            return Err(caller_correctable_no_effect(
+                str_replace_fail(
+                    &format!("edit[{i}] is a no-op."),
+                    "old_str and new_str are byte-for-byte identical.",
+                    "Remove this edit, or fix new_str to reflect the intended change.",
+                ),
+                astra_core::ToolRecoveryAction::CorrectArguments,
+            ));
         }
         if let Some(err) =
             check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
@@ -1553,18 +1582,22 @@ pub fn prepare_multi_edit(
         }
         let count = working.matches(old_str).count();
         if count == 0 {
-            return Err(ToolResult::error(str_replace_not_found_hint_for_edit(
-                path_str, &working, old_str, i,
-            )));
+            return Err(caller_correctable_no_effect(
+                str_replace_not_found_hint_for_edit(path_str, &working, old_str, i),
+                astra_core::ToolRecoveryAction::ReadTargetedRange,
+            ));
         }
         if count > 1 {
-            return Err(ToolResult::error(str_replace_fail(
-                &format!("edit[{i}] old_str is ambiguous in {path_str}."),
-                &format!(
-                    "old_str matched {count} times; batch edits require exactly one match per edit."
+            return Err(caller_correctable_no_effect(
+                str_replace_fail(
+                    &format!("edit[{i}] old_str is ambiguous in {path_str}."),
+                    &format!(
+                        "old_str matched {count} times; batch edits require exactly one match per edit."
+                    ),
+                    "Extend old_str with more surrounding context lines so it matches exactly once.",
                 ),
-                "Extend old_str with more surrounding context lines so it matches exactly once.",
-            )));
+                astra_core::ToolRecoveryAction::CorrectArguments,
+            ));
         }
         let next = working.replacen(old_str, new_str, 1);
         if !allow_structural_change {
@@ -1575,11 +1608,14 @@ pub fn prepare_multi_edit(
     }
     working = normalize_content_before_write(&path, &working);
     if working == original_content {
-        return Err(ToolResult::error(str_replace_fail(
-            "the normalized batch replacement would not change the file.",
-            "The edits cancel out after deterministic newline normalization, so the final bytes equal the original.",
-            "Change or remove the no-op edit; no bytes were changed.",
-        )));
+        return Err(caller_correctable_no_effect(
+            str_replace_fail(
+                "the normalized batch replacement would not change the file.",
+                "The edits cancel out after deterministic newline normalization, so the final bytes equal the original.",
+                "Change or remove the no-op edit; no bytes were changed.",
+            ),
+            astra_core::ToolRecoveryAction::CorrectArguments,
+        ));
     }
 
     let original_content_hash = sha256_digest_of_existing_file(&path);

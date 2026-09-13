@@ -390,7 +390,7 @@ impl TurnIntentJudgeOutcome {
 pub enum ControlToolRecovery {
     Unsupported,
     Missing,
-    Recovered(EdgeToolExecResult),
+    Recovered(Box<EdgeToolExecResult>),
 }
 
 /// Typed control outcome of publishing already-admitted provider tool calls.
@@ -6339,6 +6339,7 @@ pub(crate) mod tests {
                     let arguments = tool_call.get("function")?.get("arguments")?.as_str()?;
                     let args = serde_json::from_str(arguments).ok()?;
                     Some(EdgeToolExecResult {
+                        execution_completion: None,
                         request_id,
                         tool,
                         args,
@@ -6667,6 +6668,7 @@ pub(crate) mod tests {
             );
         }
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: format!("req-{name}"),
             tool: name.to_string(),
             args: json!({}),
@@ -6692,6 +6694,7 @@ pub(crate) mod tests {
         .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
         .insert_into(&mut fields);
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: "req-bash".to_string(),
             tool: "bash".to_string(),
             args: json!({"command": "make check 2>&1"}),
@@ -6717,6 +6720,7 @@ pub(crate) mod tests {
         .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
         .insert_into(&mut fields);
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: "req-agent-fanout".to_string(),
             tool: "agent_fanout".to_string(),
             args: json!({
@@ -6811,6 +6815,7 @@ pub(crate) mod tests {
             );
         }
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: format!("req-{name}"),
             tool: name.to_string(),
             args,
@@ -13342,6 +13347,7 @@ mod observability_e2e_tests {
             .map(|name| {
                 let args = json!({"path": format!("/tmp/{name}.txt")});
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: format!("call-{name}"),
                     tool: (*name).to_string(),
                     args,
@@ -13600,6 +13606,7 @@ mod parallel_execution_tests {
                     json!({"path": format!("/tmp/{id}.txt")})
                 };
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: (*id).to_string(),
                     tool: (*name).to_string(),
                     args,

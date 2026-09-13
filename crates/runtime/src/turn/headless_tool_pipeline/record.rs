@@ -42,15 +42,11 @@ fn tool_call_disposition_from_result_fields(
     fields: &serde_json::Map<String, Value>,
     fallback: astra_services::session_journal::ToolCallDisposition,
 ) -> astra_services::session_journal::ToolCallDisposition {
-    fields
-        .get("disposition")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .or_else(|| {
-            (fields.get("execution_started").and_then(Value::as_bool) == Some(false))
-                .then_some(astra_services::session_journal::ToolCallDisposition::Rejected)
-        })
-        .unwrap_or(fallback)
+    astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+        fields.get("disposition"),
+        fields.get("execution_started").and_then(Value::as_bool),
+        fallback,
+    )
 }
 
 fn emit_tool_display_feedback(
@@ -617,14 +613,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 record: execution.confirmed_invocation.take(),
             }
         };
-        let invocation_completion = finalized.record.as_ref().and_then(|record| {
+        let execution_completion = finalized.record.as_ref().and_then(|record| {
             match astra_turn_types::ToolInvocationCompletionRef::from_record(record) {
-                Ok(reference) => Some(reference),
+                Ok(reference) => Some(reference.into()),
                 Err(error) => {
                     tracing::error!(%error, "confirmed invocation record cannot bind recovery evidence");
                     None
                 }
             }
+        }).or_else(|| {
+            execution.edge_terminal_authority.then(|| {
+                self.ctx.edge_tool_round.iter().enumerate()
+                    .find(|(index, edge)| edge.assistant_tool_call_id(*index) == execution.id
+                        && edge.tool_name() == execution.name)
+                    .and_then(|(_, edge)| edge.execution_completion()).cloned()
+            }).flatten()
         });
         let finalized = finalized.result;
         is_err = finalized.is_error;
@@ -636,8 +639,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .metadata
         });
         let mut error_kind =
-            execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref())
-                .or(source_error_kind);
+            execution_error_kind(execution.tool_result_fields.as_ref()).or(source_error_kind);
 
         let journal_result_source =
             tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
@@ -730,7 +732,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
-            rec.invocation_completion = invocation_completion;
+            rec.execution_completion = execution_completion;
             rec.runtime_args_full = raw_args_full;
             rec.tool_call_id = Some(execution.id.clone());
             rec.result_artifact = journal_result.artifact.clone();
@@ -947,10 +949,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // act on item IDs/status without replacing it with an opaque artifact
         // handle.  Ordinary large/lossy results retain the existing artifact
         // replacement behavior.
-        let model_result_fields = tool_result_fields_for_model_roundtrip(
+        let mut model_result_fields = tool_result_fields_for_model_roundtrip(
             &execution.name,
             &full_model_result_str,
             execution.tool_result_fields.as_ref(),
+        )
+        .unwrap_or_default();
+        let result_status = if is_err {
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
+        } else {
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+        };
+        model_result_fields.insert(
+            "status".to_string(),
+            Value::String(result_status.as_str().to_string()),
         );
         let model_result_str = if structural_model_projection.is_some() {
             model_result_str
@@ -962,7 +974,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.id,
             &execution.name,
             &model_result_str,
-            model_result_fields.as_ref(),
+            Some(&model_result_fields),
+            result_status,
         );
         // Add metadata for compression (P6) and folding (P0):
         // - _round_index: Current-round tool results should never be truncated
@@ -1435,6 +1448,7 @@ mod tests {
             "start_work",
             &compact_model_result,
             Some(&fields),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
         );
         assert!(
             !model_message["content"]
@@ -1716,6 +1730,18 @@ mod tests {
         assert_eq!(
             tool_call_disposition_from_result_fields(&fields, ToolCallDisposition::Executed),
             ToolCallDisposition::Deferred
+        );
+    }
+
+    #[test]
+    fn explicit_non_execution_cannot_be_promoted_by_executed_disposition() {
+        let fields = json!({"execution_started": false, "disposition": "executed"});
+        assert_eq!(
+            tool_call_disposition_from_result_fields(
+                fields.as_object().unwrap(),
+                ToolCallDisposition::Executed,
+            ),
+            ToolCallDisposition::Rejected
         );
     }
 }

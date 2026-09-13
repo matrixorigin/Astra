@@ -29,6 +29,10 @@ pub struct CompletionSettlementState {
     /// synthesis-only: it calibrates claims against retained evidence rather
     /// than reopening exploration or hiding the failed outcome.
     pub outcome_reconciliation_retries: u32,
+    /// Evidence-linked model interpretation accepted for the active boundary.
+    /// This does not replace execution facts or deterministic verifier receipts.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub outcome_reconciliation_assessment: Option<crate::task_resolution::TaskResolutionAssessment>,
     /// Number of bounded same-turn retries after a task whose typed profile
     /// requires a workspace change attempted to finish without recording one.
     /// This is deliberately separate from the read-only escalation advisory:
@@ -148,6 +152,10 @@ pub struct ForegroundFanoutPagination {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum CompletionAction {
+    /// Submit an evidence-linked model assessment at this exact boundary.
+    /// Matching admission does not establish acceptance or verification success.
+    #[serde(rename = "outcome_reconciliation")]
+    OutcomeReconciliation { boundary_id: String },
     #[serde(rename = "required_workspace_mutation")]
     RequiredWorkspaceMutation,
     #[serde(rename = "required_external_effect")]
@@ -226,6 +234,7 @@ mod tests {
             output_cap_continuations: 1,
             textless_response_retries: 1,
             outcome_reconciliation_retries: 2,
+            outcome_reconciliation_assessment: None,
             workspace_mutation_retries: 3,
             external_effect_retries: 4,
             external_effect_recovery_paths: Some(vec!["artifact".into()]),

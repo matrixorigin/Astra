@@ -119,65 +119,6 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     }
 }
 
-/// Stable success sentinel emitted by prose-style mutation tools.
-///
-/// Contract: file-mutation emitters that return human-readable prose
-/// (`str_replace`, `multi_edit`, `delete_file`) MUST append this token to a
-/// successful result body. Emitters that return structured JSON (e.g.
-/// `write_file` returns `{"success":true,...}`) are detected separately via
-/// the JSON branch of [`tool_output_has_explicit_success_signal`] and do not
-/// need the sentinel (appending it would break JSON parsing).
-///
-/// The body-wins reconciliation in
-/// [`execution_result_is_error`](crate::turn::headless_tool_pipeline::execute::execution_result_is_error)
-/// keys on this signal, so coupling matcher behavior to human-readable prose
-/// would silently regress when copy is tweaked. Read-only tools do not need to
-/// emit it: they are never reconciled against a failed edge-metadata status
-/// (transport failures on read-only tools are surfaced as errors, which is
-/// the desired behavior).
-pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
-
-/// True when the visible tool body carries an explicit success marker.
-///
-/// Priority order (stable first):
-/// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
-/// 2. Structured JSON success (`ok:true` / `success:true` /
-///    `status: completed`).
-///
-/// This is deliberately narrower than "not an error". It exists for transport
-/// reconciliation: if edge metadata says failure but the body says a mutation
-/// succeeded, the body must win so the journal does not turn a real edit into a
-/// false failed tool call.
-#[must_use]
-pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
-    let trimmed = output.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // 1. Stable sentinel — highest priority contract.
-    if output.contains(TOOL_SUCCESS_SENTINEL) {
-        return true;
-    }
-
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        if v.get("ok").and_then(Value::as_bool) == Some(true) {
-            return true;
-        }
-        if v.get("success").and_then(Value::as_bool) == Some(true) {
-            return true;
-        }
-        if let Some(status) = v.get("status").and_then(Value::as_str) {
-            let status = status.trim().to_ascii_lowercase();
-            if status == "completed" {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 /// Canonical tri-state result of a tool execution.
 ///
 /// Consumed by `cloud_tool_result_status_label` and by `ToolResultStatusKind`
@@ -193,6 +134,17 @@ pub enum ToolResultStatus {
     Failed,
     /// Execution was skipped (dedup / protective skip — not an error).
     Skipped,
+}
+
+impl ToolResultStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 /// Classify a tool's output text into [`ToolResultStatus`].
@@ -740,36 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_success_signal_detects_str_replace_bodies() {
-        let body =
-            format!("Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body));
-        assert!(!tool_output_has_explicit_success_signal(
-            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>"
-        ));
-        assert!(tool_output_has_explicit_success_signal(
-            r#"{"ok":true,"status":"completed"}"#
-        ));
-        assert!(!tool_output_has_explicit_success_signal(
-            "permission denied"
-        ));
-        assert!(!tool_output_has_explicit_success_signal(
-            "Error: str_replace failed: old_str not found"
-        ));
-    }
-
-    #[test]
-    fn explicit_success_signal_rejects_noncanonical_status_aliases() {
-        for status in ["ok", "success", "succeeded", "complete", "passed"] {
-            let body = format!(r#"{{"status":"{status}"}}"#);
-            assert!(
-                !tool_output_has_explicit_success_signal(&body),
-                "noncanonical status alias {status:?} must not be an explicit success signal"
-            );
-        }
-    }
-
-    #[test]
     fn tool_error_empty_error_string_is_not_error() {
         let result = r#"{"error":""}"#;
         assert!(!is_tool_error(result));
@@ -785,20 +707,6 @@ mod tests {
     fn tool_error_nested_error_key_is_not_error() {
         let result = r#"{"ok":true,"data":{"error":"some inner issue"}}"#;
         assert!(!is_tool_error(result));
-    }
-
-    #[test]
-    fn sentinel_wins_over_failed_metadata() {
-        // Contract: mutation emitters append TOOL_SUCCESS_SENTINEL to successful
-        // bodies. The body-wins reconciliation must key on the sentinel, so a
-        // human-readable body coupled with a stale failed edge status still
-        // classifies as success.
-        let body = format!("Replaced successfully\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body));
-
-        // Sentinel must win even when the prose prefix is missing/unrecognized.
-        let body_minimal = format!("done\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body_minimal));
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod session_facts;
 mod session_fork;
 mod session_handoff;
 mod stop_hooks;
+pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;

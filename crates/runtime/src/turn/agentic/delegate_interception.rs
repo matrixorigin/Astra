@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use serde_json::Value;
 
 use super::headless_round::HeadlessStderrStyle;
@@ -19,7 +20,7 @@ pub(crate) const REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY: &str =
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
-    pub(crate) pre_resolved_results: Vec<(String, String)>,
+    pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) intercepted_any: bool,
 }
 
@@ -103,7 +104,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .map(|id| {
-                        (
+                        HeadlessPreResolvedToolResult::new(
                             id.to_string(),
                             format!(
                                 "ERROR: Delegation limit reached ({} delegations already executed this turn). \
@@ -111,6 +112,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                                  Do NOT delegate again.",
                                 state.delegations_this_turn
                             ),
+                            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
                         )
                     })
             })
@@ -228,12 +230,21 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     let pre_resolved_results = delegation_results
         .iter()
         .map(|result| {
-            (
+            HeadlessPreResolvedToolResult::new(
                 result.call_id.clone(),
                 astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
                     DELEGATE_TOOL_NAME,
                     &result.summary,
                 ),
+                if result
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.succeeded)
+                {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+                } else {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
+                },
             )
         })
         .collect();
@@ -2242,9 +2253,11 @@ mod tests {
         assert!(result.intercepted_any);
         assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
         assert_eq!(result.pre_resolved_results.len(), 1);
-        assert_eq!(result.pre_resolved_results[0].0, "call_delegate");
+        assert_eq!(result.pre_resolved_results[0].call_id, "call_delegate");
         assert!(
-            result.pre_resolved_results[0].1.contains("Delegation"),
+            result.pre_resolved_results[0]
+                .content
+                .contains("Delegation"),
             "{:?}",
             result.pre_resolved_results
         );
@@ -2290,8 +2303,8 @@ mod tests {
         assert!(result.intercepted_any);
         assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
         assert_eq!(result.pre_resolved_results.len(), 1);
-        assert_eq!(result.pre_resolved_results[0].0, "call_4th");
-        let content = &result.pre_resolved_results[0].1;
+        assert_eq!(result.pre_resolved_results[0].call_id, "call_4th");
+        let content = &result.pre_resolved_results[0].content;
         assert!(
             content.contains("Delegation limit reached"),
             "expected refusal message, got: {content}"

@@ -463,7 +463,23 @@ impl TurnGuard {
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
         let quality = result_quality::classify_result(result_str);
-        self.record_tool_result_quality_with_kind(tool_name, result_str, source_error_kind, quality)
+        self.record_tool_result_quality_with_kind(tool_name, source_error_kind, quality)
+    }
+
+    /// Record a result whose execution boundary has already reported success.
+    /// Output quality may still be empty or truncated, but content that looks
+    /// like an error cannot reverse the executor's terminal outcome.
+    pub fn record_successful_tool_result_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+    ) -> ResultQuality {
+        let quality = match result_quality::classify_result(result_str) {
+            ResultQuality::Error => ResultQuality::Success,
+            other => other,
+        };
+        self.record_tool_result_quality_with_kind(tool_name, source_error_kind, quality)
     }
 
     /// Record a tool result whose execution layer has already determined that
@@ -473,21 +489,30 @@ impl TurnGuard {
     pub fn record_failed_tool_result_with_kind(
         &mut self,
         tool_name: &str,
-        result_str: &str,
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
         self.record_tool_result_quality_with_kind(
             tool_name,
-            result_str,
             source_error_kind,
             ResultQuality::Error,
         )
     }
 
+    /// Record an admission rejection without treating it as evidence that the
+    /// tool implementation executed and failed.
+    pub fn record_rejected_tool_result_with_kind(
+        &mut self,
+        source_error_kind: Option<astra_core::ErrorKind>,
+    ) -> ResultQuality {
+        self.round_had_error = true;
+        self.errors
+            .record_error(source_error_kind.unwrap_or(astra_core::ErrorKind::Unknown));
+        ResultQuality::Error
+    }
+
     fn record_tool_result_quality_with_kind(
         &mut self,
         tool_name: &str,
-        result_str: &str,
         source_error_kind: Option<astra_core::ErrorKind>,
         quality: ResultQuality,
     ) -> ResultQuality {
@@ -498,8 +523,7 @@ impl TurnGuard {
             }
             ResultQuality::Error => {
                 self.round_had_error = true;
-                let category =
-                    source_error_kind.unwrap_or_else(|| error_recovery::classify_error(result_str));
+                let category = source_error_kind.unwrap_or(astra_core::ErrorKind::Unknown);
                 let shell_tool = crate::tool::categories::registry().is_shell(tool_name);
                 match category {
                     // Resource exhaustion is an actual runtime safety limit,
@@ -1427,8 +1451,11 @@ mod tests {
     #[test]
     fn unavailable_tool_health_avoidance_immediately() {
         let mut guard = TurnGuard::new();
-        // Single "command not found" → immediate health avoidance (no consecutive threshold)
-        guard.record_tool_result("mo_query", "Error: command not found");
+        // Only source-authored unavailability is an immediate health signal.
+        guard.record_failed_tool_result_with_kind(
+            "mo_query",
+            Some(astra_core::ErrorKind::ToolUnavailable),
+        );
         assert!(guard.health.is_avoidance_advised("mo_query"));
     }
 
@@ -1471,7 +1498,10 @@ mod tests {
     fn repeated_input_validation_failures_do_not_escalate_as_executor_failures() {
         let mut guard = TurnGuard::new();
         for _ in 0..16 {
-            guard.record_tool_result("agent_fanout", "Error: Invalid argument");
+            guard.record_failed_tool_result_with_kind(
+                "agent_fanout",
+                Some(astra_core::ErrorKind::ToolInvalidArgs),
+            );
         }
 
         assert_eq!(guard.errors.total_errors, 16, "rejections remain traceable");
@@ -1513,14 +1543,25 @@ mod tests {
     }
 
     #[test]
-    fn binding_failure_not_health_failure() {
+    fn unclassified_binding_prose_does_not_claim_binding_authority() {
         let mut guard = TurnGuard::new();
         let result = "Error: tool binding failure for agent_fanout";
         let quality = guard.record_tool_result("agent_fanout", result);
 
         assert_eq!(quality, super::result_quality::ResultQuality::Error);
         assert!(guard.round_had_error);
-        assert!(guard.health.get("agent_fanout").is_none());
+        assert_eq!(
+            guard
+                .errors
+                .errors_by_category
+                .get(&astra_core::ErrorKind::Unknown),
+            Some(&1)
+        );
+        assert!(
+            guard.health.get("agent_fanout").is_some(),
+            "unclassified failure remains visible; output prose cannot exempt it as a binding failure"
+        );
+        assert!(!guard.health.is_avoidance_advised("agent_fanout"));
     }
 
     #[test]

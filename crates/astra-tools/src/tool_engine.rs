@@ -40,6 +40,8 @@ pub enum ToolInvocationAdmissionSource {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolInvocationMetadata<'a> {
+    pub task_resolution_authority:
+        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
@@ -435,6 +437,7 @@ mod tests {
                 &TestContext { prefix: "ctx" },
                 &args,
                 ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),

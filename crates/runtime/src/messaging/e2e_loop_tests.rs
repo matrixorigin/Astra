@@ -33,7 +33,9 @@ mod tests {
     use astra_text_utils::semantic_dedup::SemanticDedup;
     use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+    use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+    use astra_turn_core::tool_result_semantics::ToolResultStatus;
     use astra_turn_core::turn_guard::TurnGuard;
 
     fn edge_runtime_environment_fields() -> Map<String, Value> {
@@ -453,6 +455,7 @@ mod tests {
 
         // Tool turn → should send progress to parent.
         let edge_tools = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-read-1".into(),
             tool: "read_file".into(),
             args: json!({"path": "/tmp/x.txt"}),
@@ -605,6 +608,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -692,6 +696,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -788,6 +793,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -872,9 +878,10 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // Simulate: skill interception resolved call_skill before headless round
-        let pre_resolved = vec![(
-            "call_skill".to_string(),
-            "Skill instructions here".to_string(),
+        let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
+            "call_skill",
+            "Skill instructions here",
+            ToolResultStatus::Completed,
         )];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -888,6 +895,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1005,8 +1013,16 @@ mod tests {
 
         // ALL tool calls were pre-resolved by upstream (skill + defer)
         let pre_resolved = vec![
-            ("skill:0".to_string(), "Skill instructions".to_string()),
-            ("read_file:1".to_string(), "file contents".to_string()),
+            HeadlessPreResolvedToolResult::new(
+                "skill:0",
+                "Skill instructions",
+                ToolResultStatus::Completed,
+            ),
+            HeadlessPreResolvedToolResult::new(
+                "read_file:1",
+                "file contents",
+                ToolResultStatus::Completed,
+            ),
         ];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1020,6 +1036,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1105,6 +1122,7 @@ mod tests {
 
         // Edge round has the grep result (executed at edge during SSE)
         let edge_tool_round = vec![EdgeToolExecResult {
+            execution_completion: None,
             // Edge execution custody is keyed by the provider-emitted tool-call
             // id.  An id-less result is diagnostic only and must not be
             // attached to a different call by name/arguments.
@@ -1129,7 +1147,11 @@ mod tests {
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
         // Skill was pre-resolved; grep will be matched from edge_tool_round
-        let pre_resolved = vec![("skill:0".to_string(), "Skill instructions".to_string())];
+        let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
+            "skill:0",
+            "Skill instructions",
+            ToolResultStatus::Completed,
+        )];
         let permission_context = PermissionSyncContext::shared_root(PermissionMode::Auto);
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1143,6 +1165,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1252,6 +1275,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1391,6 +1415,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1532,6 +1557,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),
@@ -1627,6 +1653,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
             deferred_activations_by_call_id: &std::collections::HashMap::new(),

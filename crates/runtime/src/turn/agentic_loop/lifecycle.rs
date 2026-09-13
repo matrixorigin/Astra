@@ -546,6 +546,7 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             &tool_call_id,
             crate::turn::skill_tool::SKILL_TOOL_NAME,
             &content_for_model,
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
         );
     state.push_prompt_history_message(tool_msg);
     state.tool_results.push(tool_result);

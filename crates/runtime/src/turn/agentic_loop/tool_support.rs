@@ -208,6 +208,7 @@ mod tests {
     #[test]
     fn edge_tool_observability_exit_code_uses_structured_exit_semantics() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-1".into(),
             tool: "bash".into(),
             args: json!({"command": "grep needle haystack.txt"}),
@@ -226,6 +227,7 @@ mod tests {
     #[test]
     fn edge_tool_observability_exit_code_structured_error_overrides_status() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-1".into(),
             tool: "bash".into(),
             args: json!({"command": "exit 7"}),
@@ -244,6 +246,7 @@ mod tests {
     #[test]
     fn executor_failure_remains_visible_after_successful_process_exit() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "verify-unavailable".into(),
             tool: "bash".into(),
             args: json!({"command": "true", "mode": "verify"}),

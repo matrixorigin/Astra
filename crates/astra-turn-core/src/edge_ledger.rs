@@ -226,6 +226,23 @@ fn remember_consumed_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value
 /// divergent reuse of an already-consumed callback key (`Some(false)`).
 /// `None` means this ledger has no consumed receipt for the key. Receipts are
 /// scoped to the exact ledger instance and expire with the normal ledger age.
+pub fn callback_content_eq(left: &Value, right: &Value) -> bool {
+    if left.get("kind").and_then(Value::as_str) != Some("tool_result")
+        || right.get("kind").and_then(Value::as_str) != Some("tool_result")
+    {
+        return left == right;
+    }
+    match (left.as_object(), right.as_object()) {
+        (Some(left), Some(right)) => left
+            .iter()
+            .filter(|(key, _)| key.as_str() != "execution_completion")
+            .eq(right
+                .iter()
+                .filter(|(key, _)| key.as_str() != "execution_completion")),
+        _ => false,
+    }
+}
+
 pub fn ledger_replay_status(
     ledger: &Arc<CallbackLedger>,
     key: &str,
@@ -242,7 +259,7 @@ pub fn ledger_replay_status(
             continue;
         }
         matching_ledger = true;
-        if &receipt.value == value {
+        if callback_content_eq(&receipt.value, value) {
             return Some(true);
         }
     }
@@ -1186,6 +1203,28 @@ pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &Reason
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_replay_identity_excludes_only_server_completion_provenance() {
+        let original =
+            serde_json::json!({"kind":"tool_result", "user_id":"owner", "body":{"output":"value"}});
+        let mut durable = original.clone();
+        durable["execution_completion"] = serde_json::json!({"authority":"edge_dispatch"});
+        assert!(super::callback_content_eq(&original, &durable));
+        let mut changed = durable.clone();
+        changed["body"]["execution_completion"] = serde_json::json!("untrusted");
+        assert!(!super::callback_content_eq(&original, &changed));
+        changed = durable.clone();
+        changed["user_id"] = serde_json::json!("other");
+        assert!(!super::callback_content_eq(&original, &changed));
+        changed = durable.clone();
+        changed["body"]["output"] = serde_json::json!("different");
+        assert!(!super::callback_content_eq(&original, &changed));
+        let mut approval = original;
+        approval["kind"] = serde_json::json!("approval");
+        let mut changed_approval = approval.clone();
+        changed_approval["execution_completion"] = serde_json::json!({});
+        assert!(!super::callback_content_eq(&approval, &changed_approval));
+    }
     use super::*;
 
     use crate::history::{RecoveredEventRow, append_recovered_events};

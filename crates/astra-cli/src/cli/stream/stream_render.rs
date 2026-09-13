@@ -21,9 +21,7 @@ use astra_turn_core::sse_stream_host::{
     consume_sse_stream_cancellable, stream_idle_timeout,
 };
 use astra_turn_core::tool_policy::is_tool_concurrency_safe;
-use astra_turn_core::tool_result_semantics::{
-    cloud_tool_result_status_label, tool_dedup_signature, tool_error_triggers_rollback,
-};
+use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 use crossterm::{cursor, execute, style::Stylize, terminal};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
@@ -635,6 +633,19 @@ fn server_tool_completion_status(event: &Value) -> String {
     }
 }
 
+fn normalized_fanout_start_status(event: &Value, output: &str) -> String {
+    match astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(
+        output,
+    ) {
+        Some(AgentFanoutControlReceiptKind::Group) => "completed".to_string(),
+        Some(
+            AgentFanoutControlReceiptKind::RejectedBeforeAcceptance
+            | AgentFanoutControlReceiptKind::ExecutionUnknown,
+        )
+        | None => server_tool_completion_status(event),
+    }
+}
+
 fn server_tool_completion_output(event: &Value) -> String {
     // Some transport projections reserve `output` but leave it null while
     // carrying the canonical receipt in `result`. Presence is not evidence:
@@ -677,20 +688,7 @@ fn normalized_server_tool_completion_status(state: &ServerToolCallState, event: 
     if state.name == "agent_fanout"
         && state.args.get("action").and_then(Value::as_str) == Some("start")
     {
-        if matches!(
-            server_tool_execution_fact(event).or_else(|| {
-                astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_execution_fact(
-                    &server_tool_completion_output(event),
-                )
-            }),
-            Some(
-                AgentFanoutControlExecutionFact::NotExecuted
-                    | AgentFanoutControlExecutionFact::Unknown,
-            )
-        ) {
-            return server_tool_completion_status(event);
-        }
-        cloud_tool_result_status_label(&server_tool_completion_output(event)).to_string()
+        normalized_fanout_start_status(event, &server_tool_completion_output(event))
     } else {
         server_tool_completion_status(event)
     }
@@ -2210,6 +2208,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -3017,6 +3016,7 @@ impl<'a> CliSseStreamHost<'a> {
         }
 
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
             args: req.args.clone(),
@@ -3674,19 +3674,7 @@ impl CliSseStreamHost<'_> {
             // as `launched`/`running` mean the launch call succeeded. A
             // typed non-executed/unknown envelope instead owns its explicit
             // terminal status and must not be flattened to generic failure.
-            match server_tool_execution_fact(event).or_else(|| {
-                astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_execution_fact(
-                    &output,
-                )
-            }) {
-                Some(
-                    AgentFanoutControlExecutionFact::NotExecuted
-                    | AgentFanoutControlExecutionFact::Unknown,
-                ) => {
-                    server_tool_completion_status(event)
-                }
-                _ => cloud_tool_result_status_label(&output).to_string(),
-            }
+            normalized_fanout_start_status(event, &output)
         } else {
             server_tool_completion_status(event)
         };
@@ -4166,6 +4154,7 @@ async fn execute_server_budgeted(
         .min(request.execution_timeout_ms);
     if remaining_execution_ms == 0 {
         let mut result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
             args: args.clone(),
@@ -5466,16 +5455,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let status = if !allowed || tool_execution_marked_error {
             "failed"
         } else {
-            cloud_tool_result_status_label(&output)
+            "completed"
         }
         .to_string();
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Rollback policy: only trigger turn rollback for HARD errors on mutation tools.
-        // Soft errors (e.g., "old_str == new_str", "file not found") let the agent retry.
+        // Execution status and rollback severity are separate facts. Only a
+        // typed failure/effect record can classify rollback risk; output text
+        // is model-facing content and may quote arbitrary source or logs.
         if tool_result_status_is_failure(&status)
             && Self::tool_error_triggers_turn_rollback(tool, args)
-            && tool_error_triggers_rollback(tool, &output)
+            && tool_failure_requires_turn_rollback(tool_result_fields.as_ref())
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active).await;
@@ -5581,6 +5571,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -5610,6 +5601,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .last()
             .cloned()
             .unwrap_or_else(|| EdgeToolExecResult {
+                execution_completion: None,
                 request_id: String::new(),
                 tool: String::new(),
                 args: serde_json::Value::Null,
@@ -6486,6 +6478,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let tool_result_fields =
                 self.tool_result_fields_with_cli_runtime(outcome.tool_result_fields);
             let result = EdgeToolExecResult {
+                execution_completion: None,
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
                 args: req.args.clone(),
@@ -8018,8 +8011,68 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
     if outcome.is_error {
         "failed"
     } else {
-        cloud_tool_result_status_label(&outcome.output)
+        "completed"
     }
+}
+
+/// Decide turn rollback from execution and owner-authored mutation facts.
+///
+/// Failure causes are recovery guidance, not proof of side effects. Rejected
+/// or unstarted calls and owner-confirmed no-mutation results are safe to
+/// correct. A committed/partial mutation rolls back; missing effect facts stay
+/// conservative. Never infer the effect from output prose or failure cause.
+fn tool_failure_requires_turn_rollback(tool_result_fields: Option<&Map<String, Value>>) -> bool {
+    let Some(fields) = tool_result_fields else {
+        return true;
+    };
+
+    if fields
+        .get("workspace_mutation_partial")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    if let Some(applied) = fields
+        .get("workspace_mutation_applied")
+        .and_then(Value::as_bool)
+    {
+        return applied;
+    }
+    if fields.get("executed").and_then(Value::as_bool) == Some(false)
+        || fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+        || fields.get("disposition").and_then(Value::as_str) == Some("rejected")
+    {
+        return false;
+    }
+
+    if let Some(semantics) = fields
+        .get("exit_semantics")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
+                tag.to_string(),
+            ))
+            .ok()
+        })
+    {
+        return semantics.is_tool_error();
+    }
+
+    if let Some(result_class) = fields
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
+                Value::String(tag.to_string()),
+            )
+            .ok()
+        })
+    {
+        return result_class.is_tool_error();
+    }
+
+    true
 }
 
 fn normalize_sandbox_denied_outcome(
@@ -8175,6 +8228,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let admission_source_for_blocking = invocation.admission_source;
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
+            task_resolution_authority: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),
@@ -8714,9 +8768,9 @@ mod tests {
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
-        tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
-        turn_has_tool_work, turn_phase_receipt_from_server_event,
-        work_task_board_update_from_server_event,
+        tool_completion_is_authoritative, tool_dedup_signature,
+        tool_failure_requires_turn_rollback, tool_output_event_text, turn_has_tool_work,
+        turn_phase_receipt_from_server_event, work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -8724,6 +8778,7 @@ mod tests {
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
+    use serde_json::Map;
     use serde_json::Value;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -11331,6 +11386,7 @@ mod tests {
             ..Default::default()
         });
         host.on_tool_result(&EdgeToolExecResult {
+            execution_completion: None,
             request_id: "tool-1".to_string(),
             tool: "bash".to_string(),
             args: serde_json::json!({"command": "echo hi"}),
@@ -12498,6 +12554,71 @@ mod tests {
         };
 
         assert_eq!(edge_tool_outcome_status(&outcome), "completed");
+    }
+
+    #[test]
+    fn successful_outcome_body_cannot_create_a_failed_terminal_status() {
+        let outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: "Error: a successful file read returned this first line".to_string(),
+            tool_result_fields: None,
+            is_error: false,
+        };
+        assert_eq!(edge_tool_outcome_status(&outcome), "completed");
+    }
+
+    #[test]
+    fn rollback_decision_uses_execution_and_effect_facts_not_failure_cause() {
+        let diagnostics_only = Map::from_iter([(
+            "recovery_evidence".to_string(),
+            serde_json::to_value(astra_core::ToolFailureEvidence::new(
+                astra_core::ErrorKind::ToolInvalidArgs,
+                astra_core::ToolFailureCause::InvalidArguments,
+                false,
+                Vec::new(),
+            ))
+            .unwrap(),
+        )]);
+        assert!(tool_failure_requires_turn_rollback(Some(&diagnostics_only)));
+
+        let rejected_before_execution = Map::from_iter([(
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        )]);
+        assert!(!tool_failure_requires_turn_rollback(Some(
+            &rejected_before_execution
+        )));
+
+        let no_mutation =
+            Map::from_iter([("workspace_mutation_applied".to_string(), Value::Bool(false))]);
+        assert!(!tool_failure_requires_turn_rollback(Some(&no_mutation)));
+
+        let effect_committed =
+            Map::from_iter([("workspace_mutation_applied".to_string(), Value::Bool(true))]);
+        assert!(tool_failure_requires_turn_rollback(Some(&effect_committed)));
+
+        let partial_effect =
+            Map::from_iter([("workspace_mutation_partial".to_string(), Value::Bool(true))]);
+        assert!(tool_failure_requires_turn_rollback(Some(&partial_effect)));
+
+        let contradictory_rejection = Map::from_iter([
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            ("workspace_mutation_applied".to_string(), Value::Bool(true)),
+        ]);
+        assert!(tool_failure_requires_turn_rollback(Some(
+            &contradictory_rejection
+        )));
+
+        let contradictory_no_effect = Map::from_iter([
+            ("execution_started".to_string(), Value::Bool(false)),
+            ("workspace_mutation_partial".to_string(), Value::Bool(true)),
+        ]);
+        assert!(tool_failure_requires_turn_rollback(Some(
+            &contradictory_no_effect
+        )));
+        assert!(tool_failure_requires_turn_rollback(None));
     }
     // ── Skill/MCP output summary tests ──
 
@@ -14236,6 +14357,380 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn turn_rollback_preserves_prior_edits_after_typed_str_replace_no_effects() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
+        let session_id = "turn-rollback-str-replace-no-effect";
+        std::fs::write(temp.path().join("first.txt"), "before\n").expect("seed first file");
+        std::fs::write(temp.path().join("noop.txt"), "same\n").expect("seed no-op file");
+        std::fs::write(temp.path().join("batch-noop.txt"), "same\n")
+            .expect("seed batch no-op file");
+        std::fs::write(temp.path().join("batch-missing.txt"), "current bytes\n")
+            .expect("seed batch missing-anchor file");
+        std::fs::write(
+            temp.path().join("ambiguous.txt"),
+            "repeat-anchor\nother\nrepeat-anchor\n",
+        )
+        .expect("seed ambiguous file");
+        std::fs::write(
+            temp.path().join("batch-ambiguous.txt"),
+            "repeat\nother\nrepeat\n",
+        )
+        .expect("seed batch ambiguous file");
+        for (path, contents) in [
+            ("per-path-noop.txt", "same\n"),
+            ("per-path-missing.txt", "current bytes\n"),
+            ("per-path-ambiguous.txt", "repeat\nother\nrepeat\n"),
+        ] {
+            std::fs::write(temp.path().join(path), contents).expect("seed per-path batch file");
+        }
+        std::fs::write(temp.path().join("stale.txt"), "current bytes\n")
+            .expect("seed stale-anchor file");
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id),
+        );
+        for path in ["batch-noop.txt", "batch-missing.txt", "batch-ambiguous.txt"] {
+            executor.read_file(&serde_json::json!({"path": path}));
+        }
+        executor
+            .journal_turn_index
+            .store(21, std::sync::atomic::Ordering::Relaxed);
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: std::sync::Arc::clone(&executor),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                ask_user_request_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let request = |request_id: &str, tool: &str, args: serde_json::Value| ToolBatchRequest {
+            session_id: "test-session".to_string(),
+            run_id: "test-run".to_string(),
+            turn_chain_id: "test-chain".to_string(),
+            request_id: request_id.to_string(),
+            execution_timeout_ms: 300_000,
+            execution_deadline_unix_ms: 4_102_444_800_000,
+            tool: tool.to_string(),
+            args,
+        };
+        macro_rules! execute_one {
+            ($request:expr) => {
+                host.execute_tools_batch(vec![$request])
+                    .await
+                    .into_iter()
+                    .next()
+                    .expect("one tool result")
+            };
+        }
+
+        let first_edit = execute_one!(request(
+            "first-edit",
+            "str_replace",
+            serde_json::json!({
+                "path": "first.txt",
+                "old_str": "before",
+                "new_str": "after-one",
+            }),
+        ));
+        assert_eq!(first_edit.status, "completed", "{}", first_edit.output);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "after-one\n"
+        );
+
+        let no_op = execute_one!(request(
+            "same-text-no-op",
+            "str_replace",
+            serde_json::json!({
+                "path": "noop.txt",
+                "old_str": "same",
+                "new_str": "same",
+            }),
+        ));
+        assert_eq!(
+            no_op.status, "failed",
+            "no-op must remain a visible tool error"
+        );
+        let no_op_fields = no_op
+            .tool_result_fields
+            .as_ref()
+            .expect("typed no-op evidence");
+        assert_eq!(
+            no_op_fields["recovery_evidence"]["cause"].as_str(),
+            Some("invalid_arguments")
+        );
+        assert!(!no_op_fields.contains_key("rollback_state"));
+        assert!(host.turn_rollback_fired.is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "after-one\n",
+            "a no-op correction must not undo the earlier successful edit"
+        );
+
+        let batch_no_op = execute_one!(request(
+            "same-file-batch-no-op",
+            "str_replace",
+            serde_json::json!({
+                "path": "batch-noop.txt",
+                "edits": [{"old_str": "same", "new_str": "same"}],
+            }),
+        ));
+        assert_eq!(batch_no_op.status, "failed", "batch no-op stays visible");
+        let batch_no_op_fields = batch_no_op
+            .tool_result_fields
+            .as_ref()
+            .expect("batch no-op result metadata");
+        assert_eq!(
+            batch_no_op_fields
+                .get("recovery_evidence")
+                .and_then(|evidence| evidence.get("cause"))
+                .and_then(Value::as_str),
+            Some("invalid_arguments"),
+            "fields: {batch_no_op_fields:?}; output: {}",
+            batch_no_op.output
+        );
+        assert_eq!(batch_no_op_fields["workspace_mutation_applied"], false);
+        assert!(host.turn_rollback_fired.is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "after-one\n",
+            "same-file batch no-op must preserve the earlier edit"
+        );
+
+        let batch_missing_anchor = execute_one!(request(
+            "same-file-batch-missing-anchor",
+            "str_replace",
+            serde_json::json!({
+                "path": "batch-missing.txt",
+                "edits": [{"old_str": "UNIQUE_BATCH_ANCHOR_NOT_PRESENT", "new_str": "replacement"}],
+            }),
+        ));
+        assert_eq!(batch_missing_anchor.status, "failed");
+        assert_eq!(
+            batch_missing_anchor.tool_result_fields.as_ref().unwrap()["recovery_evidence"]["cause"]
+                .as_str(),
+            Some("invalid_arguments")
+        );
+        assert_eq!(
+            batch_missing_anchor.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
+            false
+        );
+        assert!(host.turn_rollback_fired.is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("batch-missing.txt")).unwrap(),
+            "current bytes\n",
+            "the rejected batch must leave its target unchanged"
+        );
+
+        let batch_ambiguous_anchor = execute_one!(request(
+            "same-file-batch-ambiguous-anchor",
+            "str_replace",
+            serde_json::json!({
+                "path": "batch-ambiguous.txt",
+                "edits": [{"old_str": "repeat", "new_str": "changed"}],
+            }),
+        ));
+        assert_eq!(batch_ambiguous_anchor.status, "failed");
+        assert_eq!(
+            batch_ambiguous_anchor.tool_result_fields.as_ref().unwrap()["recovery_evidence"]["cause"]
+                .as_str(),
+            Some("invalid_arguments")
+        );
+        assert_eq!(
+            batch_ambiguous_anchor.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
+            false
+        );
+        assert!(host.turn_rollback_fired.is_none());
+
+        // The per-edit-path form uses the shared multi-path preparer instead
+        // of the local same-file batch fast path. Its validation failures
+        // must preserve the same no-effect contract.
+        for (request_id, path, contents, old_str, new_str) in [
+            (
+                "per-path-batch-no-op",
+                "per-path-noop.txt",
+                "same\n",
+                "same",
+                "same",
+            ),
+            (
+                "per-path-batch-missing-anchor",
+                "per-path-missing.txt",
+                "current bytes\n",
+                "UNIQUE_PER_PATH_ANCHOR_NOT_PRESENT",
+                "replacement",
+            ),
+            (
+                "per-path-batch-ambiguous-anchor",
+                "per-path-ambiguous.txt",
+                "repeat\nother\nrepeat\n",
+                "repeat",
+                "changed",
+            ),
+        ] {
+            let result = execute_one!(request(
+                request_id,
+                "str_replace",
+                serde_json::json!({
+                    "edits": [{"path": path, "old_str": old_str, "new_str": new_str}],
+                }),
+            ));
+            assert_eq!(result.status, "failed", "{request_id}: {}", result.output);
+            let fields = result
+                .tool_result_fields
+                .as_ref()
+                .expect("per-path batch validation evidence");
+            assert_eq!(
+                fields["recovery_evidence"]["cause"].as_str(),
+                Some("invalid_arguments"),
+                "{request_id}: {fields:?}"
+            );
+            assert_eq!(fields["workspace_mutation_applied"], false, "{request_id}");
+            assert!(host.turn_rollback_fired.is_none(), "{request_id}");
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join(path)).unwrap(),
+                contents,
+                "{request_id} must leave its target unchanged"
+            );
+        }
+
+        let ambiguous = execute_one!(request(
+            "ambiguous-anchor",
+            "str_replace",
+            serde_json::json!({
+                "path": "ambiguous.txt",
+                "old_str": "repeat-anchor",
+                "new_str": "changed-anchor",
+            }),
+        ));
+        assert_eq!(ambiguous.status, "failed");
+        let ambiguous_fields = ambiguous
+            .tool_result_fields
+            .as_ref()
+            .expect("typed ambiguity evidence");
+        assert_eq!(
+            ambiguous_fields["recovery_evidence"]["cause"].as_str(),
+            Some("invalid_arguments")
+        );
+        assert!(!ambiguous_fields.contains_key("rollback_state"));
+        assert!(host.turn_rollback_fired.is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "after-one\n",
+            "an ambiguous anchor must not undo the earlier successful edit"
+        );
+
+        let second_edit = execute_one!(request(
+            "second-edit",
+            "str_replace",
+            serde_json::json!({
+                "path": "first.txt",
+                "old_str": "after-one",
+                "new_str": "after-two",
+            }),
+        ));
+        assert_eq!(second_edit.status, "completed", "{}", second_edit.output);
+
+        let missing_anchor = execute_one!(request(
+            "missing-anchor",
+            "str_replace",
+            serde_json::json!({
+                "path": "stale.txt",
+                "old_str": "UNIQUE_ANCHOR_NOT_PRESENT_7d8af24e8ac248fe9e4f",
+                "new_str": "replacement",
+            }),
+        ));
+        assert_eq!(missing_anchor.status, "failed");
+        let missing_fields = missing_anchor
+            .tool_result_fields
+            .as_ref()
+            .expect("typed missing-anchor evidence");
+        assert_eq!(
+            missing_fields["recovery_evidence"]["cause"].as_str(),
+            Some("invalid_arguments")
+        );
+        assert!(!missing_fields.contains_key("rollback_state"));
+        assert!(host.turn_rollback_fired.is_none());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "after-two\n",
+            "a missing anchor must not undo successful edits from this turn"
+        );
+        assert!(
+            boundary_events(session_id)
+                .iter()
+                .all(|event| { event.event_type != JournalEventType::ExecutionBoundaryAborted })
+        );
+
+        // Negative control: an ambiguous command failure after a shell-side
+        // effect must retain the conservative rollback behavior for bounded
+        // structured edits. The shell effect itself is outside that journal.
+        let ambiguous_failure = execute_one!(request(
+            "effectful-bash-failure",
+            "bash",
+            serde_json::json!({
+                "command": "printf 'side effect\\n' > shell-effect.txt; exit 1",
+            }),
+        ));
+        assert_eq!(ambiguous_failure.status, "failed");
+        let rollback_fields = ambiguous_failure
+            .tool_result_fields
+            .as_ref()
+            .expect("ambiguous failure rollback metadata");
+        assert_eq!(rollback_fields["rollback_boundary"].as_str(), Some("turn"));
+        assert_eq!(
+            rollback_fields["rollback_state"].as_str(),
+            Some("rolled_back")
+        );
+        assert!(host.turn_rollback_fired.is_some());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
+            "before\n",
+            "an ambiguous failure must still undo earlier bounded edits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("shell-effect.txt")).unwrap(),
+            "side effect\n",
+            "unbounded shell effects remain outside file-journal rollback"
+        );
+        let events = boundary_events(session_id);
+        let aborted = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::ExecutionBoundaryAborted)
+            .expect("only the ambiguous failure should abort the turn boundary");
+        assert_eq!(
+            boundary_metadata(aborted)["trigger_tool_name"].as_str(),
+            Some("bash")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn turn_rollback_skips_later_requests_after_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -15134,6 +15629,7 @@ mod tests {
     #[test]
     fn test_merge_edge_tool_rounds() {
         let consumed = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
             args: serde_json::json!({"approved": true}),
@@ -15153,6 +15649,7 @@ mod tests {
 
         // deduplicates by request_id (host wins)
         let host = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
             args: serde_json::json!({"approved": true}),
@@ -15825,6 +16322,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                execution_completion: None,
                 request_id: "req-1".into(),
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "lib.rs"}),
@@ -15854,6 +16352,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                execution_completion: None,
                 request_id: "req-err".into(),
                 tool: "bash".into(),
                 args: serde_json::json!({"command": "rm -rf /"}),
@@ -15877,6 +16376,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                execution_completion: None,
                 request_id: "req-skip".into(),
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "lib.rs"}),
@@ -15905,6 +16405,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                execution_completion: None,
                 request_id: "req-invalid-git".into(),
                 tool: "git".into(),
                 args: serde_json::json!({"action": "diff", "path": "missing.rs"}),

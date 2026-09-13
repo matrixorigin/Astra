@@ -2,13 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use crate::guardrails::error_recovery::{
-    ErrorCategory, build_recovery_message_with_evidence, classify_error,
-};
+use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message_with_evidence};
 use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
-use crate::tool::result::semantics::is_resource_limit_output;
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint, epoch_ms,
@@ -22,7 +19,13 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadlessOutputEnrichSignal {
     ResourceLimitObserved { tool: String },
-    ResourceLimitDetectedInOutput { tool: String },
+}
+
+/// Whether the tool implementation ran for a returned terminal result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessExecutionDisposition {
+    Executed,
+    RejectedBeforeExecution,
 }
 
 /// Mutable state used while enriching one headless tool result.
@@ -40,6 +43,7 @@ pub struct HeadlessOutputEnrichRequest<'a> {
     pub source_error_kind: Option<ErrorCategory>,
     pub source_recovery_evidence: Option<&'a astra_core::ToolFailureEvidence>,
     pub tool_already_restricted: bool,
+    pub execution_disposition: HeadlessExecutionDisposition,
 }
 
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
@@ -55,23 +59,16 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         source_error_kind,
         source_recovery_evidence,
         tool_already_restricted,
+        execution_disposition,
     } = request;
     let mut resource_limit_recorded = false;
-    let is_typed_wait = serde_json::from_str::<Value>(result_str)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| status == "waiting")
-        })
-        .unwrap_or(false);
-
-    if *is_err && !tool_already_restricted && !is_typed_wait {
-        let category = source_error_kind.unwrap_or_else(|| classify_error(result_str));
+    if *is_err && !tool_already_restricted {
+        let category = source_error_kind.unwrap_or(ErrorCategory::Unknown);
 
         if matches!(category, ErrorCategory::ResourceLimit) {
-            ctx.turn_guard.health.record_resource_limit_failure(name);
+            if execution_disposition == HeadlessExecutionDisposition::Executed {
+                ctx.turn_guard.health.record_resource_limit_failure(name);
+            }
             ctx.turn_guard.errors.record_error(category);
             resource_limit_recorded = true;
             on_signal(HeadlessOutputEnrichSignal::ResourceLimitObserved {
@@ -94,37 +91,40 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         ctx.advisories.push(recovery_msg);
     }
 
-    if !*is_err && !tool_already_restricted && is_resource_limit_output(result_str) {
-        ctx.turn_guard.health.record_resource_limit_failure(name);
-        ctx.turn_guard
-            .errors
-            .record_error(ErrorCategory::ResourceLimit);
-        *is_err = true;
-        resource_limit_recorded = true;
-        on_signal(HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
-            tool: name.to_string(),
-        });
-    }
-
     resource_limit_recorded
 }
 
 /// Record result quality without rewriting the executor's result document.
+pub struct HeadlessResultQualityRequest<'a> {
+    pub name: &'a str,
+    pub result_str: &'a str,
+    pub source_error_kind: Option<ErrorCategory>,
+    pub execution_failed: bool,
+    pub execution_disposition: HeadlessExecutionDisposition,
+    pub resource_limit_recorded: bool,
+}
+
 pub fn append_headless_result_quality_feedback(
-    name: &str,
-    result_str: &str,
-    source_error_kind: Option<ErrorCategory>,
-    execution_failed: bool,
-    resource_limit_recorded: bool,
+    request: HeadlessResultQualityRequest<'_>,
     turn_guard: &mut TurnGuard,
     advisories: &mut Vec<String>,
 ) -> ResultQuality {
+    let HeadlessResultQualityRequest {
+        name,
+        result_str,
+        source_error_kind,
+        execution_failed,
+        execution_disposition,
+        resource_limit_recorded,
+    } = request;
     let result_quality = if resource_limit_recorded {
         ResultQuality::Error
+    } else if execution_disposition == HeadlessExecutionDisposition::RejectedBeforeExecution {
+        turn_guard.record_rejected_tool_result_with_kind(source_error_kind)
     } else if execution_failed {
-        turn_guard.record_failed_tool_result_with_kind(name, result_str, source_error_kind)
+        turn_guard.record_failed_tool_result_with_kind(name, source_error_kind)
     } else {
-        turn_guard.record_tool_result_with_kind(name, result_str, source_error_kind)
+        turn_guard.record_successful_tool_result_with_kind(name, result_str, source_error_kind)
     };
     // Execution errors already received classified recovery evidence in
     // `enrich_headless_tool_output_for_errors_and_limits`. Appending generic
@@ -308,9 +308,10 @@ mod tests {
                 name: "bash",
                 result_str: &mut out,
                 is_err: &mut is_err,
-                source_error_kind: None,
+                source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
             },
             &mut ctx,
             |s| signals.push(s),
@@ -341,9 +342,10 @@ mod tests {
                 name: "read_file",
                 result_str: &mut out,
                 is_err: &mut is_err,
-                source_error_kind: None,
+                source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
             },
             &mut ctx,
             |s| signals.push(s),
@@ -359,7 +361,50 @@ mod tests {
     }
 
     #[test]
-    fn enrich_resource_limit_in_output_flips_err() {
+    fn rejected_resource_failure_keeps_error_pressure_without_execution_health() {
+        let mut tg = TurnGuard::new();
+        let mut is_err = true;
+        let mut advisories = Vec::new();
+        let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "read_file",
+                result_str: "capacity unavailable before execution",
+                is_err: &mut is_err,
+                source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+            },
+            &mut HeadlessOutputEnrichCtx {
+                turn_guard: &mut tg,
+                advisories: &mut advisories,
+            },
+            |_| {},
+        );
+        let quality = append_headless_result_quality_feedback(
+            HeadlessResultQualityRequest {
+                name: "read_file",
+                result_str: "capacity unavailable before execution",
+                source_error_kind: Some(astra_core::ErrorKind::ResourceLimit),
+                execution_failed: true,
+                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+                resource_limit_recorded,
+            },
+            &mut tg,
+            &mut advisories,
+        );
+
+        assert_eq!(quality, ResultQuality::Error);
+        assert_eq!(tg.errors.total_errors, 1);
+        assert!(tg.health.get("read_file").is_none());
+        assert!(
+            !advisories.is_empty(),
+            "recovery guidance must be preserved"
+        );
+    }
+
+    #[test]
+    fn successful_output_text_cannot_create_a_resource_failure() {
         let mut tg = TurnGuard::new();
         let mut out = "fork: retry: Resource temporarily unavailable".to_string();
         let mut is_err = false;
@@ -376,18 +421,14 @@ mod tests {
                 source_error_kind: None,
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
             },
             &mut ctx,
             |s| signals.push(s),
         );
-        assert!(rec);
-        assert!(is_err);
-        assert_eq!(
-            signals,
-            vec![HeadlessOutputEnrichSignal::ResourceLimitDetectedInOutput {
-                tool: "bash".into()
-            }]
-        );
+        assert!(!rec);
+        assert!(!is_err);
+        assert!(signals.is_empty());
     }
 
     #[test]
@@ -412,6 +453,7 @@ mod tests {
                     source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
                     source_recovery_evidence: None,
                     tool_already_restricted: false,
+                    execution_disposition: HeadlessExecutionDisposition::Executed,
                 },
                 &mut HeadlessOutputEnrichCtx {
                     turn_guard: &mut turn_guard,
@@ -428,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_wait_remains_parseable_without_generic_failure_advice() {
+    fn successful_waiting_receipt_is_not_reinterpreted_as_failure() {
         let mut turn_guard = TurnGuard::new();
         let mut output = json!({
             "status": "waiting",
@@ -437,7 +479,7 @@ mod tests {
         })
         .to_string();
         let expected = output.clone();
-        let mut is_error = true;
+        let mut is_error = false;
         let mut context = HeadlessOutputEnrichCtx {
             turn_guard: &mut turn_guard,
             advisories: &mut Vec::new(),
@@ -451,16 +493,51 @@ mod tests {
                 source_error_kind: None,
                 source_recovery_evidence: None,
                 tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
             },
             &mut context,
-            |_| panic!("typed waiting is not a resource failure"),
+            |_| panic!("a typed success is not a resource failure"),
         );
 
         assert!(!resource_limit);
+        assert!(!is_error);
         assert_eq!(output, expected);
         assert_eq!(
             serde_json::from_str::<Value>(&output).unwrap()["status"],
             "waiting"
+        );
+    }
+
+    #[test]
+    fn failure_metadata_is_not_hidden_by_waiting_text() {
+        let mut turn_guard = TurnGuard::new();
+        let mut output = json!({"status": "waiting"}).to_string();
+        let mut is_error = true;
+        let mut advisories = Vec::new();
+
+        enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "agent",
+                result_str: &mut output,
+                is_err: &mut is_error,
+                source_error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
+            },
+            &mut HeadlessOutputEnrichCtx {
+                turn_guard: &mut turn_guard,
+                advisories: &mut advisories,
+            },
+            |_| panic!("ToolUnavailable is not ResourceLimit"),
+        );
+
+        assert!(is_error);
+        assert_eq!(advisories.len(), 1);
+        assert!(advisories[0].contains("not available"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap(),
+            json!({"status": "waiting"})
         );
     }
 
@@ -488,6 +565,7 @@ mod tests {
                 source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
                 source_recovery_evidence: Some(&evidence),
                 tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
             },
             &mut context,
             |_| {},
@@ -504,15 +582,45 @@ mod tests {
         let mut tg = TurnGuard::new();
         let out = "ok".to_string();
         let _q = append_headless_result_quality_feedback(
-            "bash",
-            &out,
-            None,
-            false,
-            false,
+            HeadlessResultQualityRequest {
+                name: "bash",
+                result_str: &out,
+                source_error_kind: None,
+                execution_failed: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
+                resource_limit_recorded: false,
+            },
             &mut tg,
             &mut Vec::new(),
         );
         assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn successful_execution_keeps_error_shaped_content_as_content() {
+        for out in [
+            "Error: this is a line from the inspected file".to_string(),
+            json!({"status": "failed", "content": "quoted log record"}).to_string(),
+        ] {
+            let mut tg = TurnGuard::new();
+            let quality = append_headless_result_quality_feedback(
+                HeadlessResultQualityRequest {
+                    name: "read_file",
+                    result_str: &out,
+                    source_error_kind: None,
+                    execution_failed: false,
+                    execution_disposition: HeadlessExecutionDisposition::Executed,
+                    resource_limit_recorded: false,
+                },
+                &mut tg,
+                &mut Vec::new(),
+            );
+            assert_eq!(
+                quality,
+                ResultQuality::Success,
+                "content was reclassified: {out}"
+            );
+        }
     }
 
     #[test]
@@ -528,11 +636,14 @@ mod tests {
         let original = out.clone();
 
         let quality = append_headless_result_quality_feedback(
-            "outline",
-            &out,
-            Some(astra_core::ErrorKind::ToolNotFound),
-            true,
-            false,
+            HeadlessResultQualityRequest {
+                name: "outline",
+                result_str: &out,
+                source_error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                execution_failed: true,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
+                resource_limit_recorded: false,
+            },
             &mut tg,
             &mut Vec::new(),
         );
@@ -546,6 +657,27 @@ mod tests {
             !out.contains("Use another tool only"),
             "classified recovery must not receive a second generic error instruction: {out}"
         );
+    }
+
+    #[test]
+    fn rejected_attempt_records_error_without_execution_health() {
+        let mut tg = TurnGuard::new();
+        let quality = append_headless_result_quality_feedback(
+            HeadlessResultQualityRequest {
+                name: "outline",
+                result_str: "unknown tool",
+                source_error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                execution_failed: true,
+                execution_disposition: HeadlessExecutionDisposition::RejectedBeforeExecution,
+                resource_limit_recorded: false,
+            },
+            &mut tg,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(quality, ResultQuality::Error);
+        assert_eq!(tg.errors.total_errors, 1);
+        assert!(tg.health.get("outline").is_none());
     }
 
     #[test]

@@ -111,7 +111,11 @@ impl WorkspaceObservationFacts {
             .flatten();
         let evidence = Evidence {
             ordinal,
-            invocation: record.invocation_completion.clone(),
+            invocation: record
+                .execution_completion
+                .as_ref()
+                .and_then(|reference| reference.as_invocation())
+                .cloned(),
         };
         let full_scope =
             super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record);
@@ -241,6 +245,72 @@ pub(crate) mod tests {
         executed_with_args(ledger, id, name, serde_json::json!({"command": command}))
     }
 
+    #[test]
+    fn task_resolution_recovered_workspace_proof_cannot_cross_later_writer() {
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let read = executed_with_args(
+            &mut ledger,
+            "read",
+            "list_dir",
+            serde_json::json!({"path": "/app"}),
+        );
+        let write = executed_with_args(
+            &mut ledger,
+            "write",
+            "write_file",
+            serde_json::json!({"path": "/app/artifact", "content": "changed"}),
+        );
+        let reference = read.execution_completion.clone().unwrap();
+        let records = vec![read, write];
+        let mut frontier = VerificationFrontier::default();
+        frontier.advance(Some("/app"), &[], &records).unwrap();
+        assert!(
+            !frontier
+                .task_resolution_workspace_evidence_is_current(
+                    Some("/app"),
+                    &[],
+                    &records,
+                    std::slice::from_ref(&reference)
+                )
+                .unwrap()
+        );
+        // Both policy scope and frontier ordinals must survive real recovery.
+        frontier = restore_from_ledger(&frontier, &records, &ledger);
+        let mut policy = crate::turn::runtime_policy::RuntimePolicyEvaluationState::default();
+        crate::turn::runtime_policy::evaluate_tool_boundary(
+            &mut policy,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &records,
+            2,
+        )
+        .unwrap();
+        let policy =
+            crate::turn::runtime_policy::RuntimePolicyEvaluationState::deserialize_continuation(
+                policy
+                    .serialize_continuation(serde_json::value::Serializer)
+                    .unwrap(),
+            )
+            .unwrap();
+        let workspace_refs = policy.task_resolution_workspace_evidence(&["read".into()]);
+        assert_eq!(workspace_refs, vec![reference]);
+        assert!(
+            !frontier
+                .task_resolution_workspace_evidence_is_current(
+                    Some("/app"),
+                    &[],
+                    &[],
+                    &workspace_refs
+                )
+                .unwrap()
+        );
+        assert!(
+            frontier
+                .task_resolution_workspace_evidence_is_current(Some("/app"), &[], &[], &[])
+                .unwrap(),
+            "external evidence does not acquire an implicit workspace obligation"
+        );
+    }
+
     fn executed_with_args(
         ledger: &mut astra_turn_core::invocation_ledger::InMemoryInvocationLedger,
         id: &str,
@@ -280,8 +350,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         ToolCallRecord {
-            invocation_completion: Some(
-                ToolInvocationCompletionRef::from_record(&terminal).unwrap(),
+            execution_completion: Some(
+                ToolInvocationCompletionRef::from_record(&terminal)
+                    .unwrap()
+                    .into(),
             ),
             runtime_args_full: Some(args.to_string()),
             ..record(name, true, "")
@@ -366,7 +438,7 @@ pub(crate) mod tests {
         let mut extra_rows = rows.clone();
         extra_rows.push(
             unrelated_ledger
-                .get(&unrelated.invocation_completion.unwrap().identity)
+                .get(unrelated.execution_completion.unwrap().identity())
                 .unwrap()
                 .clone(),
         );
@@ -741,7 +813,7 @@ pub(crate) mod tests {
             .iter()
             .map(|record| {
                 ledger
-                    .get(&record.invocation_completion.as_ref().unwrap().identity)
+                    .get(record.execution_completion.as_ref().unwrap().identity())
                     .unwrap()
                     .clone()
             })
@@ -1223,6 +1295,50 @@ impl VerificationFrontier {
         Ok(view.observation.is_satisfied())
     }
 
+    /// An assessment may interpret a different observer as satisfying a task,
+    /// but may not reuse a workspace observation across a later known writer.
+    /// External evidence has no implicit workspace-freshness requirement.
+    pub(crate) fn task_resolution_workspace_evidence_is_current(
+        &self,
+        workspace_root: Option<&str>,
+        hooks: &[StopHook],
+        records: &[ToolCallRecord],
+        workspace_evidence: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
+    ) -> Result<bool, VerificationRecoveryError> {
+        let mut view = self.clone();
+        view.advance(workspace_root, hooks, records)?;
+        let Some(barrier) = view.observation.barrier.as_ref() else {
+            return Ok(true);
+        };
+        let base = view.processed_through.saturating_sub(records.len() as u64);
+        for reference in workspace_evidence {
+            let ordinal = records
+                .iter()
+                .position(|record| record.execution_completion.as_ref() == Some(reference))
+                .map(|index| base + index as u64 + 1)
+                .or_else(|| {
+                    view.observation
+                        .proof
+                        .as_ref()
+                        .map(|proof| &proof.evidence)
+                        .into_iter()
+                        .chain(std::iter::once(barrier))
+                        .find(|evidence| {
+                            reference.as_invocation().is_some_and(|reference| {
+                                evidence.invocation.as_ref() == Some(reference)
+                            })
+                        })
+                        .map(|evidence| evidence.ordinal)
+                });
+            if ordinal.is_none_or(|ordinal| ordinal < barrier.ordinal) {
+                // A restored prefix must use retained bound ordinals, never
+                // the absence of a local record as evidence of freshness.
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn advance(
         &mut self,
         workspace_root: Option<&str>,
@@ -1268,7 +1384,11 @@ impl VerificationFrontier {
             }
             let evidence = Evidence {
                 ordinal: self.processed_through,
-                invocation: record.invocation_completion.clone(),
+                invocation: record
+                    .execution_completion
+                    .as_ref()
+                    .and_then(|reference| reference.as_invocation())
+                    .cloned(),
             };
             let mut verified = false;
             for (hook, proof) in self.contract.iter().zip(&mut self.proofs) {

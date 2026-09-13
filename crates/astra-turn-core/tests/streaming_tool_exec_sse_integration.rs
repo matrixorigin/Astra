@@ -53,6 +53,7 @@ impl SseStreamHost for SpeculatingHost {
         args: &Value,
     ) -> EdgeToolExecResult {
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -323,6 +324,7 @@ async fn complex_speculation_off_is_serial() {
             args: &Value,
         ) -> EdgeToolExecResult {
             EdgeToolExecResult {
+                execution_completion: None,
                 request_id: request_id.to_string(),
                 tool: tool.to_string(),
                 args: args.clone(),

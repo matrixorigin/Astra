@@ -452,6 +452,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // while the canonical catalog retains the full diagnostic contract.
         control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
         control_plane("reflect", ToolLoadPolicy::AlwaysLoad),
+        control_plane("submit_task_resolution", ToolLoadPolicy::Deferred),
         // Non-blocking status updates are still part of the user communication
         // path, so keep notify available with ask_user instead of requiring a
         // discovery round-trip.

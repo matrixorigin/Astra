@@ -167,20 +167,24 @@ fn write_file_existing_external_file_respects_expanded_sandbox_boundary() {
     std::fs::write(&target, "old\n").unwrap();
 
     let exe = ToolExecutor::new(&project);
-    let before_expand = exe.read_file(&serde_json::json!({
+    let before_expand = exe.read_file_with_metadata(&serde_json::json!({
         "path": target.to_string_lossy()
     }));
     assert!(
-        crate::sandbox_retry::is_sandbox_denied(&before_expand),
-        "{before_expand}"
+        before_expand.is_error
+            && crate::sandbox_retry::is_sandbox_denied_result(
+                &before_expand.output,
+                before_expand.metadata.as_ref()
+            ),
+        "{before_expand:?}"
     );
 
     exe.expand_sandbox_path(external).unwrap();
 
-    let read = exe.read_file(&serde_json::json!({
+    let read = exe.read_file_with_metadata(&serde_json::json!({
         "path": target.to_string_lossy()
     }));
-    assert!(read.contains("old"), "{read}");
+    assert!(!read.is_error && read.output.contains("old"), "{read:?}");
 
     let result = exe.write_file(&serde_json::json!({
         "path": target.to_string_lossy(),
@@ -221,6 +225,44 @@ async fn execute_with_metadata_sandbox_denial_is_structured_and_hides_wire_prefi
         fields.get("error_kind").and_then(serde_json::Value::as_str),
         Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
     );
+    assert_eq!(
+        fields
+            .get("disposition")
+            .and_then(serde_json::Value::as_str),
+        Some("rejected")
+    );
+    assert_eq!(
+        fields
+            .get("execution_started")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn per_path_edit_batch_sandbox_denial_preserves_authority_before_any_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("local.txt");
+    std::fs::write(&local, "before\n").unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    let outcome = exe.execute_with_metadata("str_replace", &serde_json::json!({"edits": [
+        {"path": "local.txt", "old_str": "before", "new_str": "after"},
+        {"path": "/var/astra-sandbox-test-nonexistent", "old_str": "before", "new_str": "after"}
+    ]})).await;
+    assert!(outcome.is_error);
+    assert!(
+        !outcome
+            .output
+            .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
+    );
+    let fields = outcome.tool_result_fields.unwrap();
+    assert_eq!(
+        fields["error_kind"],
+        crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND
+    );
+    assert_eq!(fields["disposition"], "rejected");
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(std::fs::read_to_string(local).unwrap(), "before\n");
 }
 
 #[tokio::test]

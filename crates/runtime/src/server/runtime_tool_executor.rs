@@ -52,6 +52,70 @@ const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TOOL_RESULT_ARTIFACT_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL: usize = 16;
 
+/// Normalize authenticated, durable Edge evidence without inferring execution
+/// from output text. Interrupted dispatches need affirmative execution evidence.
+fn edge_assessment_record(
+    record: &astra_services::session_journal::ToolCallRecord,
+    result: astra_thin_client::ToolResultRequest,
+) -> Result<
+    astra_services::session_journal::ToolCallRecord,
+    astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError,
+> {
+    use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+    use astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError;
+    let fields = result.tool_result_fields.as_ref();
+    let started = fields
+        .and_then(|fields| fields.get("execution_started"))
+        .and_then(Value::as_bool);
+    let (fallback, terminal_semantics) = match result.status.as_str() {
+        "completed" | "failed" | "partial_failure" => (ToolCallDisposition::Executed, None),
+        "timeout" | "cancelled" | "interrupted" => (
+            if started == Some(true) {
+                ToolCallDisposition::Executed
+            } else {
+                ToolCallDisposition::Rejected
+            },
+            Some(match result.status.as_str() {
+                "timeout" => "timed_out",
+                "cancelled" => "cancelled",
+                _ => "execution_error",
+            }),
+        ),
+        "denied" | "rejected" => return Err(AssessmentEvidenceError::NotExecutedFailure),
+        _ => return Err(AssessmentEvidenceError::LedgerMismatch),
+    };
+    Ok(ToolCallRecord {
+        tool_call_id: record.tool_call_id.clone(),
+        execution_completion: record.execution_completion.clone(),
+        round: record.round,
+        disposition: Some(ToolCallDisposition::from_execution_metadata(
+            fields.and_then(|fields| fields.get("disposition")),
+            started,
+            fallback,
+        )),
+        ok: result.status == "completed",
+        // Incomplete execution cannot inherit a claimed successful domain
+        // result. Keep its cause unknown rather than guessing from output.
+        result_class: if terminal_semantics.is_some() {
+            None
+        } else {
+            fields
+                .and_then(|fields| fields.get("result_class"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        },
+        exit_semantics: terminal_semantics
+            .or_else(|| {
+                fields
+                    .and_then(|fields| fields.get("exit_semantics"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned),
+        result_full: Some(result.output),
+        ..Default::default()
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemanticReadCacheActivation {
     DisabledNoCapabilities,
@@ -285,6 +349,28 @@ fn dispatch_control_for_invocation_error(
         RuntimeToolDispatchControl::FailedClosed {
             reason: error.to_string(),
         }
+    }
+}
+
+fn tool_invocation_decision_rejected_result(error: String) -> astra_tools::ToolResult {
+    astra_tools::ToolResult {
+        output: serde_json::json!({
+            "status": "failed",
+            "error": error,
+            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+            "retryable": false,
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "error_kind".to_string(),
+                serde_json::json!(astra_core::ErrorKind::ToolBinding.as_str()),
+            ),
+            ("disposition".to_string(), serde_json::json!("rejected")),
+            ("execution_started".to_string(), serde_json::json!(false)),
+        ])),
+        is_error: true,
+        exit_semantics: None,
     }
 }
 
@@ -1048,6 +1134,99 @@ impl RuntimeToolExecutor {
         ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
     ) {
         self.invocation_ledger = Some(ledger);
+    }
+
+    /// Resolve a bounded assessment through the same ledger that executed its
+    /// calls. Scope and boundary are supplied by the active completion window,
+    /// not taken from the proposal. Subject freshness remains a loop obligation.
+    pub(crate) fn task_resolution_evidence_available(&self) -> bool {
+        self.invocation_ledger.is_some()
+    }
+
+    pub(crate) async fn validate_task_resolution_evidence(
+        &self,
+        assessment: &astra_turn_types::task_resolution::TaskResolutionAssessment,
+        scope: &str,
+        boundary_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+        records: &[astra_services::session_journal::ToolCallRecord],
+    ) -> Result<(), astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError> {
+        use astra_turn_core::evaluation::task_resolution::{
+            AssessmentEvidenceError, AssessmentInvocationScope,
+            resolve_bound_assessment_invocations, validate_assessment_evidence,
+            validate_assessment_header,
+        };
+        use futures_util::{FutureExt, StreamExt, TryStreamExt};
+
+        validate_assessment_header(assessment, scope, boundary_id)?;
+        let requested: HashSet<_> = assessment
+            .failed_call_ids
+            .iter()
+            .chain(&assessment.evidence_call_ids)
+            .map(String::as_str)
+            .collect();
+        let mut selected = Vec::new();
+        for record in records.iter().filter(|record| {
+            record
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| requested.contains(id))
+        }) {
+            let reference = record
+                .execution_completion
+                .as_ref()
+                .ok_or(AssessmentEvidenceError::LedgerMismatch)?;
+            let identity = reference.identity();
+            // Check ownership BEFORE a store lookup, including the archive path.
+            if identity.user_id != self.user_id
+                || identity.session_id != self.session_id
+                || identity.run_id != run_id
+                || identity.turn_chain_id != turn_chain_id
+                || record.tool_call_id.as_deref() != Some(identity.invocation_id.as_str())
+            {
+                return Err(AssessmentEvidenceError::LedgerMismatch);
+            }
+            selected.push(record.clone());
+        }
+        let mut resolved = futures_util::stream::iter(selected.into_iter().enumerate())
+            .map(|(index, record)| async move {
+                use astra_turn_types::task_resolution::ToolExecutionEvidenceRef;
+                let reference = record.execution_completion.as_ref().ok_or(AssessmentEvidenceError::LedgerMismatch)?;
+                let normalized = match reference {
+                    ToolExecutionEvidenceRef::Invocation(reference) => {
+                        let ledger = self.invocation_ledger.as_ref().ok_or(AssessmentEvidenceError::LedgerUnavailable)?;
+                        let row = ledger.get(&reference.identity).await.map_err(|_| AssessmentEvidenceError::LedgerUnavailable)?
+                            .ok_or(AssessmentEvidenceError::UnavailableReference)?;
+                        resolve_bound_assessment_invocations(assessment, scope, boundary_id,
+                            AssessmentInvocationScope { user_id: &self.user_id, session_id: &self.session_id, run_id, turn_chain_id },
+                            std::slice::from_ref(&record), &[row])?
+                            .pop().ok_or(AssessmentEvidenceError::UnavailableReference)?
+                    }
+                    ToolExecutionEvidenceRef::EdgeDispatch(reference) => {
+                        let result = self.tool_execution_service.edge_completion_result(reference).await
+                            .map_err(|error| {
+                                tracing::warn!(%error, %run_id, "task assessment Edge evidence unavailable");
+                                AssessmentEvidenceError::LedgerUnavailable
+                            })?;
+                        edge_assessment_record(&record, result)?
+                    }
+                };
+                Ok::<_, AssessmentEvidenceError>((index, normalized))
+            }.boxed())
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
+        resolved.sort_by_key(|(index, _)| *index);
+        validate_assessment_evidence(
+            assessment,
+            scope,
+            boundary_id,
+            &resolved
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[cfg(test)]
@@ -2399,7 +2578,7 @@ impl RuntimeToolExecutor {
     }
 
     fn unknown_tool_error_result(&self, name: &str) -> astra_tools::ToolResult {
-        tool_result_from_output(
+        let mut result = tool_result_from_output(
             json!({
                 "status": "failed",
                 "error": format!(
@@ -2409,7 +2588,11 @@ impl RuntimeToolExecutor {
                 "retryable": false,
             })
             .to_string(),
-        )
+        );
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        metadata.insert("disposition".to_string(), json!("rejected"));
+        metadata.insert("execution_started".to_string(), json!(false));
+        result
     }
 
     fn capability_unavailable_error_result(
@@ -3029,6 +3212,9 @@ impl RuntimeToolExecutor {
         durable_dispatch_admission: Option<
             crate::server::tool_invocation_runtime::DurableDispatchAdmission,
         >,
+        task_resolution_authority: Option<
+            &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
+        >,
     ) -> GovernableRuntimeToolResult {
         let identity = match astra_turn_types::ToolInvocationIdentity::new(
             &self.user_id,
@@ -3053,6 +3239,9 @@ impl RuntimeToolExecutor {
         let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
+        request.policy.task_resolution_authority = task_resolution_authority
+            .and_then(|authority| authority.for_call(invocation_id))
+            .cloned();
         // This path owns the full durable admission/route state machine. Keep
         // that large future out of the caller future's inline state: server
         // SSE runs on a bounded Tokio worker stack, and embedding all route
@@ -3096,6 +3285,7 @@ impl RuntimeToolExecutor {
                 None,
                 Some(&grant),
                 Some(durable_dispatch_admission),
+                None,
             )
             .await;
         let governed = govern_runtime_tool_result(deferred.result, false);
@@ -3184,15 +3374,9 @@ impl RuntimeToolExecutor {
             ) {
                 Ok(decision) => decision,
                 Err(error) => {
-                    return GovernableRuntimeToolResult::completed(astra_tools::ToolResult::error(
-                        serde_json::json!({
-                            "status": "failed",
-                            "error": error.to_string(),
-                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
-                            "retryable": false,
-                        })
-                        .to_string(),
-                    ));
+                    return GovernableRuntimeToolResult::completed(
+                        tool_invocation_decision_rejected_result(error.to_string()),
+                    );
                 }
             };
             let fingerprint = match decision.fingerprint(&request.args) {
@@ -4058,6 +4242,7 @@ impl RuntimeToolExecutor {
                                 },
                             ),
                             expected_control_epoch: request.policy.expected_control_epoch,
+                            task_resolution_authority: request.policy.task_resolution_authority.as_ref(),
                         },
                         cancel_token,
                     )
@@ -4960,6 +5145,7 @@ mod tests {
                 &json!({"city": 42}),
                 None,
                 Some(&grant),
+                None,
                 None,
             )
             .await;
@@ -7838,6 +8024,254 @@ esac
     }
 
     #[test]
+    fn task_resolution_edge_terminal_status_preserves_execution_and_incomplete_evidence() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+        use astra_turn_core::evaluation::task_resolution::{
+            is_assessment_observation_candidate, validate_assessment_evidence,
+        };
+        use astra_turn_types::task_resolution::{
+            TaskResolutionAssessment, TaskResolutionConclusion,
+        };
+        let normalize = |id: &str, status: &str, fields: Value, round| {
+            edge_assessment_record(
+                &ToolCallRecord {
+                    tool_call_id: Some(id.into()),
+                    round: Some(round),
+                    ..Default::default()
+                },
+                astra_thin_client::ToolResultRequest::new_with_hash(
+                    astra_thin_client::ToolResultRequestParts {
+                        session_id: "session".into(),
+                        run_id: "run".into(),
+                        turn_chain_id: "chain".into(),
+                        request_id: id.into(),
+                        edge_agent_id: "edge".into(),
+                        status: status.into(),
+                        output: "Error: actual source content, not a status".into(),
+                        duration_ms: 1,
+                        tool_result_fields: fields.as_object().cloned(),
+                    },
+                ),
+            )
+        };
+        let assessment = TaskResolutionAssessment {
+            scope: "intent".into(),
+            boundary_id: "boundary".into(),
+            verification_target: "read target".into(),
+            failed_call_ids: vec!["failed".into()],
+            evidence_call_ids: vec!["later".into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "Later read supplies the target.".into(),
+            remaining_gaps: vec![],
+        };
+        let later = normalize("later", "completed", json!({}), 1).unwrap();
+        assert!(is_assessment_observation_candidate(&later));
+        for status in ["timeout", "cancelled", "interrupted"] {
+            let failed = normalize("failed", status, json!({"execution_started": true, "result_class": "success", "exit_semantics": "success"}), 0).unwrap();
+            assert_eq!(failed.disposition, Some(ToolCallDisposition::Executed));
+            assert!(!is_assessment_observation_candidate(&failed));
+            assert_eq!(
+                validate_assessment_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    &[failed, later.clone()]
+                ),
+                Ok(())
+            );
+            let explicitly_executed =
+                normalize("failed", status, json!({"disposition": "executed"}), 0).unwrap();
+            assert_eq!(
+                validate_assessment_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    &[explicitly_executed, later.clone()]
+                ),
+                Ok(())
+            );
+            for fields in [
+                json!({}),
+                json!({"execution_started": false}),
+                json!({"execution_started": false, "disposition": "executed"}),
+                json!({"execution_started": true, "disposition": "rejected"}),
+            ] {
+                let unproven = normalize("failed", status, fields, 0).unwrap();
+                assert_eq!(unproven.disposition, Some(ToolCallDisposition::Rejected));
+                assert!(
+                    validate_assessment_evidence(
+                        &assessment,
+                        "intent",
+                        "boundary",
+                        &[unproven, later.clone()]
+                    )
+                    .is_err()
+                );
+            }
+        }
+        for status in ["denied", "rejected", "unknown"] {
+            assert!(
+                normalize(
+                    "failed",
+                    status,
+                    json!({"execution_started": true, "disposition": "executed"}),
+                    0
+                )
+                .is_err()
+            );
+        }
+        for status in ["failed", "partial_failure"] {
+            let failed = normalize("failed", status, json!({}), 0).unwrap();
+            assert_eq!(
+                validate_assessment_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    &[failed, later.clone()]
+                ),
+                Ok(())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resolution_reads_shared_ledger_after_executor_recreation() {
+        use astra_services::session_journal::ToolCallRecord;
+        use astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError;
+        use astra_turn_types::task_resolution::{
+            TaskResolutionAssessment, TaskResolutionConclusion,
+        };
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationCompletionRef, ToolInvocationDecision,
+            ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationResultPayload,
+            ToolInvocationTerminalOutcome,
+        };
+        let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
+        let mut records = Vec::new();
+        for (id, ok) in [("failed", false), ("later", true)] {
+            let identity =
+                ToolInvocationIdentity::new("test-user", "test-session", "run", "chain", id)
+                    .unwrap();
+            let decision = ToolInvocationDecision::new(&json!({"allowed": true})).unwrap();
+            let fingerprint = ToolInvocationFingerprint::new(
+                DurableToolReference::built_in("bash", "v1").unwrap(),
+                &json!({"command": id}),
+                &decision.decision_id,
+            )
+            .unwrap();
+            ledger
+                .prepare(&identity, &fingerprint, &decision)
+                .await
+                .unwrap();
+            ledger.dispatch(&identity, "owner", None).await.unwrap();
+            let result = ToolInvocationResultPayload {
+                output: "direct result".into(),
+                metadata: Default::default(),
+                exit_semantics: None,
+            };
+            let outcome = if ok {
+                ToolInvocationTerminalOutcome::Succeeded { result }
+            } else {
+                ToolInvocationTerminalOutcome::Failed {
+                    result,
+                    error_kind: None,
+                    retryable: false,
+                }
+            };
+            let row = ledger.complete(&identity, "owner", &outcome).await.unwrap();
+            records.push(ToolCallRecord {
+                tool_call_id: Some(id.into()),
+                execution_completion: Some(
+                    ToolInvocationCompletionRef::from_record(&row)
+                        .unwrap()
+                        .into(),
+                ),
+                ..Default::default()
+            });
+        }
+        let assessment = TaskResolutionAssessment {
+            scope: "intent".into(),
+            boundary_id: "boundary".into(),
+            verification_target: "requested check".into(),
+            failed_call_ids: vec!["failed".into()],
+            evidence_call_ids: vec!["later".into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "Later direct evidence supports the requested check.".into(),
+            remaining_gaps: vec![],
+        };
+        let (mut executor, _dir) = test_executor();
+        assert_eq!(
+            executor
+                .validate_task_resolution_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    "run",
+                    "chain",
+                    &records
+                )
+                .await,
+            Err(AssessmentEvidenceError::LedgerUnavailable)
+        );
+        executor.set_invocation_ledger(ledger.clone());
+        assert_eq!(
+            executor
+                .validate_task_resolution_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    "run",
+                    "chain",
+                    &records
+                )
+                .await,
+            Ok(())
+        );
+        drop(executor);
+        let (mut resumed, _resumed_dir) = test_executor();
+        resumed.set_invocation_ledger(ledger);
+        assert_eq!(
+            resumed
+                .validate_task_resolution_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    "run",
+                    "chain",
+                    &records
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            resumed
+                .validate_task_resolution_evidence(
+                    &assessment,
+                    "intent",
+                    "boundary",
+                    "another-run",
+                    "chain",
+                    &records
+                )
+                .await,
+            Err(AssessmentEvidenceError::LedgerMismatch)
+        );
+        assert_eq!(
+            resumed
+                .validate_task_resolution_evidence(
+                    &assessment,
+                    "intent",
+                    "new-boundary",
+                    "run",
+                    "chain",
+                    &records
+                )
+                .await,
+            Err(AssessmentEvidenceError::WrongBoundary)
+        );
+    }
+
+    #[test]
     fn primary_work_handoff_never_confuses_unavailable_with_absent() {
         let (executor, _dir) = test_executor();
         assert!(matches!(
@@ -9123,6 +9557,13 @@ esac
             "{}",
             result.output
         );
+        let metadata = result.metadata.expect("typed rejection metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
     }
 
     #[tokio::test]

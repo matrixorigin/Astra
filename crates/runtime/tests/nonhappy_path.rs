@@ -225,18 +225,40 @@ mod turn_guard_integration {
         );
     }
 
-    /// Proves: diverse error types all get classified
+    /// Source categories remain distinct; absent source evidence remains unknown.
     #[test]
     fn error_classification_integration() {
         let mut guard = TurnGuard::new();
 
-        guard.record_tool_result("github", "Error: 401 Unauthorized");
-        guard.record_tool_result("bash", "Error: connection timed out");
-        guard.record_tool_result("read_file", "Error: no such file or directory");
+        for (tool, kind) in [
+            ("github", astra_core::ErrorKind::Auth),
+            ("bash", astra_core::ErrorKind::ToolTimeout),
+            ("read_file", astra_core::ErrorKind::ToolNotFound),
+        ] {
+            guard.record_failed_tool_result_with_kind(tool, Some(kind));
+            assert_eq!(guard.errors.errors_by_category.get(&kind), Some(&1));
+        }
 
         assert_eq!(guard.errors.total_errors, 3);
-        // All different categories tracked
-        assert!(guard.errors.errors_by_category.len() >= 3);
+        assert_eq!(guard.errors.errors_by_category.len(), 3);
+
+        let mut untyped = TurnGuard::new();
+        for message in [
+            "Error: 401 Unauthorized",
+            "Error: connection timed out",
+            "Error: no such file or directory",
+        ] {
+            untyped.record_tool_result("read_file", message);
+        }
+        assert_eq!(untyped.errors.total_errors, 3);
+        assert_eq!(untyped.errors.errors_by_category.len(), 1);
+        assert_eq!(
+            untyped
+                .errors
+                .errors_by_category
+                .get(&astra_core::ErrorKind::Unknown),
+            Some(&3)
+        );
     }
 
     /// Proves: cross-session health respects minimum call threshold

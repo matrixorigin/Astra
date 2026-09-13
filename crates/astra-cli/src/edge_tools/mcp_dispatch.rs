@@ -5,14 +5,35 @@
 
 use serde_json::Value;
 
-use super::ToolExecutor;
+use super::{ToolExecutionOutcome, ToolExecutor};
+
+fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecutionOutcome {
+    let mut fields = serde_json::Map::new();
+    if let Some(content) = result.structured_content {
+        fields.insert("mcp_structured_content".to_string(), content);
+    }
+    if let Some(metadata) = result.protocol_metadata {
+        fields.insert("mcp_protocol_metadata".to_string(), metadata);
+    }
+    ToolExecutionOutcome {
+        output: result.output,
+        is_error: result.is_error,
+        tool_result_fields: (!fields.is_empty()).then_some(fields),
+    }
+}
 
 impl ToolExecutor {
-    pub(super) async fn execute_mcp_tool(&self, mcp_name: &str, args: &Value) -> String {
+    pub(super) async fn execute_mcp_tool(
+        &self,
+        mcp_name: &str,
+        args: &Value,
+    ) -> ToolExecutionOutcome {
         let manager_arc = match self.mcp_runtime_snapshot("mcp_runtime_dispatch").manager {
             Some(m) => m.clone(),
             None => {
-                return format!("Error: MCP not available. Tool '{mcp_name}' cannot be executed.");
+                return ToolExecutionOutcome::error(format!(
+                    "Error: MCP not available. Tool '{mcp_name}' cannot be executed."
+                ));
             }
         };
 
@@ -23,14 +44,18 @@ impl ToolExecutor {
             let (srv, tool) = match mgr.find_tool_by_mcp_name(mcp_name) {
                 Some((s, t)) => (s.to_string(), t.to_string()),
                 None => {
-                    return format!(
+                    return ToolExecutionOutcome::error(format!(
                         "Error: MCP tool '{mcp_name}' not found on any connected server."
-                    );
+                    ));
                 }
             };
             let c = match mgr.get(&srv) {
                 Some(c) => c,
-                None => return format!("Error: MCP server '{srv}' not connected."),
+                None => {
+                    return ToolExecutionOutcome::error(format!(
+                        "Error: MCP server '{srv}' not connected."
+                    ));
+                }
             };
             (srv, tool, c)
         };
@@ -38,10 +63,10 @@ impl ToolExecutor {
         // Call tool (no lock held during await)
         match conn.call_tool(&original_name, args.clone()).await {
             Ok(result) => {
-                return crate::mcp_client::extract_result_text_with_limit(
+                return mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
                     &result,
                     crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
-                );
+                ));
             }
             Err(e) => {
                 eprintln!(
@@ -62,10 +87,10 @@ impl ToolExecutor {
                     );
                 }
                 Err(e) => {
-                    return format!(
+                    return ToolExecutionOutcome::error(format!(
                         "Error: MCP tool '{}' failed and reconnect to '{}' also failed: {e}",
                         original_name, server_name
-                    );
+                    ));
                 }
             }
         }
@@ -75,20 +100,24 @@ impl ToolExecutor {
             let mgr = manager_arc.read().await;
             match mgr.get(&server_name) {
                 Some(c) => c,
-                None => return format!("Error: MCP server '{server_name}' lost after reconnect."),
+                None => {
+                    return ToolExecutionOutcome::error(format!(
+                        "Error: MCP server '{server_name}' lost after reconnect."
+                    ));
+                }
             }
         };
 
         match conn.call_tool(&original_name, args.clone()).await {
-            Ok(result) => crate::mcp_client::extract_result_text_with_limit(
-                &result,
-                crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
-            ),
-            Err(e) => {
-                format!(
-                    "Error calling MCP tool '{original_name}' on server '{server_name}' after reconnect: {e}"
-                )
+            Ok(result) => {
+                mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
+                    &result,
+                    crate::mcp_client::MAX_RESULT_CONTENT_LENGTH,
+                ))
             }
+            Err(e) => ToolExecutionOutcome::error(format!(
+                "Error calling MCP tool '{original_name}' on server '{server_name}' after reconnect: {e}"
+            )),
         }
     }
 }
@@ -120,8 +149,9 @@ mod tests {
         let result = executor
             .execute_mcp_tool("mcp_test_tool", &serde_json::Value::Null)
             .await;
-        assert!(result.contains("MCP not available"));
-        assert!(result.contains("mcp_test_tool"));
+        assert!(result.is_error);
+        assert!(result.output.contains("MCP not available"));
+        assert!(result.output.contains("mcp_test_tool"));
     }
 
     // ── Error path: tool not found ────────────────────────────────────────
@@ -132,7 +162,27 @@ mod tests {
         let result = executor
             .execute_mcp_tool("mcp_nonexistent_tool", &serde_json::Value::Null)
             .await;
-        assert!(result.contains("not found on any connected server"));
-        assert!(result.contains("mcp_nonexistent_tool"));
+        assert!(result.is_error);
+        assert!(result.output.contains("not found on any connected server"));
+        assert!(result.output.contains("mcp_nonexistent_tool"));
+    }
+
+    #[test]
+    fn mcp_status_is_preserved_independently_of_result_text() {
+        let successful = super::mcp_result_to_tool_outcome(astra_mcp::McpToolCallResult {
+            output: "Error: this is successful server-provided content".to_string(),
+            structured_content: None,
+            protocol_metadata: None,
+            is_error: false,
+        });
+        assert!(!successful.is_error);
+
+        let failed = super::mcp_result_to_tool_outcome(astra_mcp::McpToolCallResult {
+            output: r#"{"status":"completed","data":"partial"}"#.to_string(),
+            structured_content: None,
+            protocol_metadata: None,
+            is_error: true,
+        });
+        assert!(failed.is_error);
     }
 }

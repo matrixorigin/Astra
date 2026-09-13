@@ -478,6 +478,7 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
 
 struct EdgeToolRun {
     output: String,
+    is_error: bool,
     error_kind: Option<astra_core::ErrorKind>,
     tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
@@ -486,6 +487,7 @@ impl EdgeToolRun {
     fn ok(output: String) -> Self {
         Self {
             output,
+            is_error: false,
             error_kind: None,
             tool_result_fields: None,
         }
@@ -494,6 +496,7 @@ impl EdgeToolRun {
     fn error(output: String) -> Self {
         Self {
             output,
+            is_error: true,
             error_kind: None,
             tool_result_fields: None,
         }
@@ -511,6 +514,7 @@ impl EdgeToolRun {
         }
         Self {
             output,
+            is_error: true,
             error_kind: Some(kind),
             tool_result_fields: Some(fields),
         }
@@ -527,6 +531,7 @@ impl EdgeToolRun {
         }
         Self {
             output,
+            is_error: true,
             error_kind: Some(evidence.kind),
             tool_result_fields: Some(fields),
         }
@@ -542,17 +547,14 @@ impl EdgeToolRun {
     }
 
     fn into_outcome(self) -> ToolExecutionOutcome {
-        if let Some(outcome) = sandbox_denied_outcome_from_output(&self.output) {
-            return outcome;
-        }
-
         let EdgeToolRun {
             output,
+            is_error,
             error_kind,
             tool_result_fields,
         } = self;
 
-        let mut outcome = if error_kind.is_some() || cli_tool_output_is_error(&output) {
+        let mut outcome = if is_error {
             ToolExecutionOutcome::error(output)
         } else {
             ToolExecutionOutcome::ok(output)
@@ -580,6 +582,7 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
     let result = astra_tools::cancelled_tool_result(name, execution_started);
     EdgeToolRun {
         output: result.output,
+        is_error: true,
         error_kind: Some(astra_core::ErrorKind::Cancelled),
         tool_result_fields: result.metadata,
     }
@@ -4834,10 +4837,8 @@ impl ToolExecutor {
         let (mut output, _) =
             astra_tools::credential_redaction::redact_credentials_for_display(&output);
         let embedded_work_observation = embedded_work_unit_observation(&output);
-        // Structural error propagation: `execute_raw` returns a plain String,
-        // discarding any structured error kind at the source. Recover it here
-        // so downstream `tool_work_surface_events` can route on `error_kind`
-        // metadata instead of re-deriving it from fragile string matching.
+        // Source status wins over result prose. Unmigrated String handlers
+        // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
             || !coordination_integrity_valid;
         // Owner metadata is the primary structured-writer fact. A whole-tree
@@ -4846,42 +4847,12 @@ impl ToolExecutor {
         // bounded scan even when a one-file write committed successfully.
         // No output prose or exit-zero result participates in this decision.
         let writer_applied = writer_applied_by_owner || writer_applied_by_fingerprint;
-        let mut tool_result_fields = if is_error {
-            // Preserve producer-owned lifecycle truth even when the tool's
-            // business result is an error. In particular, a shell can write
-            // part of a workspace before timing out or returning non-zero;
-            // dropping its executor-owned receipt would make the runtime
-            // believe that no mutation happened. Keep only typed evidence
-            // here; ordinary command metadata remains on the success path.
-            let mut fields = embedded_work_observation.map(|observation| {
-                let mut fields = serde_json::Map::new();
-                observation.insert_into(&mut fields);
-                fields
-            });
-            if let Some(producer_fields) = tool_result_fields {
-                const PRESERVED_ERROR_FIELDS: &[&str] = &[
-                    astra_tools::workspace_observation::OBSERVED_FIELD,
-                    astra_tools::workspace_observation::SCOPE_FIELD,
-                    astra_tools::workspace_observation::RECEIPT_FIELD,
-                    "workspace_mutation_partial",
-                    "workspace_mutation_partial_paths",
-                    "source_preimage",
-                ];
-                for key in PRESERVED_ERROR_FIELDS {
-                    if let Some(value) = producer_fields.get(*key) {
-                        fields
-                            .get_or_insert_with(serde_json::Map::new)
-                            .insert((*key).to_string(), value.clone());
-                    }
-                }
-            }
-            fields
-        } else {
-            if let Some(observation) = embedded_work_observation {
-                observation.insert_into(tool_result_fields.get_or_insert_with(Default::default));
-            }
-            tool_result_fields
-        };
+        // Execution failure does not erase the producer's execution facts.
+        // In particular, timeout and partial mutation remain independently
+        // observable. Do not reconstruct a second metadata schema here.
+        if let Some(observation) = embedded_work_observation {
+            observation.insert_into(tool_result_fields.get_or_insert_with(Default::default));
+        }
         if writer_applied {
             tool_result_fields
                 .get_or_insert_with(Default::default)
@@ -4949,8 +4920,7 @@ impl ToolExecutor {
             }
         }
         if is_error {
-            let kind = astra_core::classify_tool_output(&output);
-            EdgeToolRun::classified_error(output, kind)
+            EdgeToolRun::error(output)
         } else {
             EdgeToolRun::ok(output)
         }
@@ -4995,9 +4965,10 @@ impl ToolExecutor {
                 // exposes while still resolving MCP/skill-backed tools.
                 "tool_search" => self.tool_search(args),
                 "read_file" => {
-                    let (output, fields) = self.read_file_with_metadata(args);
-                    *tool_result_fields = fields;
-                    output
+                    let result = self.read_file_with_metadata(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
                 }
                 "write_file" => {
                     // delete=true routes to delete_file handler
@@ -5058,17 +5029,23 @@ impl ToolExecutor {
                 "str_replace" => {
                     let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
                         Ok(args) => args,
-                        Err(error) => return error,
+                        Err(error) => {
+                            *source_is_error = Some(true);
+                            return error;
+                        }
                     };
                     // edits array routes through the str_replace batch
                     // wrapper so both same-file and per-edit path batches
                     // share one contract.
                     if args.get("edits").and_then(Value::as_array).is_some() {
                         let result = self.str_replace_batch_result(&args);
+                        *source_is_error = Some(result.is_error);
                         *tool_result_fields = result.metadata.clone();
                         result.output
                     } else {
-                        let (output, applied) = self.str_replace_with_applied(&args);
+                        let (result, applied) = self.str_replace_with_applied(&args);
+                        *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata;
                         if applied {
                             tool_result_fields
                                 .get_or_insert_with(Default::default)
@@ -5077,7 +5054,7 @@ impl ToolExecutor {
                                     Value::Bool(true),
                                 );
                         }
-                        output
+                        result.output
                     }
                 }
                 "list_dir" => self.list_dir(args),
@@ -5092,6 +5069,7 @@ impl ToolExecutor {
                         args,
                     )
                     .await;
+                    *source_is_error = Some(result.is_error);
                     *tool_result_fields = result.metadata.clone();
                     result.output
                 }
@@ -5199,22 +5177,25 @@ impl ToolExecutor {
                     astra_tools::web_fetch::fetch_with_cache_scope(args, &cache_scope).await
                 }
                 "display_sixel" => {
-                    astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
-                        .await
-                        .output
+                    let result =
+                        astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                            .await;
+                    *source_is_error = Some(result.is_error);
+                    result.output
                 }
                 "run_script" => {
                     #[cfg(unix)]
                     {
                         let config = astra_tools::run_script::RunScriptConfig::default();
-                        astra_tools::run_script::handle_run_script_with_cancel(
+                        let result = astra_tools::run_script::handle_run_script_with_cancel(
                             args,
                             self,
                             config,
                             cancel_token,
                         )
-                        .await
-                        .output
+                        .await;
+                        *source_is_error = Some(result.is_error);
+                        result.output
                     }
                     #[cfg(not(unix))]
                     {
@@ -5379,7 +5360,9 @@ impl ToolExecutor {
                                         .get("input")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({}));
-                                    self.execute_chain(&chain, input).await
+                                    let outcome = self.execute_chain_outcome(&chain, input).await;
+                                    *source_is_error = Some(outcome.is_error);
+                                    outcome.output
                                 }
                                 Err(e) => format!("Error: Invalid chain format: {e}"),
                             }
@@ -5459,9 +5442,10 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    astra_tools::web_search::perform_web_search(args, &cache_scope)
-                        .await
-                        .output
+                    let result =
+                        astra_tools::web_search::perform_web_search(args, &cache_scope).await;
+                    *source_is_error = Some(result.is_error);
+                    result.output
                 }
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {
@@ -5510,7 +5494,10 @@ impl ToolExecutor {
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
-                    self.execute_mcp_tool(name, args).await
+                    let outcome = self.execute_mcp_tool(name, args).await;
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields.clone();
+                    outcome.output
                 }
                 _ => format!("Error: Tool '{name}' is not implemented by the CLI executor"),
             }
@@ -5518,7 +5505,10 @@ impl ToolExecutor {
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
         if name != "memory"
-            && !cli_tool_output_is_error(&output)
+            // Feedback must follow the executor's terminal fact, not prose
+            // that can contain error examples or conceal a failed execution.
+            // Legacy handlers without a typed outcome supply no success proof.
+            && *source_is_error == Some(false)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let producer_id = self
@@ -5557,29 +5547,42 @@ impl ToolExecutor {
         output
     }
 
-    /// Execute a multi-step ToolChain, forwarding each step to self.execute().
-    ///
-    /// Returns a JSON summary with per-step outputs and the final result.
-    /// Execution stops on the first error unless the step has a skip condition.
+    #[cfg(test)]
     pub fn execute_chain(
         &self,
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
+        let outcome = self.execute_chain_outcome(chain, input);
+        Box::pin(async move { outcome.await.output })
+    }
+
+    /// Execute a multi-step ToolChain, preserving each executor's outcome.
+    ///
+    /// Returns a JSON summary with per-step outputs and the final result.
+    /// Execution stops on the first error unless the step has a skip condition.
+    fn execute_chain_outcome(
+        &self,
+        chain: &astra_turn_core::tool_registry_chain::ToolChain,
+        input: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + '_>>
+    {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
 
         if let Err(error) = crate::tool_safety_guard::ToolSafetyGuard::check_chain(chain) {
             let chain_name = chain.name.clone();
             let steps_total = chain.steps.len();
             return Box::pin(async move {
-                serde_json::json!({
-                    "chain": chain_name,
-                    "steps_executed": 0,
-                    "steps_total": steps_total,
-                    "final_output": error,
-                    "steps": [],
-                })
-                .to_string()
+                ToolExecutionOutcome::error(
+                    serde_json::json!({
+                        "chain": chain_name,
+                        "steps_executed": 0,
+                        "steps_total": steps_total,
+                        "final_output": error,
+                        "steps": [],
+                    })
+                    .to_string(),
+                )
             });
         }
 
@@ -5603,6 +5606,7 @@ impl ToolExecutor {
             let mut ctx = ChainContext::new(input);
             let mut step_results = Vec::new();
             let mut rollback = None;
+            let mut failed = false;
 
             for (idx, step) in steps.iter().enumerate() {
                 if ctx.should_skip(step) {
@@ -5615,8 +5619,9 @@ impl ToolExecutor {
                 }
 
                 let resolved = resolve_args(&step.args, &ctx);
-                let output = self.execute(&step.tool, &resolved).await;
-                let is_err = cli_tool_output_is_error(&output);
+                let outcome = self.execute_with_metadata(&step.tool, &resolved).await;
+                let is_err = outcome.is_error;
+                let output = outcome.output;
 
                 ctx.record_step(
                     idx,
@@ -5634,6 +5639,7 @@ impl ToolExecutor {
                 }));
 
                 if is_err {
+                    failed = true;
                     if rollback_on_failure {
                         if let (
                             Some(file_checkpoint),
@@ -5721,7 +5727,11 @@ impl ToolExecutor {
             if let Some(rollback) = rollback {
                 result.insert("rollback".to_string(), rollback);
             }
-            Value::Object(result).to_string()
+            ToolExecutionOutcome {
+                output: Value::Object(result).to_string(),
+                tool_result_fields: None,
+                is_error: failed,
+            }
         })
     }
 
@@ -6587,6 +6597,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_file_dispatch_preserves_source_success_for_error_prefixed_content() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(
+            dir.path().join("message.txt"),
+            "Error: literal file content\n",
+        )
+        .unwrap();
+
+        let outcome = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "message.txt"}))
+            .await;
+
+        assert!(!outcome.is_error, "source status must win over body prose");
+        assert!(outcome.output.contains("Error: literal file content"));
+    }
+
+    #[tokio::test]
+    async fn read_file_dispatch_preserves_source_io_failure() {
+        use serde_json::Value;
+        let (_dir, executor) = temp_executor();
+
+        let outcome = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "missing.txt"}))
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(outcome.output.starts_with("Error:"));
+        let fields = outcome.tool_result_fields.as_ref();
+        assert_ne!(
+            fields
+                .and_then(|fields| fields.get("disposition"))
+                .and_then(Value::as_str),
+            Some("rejected"),
+            "an attempted read's I/O failure is not an admission rejection"
+        );
+        assert!(
+            fields.and_then(|fields| fields.get("error_kind")).is_none(),
+            "unknown I/O cause must not be guessed from its message"
+        );
+    }
+
     fn assert_typed_workspace_mutation_receipt(outcome: &super::ToolExecutionOutcome) {
         assert!(!outcome.is_error, "writer failed: {outcome:?}");
         let fields = outcome
@@ -6617,6 +6669,7 @@ mod tests {
     async fn structured_writer_receipts_do_not_depend_on_full_workspace_fingerprints() {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
+                task_resolution_authority: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
                 tool_call_id: Some(tool_call_id),
@@ -6803,6 +6856,7 @@ mod tests {
                     "content": content,
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),
                     tool_call_id: Some("call-external-noop"),
@@ -7101,6 +7155,37 @@ mod tests {
         );
         assert_eq!(fields["recovery_evidence"]["retryable"], false);
         assert_eq!(fields["work_state"], "unchanged");
+    }
+
+    #[test]
+    fn typed_edge_success_keeps_error_shaped_content_as_content() {
+        for content in [
+            "Error: this is a line read from a file".to_string(),
+            r#"{"status":"failed","error":"quoted log record"}"#.to_string(),
+            "SANDBOX_DENIED: this prefix came from file content".to_string(),
+        ] {
+            let outcome = super::EdgeToolRun::ok(content).into_outcome();
+            assert!(!outcome.is_error, "content was reclassified: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn failed_edge_execution_preserves_source_facts_without_reclassifying_them() {
+        use serde_json::json;
+        let fields = serde_json::Map::from_iter([
+            ("exit_code".into(), json!(124)),
+            ("exit_semantics".into(), json!("timed_out")),
+            ("disposition".into(), json!("executed")),
+            ("execution_started".into(), json!(true)),
+            ("workspace_mutation_partial".into(), json!(true)),
+        ]);
+        let outcome = super::EdgeToolRun::error(
+            "SANDBOX_DENIED: quoted subprocess failure, not a policy decision".into(),
+        )
+        .with_tool_result_fields(Some(fields.clone()))
+        .into_outcome();
+        assert!(outcome.is_error);
+        assert_eq!(outcome.tool_result_fields, Some(fields));
     }
 
     #[test]

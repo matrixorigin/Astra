@@ -232,6 +232,16 @@ impl ToolResult {
         self
     }
 
+    /// Mark a failed structured-writer result only when its owner knows the
+    /// invocation made no workspace mutation. Absence remains unknown; it is
+    /// not equivalent to `false`.
+    pub fn with_workspace_mutation_not_applied(mut self) -> Self {
+        self.metadata
+            .get_or_insert_with(Map::new)
+            .insert("workspace_mutation_applied".to_string(), Value::Bool(false));
+        self
+    }
+
     /// Mark the owner-side result of a complete-state writer whose exact
     /// requested target was already present.  This marker is intentionally
     /// local to the executor; the workspace-owning boundary must bind it to a

@@ -2758,14 +2758,14 @@ mod tests {
         )
         .unwrap();
         let journal = astra_services::session_journal::ToolCallRecord {
-            invocation_completion: Some(reference),
+            execution_completion: Some(reference.into()),
             ..Default::default()
         };
         let encoded = serde_json::to_value(&journal).unwrap();
-        assert!(encoded.get("invocation_completion").is_none());
+        assert!(encoded.get("execution_completion").is_none());
         let restored: astra_services::session_journal::ToolCallRecord =
             serde_json::from_value(encoded).unwrap();
-        assert!(restored.invocation_completion.is_none());
+        assert!(restored.execution_completion.is_none());
     }
 
     #[tokio::test]

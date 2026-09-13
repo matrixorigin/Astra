@@ -87,9 +87,9 @@ pub(crate) struct HeadlessResolvedExecution {
     args: Value,
     result_str: String,
     tool_result_fields: Option<Map<String, Value>>,
-    /// Authoritative outcome from a typed runtime or Edge result. Only local
-    /// tools without a typed boundary leave this unset for domain-specific
-    /// output classification.
+    /// Authoritative outcome from a typed runtime or Edge result. An unset
+    /// outcome stays unknown and fails closed; display output is never used to
+    /// manufacture execution status.
     authoritative_is_error: Option<bool>,
     pending_runtime_completion:
         Option<crate::server::runtime_tool_executor::PendingRuntimeToolCompletion>,
@@ -387,6 +387,8 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub current_turn_chain_id: Option<&'a str>,
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub task_resolution_authority:
+        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub tool_calls: &'a [Value],
     /// Schema-addressed deferred selection proof for a specific provider call.
     /// It bypasses only wire-schema visibility; every execution policy below
@@ -1063,6 +1065,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let run_id = self.ctx.current_run_id;
         let turn_chain_id = self.ctx.current_turn_chain_id;
         let durable_dispatch_admission = self.ctx.durable_dispatch_admission;
+        let task_resolution_authority = self.ctx.task_resolution_authority;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
 
@@ -1108,6 +1111,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     run_id,
                     turn_chain_id,
                     durable_dispatch_admission,
+                    task_resolution_authority,
                     provider_policy.as_ref(),
                     permission_grant.as_ref(),
                     session_turn,
@@ -1373,6 +1377,7 @@ mod tests {
                 api: ThinClient::new("http://127.0.0.1:1", None).unwrap(),
                 tool_calls: Vec::new(),
                 edge_tool_round: vec![EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: String::new(),
                     tool: "grep".to_string(),
                     args: json!({ "pattern": "headless" }),
@@ -1485,6 +1490,7 @@ mod tests {
                     current_turn_chain_id: has_runtime_executor
                         .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
+                    task_resolution_authority: None,
                     tool_calls: &self.tool_calls,
                     deferred_activations_by_call_id: &self.deferred_activations_by_call_id,
                     runtime_control_calls_by_id: &self.runtime_control_calls_by_id,
@@ -1881,6 +1887,7 @@ mod tests {
     async fn concurrent_batch_records_tool_starts_before_terminal_events() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.push(EdgeToolExecResult {
+            execution_completion: None,
             request_id: String::new(),
             tool: "grep".to_string(),
             args: json!({ "pattern": "pipeline" }),
@@ -2125,6 +2132,7 @@ mod tests {
     async fn server_owned_tool_rejects_edge_result_without_server_reroute() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0] = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-notify".to_string(),
             tool: "notify".to_string(),
             args: json!({ "message": "server-owned status" }),
@@ -3110,6 +3118,7 @@ mod tests {
         let mut harness = PipelineHarness::new();
         begin_recorded_turn(&mut harness, 3);
         let writer = |id: &str| EdgeToolExecResult {
+            execution_completion: None,
             request_id: id.to_string(),
             tool: "write_file".to_string(),
             args: json!({"path": "src/output.txt", "content": "same bytes"}),
@@ -3233,6 +3242,61 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("cancelled_tool"))
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_route_rejection_keeps_runtime_terminal_owner() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        harness.tool_calls = vec![json!({
+            "id": "call-task-resolution-rejected",
+            "type": "function",
+            "function": {
+                "name": "submit_task_resolution",
+                "arguments": serde_json::to_string(&json!({
+                    "verification_target": "artifact",
+                    "failed_call_ids": ["failed-call"],
+                    "evidence_call_ids": [],
+                    "conclusion": "unknown",
+                    "rationale": "No active authority",
+                    "remaining_gaps": ["verify artifact"]
+                }))
+                .unwrap()
+            }
+        })];
+        harness.runtime_control_calls_by_id.insert(
+            "call-task-resolution-rejected".to_string(),
+            RuntimeControlInvocationKind::OutcomeReconciliation,
+        );
+        begin_recorded_turn(&mut harness, 1);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), "test-session");
+        let shared_ids = {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+            pipeline
+                .run_slot_with_control(HeadlessRoundToolIdx::ServerToolCall(0))
+                .await;
+            pipeline.into_shared_loop_terminal_call_ids()
+        };
+
+        assert!(
+            !shared_ids.contains("call-task-resolution-rejected"),
+            "a handler rejection after runtime route establishment must not mint a shared-loop terminal"
+        );
+        let record = harness.tool_call_records.last().expect("rejection record");
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        );
+        assert!(
+            record
+                .result_full
+                .as_deref()
+                .is_some_and(|result| result.contains("No active reconciliation authority")),
+            "the valid call must reach the runtime handler before rejection: {record:?}"
+        );
+        assert!(!record.was_executed());
     }
 
     #[tokio::test]
@@ -3616,11 +3680,17 @@ mod tests {
             .tool_call_records
             .first()
             .expect("tool record should be present");
-        assert_eq!(record.invocation_completion.as_ref(), Some(&completion_ref));
+        assert_eq!(
+            record
+                .execution_completion
+                .as_ref()
+                .and_then(|reference| reference.as_invocation()),
+            Some(&completion_ref)
+        );
         assert!(
             serde_json::to_value(record)
                 .unwrap()
-                .get("invocation_completion")
+                .get("execution_completion")
                 .is_none()
         );
         assert!(
@@ -3678,7 +3748,10 @@ mod tests {
         replay_pipeline.record_execution(replayed).await;
         let replay_record = replay_pipeline.ctx.tool_call_records.last().unwrap();
         assert_eq!(
-            replay_record.invocation_completion.as_ref(),
+            replay_record
+                .execution_completion
+                .as_ref()
+                .and_then(|reference| reference.as_invocation()),
             Some(&completion_ref)
         );
         assert!(
@@ -4066,7 +4139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_failed_edge_status_overrides_success_looking_output() {
+    async fn failed_edge_status_remains_authoritative_over_success_looking_output() {
         let mut harness = PipelineHarness::new();
         let args = json!({
             "path": "src/lib.rs",
@@ -4075,10 +4148,9 @@ mod tests {
         });
         harness.edge_tool_round[0].tool = "str_replace".to_string();
         harness.edge_tool_round[0].args = args;
-        harness.edge_tool_round[0].output = format!(
-            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>\n{}",
-            astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL
-        );
+        harness.edge_tool_round[0].output =
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>"
+                .to_string();
         harness.edge_tool_round[0].status = "failed".to_string();
         let mut fields = edge_runtime_environment_fields();
         fields.insert("status".to_string(), Value::String("failed".to_string()));
@@ -5288,6 +5360,36 @@ mod tests {
             executed.is_err,
             "server executor should return error for unknown tool"
         );
+        let fields = executed
+            .execution
+            .tool_result_fields
+            .as_ref()
+            .expect("unknown tool rejection metadata");
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str()),
+            "result={:?}, fields={fields:?}, authoritative_is_error={:?}, parsed_error_kind={:?}",
+            executed.execution.result_str,
+            executed.execution.authoritative_is_error,
+            executed.error_kind,
+        );
+        assert_eq!(
+            fields.get("disposition").and_then(Value::as_str),
+            Some("rejected"),
+            "result={:?}, fields={fields:?}, authoritative_is_error={:?}, parsed_error_kind={:?}",
+            executed.execution.result_str,
+            executed.execution.authoritative_is_error,
+            executed.error_kind,
+        );
+        assert_eq!(
+            fields.get("execution_started").and_then(Value::as_bool),
+            Some(false),
+            "result={:?}, fields={fields:?}, authoritative_is_error={:?}, parsed_error_kind={:?}",
+            executed.execution.result_str,
+            executed.execution.authoritative_is_error,
+            executed.error_kind,
+        );
+        assert_eq!(pipeline.ctx.turn_guard.errors.total_errors, 1);
 
         pipeline.record_execution(executed).await;
 
@@ -5303,6 +5405,51 @@ mod tests {
             .expect("unavailable execution must still be journaled");
         assert!(!record.ok);
         assert!(record.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn executed_read_file_io_failure_remains_execution_health() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("read_file".to_string());
+        configure_server_read_file(
+            &mut harness,
+            "call-missing-file",
+            "missing-file-that-does-not-exist.txt",
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected valid read_file call"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted read_file call"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.is_err, "missing file must be an I/O failure");
+        assert_ne!(
+            executed
+                .execution
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("disposition"))
+                .and_then(Value::as_str),
+            Some("rejected"),
+            "an attempted file read must not be reclassified as admission rejection"
+        );
+        pipeline.record_execution(executed).await;
+
+        let health = pipeline
+            .ctx
+            .turn_guard
+            .health
+            .get("read_file")
+            .expect("executed I/O failure must remain in tool health");
+        assert_eq!(health.total_calls, 1);
+        assert_eq!(health.total_failures, 1);
     }
 
     #[tokio::test]
@@ -5376,6 +5523,7 @@ mod tests {
             }
         }));
         harness.edge_tool_round = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-agent-fanout-1".to_string(),
             tool: "agent_fanout".to_string(),
             args: edge_args,
@@ -5576,7 +5724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_populates_outcome_cache_under_canonical_signature() {
+    async fn unbound_server_tool_rejection_does_not_pollute_outcome_cache() {
         let mut harness = PipelineHarness::new();
         let missing_tool = "definitely_missing_server_tool";
         harness.valid_tool_names.insert(missing_tool.to_string());
@@ -5603,25 +5751,37 @@ mod tests {
             &executed.execution.name,
             &executed.execution.args,
         );
-        let outcome = pipeline
-            .ctx
-            .turn_guard
-            .health
-            .recent_outcome(&sig)
-            .expect("outcome cache should have an entry for the executed signature");
         assert!(
-            !outcome.success,
-            "unknown-tool error path should record a failure outcome"
+            pipeline
+                .ctx
+                .turn_guard
+                .health
+                .recent_outcome(&sig)
+                .is_none(),
+            "rejected work that never reached an executor is not execution-health evidence"
         );
-        assert_eq!(
+        assert!(
             pipeline
                 .ctx
                 .turn_guard
                 .health
                 .outcome_history(&sig)
-                .unwrap()
-                .len(),
-            1
+                .is_none(),
+            "pre-execution rejection must not create a signature outcome history"
+        );
+        assert_eq!(executed.execution.authoritative_is_error, Some(true));
+        let fields = executed
+            .execution
+            .tool_result_fields
+            .as_ref()
+            .expect("rejection metadata");
+        assert_eq!(
+            fields.get("disposition").and_then(Value::as_str),
+            Some("rejected")
+        );
+        assert_eq!(
+            fields.get("execution_started").and_then(Value::as_bool),
+            Some(false)
         );
     }
 
@@ -6047,6 +6207,7 @@ mod tests {
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
         harness.edge_tool_round = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-agent-1".to_string(),
             tool: "agent".to_string(),
             args: args.clone(),
@@ -6242,6 +6403,8 @@ mod tests {
                 .get("grep")
                 .map(|h| h.total_calls)
                 .unwrap_or(0);
+            // This is an attempt counter: a typed pre-execution rejection
+            // still records the tool-call attempt that reached the executor.
             (
                 pipeline.executed_this_turn,
                 after_outline_calls.saturating_sub(before_outline_calls),
@@ -6297,7 +6460,7 @@ mod tests {
         assert_eq!(memory_guided.1, 0);
         assert!(
             memory_guided.0 < blind_retry.0,
-            "memory-guided recovery should use fewer actual tool executions: blind={:?}, memory={:?}",
+            "memory-guided recovery should use fewer tool-call attempts: blind={:?}, memory={:?}",
             blind_retry,
             memory_guided
         );

@@ -18,6 +18,8 @@ use crate::orchestration::agent_result_wire::{
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::{Value, json};
 
+pub mod task_resolution;
+
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSignal {
@@ -962,9 +964,10 @@ fn fallback_tool_outcome_identity(record: &ToolCallRecord) -> Option<String> {
 fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
     let args = record.authoritative_args_full().unwrap_or("").trim();
     if !args.is_empty() {
-        if let Some(prefix) = normalize_validation_prefix(&record.name, args) {
-            return Some(format!("validation::{prefix}"));
-        }
+        // A validation command prefix is only a recognition hint: it drops
+        // working directories and other arguments that distinguish targets.
+        // Without an authoritative target binding, preserve the full request
+        // identity rather than clearing an unrelated verification failure.
         return Some(format!(
             "tool::{}::args::{}",
             record.name,
@@ -1003,7 +1006,28 @@ fn unresolved_tool_outcome_failure_counts(
 fn unresolved_tool_outcome_fact_counts(
     facts: &[ToolEvaluationFact],
 ) -> std::collections::BTreeMap<String, usize> {
-    let mut unresolved_by_key = std::collections::BTreeMap::<EvaluationOutcomeKey, String>::new();
+    let mut counts = std::collections::BTreeMap::new();
+    for failure in unresolved_tool_outcome_facts(facts).values() {
+        *counts.entry(failure.result_class.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// The last unresolved execution for an operation in the supplied fact window.
+/// Indices are window-local; they confer no durable invocation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedToolOutcome {
+    pub fact_index: usize,
+    pub result_class: String,
+    pub invocation: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+}
+
+/// Shared source for both failure counts and precise reconciliation coverage.
+/// Opaque failures remain in this result and never match a later success.
+pub fn unresolved_tool_outcome_facts(
+    facts: &[ToolEvaluationFact],
+) -> std::collections::BTreeMap<EvaluationOutcomeKey, UnresolvedToolOutcome> {
+    let mut unresolved_by_key = std::collections::BTreeMap::new();
 
     for (record_index, record) in facts.iter().enumerate() {
         let disposition = record.disposition;
@@ -1042,7 +1066,14 @@ fn unresolved_tool_outcome_fact_counts(
                 .effective_result_class
                 .clone()
                 .unwrap_or_else(|| "tool_failure".to_string());
-            unresolved_by_key.insert(key, class);
+            unresolved_by_key.insert(
+                key,
+                UnresolvedToolOutcome {
+                    fact_index: record_index,
+                    result_class: class,
+                    invocation: record.execution_completion.clone(),
+                },
+            );
             continue;
         }
 
@@ -1057,23 +1088,23 @@ fn unresolved_tool_outcome_fact_counts(
         let Some(class) = &record.effective_result_class else {
             continue;
         };
-        let Some(identity) = record.operation_identity else {
-            continue;
-        };
-        let key = EvaluationOutcomeKey::Stable(identity);
+        let key = record.outcome_key(record_index);
 
         if result_class_is_outcome_failure(class) {
-            unresolved_by_key.insert(key, class.clone());
+            unresolved_by_key.insert(
+                key,
+                UnresolvedToolOutcome {
+                    fact_index: record_index,
+                    result_class: class.clone(),
+                    invocation: record.execution_completion.clone(),
+                },
+            );
         } else if result_class_resolves_outcome_failure(class) {
             unresolved_by_key.remove(&key);
         }
     }
 
-    let mut counts = std::collections::BTreeMap::new();
-    for class in unresolved_by_key.values() {
-        *counts.entry(class.clone()).or_insert(0) += 1;
-    }
-    counts
+    unresolved_by_key
 }
 
 /// Return the canonical operation identity used by the terminal outcome
@@ -1555,6 +1586,14 @@ pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
 #[serde(deny_unknown_fields)]
 pub struct ToolEvaluationFact {
     tool_name: String,
+    /// Exact terminal execution provenance, retained through the bounded
+    /// policy window. Absence never authorizes a guessed recovery reference.
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+    /// Runtime-owned workspace observer classification. Kept with the fact so
+    /// recovery need not infer scope from a tool name or a command preview.
+    workspace_observation_candidate: bool,
+    assessment_observation_candidate: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     operation_identity: Option<EvaluationIdentity>,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
@@ -1617,6 +1656,10 @@ impl EvaluationIdentity {
 }
 
 impl ToolEvaluationFact {
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         let class = self.effective_result_class.as_deref().unwrap_or("");
         let resolves = result_class_resolves_outcome_failure(class);
@@ -1633,6 +1676,11 @@ impl ToolEvaluationFact {
         let args = record.authoritative_args_full().unwrap_or("");
         Self {
             tool_name: record.name.clone(),
+            execution_completion: record.execution_completion.clone(),
+            workspace_observation_candidate: false,
+            assessment_observation_candidate: task_resolution::is_assessment_observation_candidate(
+                record,
+            ),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
             effective_result_class: effective_tool_result_class(record),
@@ -1657,6 +1705,26 @@ impl ToolEvaluationFact {
 
     pub fn was_executed(&self) -> bool {
         self.disposition == astra_services::session_journal::ToolCallDisposition::Executed
+    }
+
+    pub fn execution_completion(
+        &self,
+    ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
+        self.execution_completion.as_ref()
+    }
+
+    pub fn with_workspace_observation_candidate(mut self, observed: bool) -> Self {
+        self.workspace_observation_candidate = observed;
+        self
+    }
+
+    /// This is an observation-scope fact, not a successful verifier receipt.
+    pub fn is_workspace_observation_candidate(&self) -> bool {
+        self.workspace_observation_candidate
+    }
+
+    pub fn is_assessment_observation_candidate(&self) -> bool {
+        self.assessment_observation_candidate
     }
 
     fn outcome_key(&self, index: usize) -> EvaluationOutcomeKey {
@@ -3655,6 +3723,41 @@ mod tests {
     }
 
     #[test]
+    fn validation_recovery_does_not_cross_working_directories() {
+        for (failed_args, success_args) in [
+            (
+                serde_json::json!({"command": "cd a && cargo test"}),
+                serde_json::json!({"command": "cd b && cargo test"}),
+            ),
+            (
+                serde_json::json!({"command": "cargo test", "working_dir": "a"}),
+                serde_json::json!({"command": "cargo test", "working_dir": "b"}),
+            ),
+        ] {
+            let mut failed = journal_ok_call("bash");
+            failed.ok = false;
+            failed.result_class = Some("test_failure".into());
+            failed.args_full = Some(failed_args.to_string());
+            let mut success = journal_ok_call("bash");
+            success.args_full = Some(success_args.to_string());
+            success.result_class = Some("success".into());
+            let mut matching_success = success.clone();
+            matching_success.args_full = failed.args_full.clone();
+            let records = [failed.clone(), success];
+            assert_eq!(count_unresolved_tool_outcome_failures(&records), 1);
+            assert_eq!(active_execution_failure_operation_keys(&records).len(), 1);
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(&[failed.clone(), matching_success.clone()]),
+                0,
+                "an exact retry at the original target must still resolve its failure"
+            );
+            assert!(
+                active_execution_failure_operation_keys(&[failed, matching_success]).is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn rejected_operation_identity_is_cleared_by_canonical_success() {
         let mut rejected = journal_ok_call("bash");
         rejected.ok = false;
@@ -4424,7 +4527,50 @@ mod tests {
     }
 
     #[test]
-    fn later_matching_success_resolves_tool_outcome_failure() {
+    fn unresolved_outcome_coverage_keeps_typed_failure_and_latest_index() {
+        let mut failed = journal_ok_call("bash");
+        failed.args_full = Some(serde_json::json!({"command": "verify artifact"}).to_string());
+        failed.result_class = Some("test_failure".into());
+        failed.exit_semantics = Some("domain_negative".into());
+        let facts = vec![ToolEvaluationFact::from_record(&failed); 2];
+        let unresolved = unresolved_tool_outcome_facts(&facts);
+        assert_eq!(unresolved.len(), 1);
+        let entry = unresolved.values().next().unwrap();
+        assert_eq!(entry.fact_index, 1);
+        assert_eq!(entry.result_class, "test_failure");
+        assert_eq!(
+            unresolved_tool_outcome_fact_counts(&facts)["test_failure"],
+            1
+        );
+
+        let mut passed = failed;
+        passed.result_class = Some("success".into());
+        passed.exit_semantics = Some("success".into());
+        let mut recovered = facts;
+        recovered.push(ToolEvaluationFact::from_record(&passed));
+        assert!(unresolved_tool_outcome_facts(&recovered).is_empty());
+
+        let mut opaque = journal_ok_call("bash");
+        opaque.args_full = None;
+        opaque.args_preview = None;
+        opaque.tool_call_id = None;
+        opaque.result_class = Some("test_failure".into());
+        opaque.exit_semantics = Some("domain_negative".into());
+        let facts = vec![ToolEvaluationFact::from_record(&opaque)];
+        let unresolved = unresolved_tool_outcome_facts(&facts);
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "missing identity must not erase a typed failure"
+        );
+        assert!(matches!(
+            unresolved.keys().next(),
+            Some(EvaluationOutcomeKey::Opaque { .. })
+        ));
+    }
+
+    #[test]
+    fn changed_verification_command_preserves_raw_failure_without_task_assessment() {
         let mut failed = journal_ok_call("bash");
         failed.args_full = Some(
             serde_json::json!({"command": "cargo test -p astra-runtime | tail -20"}).to_string(),
@@ -4447,10 +4593,11 @@ mod tests {
             0.2,
         );
 
-        assert!(eval.success, "{eval:?}");
+        // The task-resolution layer can assess this alternate verification.
+        // Raw execution accounting must not guess equivalence from a pipeline.
+        assert!(!eval.success, "{eval:?}");
         assert!(
-            !eval
-                .signals
+            eval.signals
                 .iter()
                 .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailure { .. }))
         );

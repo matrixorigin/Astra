@@ -9,6 +9,31 @@ use thiserror::Error;
 use crate::tool::args::shape::canonicalize_tool_call_for_execution;
 use crate::tool::categories::is_file_mutation_tool;
 
+/// A tool result already resolved by an upstream runtime interceptor.
+/// Execution status is carried with the result instead of reconstructed from
+/// its model-facing content later in the request pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessPreResolvedToolResult {
+    pub call_id: String,
+    pub content: String,
+    pub status: crate::tool_result_semantics::ToolResultStatus,
+}
+
+impl HeadlessPreResolvedToolResult {
+    #[must_use]
+    pub fn new(
+        call_id: impl Into<String>,
+        content: impl Into<String>,
+        status: crate::tool_result_semantics::ToolResultStatus,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            content: content.into(),
+            status,
+        }
+    }
+}
+
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadlessRoundToolIdx {
@@ -269,7 +294,12 @@ pub fn headless_openai_duplicate_within_turn_pair(
     tool_call_id: &str,
     tool_name: &str,
 ) -> (Value, Value) {
-    openai_tool_roundtrip_values(tool_call_id, tool_name, HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
+    openai_tool_roundtrip_values(
+        tool_call_id,
+        tool_name,
+        HEADLESS_DUPLICATE_WITHIN_TURN_BODY,
+        crate::tool_result_semantics::ToolResultStatus::Skipped,
+    )
 }
 
 #[must_use]
@@ -277,9 +307,10 @@ pub fn headless_idempotency_hit_openai_pair(
     tool_call_id: &str,
     tool_name: &str,
     cached_output: &str,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
     let body = idempotency_cache_hit_message(cached_output);
-    openai_tool_roundtrip_values(tool_call_id, tool_name, body.as_str())
+    openai_tool_roundtrip_values(tool_call_id, tool_name, body.as_str(), status)
 }
 
 #[must_use]
@@ -289,7 +320,12 @@ pub fn headless_unknown_local_tool_openai_pair(
     valid_tool_names: &HashSet<String>,
 ) -> (Value, Value) {
     let err = unknown_local_tool_error_message(tool_name, valid_tool_names);
-    openai_tool_roundtrip_values(tool_call_id, tool_name, err.as_str())
+    openai_tool_roundtrip_values(
+        tool_call_id,
+        tool_name,
+        err.as_str(),
+        crate::tool_result_semantics::ToolResultStatus::Failed,
+    )
 }
 
 /// Read-only tools for headless (edge) execution — safe to execute
@@ -303,6 +339,11 @@ pub static READ_ONLY_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// One edge-executed tool row in the current LLM round (ordering preserved vs `tool_calls`).
 pub trait EdgeToolRoundRow {
+    fn execution_completion(
+        &self,
+    ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
+        None
+    }
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
@@ -644,8 +685,9 @@ pub fn openai_tool_roundtrip_values(
     tool_call_id: &str,
     tool_name: &str,
     content: &str,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
-    openai_tool_roundtrip_values_with_result_fields(tool_call_id, tool_name, content, None)
+    openai_tool_roundtrip_values_with_result_fields(tool_call_id, tool_name, content, None, status)
 }
 
 #[must_use]
@@ -654,6 +696,7 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     tool_name: &str,
     content: &str,
     tool_result_fields: Option<&serde_json::Map<String, Value>>,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
     let mut msg = json!({
         "role": "tool",
@@ -675,6 +718,12 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     if let Some(extra_fields) = tool_result_fields {
         tr.extend(extra_fields.clone());
     }
+    // The executor/interceptor status is authoritative over any optional
+    // metadata value with the same key.
+    tr.insert(
+        "status".to_string(),
+        Value::String(status.as_str().to_string()),
+    );
     let tr = Value::Object(tr);
     (msg, tr)
 }
@@ -1099,6 +1148,7 @@ mod tests {
             tr["result"].as_str(),
             Some(HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
         );
+        assert_eq!(tr["status"], "skipped");
     }
 
     #[test]
@@ -1419,13 +1469,19 @@ mod tests {
 
     #[test]
     fn openai_tool_roundtrip_values_matches_headless_shape() {
-        let (m, tr) = openai_tool_roundtrip_values("call-1", "read_file", "ok");
+        let (m, tr) = openai_tool_roundtrip_values(
+            "call-1",
+            "read_file",
+            "ok",
+            crate::tool_result_semantics::ToolResultStatus::Completed,
+        );
         assert_eq!(m["role"], "tool");
         assert_eq!(m["tool_call_id"], "call-1");
         assert_eq!(m["content"], "ok");
         assert_eq!(tr["tool_call_id"], "call-1");
         assert_eq!(tr["name"], "read_file");
         assert_eq!(tr["result"], "ok");
+        assert_eq!(tr["status"], "completed");
     }
 
     #[test]
@@ -1439,6 +1495,7 @@ mod tests {
             "probe",
             body,
             Some(&fields),
+            crate::tool_result_semantics::ToolResultStatus::Failed,
         );
         assert_eq!(message["content"], body);
         assert_eq!(row["result"], body);
@@ -1463,11 +1520,13 @@ mod tests {
             "mo_query",
             "OK (no results)",
             Some(&extra_fields),
+            crate::tool_result_semantics::ToolResultStatus::Completed,
         );
         assert_eq!(tr["tool_call_id"], "call-2");
         assert_eq!(tr["name"], "mo_query");
         assert_eq!(tr["result"], "OK (no results)");
         assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
+        assert_eq!(tr["status"], "completed");
     }
 
     #[test]

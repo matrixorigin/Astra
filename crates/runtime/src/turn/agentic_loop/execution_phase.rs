@@ -936,6 +936,7 @@ pub(crate) fn enforce_completion_action_window_before_text_completion(
 
     if let Some(pending) = pending_action {
         let pending_label = match pending {
+            CompletionAction::OutcomeReconciliation { .. } => "outcome reconciliation".to_string(),
             CompletionAction::RequiredWorkspaceMutation => "workspace mutation".to_string(),
             CompletionAction::RequiredExternalEffect => "external state mutation".to_string(),
             CompletionAction::CompletionTaskAction => "completion task action".to_string(),
@@ -2053,22 +2054,285 @@ fn mark_workspace_completion_incomplete(
     ));
 }
 
+/// Retain an admitted proposal only after its referenced durable executions
+/// pass integrity validation. This does not establish semantic task success.
+pub(crate) fn task_resolution_boundary_id<H: AgenticLoopHost>(
+    host: &H,
+    state: &AgenticLoopState,
+) -> Option<String> {
+    let run_id = state
+        .current_run_id
+        .as_deref()
+        .filter(|id| !id.is_empty())?;
+    let chain_id = state
+        .canonical_turn_chain_id
+        .as_deref()
+        .filter(|id| !id.is_empty())?;
+    let subject = host.runtime_policy_subject(state);
+    if !subject.is_valid() {
+        return None;
+    }
+    // The polling cursor follows all run events, including tool completions.
+    // Semantic guidance already changes the canonical chain and clears the
+    // completion window; ordinary event consumption must not revoke it.
+    let identity = serde_json::json!({
+        "domain": "task-resolution-boundary-v1",
+        "run_id": run_id,
+        "turn_chain_id": chain_id,
+        "subject": subject,
+    });
+    Some(format!(
+        "{:x}",
+        Sha256::digest(astra_core::canonical_json_string(&identity))
+    ))
+}
+
+pub(crate) async fn accept_task_resolution_after_tool_round(
+    state: &mut AgenticLoopState,
+    records_start: usize,
+    current_boundary: Option<&str>,
+) {
+    let Some(window) = state
+        .hooks
+        .completion_settlement
+        .completion_action_window
+        .as_ref()
+    else {
+        return;
+    };
+    let CompletionAction::OutcomeReconciliation { boundary_id } = &window.action else {
+        return;
+    };
+    tracing::info!(
+        target: "astra::task_resolution",
+        run_id = ?state.current_run_id,
+        consumed = window.consumed,
+        matched = window.matched,
+        current_boundary_matches = current_boundary == Some(boundary_id.as_str()),
+        new_records = state.stall.tool_call_records.len().saturating_sub(records_start),
+        "task resolution acceptance boundary"
+    );
+    if !window.consumed || !window.matched {
+        return;
+    }
+    let boundary_id = boundary_id.clone();
+    // Matching admission only permits a submission. The durable result and its
+    // referenced executions still have to establish evidence integrity.
+    state
+        .hooks
+        .completion_settlement
+        .outcome_reconciliation_assessment = None;
+    if current_boundary != Some(boundary_id.as_str()) {
+        return;
+    }
+    let Some(executor) = state.runtime_tool_executor.as_ref() else {
+        return;
+    };
+    let (Some(run_id), Some(chain_id)) = (
+        state.current_run_id.as_deref(),
+        state.canonical_turn_chain_id.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(new_records) = state.stall.tool_call_records.get(records_start..) else {
+        return;
+    };
+    let mut submissions = new_records
+        .iter()
+        .filter(|record| record.name == "submit_task_resolution");
+    let Some(submission) = submissions.next() else {
+        return;
+    };
+    if submissions.next().is_some()
+        || !submission.ok
+        || submission.disposition
+            != Some(astra_services::session_journal::ToolCallDisposition::Executed)
+    {
+        return;
+    }
+    let Some(assessment) = submission.result_full.as_deref().and_then(|payload| {
+        serde_json::from_str::<astra_turn_types::task_resolution::TaskResolutionAssessment>(payload)
+            .ok()
+    }) else {
+        return;
+    };
+    let evidence = state
+        .stall
+        .runtime_policy_evaluation
+        .task_resolution_evidence(&assessment, &state.stall.tool_call_records[..records_start]);
+    let result = executor
+        .validate_task_resolution_evidence(
+            &assessment,
+            chain_id,
+            &boundary_id,
+            run_id,
+            chain_id,
+            &evidence,
+        )
+        .await;
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                target: "astra::task_resolution",
+                run_id,
+                conclusion = ?assessment.conclusion,
+                "task resolution evidence validated"
+            );
+            state.push_volatile_payload(super::host::VolatileKind::FinalAnswerSettlement, serde_json::json!({
+                "schema": "task_resolution_assessed.v1",
+                "boundary_id": boundary_id,
+                "conclusion": assessment.conclusion,
+                "remaining_gaps": assessment.remaining_gaps,
+                "instruction": "The referenced execution evidence passed integrity validation. This remains your task assessment, not a machine verification receipt. Give the user an accurate final report and retain any remaining gaps; runtime checks final coverage separately.",
+            }));
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_assessment = Some(assessment);
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "astra::task_resolution",
+                run_id,
+                reason = %error,
+                "task resolution evidence rejected"
+            );
+            state.push_volatile_payload(super::host::VolatileKind::FinalAnswerSettlement, serde_json::json!({
+                "schema": "task_resolution_unaccepted.v1",
+                "boundary_id": boundary_id,
+                "reason": error.to_string(),
+                "instruction": "Recovery was not established by the available evidence. Preserve the unresolved verification in the final report; do not claim that submission acceptance or a successful tool response proves task completion.",
+            }));
+        }
+    }
+}
+
+/// Task interpretation can release only the exact failures it references.
+/// Execution counts and deterministic verification remain unchanged.
+async fn task_resolution_covers_current_outcomes(
+    state: &AgenticLoopState,
+    current_boundary: Option<&str>,
+) -> bool {
+    use astra_turn_types::task_resolution::TaskResolutionConclusion;
+    let Some(assessment) = state
+        .hooks
+        .completion_settlement
+        .outcome_reconciliation_assessment
+        .as_ref()
+    else {
+        return false;
+    };
+    if assessment.conclusion != TaskResolutionConclusion::Supported
+        || current_boundary != Some(assessment.boundary_id.as_str())
+    {
+        tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+            conclusion = ?assessment.conclusion,
+            current_boundary_matches = current_boundary == Some(assessment.boundary_id.as_str()),
+            "task resolution does not support current boundary");
+        return false;
+    }
+    let failures = state
+        .stall
+        .runtime_policy_evaluation
+        .unresolved_tool_outcomes();
+    if failures.is_empty() {
+        return false;
+    }
+    let evidence = state
+        .stall
+        .runtime_policy_evaluation
+        .task_resolution_evidence(assessment, &state.stall.tool_call_records);
+    if !failures.values().all(|failure| {
+        failure.invocation.as_ref().is_some_and(|reference| {
+            assessment
+                .failed_call_ids
+                .contains(&reference.identity().invocation_id)
+                && evidence
+                    .iter()
+                    .any(|record| record.execution_completion.as_ref() == Some(reference))
+        })
+    }) {
+        tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+            unresolved_count = failures.len(), evidence_count = evidence.len(),
+            "task resolution does not cover current failure references");
+        return false;
+    }
+    let mut workspace_evidence = state
+        .stall
+        .runtime_policy_evaluation
+        .task_resolution_workspace_evidence(&assessment.evidence_call_ids);
+    workspace_evidence.extend(
+        state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|record| {
+                record
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| assessment.evidence_call_ids.contains(id))
+                    && super::lifecycle::record_can_observe_bound_workspace(
+                        state.hooks.workspace_root_hint.as_deref(),
+                        record,
+                    )
+            })
+            .filter_map(|record| record.execution_completion.clone()),
+    );
+    let freshness = state
+        .stall
+        .verification_frontier
+        .task_resolution_workspace_evidence_is_current(
+            state.hooks.workspace_root_hint.as_deref(),
+            &state.hooks.stop_hooks,
+            &state.stall.tool_call_records,
+            &workspace_evidence,
+        );
+    if !matches!(freshness, Ok(true)) {
+        tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+            result = ?freshness, "task resolution workspace evidence is not current");
+        return false;
+    }
+    let Some(executor) = state.runtime_tool_executor.as_ref() else {
+        return false;
+    };
+    let (Some(run_id), Some(chain_id)) = (
+        state.current_run_id.as_deref(),
+        state.canonical_turn_chain_id.as_deref(),
+    ) else {
+        return false;
+    };
+    let validation = executor
+        .validate_task_resolution_evidence(
+            assessment,
+            chain_id,
+            &assessment.boundary_id,
+            run_id,
+            chain_id,
+            &evidence,
+        )
+        .await;
+    tracing::info!(target: "astra::task_resolution", run_id,
+        result = ?validation, "task resolution final evidence validation");
+    validation.is_ok()
+}
+
 /// Give a candidate final answer one bounded rewrite when the structured
 /// execution ledger still reports a persistent unresolved outcome.
-///
-/// This is deliberately not a semantic claim checker and does not parse the
-/// answer.  The policy evaluator has already required two observations of the
-/// same active failure.  We preserve that factual boundary, remove the
-/// candidate from canonical history, and ask for a text-only reconciliation.
-fn enforce_outcome_reconciliation_before_text_completion(state: &mut AgenticLoopState) -> bool {
+fn enforce_outcome_reconciliation_before_text_completion(
+    state: &mut AgenticLoopState,
+    current_boundary: Option<&str>,
+) -> bool {
     if state
         .hooks
         .completion_settlement
         .outcome_reconciliation_retries
         > 0
-        || !crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
+        || !(crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
             &state.stall.active_policy_feedback,
-        )
+        ) || state
+            .stall
+            .runtime_policy_evaluation
+            .has_task_resolution_candidate())
     {
         return false;
     }
@@ -2077,16 +2341,61 @@ fn enforce_outcome_reconciliation_before_text_completion(state: &mut AgenticLoop
         .hooks
         .completion_settlement
         .outcome_reconciliation_retries = 1;
-    state.hooks.completion_settlement.text_only = true;
+    state
+        .hooks
+        .completion_settlement
+        .outcome_reconciliation_assessment = None;
+    let mut current_boundary = current_boundary.filter(|_| {
+        state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::task_resolution_evidence_available,
+        )
+    });
+    // If a host has no durable invocation scope, keep a truthful text review
+    // rather than advertising a submission it cannot validate.
+    state.hooks.completion_settlement.text_only = current_boundary.is_none();
+    state.hooks.completion_settlement.work_settlement_only = false;
+    if let Some(boundary_id) = current_boundary {
+        state.budget_wrapup_injected = false;
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: CompletionAction::OutcomeReconciliation {
+                    boundary_id: boundary_id.to_owned(),
+                },
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        if !crate::turn::agentic::tool_interception::runtime_allows_tool(
+            state,
+            "submit_task_resolution",
+        ) {
+            state.hooks.completion_settlement.completion_action_window = None;
+            state.hooks.completion_settlement.text_only = true;
+            current_boundary = None;
+        }
+    }
     state.final_text.clear();
-    state.max_turns = state.max_turns.saturating_add(1);
-    state.remaining_turns = state.remaining_turns.saturating_add(1);
+    let reserved_rounds = if current_boundary.is_some() { 2 } else { 1 };
+    state.max_turns = state.max_turns.saturating_add(reserved_rounds);
+    state.remaining_turns = state.remaining_turns.saturating_add(reserved_rounds);
+    let submission_contract = current_boundary.map(|boundary_id| {
+        let action = CompletionAction::OutcomeReconciliation {
+            boundary_id: boundary_id.to_owned(),
+        };
+        completion_action_hint_for_state(state, &action)
+    });
     state.push_volatile_payload(
         super::host::VolatileKind::FinalAnswerSettlement,
         serde_json::json!({
             "schema": "outcome_reconciliation_required.v1",
             "signal": "persistent_unresolved_tool_outcome",
-            "instruction": "Review the candidate answer against the retained direct tool results. Reconcile every still-failed or rejected outcome that matters to the latest user request. Separate observed facts, inferences, and unresolved hypotheses; remove contradictory certainty. Produce the corrected final answer now without requesting more tools or discussing this internal review boundary.",
+            "action_hint": submission_contract,
+            "instruction": if current_boundary.is_some() {
+                "Review retained execution evidence against the latest user request. Submit exactly one task-resolution assessment using the supplied contract. Link each relevant failed invocation to later evidence for the same verification target, even when commands differ. Unrelated success is not recovery. Preserve raw failed executions and explicit required checks. Supported means your evidence-backed assessment of task satisfaction, not a machine verification receipt. If relevance or recovery is uncertain, use partial or unknown and retain the gaps. After submission, give the user an accurate final report; do not explore or retry executions at this boundary."
+            } else {
+                "Review retained direct tool results. Preserve unresolved verification and distinguish observed facts from your assessment. Invocation authority is unavailable, so do not claim that a different later success cleared a failure. Give the corrected final report now without more tools."
+            },
             "authority": "runtime_policy_evidence",
         }),
     );
@@ -2096,18 +2405,24 @@ fn enforce_outcome_reconciliation_before_text_completion(state: &mut AgenticLoop
 /// If the bounded reconciliation pass did not clear the same typed failure,
 /// finish as resumable incomplete rather than allowing a model-written
 /// success claim to hide the durable evidence.  This is deliberately gated by
-/// the evaluator's `Converge` stage and by the already-spent retry, so one
-/// transient failure remains an advisory signal instead of a hard stop.
-fn enforce_persistent_unresolved_outcome_terminal(state: &mut AgenticLoopState) -> bool {
+/// the already-spent retry and remaining execution facts. A successful proposal
+/// transport must not clear failures merely by reducing scheduling pressure.
+fn enforce_persistent_unresolved_outcome_terminal(
+    state: &mut AgenticLoopState,
+    task_assessed: bool,
+) -> bool {
     if state
         .hooks
         .completion_settlement
         .outcome_reconciliation_retries
         == 0
+        || task_assessed
         || state.interruption.is_some()
-        || !crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
-            &state.stall.active_policy_feedback,
-        )
+        || state
+            .stall
+            .runtime_policy_evaluation
+            .unresolved_tool_outcomes()
+            .is_empty()
     {
         return false;
     }
@@ -4831,13 +5146,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.set_terminal_execution_authority(TerminalExecutionAuthority::EdgeLedger);
             }
 
-            // A second persistent observation after the one bounded
-            // reconciliation pass is itself a typed incomplete outcome. Set
-            // it before the generic interruption branch so the same terminal
-            // rendering/persistence path is used for both provider and
-            // policy-owned incomplete results.
-            enforce_persistent_unresolved_outcome_terminal(state);
-
             // An authoritative interruption is a terminal boundary for this
             // turn.  Do not let user-intent polling or completion obligations
             // reopen another provider call after the host has already
@@ -5114,8 +5422,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     .await;
             }
 
+            let reconciliation_boundary = task_resolution_boundary_id(host, state);
             if state.interruption.is_none()
-                && enforce_outcome_reconciliation_before_text_completion(state)
+                && enforce_outcome_reconciliation_before_text_completion(
+                    state,
+                    reconciliation_boundary.as_deref(),
+                )
             {
                 state.messages.truncate(transcript_append_start);
                 record_early_exit_llm_round(
@@ -5129,6 +5441,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
                     .await;
             }
+
+            let task_assessed =
+                task_resolution_covers_current_outcomes(state, reconciliation_boundary.as_deref())
+                    .await;
+            enforce_persistent_unresolved_outcome_terminal(state, task_assessed);
 
             let round_slice_incomplete = enforce_terminal_completion_disposition_before_success(
                 state,
@@ -6449,6 +6766,17 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
     let mut accepted_action_shapes = Vec::new();
     let (reason_code, latest_target, missing_labels): (&str, Option<String>, serde_json::Value) =
         match action {
+            CompletionAction::OutcomeReconciliation { .. } => {
+                accepted_action_shapes.push(serde_json::json!({
+                    "tool": "submit_task_resolution",
+                    "constraint": "submit one evidence-linked assessment for this boundary; a matching invocation is not acceptance or a verification receipt",
+                }));
+                (
+                    "outcome_reconciliation_required",
+                    None,
+                    serde_json::Value::Null,
+                )
+            }
             CompletionAction::RequiredWorkspaceMutation => {
                 ("workspace_mutation_missing", None, serde_json::Value::Null)
             }
@@ -6531,6 +6859,7 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
             }
         };
     let accepted_action_family = serde_json::json!(match action {
+        CompletionAction::OutcomeReconciliation { .. } => "outcome_reconciliation",
         CompletionAction::RequiredWorkspaceMutation => "workspace_mutation",
         CompletionAction::RequiredExternalEffect => "external_effect",
         CompletionAction::CompletionTaskAction => "completion_task_action",
@@ -6572,6 +6901,29 @@ pub(crate) fn completion_action_hint_for_state(
     action: &CompletionAction,
 ) -> serde_json::Value {
     let mut hint = completion_action_hint(action);
+    if matches!(action, CompletionAction::OutcomeReconciliation { .. }) {
+        hint["carrier"] = serde_json::json!({
+            "tool": astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
+            "name": "submit_task_resolution",
+            "arguments_schema": astra_tools::schemas::submit_task_resolution_schema()["function"]["parameters"],
+            "call_shape": "invoke_tool({\"name\":\"submit_task_resolution\",\"arguments\": <assessment object matching arguments_schema>})",
+            "instruction": "Invoke this carrier directly; no tool_search or schema loading is needed in this window. Runtime binds scope and boundary; do not supply them. Copy execution call_id values exactly from the evidence below, never substitute a command or description. Candidates are observations, not proof of relevance. For supported, remaining_gaps must be the empty array [], not a string such as None.",
+        });
+        hint["execution_evidence"] = state
+            .stall
+            .runtime_policy_evaluation
+            .task_resolution_hint_evidence();
+        hint["unresolved_count"] = serde_json::json!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .len()
+        );
+        hint["coverage_requirement"] = serde_json::json!(
+            "Each displayed execution list is bounded to 32, not necessarily complete. A supported submission must cover every unresolved failure; otherwise use partial or unknown and retain the remaining gaps."
+        );
+    }
     if matches!(action, CompletionAction::RequiredExternalEffect)
         && !typed_memory_external_effect_is_in_scope(state)
     {
@@ -6671,6 +7023,10 @@ pub(crate) fn completion_action_match_label(
     }
     let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).ok();
     match action {
+        CompletionAction::OutcomeReconciliation { boundary_id } => {
+            (name == "submit_task_resolution" && !boundary_id.is_empty())
+                .then(|| format!("outcome_reconciliation:{boundary_id}"))
+        }
         CompletionAction::RequiredWorkspaceMutation => {
             if completion_action_requires_complete_state_writer(state, action) {
                 (name == "write_file"
@@ -6894,6 +7250,9 @@ pub(crate) fn completion_action_window_is_batchable(
     state: &AgenticLoopState,
     action: &CompletionAction,
 ) -> bool {
+    if matches!(action, CompletionAction::OutcomeReconciliation { .. }) {
+        return false;
+    }
     let CompletionAction::ExplicitVerification { missing_labels } = action else {
         return true;
     };
@@ -6938,9 +7297,21 @@ pub(crate) fn apply_completion_action_admission(
     }
 
     let is_explicit_verification = matches!(&action, CompletionAction::ExplicitVerification { .. });
-    let raw_contains_matching_action = raw_tool_calls
+    // Completion obligations apply to logical operations, not their transport
+    // carrier. Include rejected requests so a denied matching action consumes
+    // its boundary without acquiring execution authority or a mismatch retry.
+    let requested_matching_action = admission
+        .admitted
         .iter()
-        .any(|call| completion_action_match_label(state, &action, call).is_some());
+        .chain(
+            admission
+                .rejected
+                .iter()
+                .map(|rejected| &rejected.invocation),
+        )
+        .any(|call| {
+            completion_action_match_label(state, &action, call.logical_target_call()).is_some()
+        });
     let correction_available = state
         .hooks
         .completion_settlement
@@ -6976,13 +7347,13 @@ pub(crate) fn apply_completion_action_admission(
             result: serde_json::json!({
                 "status": "rejected",
                 "error_kind": "completion_action_mismatch",
-                "retryable": !raw_contains_matching_action && correction_available,
+                "retryable": !requested_matching_action && correction_available,
                 "allowed_action": action.clone(),
                 "action_hint": completion_action_hint_for_state(state, &action),
                 "error": completion_action_mismatch_instruction(
                     state,
                     &action,
-                    !raw_contains_matching_action && correction_available,
+                    !requested_matching_action && correction_available,
                 ),
             })
             .to_string(),
@@ -6990,7 +7361,7 @@ pub(crate) fn apply_completion_action_admission(
     }
     let matched = !retained.is_empty();
     admission.admitted = retained;
-    if !raw_contains_matching_action && correction_available {
+    if !requested_matching_action && correction_available {
         let action_hint = completion_action_hint_for_state(state, &action);
         let mismatch_instruction = completion_action_mismatch_instruction(state, &action, true);
         if let Some(window) = state
@@ -9969,6 +10340,36 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(pending_completion_action(&state).unwrap(), None);
+    }
+
+    #[test]
+    fn outcome_reconciliation_matches_only_its_nonbatchable_action() {
+        let state = make_state();
+        let action = CompletionAction::OutcomeReconciliation {
+            boundary_id: "boundary-1".into(),
+        };
+        let call = |name: &str| {
+            serde_json::json!({
+                "id": "assessment-call", "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            })
+        };
+        assert!(
+            completion_action_match_label(&state, &action, &call("submit_task_resolution"))
+                .is_some()
+        );
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::OutcomeReconciliation {
+                    boundary_id: String::new()
+                },
+                &call("submit_task_resolution")
+            )
+            .is_none()
+        );
+        assert!(completion_action_match_label(&state, &action, &call("reflect")).is_none());
+        assert!(!completion_action_window_is_batchable(&state, &action));
     }
 
     #[test]
@@ -15397,6 +15798,315 @@ mod tests {
     }
 
     #[test]
+    fn task_resolution_boundary_tracks_intent_not_presentation() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_run_id = Some("run".into());
+        state.canonical_turn_chain_id = Some("chain".into());
+        let first = task_resolution_boundary_id(&host, &state).unwrap();
+        state.final_text = "Another candidate".into();
+        assert_eq!(
+            task_resolution_boundary_id(&host, &state).as_deref(),
+            Some(first.as_str())
+        );
+        state.user_intents.set_user_intent_cursor_for_test(1);
+        assert_eq!(
+            task_resolution_boundary_id(&host, &state).as_deref(),
+            Some(first.as_str()),
+            "scanning ordinary run events must not change semantic identity"
+        );
+        assert!(apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[crate::turn::run_control::QueuedUserIntent {
+                intent_id: "new-guidance".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 2,
+                input: serde_json::json!({"content": "Verify the other artifact instead."}),
+            }],
+        ));
+        assert_ne!(
+            task_resolution_boundary_id(&host, &state).as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn task_resolution_covers_only_exact_failures_and_survives_policy_recovery() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+        use astra_turn_types::task_resolution::{
+            TaskResolutionAssessment, TaskResolutionConclusion,
+        };
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationCompletionRef, ToolInvocationDecision,
+            ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationResultPayload,
+            ToolInvocationTerminalOutcome,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            dir.path().into(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        executor.set_invocation_ledger(ledger.clone());
+        let mut state = make_state();
+        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
+        state.current_run_id = Some("run".into());
+        state.canonical_turn_chain_id = Some("chain".into());
+        let host = MockHost::new(Vec::new());
+        let boundary = task_resolution_boundary_id(&host, &state).unwrap();
+        for (index, (id, ok, target)) in [
+            ("failed", false, "artifact"),
+            ("later", true, "artifact"),
+            ("unrelated", false, "other-artifact"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = if ok { "read_file" } else { "grep" };
+            let args = serde_json::json!({"path": target});
+            let identity =
+                ToolInvocationIdentity::new("user", "session", "run", "chain", id).unwrap();
+            let decision =
+                ToolInvocationDecision::new(&serde_json::json!({"allowed": true})).unwrap();
+            let fingerprint = ToolInvocationFingerprint::new(
+                DurableToolReference::built_in(name, "v1").unwrap(),
+                &args,
+                &decision.decision_id,
+            )
+            .unwrap();
+            ledger
+                .prepare(&identity, &fingerprint, &decision)
+                .await
+                .unwrap();
+            ledger.dispatch(&identity, "owner", None).await.unwrap();
+            let result = ToolInvocationResultPayload {
+                output: "direct evidence".into(),
+                metadata: Default::default(),
+                exit_semantics: None,
+            };
+            let outcome = if ok {
+                ToolInvocationTerminalOutcome::Succeeded { result }
+            } else {
+                ToolInvocationTerminalOutcome::Failed {
+                    result,
+                    error_kind: None,
+                    retryable: false,
+                }
+            };
+            let row = ledger.complete(&identity, "owner", &outcome).await.unwrap();
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: name.into(),
+                tool_call_id: Some(id.into()),
+                ok,
+                args_full: Some(args.to_string()),
+                round: Some(index as u32 + 1),
+                execution_completion: Some(
+                    ToolInvocationCompletionRef::from_record(&row)
+                        .unwrap()
+                        .into(),
+                ),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        }
+        let unrelated = state.stall.tool_call_records.pop().unwrap();
+        for control in [
+            "single_failure",
+            "same_round",
+            "exact_recovery",
+            "rejected",
+            "inconclusive",
+            "missing_reference",
+        ] {
+            let mut records = state.stall.tool_call_records.clone();
+            match control {
+                "single_failure" => {
+                    records.pop();
+                }
+                "exact_recovery" => {
+                    records[1].name = records[0].name.clone();
+                    records[1].args_full = records[0].args_full.clone();
+                }
+                "same_round" => records[1].round = records[0].round,
+                "rejected" => records[1].disposition = Some(ToolCallDisposition::Rejected),
+                "inconclusive" => records[1].result_class = Some("inconclusive".into()),
+                "missing_reference" => records[1].execution_completion = None,
+                _ => unreachable!(),
+            }
+            let mut policy = crate::turn::runtime_policy::RuntimePolicyEvaluationState::default();
+            crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+                &mut policy,
+                astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                &records,
+                2,
+                astra_turn_core::evaluation::EvaluationThresholds::default(),
+            )
+            .unwrap();
+            assert!(
+                !policy.has_task_resolution_candidate(),
+                "negative control {control} must not request assessment"
+            );
+        }
+        state.stall.active_policy_feedback =
+            crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+                &mut state.stall.runtime_policy_evaluation,
+                astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                &state.stall.tool_call_records[..1],
+                1,
+                astra_turn_core::evaluation::EvaluationThresholds::default(),
+            )
+            .unwrap()
+            .unwrap();
+        if let Some(feedback) = crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            2,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap()
+        {
+            state.stall.active_policy_feedback = feedback;
+        }
+        assert!(
+            !crate::turn::runtime_policy::feedback_requires_outcome_reconciliation(
+                &state.stall.active_policy_feedback
+            )
+        );
+        assert!(
+            enforce_outcome_reconciliation_before_text_completion(&mut state, Some(&boundary)),
+            "changed-command success must open assessment even with Observe feedback"
+        );
+        let hint = completion_action_hint_for_state(
+            &state,
+            &CompletionAction::OutcomeReconciliation {
+                boundary_id: boundary.clone(),
+            },
+        );
+        assert_eq!(hint["carrier"]["tool"], "invoke_tool");
+        let candidate_id = hint["execution_evidence"]["evidence_candidates"][0]["call_id"]
+            .as_str()
+            .expect("the submission surface must expose a usable evidence identity");
+        assert_eq!(candidate_id, "later");
+        let assessment = TaskResolutionAssessment {
+            scope: "chain".into(),
+            boundary_id: boundary.clone(),
+            verification_target: "artifact".into(),
+            failed_call_ids: vec!["failed".into()],
+            evidence_call_ids: vec![candidate_id.into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "Direct artifact read supplies the requested evidence after grep failed."
+                .into(),
+            remaining_gaps: vec![],
+        };
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: CompletionAction::OutcomeReconciliation {
+                    boundary_id: boundary.clone(),
+                },
+                consumed: true,
+                matched: true,
+                attempts_remaining: 0,
+                mismatch_corrections_remaining: 1,
+            });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "submit_task_resolution".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            result_full: Some(serde_json::to_string(&assessment).unwrap()),
+            ..Default::default()
+        });
+        // A real run-control poll advances over ordinary tool events too.
+        // Recompute the boundary as the production tool phase does, rather
+        // than feeding the opening boundary back into acceptance unchanged.
+        state.user_intents.commit_observed_cursor(17);
+        let current_boundary = task_resolution_boundary_id(&host, &state).unwrap();
+        accept_task_resolution_after_tool_round(&mut state, 2, Some(&current_boundary)).await;
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.payload["schema"] == "task_resolution_assessed.v1"
+                && entry.payload["conclusion"] == "supported"
+        }));
+        assert!(task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+        for conclusion in [
+            TaskResolutionConclusion::Unknown,
+            TaskResolutionConclusion::Partial,
+        ] {
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_assessment
+                .as_mut()
+                .unwrap()
+                .conclusion = conclusion;
+            assert!(!task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+            assert!(
+                enforce_persistent_unresolved_outcome_terminal(&mut state, false),
+                "Observe feedback cannot let an unresolved assessment bypass final coverage"
+            );
+            state.interruption = None;
+        }
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_assessment
+            .as_mut()
+            .unwrap()
+            .conclusion = TaskResolutionConclusion::Supported;
+        assert_eq!(
+            state
+                .stall
+                .runtime_policy_evaluation
+                .unresolved_tool_outcomes()
+                .len(),
+            1,
+            "task assessment must not erase execution failure"
+        );
+        assert!(!task_resolution_covers_current_outcomes(&state, Some("stale")).await);
+
+        let retained = state.stall.runtime_policy_evaluation.clone();
+        state.stall.tool_call_records.pop();
+        state.stall.tool_call_records.push(unrelated);
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &state.stall.tool_call_records,
+            3,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap();
+        assert!(
+            !task_resolution_covers_current_outcomes(&state, Some(&boundary)).await,
+            "one target assessment cannot clear another failure"
+        );
+
+        state.stall.runtime_policy_evaluation =
+            crate::turn::runtime_policy::RuntimePolicyEvaluationState::deserialize_continuation(
+                retained
+                    .serialize_continuation(serde_json::value::Serializer)
+                    .unwrap(),
+            )
+            .unwrap();
+        state.stall.tool_call_records.clear();
+        assert!(
+            task_resolution_covers_current_outcomes(&state, Some(&boundary)).await,
+            "restored prefix resolves original completion refs through the shared ledger"
+        );
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_assessment
+            .as_mut()
+            .unwrap()
+            .conclusion = TaskResolutionConclusion::Unknown;
+        assert!(!task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+    }
+
+    #[test]
     fn persistent_unresolved_outcome_gets_one_text_only_reconciliation() {
         let mut state = make_state();
         install_committed_work_synthesis_wire_surface(&mut state);
@@ -15424,7 +16134,7 @@ mod tests {
             )
         );
         assert!(enforce_outcome_reconciliation_before_text_completion(
-            &mut state
+            &mut state, None
         ));
         assert!(state.hooks.completion_settlement.text_only);
         assert_eq!(
@@ -15442,13 +16152,287 @@ mod tests {
                 == Some("outcome_reconciliation_required.v1")
         }));
         assert!(!enforce_outcome_reconciliation_before_text_completion(
-            &mut state
+            &mut state, None
         ));
+    }
+
+    #[tokio::test]
+    async fn task_resolution_opener_releases_only_the_bounded_action_from_wrapup() {
+        struct CanonicalAdmissionHost {
+            valid_tools: HashSet<String>,
+            admission: ToolCallAdmission,
+        }
+
+        #[async_trait::async_trait]
+        impl AgenticLoopHost for CanonicalAdmissionHost {
+            fn emit_headless_line(
+                &mut self,
+                _style: crate::turn::agentic::headless_round::HeadlessStderrStyle,
+                _line: String,
+            ) {
+            }
+
+            fn is_quiet(&self) -> bool {
+                true
+            }
+
+            fn admit_tool_calls(
+                &mut self,
+                _tool_calls: &[serde_json::Value],
+                _finish_reason: Option<&str>,
+            ) -> ToolCallAdmission {
+                self.admission.clone()
+            }
+
+            async fn execute_turn(
+                &mut self,
+                _state: &mut AgenticLoopState,
+            ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+                unreachable!("this host only exercises the admitted tool phase")
+            }
+
+            fn valid_tool_names(&self) -> &HashSet<String> {
+                &self.valid_tools
+            }
+        }
+
+        let mut state = make_state();
+        let dir = tempfile::tempdir().unwrap();
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            dir.path().into(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        executor.set_invocation_ledger(
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None),
+        );
+        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
+        state.current_run_id = Some("run".into());
+        state.canonical_turn_chain_id = Some("chain".into());
+        state.current_session_id = Some("session".into());
+        state.context_manifest_user_id = Some("user".into());
+        state.budget_wrapup_injected = true;
+        state.hooks.completion_settlement.text_only = true;
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated", "schema_version": 2, "revision": 3,
+            "evaluated_at_round": 6, "subject": {"kind": "run"},
+            "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
+                "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
+        })).unwrap();
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state,
+            Some("boundary")
+        ));
+        assert!(!state.budget_wrapup_injected);
+        assert!(!state.hooks.completion_settlement.text_only);
+        let action = &state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .unwrap()
+            .action;
+        let correct = serde_json::json!({"id": "call", "type": "function", "function": {
+            "name": "submit_task_resolution", "arguments": "{\"boundary_id\":\"boundary\"}"}});
+        assert!(completion_action_match_label(&state, action, &correct).is_some());
+        let unrelated = serde_json::json!({"id": "call", "type": "function", "function": {
+            "name": "bash", "arguments": "{\"command\":\"true\"}"}});
+        assert!(completion_action_match_label(&state, action, &unrelated).is_none());
+        let args = serde_json::json!({
+            "verification_target": "artifact",
+            "failed_call_ids": ["not-retained"], "evidence_call_ids": [],
+            "conclusion": "unknown", "rationale": "Evidence unavailable", "remaining_gaps": ["verify artifact"]
+        });
+        let call = serde_json::json!({"id": "submission", "type": "function", "function": {
+            "name": "invoke_tool", "arguments": serde_json::json!({
+                "name": "submit_task_resolution", "arguments": args
+            }).to_string()
+        }});
+        assert!(
+            completion_action_match_label(&state, action, &call).is_none(),
+            "the physical carrier is not itself the bounded logical action"
+        );
+        let canonical_call = astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::runtime_control_from_carrier(
+            &call,
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::OutcomeReconciliation,
+        )
+        .unwrap()
+        .expect("task-resolution carrier must canonicalize");
+        assert!(
+            completion_action_match_label(&state, action, canonical_call.logical_target_call())
+                .is_some()
+        );
+        let opened_action = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .unwrap()
+            .action
+            .clone();
+
+        let rejected = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: Vec::new(),
+                rejected: vec![RejectedToolCall {
+                    invocation: canonical_call.clone(),
+                    result: "policy rejected".into(),
+                }],
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&call),
+        );
+        assert!(rejected.admitted.is_empty());
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .unwrap();
+        assert!(window.consumed);
+        assert!(
+            !window.matched,
+            "a rejected carrier has no handler authority"
+        );
+        assert_eq!(window.mismatch_corrections_remaining, 1);
+
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: opened_action.clone(),
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let mismatch = apply_completion_action_admission(
+            &mut state,
+            ToolCallAdmission {
+                admitted: ordinary_admitted([unrelated.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+            std::slice::from_ref(&unrelated),
+        );
+        assert!(mismatch.admitted.is_empty());
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .unwrap();
+        assert!(!window.consumed);
+        assert!(!window.matched);
+        assert_eq!(window.mismatch_corrections_remaining, 0);
+
+        state.hooks.completion_settlement.completion_action_window =
+            Some(super::super::host::CompletionActionWindow {
+                action: opened_action,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let mut host = CanonicalAdmissionHost {
+            valid_tools: HashSet::from(["submit_task_resolution".to_string()]),
+            admission: ToolCallAdmission {
+                admitted: vec![canonical_call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        };
+        state.step_recorder.begin_turn(1);
+        super::super::tool_phase::execute_tool_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+            TurnExecutionPhase {
+                llm_wall_start: Instant::now(),
+                turn_result: server_tool_result(vec![call], vec![], 1, 1, None),
+            },
+        )
+        .await
+        .unwrap();
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .unwrap();
+        assert!(window.consumed);
+        assert!(window.matched);
+        assert_eq!(
+            window.mismatch_corrections_remaining, 1,
+            "the first canonical matching carrier must not spend its correction"
+        );
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == "submit_task_resolution" && record.ok }),
+            "legal bounded submission must reach the handler: {:?}",
+            state.stall.tool_call_records
+        );
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .outcome_reconciliation_assessment
+                .is_none(),
+            "unavailable referenced evidence must not acquire acceptance"
+        );
+        state
+            .hooks
+            .completion_settlement
+            .outcome_reconciliation_retries = 0;
+        state.hooks.completion_settlement.completion_action_window = None;
+        state.runtime_tool_executor = None;
+        // Restore only the policy signal for the no-executor opening control.
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated", "schema_version": 2, "revision": 3,
+            "evaluated_at_round": 6, "subject": {"kind": "run"},
+            "entries": [{"signal": "unresolved_tool_outcomes", "stage": "converge",
+                "observed_at_round": 6, "evidence_count": 3, "recommendation": "diagnose_tool_outcomes"}]
+        })).unwrap();
+        assert!(enforce_outcome_reconciliation_before_text_completion(
+            &mut state,
+            Some("boundary")
+        ));
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .is_none()
+        );
     }
 
     #[test]
     fn persistent_unresolved_outcome_becomes_resumable_incomplete_after_retry() {
         let mut state = make_state();
+        crate::turn::runtime_policy::evaluate_tool_boundary_with_thresholds(
+            &mut state.stall.runtime_policy_evaluation,
+            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+            &[astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                args_full: Some(r#"{"command":"verify"}"#.into()),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ok: false,
+                round: Some(1),
+                ..Default::default()
+            }],
+            1,
+            astra_turn_core::evaluation::EvaluationThresholds::default(),
+        )
+        .unwrap();
         state
             .hooks
             .completion_settlement
@@ -15469,13 +16453,17 @@ mod tests {
         }))
         .expect("valid policy feedback");
 
-        assert!(enforce_persistent_unresolved_outcome_terminal(&mut state));
+        assert!(enforce_persistent_unresolved_outcome_terminal(
+            &mut state, false
+        ));
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
         assert!(state.final_text.contains("remains incomplete"));
-        assert!(!enforce_persistent_unresolved_outcome_terminal(&mut state));
+        assert!(!enforce_persistent_unresolved_outcome_terminal(
+            &mut state, false
+        ));
     }
 
     #[test]

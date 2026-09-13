@@ -927,6 +927,7 @@ mod tests {
             tool_call_id: Some(call_id),
             admission_source,
             expected_control_epoch: None,
+            task_resolution_authority: None,
         }
     }
 

@@ -54,8 +54,10 @@ use astra_turn_core::agentic_post_tool_policy::{
 use astra_turn_core::agentic_turn_flow::{
     agentic_round_stall_preflight, append_explain_turn_batch,
 };
+use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::tool_result_semantics::ToolResultStatus;
 
 /// Persist schema-addressed deferred selections at the tool-result boundary.
 ///
@@ -359,20 +361,17 @@ fn pre_resolved_server_tool_terminal_records(
     // Admission/interception records never cross RuntimeToolExecutor. They
     // have always been owned by this shared loop's terminal projection.
     //
-    // A round record is normally selected by the typed owner set returned by
-    // the headless pipeline.  A non-executed record is also unambiguously
-    // shared-loop owned: a runtime route cannot have emitted a completion if
-    // no execution was admitted.  This second condition closes the preflight
-    // validation path (for example an invalid deferred carrier) even when a
-    // caller stopped before the owner set was materialized. Executed records
-    // remain owner-set gated so a RuntimeToolExecutor terminal is never
-    // duplicated.
+    // Round records are selected only by the typed owner set returned by the
+    // headless pipeline. A runtime route may establish terminal ownership and
+    // then return a non-executed rejection from its handler, so journal
+    // disposition is not evidence that the shared loop owns another terminal.
     let candidates = pre_execution_records
         .iter()
         .chain(round_records.iter().filter(|record| {
-            record.tool_call_id.as_deref().is_some_and(|id| {
-                shared_loop_terminal_call_ids.contains(id) || !record.was_executed()
-            })
+            record
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| shared_loop_terminal_call_ids.contains(id))
         }));
     for record in candidates {
         let Some(id) = record
@@ -615,7 +614,7 @@ fn fanout_completion_observation(args: &Value, output: &str) -> FanoutCompletion
 fn observe_foreground_fanout_completion(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
-    pre_resolved_results: &[(String, String)],
+    pre_resolved_results: &[HeadlessPreResolvedToolResult],
     edge_tool_round: &[EdgeToolExecResult],
 ) -> bool {
     let mut synthesize = false;
@@ -709,7 +708,7 @@ fn observe_foreground_fanout_completion(
         }
     };
     for result in edge_tool_round {
-        if result.tool == "agent_fanout" {
+        if result.tool == "agent_fanout" && result.status == "completed" {
             observe(&result.args, &result.output);
         }
     }
@@ -720,10 +719,16 @@ fn observe_foreground_fanout_completion(
         let Some(call_id) = call.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let Some((_, output)) = pre_resolved_results.iter().find(|(id, _)| id == call_id) else {
+        let Some(result) = pre_resolved_results
+            .iter()
+            .find(|result| result.call_id == call_id)
+        else {
             continue;
         };
-        observe(&tool_call_arguments_value(call), output);
+        if result.status != ToolResultStatus::Completed {
+            continue;
+        }
+        observe(&tool_call_arguments_value(call), &result.content);
     }
     synthesize
 }
@@ -750,7 +755,7 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
     host: &mut H,
     parent_run_id: Option<&str>,
     tool_calls: &[Value],
-    pre_resolved_results: &mut Vec<(String, String)>,
+    pre_resolved_results: &mut Vec<HeadlessPreResolvedToolResult>,
     edge_tool_round: &mut Vec<EdgeToolExecResult>,
 ) {
     for tool_call in tool_calls {
@@ -805,7 +810,7 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
                 );
                 continue;
             }
-            ControlToolRecovery::Recovered(recovered) => recovered,
+            ControlToolRecovery::Recovered(recovered) => *recovered,
         };
         // Host-owned control tools are resolved by the host, not by an edge
         // executor. Routing the recovered value back through `edge_tool_round`
@@ -816,8 +821,18 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         if let Some(index) = existing_row {
             edge_tool_round.remove(index);
         }
-        pre_resolved_results.retain(|(call_id, _)| call_id != tool_call_id);
-        pre_resolved_results.push((tool_call_id.to_string(), recovered.output));
+        pre_resolved_results.retain(|result| result.call_id != tool_call_id);
+        let status = match recovered.status.as_str() {
+            "completed" => ToolResultStatus::Completed,
+            "skipped" => ToolResultStatus::Skipped,
+            "failed" => ToolResultStatus::Failed,
+            _ => ToolResultStatus::Failed,
+        };
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            tool_call_id,
+            recovered.output,
+            status,
+        ));
         let recovery_kind = if existing_row.is_some() {
             "replaced unusable control-tool transport output with host-resolved result"
         } else {
@@ -2602,7 +2617,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     expected_owner_generation: state.current_run_owner_generation,
                 },
             );
+        let task_resolution_authority = state.hooks.completion_settlement.completion_action_window
+            .as_ref().filter(|window| window.consumed && window.matched)
+            .and_then(|window| {
+                let super::host::CompletionAction::OutcomeReconciliation { boundary_id } = &window.action else { return None; };
+                let [call] = all_tool_calls else { return None; };
+                let id = call.get("id").and_then(Value::as_str)?;
+                super::execution_phase::completion_action_match_label(state, &window.action, call)?;
+                astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority::for_admitted_call(boundary_id, id)
+            });
         let headless_outcome = super::super::agentic::headless_round::run_agentic_headless_tool_round_with_action_fence(HeadlessToolRoundCtx {
+            task_resolution_authority: task_resolution_authority.as_ref(),
             turn_index,
             session_turn: session_turn_number(state),
             quiet: headless_quiet,
@@ -2996,6 +3021,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     // scoped; ordinary completion-window reconciliation below intentionally
     // continues to consume only executor-produced outcomes.
     super::execution_phase::advance_rejected_work_settlement_recovery(state, round_records_start);
+    let reconciliation_boundary = super::execution_phase::task_resolution_boundary_id(host, state);
+    super::execution_phase::accept_task_resolution_after_tool_round(
+        state,
+        evo_records_before,
+        reconciliation_boundary.as_deref(),
+    )
+    .await;
     super::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
         state,
         evo_records_before,
@@ -3573,6 +3605,7 @@ mod tests {
             }
         })];
         let results = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
             args: json!({"skill_name":"parallel-review"}),
@@ -3608,6 +3641,7 @@ mod tests {
             }
         })];
         let results = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
             args: json!({"skill_name":"parallel-review"}),
@@ -3643,6 +3677,7 @@ mod tests {
             }
         })];
         let results = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "skill-call-1".into(),
             tool: "skill".into(),
             args: json!({"skill_name":"parallel-review"}),
@@ -3672,6 +3707,7 @@ mod tests {
             "function":{"name":"read_file","arguments":"{\"path\":\"notes.txt\"}"}
         })];
         let results = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "read-1".into(),
             tool: "read_file".into(),
             args: json!({"path":"notes.txt"}),
@@ -3711,6 +3747,7 @@ mod tests {
             },
         ];
         let edge = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "edge-1".into(),
             tool: "read_file".into(),
             args: json!({"path": "src/lib.rs"}),
@@ -3749,13 +3786,9 @@ mod tests {
 
         let projected_without_owner_snapshot =
             pre_resolved_server_tool_terminal_records(&[], &round_records, &HashSet::new(), &edge);
-        assert_eq!(
-            projected_without_owner_snapshot
-                .iter()
-                .filter_map(|record| record.tool_call_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["server-rejected-in-round"],
-            "a non-executed preflight rejection must still receive a shared terminal"
+        assert!(
+            projected_without_owner_snapshot.is_empty(),
+            "a rejected journal disposition cannot override the typed terminal owner"
         );
     }
 
@@ -4399,6 +4432,7 @@ mod tests {
         let mut fields = serde_json::Map::new();
         observation.insert_into(&mut fields);
         let structured = astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            execution_completion: None,
             request_id: "req-1".into(),
             tool: "a_tool_that_did_not_exist_when_the_loop_was_written".into(),
             args: serde_json::json!({}),
@@ -4962,6 +4996,7 @@ mod tests {
     #[test]
     fn terminal_foreground_fanout_receipt_opens_synthesis_boundary() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "fanout-call".into(),
             tool: "agent_fanout".into(),
             args: json!({"action":"start","target_count":2,"slots":[]}),
@@ -5141,7 +5176,11 @@ mod tests {
         assert!(!observe_foreground_fanout_completion(
             &mut state,
             &[start_call],
-            &[("fanout-start".into(), paginated)],
+            &[HeadlessPreResolvedToolResult::new(
+                "fanout-start",
+                paginated,
+                ToolResultStatus::Completed,
+            )],
             &[],
         ));
         assert_eq!(
@@ -5158,6 +5197,7 @@ mod tests {
         );
 
         let unrelated = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "other-page".into(),
             tool: "agent_fanout".into(),
             args: json!({"action":"get_results","group_id":"other-group"}),
@@ -5211,6 +5251,7 @@ mod tests {
             ),
         ] {
             let invalid_page = EdgeToolExecResult {
+                execution_completion: None,
                 request_id: request_id.into(),
                 tool: "agent_fanout".into(),
                 args: json!({"action":"get_results","group_id":"group-paged","slot_index":0,"offset":4096}),
@@ -5238,6 +5279,7 @@ mod tests {
         }
 
         let first_final_page = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "first-final-page".into(),
             tool: "agent_fanout".into(),
             args: json!({"action":"get_results","group_id":"group-paged","slot_index":0,"offset":4096}),
@@ -5269,6 +5311,7 @@ mod tests {
         );
 
         let second_final_page = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "second-final-page".into(),
             tool: "agent_fanout".into(),
             args: json!({"action":"get_results","group_id":"group-paged","slot_index":1,"offset":2048}),
@@ -5317,6 +5360,7 @@ mod tests {
         })
         .to_string();
         let recovered = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout".to_string(),
             tool: "agent_fanout".to_string(),
             args: args.clone(),
@@ -5328,7 +5372,9 @@ mod tests {
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
             .with_recovered_control_tool_result(
                 "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
+                    recovered,
+                )),
             );
         let tool_calls = vec![json!({
             "id": "call-fanout",
@@ -5353,7 +5399,11 @@ mod tests {
         assert!(edge_tool_round.is_empty());
         assert_eq!(
             pre_resolved_results,
-            vec![("call-fanout".to_string(), recovered_output)]
+            vec![HeadlessPreResolvedToolResult::new(
+                "call-fanout",
+                recovered_output,
+                ToolResultStatus::Completed,
+            )]
         );
         assert_eq!(host.recovered_control_requests.len(), 1);
     }
@@ -5376,18 +5426,21 @@ mod tests {
         })
         .to_string();
         let recovered = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout".to_string(),
             tool: "agent_fanout".to_string(),
             args: args.clone(),
             output: recovered_output.clone(),
             tool_result_fields: None,
-            status: "completed".to_string(),
+            status: "failed".to_string(),
             duration_ms: 3,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
             .with_recovered_control_tool_result(
                 "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
+                    recovered,
+                )),
             );
         let tool_calls = vec![json!({
             "id": "call-fanout",
@@ -5398,6 +5451,7 @@ mod tests {
             }
         })];
         let mut edge_tool_round = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout".to_string(),
             tool: "agent_fanout".to_string(),
             args: args.clone(),
@@ -5423,11 +5477,16 @@ mod tests {
         );
         assert_eq!(
             pre_resolved_results,
-            vec![("call-fanout".to_string(), recovered_output.clone())]
+            vec![HeadlessPreResolvedToolResult::new(
+                "call-fanout",
+                recovered_output.clone(),
+                ToolResultStatus::Failed,
+            )]
         );
         assert_eq!(host.recovered_control_requests.len(), 1);
-        let receipt: Value = serde_json::from_str(&pre_resolved_results[0].1).unwrap();
+        let receipt: Value = serde_json::from_str(&pre_resolved_results[0].content).unwrap();
         assert_eq!(receipt["status"], "started");
+        assert_eq!(pre_resolved_results[0].status, ToolResultStatus::Failed);
         assert_eq!(receipt["group_id"], "review-42");
     }
 
@@ -5451,6 +5510,7 @@ mod tests {
             "group_id": "run-parent-fanout-1"
         });
         let first_existing = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout-a".to_string(),
             tool: "agent_fanout".to_string(),
             args: args.clone(),
@@ -5465,6 +5525,7 @@ mod tests {
             duration_ms: 7,
         };
         let recovered_second = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout-b".to_string(),
             tool: "agent_fanout".to_string(),
             args: args.clone(),
@@ -5481,7 +5542,9 @@ mod tests {
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
             .with_recovered_control_tool_result(
                 "call-fanout-b",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered_second),
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
+                    recovered_second,
+                )),
             );
         let tool_calls = vec![json!({
             "id": "call-fanout-b",
@@ -5511,9 +5574,9 @@ mod tests {
             vec!["call-fanout-a"]
         );
         assert_eq!(pre_resolved_results.len(), 1);
-        assert_eq!(pre_resolved_results[0].0, "call-fanout-b");
+        assert_eq!(pre_resolved_results[0].call_id, "call-fanout-b");
         assert_eq!(
-            serde_json::from_str::<Value>(&pre_resolved_results[0].1).unwrap()["marker"],
+            serde_json::from_str::<Value>(&pre_resolved_results[0].content).unwrap()["marker"],
             "b"
         );
         assert_eq!(
@@ -5528,6 +5591,7 @@ mod tests {
     #[tokio::test]
     async fn missing_non_control_tool_row_is_not_recovered_by_host_state() {
         let recovered = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-fanout".to_string(),
             tool: "agent_fanout".to_string(),
             args: json!({"action": "get_results", "group_id": "review"}),
@@ -5539,7 +5603,9 @@ mod tests {
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
             .with_recovered_control_tool_result(
                 "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
+                    recovered,
+                )),
             );
         let tool_calls = vec![json!({
             "id": "call-bash",

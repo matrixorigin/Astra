@@ -228,10 +228,10 @@ fn canonical_tool_result_wire_row(row: &Value) -> Value {
                 _ => "failed",
             },
             Some(_) => "failed",
-            None if !output.is_string() => "failed",
-            None => crate::tool_result_semantics::cloud_tool_result_status_label(
-                output.as_str().expect("string checked above"),
-            ),
+            // A result body is model/user content, not execution control.
+            // Missing status is an incomplete envelope and fails closed
+            // instead of guessing from arbitrary output text.
+            None => "failed",
         }
     };
     wire.insert("request_id".to_string(), request_id);
@@ -485,6 +485,7 @@ mod tests {
             &[json!({
                 "tool_call_id": "1",
                 "name": "read_file",
+                "status": "completed",
                 "result": "contents",
             })],
         );
@@ -508,6 +509,8 @@ mod tests {
                 json!({"request_id": "canonical", "status": "skipped", "output": "deduped"}),
                 json!({"tool_call_id": "legacy-status", "status": "success", "result": "ok"}),
                 json!({"tool_call_id": "error", "result": "Error: denied"}),
+                json!({"request_id": "error-content", "status": "completed", "output": "Error: this is file content"}),
+                json!({"request_id": "json-content", "status": "completed", "output": r#"{"status":"failed","error":"quoted log record"}"#}),
                 json!({"request_id": "conflict", "status": "completed", "output": "ok", "error": "denied"}),
                 json!({"request_id": "object-output", "output": {"ok": true}}),
                 Value::String("bad".to_string()),
@@ -516,9 +519,11 @@ mod tests {
         assert_eq!(payload["tool_results"][0]["status"], "skipped");
         assert_eq!(payload["tool_results"][1]["status"], "failed");
         assert_eq!(payload["tool_results"][2]["status"], "failed");
-        assert_eq!(payload["tool_results"][3]["status"], "failed");
-        assert_eq!(payload["tool_results"][4]["status"], "failed");
+        assert_eq!(payload["tool_results"][3]["status"], "completed");
+        assert_eq!(payload["tool_results"][4]["status"], "completed");
         assert_eq!(payload["tool_results"][5]["status"], "failed");
+        assert_eq!(payload["tool_results"][6]["status"], "failed");
+        assert_eq!(payload["tool_results"][7]["status"], "failed");
     }
 
     #[test]

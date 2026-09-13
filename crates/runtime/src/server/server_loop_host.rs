@@ -5431,11 +5431,26 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         mut admission: crate::turn::agentic_loop::host::ToolCallAdmission,
     ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
-        if self.work_lifecycle_is_active(state) {
+        let runtime_control_kind = if matches!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .map(|window| &window.action),
+            Some(crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. })
+        ) {
+            Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::OutcomeReconciliation)
+        } else if self.work_lifecycle_is_active(state) {
+            Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
+        } else {
+            None
+        };
+        if let Some(kind) = runtime_control_kind {
             for invocation in &mut admission.admitted {
                 if let Ok(Some(runtime_control)) = astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::runtime_control_from_carrier(
                     invocation.physical_provider_call(),
-                    astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement,
+                    kind,
                 ) {
                     *invocation = runtime_control;
                 }
@@ -10649,6 +10664,7 @@ impl ServerAgenticLoopHost {
         self.emit_edge_executor_offline_events(request_id, tool_name, &output, &fields);
 
         astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool_name.to_string(),
             args: args.clone(),
@@ -11494,6 +11510,7 @@ impl ServerAgenticLoopHost {
                 fields.insert("retryable".to_string(), Value::Bool(retryable));
                 fields.insert("executed".to_string(), Value::Bool(false));
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id,
                     tool: tool_name,
                     args,
@@ -11534,6 +11551,7 @@ impl ServerAgenticLoopHost {
         fields.insert("retryable".to_string(), Value::Bool(true));
         fields.insert("executed".to_string(), Value::Bool(false));
         EdgeToolExecResult {
+            execution_completion: None,
             request_id,
             tool: tool_name,
             args,
@@ -11572,6 +11590,7 @@ impl ServerAgenticLoopHost {
         fields.insert("retryable".to_string(), Value::Bool(false));
         fields.insert("executed".to_string(), Value::Null);
         EdgeToolExecResult {
+            execution_completion: None,
             request_id,
             tool: tool_name,
             args,
@@ -11736,6 +11755,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     request_id.clone(),
                     EdgeToolExecResult {
+                        execution_completion: None,
                         request_id: request_id.clone(),
                         tool: tool_name.clone(),
                         args: args.clone(),
@@ -11777,6 +11797,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     request_id.clone(),
                     EdgeToolExecResult {
+                        execution_completion: None,
                         request_id: request_id.clone(),
                         tool: tool_name.clone(),
                         args: args.clone(),
@@ -11811,6 +11832,7 @@ impl ServerAgenticLoopHost {
             results_by_id.insert(
                 request_id.clone(),
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.clone(),
                     tool: tool_name.clone(),
                     args: args.clone(),
@@ -12074,6 +12096,7 @@ impl ServerAgenticLoopHost {
                         results_by_id.insert(
                             request_id.clone(),
                             EdgeToolExecResult {
+                                execution_completion: None,
                                 tool_result_fields: Some(self.edge_result_fields_with_runtime(
                                     &request_id,
                                     &tool_name,
@@ -12457,6 +12480,9 @@ impl ServerAgenticLoopHost {
                     }
                 };
                 let callback_key = tool_callback_key(&identity);
+                // Persist the canonical request, not the host's later
+                // transient "already committed" projection marker.
+                let dispatch_payload = tool_request_event.to_string();
                 let admission = interaction_sink
                     .commit_guarded_tool_request(GuardedToolRequestCommit {
                         action_id,
@@ -12471,7 +12497,7 @@ impl ServerAgenticLoopHost {
                 // could commit between the final offer check and the ledger
                 // write.
                 drop(policy_leases);
-                let committed_event = match admission {
+                let mut committed_event = match admission {
                     Ok(
                         GuardedToolRequestCommitOutcome::Committed { event }
                         | GuardedToolRequestCommitOutcome::AckRecoveredCommitted { event },
@@ -12621,6 +12647,86 @@ impl ServerAgenticLoopHost {
                     stop_after_started_calls = true;
                     break;
                 }
+                // Explicit local-only hosts retain callback delivery without
+                // durable proof. A configured durable owner may not silently
+                // downgrade to that mode after an admission failure.
+                if committed_event.is_some()
+                    && let Some(service) = self.edge_dispatch_service.as_ref()
+                {
+                    use astra_services::multi_agent::{
+                        EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError,
+                    };
+                    let dispatch_admission = service
+                        .admit_and_claim_direct_dispatch(
+                            &identity,
+                            &selected_edge_agent_id,
+                            &dispatch_payload,
+                        )
+                        .await;
+                    let dispatch_error = match dispatch_admission {
+                        Ok(EdgeDirectDispatchAdmission::Claimed) => None,
+                        Ok(EdgeDirectDispatchAdmission::Observing) => {
+                            committed_event = None;
+                            None
+                        }
+                        Ok(EdgeDirectDispatchAdmission::Terminal(result_json)) => {
+                            match canonical_edge_dispatch_result(
+                                &identity,
+                                &selected_edge_agent_id,
+                                &result_json,
+                            ) {
+                                Ok((body, execution_completion)) => {
+                                    self.edge_callback_ledger
+                                        .lock()
+                                        .await
+                                        .entry(callback_key.clone())
+                                        .or_insert_with(|| {
+                                            json!({
+                                                "kind": "tool_result", "user_id": self.user_id,
+                                                "session_id": self.session_id, "run_id": run_id,
+                                                "turn_chain_id": turn_chain_id, "body": body,
+                                                "execution_completion": execution_completion,
+                                            })
+                                        });
+                                    committed_event = None;
+                                    None
+                                }
+                                Err(error) => {
+                                    Some(EdgeDispatchAdmissionError::OutcomeUnknown(error))
+                                }
+                            }
+                        }
+                        Err(error) => Some(error),
+                    };
+                    if let Some(error) = dispatch_error {
+                        astra_turn_core::edge_ledger::cancel_expected_ledger_entry(
+                            &self.edge_callback_ledger,
+                            &callback_key,
+                        );
+                        if matches!(error, EdgeDispatchAdmissionError::OutcomeUnknown(_)) {
+                            let unknown = self.edge_action_outcome_unknown_result(tc);
+                            results_by_id.insert(unknown.request_id.clone(), unknown);
+                        }
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_admission_failed",
+                            &format!("Durable Edge dispatch could not be established: {error}"),
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        stop_after_started_calls = true;
+                        break;
+                    }
+                }
                 started_call_ids.insert(request_id.to_string());
                 if committed_event.is_some() {
                     for event in progress_events {
@@ -12693,6 +12799,9 @@ impl ServerAgenticLoopHost {
                     .unwrap_or("")
                     .to_string();
                 let tool_result = delivery.tool_results.first().cloned();
+                let execution_completion = tool_result
+                    .as_ref()
+                    .and_then(|result| result.execution_completion.clone());
                 let status = tool_result
                     .as_ref()
                     .map(|result| result.status.clone())
@@ -12719,6 +12828,7 @@ impl ServerAgenticLoopHost {
                 results_by_id.insert(
                     id.clone(),
                     EdgeToolExecResult {
+                        execution_completion,
                         request_id: id,
                         tool: tool_name,
                         args,
@@ -12940,22 +13050,23 @@ impl ServerAgenticLoopHost {
             }
         };
 
-        let body = match canonical_edge_dispatch_result(identity, edge_agent_id, &result_json) {
-            Ok(body) => body,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::server_loop_host",
-                    user_id = %self.user_id,
-                    session_id = %self.session_id,
-                    run_id = %identity.run_id,
-                    turn_chain_id = %identity.turn_chain_id,
-                    request_id = %identity.request_id,
-                    error = %error,
-                    "edge dispatch fallback rejected a non-canonical durable result"
-                );
-                return delivery;
-            }
-        };
+        let (body, execution_completion) =
+            match canonical_edge_dispatch_result(identity, edge_agent_id, &result_json) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::server_loop_host",
+                        user_id = %self.user_id,
+                        session_id = %self.session_id,
+                        run_id = %identity.run_id,
+                        turn_chain_id = %identity.turn_chain_id,
+                        request_id = %identity.request_id,
+                        error = %error,
+                        "edge dispatch fallback rejected a non-canonical durable result"
+                    );
+                    return delivery;
+                }
+            };
         let key = tool_callback_key(identity);
         {
             let mut ledger = self.edge_callback_ledger.lock().await;
@@ -12967,6 +13078,7 @@ impl ServerAgenticLoopHost {
                     "run_id": identity.run_id.as_str(),
                     "turn_chain_id": identity.turn_chain_id.as_str(),
                     "body": body,
+                    "execution_completion": execution_completion,
                 })
             });
         }
@@ -13017,7 +13129,7 @@ impl ServerAgenticLoopHost {
             .await
         {
             Ok(Some(result_json)) => {
-                let body = match canonical_edge_dispatch_result(
+                let (body, execution_completion) = match canonical_edge_dispatch_result(
                     identity,
                     edge_agent_id,
                     &result_json,
@@ -13046,6 +13158,7 @@ impl ServerAgenticLoopHost {
                         "run_id": identity.run_id.as_str(),
                         "turn_chain_id": identity.turn_chain_id.as_str(),
                         "body": body,
+                        "execution_completion": execution_completion,
                     }),
                 );
                 true
@@ -13379,7 +13492,19 @@ impl ServerAgenticLoopHost {
         // target only after the provider response, from typed selection
         // evidence and the current catalog digest; normal admission and
         // execution still apply to that target.
-        if !tools.is_empty() {
+        let reconciliation_active = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .is_some_and(|window| {
+                matches!(
+                    window.action,
+                    crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
+                )
+            })
+            && !restricted_tools.contains("submit_task_resolution");
+        if !tools.is_empty() || reconciliation_active {
             // Keep the stable resident schemas contiguous. The carrier is
             // part of that stable prefix; dynamic schemas remain after it so
             // their per-turn churn cannot move the cache breakpoint.
@@ -13493,6 +13618,25 @@ impl ServerAgenticLoopHost {
             self.resolved_context_window,
             state,
         );
+        if state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .is_some_and(|window| {
+                matches!(
+                    window.action,
+                    crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
+                )
+            })
+            && current_deferred_tool_schemas
+                .iter()
+                .any(|schema| tool_schema_name(schema) == Some("submit_task_resolution"))
+        {
+            // A runtime-required transition does not depend on tool_search;
+            // its exact contract is carried by the completion-action hint.
+            activatable_deferred_tool_names.insert("submit_task_resolution".into());
+        }
         if state.hooks.completion_settlement.work_settlement_only {
             activatable_deferred_tool_names.retain(|name| name == "settle_work_item");
         }
@@ -18867,38 +19011,21 @@ fn canonical_edge_dispatch_result(
     identity: &astra_services::multi_agent::EdgeDispatchIdentity,
     expected_edge_agent_id: &str,
     result_json: &str,
-) -> Result<Value, String> {
-    let result = serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json)
-        .map_err(|error| format!("invalid ToolResultRequest JSON: {error}"))?;
-    if result.session_id != identity.session_id
-        || result.run_id != identity.run_id
-        || result.turn_chain_id != identity.turn_chain_id
-        || result.request_id != identity.request_id
-    {
-        return Err("durable tool result identity does not match its dispatch".to_string());
-    }
-    if result.edge_agent_id != expected_edge_agent_id {
-        return Err("durable tool result executor custody does not match its dispatch".to_string());
-    }
-    astra_thin_client::tool_result_status_is_error(&result.status)
-        .ok_or_else(|| "durable tool result status is not canonical".to_string())?;
-    let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
-        astra_thin_client::ToolResultHashParts {
-            session_id: &result.session_id,
-            run_id: &result.run_id,
-            turn_chain_id: &result.turn_chain_id,
-            request_id: &result.request_id,
-            edge_agent_id: &result.edge_agent_id,
-            status: &result.status,
-            output: &result.output,
-            duration_ms: result.duration_ms,
-            tool_result_fields: result.tool_result_fields.as_ref(),
-        },
-    );
-    if result.result_hash != expected_hash {
-        return Err("durable tool result hash does not match its payload".to_string());
-    }
+) -> Result<
+    (
+        Value,
+        astra_turn_types::task_resolution::ToolExecutionEvidenceRef,
+    ),
+    String,
+> {
+    let result = super::tool_execution_service::canonical_edge_completion(
+        identity,
+        expected_edge_agent_id,
+        result_json,
+    )?;
+    let reference = super::tool_execution_service::edge_completion_reference(identity, &result)?;
     serde_json::to_value(result)
+        .map(|body| (body, reference))
         .map_err(|error| format!("could not project canonical durable tool result: {error}"))
 }
 
@@ -18907,6 +19034,66 @@ fn canonical_edge_dispatch_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_edge_evidence_rejects_foreign_custody_and_changed_payload() {
+        use astra_thin_client::{ToolResultRequest, ToolResultRequestParts};
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "user", "session", "run", "chain", "call",
+        );
+        let parts = ToolResultRequestParts {
+            session_id: "session".into(),
+            run_id: "run".into(),
+            turn_chain_id: "chain".into(),
+            request_id: "call".into(),
+            edge_agent_id: "edge".into(),
+            status: "completed".into(),
+            output: "Error: this is successful file content".into(),
+            duration_ms: 1,
+            tool_result_fields: None,
+        };
+        let accepted = ToolResultRequest::new_with_hash(parts.clone());
+        assert!(
+            canonical_edge_dispatch_result(
+                &identity,
+                "edge",
+                &serde_json::to_string(&accepted).unwrap()
+            )
+            .is_ok()
+        );
+        for field in ["session", "run", "chain", "request", "executor", "status"] {
+            let mut altered = parts.clone();
+            match field {
+                "session" => altered.session_id = "foreign".into(),
+                "run" => altered.run_id = "foreign".into(),
+                "chain" => altered.turn_chain_id = "foreign".into(),
+                "request" => altered.request_id = "foreign".into(),
+                "executor" => altered.edge_agent_id = "foreign".into(),
+                "status" => altered.status = "invented".into(),
+                _ => unreachable!(),
+            }
+            let altered = ToolResultRequest::new_with_hash(altered);
+            assert!(
+                canonical_edge_dispatch_result(
+                    &identity,
+                    "edge",
+                    &serde_json::to_string(&altered).unwrap()
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        let mut tampered = accepted;
+        tampered.output.push_str(" altered");
+        assert!(
+            canonical_edge_dispatch_result(
+                &identity,
+                "edge",
+                &serde_json::to_string(&tampered).unwrap()
+            )
+            .is_err()
+        );
+    }
     use crate::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
     #[cfg(feature = "e2e-hooks")]
@@ -22555,6 +22742,148 @@ mod tests {
         result_json: Option<String>,
     }
 
+    #[derive(Clone, Copy)]
+    enum HostAdmissionFixture {
+        Claimed,
+        Rejected,
+        OutcomeUnknown,
+    }
+
+    struct RecordingHostEdgeDispatch {
+        mode: HostAdmissionFixture,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        admitted: std::sync::atomic::AtomicBool,
+        result_json: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDispatchService for RecordingHostEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Err("host fixture uses atomic direct admission".to_string())
+        }
+
+        async fn admit_and_claim_direct_dispatch(
+            &self,
+            identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            edge_agent_id: &str,
+            payload_json: &str,
+        ) -> Result<
+            astra_services::multi_agent::EdgeDirectDispatchAdmission,
+            astra_services::multi_agent::EdgeDispatchAdmissionError,
+        > {
+            assert!(!edge_agent_id.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(payload_json)
+                    .expect("host must admit its canonical request payload")
+                    .get("request_id")
+                    .and_then(Value::as_str),
+                Some(identity.request_id.as_str())
+            );
+            self.events.lock().expect("host events").push("admit");
+            match self.mode {
+                HostAdmissionFixture::Claimed => {
+                    self.admitted.store(true, Ordering::SeqCst);
+                    Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed)
+                }
+                HostAdmissionFixture::Rejected => Err(
+                    astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(
+                        "simulated admission rejection".to_string(),
+                    ),
+                ),
+                HostAdmissionFixture::OutcomeUnknown => Err(
+                    astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
+                        "simulated ambiguous admission".to_string(),
+                    ),
+                ),
+            }
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn deliver_result(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            result_json: &str,
+        ) -> Result<bool, String> {
+            assert!(
+                self.admitted.load(Ordering::SeqCst),
+                "durable delivery requires prior admission"
+            );
+            self.events.lock().expect("host events").push("deliver");
+            *self.result_json.lock().expect("durable result") = Some(result_json.to_string());
+            Ok(true)
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn wait_result(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _timeout: Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(self.result_json.lock().expect("durable result").clone())
+        }
+
+        async fn cleanup_stale(&self, _older_than: Duration) -> Result<u64, String> {
+            Err("not used".to_string())
+        }
+    }
+
+    struct RecordingProjectionInteractionSink {
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        durable_delivery: Option<(
+            Arc<RecordingHostEdgeDispatch>,
+            astra_services::multi_agent::EdgeDispatchIdentity,
+            String,
+            String,
+        )>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for RecordingProjectionInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            Ok(GuardedToolRequestCommitOutcome::Committed {
+                event: request.event,
+            })
+        }
+
+        async fn deliver_committed_tool_request(&self, _event: Value) -> Result<(), String> {
+            self.events.lock().expect("host events").push("project");
+            if let Some((dispatch, identity, edge_agent_id, result_json)) = &self.durable_delivery {
+                dispatch
+                    .deliver_result(identity, edge_agent_id, result_json)
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
         async fn insert_dispatch(
@@ -22602,6 +22931,155 @@ mod tests {
 
         async fn cleanup_stale(&self, _older_than: Duration) -> Result<u64, String> {
             Err("not used".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn task_resolution_mixed_authorities_survive_executor_recreation() {
+        use astra_services::session_journal::ToolCallRecord;
+        use astra_turn_types::task_resolution::{
+            TaskResolutionAssessment, TaskResolutionConclusion,
+        };
+        use astra_turn_types::{
+            DurableToolReference, ToolInvocationCompletionRef, ToolInvocationDecision,
+            ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationResultPayload,
+            ToolInvocationTerminalOutcome,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
+        let identity =
+            ToolInvocationIdentity::new("user1", "sess1", "run1", "chain", "failed").unwrap();
+        let decision = ToolInvocationDecision::new(&json!({"allowed": true})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "v1").unwrap(),
+            &json!({"command": "first attempt"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        ledger
+            .prepare(&identity, &fingerprint, &decision)
+            .await
+            .unwrap();
+        ledger.dispatch(&identity, "owner", None).await.unwrap();
+        let row = ledger
+            .complete(
+                &identity,
+                "owner",
+                &ToolInvocationTerminalOutcome::Failed {
+                    result: ToolInvocationResultPayload {
+                        output: "failed attempt".into(),
+                        metadata: Default::default(),
+                        exit_semantics: None,
+                    },
+                    error_kind: None,
+                    retryable: false,
+                },
+            )
+            .await
+            .unwrap();
+        let edge_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "user1", "sess1", "run1", "chain", "later",
+        );
+        let edge_result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "sess1".into(),
+                run_id: "run1".into(),
+                turn_chain_id: "chain".into(),
+                request_id: "later".into(),
+                edge_agent_id: "edge".into(),
+                status: "completed".into(),
+                output: "observed target".into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        let reference = crate::server::tool_execution_service::edge_completion_reference(
+            &edge_identity,
+            &edge_result,
+        )
+        .unwrap();
+        let records = vec![
+            ToolCallRecord {
+                tool_call_id: Some("failed".into()),
+                round: Some(0),
+                execution_completion: Some(
+                    ToolInvocationCompletionRef::from_record(&row)
+                        .unwrap()
+                        .into(),
+                ),
+                ok: true,
+                ..Default::default()
+            },
+            ToolCallRecord {
+                tool_call_id: Some("later".into()),
+                round: Some(1),
+                execution_completion: Some(reference),
+                ok: false,
+                result_class: Some("execution_error".into()),
+                ..Default::default()
+            },
+        ];
+        let assessment = TaskResolutionAssessment {
+            scope: "intent".into(),
+            boundary_id: "boundary".into(),
+            verification_target: "requested target".into(),
+            failed_call_ids: vec!["failed".into()],
+            evidence_call_ids: vec!["later".into()],
+            conclusion: TaskResolutionConclusion::Supported,
+            rationale: "Later direct observation supports target.".into(),
+            remaining_gaps: vec![],
+        };
+        let canonical = serde_json::to_string(&edge_result).unwrap();
+        let shared = Arc::new(StaticWaitResultEdgeDispatch {
+            result_json: Some(canonical.clone()),
+        });
+        for _ in 0..2 {
+            let mut executor = runtime_tool_executor_with_agent_context(workspace.path())
+                .with_tool_execution_service(
+                    crate::server::tool_execution_service::ToolExecutionService::builder()
+                        .edge_dispatch_service(shared.clone())
+                        .build(),
+                );
+            executor.set_invocation_ledger(ledger.clone());
+            assert_eq!(
+                executor
+                    .validate_task_resolution_evidence(
+                        &assessment,
+                        "intent",
+                        "boundary",
+                        "run1",
+                        "chain",
+                        &records
+                    )
+                    .await,
+                Ok(())
+            );
+        }
+        let mut tampered = edge_result.clone();
+        tampered.output = "different observation".into();
+        for result_json in [None, Some(serde_json::to_string(&tampered).unwrap())] {
+            let mut executor = runtime_tool_executor_with_agent_context(workspace.path())
+                .with_tool_execution_service(
+                    crate::server::tool_execution_service::ToolExecutionService::builder()
+                        .edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+                            result_json,
+                        }))
+                        .build(),
+                );
+            executor.set_invocation_ledger(ledger.clone());
+            assert!(
+                executor
+                    .validate_task_resolution_evidence(
+                        &assessment,
+                        "intent",
+                        "boundary",
+                        "run1",
+                        "chain",
+                        &records
+                    )
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -29947,6 +30425,153 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn host_claims_durable_edge_dispatch_before_projection() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-host-admit",
+            "s-host-admit",
+            "run-host-admit",
+            "chain-host-admit",
+            "read-host-admit",
+        );
+        let durable_result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-process-42".to_string(),
+                status: "completed".to_string(),
+                output: "durable host result".to_string(),
+                duration_ms: 7,
+                tool_result_fields: None,
+            },
+        );
+        let dispatch = Arc::new(RecordingHostEdgeDispatch {
+            mode: HostAdmissionFixture::Claimed,
+            events: events.clone(),
+            admitted: std::sync::atomic::AtomicBool::new(false),
+            result_json: std::sync::Mutex::new(None),
+        });
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-host-admit".to_string(),
+            "s-host-admit".to_string(),
+        )
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+        .with_edge_dispatch_service(dispatch.clone())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        host.set_interaction_sink(Arc::new(RecordingProjectionInteractionSink {
+            events: events.clone(),
+            durable_delivery: Some((
+                dispatch,
+                identity,
+                "edge-process-42".to_string(),
+                serde_json::to_string(&durable_result).expect("serialize durable result"),
+            )),
+        }));
+        let call = json!({
+            "id": "read-host-admit",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.txt","timeout":0.001}"#}
+        });
+        let context = test_edge_action_context("u-host-admit", "run-host-admit").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger("run-host-admit", "chain-host-admit", &[call], &context)
+            .await;
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "completed");
+        assert!(matches!(
+            outcome.results[0].execution_completion.as_ref(),
+            Some(astra_turn_types::task_resolution::ToolExecutionEvidenceRef::EdgeDispatch(_))
+        ));
+        assert_eq!(
+            events.lock().expect("host events").as_slice(),
+            ["admit", "project", "deliver"],
+            "durable claim must linearize before client projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_durable_edge_admission_failure_never_projects() {
+        for mode in [
+            HostAdmissionFixture::Rejected,
+            HostAdmissionFixture::OutcomeUnknown,
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let dispatch = Arc::new(RecordingHostEdgeDispatch {
+                mode,
+                events: events.clone(),
+                admitted: std::sync::atomic::AtomicBool::new(false),
+                result_json: std::sync::Mutex::new(None),
+            });
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-host-denied".to_string(),
+                "s-host-denied".to_string(),
+            )
+            .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+            .with_edge_dispatch_service(dispatch)
+            .build();
+            host.install_runtime_tool_schemas(
+                vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                Default::default(),
+            );
+            host.set_interaction_sink(Arc::new(RecordingProjectionInteractionSink {
+                events: events.clone(),
+                durable_delivery: None,
+            }));
+            let call = json!({
+                "id": "read-host-denied",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"a.txt"}"#}
+            });
+            let context = test_edge_action_context("u-host-denied", "run-host-denied").await;
+
+            let outcome = host
+                .deliver_edge_tools_via_ledger(
+                    "run-host-denied",
+                    "chain-host-denied",
+                    &[call],
+                    &context,
+                )
+                .await;
+
+            assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
+            assert_eq!(outcome.results.len(), 1);
+            assert!(outcome.results[0].execution_completion.is_none());
+            assert_eq!(
+                events.lock().expect("host events").as_slice(),
+                ["admit"],
+                "failed or ambiguous durable admission must not project"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn already_committed_edge_request_without_custody_fails_closed_without_redelivery() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -35587,6 +36212,63 @@ mod tests {
     }
 
     #[test]
+    fn task_resolution_carrier_requires_window_and_keeps_resident_schemas() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user".into(),
+            "session".into(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        let before = host.visible_turn_tools(&mut state);
+        let carrier = json!({
+            "id": "assessment", "type": "function", "function": {
+                "name": "invoke_tool",
+                "arguments": json!({"name": "submit_task_resolution", "arguments": {"boundary_id": "boundary"}}).to_string()
+            }
+        });
+        let admitted = |state: &AgenticLoopState, host: &ServerAgenticLoopHost| {
+            host.canonicalize_tool_admission_for_state(
+                state,
+                crate::turn::agentic::tool_interception::admit_tool_calls(
+                    std::slice::from_ref(&carrier),
+                    Some("tool_calls"),
+                ),
+            )
+        };
+        assert!(admitted(&state, &host).admitted.is_empty());
+        state.hooks.completion_settlement.completion_action_window =
+            Some(astra_turn_types::CompletionActionWindow {
+                action: crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation {
+                    boundary_id: "boundary".into(),
+                },
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let after = host.visible_turn_tools(&mut state);
+        assert_eq!(
+            before, after,
+            "reconciliation must not insert the target schema into tools[]"
+        );
+        let active = admitted(&state, &host);
+        assert_eq!(active.admitted.len(), 1);
+        assert_eq!(active.admitted[0].runtime_control_kind(), Some(
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::OutcomeReconciliation));
+        assert_eq!(active.admitted[0].physical_provider_call(), &carrier);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                active.admitted[0].logical_target_call()
+            ),
+            Some("submit_task_resolution")
+        );
+    }
+
+    #[test]
     fn active_work_attempt_authorizes_only_its_settlement_carrier() {
         let carrier = json!({
             "id": "call-active-settle",
@@ -37367,6 +38049,7 @@ mod tests {
     #[tokio::test]
     async fn server_host_mock_tool_response() {
         let tools = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "r1".to_string(),
             tool: "bash".to_string(),
             args: json!({"command": "echo hello"}),

@@ -68,7 +68,7 @@ pub(crate) async fn run_local_tool_policy_preflight(
 }
 
 pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(
+    let mut result = astra_tools::ToolResult::error(
         json!({
             "status": "failed",
             "error": format!(
@@ -78,7 +78,16 @@ pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
             "retryable": false,
         })
         .to_string(),
-    )
+    );
+    result.metadata = Some(serde_json::Map::from_iter([
+        (
+            "error_kind".to_string(),
+            json!(astra_core::ErrorKind::ToolNotFound.as_str()),
+        ),
+        ("disposition".to_string(), json!("rejected")),
+        ("execution_started".to_string(), json!(false)),
+    ]));
+    result
 }
 
 pub(crate) fn spawn_resource_tool_call_recording(
@@ -280,6 +289,13 @@ mod tests {
         assert!(!result.output.contains("mo_query"));
         assert!(!result.output.contains("powershell"));
         assert!(error.contains("current runtime tool surface"));
+        let metadata = result.metadata.expect("typed rejection metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
     }
 
     #[test]

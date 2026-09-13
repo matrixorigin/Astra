@@ -1727,6 +1727,7 @@ mod tests {
                         expected_owner_generation: 0,
                     },
                 ),
+                None,
             )
             .await;
         assert!(
@@ -1767,6 +1768,7 @@ mod tests {
                         expected_owner_generation: 0,
                     },
                 ),
+                None,
             )
             .await;
         assert!(stale.pending.is_none());

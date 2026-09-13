@@ -56,6 +56,11 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "notify", NotifyToolHandler);
     register_handler_or_log!(
         engine,
+        "submit_task_resolution",
+        SubmitTaskResolutionToolHandler
+    );
+    register_handler_or_log!(
+        engine,
         "web_search",
         DefaultExecutorToolHandler { name: "web_search" }
     );
@@ -228,6 +233,80 @@ impl ToolHandler<RuntimeToolExecutor> for SettleWorkItemToolHandler {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct GetAgentInfoToolHandler;
+
+struct SubmitTaskResolutionToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for SubmitTaskResolutionToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_invocation(context, args, ToolInvocationMetadata::default(), cancel)
+            .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        _context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        let reject = |reason: &str| astra_tools::ToolResult {
+            output: serde_json::json!({"status": "rejected", "reason": reason}).to_string(),
+            is_error: true,
+            exit_semantics: None,
+            metadata: Some(serde_json::Map::from_iter([
+                ("disposition".into(), serde_json::json!("rejected")),
+                ("execution_started".into(), serde_json::json!(false)),
+            ])),
+        };
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("submit_task_resolution", false);
+        }
+        let (Some(authority), Some(call_id), Some(chain_id)) = (
+            invocation.task_resolution_authority,
+            invocation.tool_call_id,
+            invocation.turn_chain_id,
+        ) else {
+            return reject("No active reconciliation authority for this invocation");
+        };
+        if authority.for_call(call_id).is_none() {
+            return reject("Reconciliation authority does not match this invocation");
+        }
+        let boundary_id = authority.boundary_id();
+        let Ok(proposal) = serde_json::from_value::<
+            astra_turn_types::task_resolution::TaskResolutionProposal,
+        >(args.clone()) else {
+            return reject("Invalid structured task assessment");
+        };
+        let assessment = astra_turn_types::task_resolution::TaskResolutionAssessment {
+            scope: chain_id.to_owned(),
+            boundary_id: boundary_id.to_owned(),
+            verification_target: proposal.verification_target,
+            failed_call_ids: proposal.failed_call_ids,
+            evidence_call_ids: proposal.evidence_call_ids,
+            conclusion: proposal.conclusion,
+            rationale: proposal.rationale,
+            remaining_gaps: proposal.remaining_gaps,
+        };
+        if let Err(error) = astra_turn_core::evaluation::task_resolution::validate_assessment_header(
+            &assessment,
+            chain_id,
+            boundary_id,
+        ) {
+            return reject(&error.to_string());
+        }
+        // Echo the typed proposal, not an acceptance or success receipt. The
+        // shared loop validates durable evidence before retaining an assessment.
+        astra_tools::ToolResult::text(
+            serde_json::to_string(&assessment).expect("typed assessment serializes"),
+        )
+    }
+}
 
 #[async_trait]
 impl ToolHandler<RuntimeToolExecutor> for GetAgentInfoToolHandler {
@@ -1435,6 +1514,76 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn task_resolution_submission_requires_exact_local_authority() {
+        use astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority;
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "user".into(),
+            "session".into(),
+            None,
+            None,
+        );
+        let args = serde_json::json!({
+            "verification_target": "artifact",
+            "failed_call_ids": ["failed"], "evidence_call_ids": [],
+            "conclusion": "unknown", "rationale": "No later verification", "remaining_gaps": ["verify artifact"]
+        });
+        let handler = SubmitTaskResolutionToolHandler;
+        let denied = handler.execute(&executor, &args, None).await;
+        assert!(denied.is_error);
+        assert_eq!(denied.metadata.unwrap()["execution_started"], false);
+        let authority =
+            TaskResolutionSubmissionAuthority::for_admitted_call("boundary", "call").unwrap();
+        let metadata = ToolInvocationMetadata {
+            tool_call_id: Some("call"),
+            turn_chain_id: Some("chain"),
+            task_resolution_authority: Some(&authority),
+            ..Default::default()
+        };
+        let accepted = handler
+            .execute_invocation(&executor, &args, metadata, None)
+            .await;
+        assert!(!accepted.is_error);
+        let mut expected = args.clone();
+        expected["scope"] = serde_json::json!("chain");
+        expected["boundary_id"] = serde_json::json!("boundary");
+        assert_eq!(
+            serde_json::from_str::<Value>(&accepted.output).unwrap(),
+            expected
+        );
+        // A successful submission preserves unknown; it is not a success receipt.
+        for (field, value) in [("scope", "other-chain"), ("boundary_id", "stale")] {
+            let mut invalid = args.clone();
+            invalid[field] = serde_json::json!(value);
+            assert!(
+                handler
+                    .execute_invocation(&executor, &invalid, metadata, None)
+                    .await
+                    .is_error
+            );
+        }
+        let sibling = ToolInvocationMetadata {
+            tool_call_id: Some("sibling"),
+            ..metadata
+        };
+        assert!(
+            handler
+                .execute_invocation(&executor, &args, sibling, None)
+                .await
+                .is_error
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            handler
+                .execute_invocation(&executor, &args, metadata, Some(&cancelled))
+                .await
+                .is_error
+        );
+    }
 
     #[test]
     fn server_direct_default_executor_handlers_follow_shared_contract() {

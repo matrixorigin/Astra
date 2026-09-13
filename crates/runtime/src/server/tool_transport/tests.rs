@@ -1293,10 +1293,15 @@ async fn unknown_tool_is_denied_before_local_transport() {
         .await;
 
     assert!(result.is_error, "{result:?}");
-    assert!(
-        result.metadata.is_none(),
-        "unknown tool is a schema/admission failure, not a runtime capability denial"
+    let metadata = result
+        .metadata
+        .expect("unknown tool must retain typed admission metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        astra_core::ErrorKind::ToolNotFound.as_str()
     );
+    assert_eq!(metadata["disposition"], "rejected");
+    assert_eq!(metadata["execution_started"], false);
     let body: Value = serde_json::from_str(&result.output).expect("json error body");
     assert_eq!(
         body["error_kind"],

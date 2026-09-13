@@ -5,6 +5,7 @@ use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 use serde_json::Value;
 
+use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool::deferred_activation::{
     CanonicalToolInvocation, DeferredToolActivation, RuntimeControlInvocationKind,
@@ -34,7 +35,7 @@ pub(crate) struct PreparedToolRound {
     /// physical/logical projection. They are not provider deferred
     /// activations and must not be admitted by a name-only exception.
     pub(crate) runtime_control_calls_by_id: HashMap<String, RuntimeControlInvocationKind>,
-    pub(crate) pre_resolved_results: Vec<(String, String)>,
+    pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
 }
@@ -49,7 +50,7 @@ pub(crate) struct PreparedToolRound {
 pub(crate) fn record_pre_execution_rejections(
     state: &mut AgenticLoopState,
     rejected_tool_calls: Vec<RejectedToolCall>,
-) -> (Vec<Value>, Vec<(String, String)>) {
+) -> (Vec<Value>, Vec<HeadlessPreResolvedToolResult>) {
     let mut tool_calls = Vec::with_capacity(rejected_tool_calls.len());
     let mut pre_resolved_results = Vec::with_capacity(rejected_tool_calls.len());
 
@@ -57,7 +58,11 @@ pub(crate) fn record_pre_execution_rejections(
         tool_calls.push(rejected.invocation.physical_provider_call().clone());
         let call_id = rejected.provider_call_id().to_string();
         let logical_name = rejected.logical_name().to_string();
-        pre_resolved_results.push((call_id.clone(), rejected.result.clone()));
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            call_id.clone(),
+            rejected.result.clone(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        ));
         let structured_result = serde_json::from_str::<Value>(&rejected.result).ok();
         let rejection_detail = structured_result
             .as_ref()
@@ -539,6 +544,21 @@ pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Optio
 }
 
 pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
+    if tool_name == "submit_task_resolution"
+        && !state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .is_some_and(|window| {
+                matches!(
+                    window.action,
+                    super::super::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
+                )
+            })
+    {
+        return false;
+    }
     if !optional_tool_is_enabled(state, tool_name) {
         return false;
     }
@@ -792,7 +812,11 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
         let args_preview = args_preview_by_id
             .get(result.tool_call_id.as_str())
             .cloned();
-        pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            result.tool_call_id.clone(),
+            result.result.clone(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        ));
         let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
             Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
             None => (None, None),
@@ -821,7 +845,15 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     }
 
     for result in &skill_results {
-        pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            result.tool_call_id.clone(),
+            result.result.clone(),
+            if result.ok {
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+            } else {
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
+            },
+        ));
 
         let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
             Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
@@ -1759,8 +1791,9 @@ mod tests {
             serde_json::Value::String("{}".to_string())
         );
         assert_eq!(prepared.pre_resolved_results.len(), 1);
-        assert_eq!(prepared.pre_resolved_results[0].0, "call-python");
-        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].1).unwrap();
+        assert_eq!(prepared.pre_resolved_results[0].call_id, "call-python");
+        let result: Value =
+            serde_json::from_str(&prepared.pre_resolved_results[0].content).unwrap();
         assert_eq!(result["status"], "rejected");
         assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
         assert!(
@@ -1923,7 +1956,7 @@ mod tests {
         .await;
 
         assert_eq!(prepared.pre_resolved_results.len(), 1);
-        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].1)
+        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].content)
             .expect("structured policy rejection result");
         assert_eq!(result["status"], "rejected");
         let record = &state.stall.tool_call_records[0];
@@ -2321,12 +2354,9 @@ mod tests {
         .await;
 
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-session" && result.contains("BLOCKED:")
-                }),
+            prepared.pre_resolved_results.iter().any(|result| {
+                result.call_id == "call-session" && result.content.contains("BLOCKED:")
+            }),
             "request allowlists must still suppress excluded control-plane tools"
         );
     }
@@ -2366,14 +2396,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-bash" && result.contains("Allowed tools: none")
-                })
-        );
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-bash" && result.content.contains("Allowed tools: none")
+        }));
     }
 
     #[tokio::test]
@@ -2409,17 +2434,16 @@ mod tests {
         .await;
 
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(id, msg)| id == "call-rf" && msg.contains("BLOCKED:")),
+            prepared.pre_resolved_results.iter().any(|result| {
+                result.call_id == "call-rf" && result.content.contains("BLOCKED:")
+            }),
             "request-only allowlist should block read_file"
         );
         assert!(
             prepared
                 .pre_resolved_results
                 .iter()
-                .all(|(id, _)| id != "call-bash"),
+                .all(|result| result.call_id != "call-bash"),
             "request-only allowlist should leave allowed bash alone"
         );
     }
@@ -2450,12 +2474,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(id, result)| { id == "call-blocked-secret" && result.contains("BLOCKED:") })
-        );
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-blocked-secret" && result.content.contains("BLOCKED:")
+        }));
         let record = state
             .stall
             .tool_call_records
@@ -2503,10 +2524,9 @@ mod tests {
         // is fine — the assertion is purely "the allowlist gate didn't
         // mistake it for a denied tool".)
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .all(|(id, msg)| id != "call-skill-mixed" || !msg.contains("BLOCKED:")),
+            prepared.pre_resolved_results.iter().all(|result| {
+                result.call_id != "call-skill-mixed" || !result.content.contains("BLOCKED:")
+            }),
             "mixed-case Skill must not be blocked by the allowlist gate"
         );
     }
@@ -2533,14 +2553,10 @@ mod tests {
         )
         .await;
 
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-empty" && result.contains("Tool name is missing or empty")
-                })
-        );
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-empty"
+                && result.content.contains("Tool name is missing or empty")
+        }));
     }
 
     /// Verify that surgical removal stubs and skill result records preserve

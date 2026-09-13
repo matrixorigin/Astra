@@ -144,6 +144,8 @@ pub fn stream_idle_timeout_after_progress() -> std::time::Duration {
 /// Result of executing an edge tool request via the host.
 #[derive(Debug, Clone)]
 pub struct EdgeToolExecResult {
+    /// Server-owned evidence provenance, never read from tool-result metadata.
+    pub execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
     pub request_id: String,
     pub tool: String,
     pub args: Value,
@@ -157,6 +159,11 @@ pub struct EdgeToolExecResult {
 }
 
 impl crate::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
+    fn execution_completion(
+        &self,
+    ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
+        self.execution_completion.as_ref()
+    }
     fn tool_name(&self) -> &str {
         &self.tool
     }
@@ -1331,6 +1338,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 }
                 if let Err(error) = host.on_server_tool_surface_admission(&tool) {
                     let result = EdgeToolExecResult {
+                        execution_completion: None,
                         request_id,
                         tool,
                         args,
@@ -1509,6 +1517,7 @@ impl SseStreamHost for NoopSseStreamHost {
         args: &Value,
     ) -> EdgeToolExecResult {
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -1650,6 +1659,7 @@ impl SseStreamHost for RecordingSseStreamHost {
             .cloned()
             .unwrap_or_else(|| format!("mock output for {tool}"));
         EdgeToolExecResult {
+            execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -1790,6 +1800,7 @@ mod tests {
                 self.token.cancelled().await;
                 self.observed_cancel = true;
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -1900,6 +1911,7 @@ mod tests {
                 self.token.cancelled().await;
                 self.settled = true;
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -1990,6 +2002,7 @@ mod tests {
             ) -> EdgeToolExecResult {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -2081,6 +2094,7 @@ mod tests {
             ) -> EdgeToolExecResult {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -2942,6 +2956,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("tool:{request_id}"));
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -3045,6 +3060,7 @@ mod tests {
                 args: &Value,
             ) -> EdgeToolExecResult {
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -3679,6 +3695,7 @@ mod tests {
                 args: &Value,
             ) -> EdgeToolExecResult {
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -3699,6 +3716,7 @@ mod tests {
                 requests
                     .into_iter()
                     .map(|req| EdgeToolExecResult {
+                        execution_completion: None,
                         request_id: req.request_id,
                         tool: req.tool,
                         args: req.args,
@@ -3797,6 +3815,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(tool.to_string());
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -4001,6 +4020,7 @@ mod tests {
                     .unwrap()
                     .push(format!("exec:{request_id}:{tool}"));
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: request_id.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),
@@ -4179,6 +4199,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("exec:{rid}:{tool}"));
                 EdgeToolExecResult {
+                    execution_completion: None,
                     request_id: rid.to_string(),
                     tool: tool.to_string(),
                     args: args.clone(),

@@ -53,6 +53,7 @@ fn terminal_tool_result(
     retryable: bool,
 ) -> EdgeDeliveredToolResult {
     EdgeDeliveredToolResult {
+        execution_completion: None,
         tool_call_id: String::new(),
         status: status.to_string(),
         tool_result_fields: Some(Map::from_iter([
@@ -255,6 +256,7 @@ impl EdgeToolRoundDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeDeliveredToolResult {
+    pub execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
     pub tool_call_id: String,
     pub status: String,
     pub tool_result_fields: Option<Map<String, Value>>,
@@ -267,6 +269,7 @@ fn structured_tool_result(
 ) -> EdgeDeliveredToolResult {
     if timed_out {
         return EdgeDeliveredToolResult {
+            execution_completion: None,
             tool_call_id: tool_call_id.to_string(),
             status: "timed_out".to_string(),
             tool_result_fields: Some(Map::from_iter([
@@ -289,6 +292,7 @@ fn structured_tool_result(
         .or(ledger_entry)
     else {
         return EdgeDeliveredToolResult {
+            execution_completion: None,
             tool_call_id: tool_call_id.to_string(),
             status: "missing_ledger".to_string(),
             tool_result_fields: Some(Map::from_iter([
@@ -309,6 +313,9 @@ fn structured_tool_result(
         };
     };
     EdgeDeliveredToolResult {
+        execution_completion: ledger_entry
+            .and_then(|entry| entry.get("execution_completion"))
+            .and_then(|reference| serde_json::from_value(reference.clone()).ok()),
         tool_call_id: tool_call_id.to_string(),
         status: body
             .get("status")
@@ -553,6 +560,7 @@ async fn wait_approval_ledger_for_tool_with_journal_poll(
             })],
             persist_tool_results: vec![persist_denied_tool_result(tc, reason.as_deref())],
             tool_results: vec![EdgeDeliveredToolResult {
+                execution_completion: None,
                 tool_call_id: id.to_string(),
                 ..terminal_tool_result("denied", "capability_denied", false)
             }],
@@ -573,6 +581,7 @@ async fn wait_approval_ledger_for_tool_with_journal_poll(
                 "result": MSG_APPROVAL_LEDGER_TIMEOUT,
             })],
             tool_results: vec![EdgeDeliveredToolResult {
+                execution_completion: None,
                 tool_call_id: id.to_string(),
                 ..terminal_tool_result("timed_out", "approval_timeout", false)
             }],
@@ -596,6 +605,7 @@ async fn wait_approval_ledger_for_tool_with_journal_poll(
                 "result": "malformed approval response (§5.5 ledger)",
             })],
             tool_results: vec![EdgeDeliveredToolResult {
+                execution_completion: None,
                 tool_call_id: id.to_string(),
                 ..terminal_tool_result("malformed", "invalid_request", false)
             }],
@@ -1905,6 +1915,40 @@ mod tests {
             Some("wrong-user")
         );
         assert!(ledger.lock().await.is_empty());
+    }
+
+    #[test]
+    fn structured_tool_result_carries_only_envelope_execution_authority() {
+        use astra_turn_types::task_resolution::{
+            EdgeDispatchCompletionRef, ToolExecutionEvidenceRef,
+        };
+        let reference = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "owner", "session", "run", "chain", "call",
+            )
+            .unwrap(),
+            edge_agent_id: "edge".into(),
+            result_hash: "retained-hash".into(),
+        });
+        let body = json!({"status": "completed", "execution_completion": reference, "tool_result_fields": {"execution_completion": reference}});
+        let local_only = json!({"kind": "tool_result", "body": body});
+        assert!(
+            structured_tool_result("call", Some(&local_only), false)
+                .execution_completion
+                .is_none()
+        );
+        let durable =
+            json!({"kind": "tool_result", "body": body, "execution_completion": reference});
+        assert_eq!(
+            structured_tool_result("call", Some(&durable), false).execution_completion,
+            Some(reference)
+        );
+        assert!(
+            structured_tool_result("call", Some(&durable), true)
+                .execution_completion
+                .is_none(),
+            "a timeout cannot inherit a completed callback receipt"
+        );
     }
 
     #[test]

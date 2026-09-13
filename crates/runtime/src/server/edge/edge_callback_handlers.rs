@@ -139,7 +139,7 @@ pub(crate) fn insert_ledger_entry(
 ) -> Result<bool, LedgerInsertError> {
     sweep_expired_entries_locked(ledger);
     if let Some(existing) = ledger.get(&key) {
-        if existing == &value {
+        if astra_turn_core::edge_ledger::callback_content_eq(existing, &value) {
             return Ok(false);
         }
         return Err(LedgerInsertError::DuplicateKey);
@@ -338,7 +338,7 @@ pub(crate) async fn post_tool_result_handler(
         &body.request_id,
     );
     let key = tool_callback_key(&identity);
-    let ledger_value = serde_json::json!({
+    let mut ledger_value = serde_json::json!({
         "kind": "tool_result",
         "user_id": user.user_id,
         "session_id": body.session_id.as_str(),
@@ -373,44 +373,6 @@ pub(crate) async fn post_tool_result_handler(
         }
         None => {}
     }
-    // The ledger lock and expectation check form one boundary with waiter
-    // timeout cleanup. Session ownership authenticates the caller, but only a
-    // request this process emitted may enter its process-local delivery lane.
-    let ledger_insert_result = {
-        let mut lock = state.edge_callback_ledger.lock().await;
-        ledger_entry_is_expected(
-            &state.edge_callback_ledger,
-            &key,
-            body.edge_agent_id.as_str(),
-        )
-        .then(|| insert_ledger_entry(&mut lock, key.clone(), ledger_value))
-    };
-    let (local_callback_accepted, ledger_enqueued, ledger_capacity_exceeded) =
-        match ledger_insert_result {
-            Some(Ok(enqueued)) => (true, enqueued, false),
-            Some(Err(LedgerInsertError::DuplicateKey)) => {
-                return Err(ledger_insert_error_response(
-                    &key,
-                    LedgerInsertError::DuplicateKey,
-                ));
-            }
-            Some(Err(LedgerInsertError::CapacityExceeded)) => (false, false, true),
-            None => (false, false, false),
-        };
-
-    // A server-side timeout may settle the owning turn immediately before the
-    // edge observes that cancellation.  The resulting callback is useful only
-    // as an acknowledgement: accept exactly `cancelled` from the selected
-    // executor, once, during the bounded lease installed by the waiter.  It
-    // must never reopen normal delivery or accept a completed late result.
-    let local_cancelled_callback_ack = !local_callback_accepted
-        && safe_body.status.eq_ignore_ascii_case("cancelled")
-        && take_cancelled_callback_ack_expectation(
-            &state.edge_callback_ledger,
-            &key,
-            body.edge_agent_id.as_str(),
-        );
-
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
     let dispatch_svc = &state.execution.edge_dispatch_service;
@@ -440,6 +402,48 @@ pub(crate) async fn post_tool_result_handler(
             false
         }
     };
+
+    if dispatch_delivered {
+        let reference =
+            crate::server::tool_execution_service::edge_completion_reference(&identity, &safe_body)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        ledger_value["execution_completion"] =
+            serde_json::to_value(reference).map_err(|error| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })?;
+    }
+    // Do not release the local waiter until durable acceptance is known. A
+    // failed durable write still permits existing local delivery, without a
+    // reference. Recheck the expectation under lock after the await.
+    let ledger_insert_result = {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        ledger_entry_is_expected(
+            &state.edge_callback_ledger,
+            &key,
+            body.edge_agent_id.as_str(),
+        )
+        .then(|| insert_ledger_entry(&mut lock, key.clone(), ledger_value))
+    };
+    let (local_callback_accepted, ledger_enqueued, ledger_capacity_exceeded) =
+        match ledger_insert_result {
+            Some(Ok(enqueued)) => (true, enqueued, false),
+            Some(Err(LedgerInsertError::DuplicateKey)) => {
+                return Err(ledger_insert_error_response(
+                    &key,
+                    LedgerInsertError::DuplicateKey,
+                ));
+            }
+            Some(Err(LedgerInsertError::CapacityExceeded)) => (false, false, true),
+            None => (false, false, false),
+        };
+    // A late cancellation acknowledgement must not reopen normal delivery.
+    let local_cancelled_callback_ack = !local_callback_accepted
+        && safe_body.status.eq_ignore_ascii_case("cancelled")
+        && take_cancelled_callback_ack_expectation(
+            &state.edge_callback_ledger,
+            &key,
+            body.edge_agent_id.as_str(),
+        );
 
     // A server cancellation races the edge executor's process cancellation:
     // `fail_dispatch(..., "cancelled")` has already made the durable outcome
@@ -3766,6 +3770,14 @@ mod edge_callback_insert_tests {
         .expect("the selected edge executor must retain callback custody");
         assert_eq!(accepted.0["delivery_route"], "same_pod_ledger");
         let ledger = state.edge_callback_ledger.lock().await;
+        assert!(
+            ledger
+                .get(&key)
+                .unwrap()
+                .get("execution_completion")
+                .is_none(),
+            "local-only acceptance cannot mint durable evidence"
+        );
         assert_eq!(
             ledger
                 .get(&key)
@@ -3799,6 +3811,96 @@ mod edge_callback_insert_tests {
         )
         .await
         .expect("the selected executor's exact retry must remain idempotent");
+        assert_eq!(replay.0["delivery_route"], "idempotent_replay");
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_edge_callback_carries_only_server_owned_completion_reference() {
+        let identity = EdgeDispatchIdentity::new(
+            "u-approval",
+            "sess-evidence",
+            "run-evidence",
+            "chain-evidence",
+            "call-evidence",
+        );
+        let dispatch = Arc::new(RecordingEdgeDispatch {
+            deliver_result: true,
+            server_cancelled_dispatch: false,
+            delivered: Mutex::new(Vec::new()),
+        });
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(Arc::new(
+                ApprovalTargetRunLifecycle::new("run-evidence", "sess-evidence")
+                    .with_running_edge_wait(),
+            ))
+            .with_edge_dispatch_service(dispatch);
+        let key = tool_callback_key(&identity);
+        astra_turn_core::edge_ledger::expect_ledger_entry(
+            &state.edge_callback_ledger,
+            &key,
+            "edge-evidence",
+        )
+        .unwrap();
+        let request = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-evidence".into(),
+                status: "completed".into(),
+                output: "observed".into(),
+                duration_ms: 1,
+                tool_result_fields: Some(serde_json::Map::from_iter([(
+                    "execution_completion".into(),
+                    json!({"authority":"forged"}),
+                )])),
+            },
+        );
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-evidence".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["dispatch_delivered"], true);
+        let entry = astra_turn_core::edge_ledger::take_ledger_entry(
+            &state.edge_callback_ledger,
+            &key,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let reference: astra_turn_types::task_resolution::ToolExecutionEvidenceRef =
+            serde_json::from_value(entry["execution_completion"].clone()).unwrap();
+        assert_eq!(reference.identity().user_id, "u-approval");
+        assert_eq!(reference.identity().invocation_id, "call-evidence");
+        let astra_turn_types::task_resolution::ToolExecutionEvidenceRef::EdgeDispatch(reference) =
+            reference
+        else {
+            panic!("wrong authority")
+        };
+        assert_eq!(reference.edge_agent_id, "edge-evidence");
+        assert_eq!(
+            Some(reference.result_hash.as_str()),
+            entry.pointer("/body/result_hash").and_then(Value::as_str)
+        );
+        let replay = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-replay".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(request),
+        )
+        .await
+        .unwrap();
         assert_eq!(replay.0["delivery_route"], "idempotent_replay");
         assert!(state.edge_callback_ledger.lock().await.is_empty());
     }

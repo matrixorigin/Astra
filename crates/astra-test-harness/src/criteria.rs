@@ -683,6 +683,80 @@ pub fn evaluate_deterministic(
 
 /// Session-aware variant of [`evaluate_deterministic`]. The runner
 /// calls this after loading the journal (if any).
+#[derive(Default)]
+struct WorkGraphSnapshotMutationEvidence {
+    added_item_ids: std::collections::HashSet<String>,
+    active_revision: bool,
+    retired_revision: bool,
+    cancelled_revision: bool,
+    superseded_revision: bool,
+}
+
+fn work_graph_snapshot_mutation_evidence(
+    declared_tasks: &std::collections::HashMap<String, u64>,
+    tasks: &[serde_json::Value],
+) -> WorkGraphSnapshotMutationEvidence {
+    let mut evidence = WorkGraphSnapshotMutationEvidence::default();
+    for task in tasks {
+        let Some(item_id) = task.get("item_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let state = task
+            .get("declaration_state")
+            .and_then(serde_json::Value::as_str);
+        if item_id != "root"
+            && !declared_tasks.contains_key(item_id)
+            && !matches!(state, Some("cancelled" | "deleted"))
+        {
+            evidence.added_item_ids.insert(item_id.to_owned());
+        }
+        let Some(base_revision) = declared_tasks.get(item_id) else {
+            continue;
+        };
+        let revision = task
+            .get("item_revision")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| task.get("revision").and_then(serde_json::Value::as_u64));
+        if !revision.is_some_and(|revision| revision > *base_revision) {
+            continue;
+        }
+        evidence.active_revision |= state == Some("active");
+        evidence.cancelled_revision |= state == Some("cancelled");
+        evidence.superseded_revision |= state == Some("superseded");
+    }
+    evidence.retired_revision = evidence.cancelled_revision || evidence.superseded_revision;
+    evidence
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_work_graph_snapshot_evidence(
+    evidence: WorkGraphSnapshotMutationEvidence,
+    accepted_mutation_evidence: &mut usize,
+    accepted_addition: &mut bool,
+    accepted_active_revision: &mut bool,
+    accepted_retired_revision: &mut bool,
+    accepted_cancelled_revision: &mut bool,
+    accepted_superseded_revision: &mut bool,
+    accepted_atomic_retire_and_add: &mut bool,
+    require_cancelled_revision: bool,
+    require_superseded_revision: bool,
+) {
+    let additions = !evidence.added_item_ids.is_empty();
+    if !additions && !evidence.active_revision && !evidence.retired_revision {
+        return;
+    }
+    *accepted_mutation_evidence += 1;
+    *accepted_addition |= additions;
+    *accepted_active_revision |= evidence.active_revision;
+    *accepted_retired_revision |= evidence.retired_revision;
+    *accepted_cancelled_revision |= evidence.cancelled_revision;
+    *accepted_superseded_revision |= evidence.superseded_revision;
+    let required_atomic_retirement = evidence.retired_revision
+        && (!require_cancelled_revision || evidence.cancelled_revision)
+        && (!require_superseded_revision || evidence.superseded_revision);
+    *accepted_atomic_retire_and_add |= additions && required_atomic_retirement;
+}
+
 pub fn evaluate_deterministic_with_session(
     criteria: &[Criterion],
     outcome: &RunOutcome,
@@ -2255,7 +2329,7 @@ fn evaluate_one(
             };
 
             let mut work_established = false;
-            let mut accepted_patches = 0usize;
+            let mut accepted_mutation_evidence = 0usize;
             let mut accepted_addition = false;
             let mut accepted_active_revision = false;
             let mut accepted_retired_revision = false;
@@ -2265,6 +2339,10 @@ fn evaluate_one(
             let mut accepted_atomic_retire_and_add = false;
             let mut integrity_failure = false;
             let mut first_failure = None;
+            let mut declared_tasks = std::collections::HashMap::<String, u64>::new();
+            let mut work_id = None::<String>;
+            let mut initial_graph_revision = None::<u64>;
+            let mut deferred_successor_ids = std::collections::HashSet::<String>::new();
             for call in session.journal_tool_calls() {
                 if call.name == "start_work"
                     && call.ok != Some(false)
@@ -2276,74 +2354,123 @@ fn evaluate_one(
                         == Some("started")
                 {
                     work_established = true;
+                    let Some(result) = call.result.as_ref() else {
+                        continue;
+                    };
+                    work_id = result
+                        .get("work_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    initial_graph_revision = result
+                        .pointer("/task_board_update/graph_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| {
+                            result
+                                .get("graph_revision")
+                                .and_then(serde_json::Value::as_u64)
+                        });
                     // Admission may durably apply user-declared mutations in
                     // the same transaction that establishes Work. Compare the
                     // typed declared base with the accepted snapshot instead
                     // of requiring a later `propose_work_plan` call.
-                    if let Some(result) = call.result.as_ref() {
-                        let declared: std::collections::HashMap<&str, u64> = result
-                            .get("declared_tasks")
-                            .and_then(serde_json::Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|task| {
-                                Some((
-                                    task.get("item_id")?.as_str()?,
-                                    task.get("item_revision")?.as_u64()?,
-                                ))
-                            })
-                            .collect();
-                        let tasks = result
-                            .pointer("/task_board_update/tasks")
-                            .and_then(serde_json::Value::as_array);
-                        let additions = tasks.is_some_and(|tasks| {
-                            tasks.iter().any(|task| {
-                                task.get("item_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|item_id| {
-                                        item_id != "root" && !declared.contains_key(item_id)
-                                    })
-                            })
-                        });
-                        let revised_state = |state: &str| {
-                            tasks.is_some_and(|tasks| {
-                                tasks.iter().any(|task| {
-                                    let Some(item_id) =
-                                        task.get("item_id").and_then(serde_json::Value::as_str)
-                                    else {
-                                        return false;
-                                    };
-                                    let Some(base_revision) = declared.get(item_id) else {
-                                        return false;
-                                    };
-                                    task.get("item_revision")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .is_some_and(|revision| revision > *base_revision)
-                                        && task
-                                            .get("declaration_state")
-                                            .and_then(serde_json::Value::as_str)
-                                            == Some(state)
-                                })
-                            })
-                        };
-                        let active_revision = revised_state("active");
-                        let cancelled_revision = revised_state("cancelled");
-                        let superseded_revision = revised_state("superseded");
-                        let retired_revision = cancelled_revision || superseded_revision;
-                        if additions || active_revision || retired_revision {
-                            accepted_patches += 1;
-                            accepted_addition |= additions;
-                            accepted_active_revision |= active_revision;
-                            accepted_retired_revision |= retired_revision;
-                            accepted_cancelled_revision |= cancelled_revision;
-                            accepted_superseded_revision |= superseded_revision;
-                            let required_atomic_retirement = retired_revision
-                                && (!*require_cancelled_revision || cancelled_revision)
-                                && (!*require_superseded_revision || superseded_revision);
-                            accepted_atomic_retire_and_add |=
-                                additions && required_atomic_retirement;
-                        }
+                    declared_tasks = result
+                        .get("declared_tasks")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|task| {
+                            Some((
+                                task.get("item_id")?.as_str()?.to_owned(),
+                                task.get("item_revision")?.as_u64()?,
+                            ))
+                        })
+                        .collect();
+                    if let Some(tasks) = result
+                        .pointer("/task_board_update/tasks")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        let evidence =
+                            work_graph_snapshot_mutation_evidence(&declared_tasks, tasks);
+                        record_work_graph_snapshot_evidence(
+                            evidence,
+                            &mut accepted_mutation_evidence,
+                            &mut accepted_addition,
+                            &mut accepted_active_revision,
+                            &mut accepted_retired_revision,
+                            &mut accepted_cancelled_revision,
+                            &mut accepted_superseded_revision,
+                            &mut accepted_atomic_retire_and_add,
+                            *require_cancelled_revision,
+                            *require_superseded_revision,
+                        );
                     }
+                    continue;
+                }
+                if call.name == "settle_work_item" && call.ok != Some(false) {
+                    if let Some(result) = call.result.as_ref()
+                        && result.get("status").and_then(serde_json::Value::as_str)
+                            == Some("recorded")
+                        && result
+                            .pointer("/settlement_transition/delivery_status")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("delivered")
+                        && let Some(item_id) = result
+                            .pointer("/next_task/item_id")
+                            .and_then(serde_json::Value::as_str)
+                    {
+                        deferred_successor_ids.insert(item_id.to_owned());
+                    }
+                    continue;
+                }
+                if call.name == "inspect_work_plan" && work_established && call.ok != Some(false) {
+                    let Some(result) = call.result.as_ref() else {
+                        continue;
+                    };
+                    let observed_work_id = result
+                        .pointer("/basis/work_id")
+                        .and_then(serde_json::Value::as_str);
+                    let same_work = work_id
+                        .as_deref()
+                        .zip(observed_work_id)
+                        .is_some_and(|(expected, observed)| expected == observed);
+                    let graph_revision = result
+                        .pointer("/basis/graph_revision")
+                        .and_then(serde_json::Value::as_u64);
+                    let is_post_establishment_snapshot = initial_graph_revision
+                        .zip(graph_revision)
+                        .is_some_and(|(initial, observed)| observed > initial);
+                    let Some(tasks) = result
+                        .pointer("/items/entries")
+                        .and_then(serde_json::Value::as_array)
+                    else {
+                        continue;
+                    };
+                    if !same_work || !is_post_establishment_snapshot {
+                        continue;
+                    }
+                    let evidence = work_graph_snapshot_mutation_evidence(&declared_tasks, tasks);
+                    if evidence.added_item_ids.is_empty()
+                        && !evidence.active_revision
+                        && !evidence.retired_revision
+                    {
+                        continue;
+                    }
+                    accepted_mutation_evidence += 1;
+                    accepted_addition |= !evidence.added_item_ids.is_empty();
+                    accepted_active_revision |= evidence.active_revision;
+                    accepted_retired_revision |= evidence.retired_revision;
+                    accepted_cancelled_revision |= evidence.cancelled_revision;
+                    accepted_superseded_revision |= evidence.superseded_revision;
+                    let deferred_successor_was_added = evidence
+                        .added_item_ids
+                        .iter()
+                        .any(|item_id| deferred_successor_ids.contains(item_id));
+                    let required_atomic_retirement = evidence.retired_revision
+                        && (!*require_cancelled_revision || evidence.cancelled_revision)
+                        && (!*require_superseded_revision || evidence.superseded_revision);
+                    accepted_atomic_retire_and_add |= !evidence.added_item_ids.is_empty()
+                        && required_atomic_retirement
+                        && deferred_successor_was_added;
                     continue;
                 }
                 if call.name != "propose_work_plan" {
@@ -2425,7 +2552,7 @@ fn evaluate_one(
                             .and_then(serde_json::Value::as_array)
                             .is_some_and(|entries| !entries.is_empty())
                     });
-                accepted_patches += 1;
+                accepted_mutation_evidence += 1;
                 accepted_addition |= additions;
                 accepted_active_revision |= active_revision;
                 accepted_retired_revision |= retired_revision;
@@ -2456,7 +2583,7 @@ fn evaluate_one(
             .flatten()
             .collect::<Vec<_>>();
             let passed = work_established
-                && accepted_patches > 0
+                && accepted_mutation_evidence > 0
                 && missing.is_empty()
                 && !integrity_failure;
             CriterionResult {
@@ -2465,7 +2592,7 @@ fn evaluate_one(
                 passed,
                 detail: if passed {
                     format!(
-                        "{accepted_patches} accepted Work graph patch(es) collectively satisfied the typed mutation contract"
+                        "{accepted_mutation_evidence} durable Work graph mutation evidence record(s) satisfied the typed mutation contract"
                     )
                 } else if integrity_failure {
                     first_failure.unwrap_or_else(|| {
@@ -2473,12 +2600,12 @@ fn evaluate_one(
                     })
                 } else if !missing.is_empty() {
                     format!(
-                        "accepted Work graph history omitted required mutation(s): {}",
+                        "durable Work graph evidence omitted required mutation(s): {}",
                         missing.join(", ")
                     )
                 } else {
                     first_failure.unwrap_or_else(|| {
-                        "no accepted Work graph patch was recorded after Work establishment".into()
+                        "no durable Work graph mutation evidence was recorded after Work establishment".into()
                     })
                 },
                 full_detail: None,
@@ -8109,6 +8236,133 @@ mod tests {
     }
 
     #[test]
+    fn journal_work_graph_patch_accepts_deferred_admission_mutation_at_settlement() {
+        let capture = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {
+                        "tool_call_id": "start",
+                        "name": "start_work",
+                        "ok": true,
+                        "result": {
+                            "status": "started",
+                            "work_id": "work-1",
+                            "graph_revision": 2,
+                            "declared_tasks": [
+                                {"item_id": "task-1", "item_revision": 1},
+                                {"item_id": "task-2", "item_revision": 1}
+                            ],
+                            "task_board_update": {
+                                "kind": "snapshot",
+                                "graph_revision": 2,
+                                "tasks": [
+                                    {"item_id": "root", "item_revision": 1, "declaration_state": "active"},
+                                    {"item_id": "task-1", "item_revision": 1, "declaration_state": "active"},
+                                    {"item_id": "task-2", "item_revision": 1, "declaration_state": "active"}
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "tool_call_id": "settle-first",
+                        "name": "settle_work_item",
+                        "ok": true,
+                        "result": {
+                            "status": "recorded",
+                            "outcome": "delivered",
+                            "settlement_transition": {"item_id": "task-1", "delivery_status": "delivered"},
+                            "next_task": {"item_id": "replacement-1"}
+                        }
+                    },
+                    {
+                        "tool_call_id": "inspect-after-settlement",
+                        "name": "inspect_work_plan",
+                        "ok": true,
+                        "result": {
+                            "basis": {"work_id": "work-1", "graph_revision": 3},
+                            "items": {"entries": [
+                                {"item_id": "root", "revision": 1, "declaration_state": "active"},
+                                {"item_id": "task-1", "revision": 1, "declaration_state": "active"},
+                                {"item_id": "task-2", "revision": 2, "declaration_state": "cancelled"},
+                                {"item_id": "replacement-1", "revision": 1, "declaration_state": "active"}
+                            ]}
+                        }
+                    }
+                ]
+            }),
+        )]);
+        let criterion = Criterion::JournalWorkGraphPatch {
+            require_addition: true,
+            require_active_revision: false,
+            require_retired_revision: true,
+            require_cancelled_revision: true,
+            require_superseded_revision: false,
+            require_dependency_change: false,
+            require_atomic_retire_and_add: true,
+        };
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&capture),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+
+        let unrelated_work = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {
+                        "tool_call_id": "start",
+                        "name": "start_work",
+                        "ok": true,
+                        "result": {
+                            "status": "started",
+                            "work_id": "work-1",
+                            "graph_revision": 2,
+                            "declared_tasks": [
+                                {"item_id": "task-1", "item_revision": 1},
+                                {"item_id": "task-2", "item_revision": 1}
+                            ]
+                        }
+                    },
+                    {
+                        "tool_call_id": "settle-first",
+                        "name": "settle_work_item",
+                        "ok": true,
+                        "result": {
+                            "status": "recorded",
+                            "outcome": "delivered",
+                            "settlement_transition": {"item_id": "task-1", "delivery_status": "delivered"},
+                            "next_task": {"item_id": "replacement-1"}
+                        }
+                    },
+                    {
+                        "tool_call_id": "inspect-other-work",
+                        "name": "inspect_work_plan",
+                        "ok": true,
+                        "result": {
+                            "basis": {"work_id": "work-2", "graph_revision": 3},
+                            "items": {"entries": [
+                                {"item_id": "task-2", "revision": 2, "declaration_state": "cancelled"},
+                                {"item_id": "replacement-1", "revision": 1, "declaration_state": "active"}
+                            ]}
+                        }
+                    }
+                ]
+            }),
+        )]);
+        let rejected = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&unrelated_work),
+        );
+        assert!(!rejected[0].passed, "{}", rejected[0].detail);
+        assert!(rejected[0].detail.contains("addition"));
+        assert!(rejected[0].detail.contains("cancelled revision"));
+    }
+
+    #[test]
     fn journal_work_graph_patch_can_match_collective_mutation_sequence() {
         let capture = mk_session(&[(
             "turn",
@@ -8178,7 +8432,9 @@ mod tests {
         );
         assert!(result[0].passed, "{}", result[0].detail);
         assert!(
-            result[0].detail.contains("2 accepted"),
+            result[0]
+                .detail
+                .contains("2 durable Work graph mutation evidence"),
             "{}",
             result[0].detail
         );

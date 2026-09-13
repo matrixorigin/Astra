@@ -244,6 +244,9 @@ pub trait EdgeDispatchService: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
+    /// A zero timeout performs one exact durable read without subscribing;
+    /// nonzero timeouts wait for arrival. Neither path treats cache absence as
+    /// evidence that a durable result does not exist.
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
@@ -1504,6 +1507,29 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
+        if timeout.is_zero() {
+            if !identity.is_complete() {
+                return Err("edge result read requires complete owner identity".into());
+            }
+            let row = sqlx::query(
+                "SELECT CAST(result_json AS CHAR) AS result_json FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                   AND request_id = ? AND status IN ('completed', 'failed')",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("edge_dispatch exact result read: {error}"))?;
+            return row
+                .map(|row| row.try_get::<Option<String>, _>("result_json"))
+                .transpose()
+                .map(Option::flatten)
+                .map_err(|error| format!("edge_dispatch result decode: {error}"));
+        }
         let mut receiver = self.wait_coordinator.subscribe(identity.clone()).await;
         let wait = async {
             loop {
@@ -2142,7 +2168,16 @@ mod tests {
             "request_id": request_id,
             "status": "completed",
             "output": "ok",
-            "duration_ms": 12
+            "duration_ms": 12,
+            "tool_result_fields": {
+                "nested": {
+                    "integral_float": 86400.0,
+                    "other_integral_float": 1800.0,
+                    "fraction": 0.125,
+                    "integer": 1800,
+                    "large_integer": 9007199254740993_u64,
+                }
+            }
         })
         .to_string();
         assert!(
@@ -2156,6 +2191,28 @@ mod tests {
             .expect("wait task should join")
             .expect("wait_result should not fail")
             .expect("wait_result should observe completed result");
+        let fresh_reader = DatabaseEdgeDispatchService::from_shared(&pool);
+        let recovered = fresh_reader
+            .wait_result(&identity, std::time::Duration::ZERO)
+            .await
+            .expect("exact read must not require a prior waiter")
+            .expect("completed durable row must survive coordinator recreation");
+        assert_eq!(
+            recovered, result_json,
+            "durable receipts must preserve signed bytes, including numeric representation"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&result_json).unwrap()
+        );
+        assert!(
+            fresh_reader
+                .wait_result(&other_identity, std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .is_none(),
+            "exact recovery must preserve owner isolation"
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&waited)
                 .expect("waited result should be JSON"),
@@ -2167,6 +2224,15 @@ mod tests {
                 .await
                 .expect("exact replay after lost acknowledgement"),
             "an exact terminal replay must be acknowledged idempotently"
+        );
+        let mut changed: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+        changed["tool_result_fields"]["nested"]["fraction"] = json!(0.25);
+        assert!(
+            !pod_c
+                .deliver_result(&identity, &edge_agent_id, &changed.to_string())
+                .await
+                .unwrap(),
+            "a different execution fact cannot replace an accepted receipt"
         );
         assert!(
             !pod_c

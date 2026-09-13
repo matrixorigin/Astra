@@ -16,8 +16,8 @@ use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
-    EdgeToolRoundRow, begin_headless_tool_round_opening_ext, openai_tool_roundtrip_values,
-    resolve_headless_tool_slot,
+    EdgeToolRoundRow, HeadlessPreResolvedToolResult, begin_headless_tool_round_opening_ext,
+    openai_tool_roundtrip_values, resolve_headless_tool_slot,
 };
 use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
 use astra_turn_core::tool::deferred_activation::{
@@ -79,6 +79,8 @@ impl<'a> HeadlessToolCallViews<'a> {
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
+    pub task_resolution_authority:
+        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Internal agentic step index (0-based) for cache and loop accounting.
     pub turn_index: usize,
     /// User-visible session turn currently in progress (1-based).
@@ -142,7 +144,7 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// Tool results resolved by upstream interception layers (skill, send_message)
     /// before the headless round. Injected immediately after the assistant message
     /// to maintain correct ordering: assistant(tool_calls) → tool(pre_resolved) → tool(executed).
-    pub pre_resolved_results: &'a [(String, String)],
+    pub pre_resolved_results: &'a [HeadlessPreResolvedToolResult],
     /// Optional server-side tool executor for web agent sessions.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
@@ -175,7 +177,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     edge_tool_round: &'a [E],
     reasoning_content: &str,
     reasoning_signature: &str,
-    pre_resolved_results: &[(String, String)],
+    pre_resolved_results: &[HeadlessPreResolvedToolResult],
     messages: &mut Vec<Value>,
     tool_results: &mut Vec<Value>,
     step_recorder: &mut StepRecorder,
@@ -209,11 +211,15 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     messages.push(opening.assistant_message);
 
     let mut pre_resolved_ids = HashSet::new();
-    for (call_id, result_text) in pre_resolved_results {
-        pre_resolved_ids.insert(call_id.clone());
-        let content_for_model = tool_result_content_for_model("pre_resolved", result_text);
-        let (mut tool_msg, tr) =
-            openai_tool_roundtrip_values(call_id, "pre_resolved", &content_for_model);
+    for result in pre_resolved_results {
+        pre_resolved_ids.insert(result.call_id.clone());
+        let content_for_model = tool_result_content_for_model("pre_resolved", &result.content);
+        let (mut tool_msg, tr) = openai_tool_roundtrip_values(
+            &result.call_id,
+            "pre_resolved",
+            &content_for_model,
+            result.status,
+        );
         if let Some(obj) = tool_msg.as_object_mut() {
             obj.insert(
                 "_round_index".to_string(),
@@ -279,6 +285,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
     action_fence: Option<&dyn HeadlessActionFence>,
 ) -> HeadlessRoundOutcome {
     let HeadlessToolRoundCtx {
+        task_resolution_authority,
         turn_index,
         session_turn,
         quiet,
@@ -436,6 +443,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_run_id,
             current_turn_chain_id,
             durable_dispatch_admission,
+            task_resolution_authority,
             tool_calls: logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,

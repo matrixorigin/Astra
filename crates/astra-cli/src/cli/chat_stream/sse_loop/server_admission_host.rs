@@ -25,7 +25,6 @@ use astra_runtime::{
 use astra_turn_core::{
     compaction_types::CompactionEvent, orchestration::agent_result_wire::render_agent_tool_error,
     sse_stream_host::EdgeToolExecResult, tool::schema::tool_names_from_schemas,
-    tool_result_semantics::cloud_tool_result_status_label,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -1392,7 +1391,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             let status = if outcome.is_error {
                 "failed"
             } else {
-                cloud_tool_result_status_label(&outcome.output)
+                "completed"
             }
             .to_string();
             let event_output = tool_output_event_text(tool_name, &outcome.output);
@@ -1420,7 +1419,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     parent_tool_use_id: None,
                 });
             }
-            return ControlToolRecovery::Recovered(EdgeToolExecResult {
+            return ControlToolRecovery::Recovered(Box::new(EdgeToolExecResult {
+                execution_completion: None,
                 request_id: tool_call_id.to_string(),
                 tool: tool_name.to_string(),
                 args: args.clone(),
@@ -1428,7 +1428,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 tool_result_fields: None,
                 status,
                 duration_ms,
-            });
+            }));
         }
 
         let started_at = std::time::Instant::now();
@@ -1447,7 +1447,19 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 "Cannot recover missing agent_fanout edge result: recovery timed out before the host could render the registered fanout group.",
             ),
         };
-        let status = cloud_tool_result_status_label(&output).to_string();
+        let status = if matches!(
+            astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(
+                &output,
+            ),
+            Some(
+                astra_turn_core::orchestration::agent_result_wire::AgentFanoutControlReceiptKind::Group
+            )
+        ) {
+            "completed"
+        } else {
+            "failed"
+        }
+        .to_string();
         let duration_ms = accumulated_control_duration_ms(
             prior_duration_ms,
             started_at.elapsed().as_millis() as u64,
@@ -1463,7 +1475,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             duration_ms,
             &output,
         ));
-        ControlToolRecovery::Recovered(EdgeToolExecResult {
+        ControlToolRecovery::Recovered(Box::new(EdgeToolExecResult {
+            execution_completion: None,
             request_id: tool_call_id.to_string(),
             tool: tool_name.to_string(),
             args: args.clone(),
@@ -1471,7 +1484,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             tool_result_fields: None,
             status,
             duration_ms,
-        })
+        }))
     }
 
     async fn cancel_child_agents(

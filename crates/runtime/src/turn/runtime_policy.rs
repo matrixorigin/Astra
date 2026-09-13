@@ -17,7 +17,7 @@ use astra_core::observation_journal::{
     BudgetSnapshot, JournalFacts, PerformanceSnapshot, StallSnapshot, StreakSnapshot,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_turn_core::context_feedback::{
@@ -367,6 +367,175 @@ pub struct RuntimePolicyEvaluationState {
 }
 
 impl RuntimePolicyEvaluationState {
+    const TASK_RESOLUTION_HINT_EVIDENCE_LIMIT: usize = 32;
+
+    /// Use the same bounded evidence window and reducer as policy feedback.
+    /// This is coverage evidence, not authority to erase execution failures.
+    pub(crate) fn unresolved_tool_outcomes(
+        &self,
+    ) -> BTreeMap<
+        astra_turn_core::evaluation::EvaluationOutcomeKey,
+        astra_turn_core::evaluation::UnresolvedToolOutcome,
+    > {
+        astra_turn_core::evaluation::unresolved_tool_outcome_facts(
+            &self.record_window.iter().cloned().collect::<Vec<_>>(),
+        )
+    }
+
+    /// Candidate evidence opens one terminal assessment, never clears failures
+    /// or increases scheduling pressure. Same-round siblings are not later.
+    pub(crate) fn has_task_resolution_candidate(&self) -> bool {
+        self.unresolved_tool_outcomes().values().any(|failure| {
+            let Some(failed_round) = self
+                .record_window
+                .get(failure.fact_index)
+                .and_then(|fact| fact.round)
+            else {
+                return false;
+            };
+            failure.invocation.is_some()
+                && self
+                    .record_window
+                    .iter()
+                    .skip(failure.fact_index + 1)
+                    .any(|fact| Self::is_later_task_resolution_evidence(fact, failed_round))
+        })
+    }
+
+    fn is_later_task_resolution_evidence(
+        fact: &astra_turn_core::evaluation::ToolEvaluationFact,
+        failed_round: u32,
+    ) -> bool {
+        fact.execution_completion().is_some()
+            && fact.round.is_some_and(|round| round > failed_round)
+            && fact.is_assessment_observation_candidate()
+    }
+
+    /// Bounded labels for the terminal assessment prompt. These are hints to
+    /// select existing execution references; the assessment validator remains
+    /// the authority for relevance, chronology, and terminal integrity.
+    pub(crate) fn task_resolution_hint_evidence(&self) -> serde_json::Value {
+        let mut failures = self
+            .unresolved_tool_outcomes()
+            .into_values()
+            .filter(|failure| failure.invocation.is_some())
+            .collect::<Vec<_>>();
+        failures.sort_by_key(|failure| failure.fact_index);
+
+        let failed_executions = failures
+            .iter()
+            .take(Self::TASK_RESOLUTION_HINT_EVIDENCE_LIMIT)
+            .filter_map(|failure| {
+                let fact = self.record_window.get(failure.fact_index)?;
+                let reference = failure.invocation.as_ref()?;
+                Some(serde_json::json!({
+                    "call_id": reference.identity().invocation_id.as_str(),
+                    "tool": fact.tool_name(),
+                    "round": fact.round,
+                    "ok": fact.ok,
+                    "disposition": fact.disposition,
+                }))
+            })
+            .collect::<Vec<_>>();
+
+        let mut evidence_candidates = Vec::new();
+        for (candidate_index, fact) in self.record_window.iter().enumerate() {
+            if evidence_candidates.len() == Self::TASK_RESOLUTION_HINT_EVIDENCE_LIMIT {
+                break;
+            }
+            let is_later = failures.iter().any(|failure| {
+                let Some(failed_round) = self
+                    .record_window
+                    .get(failure.fact_index)
+                    .and_then(|failed| failed.round)
+                else {
+                    return false;
+                };
+                candidate_index > failure.fact_index
+                    && Self::is_later_task_resolution_evidence(fact, failed_round)
+            });
+            if !is_later {
+                continue;
+            }
+            let Some(reference) = fact.execution_completion() else {
+                continue;
+            };
+            evidence_candidates.push(serde_json::json!({
+                "call_id": reference.identity().invocation_id.as_str(),
+                "tool": fact.tool_name(),
+                "round": fact.round,
+                "ok": fact.ok,
+                "disposition": fact.disposition,
+            }));
+        }
+
+        serde_json::json!({
+            "failed_executions": failed_executions,
+            "evidence_candidates": evidence_candidates,
+        })
+    }
+
+    /// Recover bounded invocation references from a retained prefix, then use
+    /// the current journal suffix. This projection carries identity/order only;
+    /// the ledger resolver must rebuild outcomes from their original digests.
+    pub(crate) fn task_resolution_evidence(
+        &self,
+        assessment: &astra_turn_types::task_resolution::TaskResolutionAssessment,
+        records: &[ToolCallRecord],
+    ) -> Vec<ToolCallRecord> {
+        let requested: BTreeSet<_> = assessment
+            .failed_call_ids
+            .iter()
+            .chain(&assessment.evidence_call_ids)
+            .map(String::as_str)
+            .collect();
+        let mut evidence: Vec<_> = self
+            .record_window
+            .iter()
+            .filter_map(|fact| {
+                let reference = fact.execution_completion()?;
+                if !requested.contains(reference.identity().invocation_id.as_str())
+                    || records
+                        .iter()
+                        .any(|record| record.execution_completion.as_ref() == Some(reference))
+                {
+                    return None;
+                }
+                Some(ToolCallRecord {
+                    tool_call_id: Some(reference.identity().invocation_id.clone()),
+                    execution_completion: Some(reference.clone()),
+                    round: fact.round,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        evidence.extend(
+            records
+                .iter()
+                .filter(|record| {
+                    record
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| requested.contains(id))
+                })
+                .cloned(),
+        );
+        evidence
+    }
+
+    pub(crate) fn task_resolution_workspace_evidence(
+        &self,
+        evidence_call_ids: &[String],
+    ) -> Vec<astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
+        self.record_window
+            .iter()
+            .filter(|fact| fact.is_workspace_observation_candidate())
+            .filter_map(|fact| fact.execution_completion())
+            .filter(|reference| evidence_call_ids.contains(&reference.identity().invocation_id))
+            .cloned()
+            .collect()
+    }
+
     pub fn preflight_history(
         &self,
         records_len: usize,
@@ -520,7 +689,12 @@ fn evaluate_policy_boundary(
         .map(|record| {
             (
                 record,
-                astra_turn_core::evaluation::ToolEvaluationFact::from_record(record),
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(record)
+                    .with_workspace_observation_candidate(
+                        super::agentic_loop::lifecycle::record_can_observe_bound_workspace(
+                            None, record,
+                        ),
+                    ),
             )
         })
         .collect::<Vec<_>>();
@@ -1242,6 +1416,106 @@ mod tests {
             ok: false,
             result_class: Some(result_class.to_string()),
             ..Default::default()
+        }
+    }
+
+    fn with_completion(mut record: ToolCallRecord, call_id: &str) -> ToolCallRecord {
+        record.tool_call_id = Some(call_id.to_string());
+        record.execution_completion = Some(
+            astra_turn_types::task_resolution::ToolExecutionEvidenceRef::EdgeDispatch(
+                astra_turn_types::task_resolution::EdgeDispatchCompletionRef {
+                    identity: astra_turn_types::ToolInvocationIdentity::new(
+                        "user", "session", "run", "chain", call_id,
+                    )
+                    .unwrap(),
+                    edge_agent_id: "edge-1".to_string(),
+                    result_hash: format!("hash-{call_id}"),
+                },
+            ),
+        );
+        record
+    }
+
+    #[test]
+    fn task_resolution_hint_projects_real_later_evidence_and_survives_restore() {
+        let records = vec![
+            with_completion(
+                failed("bash", r#"{"command":"cargo test"}"#, 1, "test_failure"),
+                "failed-check",
+            ),
+            with_completion(
+                executed("read_file", r#"{"path":"report.txt"}"#, 2),
+                "read-report",
+            ),
+        ];
+        let mut state = RuntimePolicyEvaluationState::default();
+        evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 2).unwrap();
+
+        let hint = state.task_resolution_hint_evidence();
+        assert_eq!(hint["failed_executions"][0]["call_id"], "failed-check");
+        assert_eq!(hint["failed_executions"][0]["tool"], "bash");
+        assert_eq!(hint["failed_executions"][0]["round"], 1);
+        assert_eq!(hint["failed_executions"][0]["ok"], false);
+        assert_eq!(hint["failed_executions"][0]["disposition"], "executed");
+        assert_eq!(hint["evidence_candidates"][0]["call_id"], "read-report");
+        assert_eq!(hint["evidence_candidates"][0]["tool"], "read_file");
+        assert_eq!(hint["evidence_candidates"][0]["round"], 2);
+        assert_eq!(hint["evidence_candidates"][0]["ok"], true);
+        assert_eq!(hint["evidence_candidates"][0]["disposition"], "executed");
+
+        let wire = state
+            .serialize_continuation(serde_json::value::Serializer)
+            .unwrap();
+        let restored = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
+        assert_eq!(restored.task_resolution_hint_evidence(), hint);
+    }
+
+    #[test]
+    fn task_resolution_hint_excludes_same_round_and_missing_references() {
+        for (records, expected_failures) in [
+            (
+                vec![
+                    with_completion(
+                        failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
+                        "failed-same-round",
+                    ),
+                    with_completion(
+                        executed("read_file", r#"{"path":"same.txt"}"#, 1),
+                        "read-same-round",
+                    ),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
+                    with_completion(
+                        executed("read_file", r#"{"path":"later.txt"}"#, 2),
+                        "read-after-unreferenced-failure",
+                    ),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    with_completion(
+                        failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
+                        "failed-before-unreferenced-read",
+                    ),
+                    executed("read_file", r#"{"path":"later.txt"}"#, 2),
+                ],
+                1,
+            ),
+        ] {
+            let mut state = RuntimePolicyEvaluationState::default();
+            evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 2).unwrap();
+            assert!(!state.has_task_resolution_candidate());
+            let hint = state.task_resolution_hint_evidence();
+            assert_eq!(
+                hint["failed_executions"].as_array().unwrap().len(),
+                expected_failures
+            );
+            assert_eq!(hint["evidence_candidates"], serde_json::json!([]));
         }
     }
 

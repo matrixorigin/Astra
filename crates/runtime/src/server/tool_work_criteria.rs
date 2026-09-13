@@ -575,6 +575,7 @@ mod tests {
             tool_call_id: Some(call_id),
             admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy),
             expected_control_epoch: None,
+            task_resolution_authority: None,
         }
     }
 

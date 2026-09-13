@@ -56,6 +56,31 @@ fn capability_denied_message(
     )
 }
 
+fn unknown_tool_result(request: &ToolExecutionRequest) -> astra_tools::ToolResult {
+    astra_tools::ToolResult {
+        output: json!({
+            "status": "failed",
+            "error": format!(
+                "Unknown tool `{}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema.",
+                request.tool_name
+            ),
+            "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+            "retryable": false,
+        })
+        .to_string(),
+        metadata: Some(serde_json::Map::from_iter([
+            (
+                "error_kind".to_string(),
+                json!(astra_core::ErrorKind::ToolNotFound.as_str()),
+            ),
+            ("disposition".to_string(), json!("rejected")),
+            ("execution_started".to_string(), json!(false)),
+        ])),
+        is_error: true,
+        exit_semantics: None,
+    }
+}
+
 pub(crate) fn capability_denied_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
@@ -65,21 +90,7 @@ pub(crate) fn capability_denied_result(
         reason,
         astra_runtime_env::ToolUnavailableReason::UnknownTool
     ) {
-        return astra_tools::ToolResult {
-            output: json!({
-                "status": "failed",
-                "error": format!(
-                    "Unknown tool `{}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema.",
-                    request.tool_name
-                ),
-                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
-                "retryable": false,
-            })
-            .to_string(),
-            metadata: None,
-            is_error: true,
-            exit_semantics: None,
-        };
+        return unknown_tool_result(request);
     }
     let offline_edge_executor =
         matches!(request.workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
@@ -157,21 +168,7 @@ pub(crate) fn unsupported_workspace_executor_result(
             .get(&request.tool_name)
             .is_none()
     {
-        return astra_tools::ToolResult {
-            output: json!({
-                "status": "failed",
-                "error": format!(
-                    "Unknown tool `{}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema.",
-                    request.tool_name
-                ),
-                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
-                "retryable": false,
-            })
-            .to_string(),
-            metadata: None,
-            is_error: true,
-            exit_semantics: None,
-        };
+        return unknown_tool_result(request);
     }
     let mut blocked_executor = request.executor.clone();
     blocked_executor.status = ExecutorStatus::Degraded;

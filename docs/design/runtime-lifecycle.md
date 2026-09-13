@@ -87,6 +87,61 @@ Progress does not discharge completion obligations. Required validation must
 still apply to the final mutation state; a renewed slice must not be reported
 as successful completion or bypass provider and permission boundaries.
 
+### Execution failures and task resolution
+
+Tool results retain their source status, exit semantics, output, and invocation
+identity. Classification uses supported evidence; an unknown cause stays unknown.
+The Agent interprets the impact on the user's task. A later unrelated success
+must not clear a failure, and changing a command does not prove equivalence.
+
+At completion, an unresolved failure with a later-round observation candidate,
+or the existing repeated-failure signal, permits
+one evidence-linked `submit_task_resolution` proposal through the existing
+`invoke_tool` carrier. Its full schema is supplied only in that boundary's hint,
+not added to resident tools. The proposal identifies the verification target,
+failed and later evidence calls, `supported`/`partial`/`unknown`, rationale, and
+remaining gaps. This is a model assessment, not a verification receipt.
+Candidate existence does not establish semantic relevance. Same-round sibling
+results are not later evidence, and exact-operation recovery needs no proposal.
+The transient hint supplies bounded, source-owned execution IDs and typed
+status from the retained policy window, so the Agent can reference evidence
+without inventing identities or performing discovery. Submission transport and
+evidence validation have distinct feedback; neither replaces final coverage.
+Scheduling pressure may decrease after healthy progress; once this bounded
+assessment starts, final coverage is checked against the remaining failure facts,
+not the scheduling stage or whether the proposal tool itself returned success.
+
+Admission binds the call to the current run, turn chain, Work subject and user
+intent. The model supplies only the interpretation; the handler binds scope and
+boundary from current invocation authority. Model-supplied control fields are
+rejected, not silently overridden. Acceptance resolves exact, authority-tagged completion references in the
+existing owner-scoped invocation ledger or Edge dispatch store. Edge references
+bind the selected executor and canonical result hash, and are attached by the
+Server only after durable acceptance; local-only delivery grants no such proof.
+Durable result bodies use lossless text storage: database JSON normalization
+must not change the numeric representation covered by the accepted hash.
+With a configured durable Edge owner, direct tool delivery admits and claims the
+dispatch after guarded run admission and before publishing the request. Existing
+in-flight or terminal dispatches are observed, not re-executed. A durable
+admission failure must not silently downgrade to local-only delivery; an
+ambiguous outcome remains unknown. Explicit local-only hosts can still execute
+through guarded callback delivery without gaining durable assessment authority.
+HTTP callback replay compares original callback content, not the Server's added
+provenance, and never upgrades or overwrites the first delivered reference.
+Task-level resolution requires coverage of all current
+unresolved failures and must not reuse stale workspace evidence after a later
+writer. Missing, ambiguous, foreign, or unavailable evidence remains unresolved.
+The bounded policy window retains original references across checkpoint recovery;
+local display text and absence from a recovered suffix are not authority.
+Edge workspace evidence without a retained trustworthy ordering relative to a
+known writer remains unresolved after recovery. This does not expand the
+authority of deterministic invocation-backed verification contracts.
+
+Raw execution failures remain in accounting even when another approach satisfies
+the task. Explicit deterministic checks and canonical Work settlement keep their
+own authority. A rejected submission or unavailable capability produces an honest
+partial/unknown report, not another unrestricted execution loop.
+
 ## Tasks
 
 Work admission counts user acceptance units, not execution phases. Observation,

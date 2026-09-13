@@ -6550,6 +6550,7 @@ mod tests {
             .bash_outcome_with_cancel_async(
                 &args,
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -6607,6 +6608,7 @@ mod tests {
                     "timeout": 5
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -6685,6 +6687,7 @@ mod tests {
                     "timeout": 1
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -6760,6 +6763,7 @@ mod tests {
                     "timeout": 5
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),

@@ -223,6 +223,10 @@ pub struct ToolPolicySnapshot {
     /// never serialized to an external executor or accepted from tool args.
     #[serde(skip)]
     pub expected_control_epoch: Option<i64>,
+    /// Request-local completion authority; never accepted from serialized input.
+    #[serde(skip)]
+    pub task_resolution_authority:
+        Option<astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]

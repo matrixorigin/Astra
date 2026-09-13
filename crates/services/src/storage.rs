@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-09-v71";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-13-v72";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1889,6 +1889,73 @@ async fn add_column_if_missing(
     }
 
     query(ddl).execute(pool).await?;
+    Ok(())
+}
+
+const EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL: &str =
+    "ALTER TABLE edge_pending_dispatch MODIFY COLUMN result_json LONGTEXT NULL";
+
+fn edge_pending_dispatch_result_json_upgrade_ddl(
+    data_type: &str,
+    nullable: bool,
+) -> Result<Option<&'static str>, sqlx::Error> {
+    if !nullable {
+        return Err(sqlx::Error::Protocol(
+            "edge_pending_dispatch.result_json must remain nullable".to_string(),
+        ));
+    }
+    // MatrixOne reports a declared LONGTEXT column as DATA_TYPE=TEXT. Both
+    // catalog spellings identify the same lossless text storage contract;
+    // the declaration and upgrade DDL retain LONGTEXT capacity.
+    if data_type.eq_ignore_ascii_case("longtext") || data_type.eq_ignore_ascii_case("text") {
+        return Ok(None);
+    }
+    if data_type.eq_ignore_ascii_case("json") {
+        return Ok(Some(EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL));
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "edge_pending_dispatch.result_json has unsupported type {data_type}; expected JSON or lossless text storage"
+    )))
+}
+
+/// Preserve the exact result bytes used by the Edge dispatch integrity hash.
+///
+/// MatrixOne's JSON storage normalizes numeric lexemes on read, so values such
+/// as `86400` and `86400.0` need not retain their accepted wire spelling and
+/// can no longer match its hash. Existing JSON rows are converted in place
+/// without rewriting their integrity hashes: their original lexemes are
+/// already unrecoverable, while all subsequent rows retain their exact text.
+async fn ensure_edge_pending_dispatch_result_json_lossless(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let row = query(
+        "SELECT DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'edge_pending_dispatch' \
+           AND COLUMN_NAME = 'result_json' LIMIT 1",
+    )
+    .bind(database)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        sqlx::Error::Protocol(
+            "edge_pending_dispatch.result_json is missing after table creation".to_string(),
+        )
+    })?;
+    let data_type: String = row.try_get("DATA_TYPE")?;
+    let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+        "YES" => true,
+        "NO" => false,
+        value => {
+            return Err(sqlx::Error::Protocol(format!(
+                "edge_pending_dispatch.result_json has invalid IS_NULLABLE value {value}"
+            )));
+        }
+    };
+    if let Some(ddl) = edge_pending_dispatch_result_json_upgrade_ddl(&data_type, nullable)? {
+        query(ddl).execute(pool).await?;
+    }
     Ok(())
 }
 
@@ -7604,7 +7671,7 @@ async fn ensure_core_schema_while_leased(
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
             payload_json JSON NOT NULL,
-            result_json JSON NULL,
+            result_json LONGTEXT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             pod_id VARCHAR(128) NULL,
             dispatched_at DATETIME(6) NULL,
@@ -7617,6 +7684,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    ensure_edge_pending_dispatch_result_json_lossless(&pool, &settings.database).await?;
     fail_if_obsolete_shape(
         &pool,
         &settings.database,
@@ -9368,6 +9436,27 @@ mod tests {
                 .expect("required identity migration DDL"),
             "ALTER TABLE `auth_users` MODIFY COLUMN `username` VARCHAR(128) NOT NULL"
         );
+    }
+
+    #[test]
+    fn edge_dispatch_result_storage_upgrades_only_legacy_json_shape() {
+        assert_eq!(
+            edge_pending_dispatch_result_json_upgrade_ddl("json", true)
+                .expect("legacy JSON column is upgradeable"),
+            Some(EDGE_PENDING_DISPATCH_RESULT_JSON_LONGTEXT_ALTER_SQL)
+        );
+        assert_eq!(
+            edge_pending_dispatch_result_json_upgrade_ddl("longtext", true)
+                .expect("canonical LONGTEXT column is already current"),
+            None
+        );
+        assert_eq!(
+            edge_pending_dispatch_result_json_upgrade_ddl("text", true)
+                .expect("MatrixOne reports LONGTEXT as TEXT"),
+            None
+        );
+        assert!(edge_pending_dispatch_result_json_upgrade_ddl("mediumtext", true).is_err());
+        assert!(edge_pending_dispatch_result_json_upgrade_ddl("json", false).is_err());
     }
 
     struct FakeDatabaseUserRow {

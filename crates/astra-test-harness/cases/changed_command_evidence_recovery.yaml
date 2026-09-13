@@ -1,0 +1,36 @@
+name: changed_command_evidence_recovery
+description: |
+  A failed approach and a later successful approach serve the same read-only
+  verification target. Preserve the failure, assess the later direct evidence,
+  and report the requested fact without retrying the unavailable command.
+prompt: |
+  Tell me the exact first line of README.md in this workspace.
+  First try `astra_missing_reader_probe_827 README.md` in Bash once.
+  If that reader is unavailable, do not install it or retry it: in a separate
+  later tool call use an available file-reading method to obtain the first
+  line. Report the observed line and briefly note which approach worked.
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_outcome_count
+    name: bash
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: submit_task_resolution
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: result
+    path: /conclusion
+    equals: supported
+  - type: turn_rounds_between
+    min: 3
+    max: 10
+  - type: text_not_contains
+    needle: unresolved_tool_outcomes

@@ -206,8 +206,12 @@ pub(super) fn emit_blocked_tool_result(
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
-    let (tool_msg, err_tr) =
-        openai_tool_roundtrip_values(blocked.id, blocked.name, &blocked.err_msg);
+    let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+        blocked.id,
+        blocked.name,
+        &blocked.err_msg,
+        astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+    );
     messages.push(tool_msg);
     tool_results.push(err_tr);
     let record = match blocked.journal_kind {
@@ -339,7 +343,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             Some(&body),
             false,
         );
-        let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+        let (tool_msg, tr) = headless_idempotency_hit_openai_pair(
+            &slot.id,
+            &slot.name,
+            &body,
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
+        );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
         self.ctx
@@ -387,8 +396,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 headless_stderr_unknown_tool_detail(&err_msg),
             );
         }
-        let (tool_msg, err_tr) =
-            openai_tool_roundtrip_values(&slot.id, &slot.name, err_msg.as_str());
+        let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+            &slot.id,
+            &slot.name,
+            err_msg.as_str(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        );
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
@@ -703,8 +716,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     headless_stderr_unknown_tool_detail(&err_msg),
                 );
             }
-            let (tool_msg, err_tr) =
-                openai_tool_roundtrip_values(&execution.id, &execution.name, &err_msg);
+            let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+                &execution.id,
+                &execution.name,
+                &err_msg,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+            );
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
@@ -881,8 +898,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                      change the arguments.",
                     execution.name, prior_cache_hits
                 );
-                let (tool_msg, tr) =
-                    openai_tool_roundtrip_values(&execution.id, &execution.name, &body);
+                let (tool_msg, tr) = openai_tool_roundtrip_values(
+                    &execution.id,
+                    &execution.name,
+                    &body,
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
+                );
                 self.ctx.messages.push(tool_msg);
                 self.ctx.tool_results.push(tr);
                 self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
@@ -941,6 +962,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.id,
                 &execution.name,
                 &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
             );
             if let Some(obj) = tool_msg.as_object_mut() {
                 obj.insert(
@@ -1025,8 +1047,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     }
                     (output, "semantic_dedup_pre_check")
                 };
-            let (mut tool_msg, tr) =
-                headless_idempotency_hit_openai_pair(&execution.id, &execution.name, &body);
+            let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
+                &execution.id,
+                &execution.name,
+                &body,
+                if reason_code == REASON_REPEATED_CACHE_HIT_SUPPRESSED {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped
+                } else {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+                },
+            );
             if let Some(obj) = tool_msg.as_object_mut() {
                 obj.insert(
                     "_round_index".to_string(),

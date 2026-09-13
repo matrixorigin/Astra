@@ -27,6 +27,7 @@ pub enum RuntimeControlInvocationKind {
     WorkEstablishment,
     WorkScheduler,
     WorkSettlement,
+    OutcomeReconciliation,
 }
 
 impl RuntimeControlInvocationKind {
@@ -36,6 +37,7 @@ impl RuntimeControlInvocationKind {
             Self::WorkEstablishment => "start_work",
             Self::WorkScheduler => "run_next_work_item",
             Self::WorkSettlement => "settle_work_item",
+            Self::OutcomeReconciliation => "submit_task_resolution",
         }
     }
 }

@@ -345,7 +345,16 @@ impl ToolInvocationDecisionSnapshot {
             }
         });
         request.selected_offer = self.selected_offer.clone();
+        // The frozen decision owns transport policy, not current-round
+        // completion authority. This non-serializable grant must come from
+        // today's admitted logical call, never from a replayed policy snapshot.
+        let task_resolution_authority = request
+            .policy
+            .task_resolution_authority
+            .take()
+            .filter(|authority| authority.for_call(&request.tool_call_id).is_some());
         request.policy = self.transport_policy.clone();
+        request.policy.task_resolution_authority = task_resolution_authority;
         request.policy.resolved_provider_policy = self.provider_policy.clone();
         request.policy.permission_grant = self.permission_grant.as_ref().map(|grant| {
             super::tool_execution_binding::ToolPermissionGrantSnapshot {
@@ -695,6 +704,42 @@ mod tests {
         assert_eq!(
             ToolInvocationDecisionSnapshot::from_durable(&decision.durable().unwrap()).unwrap(),
             decision
+        );
+    }
+
+    #[test]
+    fn task_resolution_authority_is_current_call_state_not_snapshot_authority() {
+        use astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority;
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut source = request();
+        source.policy.task_resolution_authority =
+            TaskResolutionSubmissionAuthority::for_admitted_call("old", "call");
+        let decision = ToolInvocationDecisionSnapshot::resolve(
+            &source,
+            ToolExecutionRouteKind::ServerLocal,
+            &registry,
+        )
+        .unwrap();
+        let mut current = request();
+        decision.apply_to_request(&mut current);
+        assert!(
+            current.policy.task_resolution_authority.is_none(),
+            "snapshot must not grant authority"
+        );
+        current.policy.task_resolution_authority =
+            TaskResolutionSubmissionAuthority::for_admitted_call("now", "sibling");
+        decision.apply_to_request(&mut current);
+        assert!(current.policy.task_resolution_authority.is_none());
+        current.policy.task_resolution_authority =
+            TaskResolutionSubmissionAuthority::for_admitted_call("now", "call");
+        decision.apply_to_request(&mut current);
+        assert!(
+            current
+                .policy
+                .task_resolution_authority
+                .as_ref()
+                .and_then(|authority| authority.for_call("call"))
+                .is_some_and(|authority| authority.boundary_id() == "now")
         );
     }
 
