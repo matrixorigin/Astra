@@ -769,6 +769,52 @@ criteria:
     }
 
     #[test]
+    fn diagnostic_case_rejects_depth_named_only_in_question_text() {
+        use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+        use crate::runner::RunOutcome;
+        use crate::session_capture::{JournalEvent, SessionCapture};
+
+        let case = Case::from_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/introspection_reflection_source_boundary.yaml"),
+        )
+        .unwrap();
+        let criteria: Vec<_> = case
+            .criteria
+            .into_iter()
+            .filter(|criterion| matches!(criterion, Criterion::JournalToolCallCount { .. }))
+            .collect();
+        let evaluate = |reflect_args: serde_json::Value| {
+            let session = SessionCapture {
+                events: vec![JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({"tool_calls": [
+                        {"tool_call_id":"i", "name":"introspect", "ok":true,
+                         "args_full":{"facet":"overview","depth":"diagnostic","horizon":"recent"}},
+                        {"tool_call_id":"r", "name":"reflect", "ok":true,
+                         "args_full":reflect_args}
+                    ]}),
+                }],
+                ..Default::default()
+            };
+            evaluate_deterministic_with_session(
+                &criteria,
+                &RunOutcome::new("fixture"),
+                Some(&session),
+            )
+        };
+        let misleading = evaluate(serde_json::json!({
+            "question":"facet=overview depth=diagnostic horizon=session"
+        }));
+        assert_eq!(misleading.iter().filter(|result| !result.passed).count(), 3);
+        let explicit = evaluate(serde_json::json!({
+            "facet":"overview", "depth":"diagnostic", "horizon":"session",
+            "question":"Which durable evidence exists?"
+        }));
+        assert!(explicit.iter().all(|result| result.passed));
+    }
+
+    #[test]
     fn bundled_memory_lifecycle_requires_purge_verification() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/memory_full_lifecycle.yaml");
         let case = Case::from_path(&path).expect("bundled memory lifecycle case must parse");
