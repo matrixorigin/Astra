@@ -838,6 +838,10 @@ dev-reset: dev-clean
 dev-setup-demo:
 	@bash scripts/setup/demo-init.sh
 
+# A freshly recreated database must run the complete schema bootstrap before
+# /health can answer. MatrixOne can take several minutes on a cold schema;
+# keep the ordinary API-start timeout unchanged and give only this destructive
+# reseed flow the longer readiness window.
 .PHONY: dev-seed
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
@@ -847,7 +851,7 @@ dev-seed:
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	scripts/dev/mysql-client.sh -e "$$SQL"
-	@$(MAKE) dev-api-restart-debug build-cli-debug
+	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./target/debug/astra admin register \
