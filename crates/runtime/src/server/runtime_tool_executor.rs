@@ -141,7 +141,7 @@ use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
 use crate::server::tool_route_runtime::{
-    ToolRouteRuntimeContext, emit_tool_route_completion_events,
+    ToolRouteObserver, ToolRouteRuntimeContext, emit_tool_route_completion_events,
     execute_tool_route_before_completion_events,
 };
 use crate::server::tool_route_selection::{ToolExecutionClass, tool_execution_class};
@@ -791,6 +791,10 @@ pub struct RuntimeToolExecutor {
     // ── Publish (work surface events) ─────────────────────────────────────────
     /// Optional live event channel used by the web-agent work surface.
     pub(super) work_surface_events: WorkSurfaceEventEmitter,
+    /// Per-turn Explain observer installed by the loop host.  This is kept
+    /// behind interior mutability because the executor is shared through an
+    /// `Arc` while the host advances turn boundaries.
+    tool_route_observer: Arc<std::sync::RwLock<Option<Arc<dyn ToolRouteObserver>>>>,
 
     // ── Session state (self-mod, rollback, observability) ─────────────────────
     /// Optional observability session for self-mod and rollback-backed session state.
@@ -997,6 +1001,7 @@ impl RuntimeToolExecutor {
             agent_binding_mcp: None,
             agent_tool_context: None,
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
+            tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
             execution_binding: ExecutionBindingState::none(),
             capabilities,
             enforce_server_tool_capabilities: false,
@@ -2844,6 +2849,15 @@ impl RuntimeToolExecutor {
         self.work_surface_events.set_tx(tx);
     }
 
+    /// Install or clear the loop host's per-turn observer at the canonical
+    /// runtime tool route boundary.  The setter accepts `&self` because
+    /// agentic loop state retains this executor behind an `Arc`.
+    pub(crate) fn set_tool_route_observer(&self, observer: Option<Arc<dyn ToolRouteObserver>>) {
+        if let Ok(mut slot) = self.tool_route_observer.write() {
+            *slot = observer;
+        }
+    }
+
     /// Publish a canonical Work lifecycle projection on the same event lane
     /// used by every runtime-tool topology. The projection is assembled only
     /// after tool-result convergence; this method deliberately owns delivery
@@ -3632,12 +3646,18 @@ impl RuntimeToolExecutor {
 
         let route_binding_fields =
             self.binding_event_fields_for(&request.workspace, &request.executor);
+        let route_observer = self
+            .tool_route_observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.clone());
         let route_context = ToolRouteRuntimeContext {
             execution_service: &self.tool_execution_service,
             local_transport: self,
             work_surface_events: &self.work_surface_events,
             binding_fields: route_binding_fields,
             cancel_token: cancel_token.clone(),
+            route_observer,
         };
         let route = durable_invocation
             .as_ref()

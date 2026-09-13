@@ -32,6 +32,7 @@ use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
 };
+use crate::server::tool_route_runtime::ToolRouteObserver;
 use crate::server::tool_route_selection::{
     ToolExecutionClass, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
     routing_decision_for_binding, runtime_binding_can_use_client_ledger,
@@ -3184,6 +3185,42 @@ enum WorkEstablishmentCarrierControl {
     DeferPending,
 }
 
+fn explain_analyze_call_id(event: &Value) -> Option<&str> {
+    event
+        .get("call_id")
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("request_id"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())
+}
+
+fn explain_analyze_tool_name(event: &Value) -> &str {
+    event
+        .pointer("/function/name")
+        .or_else(|| event.get("tool"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("tool")
+}
+
+fn bounded_explain_analyze_label(prefix: &str, name: &str) -> String {
+    const MAX_LABEL_BYTES: usize = 160;
+    let mut label = format!("{prefix} {name}");
+    if label.len() > MAX_LABEL_BYTES {
+        let mut boundary = MAX_LABEL_BYTES - '…'.len_utf8();
+        while !label.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        label.truncate(boundary);
+        label.push('…');
+    }
+    label
+}
+
 #[derive(Clone)]
 struct ExplainAnalyzeContext {
     run_id: String,
@@ -3574,6 +3611,10 @@ pub struct ServerAgenticLoopHost {
     /// Analyze graph. Trace spans keep their own diagnostic lifecycle.
     explain_analyze_context: Option<ExplainAnalyzeContext>,
     explain_analyze_open_nodes: HashMap<String, ExplainAnalyzeNode>,
+    explain_analyze_tool_route_observer: Option<Arc<ExplainAnalyzeToolRouteObserver>>,
+    explain_analyze_admission_parents:
+        Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    explain_analyze_admission_nodes: HashMap<String, String>,
     explain_analyze_tool_nodes: HashMap<String, String>,
     pending_request_preparation_context:
         Option<(u32, u32, astra_turn_types::ExplainAnalyzeContextMetricsV1)>,
@@ -4418,6 +4459,224 @@ struct ExplainAnalyzeProviderAttemptSpan {
     terminal_event: Option<Value>,
     terminal_sent_live: bool,
     usage_presence: crate::turn::token_usage::TokenUsagePresence,
+}
+
+#[derive(Clone)]
+struct ExplainAnalyzeToolRouteParent {
+    node_id: String,
+    parent_node_id: Option<String>,
+    round_index: Option<u32>,
+    started_at: Instant,
+}
+
+struct ExplainAnalyzeToolRouteSpan {
+    node: ExplainAnalyzeNode,
+    start_event: Option<Value>,
+    start_sent_live: bool,
+    admission_terminal_event: Option<Value>,
+    admission_terminal_sent_live: bool,
+    terminal_event: Option<Value>,
+    terminal_sent_live: bool,
+}
+
+/// Adds product-facing tool facts at the canonical runtime route boundary.
+/// Runtime work-surface events use the lifecycle fanout lane, which does not
+/// re-enter this host. The observer therefore shares the host's Explain
+/// context and live sender, retaining any fact that live delivery cannot
+/// carry so the host can reconcile it into the normal replay buffer.
+struct ExplainAnalyzeToolRouteObserver {
+    context: Option<ExplainAnalyzeContext>,
+    sender: Option<ServerEventSender>,
+    admission_parents: Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    spans: std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteSpan>>,
+}
+
+impl ExplainAnalyzeToolRouteObserver {
+    fn new(
+        context: Option<ExplainAnalyzeContext>,
+        sender: Option<ServerEventSender>,
+        admission_parents: Arc<std::sync::Mutex<HashMap<String, ExplainAnalyzeToolRouteParent>>>,
+    ) -> Self {
+        Self {
+            context,
+            sender,
+            admission_parents,
+            spans: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn drain_spans(&self) -> HashMap<String, ExplainAnalyzeToolRouteSpan> {
+        std::mem::take(
+            &mut *self
+                .spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+impl ToolRouteObserver for ExplainAnalyzeToolRouteObserver {
+    fn note_dispatch_started(
+        &self,
+        boundary: &crate::server::tool_route_boundary::ToolRouteBoundary,
+        started_at: Instant,
+    ) {
+        let Some(call_id) = boundary.tool_call_id() else {
+            return;
+        };
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        let mut spans = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if spans.contains_key(call_id) {
+            return;
+        }
+        let parent = self
+            .admission_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(call_id)
+            .cloned();
+        let parent_node_id = parent
+            .as_ref()
+            // Admission is a sibling stage under the tool batch. The measured
+            // ToolCall starts after that stage resolves, so it must retain
+            // the admission node's parent rather than become its child.
+            .and_then(|parent| parent.parent_node_id.clone())
+            .or_else(|| Some(context.root_node_id.clone()));
+        let round_index = parent.as_ref().and_then(|parent| parent.round_index);
+        let (admission_terminal_event, admission_terminal_sent_live) = parent
+            .as_ref()
+            .map(|parent| {
+                let admission_node = ExplainAnalyzeNode::new(
+                    context,
+                    parent.node_id.clone(),
+                    parent.parent_node_id.clone(),
+                    astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
+                    bounded_explain_analyze_label("Waiting to dispatch", boundary.tool_name()),
+                    parent.started_at,
+                    parent.round_index,
+                    None,
+                );
+                let event = context.event(
+                    &admission_node,
+                    astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+                    started_at,
+                    Some(
+                        u64::try_from(
+                            started_at
+                                .saturating_duration_since(parent.started_at)
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX),
+                    ),
+                    Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved),
+                    None,
+                );
+                let sent_live = self.sender.as_ref().is_some_and(|sender| {
+                    event
+                        .clone()
+                        .is_some_and(|event| sender.try_send_explain_analyze(event))
+                });
+                (event, sent_live)
+            })
+            .unwrap_or((None, false));
+        if parent.is_some()
+            && let Ok(mut parents) = self.admission_parents.lock()
+        {
+            parents.remove(call_id);
+        }
+        let node = ExplainAnalyzeNode::new(
+            context,
+            format!("{}/tool/{}", context.root_node_id, context.next_event_id()),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall,
+            bounded_explain_analyze_label("Run", boundary.tool_name()),
+            started_at,
+            round_index,
+            None,
+        );
+        let start_event = context.event(
+            &node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Started,
+            started_at,
+            None,
+            None,
+            None,
+        );
+        let start_sent_live = self.sender.as_ref().is_some_and(|sender| {
+            start_event
+                .clone()
+                .is_some_and(|event| sender.try_send_explain_analyze(event))
+        });
+        spans.insert(
+            call_id.to_string(),
+            ExplainAnalyzeToolRouteSpan {
+                node,
+                start_event,
+                start_sent_live,
+                admission_terminal_event,
+                admission_terminal_sent_live,
+                terminal_event: None,
+                terminal_sent_live: false,
+            },
+        );
+    }
+
+    fn note_dispatch_finished(
+        &self,
+        boundary: &crate::server::tool_route_boundary::ToolRouteBoundary,
+        result: &astra_tools::ToolResult,
+        finished_at: Instant,
+    ) {
+        let Some(call_id) = boundary.tool_call_id() else {
+            return;
+        };
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        let mut spans = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(span) = spans.get_mut(call_id) else {
+            return;
+        };
+        if span.terminal_event.is_some() {
+            return;
+        }
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(span.node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        span.terminal_event = context.event(
+            &span.node,
+            astra_turn_types::ExplainAnalyzeTransitionV1::Finished,
+            finished_at,
+            Some(duration_ms),
+            Some(if result.is_error {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+            } else {
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+            }),
+            None,
+        );
+        // If the start was lost to bounded delivery, retain both facts for
+        // host reconciliation so consumers never observe finish-before-start.
+        if span.start_sent_live
+            && let Some(sender) = self.sender.as_ref()
+        {
+            span.terminal_sent_live = span
+                .terminal_event
+                .clone()
+                .is_some_and(|event| sender.try_send_explain_analyze(event));
+        }
+    }
 }
 
 /// Adds product-facing attempt facts at the real HTTP dispatch and response
@@ -5453,6 +5712,9 @@ impl ServerAgenticLoopHostBuilder {
             emitted_events: Vec::new(),
             explain_analyze_context: None,
             explain_analyze_open_nodes: HashMap::new(),
+            explain_analyze_tool_route_observer: None,
+            explain_analyze_admission_parents: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            explain_analyze_admission_nodes: HashMap::new(),
             explain_analyze_tool_nodes: HashMap::new(),
             pending_request_preparation_context: None,
             event_protocol_fault: None,
@@ -10139,38 +10401,18 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn start_explain_analyze_tool_call(&mut self, tool_call: &Value, round_index: u32) {
-        let Some(call_id) = tool_call
-            .get("id")
-            .or_else(|| tool_call.get("call_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|call_id| !call_id.is_empty())
-        else {
+    fn start_explain_analyze_tool_admission(&mut self, tool_call: &Value, round_index: u32) {
+        let Some(call_id) = explain_analyze_call_id(tool_call) else {
             return;
         };
-        if self.explain_analyze_tool_nodes.contains_key(call_id) {
+        if self.explain_analyze_admission_nodes.contains_key(call_id) {
             return;
         }
         let Some(context) = self.explain_analyze_context.clone() else {
             return;
         };
-        let tool_name = tool_call
-            .pointer("/function/name")
-            .or_else(|| tool_call.get("name"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or("tool");
-        let mut label = format!("Run {tool_name}");
-        if label.len() > 160 {
-            let mut boundary = 157;
-            while !label.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            label.truncate(boundary);
-            label.push('…');
-        }
+        let tool_name = explain_analyze_tool_name(tool_call);
+        let label = bounded_explain_analyze_label("Waiting to dispatch", tool_name);
         let parent_node_id = self
             .explain_analyze_open_nodes
             .iter()
@@ -10181,6 +10423,80 @@ impl ServerAgenticLoopHost {
             .max_by_key(|(_, node)| node.started_at)
             .map(|(node_id, _)| node_id.clone())
             .or_else(|| Some(context.root_node_id.clone()));
+        let node_id = format!(
+            "{}/admission/{}",
+            context.root_node_id,
+            context.next_event_id()
+        );
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Admission,
+            label,
+            Instant::now(),
+            Some(round_index),
+            None,
+        );
+        self.explain_analyze_admission_nodes
+            .insert(call_id.to_string(), node_id);
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.insert(
+                call_id.to_string(),
+                ExplainAnalyzeToolRouteParent {
+                    node_id: self
+                        .explain_analyze_admission_nodes
+                        .get(call_id)
+                        .cloned()
+                        .expect("admission node was just inserted"),
+                    parent_node_id: node.parent_node_id.clone(),
+                    round_index: Some(round_index),
+                    started_at: node.started_at,
+                },
+            );
+        }
+        self.start_explain_analyze_node(node);
+    }
+
+    /// Start measured tool work only after the runtime's dispatch boundary.
+    /// Provider admission, scheduler queueing, and approval are represented by
+    /// their own nodes and never inflate the tool execution interval.
+    fn start_explain_analyze_tool_call(&mut self, event: &Value) {
+        if !matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("tool_transport_started" | "tool_request")
+        ) {
+            return;
+        }
+        let Some(call_id) = explain_analyze_call_id(event) else {
+            return;
+        };
+        if self.explain_analyze_tool_nodes.contains_key(call_id) {
+            return;
+        }
+        let Some(context) = self.explain_analyze_context.clone() else {
+            return;
+        };
+        let started_at = Instant::now();
+        let admission_node_id = self.explain_analyze_admission_nodes.remove(call_id);
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.remove(call_id);
+        }
+        let (parent_node_id, round_index) = admission_node_id
+            .as_deref()
+            .and_then(|node_id| self.explain_analyze_open_nodes.get(node_id))
+            .map(|node| (node.parent_node_id.clone(), node.round_index))
+            .unwrap_or_else(|| (Some(context.root_node_id.clone()), None));
+        if let Some(node_id) = admission_node_id {
+            self.finish_explain_analyze_timed_node(
+                &node_id,
+                astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved,
+                started_at,
+            );
+        }
+
+        let tool_name = explain_analyze_tool_name(event);
+        let label = bounded_explain_analyze_label("Run", tool_name);
         let node_id = format!("{}/tool/{}", context.root_node_id, context.next_event_id());
         let node = ExplainAnalyzeNode::new(
             &context,
@@ -10188,8 +10504,8 @@ impl ServerAgenticLoopHost {
             parent_node_id,
             astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall,
             label,
-            Instant::now(),
-            Some(round_index),
+            started_at,
+            round_index,
             None,
         );
         self.explain_analyze_tool_nodes
@@ -10197,21 +10513,56 @@ impl ServerAgenticLoopHost {
         self.start_explain_analyze_node(node);
     }
 
+    fn start_explain_analyze_approval_wait(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+    ) -> Option<String> {
+        let context = self.explain_analyze_context.clone()?;
+        let admission_node_id = self.explain_analyze_admission_nodes.get(call_id).cloned();
+        let (parent_node_id, round_index) = admission_node_id
+            .as_deref()
+            .and_then(|node_id| self.explain_analyze_open_nodes.get(node_id))
+            .map(|node| (Some(node.node_id.clone()), node.round_index))
+            .unwrap_or_else(|| (Some(context.root_node_id.clone()), None));
+        let node_id = format!("{}/wait/{}", context.root_node_id, context.next_event_id());
+        let node = ExplainAnalyzeNode::new(
+            &context,
+            node_id.clone(),
+            parent_node_id,
+            astra_turn_types::ExplainAnalyzeNodeKindV1::Wait,
+            bounded_explain_analyze_label("Waiting for approval to run", tool_name),
+            Instant::now(),
+            round_index,
+            None,
+        );
+        self.start_explain_analyze_node(node);
+        Some(node_id)
+    }
+
+    fn finish_explain_analyze_timed_node(
+        &mut self,
+        node_id: &str,
+        outcome: astra_turn_types::ExplainAnalyzeOutcomeV1,
+        finished_at: Instant,
+    ) {
+        let Some(node) = self.explain_analyze_open_nodes.get(node_id) else {
+            return;
+        };
+        let duration_ms = u64::try_from(
+            finished_at
+                .saturating_duration_since(node.started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.finish_explain_analyze_node_at(node_id, duration_ms, outcome, None, finished_at, None);
+    }
+
     fn finish_explain_analyze_tool_call(&mut self, event: &Value) {
         if event.get("type").and_then(Value::as_str) != Some("tool_call_end") {
             return;
         }
-        let Some(call_id) = event
-            .get("call_id")
-            .or_else(|| event.get("tool_call_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|call_id| !call_id.is_empty())
-            .map(str::to_string)
-        else {
-            return;
-        };
-        let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) else {
+        let Some(call_id) = explain_analyze_call_id(event).map(str::to_string) else {
             return;
         };
         let status = event
@@ -10227,34 +10578,29 @@ impl ServerAgenticLoopHost {
             "suppressed" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
             "deferred" => astra_turn_types::ExplainAnalyzeOutcomeV1::Deferred,
             _ => match status {
-                "completed" | "succeeded" | "success" => {
+                "completed" | "succeeded" | "success" | "ok" => {
                     astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
                 }
                 "rejected" => astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected,
                 "blocked" => astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked,
                 "waiting" => astra_turn_types::ExplainAnalyzeOutcomeV1::Waiting,
                 "skipped" => astra_turn_types::ExplainAnalyzeOutcomeV1::Suppressed,
+                _ if event.get("success").and_then(Value::as_bool) == Some(true) => {
+                    astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded
+                }
                 _ => astra_turn_types::ExplainAnalyzeOutcomeV1::Failed,
             },
         };
-        let Some(node) = self.explain_analyze_open_nodes.get(&node_id) else {
-            return;
-        };
         let finished_at = Instant::now();
-        let duration_ms = u64::try_from(
-            finished_at
-                .saturating_duration_since(node.started_at)
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        self.finish_explain_analyze_node_at(
-            &node_id,
-            duration_ms,
-            outcome,
-            None,
-            finished_at,
-            None,
-        );
+        if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.remove(&call_id);
+            }
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+        if let Some(node_id) = self.explain_analyze_tool_nodes.remove(&call_id) {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
     }
 
     fn start_explain_analyze_context_assembly(
@@ -10400,6 +10746,40 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    fn publish_explain_analyze_tool_route_spans(&mut self) {
+        let Some(observer) = self.explain_analyze_tool_route_observer.as_ref() else {
+            return;
+        };
+        let mut spans = observer.drain_spans().into_iter().collect::<Vec<_>>();
+        spans.sort_by_key(|(_, span)| span.node.started_at);
+        for (call_id, span) in spans {
+            // The route observer closes dispatch admission at the same
+            // instant it starts the measured tool node. Keep the host's
+            // legacy admission map in sync for cancellation/terminal cleanup.
+            if let Some(node_id) = self.explain_analyze_admission_nodes.remove(&call_id) {
+                self.explain_analyze_open_nodes.remove(&node_id);
+            }
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.remove(&call_id);
+            }
+            if !span.admission_terminal_sent_live
+                && let Some(event) = span.admission_terminal_event
+            {
+                self.emit_progress_event(event);
+            }
+            if !span.start_sent_live
+                && let Some(event) = span.start_event
+            {
+                self.emit_progress_event(event);
+            }
+            if !span.terminal_sent_live
+                && let Some(event) = span.terminal_event
+            {
+                self.emit_progress_event(event);
+            }
+        }
+    }
+
     fn explain_phase_node(
         context: &ExplainAnalyzeContext,
         phase: TurnPhaseKind,
@@ -10487,6 +10867,7 @@ impl ServerAgenticLoopHost {
     }
 
     fn emit_validated_progress_event(&mut self, mut event: Value) {
+        self.start_explain_analyze_tool_call(&event);
         self.finish_explain_analyze_tool_call(&event);
         if let Some(object) = event.as_object_mut() {
             // Settlement authority is lifecycle-owned. Never trust or expose
@@ -10579,6 +10960,7 @@ impl ServerAgenticLoopHost {
         if self.validate_progress_event_lane(&event).is_err() {
             return;
         }
+        self.start_explain_analyze_tool_call(&event);
         self.finish_explain_analyze_tool_call(&event);
         self.attach_execution_metadata_to_tool_event(&mut event);
         let sender = self
@@ -10722,6 +11104,11 @@ impl ServerAgenticLoopHost {
         let Some(sink) = self.interaction_sink.clone() else {
             return Err("committed tool request has no durable projection owner".to_string());
         };
+        // Durable commit is the dispatch custody boundary. Start Explain's
+        // measured tool interval before projection can await a slow or failed
+        // client delivery, so the eventual callback/result still settles the
+        // same node even when projection itself errors.
+        self.start_explain_analyze_tool_call(&event);
         sink.deliver_committed_tool_request(event.clone()).await?;
         self.mirror_agent_live_event(&event);
         self.retain_emitted_event(event, true);
@@ -11764,7 +12151,7 @@ impl ServerAgenticLoopHost {
             if !round_seen.insert(key.clone()) {
                 continue;
             }
-            self.start_explain_analyze_tool_call(tool_call, round_index);
+            self.start_explain_analyze_tool_admission(tool_call, round_index);
             #[cfg(feature = "e2e-hooks")]
             {
                 let mut shared =
@@ -13083,10 +13470,29 @@ impl ServerAgenticLoopHost {
                     control = AdmittedToolCallControl::FailedClosed;
                     break 'batches;
                 }
-                match self
+                let approval_wait_node =
+                    self.start_explain_analyze_approval_wait(&request_id, &tool_name);
+                let approval_result = self
                     .wait_edge_approval_or_guidance(action_context, tc, effective_approval_wait)
-                    .await
-                {
+                    .await;
+                let wait_outcome = match &approval_result {
+                    EdgeApprovalWait::Allowed => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Resolved
+                    }
+                    EdgeApprovalWait::Denied(_) => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
+                    }
+                    EdgeApprovalWait::Superseded | EdgeApprovalWait::Cancelled => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+                    }
+                    EdgeApprovalWait::FailedClosed(_) => {
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+                    }
+                };
+                if let Some(node_id) = approval_wait_node {
+                    self.finish_explain_analyze_timed_node(&node_id, wait_outcome, Instant::now());
+                }
+                match approval_result {
                     EdgeApprovalWait::Allowed => {
                         if let Err(error) = self
                             .resolve_completed_edge_approval(&request_id, &tool_name, true, None)
@@ -16179,8 +16585,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
         let Some(run_id) = state.current_run_id.clone() else {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_tool_route_observer(None);
+            }
+            self.explain_analyze_tool_route_observer = None;
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.clear();
+            }
             self.explain_analyze_context = None;
             self.explain_analyze_open_nodes.clear();
+            self.explain_analyze_admission_nodes.clear();
             self.explain_analyze_tool_nodes.clear();
             return;
         };
@@ -16197,8 +16611,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             next_event_id: Arc::new(AtomicU64::new(1)),
         };
         self.explain_analyze_open_nodes.clear();
+        self.explain_analyze_admission_nodes.clear();
         self.explain_analyze_tool_nodes.clear();
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.clear();
+        }
         self.explain_analyze_context = Some(context.clone());
+        let tool_route_observer = Arc::new(ExplainAnalyzeToolRouteObserver::new(
+            Some(context.clone()),
+            self.event_tx.clone(),
+            Arc::clone(&self.explain_analyze_admission_parents),
+        ));
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            executor.set_tool_route_observer(Some(
+                Arc::clone(&tool_route_observer) as Arc<dyn ToolRouteObserver>
+            ));
+        }
+        self.explain_analyze_tool_route_observer = Some(tool_route_observer);
         self.start_explain_analyze_node(ExplainAnalyzeNode::new(
             &context,
             root_node_id,
@@ -16213,12 +16642,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn on_turn_terminal(
         &mut self,
-        _state: &AgenticLoopState,
+        state: &AgenticLoopState,
         result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
         let Some(context) = self.explain_analyze_context.clone() else {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_tool_route_observer(None);
+            }
             return;
         };
+        self.publish_explain_analyze_tool_route_spans();
         let outcome = match result {
             Ok(AgenticLoopOutcome::Completed) => {
                 astra_turn_types::ExplainAnalyzeOutcomeV1::Completed
@@ -16315,6 +16748,22 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 None,
             );
         }
+        let unfinished_admissions = self
+            .explain_analyze_admission_nodes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for node_id in unfinished_admissions {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
+        let unfinished_tools = self
+            .explain_analyze_tool_nodes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for node_id in unfinished_tools {
+            self.finish_explain_analyze_timed_node(&node_id, outcome, finished_at);
+        }
         let root = self
             .explain_analyze_open_nodes
             .remove(&context.root_node_id)
@@ -16341,6 +16790,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
             astra_turn_types::ExplainAnalyzeCoverageGapV1::FirstTokenLatency,
             astra_turn_types::ExplainAnalyzeCoverageGapV1::ProviderRetryBackoff,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
             astra_turn_types::ExplainAnalyzeCoverageGapV1::UserInputWaitIntervals,
         ];
         if let Some(event) = context.event_with_context_and_coverage(
@@ -16354,6 +16804,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             coverage_gaps,
         ) {
             self.emit_progress_event(event);
+        }
+        self.explain_analyze_admission_nodes.clear();
+        self.explain_analyze_tool_nodes.clear();
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            executor.set_tool_route_observer(None);
+        }
+        self.explain_analyze_tool_route_observer = None;
+        if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+            parents.clear();
         }
     }
 
@@ -16378,6 +16837,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn on_turn_phase(&mut self, receipt: TurnPhaseReceipt) {
+        self.publish_explain_analyze_tool_route_spans();
         let Some(context) = self.explain_analyze_context.clone() else {
             return;
         };
@@ -23497,6 +23957,7 @@ mod tests {
     #[derive(Default)]
     struct InMemoryInteractionSink {
         committed: std::sync::Mutex<Vec<Value>>,
+        fail_projection: bool,
     }
 
     #[async_trait::async_trait]
@@ -23517,6 +23978,9 @@ mod tests {
 
         async fn deliver_committed_tool_request(&self, event: Value) -> Result<(), String> {
             self.committed.lock().expect("interaction sink").push(event);
+            if self.fail_projection {
+                return Err("simulated live projection failure after durable commit".to_string());
+            }
             Ok(())
         }
 
@@ -30783,6 +31247,21 @@ mod tests {
         .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-explain-tools".to_string());
+        let workspace = tempfile::tempdir().expect("runtime tool workspace");
+        std::fs::write(workspace.path().join("public.txt"), "public output")
+            .expect("runtime tool input");
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "u-explain-tools".to_string(),
+            "s-explain-tools".to_string(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        );
+        state.runtime_tool_executor = Some(Arc::new(executor));
         host.on_turn_started(&state);
 
         let batch_started = Instant::now();
@@ -30794,14 +31273,23 @@ mod tests {
                 "function": {"name": "read_file", "arguments": "private arguments"}
             })],
         );
-        host.emit_progress_event(json!({
-            "type": "tool_call_end",
-            "call_id": "call-1",
-            "tool": "read_file",
-            "status": "completed",
-            "success": true,
-            "output": "private output",
-        }));
+        let tool_result = state
+            .runtime_tool_executor
+            .as_ref()
+            .expect("runtime tool executor")
+            .execute_with_metadata(
+                "read_file",
+                &json!({
+                    "path": "public.txt",
+                    "_tool_call_id": "call-1",
+                    "_run_id": "run-explain-tools",
+                }),
+            )
+            .await;
+        assert!(
+            !tool_result.is_error,
+            "real runtime tool route: {tool_result:?}"
+        );
         let batch_finished = Instant::now();
         host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
             phase: TurnPhaseKind::ToolExecution,
@@ -30837,8 +31325,18 @@ mod tests {
             .iter()
             .find(|event| event["kind"] == "tool_call" && event["transition"] == "finished")
             .expect("tool call terminal fact");
+        let admission_start = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "started")
+            .expect("dispatch wait start fact");
+        let admission_finish = explain_facts
+            .iter()
+            .find(|event| event["kind"] == "admission" && event["transition"] == "finished")
+            .expect("dispatch wait finish fact");
         assert_eq!(tool_start["label"], "Run read_file");
         assert_eq!(tool_start["parent_node_id"], batch_start["node_id"]);
+        assert_eq!(admission_start["label"], "Waiting to dispatch read_file");
+        assert_eq!(admission_finish["outcome"], "resolved");
         assert_eq!(tool_finish["outcome"], "succeeded");
         assert!(tool_finish["duration_ms"].as_u64().is_some());
         assert!(tool_finish.get("output").is_none());
@@ -30861,6 +31359,7 @@ mod tests {
                 "child_run_intervals",
                 "first_token_latency",
                 "provider_retry_backoff",
+                "tool_io_wait_intervals",
                 "user_input_wait_intervals"
             ])
         );
@@ -32598,6 +33097,17 @@ mod tests {
         .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
+        let mut explain_state = create_test_state();
+        explain_state.current_run_id = Some("test-run".to_string());
+        host.on_turn_started(&explain_state);
+        let explain_batch_started = Instant::now();
+        host.on_turn_phase_started(
+            &explain_state,
+            TurnPhaseKind::ToolExecution,
+            0,
+            0,
+            explain_batch_started,
+        );
         let interaction_sink = install_in_memory_interaction_sink(&mut host);
         host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register bash as a valid tool so the edge ledger delivery path admits it.
@@ -32638,9 +33148,10 @@ mod tests {
             ),
             "the second mutating command must enter the approval protocol"
         );
+        host.emit_admitted_tool_call_events(0, &tool_calls);
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(35)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
                 test_approval_key("u-batch", "s-batch", "w1"),
@@ -32652,7 +33163,7 @@ mod tests {
             );
             drop(guard);
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
                 tool_callback_key("u-batch", "s-batch", "w1"),
@@ -32725,6 +33236,60 @@ mod tests {
         assert_eq!(results.results[1].request_id, "w2");
         assert_eq!(results.results[0].status, "ok");
         assert_eq!(results.results[1].status, "ok");
+
+        let explain_batch_finished = Instant::now();
+        host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
+            phase: TurnPhaseKind::ToolExecution,
+            round_index: 0,
+            attempt_index: 0,
+            started_at: explain_batch_started,
+            finished_at: explain_batch_finished,
+            duration_ms: u64::try_from(
+                explain_batch_finished
+                    .saturating_duration_since(explain_batch_started)
+                    .as_millis(),
+            )
+            .unwrap(),
+            outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Succeeded,
+        });
+        host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+
+        let explain_facts = host
+            .emitted_events
+            .iter()
+            .filter(|event| event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE)
+            .collect::<Vec<_>>();
+        let tool_intervals = explain_facts
+            .iter()
+            .filter(|event| event["kind"] == "tool_call" && event["transition"] == "finished")
+            .map(|event| {
+                (
+                    event["start_elapsed_ms"]
+                        .as_u64()
+                        .expect("tool start offset"),
+                    event["elapsed_ms"].as_u64().expect("tool end offset"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_intervals.len(), 2, "both dispatched tools are timed");
+        assert!(tool_intervals[0].1 <= tool_intervals[1].0);
+        let approval_waits = explain_facts
+            .iter()
+            .filter(|event| {
+                event["kind"] == "wait"
+                    && event["transition"] == "finished"
+                    && event["label"]
+                        .as_str()
+                        .is_some_and(|label| label.starts_with("Waiting for approval"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(approval_waits.len(), 2);
+        assert!(
+            approval_waits
+                .iter()
+                .any(|event| event["duration_ms"].as_u64().is_some_and(|ms| ms >= 20)),
+            "the delayed approval must remain visible as a wait interval"
+        );
     }
 
     #[tokio::test]
@@ -32811,94 +33376,130 @@ mod tests {
 
     #[tokio::test]
     async fn auto_interaction_mode_delivers_edge_mutation_without_approval_wait() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-auto-edge".to_string(),
-            "s-auto-edge".to_string(),
-        )
-        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
-        .build();
-        let sink = install_in_memory_interaction_sink(&mut host);
-        host.install_runtime_tool_schemas(
-            vec![json!({
+        for fail_projection in [false, true] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-auto-edge".to_string(),
+                "s-auto-edge".to_string(),
+            )
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
+            .build();
+            let sink = Arc::new(InMemoryInteractionSink {
+                fail_projection,
+                ..Default::default()
+            });
+            host.set_interaction_sink(sink.clone());
+            let mut explain_state = create_test_state();
+            explain_state.current_run_id = Some("run-auto-edge".to_string());
+            host.on_turn_started(&explain_state);
+            host.install_runtime_tool_schemas(
+                vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                Default::default(),
+            );
+            let call = json!({
+                "id": "auto-write",
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "description": "Write file contents",
-                    "parameters": {"type": "object", "properties": {}}
+                    "arguments": r#"{"path":"auto.txt","content":"ok"}"#,
                 }
-            })],
-            Default::default(),
-        );
-        let call = json!({
-            "id": "auto-write",
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "arguments": r#"{"path":"auto.txt","content":"ok"}"#,
-            }
-        });
-        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
-            &astra_services::multi_agent::EdgeDispatchIdentity::new(
-                "u-auto-edge",
-                "s-auto-edge",
-                "run-auto-edge",
-                "chain-auto-edge",
-                "auto-write",
-            ),
-        );
-        let ledger = host.edge_callback_ledger.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            ledger.lock().await.insert(
-                callback_key,
-                json!({
-                    "body": {
-                        "request_id": "auto-write",
-                        "edge_agent_id": "edge-1",
-                        "status": "ok",
-                        "output": "wrote-auto"
-                    }
-                }),
+            });
+            host.emit_admitted_tool_call_events(0, std::slice::from_ref(&call));
+            let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+                &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    "u-auto-edge",
+                    "s-auto-edge",
+                    "run-auto-edge",
+                    "chain-auto-edge",
+                    "auto-write",
+                ),
             );
-        });
+            let ledger = host.edge_callback_ledger.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ledger.lock().await.insert(
+                    callback_key,
+                    json!({
+                        "body": {
+                            "request_id": "auto-write",
+                            "edge_agent_id": "edge-1",
+                            "status": "completed",
+                            "output": "wrote-auto"
+                        }
+                    }),
+                );
+            });
 
-        let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            host.deliver_edge_tools_via_ledger(
-                "run-auto-edge",
-                "chain-auto-edge",
-                &[call],
-                &context,
-            ),
-        )
-        .await
-        .expect("auto mode must not wait for a human approval");
+            let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                host.deliver_edge_tools_via_ledger(
+                    "run-auto-edge",
+                    "chain-auto-edge",
+                    &[call],
+                    &context,
+                ),
+            )
+            .await
+            .expect("auto mode must not wait for a human approval");
 
-        assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
-        assert_eq!(outcome.results.len(), 1);
-        assert_eq!(outcome.results[0].status, "ok");
-        let committed = sink.committed.lock().expect("committed interactions");
-        assert!(
-            committed.iter().all(|event| {
-                !matches!(
-                    event.get("type").and_then(Value::as_str),
-                    Some("approval_required" | "approval_batch_required")
-                )
-            }),
-            "auto mode must not publish an unresolved approval request"
-        );
-        assert_eq!(
-            committed
+            assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+            assert_eq!(outcome.results.len(), 1);
+            assert_eq!(outcome.results[0].status, "completed");
+            host.on_turn_terminal(&explain_state, &Ok(AgenticLoopOutcome::Completed));
+            let tool_terminal = host
+                .emitted_events
                 .iter()
-                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
-                .count(),
-            1,
-            "auto mode still uses the guarded tool-request boundary"
-        );
+                .filter(|event| {
+                    event["type"] == astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE
+                        && event["kind"] == "tool_call"
+                        && event["transition"] == "finished"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tool_terminal.len(),
+                1,
+                "durable callback must retain tool timing even when live projection fails: {fail_projection}"
+            );
+            assert_eq!(tool_terminal[0]["outcome"], "succeeded");
+            assert!(tool_terminal[0]["duration_ms"].as_u64().is_some());
+            assert!(
+                host.emitted_events
+                    .iter()
+                    .any(|event| event["kind"] == "admission"
+                        && event["transition"] == "finished"
+                        && event["outcome"] == "resolved")
+            );
+            let committed = sink.committed.lock().expect("committed interactions");
+            assert!(
+                committed.iter().all(|event| {
+                    !matches!(
+                        event.get("type").and_then(Value::as_str),
+                        Some("approval_required" | "approval_batch_required")
+                    )
+                }),
+                "auto mode must not publish an unresolved approval request"
+            );
+            assert_eq!(
+                committed
+                    .iter()
+                    .filter(
+                        |event| event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    )
+                    .count(),
+                1,
+                "auto mode still uses the guarded tool-request boundary"
+            );
+        }
     }
 
     #[tokio::test]
@@ -41626,12 +42227,27 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            phase_outcomes,
-            vec![
-                ("preparation".to_string(), "succeeded".to_string()),
-                ("model_round".to_string(), "failed".to_string()),
-            ],
-            "a provider failure must retain both the completed pre-provider boundary and the failed model boundary"
+            phase_outcomes.first(),
+            Some(&("context_assembly".to_string(), "succeeded".to_string())),
+            "the source assembly remains visible before the provider request"
+        );
+        assert_eq!(
+            phase_outcomes.get(1),
+            Some(&("preparation".to_string(), "succeeded".to_string())),
+            "the pre-provider boundary must complete before inference"
+        );
+        assert_eq!(
+            phase_outcomes.last(),
+            Some(&("model_round".to_string(), "failed".to_string())),
+            "the model boundary must retain the provider failure"
+        );
+        let provider_attempts = &phase_outcomes[2..phase_outcomes.len().saturating_sub(1)];
+        assert!(
+            !provider_attempts.is_empty()
+                && provider_attempts
+                    .iter()
+                    .all(|(kind, outcome)| { kind == "provider_attempt" && outcome == "failed" }),
+            "every physical retry must remain a failed provider-attempt fact: {phase_outcomes:?}"
         );
 
         state

@@ -71,6 +71,7 @@ pub enum ExplainAnalyzeCoverageGapV1 {
     ProviderRetryBackoff,
     FirstTokenLatency,
     ChildRunIntervals,
+    ToolIoWaitIntervals,
 }
 
 impl ExplainAnalyzeCoverageGapV1 {
@@ -81,16 +82,18 @@ impl ExplainAnalyzeCoverageGapV1 {
             Self::ProviderRetryBackoff => "provider_retry_backoff",
             Self::FirstTokenLatency => "first_token_latency",
             Self::ChildRunIntervals => "child_run_intervals",
+            Self::ToolIoWaitIntervals => "tool_io_wait_intervals",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::ApprovalWaitIntervals => "approval waits",
+            Self::ApprovalWaitIntervals => "some approval waits",
             Self::UserInputWaitIntervals => "user input waits",
             Self::ProviderRetryBackoff => "provider retry backoff",
             Self::FirstTokenLatency => "time to first token",
             Self::ChildRunIntervals => "child-run timing",
+            Self::ToolIoWaitIntervals => "tool I/O wait breakdown",
         }
     }
 }
@@ -487,8 +490,8 @@ mod tests {
         turn.attempt_index = None;
         turn = terminal(turn);
         turn.coverage_gaps = vec![
-            ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
             ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
         ];
         assert!(turn.is_valid());
 

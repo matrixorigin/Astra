@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,22 @@ use astra_server_types::{
 use astra_turn_core::capability::Capability;
 use astra_turn_core::tool::registry::meta::tool_meta;
 
+/// Observes the canonical runtime route boundary used by every local tool
+/// transport.  The observer is deliberately separate from work-surface SSE
+/// delivery: the latter is a client projection, while Explain needs the
+/// actual dispatch and result custody boundary even when that projection is
+/// sent through the lifecycle fanout channel.
+pub(crate) trait ToolRouteObserver: Send + Sync {
+    fn note_dispatch_started(&self, boundary: &ToolRouteBoundary, started_at: Instant);
+
+    fn note_dispatch_finished(
+        &self,
+        boundary: &ToolRouteBoundary,
+        result: &astra_tools::ToolResult,
+        finished_at: Instant,
+    );
+}
+
 pub(crate) struct ToolRouteRuntimeContext<'a, L>
 where
     L: ServerLocalToolTransport + ?Sized,
@@ -27,6 +44,7 @@ where
     pub(crate) work_surface_events: &'a WorkSurfaceEventEmitter,
     pub(crate) binding_fields: Map<String, Value>,
     pub(crate) cancel_token: Option<Arc<CancellationToken>>,
+    pub(crate) route_observer: Option<Arc<dyn ToolRouteObserver>>,
 }
 
 pub(crate) struct ExecutedToolRoute {
@@ -59,6 +77,14 @@ where
     )
     .await;
 
+    // This is the semantic dispatch boundary.  Approval and provider
+    // admission that happen inside the route remain part of the measured
+    // interval, while routing-event/fanout delivery before this point cannot
+    // inflate tool execution time.
+    let dispatch_started_at = Instant::now();
+    if let Some(observer) = context.route_observer.as_deref() {
+        observer.note_dispatch_started(&boundary, dispatch_started_at);
+    }
     let mut result = context
         .execution_service
         .execute_boundary_with_cancel(
@@ -68,8 +94,15 @@ where
         )
         .await;
     annotate_default_executor_cancel_if_needed(&boundary.request().tool_name, &mut result);
+    let dispatch_finished_at = Instant::now();
+    if let Some(observer) = context.route_observer.as_deref() {
+        observer.note_dispatch_finished(&boundary, &result, dispatch_finished_at);
+    }
 
     boundary.attach_binding_metadata(&mut result, context.execution_service.tool_registry());
+    // Preserve the existing work-surface duration contract. Explain uses the
+    // observer's independent dispatch timestamps above so route projection
+    // timing remains backwards-compatible for callers that consume it.
     let duration_ms = boundary.elapsed_ms();
     ExecutedToolRoute {
         boundary,

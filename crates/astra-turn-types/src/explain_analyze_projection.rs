@@ -447,6 +447,12 @@ impl ExplainAnalyzeGraphV1 {
 
         let mut points_by_clock: HashMap<&str, Vec<(u64, i8)>> = HashMap::new();
         for node in &self.nodes {
+            if matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::Admission | ExplainAnalyzeNodeKindV1::Wait
+            ) {
+                continue;
+            }
             if parent_ids.contains(&(node.clock_domain_id.as_str(), node.node_id.as_str())) {
                 continue;
             }
@@ -1150,8 +1156,8 @@ mod tests {
             100,
         );
         turn.coverage_gaps = vec![
-            crate::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
             crate::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            crate::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
         ];
         let mut graph = ExplainAnalyzeGraphV1::default();
         graph.apply(turn);
@@ -1160,8 +1166,8 @@ mod tests {
         assert_eq!(
             graph.coverage_gaps(),
             vec![
-                crate::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
                 crate::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+                crate::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
             ]
         );
         assert_eq!(
@@ -1453,6 +1459,104 @@ mod tests {
             ExplainAnalyzeGraphIntegrityV1::Consistent
         );
         assert_eq!(graph.max_concurrency(), Some(2));
+    }
+
+    #[test]
+    fn admission_and_wait_intervals_do_not_count_as_parallel_work() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        graph.apply(finished(
+            started("turn", ExplainAnalyzeNodeKindV1::Turn, None, "clock-1", 0),
+            0,
+            180,
+        ));
+        graph.apply(finished(
+            started(
+                "batch",
+                ExplainAnalyzeNodeKindV1::ToolBatch,
+                Some("turn"),
+                "clock-1",
+                0,
+            ),
+            0,
+            180,
+        ));
+        graph.apply(finished(
+            started(
+                "admission-a",
+                ExplainAnalyzeNodeKindV1::Admission,
+                Some("batch"),
+                "clock-1",
+                0,
+            ),
+            0,
+            70,
+        ));
+        graph.apply(finished(
+            started(
+                "approval-a",
+                ExplainAnalyzeNodeKindV1::Wait,
+                Some("admission-a"),
+                "clock-1",
+                10,
+            ),
+            10,
+            70,
+        ));
+        graph.apply(finished(
+            started(
+                "tool-a",
+                ExplainAnalyzeNodeKindV1::ToolCall,
+                Some("batch"),
+                "clock-1",
+                70,
+            ),
+            70,
+            120,
+        ));
+        graph.apply(finished(
+            started(
+                "admission-b",
+                ExplainAnalyzeNodeKindV1::Admission,
+                Some("batch"),
+                "clock-1",
+                0,
+            ),
+            0,
+            120,
+        ));
+        graph.apply(finished(
+            started(
+                "approval-b",
+                ExplainAnalyzeNodeKindV1::Wait,
+                Some("admission-b"),
+                "clock-1",
+                80,
+            ),
+            80,
+            120,
+        ));
+        graph.apply(finished(
+            started(
+                "tool-b",
+                ExplainAnalyzeNodeKindV1::ToolCall,
+                Some("batch"),
+                "clock-1",
+                120,
+            ),
+            120,
+            170,
+        ));
+        graph.finish_ingest();
+
+        assert_eq!(
+            graph.integrity(),
+            ExplainAnalyzeGraphIntegrityV1::Consistent
+        );
+        assert_eq!(
+            graph.max_concurrency(),
+            Some(1),
+            "overlapping dispatch and approval waits must not inflate executed-work concurrency"
+        );
     }
 
     #[test]

@@ -667,8 +667,8 @@ mod tests {
         let mut turn_end = finished(turn_start.clone(), 100);
         turn_end.outcome = Some(ExplainAnalyzeOutcomeV1::Completed);
         turn_end.coverage_gaps = vec![
-            ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
             ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
         ];
 
         let output = render(&[turn_start, turn_end], false, false);
@@ -678,7 +678,7 @@ mod tests {
             "{output}"
         );
         assert!(
-            output.contains("Not timed separately · approval waits · child-run timing"),
+            output.contains("Not timed separately · child-run timing · tool I/O wait breakdown"),
             "{output}"
         );
     }

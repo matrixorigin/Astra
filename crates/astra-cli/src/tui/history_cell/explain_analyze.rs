@@ -222,14 +222,18 @@ fn render_graph(
             };
             let (row, compact_row) =
                 node_row(node, &prefix, &offset, &duration, state, state_short, width);
+            let node_style = match node.kind {
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Wait => Style::default().fg(theme.warn),
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission => {
+                    Style::default().fg(Color::DarkGray)
+                }
+                _ => Style::default().fg(theme.accent),
+            };
             if compact_row {
-                lines.push(Line::from(Span::styled(
-                    row,
-                    Style::default().fg(theme.accent),
-                )));
+                lines.push(Line::from(Span::styled(row, node_style)));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled(row, Style::default().fg(theme.accent)),
+                    Span::styled(row, node_style),
                     Span::styled(format!("  {state}"), Style::default().fg(state_color)),
                 ]));
             }
@@ -1069,8 +1073,8 @@ mod tests {
             None,
         );
         turn_terminal.coverage_gaps = vec![
-            astra_turn_types::ExplainAnalyzeCoverageGapV1::ApprovalWaitIntervals,
             astra_turn_types::ExplainAnalyzeCoverageGapV1::ChildRunIntervals,
+            astra_turn_types::ExplainAnalyzeCoverageGapV1::ToolIoWaitIntervals,
         ];
         graph.apply(turn_terminal);
         graph.finish_ingest();
@@ -1078,7 +1082,7 @@ mod tests {
         let rendered = text(&ExplainAnalyzeCell::new(graph, false).display_lines(120));
         assert!(rendered.contains("partial capture"), "{rendered}");
         assert!(
-            rendered.contains("Not timed separately · approval waits · child-run timing"),
+            rendered.contains("Not timed separately · child-run timing · tool I/O wait breakdown"),
             "{rendered}"
         );
     }

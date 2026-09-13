@@ -32,6 +32,14 @@ impl ToolRouteBoundary {
         &self.request
     }
 
+    pub(crate) fn tool_call_id(&self) -> Option<&str> {
+        request_tool_call_id(&self.request)
+    }
+
+    pub(crate) fn tool_name(&self) -> &str {
+        &self.request.tool_name
+    }
+
     pub(crate) fn route_kind(&self) -> ToolExecutionRouteKind {
         self.route
     }
