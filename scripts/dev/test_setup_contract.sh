@@ -73,6 +73,12 @@ chmod +x "$test_root/scripts/dev/init.sh"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
 first_snapshot="$(snapshot_secrets "$test_root/.env")"
+[[ "$(read_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 1 ]]
+set_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS 0
+init_output="$("$test_root/scripts/dev/init.sh")"
+[[ "$(read_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 0 ]]
+[[ "$init_output" == *"Local user memory is disabled"* ]]
+
 
 while IFS='=' read -r key value; do
     if [[ -z "$value" || "$value" == *changeme* || "$value" == *change_me* || \

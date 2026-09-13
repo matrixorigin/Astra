@@ -68,6 +68,11 @@ if [ "${ASTRA_DISABLE_MEMORIA_MASTER_KEY:-}" = "1" ]; then
     unset MEMORIA_MASTER_KEY
 fi
 
+# Service reachability does not imply that local accounts can use memory.
+if [[ -n "${MEMORIA_MASTER_KEY:-}" && -z "${MEMORIA_WEB_URL:-}" && "${MEMORIA_SELF_HOSTED_MASTER_ACCESS:-0}" != 1 ]]; then
+    echo "⚠️  Memoria is configured but local user memory is disabled. Set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in $ENV_FILE for self-hosted Memoria 0.5.2+."
+fi
+
 API_PORT="${ASTRA_API_PORT:-17001}"
 DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
 DB_PORT="${MATRIXONE_PORT:-6001}"

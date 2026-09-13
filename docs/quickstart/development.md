@@ -37,6 +37,14 @@ User Runner:
 ./target/debug/astra admin model load .models.yaml --update-existing
 ```
 
+The local `.env.example` enables owner-scoped Memoria access for active local
+password accounts with `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Existing scoped
+bindings and revoked permissions remain authoritative. If your `.env` predates
+this setting, add it and restart the API after confirming Memoria is 0.5.2 or
+newer. A healthy Memoria service alone does not establish account access.
+Keep this setting disabled for hosted deployments; browser-login deployments
+use account-scoped Memoria credentials.
+
 Keep `.models.yaml` and `.env` credentials out of Git.
 
 ## Project Structure

@@ -76,6 +76,14 @@ else
     echo "✅ MEMORIA_MASTER_KEY already configured"
 fi
 
+# Existing configurations may predate the explicit local-memory permission.
+# Preserve an operator's setting and surface the missing prerequisite early.
+MEMORIA_LOCAL_ACCESS="$(env_file_read "$ENV_FILE" MEMORIA_SELF_HOSTED_MASTER_ACCESS 2>/dev/null || true)"
+MEMORIA_LOGIN_WEBSITE="$(env_file_read "$ENV_FILE" MEMORIA_WEB_URL 2>/dev/null || true)"
+if [[ -z "$MEMORIA_LOGIN_WEBSITE" && "$MEMORIA_LOCAL_ACCESS" != 1 ]]; then
+    echo "⚠️  Local user memory is disabled. For self-hosted Memoria 0.5.2+, set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in .env and restart the API."
+fi
+
 # ── Optional: fast linker (mold) ──
 CARGO_CONFIG="$PROJECT_ROOT/.cargo/config.toml"
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
