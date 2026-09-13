@@ -301,6 +301,7 @@ export {
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
 } from "./explain-analyze";
+export { renderExplainAnalyzeText } from "./explain-analyze-text";
 export type {
   ExplainAnalyzeGraphV1,
   ExplainAnalyzeDiagnosticV1,
@@ -464,3 +465,6 @@ export {
 } from "./http";
 export { AstraWebSocket } from "./websocket";
 export type { AstraWebSocketOptions, ToolApproval } from "./websocket";
+
+export { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
+export type { ExplainAnalyzeLayoutNodeV1, ExplainAnalyzeLayoutEdgeKindV1, ExplainAnalyzeLayoutEdgeV1, ExplainAnalyzeLayoutDomainV1, ExplainAnalyzeLayoutV1, ExplainAnalyzeLayoutOptionsV1 } from "./explain-analyze-layout";

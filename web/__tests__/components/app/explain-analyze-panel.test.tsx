@@ -29,7 +29,7 @@ describe("ExplainAnalyzePanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Tree" }));
     const waitingLane = screen.getByText("Waiting for approval to run bash").closest(".explain-analyze-lane");
     expect(waitingLane?.className).not.toContain("explain-analyze-tree-active");
-    expect(waitingLane?.querySelector(".explain-analyze-mini-span")?.className).toContain("bg-warning");
+    expect(waitingLane?.querySelector(".explain-analyze-tree-status")?.className).toContain("text-warning");
   });
 
   it("shows a plain-language overview, honest token lanes, and an expandable timeline", () => {
@@ -119,7 +119,7 @@ describe("ExplainAnalyzePanel", () => {
       />,
     );
 
-    expect(screen.getByText("Timings, dependencies and model usage")).toBeTruthy();
+    expect(screen.getByText("Explain Analyze · recorded timings and model usage")).toBeTruthy();
     expect(screen.getByText("Turn time")).toBeTruthy();
     expect(screen.getByTitle("2.0 s")).toBeTruthy();
     expect(screen.getByText("Slowest model request")).toBeTruthy();
@@ -378,13 +378,14 @@ describe("Explain Analyze tree view", () => {
     ...recordedStage("tree-call", "Read project configuration", 100, 800, { parent_node_id: "tree-turn" }),
   ];
 
-  it("defaults to a readable execution tree with nearby measured details", () => {
+  it("defaults to a compact tree with inline measured details", () => {
     render(<ExplainAnalyzePanel live events={facts} />);
     expect(screen.getByRole("button", { name: "Tree" }).getAttribute("aria-pressed")).toBe("true");
     expect(screen.queryByRole("slider")).toBeNull();
     expect(screen.queryByRole("button", { name: /Play timeline/ })).toBeNull();
     const stage = screen.getByRole("button", { name: /Inspect Read project configuration/ });
     expect(stage.classList.contains("explain-analyze-stage-title")).toBe(true);
+    expect(document.querySelector(".explain-analyze-mini-track")).toBeNull();
     fireEvent.click(stage);
     const details = screen.getByRole("complementary", { name: "Stage details: Read project configuration" });
     expect(stage.closest(".explain-analyze-tree-node")?.contains(details)).toBe(true);
@@ -394,6 +395,7 @@ describe("Explain Analyze tree view", () => {
 
   it("preserves selection and collapsed branches when switching views", () => {
     render(<ExplainAnalyzePanel live events={facts} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
     fireEvent.click(screen.getByRole("button", { name: /Inspect Read project configuration/ }));
     fireEvent.click(screen.getByRole("button", { name: "Timeline" }));
     expect(screen.getByRole("slider")).toBeTruthy();
@@ -418,6 +420,7 @@ describe("Explain Analyze tree view", () => {
       ...recordedStage("hidden-dependency", "Dependency result", 1_000, 1_500),
     ];
     const { container, rerender } = render(<ExplainAnalyzePanel live events={facts} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
     expect(container.querySelectorAll(".explain-analyze-lane")).toHaveLength(500);
     fireEvent.click(screen.getByRole("button", { name: /Inspect Inspect result,/ }));
     fireEvent.click(within(screen.getByRole("complementary")).getByRole("button", { name: "Dependency result" }));
@@ -437,6 +440,56 @@ describe("Explain Analyze tree view", () => {
   });
 });
 
+describe("Explain Analyze graph view", () => {
+  it("renders explicit containment and dependency edges with forked cards", () => {
+    const facts = [
+      ...recordedStage("turn", "User turn", 0, 2_000, { kind: "turn" }),
+      ...recordedStage("first", "Read project configuration", 100, 700, { parent_node_id: "turn" }),
+      ...recordedStage("second", "Read source files", 150, 800, { parent_node_id: "turn" }),
+      ...recordedStage("merge", "Prepare answer", 900, 1_400, {
+        parent_node_id: "turn", dependency_node_ids: ["first", "second"],
+      }),
+    ];
+    const { container } = render(<ExplainAnalyzePanel events={facts} />);
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    expect(screen.getByRole("button", { name: "Graph" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByLabelText("Graph legend")).toBeTruthy();
+    const edges = [...container.querySelectorAll(".explain-analyze-graph-edge")];
+    expect(edges).toHaveLength(5);
+    expect(container.querySelectorAll(".explain-analyze-graph-edge-dependency")).toHaveLength(2);
+    expect(edges.some((edge) => edge.getAttribute("d")?.includes("first") ?? false)).toBe(false);
+
+    const turn = container.querySelector('[data-node-id="turn"]') as HTMLElement;
+    const first = container.querySelector('[data-node-id="first"]') as HTMLElement;
+    const second = container.querySelector('[data-node-id="second"]') as HTMLElement;
+    expect(Number.parseFloat(turn.style.left)).toBeLessThan(Number.parseFloat(first.style.left));
+    expect(Number.parseFloat(first.style.top)).toBeLessThan(Number.parseFloat(second.style.top));
+    expect(screen.getByRole("button", { name: /Inspect Read project configuration/ })).toBe(first);
+
+    expect(screen.getByRole("button", { name: "Zoom out graph" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom out graph" }));
+    expect(screen.getByText("90%")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Fit graph" }));
+    expect(screen.getByText("78%")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Inspect Prepare answer/ }));
+    expect(screen.getByRole("complementary", { name: "Stage details: Prepare answer" })).toBeTruthy();
+  });
+
+  it("keeps wait styling and worker clock domains separate", () => {
+    const wait = recordedStage("wait", "Waiting for approval", 100, 400, { kind: "wait" });
+    const child = recordedStage("child", "Child worker", 0, 500, {
+      kind: "turn", clock_domain_id: "child-clock", run_id: "child-run", turn_id: "child-turn",
+    });
+    const { container } = render(<ExplainAnalyzePanel live events={[...wait, ...child]} />);
+    fireEvent.click(screen.getByRole("button", { name: "Graph" }));
+    expect(container.querySelector('[data-node-id="wait"]')?.className).toContain("graph-card-wait");
+    expect(container.querySelectorAll(".explain-analyze-graph-domain")).toHaveLength(2);
+    expect(screen.getByText("Measured wait time")).toBeTruthy();
+    expect(screen.getByTitle("300 ms")).toBeTruthy();
+  });
+});
+
 describe("Compact execution tree presentation", () => {
   it("shows one usage uncertainty note without four placeholder cards", () => {
     render(<ExplainAnalyzePanel live events={recordedStage("turn", "User turn", 0, 2_000, { kind: "turn" })} />);
@@ -452,6 +505,7 @@ describe("Compact execution tree presentation", () => {
     }).map((fact) => fact.transition === "finished" ? { ...fact, usage: {
       basis: "provider_partial", fresh_input_tokens: 100, output_tokens: 12,
     } } : fact)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Tree" }));
     const node = screen.getByRole("button", { name: /Inspect Model request/ }).closest(".explain-analyze-tree-node")!;
     expect(node.querySelector(".explain-analyze-tree-usage")?.textContent).toContain("in 100");
     expect(node.querySelector(".explain-analyze-tree-status")?.textContent).toBe("Completed");
@@ -503,12 +557,13 @@ it("keeps a historical started-only node static until live observation is explic
   expect(screen.getByText("Snapshot")).toBeInTheDocument();
   expect(screen.queryByText("Active stages")).toBeNull();
   expect(screen.getByText("End not recorded")).toBeInTheDocument();
-  expect(container.querySelector(".explain-analyze-mini-live")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+  expect(container.querySelector(".explain-analyze-tree-active")).toBeNull();
   rerender(<ExplainAnalyzePanel events={facts} live />);
   expect(screen.getByText("Live")).toBeInTheDocument();
-  expect(container.querySelector(".explain-analyze-mini-live")).not.toBeNull();
+  expect(container.querySelector(".explain-analyze-tree-active")).not.toBeNull();
   rerender(<ExplainAnalyzePanel events={facts} />);
-  expect(container.querySelector(".explain-analyze-mini-live")).toBeNull();
+  expect(container.querySelector(".explain-analyze-tree-active")).toBeNull();
 });
 
 it("keeps another turn live on the same clock after the first turn ends", () => {
@@ -522,7 +577,8 @@ it("keeps another turn live on the same clock after the first turn ends", () => 
   ]} />);
   expect(screen.getByText("Live")).toBeInTheDocument();
   expect(screen.queryByText("End not recorded")).toBeNull();
-  expect(container.querySelectorAll(".explain-analyze-mini-live")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Tree" }));
+  expect(container.querySelectorAll(".explain-analyze-tree-active")).toHaveLength(1);
 });
 
 
@@ -539,4 +595,99 @@ it("shows coverage for input/output-only reports even when another request omits
   expect(screen.getByText("Reported subtotal · 1/2 requests · partial or estimated")).toBeInTheDocument();
   expect(screen.getByText("40")).toBeInTheDocument();
   expect(screen.getByText("Token usage partly reported")).toBeInTheDocument();
+});
+
+
+describe("Text tree navigation and sharing", () => {
+  const facts = [
+    ...recordedStage("turn", "Review project", 0, 2_000, { kind: "turn" }),
+    ...recordedStage("batch", "Verify changes", 100, 1_800, { kind: "tool_batch", parent_node_id: "turn" }),
+    ...recordedStage("test", "Run unit tests", 200, 800, { parent_node_id: "batch" }),
+    ...recordedStage("lint", "Check formatting", 900, 1_600, { parent_node_id: "batch" }),
+  ];
+
+  it("preserves collapsed branches across search and incoming facts", () => {
+    const { rerender } = render(<ExplainAnalyzePanel events={facts} />);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Verify changes" }));
+    expect(screen.queryByRole("button", { name: /Inspect Run unit tests/ })).toBeNull();
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "unit tests" } });
+    expect(screen.getByRole("button", { name: /Inspect Run unit tests/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Inspect Check formatting/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(screen.queryByRole("button", { name: /Inspect Run unit tests/ })).toBeNull();
+    rerender(<ExplainAnalyzePanel events={[...facts, ...recordedStage("later", "Prepare final answer", 1800, 1900, { parent_node_id: "turn" })]} />);
+    expect(screen.queryByRole("button", { name: /Inspect Run unit tests/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Inspect Prepare final answer/ })).toBeTruthy();
+  });
+
+  it("navigates visible rows and expands a branch without moving focus", () => {
+    render(<ExplainAnalyzePanel events={facts} />);
+    const root = screen.getByRole("button", { name: /Inspect Review project/ });
+    root.focus();
+    fireEvent.keyDown(root, { key: "ArrowDown" });
+    const batch = screen.getByRole("button", { name: /Inspect Verify changes/ });
+    expect(document.activeElement).toBe(batch);
+    fireEvent.keyDown(batch, { key: "ArrowLeft" });
+    expect(screen.queryByRole("button", { name: /Inspect Run unit tests/ })).toBeNull();
+    expect(document.activeElement).toBe(batch);
+    fireEvent.keyDown(batch, { key: "ArrowRight" });
+    expect(screen.getByRole("button", { name: /Inspect Run unit tests/ })).toBeTruthy();
+    expect(document.activeElement).toBe(batch);
+    fireEvent.keyDown(batch, { key: "End" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /Inspect Check formatting/ }));
+  });
+
+  it("copies the full recorded hierarchy even while the display is collapsed", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    render(<ExplainAnalyzePanel events={facts} />);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all" }));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Copy tree" })); });
+    expect(writeText).toHaveBeenCalledOnce();
+    expect(writeText.mock.calls[0][0]).toContain("Run unit tests");
+    expect(writeText.mock.calls[0][0]).toMatch(/[├└]─/);
+    expect(screen.getByText("Tree copied")).toBeTruthy();
+  });
+});
+
+
+it("retains visible descendants, focus and inline selection when live siblings cross the old expansion threshold", () => {
+  const facts = [
+    ...recordedStage("root", "Large run", 0, 2_000, { kind: "turn" }),
+    ...recordedStage("batch", "Check source", 0, 800, { kind: "tool_batch", parent_node_id: "root" }),
+    ...recordedStage("child", "Focused test", 100, 500, { parent_node_id: "batch" }),
+    ...Array.from({ length: 248 }, (_, i) => recordedStage(`sibling-${i}`, `Sibling ${i}`, 900, 1000, { parent_node_id: "root" })).flat(),
+  ];
+  const { rerender } = render(<ExplainAnalyzePanel events={facts} />);
+  const child = screen.getByRole("button", { name: /Inspect Focused test/ });
+  child.focus();
+  fireEvent.click(child);
+  rerender(<ExplainAnalyzePanel events={[...facts, ...recordedStage("new", "New sibling", 1100, 1200, { parent_node_id: "root" })]} />);
+  expect(screen.getByRole("button", { name: /Inspect Focused test/ })).toBe(child);
+  expect(document.activeElement).toBe(child);
+  expect(child.getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("complementary", { name: "Stage details: Focused test" })).toBeTruthy();
+});
+
+
+it("retains known token subtotals when another request omits the lane", () => {
+  const attempts = [
+    ...recordedStage("a", "First request", 0, 100, { kind: "provider_attempt", round_index: 0, attempt_index: 0 }).map((fact) => fact.transition === "finished" ? { ...fact, usage: { basis: "provider_partial", fresh_input_tokens: 40, output_tokens: 2 } } : fact),
+    ...recordedStage("b", "Second request", 110, 200, { kind: "provider_attempt", round_index: 0, attempt_index: 1 }).map((fact) => fact.transition === "finished" ? { ...fact, usage: { basis: "provider_partial", output_tokens: 3 } } : fact),
+  ];
+  render(<ExplainAnalyzePanel events={attempts} />);
+  const summary = screen.getByLabelText("Model token usage");
+  expect(summary.textContent).toContain("Fresh input 40(1/2 requests)");
+  expect(summary.textContent).toContain("Output 5");
+  expect(summary.textContent).not.toContain("Cache read 0");
+});
+
+it("labels the maximum of independent turns without claiming a run wall time", () => {
+  render(<ExplainAnalyzePanel events={[
+    ...recordedStage("first", "First turn", 0, 2_000, { kind: "turn" }),
+    ...recordedStage("second", "Second turn", 0, 3_000, { kind: "turn", clock_domain_id: "clock-2", turn_id: "turn-2" }),
+  ]} />);
+  expect(screen.getByText("Longest turn")).toBeTruthy();
+  expect(screen.queryByText("Turn time")).toBeNull();
+  expect(screen.getByTitle("3.0 s")).toBeTruthy();
 });

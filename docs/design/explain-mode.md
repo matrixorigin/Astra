@@ -65,7 +65,7 @@ separate, explicitly requested product action and view. It must point back to
 the graph facts it used, label uncertainty, and stay visually distinct from
 the measured execution record.
 
-The default view in both Web and TUI is an execution tree. Preserve the
+Web and TUI preserve the execution tree and the
 information density of the README demonstration: context budget and source
 costs, tool selection, memory selection, model attempts, tool calls, and usage.
 Use clear hierarchy, aligned duration/token/status columns, and expandable
@@ -73,17 +73,32 @@ details. Unknown measurements remain visibly unknown. Group parallel work and
 retries under their actual owners, with explicit dependency details. Do not
 replace meaningful context information with a sparse list of timed stages.
 
-Web adds subtle active-state and new-node animation, keyboard navigation, and
-an inspector that remains visible when selecting nodes in long trees. Aligned
-miniature time bars in the duration column expose overlap without leaving the
-tree; active bars grow with explicitly estimated elapsed time, then settle to
-measured intervals when terminal facts arrive. Their shared scale is per clock
-domain and can expand while a run is live. A
-switchable timeline is a complementary view of the same facts: one axis per
-clock domain, with overlapping bars for concurrency. Use a stable status
-palette with text labels as well as color: green for completed, red for failed,
-amber for waits or blocked work, and blue for active work. Respect reduced
-motion and keep both views calm while execution advances.
+Web defaults to a full-width, monospace execution tree in the README style.
+Stage names, measured duration, and relevant outcomes share one line; context
+source estimates retain their token units rather than appearing as durations.
+A compact heading and inline time/token summary precede the tree. Measured
+provider usage, context estimates, and missing coverage remain distinct.
+Details expand immediately below the selected row. Search keeps matching
+stages with their ancestors; clearing it restores collapsed branches. Copy
+exports the full recorded text hierarchy, independent of the current collapse
+or search state. Arrow keys navigate visible rows and expand or collapse a
+branch; Enter opens its recorded facts. Live updates preserve expansion,
+selection, focus, and scroll rather than reopening branches on each event.
+
+Timeline is a secondary view for investigating overlap, with a separate axis
+per clock domain. It does not add a time bar to every row in the default tree.
+An optional node graph uses only observed parent and dependency edges: parent
+edges express containment, while dependency edges express prerequisites.
+Neither sibling order nor timestamps create a causal dependency or recovery
+relationship. Failure facts remain visible after later work succeeds. Only
+recorded explanations and explicit evidence relationships may be displayed;
+a producer that supplies no failure reason must not acquire an invented one.
+
+Use readable primary text, muted connectors, restrained metric emphasis,
+amber for waiting or unknown information, and red for failures. Status text
+remains available alongside color. New rows enter in place; live elapsed
+values carry an estimate marker and settle to measurements when terminal
+facts arrive. Respect reduced motion and keep historical records static.
 
 Live animation requires an explicit active observation from the host surface.
 Missing terminal facts alone do not establish that execution is still running.
@@ -161,6 +176,16 @@ missing terminal on an active run remains active; a terminal run with
 unresolved nodes is degraded. The run stream cursor orders durable events
 across reconnects.
 
+For tools, the admission interval ends at the actual dispatch boundary. An
+Edge approval wait is a nested `wait` interval; the `tool_call` interval starts
+when the server begins local transport or delivers a committed Edge request,
+and ends when the result is observed. Admission and wait intervals remain visible but
+do not count as parallel work. Tool-call duration is end-to-end wall time and
+may include external I/O. Explain Analyze never labels that whole duration as
+I/O wait: a separate I/O breakdown appears only when the execution source
+reports a distinct measured interval. Detailed cross-system I/O spans remain
+the responsibility of Trace.
+
 The first public Explain Analyze protocol is a versioned `explain_analyze`
 event. Its facts cover at least:
 
@@ -191,9 +216,12 @@ parallel graph formats. The version field is part of this schema's evolution,
 not a request to preserve superseded event shapes. Trace event schemas remain
 owned and versioned by the observation plane.
 
-A terminal `turn` fact carries the producer's known `coverage_gaps`. Schema v1
-currently reports approval-wait intervals, user-input waits, provider retry
-backoff, time to first token, and child-run intervals as unmeasured boundaries.
+A terminal `turn` fact carries the producer's known `coverage_gaps`. The server
+measures Edge approval waits. Server-internal approval waits are not yet
+separately instrumented and remain part of dispatch-to-result wall time.
+The approval coverage gap therefore remains. Other known gaps include user-input
+waits, provider retry backoff, time to first token, child-run intervals, and the tool I/O wait
+breakdown when an execution source does not provide it.
 Coverage gaps do not make observed facts structurally inconsistent, but they
 do prevent a renderer from presenting observed overlap as total concurrency.
 Render the measured overlap as a lower bound and name the unmeasured boundaries.

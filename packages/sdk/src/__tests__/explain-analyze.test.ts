@@ -215,9 +215,9 @@ describe("Explain Analyze graph reducer", () => {
     expect(html).toContain("Run &lt;one&gt;");
     expect(html).toContain("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;");
     expect(html).not.toContain("<script>");
-    expect(html).toContain("Unknown lanes stay unknown.");
-    expect(html).toContain("<span>Fresh input</span><strong>0</strong>");
-    expect(html).toContain("<span>Cache read</span><strong>Not fully reported</strong>");
+    expect(html).toContain("Provider tokens · in 0 · cache read unknown");
+    expect(html).toContain("cache write unknown · out unknown");
+    expect(html).toContain("script-free snapshot");
     expect(html).not.toContain("https://");
   });
 
@@ -324,26 +324,17 @@ describe("Explain Analyze graph reducer", () => {
       title: "Checkout request Explain Analyze",
     });
 
-    expect(html).toContain("<span class=\"metric-label\">Turn time</span><strong>8.5 s</strong>");
-    expect(html).toContain("<strong>4.1 s</strong>");
-    expect(html).toContain("<span class=\"metric-label\">Provider requests</span><strong>2</strong><small>1 failed or interrupted</small>");
-    expect(html).toContain("<span>Fresh input</span><strong>4,200</strong>");
-    expect(html).toContain("<span>Cache read</span><strong>6,800</strong>");
-    expect(html).toContain("<span>Cache created</span><strong>0</strong>");
-    expect(html).toContain("<span>Output</span><strong>194</strong>");
+    expect(html).toContain('<div class="report-result"><strong>8.5 s</strong>');
+    expect(html).toContain("Provider tokens · in 4,200 · cache read 6,800 · cache write 0 · out 194");
     expect(html).toContain("in 2,100 · cache 3,400 · write 0 · out 48");
     expect(html).toContain(
       'title="Fresh input: 2,100 · Cache read: 3,400 · Cache creation: 0 · Output: 48 (Provider reported)"',
     );
-    expect(html).toContain("<strong>2 at once</strong>");
-    expect(html).toContain("After “Model request (Round 1 · request 2)”");
-    expect(html).toContain("<span class=\"tree-count\">2 stages</span>");
+    expect(html).toContain("Observed overlap · 2 overlapping recorded spans at peak");
+    expect(html).toContain("after “Model request (Round 1 · request 2)”");
+    expect(html).toContain("2 children");
     expect(html).toContain("class=\"node-children\"");
-    expect(html).toContain("Parent stage</span>");
-    expect(html).toContain("Work stage</span>");
     expect(html).toContain('class="bar kind-turn is-group status-complete"');
-    expect(html).toContain(".node-children:before");
-    expect(html).toContain("Reported subtotal from 2 of 2 observed requests");
   });
 });
 
@@ -472,8 +463,8 @@ describe("saved Explain snapshots", () => {
     ]);
     expect(html).not.toContain("Some execution facts are missing or conflict.");
     expect(html).toContain("Open at capture");
-    expect(html).toContain("Offline snapshot");
     expect(html).toContain("End not recorded");
+    expect(html).toContain("script-free snapshot");
     expect(html).not.toContain(" – Now");
   });
   it("reports an unfinished child of a closed turn as incomplete", () => {
@@ -513,10 +504,7 @@ it("counts started-only requests and labels known usage as a reported subtotal",
       usage: { basis: "provider_exact", fresh_input_tokens: 40, output_tokens: 2 } }),
     started("second", "provider_attempt", 30, { round_index: 0, attempt_index: 1 }),
   ]);
-  expect(html).toContain('Provider requests</span><strong>2</strong>');
-  expect(html).toContain("Reported subtotal from 1 of 2 observed requests");
-  expect(html).toContain('<span>Fresh input</span><strong>40</strong>');
-  expect(html).not.toContain('<span class="source-tag">Provider reported</span>');
+  expect(html).toContain("Provider tokens · in 40 · cache read unknown · cache write unknown · out 2 · 1/2 requests reported");
 });
 
 it("retains reported lanes when another terminal request omits usage entirely", () => {
@@ -525,9 +513,23 @@ it("retains reported lanes when another terminal request omits usage entirely", 
       usage: { basis: "provider_partial", fresh_input_tokens: 40, output_tokens: 2 } }),
     finished("b", "provider_attempt", 10, 20, { round_index: 0, attempt_index: 1 }),
   ]);
-  expect(html).toContain("Reported subtotal from 1 of 2 observed requests");
-  expect(html).toContain('<span>Fresh input</span><strong>40</strong>');
-  expect(html).toContain('<span>Cache read</span><strong>Not fully reported</strong>');
+  expect(html).toContain("Provider tokens · in 40 · cache read unknown · cache write unknown · out 2 · 1/2 requests reported");
+});
+
+it("keeps known token lane subtotals when a reported request omits one lane", () => {
+  const html = renderExplainAnalyzeHtml([
+    finished("a", "provider_attempt", 0, 10, {
+      round_index: 0,
+      attempt_index: 0,
+      usage: { basis: "provider_partial", fresh_input_tokens: 40, output_tokens: 2 },
+    }),
+    finished("b", "provider_attempt", 10, 20, {
+      round_index: 0,
+      attempt_index: 1,
+      usage: { basis: "provider_partial", output_tokens: 3 },
+    }),
+  ]);
+  expect(html).toContain("Provider tokens · in 40 (1/2) · cache read unknown · cache write unknown · out 5");
 });
 
 it("does not promise live updates in an empty or started-only exported snapshot", () => {
@@ -535,7 +537,7 @@ it("does not promise live updates in an empty or started-only exported snapshot"
     const html = renderExplainAnalyzeHtml(events);
     expect(html).not.toContain("In progress");
     expect(html).not.toContain("as the run advances");
-    expect(html).toContain("Offline snapshot");
+    expect(html).toContain("script-free snapshot");
   }
 });
 
@@ -578,4 +580,27 @@ it("shows approval wait intervals without counting them as parallel work", () =>
   expect(html).toContain("kind-wait");
   expect(html).toContain("kind-admission");
   expect(html).toContain("tool I/O wait breakdown");
+});
+
+it("exports graph nodes with only recorded relationships and retains tree and timeline views", () => {
+  const html = renderExplainAnalyzeHtml([
+    finished("turn", "turn", 0, 100),
+    finished("a", "tool_call", 10, 30, { parent_node_id: "turn", label: "Read file" }),
+    finished("b", "tool_call", 40, 80, { parent_node_id: "turn", dependency_node_ids: ["a"], label: "Use file" }),
+  ]);
+  expect(html).toContain('id="secondary-graph"');
+  expect(html).toContain('id="secondary-timeline"');
+  expect(html).toContain('id="tree-view"');
+  expect(html.match(/class="dag-edge dag-edge-parent"/g)).toHaveLength(2);
+  expect(html.match(/class="dag-edge dag-edge-dependency"/g)).toHaveLength(1);
+  expect(html).toContain('href="#report-stage-');
+  expect(html).toContain('class="dag-inspection"');
+  expect(html).not.toContain('<script>');
+});
+
+it("discloses graph layout limits while retaining all stages in the tree", () => {
+  const html = renderExplainAnalyzeHtml(Array.from({ length: 501 }, (_, index) =>
+    finished(`tool-${index}`, "tool_call", index * 2, index * 2 + 1)));
+  expect(html).toContain("Showing 500 of 501 stages");
+  expect(html).toContain('class="node-title" title="tool-500"');
 });

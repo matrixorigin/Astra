@@ -1,8 +1,8 @@
 "use client";
 
-import { Activity, AlertTriangle, ChevronRight, Download, Pause, Play, RotateCcw } from "lucide-react";
+import { AlertTriangle, ChevronRight, Clock3, Cpu, Download, GitBranch, Layers, Pause, Play, RotateCcw, Wrench } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 import {
   explainAnalyzeMaxConcurrency,
   explainAnalyzeTurnOutcome,
@@ -12,10 +12,16 @@ import {
   formatMs,
   formatUsageDetail,
   formatUsage,
+  layoutExplainAnalyzeGraph,
   reduceExplainAnalyzeEvents,
   renderExplainAnalyzeHtml,
+  renderExplainAnalyzeText,
 } from "@astra/sdk";
-import type { ExplainAnalyzeNodeV1 } from "@astra/sdk";
+import type {
+  ExplainAnalyzeLayoutDomainV1,
+  ExplainAnalyzeLayoutNodeV1,
+  ExplainAnalyzeNodeV1,
+} from "@astra/sdk";
 import { cn } from "@/lib/utils/cn";
 
 const INITIAL_VISIBLE_NODES = 500;
@@ -26,7 +32,7 @@ const TOKEN_LANES = [
   ["Output", "output_tokens"],
 ] as const;
 
-type GraphView = "tree" | "timeline";
+type GraphView = "graph" | "tree" | "timeline";
 
 type TimelineBudget = { rendered: number; limit: number };
 
@@ -42,6 +48,8 @@ export function ExplainAnalyzePanel({
   const panelId = useId();
   const [timelineOpen, setTimelineOpen] = useState(true);
   const [graphView, setGraphView] = useState<GraphView>("tree");
+  const [search, setSearch] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_NODES);
   const [expandedNodeIds, setExpandedNodeIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -51,15 +59,34 @@ export function ExplainAnalyzePanel({
   );
   const graph = useMemo(() => reduceExplainAnalyzeEvents(events), [events]);
   const clockGroups = useMemo(() => groupByClockDomain(graph.nodes), [graph.nodes]);
+  const searchMatches = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    if (!query || graphView !== "tree") return null;
+    const nodeById = new Map(graph.nodes.map((node) => [node.nodeId, node]));
+    const included = new Set<string>();
+    let matches = 0;
+    for (const node of graph.nodes) {
+      if (!node.label.toLocaleLowerCase().includes(query)) continue;
+      matches++;
+      let current: ExplainAnalyzeNodeV1 | undefined = node;
+      while (current && !included.has(current.nodeId)) {
+        included.add(current.nodeId);
+        current = current.parentNodeId ? nodeById.get(current.parentNodeId) : undefined;
+      }
+    }
+    return { included, matches };
+  }, [graph.nodes, search, graphView]);
   const visibleClockGroups = useMemo(() => {
     let remaining = visibleCount;
-    return clockGroups.flatMap(([clockDomainId, nodes], index) => {
+    return clockGroups.flatMap(([clockDomainId, allNodes], index) => {
+      const nodes = searchMatches ? allNodes.filter((node) => searchMatches.included.has(node.nodeId)) : allNodes;
+      if (nodes.length === 0) return [];
       if (remaining <= 0) return [];
       const limit = Math.min(nodes.length, remaining);
       remaining -= limit;
       return [{ clockDomainId, nodes, domainNumber: index + 1, limit }];
     });
-  }, [clockGroups, visibleCount]);
+  }, [clockGroups, visibleCount, searchMatches]);
   const turnNodes = graph.nodes.filter((node) => node.kind === "turn");
   const finishedTurns = turnNodes.filter((node) => node.durationMs !== undefined);
   const turnTime = finishedTurns.length > 0
@@ -73,6 +100,10 @@ export function ExplainAnalyzePanel({
     .filter((node) => node.durationMs !== undefined)
     .sort((left, right) => (right.durationMs ?? 0) - (left.durationMs ?? 0))[0];
   const maxConcurrency = explainAnalyzeMaxConcurrency(graph);
+  const measuredWaitMs = graph.nodes
+    .filter((node) => node.kind === "wait" && node.terminalObserved && !node.conflicted && node.durationMs !== undefined)
+    .reduce((total, node) => total + (node.durationMs ?? 0), 0);
+  const openWaitCount = graph.nodes.filter((node) => node.kind === "wait" && !node.terminalObserved).length;
   const missingEndNodeIds = useMemo(() => new Set(graph.diagnostics
     .filter((item) => item.code === "unresolved_terminal_node").flatMap((item) => item.nodeId ? [item.nodeId] : [])), [graph.diagnostics]);
   const closedClockDomains = useMemo(() => new Set(clockGroups
@@ -118,7 +149,7 @@ export function ExplainAnalyzePanel({
     );
   }, [clockPulse, latestElapsedByClockDomain, closedClockDomains]);
   const reportedAttempts = completedAttempts.filter((node) => node.usage !== undefined);
-  const lanes = summarizeTokenLanes(reportedAttempts);
+  const lanes = summarizeTokenLanes(observedAttempts);
   const hasConflict = graph.conflictedNodeIds.length > 0;
   const hasGap = degraded || hasConflict || graph.integrity === "unknown";
   const terminalTurn = [...turnNodes].reverse().find((node) => node.terminalObserved);
@@ -167,21 +198,33 @@ export function ExplainAnalyzePanel({
     setExpandedNodeIds((current) => new Set(current).add(nodeId));
   };
 
+  const copyTree = async () => {
+    try {
+      await navigator.clipboard.writeText(renderExplainAnalyzeText(events));
+      setCopyStatus("Tree copied");
+    } catch {
+      setCopyStatus("Could not access the clipboard. Save the report instead.");
+    }
+  };
+  const setAllExpanded = (open: boolean) => {
+    const parents = new Set(graph.nodes.flatMap((node) => node.parentNodeId ? [node.parentNodeId] : []));
+    setExpandedNodeIds(open ? parents : new Set());
+    setCollapsedNodeIds(open ? new Set() : parents);
+  };
+
   if (graph.nodes.length === 0 && !hasGap) return null;
 
   return (
     <section
       aria-label="Explain Analyze"
-      className="mt-5 overflow-hidden rounded-2xl border border-border bg-surface shadow-[0_8px_26px_rgba(35,52,81,0.08)]"
+      className="explain-analyze-panel mt-5 overflow-hidden rounded-xl border border-border bg-surface"
     >
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b border-border px-5 py-4">
+      <header className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
         <div className="flex min-w-0 items-start gap-3">
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-accent/10 text-accent">
-            <Activity className="size-4" aria-hidden="true" />
-          </span>
+
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-sm font-semibold tracking-tight text-text">Explain Analyze</h2>
+              <h2 className="text-sm font-semibold tracking-tight text-text">{turnNodes.length === 1 ? turnNodes[0].label : "Explain Analyze"}</h2>
               <span
                 aria-live="polite"
                 className={cn(
@@ -202,10 +245,12 @@ export function ExplainAnalyzePanel({
               </span>
             </div>
             <p className="mt-1 text-xs text-text-muted">
-              Timings, dependencies and model usage
+              Explain Analyze · recorded timings and model usage
             </p>
           </div>
         </div>
+        <div className="flex items-center gap-2">
+        <button type="button" className="explain-analyze-text-action" onClick={() => { void copyTree(); }}>Copy tree</button>
         <button
           type="button"
           onClick={downloadHtml}
@@ -215,7 +260,9 @@ export function ExplainAnalyzePanel({
           <Download className="size-3.5" aria-hidden="true" />
           Save graph
         </button>
+        </div>
       </header>
+      {copyStatus ? <p role="status" className="px-5 pb-2 text-xs text-text-secondary">{copyStatus}</p> : null}
 
       {showWarning ? (
         <div role="status" aria-live="polite" className="flex items-start gap-2.5 border-b border-warning/20 bg-warning/5 px-5 py-3 text-xs text-warning">
@@ -228,26 +275,32 @@ export function ExplainAnalyzePanel({
 
       {graph.coverageGaps.length > 0 ? (
         <div role="note" aria-label="Explain Analyze coverage gaps" className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border bg-surface-muted/40 px-5 py-2.5 text-[11px] text-text-muted">
-          <span className="rounded-full border border-warning/20 bg-warning/5 px-2 py-0.5 font-semibold text-warning">Partial capture</span>
+          <span className="font-medium text-warning">Partial capture</span>
           <span>Not timed separately:</span>
           <span>{graph.coverageGaps.map(explainAnalyzeCoverageGapLabel).join(" · ")}</span>
         </div>
       ) : null}
 
       <div className="explain-analyze-summary" aria-label="Execution summary">
-        {finishedTurns.length > 0 ? <Metric label="Turn time" value={turnTime} detail="Runtime measured" /> : null}
+        {finishedTurns.length > 0 ? <Metric label={turnNodes.length > 1 ? "Longest turn" : "Turn time"} value={turnTime} detail="Runtime measured" /> : null}
         {slowestRequest?.durationMs !== undefined ? <Metric label="Slowest model request" value={formatMs(slowestRequest.durationMs)} detail={requestIdentity(slowestRequest)} /> : null}
         {maxConcurrency !== null ? <Metric
           label={graph.coverageGaps.length > 0 ? "Observed overlap" : "Peak parallel work"}
           value={graph.coverageGaps.length > 0 ? `At least ${maxConcurrency} at once` : `${maxConcurrency} at once`}
           detail={graph.coverageGaps.length > 0 ? "Lower bound from recorded spans, evaluated per clock domain" : "Measured within each worker timeline"}
         /> : null}
+        {measuredWaitMs > 0 ? <Metric
+          label="Measured wait time"
+          value={formatMs(measuredWaitMs)}
+          detail="Sum of measured wait intervals; overlapping waits may add. Separate I/O time is not inferred."
+        /> : null}
+        {openWaitCount > 0 ? <span className="text-[10px] text-warning">{openWaitCount} wait {openWaitCount === 1 ? "interval" : "intervals"} still open</span> : null}
         {live && activeCount > 0 ? <Metric label="Active stages" value={String(activeCount)} detail="Includes parent stages" /> : null}
         <span className="explain-analyze-summary-count">{graph.nodes.length} stages</span>
       </div>
       <div className="explain-analyze-token-summary" aria-label="Model token usage">
         {lanes.filter((lane) => lane.value !== null).map((lane) =>
-          <span key={lane.label}>{lane.label} <strong>{lane.value}</strong></span>)}
+          <span key={lane.label}>{lane.label} <strong>{lane.value}</strong>{lane.reported < lane.observed ? <small className="ml-1">({lane.reported}/{lane.observed} requests)</small> : null}</span>)}
         {lanes.some((lane) => lane.value === null)
           ? <span>{lanes.every((lane) => lane.value === null) ? "Token usage not reported" : "Token usage partly reported"}</span>
           : allExact ? <span>Provider reported</span> : null}
@@ -255,7 +308,7 @@ export function ExplainAnalyzePanel({
           <span>Reported subtotal · {reportedAttempts.length}/{observedAttempts.length} requests · partial or estimated</span> : null}
       </div>
 
-      <section aria-labelledby={`${panelId}-graph-heading`} className="px-4 pb-4 pt-3">
+      <section aria-labelledby={`${panelId}-graph-heading`} className="px-5 pb-4 pt-2">
         <button
           type="button"
           aria-expanded={timelineOpen}
@@ -266,8 +319,12 @@ export function ExplainAnalyzePanel({
             <span id={`${panelId}-graph-heading`} className="block text-sm font-semibold text-text">
               Execution graph
             </span>
-            <span className="mt-0.5 block text-[10px] text-text-muted">
-              {graphView === "tree" ? "Explore stages and requests · aligned bars show overlap · ~ marks estimated live time" : "Time runs left to right · overlap means parallel work · ~ marks estimated live time"}
+            <span className="sr-only">
+              {graphView === "graph"
+                ? "Observed containment and dependencies · click a stage for recorded facts"
+                : graphView === "tree"
+                  ? "Explore stages and requests · aligned bars show overlap · ~ marks estimated live time"
+                  : "Time runs left to right · overlap means parallel work · ~ marks estimated live time"}
             </span>
           </span>
           <span className="shrink-0 text-xs text-text-muted">
@@ -275,12 +332,20 @@ export function ExplainAnalyzePanel({
           </span>
         </button>
 
-        <div role="group" aria-label="Execution graph view" className="explain-analyze-view-switch mt-3">
-          {(["tree", "timeline"] as const).map((view) => (
+        <div className="explain-analyze-tree-toolbar">
+        <div role="group" aria-label="Execution graph view" className="explain-analyze-view-switch">
+          {(["tree", "timeline", "graph"] as const).map((view) => (
             <button key={view} type="button" aria-pressed={graphView === view}
-              onClick={() => setGraphView(view)}>{view === "tree" ? "Tree" : "Timeline"}</button>
+              onClick={() => setGraphView(view)}>{view === "graph" ? "Graph" : view === "tree" ? "Tree" : "Timeline"}</button>
           ))}
         </div>
+        {graphView === "tree" ? <>
+          <input type="search" aria-label="Search execution stages" placeholder="Find a stage…" value={search} onChange={(event) => setSearch(event.target.value)} className="explain-analyze-search" />
+          <button type="button" className="explain-analyze-text-action" onClick={() => setAllExpanded(true)}>Expand all</button>
+          <button type="button" className="explain-analyze-text-action" onClick={() => setAllExpanded(false)}>Collapse all</button>
+        </> : null}
+        </div>
+        {searchMatches ? <p role="status" className="py-2 text-xs text-text-muted">{searchMatches.matches} matching {searchMatches.matches === 1 ? "stage" : "stages"} · ancestors shown <button type="button" className="ml-2 text-accent" onClick={() => setSearch("")}>Clear search</button></p> : null}
         {timelineOpen ? (
           <div className="mt-3 space-y-3">
             {graphView === "timeline" ? <div aria-label="Graph legend" className="flex flex-wrap items-center gap-x-3 gap-y-2 text-[9px] text-text-muted">
@@ -309,9 +374,8 @@ export function ExplainAnalyzePanel({
                 isLive={live && !closedClockDomains.has(clockDomainId)}
                 missingEndNodeIds={missingEndNodeIds}
                 visibleLimit={limit}
-                totalGraphSize={graph.nodes.length}
-                expandedNodeIds={expandedNodeIds}
-                collapsedNodeIds={collapsedNodeIds}
+                expandedNodeIds={searchMatches ? searchMatches.included : expandedNodeIds}
+                collapsedNodeIds={searchMatches ? new Set() : collapsedNodeIds}
                 onToggleNode={toggleNode}
               />
             ))}
@@ -328,6 +392,7 @@ export function ExplainAnalyzePanel({
             ) : null}
           </div>
         ) : null}
+        {graphView === "tree" ? <p className="explain-analyze-tree-help">↑ ↓ navigate · ← → collapse / expand · Enter inspect · ~ live estimates</p> : null}
       </section>
     </section>
   );
@@ -356,7 +421,6 @@ function TimelineDomain({
   isLive,
   missingEndNodeIds,
   visibleLimit,
-  totalGraphSize,
   expandedNodeIds,
   collapsedNodeIds,
   onToggleNode,
@@ -368,7 +432,6 @@ function TimelineDomain({
   isLive: boolean;
   missingEndNodeIds: ReadonlySet<string>;
   visibleLimit: number;
-  totalGraphSize: number;
   expandedNodeIds: ReadonlySet<string>;
   collapsedNodeIds: ReadonlySet<string>;
   onToggleNode: (nodeId: string, currentlyOpen: boolean) => void;
@@ -418,6 +481,10 @@ function TimelineDomain({
     }
     return { nodeById, childrenByParent, roots, recordedDomainEnd, hasOpenNodes };
   }, [nodes]);
+  const graphLayout = useMemo(
+    () => graphView === "graph" ? layoutExplainAnalyzeGraph(nodes, { maxNodes: visibleLimit })[0] : undefined,
+    [nodes, visibleLimit, graphView],
+  );
   const hasActiveNodes = isLive && hasOpenNodes;
   const domainEnd = hasActiveNodes ? Math.max(recordedDomainEnd, nowElapsedMs) : recordedDomainEnd;
   const position = Math.min(cursorMs ?? domainEnd, domainEnd);
@@ -462,6 +529,9 @@ function TimelineDomain({
             <div><dt className="text-text-muted">Measured duration</dt><dd>{selected.durationMs === undefined ? "Not recorded" : formatMs(selected.durationMs)}</dd></div>
             <div><dt className="text-text-muted">Outcome</dt><dd>{!selected.terminalObserved && (!isLive || missingEndNodeIds.has(selected.nodeId)) ? "End not recorded" : nodeStatus(selected).label}</dd></div>
           </dl>
+          {selected.outcome === "failed" ? <p className="mt-3 text-xs text-danger">This stage failed. A failure reason was not included in these Explain facts.</p> : null}
+          {nodes.some((node) => node.dependencyNodeIds.includes(selected.nodeId)) ? <div className="mt-3 text-xs text-text-muted">Dependent stages: {nodes.filter((node) => node.dependencyNodeIds.includes(selected.nodeId)).map((node) =>
+            <button key={node.nodeId} type="button" className="ml-2 text-accent underline" onClick={() => inspect(node.nodeId)}>{node.label}</button>)}</div> : null}
           {selected.parentNodeId ? <p className="mt-3 text-xs text-text-muted">Parent: {nodeById.get(selected.parentNodeId)?.label ?? selected.parentNodeId}</p> : null}
           {selected.dependencyNodeIds.length > 0 ? <div className="mt-3 text-xs text-text-muted">Depends on: {selected.dependencyNodeIds.map((id) =>
             nodeById.has(id) ? <button key={id} type="button" className="ml-2 text-accent underline" onClick={() => inspect(id)}>{nodeById.get(id)?.label}</button>
@@ -481,6 +551,28 @@ function TimelineDomain({
           {selected.kind === "provider_attempt" ? <p className="mt-3 text-xs text-text-secondary">{requestIdentity(selected)} · {selected.usage ? formatUsageDetail(selected.usage) : "Token usage not reported"}</p> : null}
         </aside>
       ) : null;
+  if (graphView === "graph") {
+    return (
+      <div className="explain-analyze-domain explain-analyze-graph-domain min-w-0 rounded-xl border border-border bg-bg/40 p-3">
+        <div className="mb-3 flex justify-between text-[9px] font-medium uppercase tracking-wide text-text-muted">
+          <span>Execution {domainNumber}</span>
+          <span>{hasActiveNodes ? "~" : ""}{formatMs(domainEnd)} {hasActiveNodes ? "estimated live extent" : "recorded extent"}</span>
+        </div>
+        <GraphCanvas
+          domain={graphLayout}
+          nodes={nodes}
+          nodeById={nodeById}
+          selectedNodeId={selectedNodeId}
+          onSelectNode={inspect}
+          inspector={inspector}
+          nowElapsedMs={nowElapsedMs}
+          isLive={isLive}
+          missingEndNodeIds={missingEndNodeIds}
+        />
+        {selected ? null : <p className="mt-3 text-xs text-text-muted">Select a stage to inspect its timing, outcome and reported usage.</p>}
+      </div>
+    );
+  }
   const rows = roots.map((node) => renderTimelineNode({
     node,
     graphView,
@@ -496,7 +588,6 @@ function TimelineDomain({
     childrenByParent,
     visited,
     budget,
-    defaultOpen: totalGraphSize <= 250 || node.kind === "turn" || node.kind === "run",
     expandedNodeIds,
     collapsedNodeIds,
     onToggleNode,
@@ -515,7 +606,7 @@ function TimelineDomain({
           {inspector}
         </div>
       ) : null}
-      <div className="overflow-x-auto pb-1">
+      <div className="overflow-x-auto pb-1" onKeyDown={graphView === "tree" ? navigateExplainTree : undefined}>
         <div className={graphView === "timeline" ? "min-w-[740px]" : "min-w-0"}>
           {graphView === "timeline" ? <div className="grid grid-cols-[minmax(185px,240px)_minmax(250px,1fr)_90px_62px] items-end gap-3 border-b border-border pb-2 text-[9px] text-text-muted">
             <span>Stage</span>
@@ -536,7 +627,7 @@ function TimelineDomain({
             </div>
             <span className="text-right">Interval</span>
             <span className="text-right">Time</span>
-          </div> : <div className="explain-analyze-tree-columns explain-analyze-column-head"><span>Execution stages</span><span>Tokens</span><span>Outcome</span><span className="text-right">Duration</span></div>}
+          </div> : null}
           <div className="relative">
             {graphView === "timeline" ? <div className="explain-analyze-grid pointer-events-none absolute inset-0" aria-hidden="true">
               <div />
@@ -578,6 +669,207 @@ function TimelineDomain({
   );
 }
 
+function GraphCanvas({
+  domain,
+  nodes,
+  nodeById,
+  selectedNodeId,
+  onSelectNode,
+  inspector,
+  nowElapsedMs,
+  isLive,
+  missingEndNodeIds,
+}: {
+  domain: ExplainAnalyzeLayoutDomainV1 | undefined;
+  nodes: readonly ExplainAnalyzeNodeV1[];
+  nodeById: ReadonlyMap<string, ExplainAnalyzeNodeV1>;
+  selectedNodeId: string | null;
+  onSelectNode: (nodeId: string) => void;
+  inspector: ReactNode;
+  nowElapsedMs: number;
+  isLive: boolean;
+  missingEndNodeIds: ReadonlySet<string>;
+}) {
+  const markerId = `explain-analyze-arrow-${useId().replace(/:/g, "")}`;
+  const graphScrollRef = useRef<HTMLDivElement>(null);
+  const didAutoFit = useRef(false);
+  const [scale, setScale] = useState(1);
+  const layoutNodes = domain?.nodes ?? [];
+  const layoutNodeIds = new Set(layoutNodes.map((node) => node.nodeId));
+  const layoutEdges = domain?.edges ?? [];
+  const parentNodeIds = new Set(
+    layoutEdges.filter((edge) => edge.kind === "parent").map((edge) => edge.sourceNodeId),
+  );
+  const selectedIsVisible = selectedNodeId !== null && layoutNodeIds.has(selectedNodeId);
+  const domainWidth = domain?.width ?? 0;
+  const domainHeight = domain?.height ?? 0;
+  useEffect(() => {
+    if (domainWidth <= 0 || didAutoFit.current) return;
+    didAutoFit.current = true;
+    const availableWidth = graphScrollRef.current?.clientWidth ?? 0;
+    setScale(availableWidth > 0 ? clampGraphScale((availableWidth - 24) / domainWidth) : 1);
+  }, [domainWidth, domainHeight]);
+  const fitGraph = () => {
+    if (!domain) return;
+    const availableWidth = graphScrollRef.current?.clientWidth ?? 0;
+    if (availableWidth <= 0) {
+      setScale(0.78);
+      return;
+    }
+    setScale(clampGraphScale((availableWidth - 24) / domain.width));
+  };
+
+  return (
+    <div className="explain-analyze-graph-canvas-wrap">
+      <div className="explain-analyze-graph-toolbar-row">
+        <div aria-label="Graph legend" className="explain-analyze-graph-legend">
+          <StatusLegend colorClass="bg-success" label="Completed" />
+          <StatusLegend colorClass="bg-danger" label="Failed" />
+          <StatusLegend colorClass="bg-accent" label="In progress" />
+          <StatusLegend colorClass="bg-warning" label="Waiting" />
+          <span className="explain-analyze-graph-key">
+            <span className="explain-analyze-graph-key-line explain-analyze-graph-key-parent" aria-hidden="true" />
+            Contains
+          </span>
+          <span className="explain-analyze-graph-key">
+            <span className="explain-analyze-graph-key-line explain-analyze-graph-key-dependency" aria-hidden="true" />
+            Runs after
+          </span>
+        </div>
+        <div className="explain-analyze-graph-toolbar" role="group" aria-label="Graph zoom controls">
+          <button type="button" aria-label="Zoom out graph" disabled={scale <= 0.55} onClick={() => setScale((current) => clampGraphScale(current - 0.1))}>−</button>
+          <span aria-live="polite" className="tabular-nums">{Math.round(scale * 100)}%</span>
+          <button type="button" aria-label="Zoom in graph" disabled={scale >= 1.5} onClick={() => setScale((current) => clampGraphScale(current + 0.1))}>+</button>
+          <button type="button" aria-label="Fit graph" onClick={fitGraph}>Fit graph</button>
+        </div>
+      </div>
+      <div ref={graphScrollRef} className="explain-analyze-graph-scroll" role="group" aria-label={`Execution graph ${domain?.clockDomainId ?? ""}`}>
+        <div
+          className="explain-analyze-graph-zoom-stage"
+          style={{ width: (domain?.width ?? 0) * scale, height: (domain?.height ?? 0) * scale }}
+        >
+          <div
+            className="explain-analyze-graph-canvas"
+            style={{ width: domain?.width ?? 0, height: domain?.height ?? 0, transform: `scale(${scale})` }}
+          >
+          {domain ? (
+            <svg
+              className="explain-analyze-graph-edges"
+              width={domain.width}
+              height={domain.height}
+              viewBox={`0 0 ${domain.width} ${domain.height}`}
+              aria-hidden="true"
+              focusable="false"
+            >
+              <defs>
+                <marker id={`${markerId}-dependency`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" className="explain-analyze-graph-arrow-dependency" />
+                </marker>
+              </defs>
+              {layoutEdges.map((edge) => {
+                const target = nodeById.get(edge.targetNodeId);
+                const active = isLive && target !== undefined &&
+                  !missingEndNodeIds.has(edge.targetNodeId) &&
+                  !target.terminalObserved && target.kind !== "wait" && target.kind !== "admission";
+                const selected = selectedNodeId !== null &&
+                  (edge.sourceNodeId === selectedNodeId || edge.targetNodeId === selectedNodeId);
+                return (
+                  <path
+                    key={`${edge.kind}:${edge.sourceNodeId}:${edge.targetNodeId}`}
+                    d={edge.path}
+                    className={cn(
+                      "explain-analyze-graph-edge",
+                      edge.kind === "dependency" && "explain-analyze-graph-edge-dependency",
+                      active && "explain-analyze-graph-edge-active",
+                      selected && "explain-analyze-graph-edge-selected",
+                    )}
+                    markerEnd={edge.kind === "dependency" ? `url(#${markerId}-dependency)` : undefined}
+                  />
+                );
+              })}
+            </svg>
+          ) : null}
+          {layoutNodes.map((position: ExplainAnalyzeLayoutNodeV1) => {
+            const node = nodeById.get(position.nodeId);
+            if (!node) return null;
+            const nodeIsLive = isLive && !missingEndNodeIds.has(node.nodeId);
+            const missingEnd = !node.terminalObserved && !nodeIsLive;
+            const canEstimate = !node.terminalObserved && nodeIsLive;
+            const status = missingEnd
+              ? { label: "End not recorded", textClass: "text-warning", dotClass: "bg-warning" }
+              : nodeStatus(node);
+            const visualStatus = node.kind === "wait"
+              ? { ...status, textClass: "text-warning", dotClass: "bg-warning" }
+              : node.kind === "admission"
+                ? { ...status, textClass: "text-text-muted", dotClass: "bg-text-muted" }
+                : status.label === "Completed"
+                  ? { ...status, textClass: "text-text-muted" }
+                  : status;
+            const endLabel = node.endElapsedMs !== undefined
+              ? formatMs(node.endElapsedMs)
+              : !canEstimate ? "Unknown" : `~${formatMs(nowElapsedMs)}`;
+            const durationLabel = node.durationMs !== undefined
+              ? formatMs(node.durationMs)
+              : !canEstimate ? "Unknown" : `~${formatMs(Math.max(0, nowElapsedMs - node.startElapsedMs))}`;
+            const usage = node.usage
+              ? formatUsage(node.usage)
+              : node.context
+                ? formatExplainAnalyzeContext(node.context)
+                : node.kind === "provider_attempt" ? "Token usage not reported" : "";
+            const StageIcon = node.kind === "wait" || node.kind === "admission" ? Clock3
+              : node.kind === "provider_attempt" ? Cpu
+                : node.kind === "tool_call" ? Wrench
+                  : node.kind === "turn" ? GitBranch : Layers;
+            return (
+              <button
+                key={position.nodeId}
+                type="button"
+                data-node-id={position.nodeId}
+                aria-label={`Inspect ${node.label}, ${durationLabel}, ${status.label}`}
+                aria-pressed={selectedNodeId === node.nodeId}
+                onClick={() => onSelectNode(node.nodeId)}
+                className={cn(
+                  "explain-analyze-graph-card",
+                  `explain-analyze-graph-card-${node.kind}`,
+                  `explain-analyze-graph-card-status-${visualStatus.textClass.replace(/^text-/, "")}`,
+                  selectedNodeId === node.nodeId && "explain-analyze-graph-card-selected",
+                  canEstimate && node.kind !== "wait" && node.kind !== "admission" && "explain-analyze-graph-card-active",
+                  parentNodeIds.has(node.nodeId) && "explain-analyze-graph-card-parent",
+                )}
+                style={{ left: position.x, top: position.y, width: position.width, height: position.height }}
+              >
+                <span className="explain-analyze-graph-card-head">
+                  <span className="explain-analyze-graph-card-icon"><StageIcon aria-hidden="true" /></span>
+                  <strong className="explain-analyze-graph-card-title" title={node.label}>{node.label}</strong>
+                </span>
+                <span className="explain-analyze-graph-card-meta">
+                  <b>{durationLabel}</b>
+                  <span className={cn("explain-analyze-graph-card-status", visualStatus.textClass)}>
+                    <span className={cn("explain-analyze-graph-card-dot", visualStatus.dotClass)} aria-hidden="true" />
+                    {visualStatus.label}
+                  </span>
+                </span>
+                <span className="explain-analyze-graph-card-interval">{formatMs(node.startElapsedMs)} → {endLabel}</span>
+                {usage ? <span className="explain-analyze-graph-card-usage" title={node.usage ? formatUsageDetail(node.usage) : usage}>{usage}</span> : null}
+              </button>
+            );
+          })}
+          </div>
+        </div>
+      </div>
+      {selectedNodeId && inspector ? (
+        <div className="explain-analyze-graph-inspector">
+          {!selectedIsVisible ? <p className="text-xs text-text-muted">Selected stage is outside the visible graph window. Its recorded details are shown here.</p> : null}
+          {inspector}
+        </div>
+      ) : null}
+      {nodes.length > layoutNodes.length ? (
+        <p className="mt-2 text-[10px] text-text-muted">Showing {layoutNodes.length} of {nodes.length} stages in this graph window.</p>
+      ) : null}
+    </div>
+  );
+}
+
 function renderTimelineNode({
   node,
   graphView,
@@ -593,7 +885,6 @@ function renderTimelineNode({
   childrenByParent,
   visited,
   budget,
-  defaultOpen,
   expandedNodeIds,
   collapsedNodeIds,
   onToggleNode,
@@ -613,7 +904,6 @@ function renderTimelineNode({
   childrenByParent: ReadonlyMap<string, readonly ExplainAnalyzeNodeV1[]>;
   visited: Set<string>;
   budget: TimelineBudget;
-  defaultOpen: boolean;
   expandedNodeIds: ReadonlySet<string>;
   collapsedNodeIds: ReadonlySet<string>;
   onToggleNode: (nodeId: string, currentlyOpen: boolean) => void;
@@ -625,7 +915,7 @@ function renderTimelineNode({
   const children = childrenByParent.get(node.nodeId) ?? [];
   const isOpen = children.length > 0 && (
     expandedNodeIds.has(node.nodeId) ||
-    (!collapsedNodeIds.has(node.nodeId) && defaultOpen)
+    !collapsedNodeIds.has(node.nodeId)
   );
   const nodeIsLive = isLive && !missingEndNodeIds.has(node.nodeId);
   const missingEnd = !node.terminalObserved && !nodeIsLive;
@@ -648,13 +938,14 @@ function renderTimelineNode({
 
   return (
     <div key={node.nodeId} className="explain-analyze-tree-node">
-      <div className={cn(
+      <div data-tree-node-id={node.nodeId} data-tree-parent-id={node.parentNodeId} className={cn(
         "explain-analyze-lane relative items-center border-b border-border/60",
         graphView === "tree" ? "explain-analyze-tree-columns" : "explain-analyze-grid",
         graphView === "tree" && canEstimate && node.kind !== "wait" && node.kind !== "admission" && "explain-analyze-tree-active",
         selectedNodeId === node.nodeId && "explain-analyze-lane-selected",
         graphView === "timeline" && cursorMs !== null && node.startElapsedMs > cursorMs && "explain-analyze-lane-future",
         children.length > 0 && "explain-analyze-group-row",
+        node.outcome === "failed" && "explain-analyze-tree-failed",
       )}>
         <div
           className={cn(
@@ -681,7 +972,7 @@ function renderTimelineNode({
           )}
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
-              {graphView === "tree" ? <button type="button" className="explain-analyze-stage-title"
+              {graphView === "tree" ? <button type="button" className={cn("explain-analyze-stage-title", node.kind === "wait" && "text-warning", node.kind === "admission" && "text-text-muted")}
                 aria-label={`Inspect ${node.label}, ${durationLabel}, ${status.label}`}
                 aria-pressed={selectedNodeId === node.nodeId} onClick={() => onSelectNode(node.nodeId)}>
                 {node.label}
@@ -691,7 +982,7 @@ function renderTimelineNode({
                   {request}
                 </span>
               ) : null}
-              {children.length > 0 ? (
+              {graphView === "timeline" && children.length > 0 ? (
                 <span className="shrink-0 rounded-full bg-surface-muted px-1.5 py-0.5 text-[8px] font-medium text-text-muted">
                   {children.length} stages
                 </span>
@@ -708,17 +999,7 @@ function renderTimelineNode({
                 </span>
               ) : null}
             </div> : null}
-            {graphView === "timeline" && dependencies.length > 0 ? (
-              <p className="mt-0.5 truncate text-[8px] text-text-muted" title={dependencies.join(", ")}>
-                After {dependencies.map((label) => `“${label}”`).join(", ")}
-                {node.dependencyNodeIds.length > dependencies.length
-                  ? ` +${node.dependencyNodeIds.length - dependencies.length}`
-                  : ""}
-              </p>
-            ) : null}
-          </div>
-        </div>
-        {graphView === "tree" ? <>
+            {graphView === "tree" ? (
           <span className="explain-analyze-tree-usage" title={node.usage ? formatUsageDetail(node.usage) : undefined}>
             {node.usage ? <>
               <span>{[
@@ -732,6 +1013,19 @@ function renderTimelineNode({
               ].filter(Boolean).join(" · ")}</span>
             </> : node.context ? usage : node.kind === "provider_attempt" ? "Unreported" : ""}
           </span>
+            ) : null}
+            {graphView === "timeline" && dependencies.length > 0 ? (
+              <p className="mt-0.5 truncate text-[8px] text-text-muted" title={dependencies.join(", ")}>
+                After {dependencies.map((label) => `“${label}”`).join(", ")}
+                {node.dependencyNodeIds.length > dependencies.length
+                  ? ` +${node.dependencyNodeIds.length - dependencies.length}`
+                  : ""}
+              </p>
+            ) : null}
+          </div>
+        </div>
+        {graphView === "tree" ? <>
+
           <span className={cn("explain-analyze-tree-status", status.textClass)}>{status.label}</span>
         </> : null}
         {graphView === "timeline" ? <><div
@@ -758,13 +1052,7 @@ function renderTimelineNode({
         <span className="text-right text-[9px] tabular-nums text-text-muted">
           {formatMs(node.startElapsedMs)}–{endLabel}
         </span></> : null}
-        <span className="explain-analyze-duration text-right text-[10px] font-semibold tabular-nums text-text-secondary">
-          {durationLabel}
-          {graphView === "tree" ? <span className="explain-analyze-mini-track" aria-hidden="true">
-            <span className={cn("explain-analyze-mini-span", status.barClass, canEstimate && "explain-analyze-mini-live")}
-              style={{ left: `${left}%`, width: `${width}%` }} />
-          </span> : null}
-        </span>
+        <span className="explain-analyze-duration text-right text-[10px] font-semibold tabular-nums text-text-secondary">{durationLabel}</span>
       </div>
       {selectedNodeId === node.nodeId ? inspector : null}
       {isOpen && children.length > 0 ? (
@@ -787,7 +1075,6 @@ function renderTimelineNode({
             childrenByParent,
             visited,
             budget,
-            defaultOpen: children.length < 250,
             expandedNodeIds,
             collapsedNodeIds,
             onToggleNode,
@@ -813,10 +1100,11 @@ function summarizeTokenLanes(nodes: readonly ExplainAnalyzeNodeV1[]) {
   return TOKEN_LANES.map(([label, key]) => {
     const values = nodes.map((node) => node.usage?.[key]);
     const total = values.reduce<number>((sum, lane) => sum + (lane ?? 0), 0);
-    const value = nodes.length > 0 && values.every((lane) => lane !== undefined)
+    const reported = values.filter((lane) => lane !== undefined).length;
+    const value = reported > 0
       ? Number.isSafeInteger(total) ? total.toLocaleString() : "Exceeds precise range"
       : null;
-    return { label, value };
+    return { label, value, reported, observed: nodes.length };
   });
 }
 
@@ -826,6 +1114,10 @@ function requestIdentity(node: ExplainAnalyzeNodeV1) {
   if (round === null && attempt === null) return "Model request";
   if (round !== null && attempt !== null) return `Round ${round} · request ${attempt}`;
   return round !== null ? `Round ${round}` : `Request ${attempt}`;
+}
+
+function clampGraphScale(value: number) {
+  return Math.min(1.5, Math.max(0.55, Math.round(value * 100) / 100));
 }
 
 function nodeStatus(node: ExplainAnalyzeNodeV1) {
@@ -863,4 +1155,33 @@ function nodeStatus(node: ExplainAnalyzeNodeV1) {
   const label = node.outcome && node.outcome in labels
     ? labels[node.outcome as keyof typeof labels] : "Outcome not recorded";
   return { label, textClass: "text-text-muted", dotClass: "bg-text-muted", barClass: "bg-text-muted" };
+}
+
+function navigateExplainTree(event: KeyboardEvent<HTMLDivElement>) {
+  const target = event.target as HTMLElement;
+  if (!target.matches(".explain-analyze-stage-title")) return;
+  const stages = [...event.currentTarget.querySelectorAll<HTMLButtonElement>(".explain-analyze-stage-title")];
+  const index = stages.indexOf(target as HTMLButtonElement);
+  const row = target.closest<HTMLElement>("[data-tree-node-id]");
+  if (index < 0 || !row) return;
+  const toggle = row.querySelector<HTMLButtonElement>("button[aria-expanded]");
+  let next: HTMLButtonElement | undefined;
+  switch (event.key) {
+    case "ArrowDown": next = stages[Math.min(index + 1, stages.length - 1)]; break;
+    case "ArrowUp": next = stages[Math.max(index - 1, 0)]; break;
+    case "Home": next = stages[0]; break;
+    case "End": next = stages[stages.length - 1]; break;
+    case "ArrowRight":
+      if (toggle?.getAttribute("aria-expanded") === "false") toggle.click();
+      else next = stages[index + 1];
+      break;
+    case "ArrowLeft":
+      if (toggle?.getAttribute("aria-expanded") === "true") toggle.click();
+      else next = stages.find((stage) => stage.closest<HTMLElement>("[data-tree-node-id]")?.dataset.treeNodeId === row.dataset.treeParentId);
+      break;
+    default: return;
+  }
+  event.preventDefault();
+  next?.focus({ preventScroll: true });
+  next?.scrollIntoView?.({ block: "nearest" });
 }

@@ -38,7 +38,7 @@ astra chat --explain verbose -m "Run the shell command: ls *.sh | wc -l and answ
 ```text
 Explain Analyze · recorded · 10 stages · 10/10 timed spans · 1 clock domains
   Observed overlap · at least 2 overlapping recorded spans
-  Not timed separately · approval waits · child-run timing · time to first token · provider retry backoff · user input waits
+  Not timed separately · some approval waits · tool I/O wait breakdown · child-run timing · time to first token · provider retry backoff · user input waits
   Provider tokens · in 83,200 · cache read 0 · cache write 0 · out 54
 User turn · 2.4s · Completed · clock A +0ms
 ├─ Understand requested outcome · 25ms · Resolved · round 1 · clock A +0ms
@@ -58,8 +58,10 @@ Astra ships as one binary (CLI, TUI, and Server), plus a Web dashboard and a
 TypeScript SDK sharing one agent backbone. Bring any model endpoint.
 
 <div align="center">
-  <img alt="Animated Explain Analyze web graph: a readable execution tree switches to a replayable timeline with overlapping provider and tool spans, a moving playhead, measured durations, and token usage." src="docs/assets/explain-analyze-demo.gif" width="1100">
+  <img alt="Explain Analyze in the real Web component: a compact execution tree receives illustrative recorded events, distinguishes parallel tools and approval waits, preserves a failed test before a later successful attempt, and opens measured evidence inline." src="docs/assets/explain-analyze-demo.gif" width="1100">
 </div>
+
+<sub>Illustrative recorded-event replay through the real Web component. Tree is the default; Timeline and Graph are optional. Missing failure explanations and unmeasured I/O time are explicitly identified.</sub>
 
 ### Pick the layer you need
 
