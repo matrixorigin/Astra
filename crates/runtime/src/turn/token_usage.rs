@@ -41,6 +41,33 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
+/// Records which normalized lanes the provider actually supplied. A zero
+/// value is meaningful only when its lane is present here; absent lanes are
+/// unavailable and must not be rendered as zero by Explain Analyze.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsagePresence {
+    pub fresh_input_tokens: bool,
+    pub cache_read_tokens: bool,
+    pub cache_creation_tokens: bool,
+    pub output_tokens: bool,
+}
+
+impl TokenUsagePresence {
+    pub fn merge(&mut self, other: Self) {
+        self.fresh_input_tokens |= other.fresh_input_tokens;
+        self.cache_read_tokens |= other.cache_read_tokens;
+        self.cache_creation_tokens |= other.cache_creation_tokens;
+        self.output_tokens |= other.output_tokens;
+    }
+
+    pub fn any(self) -> bool {
+        self.fresh_input_tokens
+            || self.cache_read_tokens
+            || self.cache_creation_tokens
+            || self.output_tokens
+    }
+}
+
 impl TokenUsage {
     pub fn normalized_prompt_cache_usage(self) -> NormalizedPromptCacheUsage {
         NormalizedPromptCacheUsage::new(
@@ -138,6 +165,64 @@ pub fn extract_usage(dialect: UsageDialect, usage_obj: &Map<String, Value>) -> O
     }
 }
 
+/// Report which normalized usage lanes are backed by fields in this provider
+/// payload. This is separate from [`TokenUsage`] because its zero-filled
+/// accounting buckets intentionally do not preserve field presence.
+pub fn extract_usage_presence(
+    dialect: UsageDialect,
+    usage_obj: &Map<String, Value>,
+) -> TokenUsagePresence {
+    let mut observed = TokenUsagePresence::default();
+    match dialect {
+        UsageDialect::OpenAi
+            if !usage_obj.contains_key("prompt_tokens")
+                && !usage_obj.contains_key("completion_tokens")
+                && [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ]
+                .iter()
+                .any(|key| usage_obj.contains_key(*key)) =>
+        {
+            observed = extract_usage_presence(UsageDialect::AnthropicMessages, usage_obj);
+        }
+        UsageDialect::OpenAi => {
+            let details = usage_obj
+                .get("prompt_tokens_details")
+                .and_then(Value::as_object);
+            observed.fresh_input_tokens = as_u64(usage_obj.get("prompt_tokens")).is_some()
+                || as_u64(usage_obj.get("prompt_cache_miss_tokens")).is_some();
+            observed.cache_read_tokens = as_u64(usage_obj.get("prompt_cache_hit_tokens")).is_some()
+                || details
+                    .and_then(|details| as_u64(details.get("cached_tokens")))
+                    .is_some()
+                || as_u64(usage_obj.get("cache_read_input_tokens")).is_some();
+            observed.cache_creation_tokens = details
+                .and_then(|details| as_u64(details.get("cache_creation_input_tokens")))
+                .is_some()
+                || as_u64(usage_obj.get("cache_creation_input_tokens")).is_some();
+            observed.output_tokens = as_u64(usage_obj.get("completion_tokens")).is_some();
+        }
+        UsageDialect::BedrockConverse => {
+            observed.fresh_input_tokens = as_u64(usage_obj.get("inputTokens")).is_some();
+            observed.cache_read_tokens = as_u64(usage_obj.get("cacheReadInputTokens")).is_some();
+            observed.cache_creation_tokens =
+                as_u64(usage_obj.get("cacheWriteInputTokens")).is_some();
+            observed.output_tokens = as_u64(usage_obj.get("outputTokens")).is_some();
+        }
+        UsageDialect::AnthropicMessages => {
+            observed.fresh_input_tokens = as_u64(usage_obj.get("input_tokens")).is_some();
+            observed.cache_read_tokens = as_u64(usage_obj.get("cache_read_input_tokens")).is_some();
+            observed.cache_creation_tokens =
+                as_u64(usage_obj.get("cache_creation_input_tokens")).is_some();
+            observed.output_tokens = as_u64(usage_obj.get("output_tokens")).is_some();
+        }
+    }
+    observed
+}
+
 fn as_u64(v: Option<&Value>) -> Option<u64> {
     v.and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
 }
@@ -186,10 +271,11 @@ fn extract_openai(u: &Map<String, Value>) -> Option<TokenUsage> {
     // Required: prompt_tokens + completion_tokens (either one is enough to
     // consider this a usage object).
     let prompt_total = as_u64(u.get("prompt_tokens"));
-    let completion = as_u64(u.get("completion_tokens")).unwrap_or(0);
-    if prompt_total.is_none() && completion == 0 {
+    let completion_value = as_u64(u.get("completion_tokens"));
+    if prompt_total.is_none() && completion_value.is_none() {
         return None;
     }
+    let completion = completion_value.unwrap_or(0);
     let prompt_total = prompt_total.unwrap_or(0);
 
     let details = u.get("prompt_tokens_details").and_then(Value::as_object);
@@ -258,15 +344,21 @@ fn extract_anthropic(u: &Map<String, Value>) -> Option<TokenUsage> {
     let output = as_u64(u.get("output_tokens"));
     let cached = as_u64(u.get("cache_read_input_tokens")).unwrap_or(0);
     let cache_creation = as_u64(u.get("cache_creation_input_tokens")).unwrap_or(0);
-    if input.is_none() && output.is_none() && cached == 0 && cache_creation == 0 {
+    let has_recognized_lane = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .any(|key| u.contains_key(*key));
+    if !has_recognized_lane {
         return None;
     }
-    // Guard against all-zero usage (e.g. empty response body parsed as zeros).
+    // An explicit all-zero response is still provider evidence. An empty
+    // object was rejected above because it has no recognized usage fields.
     let i = input.unwrap_or(0);
     let o = output.unwrap_or(0);
-    if i == 0 && o == 0 && cached == 0 && cache_creation == 0 {
-        return None;
-    }
     Some(TokenUsage {
         input_tokens: i,
         cached_input_tokens: cached,
@@ -611,6 +703,28 @@ mod tests {
     }
 
     #[test]
+    fn usage_presence_distinguishes_missing_lanes_from_reported_zero() {
+        let reported = obj(json!({
+            "prompt_tokens": 18,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }));
+        let presence = extract_usage_presence(UsageDialect::OpenAi, &reported);
+        assert!(presence.fresh_input_tokens);
+        assert!(
+            presence.output_tokens,
+            "an explicitly reported zero is present"
+        );
+        assert!(presence.cache_read_tokens);
+        assert!(!presence.cache_creation_tokens);
+
+        let partial = obj(json!({"prompt_tokens": 18}));
+        let presence = extract_usage_presence(UsageDialect::OpenAi, &partial);
+        assert!(presence.fresh_input_tokens);
+        assert!(!presence.output_tokens, "an absent lane is unavailable");
+    }
+
+    #[test]
     fn openai_inclusive_contract_violation_saturates_instead_of_wrapping() {
         // A provider that violates the inclusive contract (nested
         // `cached_tokens` > `prompt_tokens`) is still unambiguously inclusive
@@ -788,7 +902,8 @@ mod tests {
     fn test_anthropic_messages_extraction() {
         // Empty usage returns None.
         assert!(extract_usage(UsageDialect::AnthropicMessages, &obj(json!({}))).is_none());
-        // All-zero returns None.
+        // Explicit all-zero lanes remain evidence instead of collapsing into
+        // an unobserved usage object.
         assert!(
             extract_usage(
                 UsageDialect::AnthropicMessages,
@@ -799,7 +914,7 @@ mod tests {
                     "cache_creation_input_tokens": 0
                 }))
             )
-            .is_none()
+            .is_some()
         );
         // Cache-only should still be Some.
         let t = extract_usage(

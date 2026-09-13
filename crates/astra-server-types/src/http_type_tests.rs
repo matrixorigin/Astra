@@ -76,6 +76,10 @@ fn deserialization_applies_defaults() {
     // RunStreamQuery
     let q: RunStreamQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.last_index, 0);
+    let replay: RunStreamQuery =
+        serde_json::from_str(r#"{"last_index":7,"replay_only":true}"#).unwrap();
+    assert_eq!(replay.last_index, 7);
+    assert!(replay.replay_only);
 
     // RunListQuery
     let q: RunListQuery = serde_json::from_str("{}").unwrap();

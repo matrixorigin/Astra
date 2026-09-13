@@ -757,6 +757,9 @@ pub(crate) struct LlmCallResult {
     pub reasoning_signature: String,
     pub tool_calls: Vec<Value>,
     pub usage: Map<String, Value>,
+    /// Provider fields observed before token usage is normalized into
+    /// zero-filled accounting buckets.
+    pub usage_presence: crate::turn::token_usage::TokenUsagePresence,
     pub model_used: String,
     #[allow(dead_code)] // validated in tests; reserved for future telemetry
     pub duration_ms: u64,
@@ -783,6 +786,41 @@ impl LlmCallResult {
             .as_deref()
             .or(self.finish_reason.as_deref())
     }
+}
+
+// Usage chunks are cumulative per reported field, but may omit other fields.
+// Keep the raw cache partition until normalization so a later cached-token
+// count can still be subtracted from an earlier inclusive prompt total.
+fn merge_reported_usage_fields(target: &mut Map<String, Value>, update: &Map<String, Value>) {
+    for (key, value) in update {
+        if value.as_u64().is_some() || value.as_i64().is_some() {
+            target.insert(key.clone(), value.clone());
+        } else if let Some(object) = value.as_object() {
+            let entry = target
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(existing) = entry.as_object_mut() {
+                merge_reported_usage_fields(existing, object);
+            }
+        }
+    }
+}
+
+fn current_usage_presence(
+    presence: &std::sync::Mutex<crate::turn::token_usage::TokenUsagePresence>,
+) -> crate::turn::token_usage::TokenUsagePresence {
+    *presence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn replace_usage_presence(
+    presence: &std::sync::Mutex<crate::turn::token_usage::TokenUsagePresence>,
+    observed: crate::turn::token_usage::TokenUsagePresence,
+) {
+    *presence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observed;
 }
 
 /// Normalize provider-native OpenAI-compatible calls once at the transport
@@ -1005,6 +1043,15 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
 
+    /// Preserve provider lane presence for Explain Analyze without changing
+    /// the inference ledger's normalized accounting contract.
+    fn note_usage_presence(
+        &self,
+        _attempt_index: u32,
+        _presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+    }
+
     /// Synchronous boundary when the HTTP send future is first polled.
     /// Durable diagnostics use it to distinguish an admitted plan from a
     /// request that actually crossed into transport execution.
@@ -1120,6 +1167,14 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
         }
     }
 
+    fn note_usage_presence(
+        &self,
+        attempt_index: u32,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner.note_usage_presence(attempt_index, presence);
+    }
+
     fn note_dispatch_started(&self, attempt_index: u32) {
         self.inner.note_dispatch_started(attempt_index);
     }
@@ -1140,10 +1195,20 @@ pub(crate) fn provider_attempt_terminal_from_result(
         },
         result.response_id.clone(),
     );
-    if result.usage.is_empty() {
-        terminal.usage_status = astra_services::InferenceUsageStatus::Unavailable;
-    }
+    terminal.usage_status = provider_usage_status_from_presence(result.usage_presence);
     terminal
+}
+
+pub(crate) fn provider_usage_status_from_presence(
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) -> astra_services::InferenceUsageStatus {
+    if !presence.any() {
+        astra_services::InferenceUsageStatus::Unavailable
+    } else if !presence.fresh_input_tokens || !presence.output_tokens {
+        astra_services::InferenceUsageStatus::ProviderPartial
+    } else {
+        astra_services::InferenceUsageStatus::ProviderExact
+    }
 }
 
 pub(crate) fn provider_attempt_terminal_from_error(
@@ -1241,6 +1306,16 @@ pub(crate) async fn finish_observed_provider_attempt(
     observer.finish_attempt(attempt_index, terminal).await
 }
 
+fn note_observed_provider_usage_presence(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) {
+    if let (Some(observer), Some(attempt_index)) = (observer, attempt_index) {
+        observer.note_usage_presence(attempt_index, presence);
+    }
+}
+
 pub(crate) async fn finish_observed_provider_error(
     observer: Option<&dyn ProviderAttemptObserver>,
     attempt_index: Option<u32>,
@@ -1260,6 +1335,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1288,6 +1364,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -5045,6 +5122,11 @@ async fn call_llm_and_collect_with_total_budget(
                 {
                     Ok(mut result) => {
                         reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
+                        note_observed_provider_usage_presence(
+                            attempt_observer,
+                            observed_attempt,
+                            result.usage_presence,
+                        );
                         if let Err(error) = finish_observed_provider_attempt(
                             attempt_observer,
                             observed_attempt,
@@ -5291,6 +5373,11 @@ async fn call_llm_and_collect_with_total_budget(
             match stream_result {
                 Ok(mut result) => {
                     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
+                    note_observed_provider_usage_presence(
+                        attempt_observer,
+                        observed_attempt,
+                        result.usage_presence,
+                    );
                     if let Err(error) = finish_observed_provider_attempt(
                         attempt_observer,
                         observed_attempt,
@@ -5750,6 +5837,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
+    let mut reported_usage = Map::new();
+    let usage_presence =
+        std::sync::Mutex::new(crate::turn::token_usage::TokenUsagePresence::default());
     let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
@@ -5785,6 +5875,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             reasoning_signature: String::new(),
             tool_calls,
             usage: usage.clone(),
+            usage_presence: current_usage_presence(&usage_presence),
             model_used: model_name.to_string(),
             duration_ms: started.elapsed().as_millis() as u64,
             finish_reason: finish_reason.clone(),
@@ -5947,14 +6038,22 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         // Parse usage from any chunk. Streaming endpoints we call are always
         // OpenAI-compatible: Bedrock Converse streams are intercepted at a
         // higher level and decoded by the dedicated Bedrock transport.
-        if let Some(u) = chunk.get("usage").and_then(Value::as_object)
-            && let Some(extracted) = crate::turn::token_usage::extract_usage(
+        if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
+            merge_reported_usage_fields(&mut reported_usage, u);
+            if let Some(extracted) = crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
-                u,
-            )
-        {
-            usage = extracted.to_json_map();
-            made_progress = true;
+                &reported_usage,
+            ) {
+                replace_usage_presence(
+                    &usage_presence,
+                    crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::OpenAi,
+                        &reported_usage,
+                    ),
+                );
+                usage = extracted.to_json_map();
+                made_progress = true;
+            }
         }
         if yield_state.is_terminal() && !usage.is_empty() {
             break;
@@ -6293,6 +6392,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         reasoning_signature: String::new(),
         tool_calls,
         usage,
+        usage_presence: current_usage_presence(&usage_presence),
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
@@ -6399,6 +6499,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     let mut reasoning_signature = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
+    let usage_presence =
+        std::sync::Mutex::new(crate::turn::token_usage::TokenUsagePresence::default());
     let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
@@ -6424,6 +6526,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             reasoning_signature: reasoning_signature.clone(),
             tool_calls,
             usage: usage_tokens.to_json_map(),
+            usage_presence: current_usage_presence(&usage_presence),
             model_used: model_name.to_string(),
             duration_ms: started.elapsed().as_millis() as u64,
             finish_reason: finish_reason.clone(),
@@ -6602,6 +6705,12 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         u,
                     )
                 {
+                    let mut observed = current_usage_presence(&usage_presence);
+                    observed.merge(crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    ));
+                    replace_usage_presence(&usage_presence, observed);
                     usage_tokens.input_tokens = extracted.input_tokens;
                     usage_tokens.cached_input_tokens = extracted.cached_input_tokens;
                     usage_tokens.cache_creation_tokens = extracted.cache_creation_tokens;
@@ -6817,6 +6926,12 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         u,
                     )
                 {
+                    let mut observed = current_usage_presence(&usage_presence);
+                    observed.merge(crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    ));
+                    replace_usage_presence(&usage_presence, observed);
                     if u.contains_key("input_tokens") {
                         usage_tokens.input_tokens = extracted.input_tokens;
                     }
@@ -6882,6 +6997,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
         reasoning_signature,
         tool_calls,
         usage: usage_tokens.to_json_map(),
+        usage_presence: current_usage_presence(&usage_presence),
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
@@ -7292,6 +7408,11 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     if result.response_id.is_none() {
         result.response_id = transport_response_id;
     }
+    note_observed_provider_usage_presence(
+        attempt_observer,
+        observed_attempt,
+        result.usage_presence,
+    );
     if let Err(error) = finish_observed_provider_attempt(
         attempt_observer,
         observed_attempt,
@@ -7339,9 +7460,16 @@ fn parse_bedrock_nonstream_response(
     let mut reasoning = String::new();
     let mut reasoning_signature = String::new();
     let mut tool_calls = Vec::new();
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage_obj = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage_obj
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::BedrockConverse,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage_obj
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::BedrockConverse,
@@ -7400,6 +7528,7 @@ fn parse_bedrock_nonstream_response(
         reasoning_signature,
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason: v
@@ -7418,9 +7547,16 @@ fn parse_openai_compatible_nonstream_response(
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage_obj = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage_obj
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage_obj
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
@@ -7488,6 +7624,7 @@ fn parse_openai_compatible_nonstream_response(
         reasoning_signature: String::new(),
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
@@ -7545,9 +7682,16 @@ fn parse_anthropic_nonstream_response(
             }
         }
     }
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::AnthropicMessages,
@@ -7564,6 +7708,7 @@ fn parse_anthropic_nonstream_response(
         reasoning_signature,
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason: v
@@ -10513,6 +10658,72 @@ mod tests {
         assert!(res.tool_calls.is_empty());
         // `[DONE]` proves protocol completion without inventing a finish reason.
         assert_eq!(res.finish_reason, None);
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
+        for (updates, expected_fresh, expected_cached) in [
+            (
+                vec![
+                    json!({"prompt_tokens": 100}),
+                    json!({"completion_tokens": 5}),
+                ],
+                100,
+                0,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens": 100}),
+                    json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"completion_tokens": 5, "prompt_tokens": null}),
+                ],
+                70,
+                30,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens": 100}),
+                    json!({"completion_tokens": 5}),
+                ],
+                70,
+                30,
+            ),
+        ] {
+            let mut frames = vec![Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            ))];
+            for usage in updates {
+                frames.push(Ok(Bytes::from(format!(
+                    "data: {}\n\n",
+                    json!({"usage": usage})
+                ))));
+            }
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "gpt-test",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("partial usage chunks must converge");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
+            assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
+            assert_eq!(terminal.usage.output_tokens, 5);
+            assert_eq!(
+                terminal.usage_status,
+                astra_services::InferenceUsageStatus::ProviderExact
+            );
+            assert!(result.usage_presence.fresh_input_tokens);
+            assert!(result.usage_presence.output_tokens);
+            assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
+            assert!(!result.usage_presence.cache_creation_tokens);
+        }
     }
 
     #[test]

@@ -3509,10 +3509,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     // first round. A resumed non-zero round preserves the restored state.
     if turn_index == 0 {
         let admission_started_at = Instant::now();
+        host.on_turn_phase_started(
+            state,
+            TurnPhaseKind::SemanticAdmission,
+            0,
+            0,
+            admission_started_at,
+        );
         let outcome = host.judge_turn_intent(state).await;
         // This is emitted before an unavailable admission can terminate the
-        // turn, so failed slow starts remain diagnosable. The common fanout
-        // helper guarantees trace, log, and Explain share one duration.
+        // turn, so a slow or unavailable decision remains visible.
         complete_turn_phase(
             host,
             state,

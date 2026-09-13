@@ -312,8 +312,9 @@ impl From<&TurnIntentJudgeOutcome> for TurnPhaseOutcome {
     }
 }
 
-/// One lifecycle-owned timing fact. The lifecycle measures the phase once,
-/// then gives the same receipt to trace and client-facing Explain projections.
+/// One lifecycle-owned timing fact. Trace records retain diagnostic context;
+/// Explain Analyze projects only the user-meaningful stage and its measured
+/// interval from this receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnPhaseReceipt {
     pub phase: TurnPhaseKind,
@@ -322,14 +323,15 @@ pub struct TurnPhaseReceipt {
     /// retry distinguishable from duplicate event delivery without relying on
     /// prose or provider-specific identifiers.
     pub attempt_index: u32,
+    pub started_at: Instant,
+    pub finished_at: Instant,
     pub duration_ms: u64,
     pub outcome: TurnPhaseOutcome,
 }
 
-/// Complete a lifecycle stage once and fan out that one timing fact to every
-/// observability surface. The trace span carries the same rounded duration as
-/// an attribute because its microsecond wall-clock bounds are sampled when the
-/// journal event is written; Explain and logs must not re-measure it.
+/// Complete a lifecycle stage once. Trace retains its own diagnostic span,
+/// while Explain Analyze receives a bounded stage fact derived from the same
+/// monotonic measurement.
 pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -340,11 +342,20 @@ pub(crate) fn complete_turn_phase<H: AgenticLoopHost>(
     outcome: TurnPhaseOutcome,
     span_id: String,
 ) -> TurnPhaseReceipt {
+    // The default host hook is intentionally a no-op. Production hosts start
+    // stages at their actual boundary; this call supplies a reconstructable
+    // start for hosts that only provide terminal receipts.
+    host.on_turn_phase_started(state, phase, round_index, attempt_index, started_at);
+    let finished_at = Instant::now();
     let receipt = TurnPhaseReceipt {
         phase,
         round_index,
         attempt_index,
-        duration_ms: started_at.elapsed().as_millis() as u64,
+        started_at,
+        finished_at,
+        duration_ms: finished_at
+            .saturating_duration_since(started_at)
+            .as_millis() as u64,
         outcome,
     };
     let mut attrs = HashMap::new();
@@ -669,10 +680,36 @@ pub trait AgenticLoopHost: Send {
     }
 
     /// Observe a completed lifecycle phase. The default preserves lightweight
-    /// hosts; production hosts project the supplied receipt over their public
-    /// event lane. The receipt is observational evidence only, never a second
+    /// hosts; production hosts project the supplied receipt into Explain
+    /// Analyze. The receipt is observational evidence only, never a second
     /// source of control state.
     fn on_turn_phase(&mut self, _receipt: TurnPhaseReceipt) {}
+
+    /// Publish a meaningful lifecycle stage as it begins. `started_at` comes
+    /// from the owner that measures the corresponding terminal receipt, so a
+    /// live graph and its completed interval share one clock boundary.
+    fn on_turn_phase_started(
+        &mut self,
+        _state: &AgenticLoopState,
+        _phase: TurnPhaseKind,
+        _round_index: u32,
+        _attempt_index: u32,
+        _started_at: Instant,
+    ) {
+    }
+
+    /// Begin one user-visible turn in Explain Analyze. Hosts may attach
+    /// product facts to their normal execution/event lane; this callback does
+    /// not create a second lifecycle owner.
+    fn on_turn_started(&mut self, _state: &AgenticLoopState) {}
+
+    /// Close the Explain Analyze turn root with the lifecycle-owned outcome.
+    fn on_turn_terminal(
+        &mut self,
+        _state: &AgenticLoopState,
+        _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    ) {
+    }
 
     /// Whether the host measures the provider boundary more precisely than
     /// the generic `execute_turn` envelope. Server hosts split request
@@ -4950,6 +4987,15 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // rejected or merely selected calls cannot replenish recovery.
         let provider_recovery_tool_record_floor = state.stall.tool_call_records.len();
         let tool_phase_start = Instant::now();
+        if has_tool_work {
+            host.on_turn_phase_started(
+                state,
+                TurnPhaseKind::ToolExecution,
+                turn_index as u32,
+                0,
+                tool_phase_start,
+            );
+        }
         #[cfg(feature = "harness")]
         let tool_phase_result = if harness_blocked_tools {
             Ok(TurnToolPhaseControl::ContinueLoop)

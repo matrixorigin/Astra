@@ -541,6 +541,28 @@ pub(crate) async fn stream_run_handler(
         }
     };
 
+    if query.replay_only {
+        return match state
+            .execution
+            .run_lifecycle_service
+            .stream_run(run_id.clone(), principal.user.user_id, query.last_index)
+            .await
+        {
+            Ok(events) => {
+                sse_json_response(transform_stream_run_events_for_client(&run_id, events))
+            }
+            Err((status, error)) => sse_error_response_from_error_with_context(
+                status,
+                error.0,
+                SseErrorContext {
+                    request_id: request_id.as_deref(),
+                    run_id: Some(&run_id),
+                    ..SseErrorContext::default()
+                },
+            ),
+        };
+    }
+
     match state
         .execution
         .run_lifecycle_service
@@ -1124,6 +1146,17 @@ mod tests {
         let Query(query) =
             Query::<RunListQuery>::try_from_uri(&cursor_uri).expect("cursor query should decode");
         assert!(query.cursor().unwrap().is_some());
+    }
+
+    #[test]
+    fn run_stream_query_decodes_replay_only_flag() {
+        let uri: Uri = "/chat/runs/run-1/stream?last_index=7&replay_only=true"
+            .parse()
+            .unwrap();
+        let Query(query) = Query::<astra_server_types::RunStreamQuery>::try_from_uri(&uri)
+            .expect("replay-only stream query should decode");
+        assert_eq!(query.last_index, 7);
+        assert!(query.replay_only);
     }
 
     #[test]

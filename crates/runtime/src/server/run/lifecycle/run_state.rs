@@ -488,6 +488,7 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "executor_bound"
                 | "executor_status_changed"
                 | "work_task_board_update"
+                | "explain_analyze"
                 | "tool_routing_decision"
                 | "tool_transport_started"
                 | "tool_transport_completed"
@@ -580,7 +581,10 @@ pub fn enforce_durable_run_event_batch_budget_with_budget(
         .iter()
         .map(|event| {
             streaming_final_event_for_replay(event)
-                || durable_event_type(event) == Some("tool_call_end")
+                || matches!(
+                    durable_event_type(event),
+                    Some("tool_call_end" | "stream_gap")
+                )
         })
         .collect();
     let critical_count = critical_events.iter().filter(|keep| **keep).count();
@@ -694,6 +698,7 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             // so an attached client, reconnect, or another observer sees the
             // same canonical Work state.
             | "work_task_board_update"
+            | "explain_analyze"
             | "compaction"
             | "agent_delegated"
             | "agent_spawned"

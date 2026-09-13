@@ -4599,9 +4599,8 @@ fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvo
         },
         result.response_id.clone(),
     );
-    if result.usage.is_empty() {
-        terminal.usage_status = astra_services::InferenceUsageStatus::Unavailable;
-    }
+    terminal.usage_status =
+        crate::turn::llm::client::provider_usage_status_from_presence(result.usage_presence);
     terminal
 }
 

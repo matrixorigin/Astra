@@ -1909,6 +1909,32 @@ async fn attached_stream_progress_recovers_after_transient_backpressure() {
 }
 
 #[tokio::test]
+async fn host_gap_recovery_delivers_explain_facts_before_acknowledging_the_gap() {
+    let gap = server_loop_host::HostEventGapTracker::default();
+    let explain_event = json!({
+        "type": "explain_analyze",
+        "event_id": "stage-finish",
+        "node_id": "stage",
+    });
+    gap.record_explain_analyze_drop(explain_event.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let bridge_gap = gap.clone();
+    let bridge =
+        tokio::spawn(async move { flush_host_event_gap_recovery(&tx, &bridge_gap, "run-1").await });
+
+    assert_eq!(rx.recv().await, Some(explain_event));
+    let mut expected_gap = stream_delivery_gap_event("run-1", 1);
+    expected_gap["explain_analyze_recovered"] = Value::Bool(true);
+    assert_eq!(rx.recv().await, Some(expected_gap));
+    assert!(bridge.await.expect("bridge task"));
+
+    let (dropped, events, complete) = gap.pending_recovery_snapshot();
+    assert_eq!(dropped, 0);
+    assert!(events.is_empty());
+    assert!(complete);
+}
+
+#[tokio::test]
 async fn attached_stream_event_detaches_after_disconnect() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx);
@@ -15867,6 +15893,45 @@ fn compaction_is_a_durable_live_replay_boundary() {
     assert!(live_delta_event_for_persistence(&event));
     assert!(streaming_event_for_persistence(&event));
     assert!(durable_replay_boundary_event(&event));
+}
+
+#[test]
+fn explain_analyze_facts_are_durable_replay_boundaries() {
+    let event = json!({
+        "type": "explain_analyze",
+        "schema_version": 1,
+        "event_id": "turn-1/model/0/started",
+        "node_id": "turn-1/model/0",
+        "transition": "started",
+    });
+
+    assert!(live_delta_event_for_persistence(&event));
+    assert!(streaming_event_for_persistence(&event));
+    assert!(durable_replay_boundary_event(&event));
+}
+
+#[test]
+fn explain_recovery_gap_survives_terminal_batch_compaction() {
+    let budget = DurableRunEventBatchBudget::default();
+    let mut events: Vec<Value> = (0..(budget.row_budget + 100))
+        .map(|index| json!({"type": "explain_analyze", "event_id": format!("fact-{index}")}))
+        .collect();
+    let gap = json!({"type": "stream_gap", "run_id": "run-1",
+        "dropped_event_count": 100, "explain_analyze_recovered": false,
+        "repair": "refresh_run_snapshot"});
+    events.push(gap.clone());
+    events.push(json!({"type": "run_finished", "status": "completed"}));
+    let retained = enforce_durable_run_event_batch_budget_with_budget(events, budget);
+    assert!(retained.len() <= budget.row_budget);
+    assert!(
+        retained.contains(&gap),
+        "compaction must preserve the public incomplete marker"
+    );
+    assert!(
+        retained
+            .iter()
+            .any(|event| durable_event_type(event) == Some("run_finished"))
+    );
 }
 
 #[test]

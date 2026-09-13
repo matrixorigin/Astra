@@ -508,6 +508,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+    host.on_turn_started(state);
     // Owned before the first await so task cancellation and panic unwinding
     // settle the same producer queue as normal and error returns.
     let _recall_run_boundary = UnattributedRecallRunBoundary::new(host.memory_recall_scope(state));
@@ -552,6 +553,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             state.interruption = None;
         }
     }
+
+    host.on_turn_terminal(state, &result);
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
     #[cfg(feature = "harness")]

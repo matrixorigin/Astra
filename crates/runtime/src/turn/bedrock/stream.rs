@@ -91,6 +91,7 @@ pub struct BedrockStreamAccumulator {
     /// emit tool calls in declared order when `into_result` runs.
     tool_calls: BTreeMap<u64, ToolCallInProgress>,
     usage: Option<TokenUsage>,
+    usage_presence: crate::turn::token_usage::TokenUsagePresence,
     finish_reason: Option<String>,
     exception: Option<(String, String)>,
     /// Total bytes retained across all response fields. This must remain
@@ -415,6 +416,11 @@ impl BedrockStreamAccumulator {
                 let Some(u) = extract_usage(UsageDialect::BedrockConverse, usage_obj) else {
                     return Ok(vec![]);
                 };
+                self.usage_presence
+                    .merge(crate::turn::token_usage::extract_usage_presence(
+                        UsageDialect::BedrockConverse,
+                        usage_obj,
+                    ));
                 self.usage = Some(u);
                 Ok(vec![BedrockStreamEvent::Usage(u)])
             }
@@ -455,6 +461,7 @@ impl BedrockStreamAccumulator {
             .collect::<Vec<_>>();
 
         let usage_map: Map<String, Value> = self.usage.map(|u| u.to_json_map()).unwrap_or_default();
+        let usage_presence = self.usage_presence;
 
         // If an exception killed the stream and no stopReason arrived, tag
         // the finish_reason so the finalization layer doesn't think the
@@ -472,6 +479,7 @@ impl BedrockStreamAccumulator {
             reasoning_signature: self.reasoning_signature,
             tool_calls,
             usage: usage_map,
+            usage_presence,
             model_used: model_name.to_string(),
             duration_ms,
             finish_reason,

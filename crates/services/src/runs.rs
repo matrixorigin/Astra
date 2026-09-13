@@ -23430,6 +23430,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_blocked",
     "run_paused",
     "run_resumed",
+    "stream_gap",
     "runtime.control.handoff.requested",
     "runtime.control.handoff.rejected",
     "user_intent_accepted",
@@ -23442,7 +23443,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "turn_done",
     "user_input",
     "usage",
-    "explain",
+    "explain_analyze",
     "error",
     "ping",
     // Canonical, bounded post-ingest runtime observation. Clients consume the
@@ -23477,8 +23478,6 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     // after the corresponding Work mutation commits and drives the compact
     // live task board in every interactive client.
     "work_task_board_update",
-    // Bounded execution-phase receipt used by Explain/trace projections.
-    "turn_phase",
 ];
 
 fn project_runtime_feedback(event: serde_json::Value) -> serde_json::Value {
@@ -23493,6 +23492,35 @@ fn project_runtime_feedback(event: serde_json::Value) -> serde_json::Value {
         "type": "runtime_feedback",
         "runtime_feedback": frame,
     })
+}
+
+fn project_stream_gap(event: serde_json::Value) -> serde_json::Value {
+    let Some(run_id) = event.get("run_id").and_then(serde_json::Value::as_str) else {
+        return serde_json::Value::Null;
+    };
+    let Some(dropped_event_count) = event
+        .get("dropped_event_count")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|count| *count > 0)
+    else {
+        return serde_json::Value::Null;
+    };
+    if event.get("repair").and_then(serde_json::Value::as_str) != Some("refresh_run_snapshot") {
+        return serde_json::Value::Null;
+    }
+    let mut projected = serde_json::json!({
+        "type": "stream_gap",
+        "run_id": run_id,
+        "dropped_event_count": dropped_event_count,
+        "repair": "refresh_run_snapshot",
+    });
+    if let Some(explain_analyze_recovered) = event
+        .get("explain_analyze_recovered")
+        .and_then(serde_json::Value::as_bool)
+    {
+        projected["explain_analyze_recovered"] = serde_json::Value::Bool(explain_analyze_recovered);
+    }
+    projected
 }
 
 fn insert_if_present(
@@ -23627,17 +23655,20 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_external = is_external_client_event_type(client_type);
         let is_tool_call_end = client_type == "tool_call_end";
         let is_work_task_board_update = client_type == "work_task_board_update";
-        let is_turn_phase = client_type == "turn_phase";
+        let is_explain_analyze = client_type == "explain_analyze";
         let is_runtime_feedback = client_type == "runtime_feedback";
+        let is_stream_gap = client_type == "stream_gap";
         if is_external {
             return if is_tool_call_end {
                 project_external_tool_call_end(event)
             } else if is_work_task_board_update {
                 project_work_task_board_update(event)
-            } else if is_turn_phase {
-                project_turn_phase(event)
+            } else if is_explain_analyze {
+                project_explain_analyze(event)
             } else if is_runtime_feedback {
                 project_runtime_feedback(event)
+            } else if is_stream_gap {
+                project_stream_gap(event)
             } else {
                 event
             };
@@ -24029,7 +24060,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             // reconstruct exactly the same shape for reconnecting clients.
             project_work_task_board_update(serde_json::Value::Object(data))
         }
-        "turn_phase" => project_turn_phase(serde_json::Value::Object(data)),
+        "explain_analyze" => project_explain_analyze(serde_json::Value::Object(data)),
+        "stream_gap" => project_stream_gap(serde_json::Value::Object(data)),
         "keepalive" => serde_json::json!({ "type": "ping" }),
         _ => {
             // wip-7 allowlist: unknown internal event_types are
@@ -24063,60 +24095,33 @@ fn project_work_task_board_update(event: serde_json::Value) -> serde_json::Value
     serde_json::Value::Object(out)
 }
 
-/// A phase receipt is intentionally smaller than an arbitrary diagnostic. It
-/// has no prompt, model, tool output, or provider detail; those remain in the
-/// correlated trace/log record. Keeping the replay and live shape identical
-/// makes Explain trustworthy after reconnect as well as during a live turn.
-fn project_turn_phase(event: serde_json::Value) -> serde_json::Value {
+/// Project the closed Explain Analyze wire contract identically from live and
+/// durable event shapes. Raw diagnostic fields cannot leak across this edge.
+fn project_explain_analyze(event: serde_json::Value) -> serde_json::Value {
     let Some(source) = event.as_object() else {
         return serde_json::Value::Null;
     };
-    let payload = serde_json::Map::from_iter([
-        (
-            "schema_version".to_string(),
-            source.get("schema_version").cloned().unwrap_or_default(),
-        ),
-        (
-            "phase".to_string(),
-            source.get("phase").cloned().unwrap_or_default(),
-        ),
-        (
-            "round_index".to_string(),
-            source.get("round_index").cloned().unwrap_or_default(),
-        ),
-        (
-            "attempt_index".to_string(),
-            source
-                .get("attempt_index")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!(0)),
-        ),
-        (
-            "outcome".to_string(),
-            source.get("outcome").cloned().unwrap_or_default(),
-        ),
-        (
-            "duration_ms".to_string(),
-            source.get("duration_ms").cloned().unwrap_or_default(),
-        ),
-    ]);
-    let Ok(receipt) = serde_json::from_value::<astra_turn_types::TurnPhaseReceiptV1>(
+    let mut payload = source.clone();
+    payload.remove("type");
+    let Ok(fact) = serde_json::from_value::<astra_turn_types::ExplainAnalyzeEventV1>(
         serde_json::Value::Object(payload),
     ) else {
         return serde_json::Value::Null;
     };
-    if !receipt.is_valid() {
+    if !fact.is_valid() {
         return serde_json::Value::Null;
     }
-    serde_json::json!({
-        "type": astra_turn_types::TURN_PHASE_EVENT_TYPE,
-        "schema_version": receipt.schema_version,
-        "phase": receipt.phase,
-        "round_index": receipt.round_index,
-        "attempt_index": receipt.attempt_index,
-        "outcome": receipt.outcome,
-        "duration_ms": receipt.duration_ms,
-    })
+    let Ok(mut projected) = serde_json::to_value(fact) else {
+        return serde_json::Value::Null;
+    };
+    let Some(projected) = projected.as_object_mut() else {
+        return serde_json::Value::Null;
+    };
+    projected.insert(
+        "type".to_string(),
+        serde_json::Value::String(astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE.to_string()),
+    );
+    serde_json::Value::Object(projected.clone())
 }
 
 const EXTERNAL_TOOL_EVENT_MAX_BYTES: usize = 64 * 1024;
@@ -33033,83 +33038,117 @@ mod tests {
     }
 
     #[test]
-    fn turn_phase_has_one_bounded_public_shape_for_live_and_replay() {
-        let expected = json!({
-            "type": "turn_phase",
+    fn explain_analyze_has_one_bounded_public_shape_for_live_and_replay() {
+        let fact = json!({
             "schema_version": 1,
-            "phase": "turn_intent_admission",
+            "event_id": "turn-1/provider/0/finished",
+            "run_id": "run-1",
+            "turn_id": "turn-1",
+            "node_id": "turn-1/provider/0",
+            "parent_node_id": "turn-1",
+            "producer_id": "astra-server-loop",
+            "clock_domain_id": "worker-1/turn-1",
+            "kind": "provider_attempt",
             "round_index": 0,
             "attempt_index": 0,
-            "outcome": "decided",
-            "duration_ms": 5_021,
+            "label": "Model request",
+            "transition": "finished",
+            "elapsed_ms": 89,
+            "start_elapsed_ms": 15,
+            "duration_ms": 73,
+            "outcome": "succeeded",
+            "usage": {
+                "basis": "provider_exact",
+                "fresh_input_tokens": 310,
+                "cache_read_tokens": 120,
+                "output_tokens": 44
+            }
         });
-        let live = transform_run_event_for_client(json!({
-            "type": "turn_phase",
-            "schema_version": 1,
-            "phase": "turn_intent_admission",
-            "round_index": 0,
-            "outcome": "decided",
-            "duration_ms": 5_021,
-            "internal_model": "must not cross the client boundary",
-        }));
-        let replay = transform_run_event_for_client(make_event(
-            "turn_phase",
-            json!({
-                "schema_version": 1,
-                "phase": "turn_intent_admission",
-                "round_index": 0,
-                "outcome": "decided",
-                "duration_ms": 5_021,
-                "internal_model": "must not cross the client boundary",
-            }),
-        ));
+        let mut expected = fact.clone();
+        expected["type"] = json!("explain_analyze");
+        let live = transform_run_event_for_client({
+            let mut event = fact.clone();
+            event["type"] = json!("explain_analyze");
+            event
+        });
+        let replay = transform_run_event_for_client(make_event("explain_analyze", fact.clone()));
 
         assert_eq!(live, expected);
         assert_eq!(replay, expected);
         assert_eq!(
+            transform_run_event_for_client({
+                let mut event = fact.clone();
+                event["schema_version"] = json!(2);
+                event["type"] = json!("explain_analyze");
+                event
+            }),
+            serde_json::Value::Null,
+            "unknown schemas must not be rendered as a current execution fact"
+        );
+        assert_eq!(
+            transform_run_event_for_client({
+                let mut event = fact.clone();
+                event["private_prompt"] = json!("not part of the public contract");
+                event["type"] = json!("explain_analyze");
+                event
+            }),
+            serde_json::Value::Null,
+            "unbounded diagnostic fields must not cross the public projection"
+        );
+        assert_eq!(
+            transform_run_event_for_client({
+                let mut event = fact;
+                event["outcome"] = json!("made_up");
+                event["type"] = json!("explain_analyze");
+                event
+            }),
+            serde_json::Value::Null,
+            "unknown outcomes must not be presented as valid execution facts"
+        );
+    }
+
+    #[test]
+    fn stream_gap_is_a_bounded_client_repair_boundary() {
+        assert_eq!(
             transform_run_event_for_client(json!({
-                "type": "turn_phase",
-                "schema_version": 1,
-                "phase": "model_inference",
-                "round_index": 1,
-                "attempt_index": 1,
-                "outcome": "succeeded",
-                "duration_ms": 73,
+                "type": "stream_gap",
+                "run_id": "run-1",
+                "dropped_event_count": 3,
+                "repair": "refresh_run_snapshot",
+                "internal_detail": "must not cross the client boundary",
             })),
             json!({
-                "type": "turn_phase",
-                "schema_version": 1,
-                "phase": "model_inference",
-                "round_index": 1,
-                "attempt_index": 1,
-                "outcome": "succeeded",
-                "duration_ms": 73,
-            }),
-            "a measured provider phase remains available after the typed projection"
+                "type": "stream_gap",
+                "run_id": "run-1",
+                "dropped_event_count": 3,
+                "repair": "refresh_run_snapshot",
+            })
         );
         assert_eq!(
             transform_run_event_for_client(json!({
-                "type": "turn_phase",
-                "schema_version": 1,
-                "phase": "unrecognized_phase",
-                "round_index": 0,
-                "outcome": "decided",
-                "duration_ms": 5_021,
+                "type": "stream_gap",
+                "run_id": "run-1",
+                "dropped_event_count": 2,
+                "repair": "refresh_run_snapshot",
+                "explain_analyze_recovered": true,
+                "internal_detail": "still private",
             })),
-            serde_json::Value::Null,
-            "unknown internal phases must not become accidental public protocol"
+            json!({
+                "type": "stream_gap",
+                "run_id": "run-1",
+                "dropped_event_count": 2,
+                "repair": "refresh_run_snapshot",
+                "explain_analyze_recovered": true,
+            })
         );
         assert_eq!(
             transform_run_event_for_client(json!({
-                "type": "turn_phase",
-                "schema_version": 1,
-                "phase": "model_inference",
-                "round_index": 0,
-                "outcome": "decided",
-                "duration_ms": 1,
+                "type": "stream_gap",
+                "run_id": "run-1",
+                "dropped_event_count": 0,
+                "repair": "refresh_run_snapshot",
             })),
-            serde_json::Value::Null,
-            "typed phase/outcome contracts reject impossible telemetry rather than presenting a lie"
+            serde_json::Value::Null
         );
     }
 

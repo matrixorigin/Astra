@@ -790,6 +790,10 @@ pub struct ChatRequest {
 pub struct RunStreamQuery {
     #[serde(default)]
     pub last_index: u32,
+    /// Return only the durable backlog through its current high watermark.
+    /// Used by attached clients to repair a reported live delivery gap.
+    #[serde(default)]
+    pub replay_only: bool,
 }
 
 #[cfg(feature = "server")]

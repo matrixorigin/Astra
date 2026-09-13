@@ -13,6 +13,7 @@ pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod explain_analyze;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
@@ -56,6 +57,11 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use explain_analyze::{
+    EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_SCHEMA_VERSION, ExplainAnalyzeEventV1,
+    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
+    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+};
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
     client_direct_execution_field,

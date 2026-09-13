@@ -175,6 +175,8 @@ use crate::server::{runtime_tool_executor, server_skill_subrun};
 const MAX_USER_INTENT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
+const MAX_TERMINAL_EXPLAIN_RECOVERY_EVENTS: usize = 400;
+const MAX_TERMINAL_EXPLAIN_RECOVERY_BYTES: usize = 1024 * 1024;
 const AGENT_BINDING_TURN_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 const AGENT_BINDING_TURN_CONTEXT_MAX_TOKENS: usize = 64_000;
 const AGENT_BINDING_INSTRUCTION_MAX_BYTES: usize = 256 * 1024;
@@ -592,6 +594,51 @@ fn stream_delivery_gap_event(run_id: &str, dropped_event_count: u64) -> Value {
     })
 }
 
+async fn flush_host_event_gap_recovery(
+    sender: &mpsc::Sender<Value>,
+    gap: &server_loop_host::HostEventGapTracker,
+    run_id: &str,
+) -> bool {
+    let (dropped, explain_events, explain_recovered) = gap.pending_recovery_snapshot();
+    let dropped = dropped.max(u64::try_from(explain_events.len()).unwrap_or(u64::MAX));
+    for event in &explain_events {
+        if sender.send(event.clone()).await.is_err() {
+            return false;
+        }
+    }
+    if dropped == 0 {
+        gap.acknowledge_recovery_batch(dropped, &explain_events);
+        return true;
+    }
+    let mut gap_event = stream_delivery_gap_event(run_id, dropped);
+    gap_event["explain_analyze_recovered"] = Value::Bool(explain_recovered);
+    if sender.send(gap_event).await.is_err() {
+        // Keep both the recovery facts and their gap count until the whole
+        // batch is accepted. Retrying may replay a prefix, so consumers use
+        // the stable event_id to make that harmless.
+        return false;
+    }
+    gap.acknowledge_recovery_batch(dropped, &explain_events);
+    true
+}
+
+fn record_unforwarded_host_event(gap: &server_loop_host::HostEventGapTracker, event: Value) {
+    if event.get("type").and_then(Value::as_str) == Some("explain_analyze") {
+        gap.record_explain_analyze_drop(event);
+    } else {
+        gap.record_drop();
+    }
+}
+
+fn record_unforwarded_host_event_tail(
+    receiver: &mut mpsc::Receiver<Value>,
+    gap: &server_loop_host::HostEventGapTracker,
+) {
+    while let Ok(event) = receiver.try_recv() {
+        record_unforwarded_host_event(gap, event);
+    }
+}
+
 /// Deliver to the currently attached SSE observer.
 ///
 /// Ordinary progress is deliberately lossy: durable projection and the live
@@ -848,8 +895,10 @@ async fn process_ordered_live_fanout_event(
     }
 
     if !durable_event_committed && live_delta_event_for_persistence(&event) {
+        let flush_structural_explain_event =
+            event.get("type").and_then(Value::as_str) == Some("explain_analyze");
         pending.push(event);
-        if pending.should_flush() {
+        if pending.should_flush() || flush_structural_explain_event {
             flush_durable_live_events(
                 pending,
                 run_engine,
@@ -15630,49 +15679,52 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 tokio::select! {
                     event = host_event_rx.recv() => {
                         let Some(event) = event else { break; };
-                        let dropped = bridge_gap.take();
-                        if dropped > 0
-                            && host_event_bridge_tx
-                                .send(stream_delivery_gap_event(
-                                    &host_event_server_run_id,
-                                    dropped,
-                                ))
-                                .await
-                                .is_err()
+                        if !flush_host_event_gap_recovery(
+                            &host_event_bridge_tx,
+                            &bridge_gap,
+                            &host_event_server_run_id,
+                        )
+                        .await
                         {
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
                             return;
                         }
-                        if host_event_bridge_tx.send(event).await.is_err() {
+                        let explain_event_id = (event.get("type").and_then(Value::as_str)
+                            == Some("explain_analyze"))
+                            .then(|| event.get("event_id").and_then(Value::as_str))
+                            .flatten()
+                            .map(str::to_owned);
+                        if let Err(error) = host_event_bridge_tx.send(event).await {
+                            record_unforwarded_host_event(&bridge_gap, error.0);
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
                             return;
+                        }
+                        if let Some(event_id) = explain_event_id {
+                            bridge_gap.acknowledge_explain_analyze_delivery(&event_id);
                         }
                     }
                     _ = bridge_gap.notified() => {
-                        let dropped = bridge_gap.take();
-                        if dropped > 0
-                            && host_event_bridge_tx
-                                .send(stream_delivery_gap_event(
-                                    &host_event_server_run_id,
-                                    dropped,
-                                ))
-                                .await
-                                .is_err()
+                        if !flush_host_event_gap_recovery(
+                            &host_event_bridge_tx,
+                            &bridge_gap,
+                            &host_event_server_run_id,
+                        )
+                        .await
                         {
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
                             return;
                         }
                     }
                 }
             }
-            let dropped = bridge_gap.take();
-            if dropped > 0 {
-                let _ = host_event_bridge_tx
-                    .send(stream_delivery_gap_event(
-                        &host_event_server_run_id,
-                        dropped,
-                    ))
-                    .await;
-            }
+            let _ = flush_host_event_gap_recovery(
+                &host_event_bridge_tx,
+                &bridge_gap,
+                &host_event_server_run_id,
+            )
+            .await;
         });
-        host.set_event_tx_with_gap(host_event_tx, host_event_gap);
+        host.set_event_tx_with_gap(host_event_tx, host_event_gap.clone());
         host.set_interaction_sink(interaction_sink);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
@@ -16533,6 +16585,35 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         );
                     }
                 }
+                // If the bridge had to stop while its downstream was stalled,
+                // keep the bounded Explain facts for terminal durable replay.
+                // A final gap marker tells an attached client to request that
+                // replay and says whether the retained facts cover every drop.
+                let (
+                    mut terminal_host_gap_count,
+                    terminal_recovery_explain_events,
+                    mut explain_recovery_complete,
+                ) = host_event_gap.take_recovery_snapshot();
+                terminal_host_gap_count = terminal_host_gap_count
+                    .max(u64::try_from(terminal_recovery_explain_events.len()).unwrap_or(u64::MAX));
+                let terminal_recovery_bytes = terminal_recovery_explain_events
+                    .iter()
+                    .map(|event| event.to_string().len())
+                    .sum::<usize>();
+                if terminal_recovery_explain_events.len() > MAX_TERMINAL_EXPLAIN_RECOVERY_EVENTS
+                    || terminal_recovery_bytes > MAX_TERMINAL_EXPLAIN_RECOVERY_BYTES
+                {
+                    // The terminal durable batch has a smaller bounded budget
+                    // than the live fact ledger. Keep the graph explicitly
+                    // incomplete rather than letting batch compaction look
+                    // like a successful repair.
+                    explain_recovery_complete = false;
+                }
+                let terminal_recovery_gap_event = (terminal_host_gap_count > 0).then(|| {
+                    let mut event = stream_delivery_gap_event(&bg_run_id, terminal_host_gap_count);
+                    event["explain_analyze_recovered"] = Value::Bool(explain_recovery_complete);
+                    event
+                });
                 park_server_root_mailbox(&mut state).await;
                 host.on_loop_terminal(&state, &loop_result).await;
                 let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
@@ -16542,6 +16623,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let loop_success = loop_result.is_ok() && state.interruption.is_none();
                 let (mut final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, emitted_events, &state);
+                let mut terminal_recovery_event_ids = std::collections::HashSet::new();
+                for event in &terminal_recovery_explain_events {
+                    if let Some(event_id) = event.get("event_id").and_then(Value::as_str) {
+                        terminal_recovery_event_ids.insert(event_id.to_string());
+                    }
+                }
+                let mut terminal_recovery_events = terminal_recovery_explain_events;
+                if let Some(gap_event) = terminal_recovery_gap_event {
+                    terminal_recovery_events.push(gap_event);
+                }
+                if !terminal_recovery_events.is_empty() {
+                    let terminal_start = final_events
+                        .iter()
+                        .position(streaming_final_event_for_replay)
+                        .unwrap_or(final_events.len());
+                    final_events.splice(terminal_start..terminal_start, terminal_recovery_events);
+                }
                 Self::stamp_run_finished_owner_generation(
                     &mut final_events,
                     execution_owner_generation,
@@ -16615,11 +16713,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // bridge may be aborted while blocked on its second hop.
                 durable_tool_terminals.mark_committed_retained_copies(&mut final_events);
                 // In streaming mode, host-emitted `type` events have already gone
-                // through event_tx and the fanout persistence path. Replay only the
-                // synthesized terminal events appended by finalize_run_events.
+                // through the fanout persistence path. Include terminal recovery
+                // facts with the synthesized terminal events so a stalled bridge
+                // can still converge both the attached client and durable history.
                 let streaming_final_events: Vec<Value> = final_events
                     .iter()
-                    .filter(|event| streaming_convergence_event_for_replay(event))
+                    .filter(|event| {
+                        streaming_convergence_event_for_replay(event)
+                            || terminal_recovery_event_ids.contains(
+                                event
+                                    .get("event_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            )
+                            || (event.get("type").and_then(Value::as_str) == Some("stream_gap")
+                                && event.get("run_id").and_then(Value::as_str)
+                                    == Some(bg_run_id.as_str()))
+                    })
                     .cloned()
                     .collect();
                 let mut streamed_final_events =
@@ -16646,7 +16756,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .into_iter()
                 .filter(|event| {
                     !incrementally_persisted_edge_interaction_event(event)
-                        && (!live_delta_event_for_persistence(event)
+                        && (terminal_recovery_event_ids.contains(
+                            event
+                                .get("event_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ) || !live_delta_event_for_persistence(event)
                             || tool_terminal_requires_settlement_repair(event))
                 })
                 .collect();

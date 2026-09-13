@@ -4212,6 +4212,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // calls for guidance-threshold purposes, not just successful ones).
     let llm_wall_start = Instant::now();
     let t_llm_start = std::time::Instant::now();
+    if !host.owns_model_inference_timing() {
+        host.on_turn_phase_started(
+            state,
+            TurnPhaseKind::ModelInference,
+            turn_index as u32,
+            0,
+            llm_wall_start,
+        );
+    }
     tracing::debug!(
         target: "astra_timing",
         llm_round = llm_attempt_index,
