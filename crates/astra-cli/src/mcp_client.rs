@@ -81,91 +81,21 @@ pub async fn disconnect_and_remove_skills(
 
 #[cfg(test)]
 pub(crate) fn ensure_mock_mcp_server_binary() -> std::path::PathBuf {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    use fs2::FileExt;
-
-    static BINARY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-    BINARY
-        .get_or_init(|| {
-            let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let profile = if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            };
-            let binary_name = format!("mock_mcp_server{}", std::env::consts::EXE_SUFFIX);
-            let binary = manifest_dir
-                .join("../..")
-                .join("target")
-                .join(profile)
-                .join(&binary_name);
-            let lock_path = binary.with_file_name(format!("{binary_name}.build.lock"));
-
-            if !binary.exists() {
-                std::fs::create_dir_all(
-                    binary
-                        .parent()
-                        .expect("mock_mcp_server binary always has a parent directory"),
-                )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "failed to create mock_mcp_server directory {:?}: {error}",
-                        binary.parent()
-                    )
-                });
-
-                let mut lock_file = OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&lock_path)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "failed to open mock_mcp_server build lock {:?}: {error}",
-                            lock_path
-                        )
-                    });
-                lock_file.lock_exclusive().unwrap_or_else(|error| {
-                    panic!(
-                        "failed to acquire mock_mcp_server build lock {:?}: {error}",
-                        lock_path
-                    )
-                });
-
-                if !binary.exists() {
-                    let _ = lock_file.set_len(0);
-                    let _ = writeln!(
-                        lock_file,
-                        "building mock_mcp_server for pid {}",
-                        std::process::id()
-                    );
-
-                    let status = std::process::Command::new("cargo")
-                        .args(["build", "-p", "astra-cli", "--bin", "mock_mcp_server"])
-                        .current_dir(manifest_dir.join("../.."))
-                        .status()
-                        .unwrap_or_else(|error| {
-                            panic!("failed to build mock_mcp_server bin: {error}")
-                        });
-
-                    assert!(
-                        status.success(),
-                        "cargo build -p astra-cli --bin mock_mcp_server failed with status {status}"
-                    );
-                }
-            }
-
-            assert!(
-                binary.exists(),
-                "mock_mcp_server binary missing at {:?} after prebuild or fallback build",
-                binary
-            );
-
-            binary
-        })
-        .clone()
+    // Cargo places this unit-test executable in <target>/<profile>/deps.
+    // Deriving the fixture beside it honors custom target directories and
+    // target triples instead of assuming the checkout's target/debug.
+    let executable = std::env::current_exe().expect("locate MCP test executable");
+    let profile_dir = executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("MCP test executable must live in the Cargo deps directory");
+    let binary = profile_dir.join(format!("mock_mcp_server{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "mock MCP fixture missing at {}. Build it before running tests: cargo build -p astra-cli --bin mock_mcp_server (with the same target directory and profile). make test-offline prepares it automatically.",
+        binary.display()
+    );
+    // Never start Cargo from a timed test: compilation is setup, and nested
+    // builds can contend with other tests for the artifact lock.
+    binary
 }

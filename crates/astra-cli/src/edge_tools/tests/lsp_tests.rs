@@ -1831,6 +1831,12 @@ fn lsp_code_lenses_fall_back_to_rust_analyzer_runnables_when_empty() {
 #[serial_test::serial]
 fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() {
     let dir = tempfile::tempdir().unwrap();
+    // Cargo run executes target/debug/demo after building. These fixtures
+    // must not share that binary with another concurrently running project.
+    let _target_guard = EnvGuard::set(
+        "CARGO_TARGET_DIR",
+        dir.path().join("target").to_str().unwrap(),
+    );
     std::fs::write(
         dir.path().join("Cargo.toml"),
         "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
@@ -1878,7 +1884,8 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
     assert!(
         parsed["stdout"]
             .as_str()
-            .is_some_and(|stdout| stdout.contains("fake-runnable-output"))
+            .is_some_and(|stdout| stdout.contains("fake-runnable-output")),
+        "runnable did not produce its expected output: {parsed}"
     );
 }
 
@@ -2190,6 +2197,12 @@ impl Config {
 #[serial_test::serial]
 fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
     let dir = tempfile::tempdir().unwrap();
+    // Cargo run executes target/debug/demo after building. These fixtures
+    // must not share that binary with another concurrently running project.
+    let _target_guard = EnvGuard::set(
+        "CARGO_TARGET_DIR",
+        dir.path().join("target").to_str().unwrap(),
+    );
     std::fs::write(
         dir.path().join("Cargo.toml"),
         "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
@@ -2654,6 +2667,12 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
+    // Cargo run executes target/debug/demo after building. These fixtures
+    // must not share that binary with another concurrently running project.
+    let _target_guard = EnvGuard::set(
+        "CARGO_TARGET_DIR",
+        dir.path().join("target").to_str().unwrap(),
+    );
     let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
     std::fs::write(
         dir.path().join("Cargo.toml"),

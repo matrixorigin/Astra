@@ -31,6 +31,12 @@ cargo test --manifest-path Cargo.toml -q
 cargo check --manifest-path Cargo.toml
 ```
 
+MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
+`make test-offline` builds this fixture before the workspace tests. For direct
+`cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run
+`cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
+target triple, and profile. Test processes do not run nested Cargo builds.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).

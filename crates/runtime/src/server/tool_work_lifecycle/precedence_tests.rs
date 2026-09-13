@@ -581,11 +581,12 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
     let pool = setup_pool().await;
-    for crash_after_mutation_commit in [false, true] {
-        let case = if crash_after_mutation_commit {
-            "mutation-committed-before-terminal-cut"
-        } else {
-            "settlement-committed-before-mutation"
+    for recovery_window in 0..4 {
+        let case = match recovery_window {
+            0 => "settlement-committed-before-mutation",
+            1 => "mutation-committed-before-terminal-cut",
+            2 => "settlement-committed-before-receipt-read-failure",
+            _ => "fresh-executor-before-terminal-cut",
         };
         let owner = WorkOwnerId::parse(format!("owner-{}", Uuid::new_v4())).expect("owner");
         let session =
@@ -653,7 +654,7 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
             "{case}"
         );
 
-        if crash_after_mutation_commit {
+        if recovery_window != 0 {
             assert!(
                 reconcile_admitted_graph_mutations(
                     &executor,
@@ -668,6 +669,8 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 0,
                 "mutation commit must not impersonate terminal settlement"
             );
+        }
+        if recovery_window == 3 {
             let repair_temp = TempDir::new().expect("terminal-cut repair workspace");
             let repair =
                 attach_fresh_executor(repair_temp.path(), pool.clone(), &owner, &session).await;
@@ -685,9 +688,64 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
             )
             .await;
             assert!(!repaired.is_error, "repair terminal cut: {repaired:?}");
-            let repaired: Value =
-                serde_json::from_str(&repaired.output).expect("terminal repair receipt");
+            let repaired: Value = serde_json::from_str(&repaired.output).expect("repair receipt");
             assert_eq!(repaired["status"], "complete");
+            let board = &repaired["task_board_update"];
+            assert!(board["graph_revision"].as_i64().is_some(), "{board}");
+            assert!(
+                board["tasks"]
+                    .as_array()
+                    .expect("repair board")
+                    .iter()
+                    .any(|task| {
+                        task["item_id"] == "task-2" && task["declaration_state"] == "cancelled"
+                    }),
+                "{board}"
+            );
+        } else if recovery_window == 2 {
+            // Enter the exact recovery path used when the post-commit board
+            // read fails. Durable settlement/allocation must not be repeated
+            // merely to recover its user-visible receipt.
+            DatabaseWorkAttemptSettlementService::new(pool.clone())
+                .record_and_advance_primary(
+                    owner.as_str(),
+                    &active.attempt_id,
+                    &run_id,
+                    7,
+                    settlement.clone(),
+                    WorkItemAttemptId::parse(format!("receipt-recovery-{}", Uuid::new_v4()))
+                        .expect("successor identity"),
+                )
+                .await
+                .expect("commit settlement before receipt read failure");
+            let pending = super::committed_settlement_resume_error(
+                &executor,
+                &active,
+                "injected post-commit board read failure".to_string(),
+            );
+            assert!(pending.is_error);
+            assert!(executor.active_primary_work_attempt().is_none());
+            let resumed = execute_run_next_work_item(
+                &executor,
+                &json!({}),
+                invocation(&run_id, "resume-after-receipt-read-failure"),
+            )
+            .await;
+            assert!(!resumed.is_error, "{resumed:?}");
+            let resumed: Value = serde_json::from_str(&resumed.output).expect("resume receipt");
+            assert_eq!(resumed["status"], "complete");
+            let board = &resumed["task_board_update"];
+            assert!(board["graph_revision"].as_i64().is_some(), "{board}");
+            assert!(
+                board["tasks"]
+                    .as_array()
+                    .expect("resume board")
+                    .iter()
+                    .any(|task| {
+                        task["item_id"] == "task-2" && task["declaration_state"] == "cancelled"
+                    }),
+                "{board}"
+            );
         } else {
             let settled = execute_settle_work_item(
                 &executor,
@@ -709,6 +767,18 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
             let settled: Value = serde_json::from_str(&settled.output).expect("settlement receipt");
             assert_eq!(settled["execution_status"], "complete");
             assert_eq!(settled["next_action"], "synthesize_final_response");
+            let board = &settled["task_board_update"];
+            assert!(board["graph_revision"].as_i64().is_some());
+            assert!(
+                board["tasks"]
+                    .as_array()
+                    .expect("canonical board tasks")
+                    .iter()
+                    .any(|task| {
+                        task["item_id"] == "task-2" && task["declaration_state"] == "cancelled"
+                    }),
+                "settlement must publish the cancelled declaration: {board}"
+            );
         }
 
         let completed = repository
@@ -743,6 +813,18 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
         assert!(!next.is_error, "recover terminal graph ({case}): {next:?}");
         let next: Value = serde_json::from_str(&next.output).expect("terminal recovery receipt");
         assert_eq!(next["status"], "complete");
+        let board = &next["task_board_update"];
+        assert!(board["graph_revision"].as_i64().is_some(), "{board}");
+        assert!(
+            board["tasks"]
+                .as_array()
+                .expect("recovered board")
+                .iter()
+                .any(|task| {
+                    task["item_id"] == "task-2" && task["declaration_state"] == "cancelled"
+                }),
+            "fresh recovery must publish cancelled declarations ({case}): {board}"
+        );
         assert_eq!(
             terminal_cut_count(&pool, &owner, &request.work_id, &request.branch_id).await,
             1,

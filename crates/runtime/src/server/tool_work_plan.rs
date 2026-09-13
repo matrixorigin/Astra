@@ -138,7 +138,7 @@ fn map_repository_error(error: WorkRepositoryError) -> astra_tools::ToolResult {
             let message = match source {
                 WorkDomainError::InvalidPlanProposal {
                     violation: WorkPlanProposalViolation::ConflictingItemChange,
-                } => "Invalid Work plan proposal: an addition must use a fresh item_id. If the same semantic work continues, submit only an active successor revision. If work is replaced, retire the old item with a cancelled or superseded revision and add the replacement under a fresh item_id."
+                } => "Invalid Work plan proposal: the same item_id occurs in both additions and revisions. A new item belongs only in additions; remove its entry from revisions. Renaming it in both lists does not resolve this conflict. Revisions apply only to existing items. If work is replaced, retire the old item with a cancelled or superseded revision and add the replacement under a fresh item_id."
                     .to_string(),
                 WorkDomainError::InvalidPlanProposal { violation } => {
                     format!("Invalid Work plan proposal: {violation}")
@@ -978,7 +978,9 @@ mod tests {
         assert!(
             payload["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("fresh item_id")
+                .is_some_and(|message| message.contains("both additions and revisions")
+                    && message.contains("remove its entry from revisions")
+                    && message.contains("fresh item_id")
                     && message.contains("cancelled or superseded revision")),
             "{}",
             result.output

@@ -164,7 +164,13 @@ The immutable establishment decision retains these triggers beyond establishment
 completion. Scheduling, including settlement's automatic successor allocation,
 must apply due mutations before selecting another task or declaring completion.
 Accepted proposals mark applied mutations, so recovery replays the same operation
-and item identities without repeating semantic admission.
+and item identities without repeating semantic admission. Settlement and resume
+receipts publish the durable graph revision and canonical task states, including
+retired declarations, even when a mutation committed before replay. A failed
+post-commit receipt read resumes through `run_next_work_item`; its receipt must
+restore the board even when the graph is already complete. These receipts read
+one canonical snapshot after settlement or task allocation so the live board
+observes cancellation and replacement together with successor assignment.
 Initial-candidate references are not aliases for arbitrary later replacements;
 conflicting retirement/prerequisite lifetimes are rejected before establishment.
 

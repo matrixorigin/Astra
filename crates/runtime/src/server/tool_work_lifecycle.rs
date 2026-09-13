@@ -412,6 +412,23 @@ fn task_board_update_from_snapshot(
     })
 }
 
+async fn load_canonical_task_board(
+    executor: &RuntimeToolExecutor,
+) -> Result<WorkTaskBoardUpdateV1, ToolResult> {
+    let binding = executor
+        .work_binding
+        .get()
+        .ok_or_else(|| ToolResult::error("canonical Work binding unavailable".to_string()))?;
+    let snapshot = binding
+        .repository
+        .load_task_execution_snapshot_for_session(&binding.owner_id, &binding.session_id)
+        .await
+        .map_err(|error| {
+            ToolResult::error(format!("could not load canonical Work board: {error}"))
+        })?;
+    task_board_update_from_snapshot(binding, &snapshot, None, None)
+}
+
 struct AppliedGraphMutations {
     graph_revision: i64,
 }
@@ -1733,6 +1750,10 @@ pub(super) async fn execute_run_next_work_item(
         );
     };
     if let Some(active) = executor.active_primary_work_attempt() {
+        let task_board_update = match load_canonical_task_board(executor).await {
+            Ok(update) => update,
+            Err(error) => return error,
+        };
         return ToolResult::text(
             json!({
                 "status": "assigned",
@@ -1743,6 +1764,7 @@ pub(super) async fn execute_run_next_work_item(
                 "expected_result": active.expected_result,
                 "completion_rule": "settle_immediately_when_expected_result_is_satisfied_without_broadening_scope",
                 "execution": "primary_session_resumed",
+                "task_board_update": task_board_update,
                 "next_action": "resume_this_task_then_call_settle_work_item"
             })
             .to_string(),
@@ -1774,6 +1796,10 @@ pub(super) async fn execute_run_next_work_item(
     match restore_primary_attempt_from_selection(executor, run_id, &selected).await {
         Ok(Some(restored)) => {
             let active = restored.active;
+            let task_board_update = match load_canonical_task_board(executor).await {
+                Ok(update) => update,
+                Err(error) => return error,
+            };
             return ToolResult::text(
                 json!({
                     "status": "assigned",
@@ -1784,7 +1810,7 @@ pub(super) async fn execute_run_next_work_item(
                     "expected_result": active.expected_result,
                     "completion_rule": "settle_immediately_when_expected_result_is_satisfied_without_broadening_scope",
                     "execution": "primary_session_resumed",
-                    "task_board_update": restored.task_board_update,
+                    "task_board_update": task_board_update,
                     "next_action": "resume_this_task_then_call_settle_work_item"
                 })
                 .to_string(),
@@ -1806,9 +1832,14 @@ pub(super) async fn execute_run_next_work_item(
             WorkTaskExecutionNext::Complete => ("complete", None),
             WorkTaskExecutionNext::Ready(_) => unreachable!("handled above"),
         };
+        let task_board_update = match load_canonical_task_board(executor).await {
+            Ok(update) => update,
+            Err(error) => return error,
+        };
         return ToolResult::text(
             json!({
                 "status": status,
+                "task_board_update": task_board_update,
                 "item_id": item_id.map(|id| id.as_str().to_string()),
                 "next_action": "inspect_or_update_canonical_work_before_another_execution_attempt"
             })
@@ -1864,19 +1895,10 @@ pub(super) async fn execute_run_next_work_item(
             "Work task was admitted but could not be activated: {error}"
         ));
     }
-    let task_board_update = board_update(
-        binding.work_id.as_str().to_string(),
-        binding.branch_id.as_str().to_string(),
-        Some(graph_revision.get()),
-        vec![board_task_for_active_attempt(
-            &active_attempt,
-            WorkTaskBoardExecutionStatusV1::Running,
-            WorkTaskBoardDeliveryStatusV1::Unreported,
-            None,
-            None,
-            Vec::new(),
-        )],
-    );
+    let task_board_update = match load_canonical_task_board(executor).await {
+        Ok(update) => update,
+        Err(error) => return error,
+    };
     ToolResult::text(
         json!({
             "status": "assigned",
@@ -2056,23 +2078,14 @@ pub(super) async fn execute_settle_work_item(
             };
             let settled_task = board_settled_task(&active, &recorded);
             let settlement_transition = canonical_settlement_transition(&settled_task);
-            let mut changed_tasks = vec![settled_task];
-            if let Some(successor) = successor.as_ref() {
-                changed_tasks.push(board_task_for_active_attempt(
-                    successor,
-                    WorkTaskBoardExecutionStatusV1::Running,
-                    WorkTaskBoardDeliveryStatusV1::Unreported,
-                    None,
-                    None,
-                    Vec::new(),
-                ));
-            }
-            let task_board_update = board_update(
-                recorded.work_id.clone(),
-                recorded.branch_id.clone(),
-                None,
-                changed_tasks,
-            );
+            // A replay may observe the graph mutation already committed. Publish
+            // durable state on every settlement, not an invocation-local delta.
+            let task_board_update = match load_canonical_task_board(executor).await {
+                Ok(update) => update,
+                Err(error) => {
+                    return committed_settlement_resume_error(executor, &active, error.output);
+                }
+            };
             if let Err(error) =
                 executor.advance_active_primary_work_attempt(&active.attempt_id, successor)
             {

@@ -2406,41 +2406,63 @@ fn evaluate_one(
                     }
                     continue;
                 }
-                if call.name == "settle_work_item" && call.ok != Some(false) {
-                    if let Some(result) = call.result.as_ref()
-                        && result.get("status").and_then(serde_json::Value::as_str)
-                            == Some("recorded")
-                        && result
-                            .pointer("/settlement_transition/delivery_status")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("delivered")
-                        && let Some(item_id) = result
-                            .pointer("/next_task/item_id")
-                            .and_then(serde_json::Value::as_str)
-                    {
-                        deferred_successor_ids.insert(item_id.to_owned());
-                    }
-                    continue;
+                if call.name == "settle_work_item"
+                    && call.ok != Some(false)
+                    && let Some(result) = call.result.as_ref()
+                    && result.get("status").and_then(serde_json::Value::as_str) == Some("recorded")
+                    && result
+                        .pointer("/settlement_transition/delivery_status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("delivered")
+                    && let Some(item_id) = result
+                        .pointer("/next_task/item_id")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    deferred_successor_ids.insert(item_id.to_owned());
                 }
-                if call.name == "inspect_work_plan" && work_established && call.ok != Some(false) {
+                // A settlement may itself publish a committed deferred
+                // patch. Require the same Work and a newer graph revision,
+                // just as for a later canonical inspection.
+                if (call.name == "inspect_work_plan" || call.name == "settle_work_item")
+                    && work_established
+                    && call.ok != Some(false)
+                {
                     let Some(result) = call.result.as_ref() else {
                         continue;
                     };
+                    if call.name == "settle_work_item"
+                        && result.get("status").and_then(serde_json::Value::as_str)
+                            != Some("recorded")
+                    {
+                        continue;
+                    }
                     let observed_work_id = result
-                        .pointer("/basis/work_id")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/work_id"
+                        } else {
+                            "/basis/work_id"
+                        })
                         .and_then(serde_json::Value::as_str);
                     let same_work = work_id
                         .as_deref()
                         .zip(observed_work_id)
                         .is_some_and(|(expected, observed)| expected == observed);
                     let graph_revision = result
-                        .pointer("/basis/graph_revision")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/graph_revision"
+                        } else {
+                            "/basis/graph_revision"
+                        })
                         .and_then(serde_json::Value::as_u64);
                     let is_post_establishment_snapshot = initial_graph_revision
                         .zip(graph_revision)
                         .is_some_and(|(initial, observed)| observed > initial);
                     let Some(tasks) = result
-                        .pointer("/items/entries")
+                        .pointer(if call.name == "settle_work_item" {
+                            "/task_board_update/tasks"
+                        } else {
+                            "/items/entries"
+                        })
                         .and_then(serde_json::Value::as_array)
                     else {
                         continue;
@@ -8307,6 +8329,39 @@ mod tests {
             Some(&capture),
         );
         assert!(result[0].passed, "{}", result[0].detail);
+
+        let mut receipt_capture = capture.clone();
+        let calls = receipt_capture.events[0].raw["tool_calls"]
+            .as_array_mut()
+            .unwrap();
+        let inspected = calls.pop().unwrap();
+        calls[1]["result"]["task_board_update"] = serde_json::json!({
+            "kind": "upsert", "work_id": "work-1", "graph_revision": 3,
+            "tasks": inspected["result"]["items"]["entries"]
+        });
+        let checked = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&receipt_capture),
+        );
+        assert!(checked[0].passed, "{}", checked[0].detail);
+        for (field, invalid) in [
+            ("work_id", serde_json::json!("other-work")),
+            ("graph_revision", serde_json::json!(2)),
+        ] {
+            let mut invalid_capture = receipt_capture.clone();
+            invalid_capture.events[0].raw["tool_calls"][1]["result"]["task_board_update"][field] =
+                invalid;
+            let checked = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&invalid_capture),
+            );
+            assert!(
+                !checked[0].passed,
+                "invalid settlement {field} must not prove mutation"
+            );
+        }
 
         let unrelated_work = mk_session(&[(
             "turn",
