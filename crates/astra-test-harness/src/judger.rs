@@ -198,13 +198,15 @@ impl Judger for AstraCliJudger {
     }
 }
 
+pub(crate) const JUDGER_STDERR_CAP: usize = 8_000;
+
 /// Assemble the judger prompt. Structured as: (1) rubric + anti-gaming
 /// language, (2) what the agent produced (tool calls + final text),
 /// (3) the yes/no question, (4) strict output format. The rubric is
 /// explicit about claim-vs-evidence because the common judger failure
 /// mode is scoring an agent high for *claiming* a task was done when
 /// no supporting evidence exists in the tool calls or text.
-fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
+pub(crate) fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
     // Data sections are fenced + length-bounded + declared as data
     // (not instructions). This mitigates prompt-injection from the
     // agent's own output — e.g. a captured stdout text containing a
@@ -212,10 +214,9 @@ fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
     // Anything inside a `data:` fence must be treated as untrusted
     // input; the judger's answer comes after the question, not from
     // the data.
-    const STDERR_CAP: usize = 8_000;
     const TEXT_CAP: usize = 8_000;
     let text = truncate_for_judger(&outcome.text, TEXT_CAP);
-    let stderr = truncate_for_judger(&outcome.stderr, STDERR_CAP);
+    let stderr = truncate_for_judger(&outcome.stderr, JUDGER_STDERR_CAP);
     format!(
         "You are a strict, skeptical test judge scoring an agent's run.\n\
          \n\
@@ -275,7 +276,7 @@ fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
 /// recent lines usually hold the `[fork-cache]` / `[selector]`
 /// events. A middle-truncation with an explicit marker beats a
 /// pure head-truncation for our use.
-fn truncate_for_judger(s: &str, max: usize) -> String {
+pub(crate) fn truncate_for_judger(s: &str, max: usize) -> String {
     let len = s.chars().count();
     if len <= max {
         return s.to_string();

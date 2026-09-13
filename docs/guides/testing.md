@@ -37,6 +37,17 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 `cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
 target triple, and profile. Test processes do not run nested Cargo builds.
 
+Live `astra-test` quality judging uses a bounded projection of the durable tool
+journal. It reserves room for call identities and statuses before sharing the
+remaining budget across arguments and results, so a large early response does
+not hide later verification. Truncated fields report their original and omitted
+character counts; if even the call identities exceed the budget, the envelope
+reports omitted calls. The projection fits the final judge prompt's existing
+budget. Raw reports and deterministic checks retain the original evidence.
+An inconclusive quality judgment caused by omitted evidence is not proof that
+the agent's claimed result is false, and a passing exit code is not a substitute
+for inspecting quality failures.
+
 ## Where Tests Live
 
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).

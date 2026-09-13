@@ -144,6 +144,12 @@ partial/unknown report, not another unrestricted execution loop.
 
 ## Tasks
 
+Reply-only plan drafting is an informational outcome, not a request to change
+the workspace or establish durable Work. Quoted goals remain data. Explicit
+execution, saving, tracking, or graph edits retain their effects even when the
+requested response is a plan or JSON. A request to establish tracked Work without
+execution may defer activation; merely returning a plan does not establish Work.
+
 Work admission counts user acceptance units, not execution phases. Observation,
 verification, reporting, and settlement for one result belong to that task;
 a separately requested report deliverable may itself be a task. Initial tasks

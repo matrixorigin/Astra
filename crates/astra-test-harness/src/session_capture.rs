@@ -603,25 +603,126 @@ impl SessionCapture {
     /// cross-family judge verify arguments and results instead of trusting the
     /// final assistant's self-report.
     pub fn render_tool_evidence(&self, max_chars: usize) -> String {
-        let mut rendered = String::new();
-        for call in self.journal_tool_calls() {
-            let record = serde_json::json!({
-                "call_id": call.call_id,
-                "name": call.name,
-                "ok": call.ok,
-                "arguments": call.arguments,
-                "result": call.result,
-                "result_artifact": call.result_artifact,
-            });
-            let line = serde_json::to_string(&record).unwrap_or_default();
-            if rendered.chars().count() + line.chars().count() + 1 > max_chars {
-                rendered.push_str("[remaining durable tool evidence elided by harness bound]\n");
-                break;
+        // Reserve identities before allocating content. One large response must
+        // not hide later verification calls from the judge.
+        let calls = self.journal_tool_calls();
+        let identities: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "turn": call.turn,
+                    "ok": call.ok,
+                })
+            })
+            .collect();
+        let envelope = |records: Vec<serde_json::Value>, content_omitted: bool| {
+            serde_json::json!({
+                "total_calls": calls.len(),
+                "rendered_calls": records.len(),
+                "omitted_calls": calls.len() - records.len(),
+                "content_omitted": content_omitted,
+                "calls": records,
+            })
+            .to_string()
+        };
+        let fits = |text: &str| text.chars().count() <= max_chars;
+        let mut visible = identities.clone();
+        while !fits(&envelope(visible.clone(), true)) {
+            if visible.pop().is_none() {
+                // Even the omission envelope cannot fit. Do not emit a partial
+                // JSON object that could be mistaken for complete evidence.
+                return if max_chars == 0 {
+                    String::new()
+                } else {
+                    "…".into()
+                };
             }
-            rendered.push_str(&line);
-            rendered.push('\n');
         }
-        rendered
+        if visible.len() < calls.len() {
+            return envelope(visible, true);
+        }
+        let fields: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                [
+                    call.arguments.clone().unwrap_or(serde_json::Value::Null),
+                    call.result.clone().unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&call.result_artifact).unwrap_or(serde_json::Value::Null),
+                ]
+            })
+            .collect();
+        let largest = fields
+            .iter()
+            .flatten()
+            .map(|value| value.to_string().chars().count())
+            .max()
+            .unwrap_or(0);
+        let render = |limit: usize| {
+            let mut content_omitted = false;
+            let records = identities
+                .iter()
+                .zip(&fields)
+                .map(|(identity, fields)| {
+                    let mut record = identity.clone();
+                    for (name, value) in ["arguments", "result", "result_artifact"]
+                        .into_iter()
+                        .zip(fields)
+                    {
+                        let serialized = value.to_string();
+                        let length = serialized.chars().count();
+                        record[name] = if length <= limit {
+                            value.clone()
+                        } else {
+                            let head = limit.div_ceil(2);
+                            let tail = limit / 2;
+                            let preview = serde_json::json!({
+                                "truncated": true,
+                                "original_chars": length,
+                                "omitted_chars": length - limit,
+                                "head": serialized.chars().take(head).collect::<String>(),
+                                "tail": serialized.chars().skip(length - tail).collect::<String>(),
+                            });
+                            // Short complete values can cost less than truncation
+                            // metadata. Taking the smaller representation also
+                            // keeps serialized size monotonic across this switch.
+                            if preview.to_string().chars().count() < length {
+                                content_omitted = true;
+                                preview
+                            } else {
+                                value.clone()
+                            }
+                        };
+                    }
+                    record
+                })
+                .collect();
+            envelope(records, content_omitted)
+        };
+        let complete = render(largest);
+        if fits(&complete) {
+            return complete;
+        }
+        let mut best = render(0);
+        if !fits(&best) {
+            return envelope(visible, true);
+        }
+        // A common field allowance preserves short values and prevents large
+        // arguments from consuming the allowance of a small result (or vice
+        // versa). Measure the serialized envelope, including JSON escaping.
+        let (mut low, mut high) = (0, largest);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let candidate = render(mid);
+            if fits(&candidate) {
+                low = mid;
+                best = candidate;
+            } else {
+                high = mid - 1;
+            }
+        }
+        best
     }
 
     /// Exact memory records created by this session according to the store
@@ -2994,6 +3095,113 @@ mod tests {
         let evidence = capture.render_tool_evidence(4096);
         assert!(evidence.contains("all_slots_delivered"), "{evidence}");
         assert!(!evidence.contains("truncated preview"), "{evidence}");
+    }
+
+    fn evidence_capture(records: serde_json::Value) -> SessionCapture {
+        SessionCapture {
+            events: vec![JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({"turn": 1, "tool_calls": records}),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn evidence_projection_large_early_output_preserves_later_verification() {
+        let capture = evidence_capture(serde_json::json!([
+            {"tool_call_id":"html", "name":"bash", "ok":true,
+             "args_full":{"command":"fetch index"}, "result_full":"<html>".repeat(8000)},
+            {"tool_call_id":"verify-a", "name":"bash", "ok":true,
+             "args_full":{"command":"verify first"}, "result_full":"first article verified"},
+            {"tool_call_id":"verify-b", "name":"bash", "ok":false,
+             "args_full":{"command":"verify second"}, "result_full":"second verification failed"}
+        ]));
+        let before = capture.journal_tool_calls();
+        let rendered = capture.render_tool_evidence(2400);
+        assert!(rendered.chars().count() <= 2400);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["total_calls"], 3);
+        assert_eq!(value["omitted_calls"], 0);
+        assert_eq!(value["content_omitted"], true);
+        assert_eq!(value["calls"][0]["result"]["truncated"], true);
+        assert_eq!(value["calls"][1]["result"], "first article verified");
+        assert_eq!(value["calls"][2]["result"], "second verification failed");
+        assert_eq!(value["calls"][2]["ok"], false);
+        let after = capture.journal_tool_calls();
+        assert_eq!(before.len(), after.len());
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(before.call_id, after.call_id);
+            assert_eq!(before.arguments, after.arguments);
+            assert_eq!(before.result, after.result);
+            assert_eq!(before.ok, after.ok);
+        }
+    }
+
+    #[test]
+    fn evidence_projection_budgets_arguments_and_results_independently() {
+        let capture = evidence_capture(serde_json::json!([
+            {"tool_call_id":"large-args", "name":"bash", "ok":true,
+             "args_full":{"command":"x".repeat(8000)}, "result_full":{"verified":true}},
+            {"tool_call_id":"large-result", "name":"bash", "ok":true,
+             "args_full":{"command":"verify"}, "result_full":"y".repeat(8000)}
+        ]));
+        let value: serde_json::Value =
+            serde_json::from_str(&capture.render_tool_evidence(1400)).unwrap();
+        assert_eq!(value["omitted_calls"], 0);
+        assert_eq!(
+            value["calls"][0]["result"],
+            serde_json::json!({"verified":true})
+        );
+        assert_eq!(
+            value["calls"][1]["arguments"],
+            serde_json::json!({"command":"verify"})
+        );
+        assert!(value["calls"][0]["result_artifact"].is_null());
+        assert_eq!(value["calls"][0]["arguments"]["truncated"], true);
+        assert_eq!(value["calls"][1]["result"]["truncated"], true);
+    }
+
+    #[test]
+    fn evidence_projection_respects_serialized_unicode_and_identity_budgets() {
+        let capture = evidence_capture(serde_json::json!([
+            {"tool_call_id":"escaped", "name":"bash", "ok":true,
+             "args_full":{"command":"测试\n\"\\".repeat(500)},
+             "result_full":"结果\n\"\\".repeat(500)}
+        ]));
+        for budget in [0, 1, 40, 100, 200, 450, 900, 1400, 2400, 4000, 16000] {
+            let rendered = capture.render_tool_evidence(budget);
+            assert!(rendered.chars().count() <= budget, "budget={budget}");
+            if rendered != "…" && !rendered.is_empty() {
+                let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+                assert_eq!(value["total_calls"], 1);
+                assert_eq!(
+                    value["rendered_calls"].as_u64().unwrap()
+                        + value["omitted_calls"].as_u64().unwrap(),
+                    1
+                );
+            }
+        }
+        let complete: serde_json::Value =
+            serde_json::from_str(&capture.render_tool_evidence(100_000)).unwrap();
+        assert_eq!(complete["content_omitted"], false);
+        assert_eq!(
+            complete["calls"][0]["arguments"],
+            capture.journal_tool_calls()[0].arguments.clone().unwrap()
+        );
+        assert_eq!(
+            complete["calls"][0]["result"],
+            capture.journal_tool_calls()[0].result.clone().unwrap()
+        );
+
+        let huge_identity = evidence_capture(serde_json::json!([
+            {"tool_call_id":"id".repeat(2000), "name":"bash", "ok":true}
+        ]));
+        let omitted: serde_json::Value =
+            serde_json::from_str(&huge_identity.render_tool_evidence(300)).unwrap();
+        assert_eq!(omitted["rendered_calls"], 0);
+        assert_eq!(omitted["omitted_calls"], 1);
+        assert_eq!(omitted["content_omitted"], true);
     }
 
     #[test]

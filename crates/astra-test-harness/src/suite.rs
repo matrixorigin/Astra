@@ -22,6 +22,20 @@ use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
 use crate::session_identity::is_valid_server_session_id;
 
+fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCapture) {
+    if session.journal_tool_calls().is_empty() {
+        return;
+    }
+    const LABEL: &str = "\n[durable-tool-evidence json]\n";
+    // Allocate within the final prompt's budget, so its second bounding step
+    // cannot cut this JSON envelope or discard middle verification calls.
+    let stderr = crate::judger::truncate_for_judger(&outcome.stderr, 2_000);
+    let available = crate::judger::JUDGER_STDERR_CAP
+        .saturating_sub(stderr.chars().count() + LABEL.chars().count());
+    let evidence = session.render_tool_evidence(available);
+    outcome.stderr = format!("{stderr}{LABEL}{evidence}");
+}
+
 /// Render the assistant responses in the order in which they were produced.
 ///
 /// `RunOutcome.text` is intentionally an aggregate used by deterministic
@@ -958,16 +972,7 @@ impl<'a> SuiteRunner<'a> {
         // paragraph and a judge may score the wrong turn.
         judger_outcome.text = render_ordered_judger_transcript(&outcome, &attempts, &step_results);
         if let Some(session) = &session {
-            // Preserve complete moderate-sized receipts here; the judger owns
-            // the final 8k head+tail prompt bound, which keeps both the start
-            // contract and terminal tail of larger fanout results visible.
-            let evidence = session.render_tool_evidence(16_000);
-            if !evidence.is_empty() {
-                judger_outcome
-                    .stderr
-                    .push_str("\n[durable-tool-evidence jsonl]\n");
-                judger_outcome.stderr.push_str(&evidence);
-            }
+            attach_durable_judger_evidence(&mut judger_outcome, session);
         }
 
         let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
@@ -1568,6 +1573,52 @@ mod tests {
                 .stderr
                 .contains("retry refused after first attempt produced session")
         );
+    }
+
+    #[test]
+    fn empty_durable_evidence_preserves_the_ordinary_stderr_budget() {
+        let mut outcome = outcome_ok("model", "answer", &[]);
+        outcome.stderr = "ordinary diagnostic\n".repeat(3000);
+        let before = outcome.stderr.clone();
+        attach_durable_judger_evidence(&mut outcome, &SessionCapture::default());
+        assert_eq!(outcome.stderr, before);
+    }
+
+    #[test]
+    fn durable_evidence_survives_the_final_judger_prompt_budget() {
+        let mut original = outcome_ok("model", "verified", &[]);
+        original.stderr = "ordinary diagnostic\n".repeat(3000);
+        let before = original.stderr.clone();
+        let session = SessionCapture {
+            events: vec![crate::session_capture::JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({"tool_calls": [
+                    {"tool_call_id":"large", "name":"bash", "ok":true,
+                     "args_full":{"command":"fetch"}, "result_full":"html".repeat(10000)},
+                    {"tool_call_id":"middle", "name":"bash", "ok":true,
+                     "args_full":{"command":"verify first"}, "result_full":"first extraction verified"},
+                    {"tool_call_id":"last", "name":"bash", "ok":true,
+                     "args_full":{"command":"verify second"}, "result_full":"second extraction verified"}
+                ]}),
+            }],
+            ..Default::default()
+        };
+        let mut judged = original.clone();
+        attach_durable_judger_evidence(&mut judged, &session);
+        assert!(judged.stderr.chars().count() <= crate::judger::JUDGER_STDERR_CAP);
+        let (_, projection) = judged
+            .stderr
+            .split_once("[durable-tool-evidence json]\n")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(projection).unwrap();
+        assert_eq!(parsed["rendered_calls"], 3);
+        assert_eq!(parsed["calls"][1]["result"], "first extraction verified");
+        assert_eq!(parsed["calls"][2]["result"], "second extraction verified");
+        let prompt = crate::judger::build_judger_prompt("Was extraction verified?", &judged);
+        assert!(prompt.contains(&judged.stderr));
+        assert!(prompt.contains(projection));
+        assert_eq!(prompt.matches("chars elided").count(), 1);
+        assert_eq!(original.stderr, before);
     }
 
     fn outcome_ok(model: &str, text: &str, tools: &[&str]) -> RunOutcome {
