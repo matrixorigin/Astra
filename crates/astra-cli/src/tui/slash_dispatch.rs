@@ -2676,12 +2676,11 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     SlashResult::Handled
 }
 
-/// `/model set <name>` — apply immediately.  Also used as the
-/// fallback for `/model <name>` shorthand.
+/// Apply a direct `/model <name>` selection immediately.
 fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
     if name.is_empty() {
-        ctx.show_error("Model name cannot be empty — try `/model list`.".into());
+        ctx.show_error("Model name cannot be empty — choose one with `/model`.".into());
         return;
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
@@ -2722,13 +2721,13 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         Some(arg.trim().to_string())
     };
     let Some(name) = target else {
-        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+        ctx.show_error("No active model — choose one with `/model` or run `/model <name>`.".into());
         return SlashResult::Handled;
     };
 
     // Prefer the cached pricing the session already carries so
-    // `/model info` is instant — live refetch happens via
-    // `/model list` when the user explicitly asks.
+    // `/model info` is instant — live refetch happens when the user
+    // explicitly opens the `/model` picker.
     let pricing = &ctx.state.cached_pricing;
     let prompt_usd = if pricing.prompt > 0.0 {
         format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)

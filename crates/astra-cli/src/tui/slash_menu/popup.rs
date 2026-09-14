@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Key features:
-//! * **Group headers**: detailed renderers can group items by category (Core,
-//!   Session & Plan, Observability, …) with dim `── Group Name ──` dividers.
+//! * **Group headers**: detailed renderers can group items by task (Common,
+//!   Sessions, Work, Inspect, …) with dim `── Group Name ──` dividers.
 //! * **Composer compact mode**: the live `/` picker omits those headers and
 //!   inline subcommand previews so every selectable action fits in the input
 //!   area. `/help` remains the place for taxonomy and long-form discovery.
@@ -27,10 +27,10 @@
 //!
 //! Group-aware anatomy:
 //! ```text
-//!     ── Core ──
+//!     ── Common ──
 //!   ▌ /help        show this help screen
 //!     /clear       clear screen
-//!     ── Session & Plan ──
+//!     ── Sessions ──
 //!     /resume      resume a session
 //!     ↓ 2 more
 //! ```
@@ -191,7 +191,7 @@ fn render_with_presentation(
         if presentation.show_group_headers && item_group != cur_group {
             cur_group = item_group;
             if let Some(g) = item_group {
-                let label = group_display_name(g);
+                let label = g.title();
                 // Ensure the gutter column is included.
                 let mut group_spans: Vec<Span<'static>> = Vec::with_capacity(3);
                 group_spans.push(Span::raw("  "));
@@ -395,21 +395,6 @@ fn pad_right_chars(s: &str, width: usize) -> String {
     out
 }
 
-/// Human-readable display name for a command group.
-fn group_display_name(group: CommandGroup) -> &'static str {
-    match group {
-        CommandGroup::Core => "Core",
-        CommandGroup::Workspace => "Workspace",
-        CommandGroup::SessionPlan => "Session & Plan",
-        CommandGroup::MemoryTasks => "Memory & Tasks",
-        CommandGroup::Observability => "Observability",
-        CommandGroup::Skills => "Skills",
-        CommandGroup::Mcp => "MCP",
-        CommandGroup::TeamAccount => "Team & Account",
-        CommandGroup::System => "System",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{SlashItem, SlashMenu};
@@ -521,37 +506,37 @@ mod tests {
             SlashItem {
                 name: "/help".into(),
                 description: "show help".into(),
-                group: Some(CommandGroup::Core),
+                group: Some(CommandGroup::Common),
                 ..Default::default()
             },
             SlashItem {
                 name: "/clear".into(),
                 description: "clear screen".into(),
-                group: Some(CommandGroup::Core),
+                group: Some(CommandGroup::Common),
                 ..Default::default()
             },
             SlashItem {
                 name: "/resume".into(),
                 description: "resume a session".into(),
-                group: Some(CommandGroup::SessionPlan),
+                group: Some(CommandGroup::Sessions),
                 ..Default::default()
             },
             SlashItem {
                 name: "/plan".into(),
                 description: "manage plan".into(),
-                group: Some(CommandGroup::SessionPlan),
+                group: Some(CommandGroup::Sessions),
                 ..Default::default()
             },
             SlashItem {
                 name: "/model".into(),
                 description: "pick a model".into(),
-                group: Some(CommandGroup::Core),
+                group: Some(CommandGroup::Common),
                 ..Default::default()
             },
             SlashItem {
                 name: "/config".into(),
                 description: "runtime config".into(),
-                group: Some(CommandGroup::Observability),
+                group: Some(CommandGroup::Inspect),
                 ..Default::default()
             },
         ];
@@ -569,19 +554,19 @@ mod tests {
             SlashItem {
                 name: "/help".into(),
                 description: "show help".into(),
-                group: Some(CommandGroup::Core),
+                group: Some(CommandGroup::Common),
                 ..Default::default()
             },
             SlashItem {
                 name: "/plan".into(),
                 description: "plan work".into(),
-                group: Some(CommandGroup::SessionPlan),
+                group: Some(CommandGroup::Sessions),
                 ..Default::default()
             },
             SlashItem {
                 name: "/context".into(),
                 description: "inspect context".into(),
-                group: Some(CommandGroup::Observability),
+                group: Some(CommandGroup::Inspect),
                 ..Default::default()
             },
         ]);
@@ -599,7 +584,7 @@ mod tests {
             );
         }
         assert!(
-            !output.contains("── Core ──"),
+            !output.contains("── Common ──"),
             "group chrome belongs in help, not the constrained composer picker: {output}"
         );
     }
@@ -675,7 +660,7 @@ mod tests {
             extra_subcommands: Vec::new(),
             usage_boost: 0,
             primary: true,
-            group: Some(CommandGroup::MemoryTasks),
+            group: Some(CommandGroup::Tools),
             usage_examples: &[],
         };
         let menu = SlashMenu::new(vec![item]);

@@ -506,3 +506,45 @@ impl SlashMenu {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_slash_keeps_search_only_commands_after_featured_actions() {
+        let mut menu = SlashMenu::new(vec![
+            SlashItem {
+                name: Cow::Borrowed("/later"),
+                primary: false,
+                ..Default::default()
+            },
+            SlashItem {
+                name: Cow::Borrowed("/featured"),
+                primary: true,
+                ..Default::default()
+            },
+            SlashItem {
+                name: Cow::Borrowed("/also-later"),
+                primary: false,
+                ..Default::default()
+            },
+        ]);
+
+        let names = |menu: &SlashMenu| {
+            menu.matches()
+                .iter()
+                .map(|item| item.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            "/featured".to_string(),
+            "/later".to_string(),
+            "/also-later".to_string(),
+        ];
+        assert_eq!(names(&menu), expected);
+
+        menu.set_filter("/");
+        assert_eq!(names(&menu), expected);
+    }
+}
