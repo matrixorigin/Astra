@@ -769,6 +769,61 @@ criteria:
     }
 
     #[test]
+    fn cache_observation_case_accepts_reasonable_cost_but_rejects_invalid_behavior() {
+        use crate::criteria::evaluate_deterministic_with_session;
+        use crate::runner::RunOutcome;
+
+        let case = Case::from_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/pipeline_cache_hit_multi_turn.yaml"),
+        )
+        .unwrap();
+        let mut valid = RunOutcome::new("fixture").with_exit_code(0);
+        valid.text = "ACK\n\nACK\n\nACK\n\nACK".into();
+        valid.cached_input_tokens = 33787;
+        valid.prompt_tokens = 1341;
+        let passes = |outcome: &RunOutcome| {
+            evaluate_deterministic_with_session(&case.criteria, outcome, None)
+                .iter()
+                .all(|result| result.passed)
+        };
+        assert!(
+            passes(&valid),
+            "reasonable sub-98% inclusive cost is not a correctness failure"
+        );
+        let mut bad = valid.clone();
+        bad.cached_input_tokens = 9999;
+        assert!(!passes(&bad));
+        bad = valid.clone();
+        bad.cache_creation_tokens = 25001;
+        assert!(!passes(&bad));
+        bad = valid.clone();
+        bad.tool_calls_count = 1;
+        assert!(!passes(&bad));
+        for turn in 0..4 {
+            let mut parts = ["ACK"; 4];
+            parts[turn] = "ACK and extra text";
+            bad = valid.clone();
+            bad.text = parts.join("\n\n");
+            assert!(!passes(&bad), "turn {turn} must respond exactly");
+        }
+        for step in &case.steps {
+            let mut outcome = RunOutcome::new("fixture");
+            outcome.text = "ACK".into();
+            assert!(
+                evaluate_deterministic_with_session(&step.criteria, &outcome, None)
+                    .iter()
+                    .all(|result| result.passed)
+            );
+            outcome.text = "ACK and extra text".into();
+            assert!(
+                evaluate_deterministic_with_session(&step.criteria, &outcome, None)
+                    .iter()
+                    .any(|result| !result.passed)
+            );
+        }
+    }
+
+    #[test]
     fn diagnostic_case_rejects_depth_named_only_in_question_text() {
         use crate::criteria::{Criterion, evaluate_deterministic_with_session};
         use crate::runner::RunOutcome;

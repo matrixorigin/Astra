@@ -216,6 +216,15 @@ Deterministic cases do not create an extra product session for a generic
 quality opinion. This keeps tenant quotas, memory, cache metrics, and session
 inventories from being contaminated by the test oracle itself.
 
+The four-turn cache observation case checks actual reuse, bounded creation,
+exact ACK responses, and zero tool calls. Its historical 98% inclusive read-share
+threshold is not a product correctness requirement: stable requests can still
+incur fresh conversation and auxiliary input. The report retains absolute costs
+and the aggregate read share including warm-up; it does not label that aggregate
+as the former post-warm-up ratio. Exact prefix continuity requires request-level
+evidence. Cases with an independently justified cost SLO can still use the generic
+provider ratio criterion. Old reports retain their original criteria and verdicts.
+
 ### Session-based criteria semantics
 
 All journal criteria require a loaded session. `session_event_count` and
