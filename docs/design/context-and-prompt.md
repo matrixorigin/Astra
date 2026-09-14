@@ -91,6 +91,14 @@ select `AppendOnlyUserTail` to retain the stable authority policy and append
 runtime instructions with their existing lifetime and supersession semantics.
 Do not silently reinterpret an explicitly selected `TailSuffix` capability.
 
+Repeated states within one typed authority kind must not create a new system
+instruction for every changing value. The stable leading turn-focus policy
+defines how to interpret `boundary_instruction` in marked runtime-owned context.
+The exact boundary-specific instruction stays with its typed runtime facts, so
+entering a boundary or changing its stage leaves the cacheable system prefix
+unchanged. The runtime still enforces the active tool surface, boundary, and
+evidence checks; accepting a proposal is not an execution receipt.
+
 The bounded live-evidence recovery also separates its introspect instruction
 from its reason/schema facts. Typed control decoding accepts both direct JSON
 and the existing required-context envelope (including JSON-string contexts)

@@ -2290,10 +2290,73 @@ pub(crate) async fn accept_task_resolution_after_tool_round(
 
 /// Task interpretation can release only the exact failures it references.
 /// Execution counts and deterministic verification remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaskResolutionCoverage {
+    Covered,
+    NoAssessment,
+    UnsupportedConclusion,
+    StaleBoundary,
+    NoUnresolvedFailures,
+    FailureReferenceMissing,
+    FailureNotCovered,
+    WorkspaceEvidenceStale,
+    WorkspaceEvidenceUnavailable,
+    InvocationLedgerUnavailable,
+    InvocationScopeUnavailable,
+    EvidenceRejected(astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError),
+}
+
+impl TaskResolutionCoverage {
+    fn is_covered(&self) -> bool {
+        matches!(self, Self::Covered)
+    }
+
+    fn reason_code(&self) -> &'static str {
+        use astra_turn_core::evaluation::task_resolution::AssessmentEvidenceError as EvidenceError;
+        match self {
+            Self::Covered => "covered",
+            Self::NoAssessment => "missing_assessment",
+            Self::UnsupportedConclusion => "unsupported_conclusion",
+            Self::StaleBoundary => "stale_boundary",
+            Self::NoUnresolvedFailures => "no_unresolved_failures",
+            Self::FailureReferenceMissing => "failure_reference_missing",
+            Self::FailureNotCovered => "failure_not_covered",
+            Self::WorkspaceEvidenceStale => "workspace_evidence_stale",
+            Self::WorkspaceEvidenceUnavailable => "workspace_evidence_unavailable",
+            Self::InvocationLedgerUnavailable => "invocation_ledger_unavailable",
+            Self::InvocationScopeUnavailable => "invocation_scope_unavailable",
+            Self::EvidenceRejected(EvidenceError::WrongScope) => "evidence_wrong_scope",
+            Self::EvidenceRejected(EvidenceError::WrongBoundary) => "evidence_wrong_boundary",
+            Self::EvidenceRejected(EvidenceError::TooLarge) => "evidence_too_large",
+            Self::EvidenceRejected(EvidenceError::LedgerMismatch) => "evidence_ledger_mismatch",
+            Self::EvidenceRejected(EvidenceError::LedgerUnavailable) => {
+                "evidence_ledger_unavailable"
+            }
+            Self::EvidenceRejected(EvidenceError::MissingClaim) => "evidence_missing_claim",
+            Self::EvidenceRejected(EvidenceError::UnavailableReference) => {
+                "evidence_reference_unavailable"
+            }
+            Self::EvidenceRejected(EvidenceError::DuplicateReference) => {
+                "evidence_duplicate_reference"
+            }
+            Self::EvidenceRejected(EvidenceError::NotExecutedFailure) => {
+                "evidence_failure_not_executed"
+            }
+            Self::EvidenceRejected(EvidenceError::NotLaterExecution) => {
+                "evidence_not_later_execution"
+            }
+            Self::EvidenceRejected(EvidenceError::MissingPositiveObservation) => {
+                "evidence_missing_positive_observation"
+            }
+            Self::EvidenceRejected(EvidenceError::UnresolvedGaps) => "evidence_has_gaps",
+        }
+    }
+}
+
 async fn task_resolution_covers_current_outcomes(
     state: &AgenticLoopState,
     current_boundary: Option<&str>,
-) -> bool {
+) -> TaskResolutionCoverage {
     use astra_turn_types::task_resolution::TaskResolutionConclusion;
     let Some(assessment) = state
         .hooks
@@ -2301,29 +2364,32 @@ async fn task_resolution_covers_current_outcomes(
         .outcome_reconciliation_assessment
         .as_ref()
     else {
-        return false;
+        return TaskResolutionCoverage::NoAssessment;
     };
-    if assessment.conclusion != TaskResolutionConclusion::Supported
-        || current_boundary != Some(assessment.boundary_id.as_str())
-    {
+    if assessment.conclusion != TaskResolutionConclusion::Supported {
         tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
             conclusion = ?assessment.conclusion,
-            current_boundary_matches = current_boundary == Some(assessment.boundary_id.as_str()),
-            "task resolution does not support current boundary");
-        return false;
+            "task resolution conclusion does not support current outcomes");
+        return TaskResolutionCoverage::UnsupportedConclusion;
+    }
+    if current_boundary != Some(assessment.boundary_id.as_str()) {
+        tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+            current_boundary_matches = false,
+            "task resolution boundary is stale");
+        return TaskResolutionCoverage::StaleBoundary;
     }
     let failures = state
         .stall
         .runtime_policy_evaluation
         .unresolved_tool_outcomes();
     if failures.is_empty() {
-        return false;
+        return TaskResolutionCoverage::NoUnresolvedFailures;
     }
     let evidence = state
         .stall
         .runtime_policy_evaluation
         .task_resolution_evidence(assessment, &state.stall.tool_call_records);
-    if !failures.values().all(|failure| {
+    let failures_covered = failures.values().all(|failure| {
         failure.invocation.as_ref().is_some_and(|reference| {
             assessment
                 .failed_call_ids
@@ -2332,11 +2398,20 @@ async fn task_resolution_covers_current_outcomes(
                     .iter()
                     .any(|record| record.execution_completion.as_ref() == Some(reference))
         })
-    }) {
+    });
+    if !failures_covered {
+        let reason = if failures
+            .values()
+            .any(|failure| failure.invocation.is_none())
+        {
+            TaskResolutionCoverage::FailureReferenceMissing
+        } else {
+            TaskResolutionCoverage::FailureNotCovered
+        };
         tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
             unresolved_count = failures.len(), evidence_count = evidence.len(),
             "task resolution does not cover current failure references");
-        return false;
+        return reason;
     }
     let mut workspace_evidence = state
         .stall
@@ -2368,19 +2443,27 @@ async fn task_resolution_covers_current_outcomes(
             &state.stall.tool_call_records,
             &workspace_evidence,
         );
-    if !matches!(freshness, Ok(true)) {
-        tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
-            result = ?freshness, "task resolution workspace evidence is not current");
-        return false;
+    match freshness {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+                "task resolution workspace evidence is not current");
+            return TaskResolutionCoverage::WorkspaceEvidenceStale;
+        }
+        Err(error) => {
+            tracing::info!(target: "astra::task_resolution", run_id = ?state.current_run_id,
+                result = ?error, "task resolution workspace evidence is unavailable");
+            return TaskResolutionCoverage::WorkspaceEvidenceUnavailable;
+        }
     }
     let Some(executor) = state.runtime_tool_executor.as_ref() else {
-        return false;
+        return TaskResolutionCoverage::InvocationLedgerUnavailable;
     };
     let (Some(run_id), Some(chain_id)) = (
         state.current_run_id.as_deref(),
         state.canonical_turn_chain_id.as_deref(),
     ) else {
-        return false;
+        return TaskResolutionCoverage::InvocationScopeUnavailable;
     };
     let validation = executor
         .validate_task_resolution_evidence(
@@ -2394,7 +2477,10 @@ async fn task_resolution_covers_current_outcomes(
         .await;
     tracing::info!(target: "astra::task_resolution", run_id,
         result = ?validation, "task resolution final evidence validation");
-    validation.is_ok()
+    match validation {
+        Ok(()) => TaskResolutionCoverage::Covered,
+        Err(error) => TaskResolutionCoverage::EvidenceRejected(error),
+    }
 }
 
 /// Give a candidate final answer one bounded rewrite when the structured
@@ -2498,14 +2584,14 @@ fn enforce_outcome_reconciliation_before_text_completion(
 /// transport must not clear failures merely by reducing scheduling pressure.
 fn enforce_persistent_unresolved_outcome_terminal(
     state: &mut AgenticLoopState,
-    task_assessed: bool,
+    coverage: &TaskResolutionCoverage,
 ) -> bool {
     if state
         .hooks
         .completion_settlement
         .outcome_reconciliation_retries
         == 0
-        || task_assessed
+        || coverage.is_covered()
         || state.interruption.is_some()
         || state
             .stall
@@ -2515,6 +2601,18 @@ fn enforce_persistent_unresolved_outcome_terminal(
     {
         return false;
     }
+
+    tracing::warn!(
+        target: "astra::task_resolution",
+        run_id = ?state.current_run_id,
+        coverage_reason = coverage.reason_code(),
+        unresolved_count = state
+            .stall
+            .runtime_policy_evaluation
+            .unresolved_tool_outcomes()
+            .len(),
+        "persistent tool outcome remains uncovered at completion"
+    );
 
     // Keep the model's latest text as a labelled partial response when it
     // exists.  A truthful reconciliation such as "the exact cause remains
@@ -2530,7 +2628,10 @@ fn enforce_persistent_unresolved_outcome_terminal(
         ResumeAction::ContinueImmediately,
         interruption_state_summary(
             state,
-            Some("persistent unresolved tool outcome after bounded reconciliation".into()),
+            Some(format!(
+                "persistent unresolved tool outcome after bounded reconciliation; coverage={}",
+                coverage.reason_code()
+            )),
         ),
     ));
     true
@@ -5540,10 +5641,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     .await;
             }
 
-            let task_assessed =
+            let task_coverage =
                 task_resolution_covers_current_outcomes(state, reconciliation_boundary.as_deref())
                     .await;
-            enforce_persistent_unresolved_outcome_terminal(state, task_assessed);
+            enforce_persistent_unresolved_outcome_terminal(state, &task_coverage);
 
             let round_slice_incomplete = enforce_terminal_completion_disposition_before_success(
                 state,
@@ -16143,7 +16244,11 @@ mod tests {
             entry.payload["schema"] == "task_resolution_assessed.v1"
                 && entry.payload["conclusion"] == "supported"
         }));
-        assert!(task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+        assert!(
+            task_resolution_covers_current_outcomes(&state, Some(&boundary))
+                .await
+                .is_covered()
+        );
         for conclusion in [
             TaskResolutionConclusion::Unknown,
             TaskResolutionConclusion::Partial,
@@ -16155,9 +16260,11 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .conclusion = conclusion;
-            assert!(!task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+            let coverage = task_resolution_covers_current_outcomes(&state, Some(&boundary)).await;
+            assert!(!coverage.is_covered());
+            assert_eq!(coverage.reason_code(), "unsupported_conclusion");
             assert!(
-                enforce_persistent_unresolved_outcome_terminal(&mut state, false),
+                enforce_persistent_unresolved_outcome_terminal(&mut state, &coverage),
                 "Observe feedback cannot let an unresolved assessment bypass final coverage"
             );
             state.interruption = None;
@@ -16178,7 +16285,9 @@ mod tests {
             1,
             "task assessment must not erase execution failure"
         );
-        assert!(!task_resolution_covers_current_outcomes(&state, Some("stale")).await);
+        let stale_boundary = task_resolution_covers_current_outcomes(&state, Some("stale")).await;
+        assert_eq!(stale_boundary.reason_code(), "stale_boundary");
+        assert!(!stale_boundary.is_covered());
 
         let retained = state.stall.runtime_policy_evaluation.clone();
         state.stall.tool_call_records.pop();
@@ -16191,8 +16300,11 @@ mod tests {
             astra_turn_core::evaluation::EvaluationThresholds::default(),
         )
         .unwrap();
+        let unrelated_failure =
+            task_resolution_covers_current_outcomes(&state, Some(&boundary)).await;
+        assert_eq!(unrelated_failure.reason_code(), "failure_not_covered");
         assert!(
-            !task_resolution_covers_current_outcomes(&state, Some(&boundary)).await,
+            !unrelated_failure.is_covered(),
             "one target assessment cannot clear another failure"
         );
 
@@ -16205,7 +16317,9 @@ mod tests {
             .unwrap();
         state.stall.tool_call_records.clear();
         assert!(
-            task_resolution_covers_current_outcomes(&state, Some(&boundary)).await,
+            task_resolution_covers_current_outcomes(&state, Some(&boundary))
+                .await
+                .is_covered(),
             "restored prefix resolves original completion refs through the shared ledger"
         );
         state
@@ -16215,7 +16329,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .conclusion = TaskResolutionConclusion::Unknown;
-        assert!(!task_resolution_covers_current_outcomes(&state, Some(&boundary)).await);
+        assert!(
+            !task_resolution_covers_current_outcomes(&state, Some(&boundary))
+                .await
+                .is_covered()
+        );
     }
 
     #[test]
@@ -16771,16 +16889,24 @@ mod tests {
         }))
         .expect("valid policy feedback");
 
+        let coverage = TaskResolutionCoverage::NoAssessment;
         assert!(enforce_persistent_unresolved_outcome_terminal(
-            &mut state, false
+            &mut state, &coverage
         ));
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
         assert!(state.final_text.contains("remains incomplete"));
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some_and(|detail| detail.contains("coverage=missing_assessment"))
+        );
         assert!(!enforce_persistent_unresolved_outcome_terminal(
-            &mut state, false
+            &mut state, &coverage
         ));
     }
 
