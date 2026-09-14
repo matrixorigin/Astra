@@ -129,7 +129,7 @@ jobs:
       - name: Check formatting
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make format-check
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           tool: cargo-audit@0.22.1

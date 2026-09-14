@@ -1,0 +1,24 @@
+name: work_mixed_mutation_timing
+description: Create a replacement immediately, execute it after initial delivery, and preserve cancellation timing.
+prompt: 使用持久化Work任务系统跟踪，直接执行，不要询问。每项任务以对应Bash命令的实际输出为交付证据。取消的任务不要执行，新增项使用新任务身份。最后按实际发生顺序报告。初始建立两项任务：第1项运行
+  printf FIRST_READY；第2项运行 printf ORIGINAL_SECOND。初始化后、任何任务执行之前，立即新增一项运行 printf ADDED_READY。注意新增立即生效，但取消必须延迟：先执行并交付第1项，再取消未执行的第2项，最后执行并交付新增项。
+timeout_seconds: 180
+debug_log: true
+criteria:
+- type: exit_code
+  code: 0
+- type: journal_work_replacement_lifecycle
+  initial_items: 2
+  cancelled_items: 1
+  added_items: 1
+  delivered_items: 2
+  cancellation_after_deliveries: 1
+  added_execution_after_initial_deliveries: 1
+  require_added_at_start: true
+- type: hard_judger
+  question: |
+    Does the final response accurately report the actual execution order and outcomes?
+    Check canonical tool evidence. FIRST_READY must be executed before ADDED_READY;
+    ORIGINAL_SECOND must never execute. Reject any invented repeat execution or delivery.
+    Acknowledging a deviation does not make the requested order satisfied.
+  threshold: 1.0

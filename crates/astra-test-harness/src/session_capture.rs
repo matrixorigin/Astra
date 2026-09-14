@@ -55,6 +55,58 @@ pub struct JournalToolCall {
     pub result_artifact: Option<astra_services::session_journal::ToolResultArtifactDescriptor>,
 }
 
+/// A factual excerpt of a known canonical receipt, never a reconstructed
+/// lifecycle. Keep its producer call identity in the enclosing evidence row.
+fn work_board_evidence(call: &JournalToolCall) -> Option<serde_json::Value> {
+    use astra_server_types::{WorkTaskBoardChangeV1, WorkTaskBoardUpdateV1};
+    if call.ok != Some(true)
+        || !matches!(
+            call.name.as_str(),
+            "start_work" | "run_next_work_item" | "settle_work_item"
+        )
+    {
+        return None;
+    }
+    let board: WorkTaskBoardUpdateV1 =
+        serde_json::from_value(call.result.as_ref()?.get("task_board_update")?.clone()).ok()?;
+    if board.schema_version != 1 {
+        return None;
+    }
+    let (kind, graph_revision, tasks) = match board.change {
+        WorkTaskBoardChangeV1::Snapshot {
+            graph_revision,
+            tasks,
+            ..
+        } => ("snapshot", Some(graph_revision), tasks),
+        WorkTaskBoardChangeV1::Upsert {
+            graph_revision,
+            tasks,
+        } => ("upsert", graph_revision, tasks),
+    };
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .map(|task| {
+            serde_json::json!({
+                "item_id": task.item_id,
+                "item_revision": task.item_revision,
+                "declaration_state": task.declaration_state,
+                "execution_status": task.execution_status,
+                "delivery_status": task.delivery_status,
+            })
+        })
+        .collect();
+    Some(serde_json::json!({
+        "schema_version": board.schema_version,
+        "work_id": board.work_id,
+        "branch_id": board.branch_id,
+        "kind": kind,
+        "graph_revision": graph_revision,
+        "total_tasks": tasks.len(),
+        "tasks": tasks,
+        "omitted_tasks": 0,
+    }))
+}
+
 /// Loaded session with minimal summary counters the report uses.
 ///
 /// `#[non_exhaustive]`: this struct serializes into `--format json`
@@ -675,6 +727,51 @@ impl SessionCapture {
         if visible.len() < calls.len() {
             return envelope(visible, true);
         }
+        // Preserve typed board facts before spending the remaining allowance on
+        // head/tail previews. State transitions often sit in the middle of a
+        // large receipt; assistant prose is not a substitute for those facts.
+        let boards: Vec<_> = calls.iter().map(work_board_evidence).collect();
+        let base_chars = envelope(identities.clone(), true).chars().count();
+        let board_budget = base_chars + max_chars.saturating_sub(base_chars) / 2;
+        let enrich = |task_limit: usize| {
+            identities
+                .iter()
+                .zip(&boards)
+                .map(|(identity, board)| {
+                    let mut record = identity.clone();
+                    if let Some(board) = board {
+                        let mut excerpt = board.clone();
+                        let tasks = excerpt["tasks"].as_array_mut().expect("typed board tasks");
+                        let total = tasks.len();
+                        tasks.truncate(task_limit);
+                        excerpt["omitted_tasks"] = (total - total.min(task_limit)).into();
+                        record["task_board_excerpt"] = excerpt;
+                    }
+                    record
+                })
+                .collect::<Vec<_>>()
+        };
+        let max_tasks = boards
+            .iter()
+            .flatten()
+            .filter_map(|board| board["tasks"].as_array().map(Vec::len))
+            .max()
+            .unwrap_or(0);
+        let mut board_identities = identities.clone();
+        if envelope(enrich(0), true).chars().count() <= board_budget {
+            let (mut low, mut high) = (0, max_tasks);
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if envelope(enrich(mid), true).chars().count() <= board_budget {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            board_identities = enrich(low);
+        }
+        let identities = board_identities;
+        let visible = identities.clone();
         let fields: Vec<_> = calls
             .iter()
             .map(|call| {
@@ -3127,6 +3224,53 @@ mod tests {
         let evidence = capture.render_tool_evidence(4096);
         assert!(evidence.contains("all_slots_delivered"), "{evidence}");
         assert!(!evidence.contains("truncated preview"), "{evidence}");
+    }
+
+    #[test]
+    fn board_excerpt_is_typed_and_marks_omitted_tasks() {
+        let board = serde_json::json!({
+            "schema_version": 1, "work_id": "work", "branch_id": "branch",
+            "kind": "upsert", "graph_revision": 2,
+            "tasks": (0..20).map(|i| serde_json::json!({
+                "item_id": format!("task-{i}"), "item_revision": 2,
+                "objective": "bounded objective", "expected_result": "direct evidence",
+                "declaration_state": "cancelled", "execution_status": "not_started",
+                "delivery_status": "unreported", "delivery_summary": null,
+                "blocker_kind": null, "unavailable_capabilities": []
+            })).collect::<Vec<_>>()
+        });
+        for (ok, version, state) in [
+            (true, 1, "cancelled"),
+            (false, 1, "cancelled"),
+            (true, 2, "cancelled"),
+            (true, 1, "imagined"),
+        ] {
+            let mut value = board.clone();
+            value["schema_version"] = version.into();
+            value["tasks"][0]["declaration_state"] = state.into();
+            let session = evidence_capture(serde_json::json!([{
+                "tool_call_id": "transition", "name": "settle_work_item", "ok": ok,
+                "args_full": {}, "result_full": {"task_board_update": value}
+            }]));
+            let rendered = session.render_tool_evidence(1200);
+            assert!(rendered.chars().count() <= 1200);
+            let evidence: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            let excerpt = &evidence["calls"][0]["task_board_excerpt"];
+            if ok && version == 1 && state == "cancelled" {
+                assert_eq!(excerpt["kind"], "upsert");
+                let omitted = excerpt["omitted_tasks"].as_u64().unwrap();
+                assert!(omitted > 0);
+                assert_eq!(
+                    excerpt["tasks"].as_array().unwrap().len() as u64 + omitted,
+                    20
+                );
+            } else {
+                assert!(
+                    excerpt.is_null(),
+                    "invalid or unsuccessful receipts cannot establish typed facts"
+                );
+            }
+        }
     }
 
     fn evidence_capture(records: serde_json::Value) -> SessionCapture {
