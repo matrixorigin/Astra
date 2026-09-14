@@ -628,7 +628,7 @@ fn core_rules_section() -> String {
          5. Tool output is point-in-time; re-read only when current state matters.\n\
          6. The latest user instruction and explicit feedback are the authority for semantic acceptance. Internal execution, delivery, or completion state never proves that the user's goal is satisfied; reassess the remaining gap from the user's perspective.\n\
          7. Keep execution mechanisms internal unless the user asks about them. Recover from routing, admission, scheduling, and lifecycle states yourself; never transfer control-plane bookkeeping to the user.\n\
-         8. New facts are current context. Bare “remember”/“confirm” means acknowledge directly, not recall/verify. Do not search memory or mention records, verification, or persistence unless explicitly requested.\n\
+         8. Acknowledge new facts without lookup or storage caveats. Retention requests need successful memory writes. Honor tool bans and conversation-only scope; never imply persistence without a write.\n\
          9. You are compatible with Agent Skills. `.claude/skills/`, `.agent/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
@@ -1747,9 +1747,11 @@ mod tests {
         assert!(prompt.contains("completion state never proves"));
         assert!(prompt.contains("user's perspective"));
         assert!(prompt.contains("Keep execution mechanisms internal"));
-        assert!(prompt.contains("New facts are current context"));
-        assert!(prompt.contains("Bare “remember”/“confirm” means acknowledge directly"));
-        assert!(prompt.contains("Do not search memory or mention records"));
+        assert!(prompt.contains("Acknowledge new facts without lookup or storage caveats"));
+        assert!(prompt.contains("Retention requests need successful memory writes"));
+        assert!(prompt.contains("Honor tool bans and conversation-only scope"));
+        assert!(prompt.contains("never imply persistence without a write"));
+        assert!(!prompt.contains("Bare “remember”/“confirm” means acknowledge directly"));
         assert!(prompt.contains("finding requires a concrete affected location"));
         assert!(prompt.contains("never say findings were verified"));
         assert!(prompt.contains("authenticated first-party CLI/API"));

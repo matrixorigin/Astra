@@ -24,6 +24,16 @@ Memory owns durable knowledge across and within sessions. Context injection uses
 - Memory used in a response is traceable.
 - Memory injection is bounded by context budget and task relevance.
 
+## User-requested retention
+
+Acknowledging a fact supplied in the conversation does not require lookup or
+persistence. A request to retain user facts or preferences requires a successful
+memory write before the assistant claims storage. Conversation-only scope and
+explicit tool bans remain authoritative; they do not grant permission to persist.
+If persistence was requested but cannot be performed under those constraints,
+the assistant must distinguish acknowledgment from an actual stored memory.
+A write receipt proves storage, not a later-session recall that has not run.
+
 ## Loading policy
 
 Memory loading is intent-driven:
@@ -57,3 +67,9 @@ The background coordinator may launch a lightweight admission task, but it check
 ## Learning boundary
 
 Memory is not training data by default. Learning artifacts require consent, redaction, quality gate, lineage, and deletion propagation.
+
+A memory retention request alone does not establish a durable Work task. A turn
+that prohibits tools must not create Work through automatic admission. Ordinary
+conversation-only acknowledgment needs no lookup or storage caveat. The compact
+resident memory surface supports remember/recall; select the full memory contract
+and use its invocation carrier for operations such as forget or update.

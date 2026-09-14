@@ -227,6 +227,11 @@ provider ratio criterion. Old reports retain their original criteria and verdict
 
 ### Session-based criteria semantics
 
+`journal_tool_call_count` can combine `ok` with its document/path/equality filter.
+Both conditions apply to the same durable invocation: a failed remember plus a
+successful recall cannot count as a successful remember. Missing outcome evidence
+fails an explicit `ok` filter.
+
 All journal criteria require a loaded session. `session_event_count` and
 `journal_tool_called` are hard requirements by default; set `optional: true`
 only when missing evidence is explicitly acceptable. `journal_tool_call_count`
@@ -481,3 +486,10 @@ rounds' worth of drift; the integration tests under
 - `astra journal diff A B` — compare two runs.
 - `.agent/skills/analyze_session` — human workflow for single-session
   analysis (superseded in automation by this harness).
+
+Canonical Work receipts include a bounded task-board excerpt in judge evidence.
+It preserves the producing call, Work/branch identity, graph and item revisions,
+and declaration/execution/delivery states before allocating space to large raw
+result previews. Snapshot and upsert remain distinct; omitted task counts are
+explicit. The excerpt copies typed receipt facts and never infers cancellation
+or completion from the assistant's answer.

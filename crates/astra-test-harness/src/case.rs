@@ -769,6 +769,73 @@ criteria:
     }
 
     #[test]
+    fn memory_tool_ban_treats_any_call_as_a_hard_failure() {
+        use crate::criteria::{Criterion, CriterionSeverity, evaluate_deterministic};
+        use crate::runner::RunOutcome;
+        let case = Case::from_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/memory_tool_ban_respects_current_turn.yaml"),
+        )
+        .unwrap();
+        let criteria: Vec<_> = case
+            .criteria
+            .into_iter()
+            .filter(|criterion| matches!(criterion, Criterion::AllOf { .. }))
+            .collect();
+        assert_eq!(criteria.len(), 1);
+        for count in [0, 1] {
+            let mut outcome = RunOutcome::new("fixture");
+            outcome.tool_calls_count = count;
+            let results = evaluate_deterministic(&criteria, &outcome);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].severity, CriterionSeverity::Hard);
+            assert_eq!(results[0].passed, count == 0);
+        }
+    }
+
+    #[test]
+    fn memory_case_requires_success_and_remember_on_the_same_call() {
+        use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+        use crate::runner::RunOutcome;
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let case = Case::from_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/memory_tracking_intent_routes_correctly.yaml"),
+        )
+        .unwrap();
+        let criteria: Vec<_> = case.criteria.into_iter().filter(|criterion|
+            matches!(criterion, Criterion::JournalToolCallCount { name, .. } if name == "memory")
+        ).collect();
+        assert_eq!(criteria.len(), 1);
+        for ok in [None, Some(false), Some(true)] {
+            let session = SessionCapture {
+                events: vec![JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({
+                        "tool_calls":[
+                            {"tool_call_id":"write","name":"memory","ok":ok,
+                             "args_full":{"action":"remember","content":"The user follows OceanBase"}},
+                            {"tool_call_id":"lookup","name":"memory","ok":true,
+                             "args_full":{"action":"recall","query":"OceanBase"}}
+                        ]
+                    }),
+                }],
+                ..Default::default()
+            };
+            let results = evaluate_deterministic_with_session(
+                &criteria,
+                &RunOutcome::new("fixture"),
+                Some(&session),
+            );
+            assert_eq!(
+                results.iter().all(|result| result.passed),
+                ok == Some(true),
+                "a successful recall cannot repair an unsuccessful remember"
+            );
+        }
+    }
+
+    #[test]
     fn cache_observation_case_accepts_reasonable_cost_but_rejects_invalid_behavior() {
         use crate::criteria::evaluate_deterministic_with_session;
         use crate::runner::RunOutcome;
@@ -906,6 +973,7 @@ criteria:
                 document: Some(crate::criteria::JournalToolDocument::Arguments),
                 path: Some(path),
                 equals: Some(value),
+                ..
             } if name == "memory" && path == "/action" && value == "forget"
         )));
         let has_memory_flow = |consumer_document, consumer_paths, action| {
@@ -1041,6 +1109,7 @@ steps:
                         document: Some(crate::criteria::JournalToolDocument::Arguments),
                         path: Some(path),
                         equals: Some(_),
+                        ..
                     } if name == "read_file" && path == "/path"
                 )
             })
