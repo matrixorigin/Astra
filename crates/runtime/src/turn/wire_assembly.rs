@@ -40,8 +40,9 @@ fn is_runtime_instruction(message: &Value) -> bool {
         || kind == "read_only_effect_boundary"
 }
 
-/// These producer-owned kinds encode a JSON instruction alongside Work facts.
-/// Extract only the explicit instruction field; never promote objectives,
+/// These producer-owned contexts carry typed instructions, usually alongside
+/// structured facts. Output-cap continuation is the text-only exception.
+/// Extract only the producer-owned instruction; never promote objectives,
 /// expected results, retry counts or mutation payloads into system authority.
 fn structured_runtime_instruction(message: &Value) -> Option<(Option<String>, Value)> {
     let kind = message.get(RUNTIME_VOLATILE_KIND_MARKER)?.as_str()?;
@@ -61,10 +62,22 @@ fn structured_runtime_instruction(message: &Value) -> Option<(Option<String>, Va
         if payload.get("kind")?.as_str()? != kind {
             return None;
         }
-        let mut instruction_payload = payload.get_mut("instruction")?.take();
-        if let Value::String(encoded) = instruction_payload {
-            instruction_payload = serde_json::from_str(&encoded).ok()?;
-        }
+        let instruction_payload = payload.get_mut("instruction")?.take();
+        let mut instruction_payload = match instruction_payload {
+            Value::String(encoded) => match serde_json::from_str::<Value>(&encoded) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return project_runtime_instruction(
+                        encoded,
+                        serde_json::json!({
+                            "schema": "runtime_boundary_instruction.v1",
+                            "kind": kind,
+                        }),
+                    );
+                }
+            },
+            payload => payload,
+        };
         let facts = instruction_payload.as_object_mut()?;
         let instruction = facts.remove("instruction")?.as_str()?.to_owned();
         return project_runtime_instruction(instruction, Value::Object(facts.clone()));
@@ -79,7 +92,16 @@ fn structured_runtime_instruction(message: &Value) -> Option<(Option<String>, Va
     } else {
         content
     };
-    let mut payload: Value = serde_json::from_str(content).ok()?;
+    let mut payload: Value = match serde_json::from_str(content) {
+        Ok(payload) => payload,
+        Err(_) if kind == RuntimeAuthorityKind::OutputCapContinuation.as_str() => {
+            return project_runtime_instruction(
+                content.to_owned(),
+                serde_json::json!({"schema": "output_cap_continuation.v1"}),
+            );
+        }
+        Err(_) => return None,
+    };
     let context = if envelope.is_some() {
         if payload.get("kind")?.as_str()? != kind {
             return None;
@@ -120,15 +142,19 @@ pub(crate) fn project_runtime_roles(messages: &[Value]) -> Vec<Value> {
     }
     for original in messages {
         let mut message = original.clone();
-        if is_runtime_system_context(original)
-            && let Some((instruction, facts)) = structured_runtime_instruction(original)
-        {
+        let structured_instruction = is_runtime_system_context(original)
+            .then(|| structured_runtime_instruction(original))
+            .flatten();
+        let has_structured_instruction = structured_instruction.is_some();
+        if let Some((instruction, facts)) = structured_instruction {
             if let Some(instruction) = instruction {
                 projected.push(serde_json::json!({"role":"system", "content": instruction}));
             }
             message["content"] = Value::String(facts.to_string());
         }
-        if is_runtime_system_context(original) && !is_runtime_instruction(original) {
+        if is_runtime_system_context(original)
+            && (!is_runtime_instruction(original) || has_structured_instruction)
+        {
             message["role"] = Value::String("user".into());
             match message.get_mut("content") {
                 Some(Value::String(text)) => {
@@ -455,6 +481,7 @@ impl RuntimeAuthorityKind {
             Self::FinalWorkSynthesis,
             Self::CanonicalWorkEstablishmentRetry,
             Self::FinalAnswerSettlement,
+            Self::OutputCapContinuation,
         ]
         .into_iter()
         .any(|candidate| candidate.as_str() == kind)

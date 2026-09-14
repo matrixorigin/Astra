@@ -23637,7 +23637,7 @@ mod tests {
         assert_eq!(start_payload["schema"], "active_work_attempt_start.v1");
         let body = crate::turn::llm::client::build_provider_request_body(
             &[
-                json!({"role":"system", "content":"stable"}),
+                boundary_instruction_test_system_policy(),
                 start_context.clone(),
                 json!({"role":"user", "content":"execute assigned task"}),
             ],
@@ -23649,24 +23649,14 @@ mod tests {
             false,
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
         );
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Execute only this assignment")
-        );
-        assert!(
-            !body["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("One direct evidence result")
-        );
-        assert!(
-            body["messages"][1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("One direct evidence result")
-        );
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("boundary_instruction"));
+        assert!(!system.contains("Execute only this assignment"));
+        assert!(!system.contains("One direct evidence result"));
+        let facts = body["messages"][1]["content"].as_str().unwrap();
+        assert!(facts.contains("boundary_instruction"));
+        assert!(facts.contains("Execute only this assignment"));
+        assert!(facts.contains("One direct evidence result"));
         assert!(
             start_payload["instruction"]
                 .as_str()
@@ -23843,7 +23833,7 @@ mod tests {
         let instruction = payload["instruction"].as_str().expect("instruction");
         let body = crate::turn::llm::client::build_provider_request_body(
             &[
-                json!({"role":"system", "content":"stable"}),
+                boundary_instruction_test_system_policy(),
                 message.clone(),
                 json!({"role":"user", "content":"summarize the outcome"}),
             ],
@@ -23855,12 +23845,9 @@ mod tests {
             false,
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
         );
-        assert!(
-            body["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains(instruction)
-        );
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("boundary_instruction"));
+        assert!(!system.contains(instruction));
         assert_eq!(
             body["messages"]
                 .as_array()
@@ -23870,6 +23857,9 @@ mod tests {
                 .count(),
             1
         );
+        let facts = body["messages"][1]["content"].as_str().unwrap();
+        assert!(facts.contains("boundary_instruction"));
+        assert!(facts.contains(instruction));
         assert!(instruction.contains("direct evidence"));
         assert!(instruction.contains("index/home page"));
         assert!(instruction.contains("omit tool names"));
@@ -30107,7 +30097,7 @@ mod tests {
         .unwrap();
         let body = crate::turn::llm::client::build_provider_request_body(
             &[
-                json!({"role":"system", "content":"stable"}),
+                boundary_instruction_test_system_policy(),
                 message,
                 json!({"role":"user", "content":"finish"}),
             ],
@@ -30120,22 +30110,30 @@ mod tests {
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
         );
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("finish or hand off before this deadline"));
+        assert!(system.contains("boundary_instruction"));
+        assert!(!system.contains("finish or hand off before this deadline"));
         assert!(!system.contains("123456789"));
+        let facts = body["messages"][1]["content"].as_str().unwrap();
+        let facts = facts
+            .strip_prefix("<astra-runtime-context>\n")
+            .and_then(|facts| facts.strip_suffix("\n</astra-runtime-context>"))
+            .expect("marked structured deadline context");
+        let facts: Value = serde_json::from_str(facts).expect("structured deadline facts");
+        assert_eq!(facts["context"]["deadline_unix_ms"], 123456789);
         assert!(
-            body["messages"][1]["content"]
+            facts["boundary_instruction"]
                 .as_str()
                 .unwrap()
-                .contains("123456789")
+                .contains("finish or hand off before this deadline")
         );
     }
 
     #[test]
-    fn work_retry_and_output_cap_producers_keep_system_authority_in_provider_body() {
+    fn work_retry_and_output_cap_producers_keep_stable_policy_and_typed_facts_in_provider_body() {
         use crate::turn::wire_assembly::RuntimeAuthorityKind;
         let human = json!({"role":"user", "content":"finish the task exactly"});
         let base = vec![
-            json!({"role":"system", "content":"stable policy"}),
+            boundary_instruction_test_system_policy(),
             human.clone(),
             json!({"role":"assistant", "content":"partial answer"}),
         ];
@@ -30187,17 +30185,16 @@ mod tests {
                     1
                 );
                 let system = wire[0]["content"].as_str().unwrap();
-                assert!(system.contains(instruction));
+                assert!(system.contains("boundary_instruction"));
+                assert!(!system.contains(instruction));
                 assert!(!system.contains("\"retry\":"));
                 assert_eq!(wire[1], human);
                 assert_eq!(wire[2], base[2]);
+                let facts = wire[3]["content"].as_str().unwrap();
+                assert!(facts.contains("boundary_instruction"));
+                assert!(facts.contains(instruction));
                 if kind == RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry {
-                    assert!(
-                        wire[3]["content"]
-                            .as_str()
-                            .unwrap()
-                            .contains(&format!("\"retry\":{retry_count}"))
-                    );
+                    assert!(facts.contains(&format!("\"retry\":{retry_count}")));
                     let replay = crate::turn::wire_assembly::runtime_volatile_preamble_message(
                         &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
                             kind: "canonical_work_establishment_retry".into(),
@@ -37419,6 +37416,14 @@ mod tests {
         fn valid_tool_names(&self) -> &HashSet<String> {
             &self.valid_tools
         }
+    }
+
+    fn boundary_instruction_test_system_policy() -> Value {
+        let policy = crate::turn::wire_assembly::active_turn_focus_policy();
+        json!({
+            "role": "system",
+            "content": policy["instruction"].as_str().expect("stable focus policy")
+        })
     }
 
     fn create_test_state() -> AgenticLoopState {
