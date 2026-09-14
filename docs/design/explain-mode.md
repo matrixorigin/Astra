@@ -254,7 +254,7 @@ filesystem path. Its contract separates four things:
 | `artifact_schema_version` | Version of the artifact envelope | `1` |
 | `artifact_type` | What the document means | `explain_analyze_snapshot` |
 | `content_type` | How the document is encoded | `application/json` |
-| `storage` | Where the runtime keeps the bytes | `local_session` |
+| `storage` | Where the runtime keeps the bytes | `database_session` for server runs; `local_session` for a local host adapter |
 | `representation` | Which canonical/derived form is addressed | `canonical` |
 | `status` | Whether the snapshot is usable | `in_progress`, `complete`, `partial`, or `unavailable` |
 | `size_bytes`, `checksum_sha256` | Bounded integrity metadata for a readable snapshot | present for `complete`/`partial` |
@@ -284,7 +284,8 @@ and capabilities: fail closed, preserve the metadata for an authorized
 diagnostic surface, and never reinterpret it as a text document. A future
 multi-artifact host will index artifacts for one turn by type and
 representation; the `latest` pointer is only a discovery aid and is never the
-artifact identity. The current CLI publishes one canonical snapshot.
+artifact identity. The execution host publishes one canonical snapshot; a
+client Markdown or HTML file is only a derived presentation copy.
 
 The current implementation persists one canonical JSON snapshot containing the
 bounded, redacted versioned event set, run/turn identity, event schema version,
@@ -295,28 +296,46 @@ timeline, text export, and HTML report must therefore agree on node identity,
 timing basis, and coverage. Saving a Markdown or HTML rendering alone does not
 make a report available to a later agent turn.
 
-This CLI path uses the local session artifact store intentionally. It does not
-claim that the server-side database artifact API or a Web download endpoint
-already serves Explain snapshots; those are host adapters for a later phase.
+Server execution persists its canonical snapshot in the owner/session-scoped
+database artifact store and wires the same bounded reader into `introspect`.
+The CLI/TUI may additionally persist a local companion for a human operator;
+that companion is not injected into server model context. A local-only host can
+use the local store and reader when it owns both execution and model calls.
 
-The current implementation intentionally exposes one capability,
-`read_window`, through the CLI's bounded reader. Future capabilities such as
+The execution topology determines which host owns the artifact bytes and which
+surface may render them:
+
+| Topology | Live and replay facts | Human rendering | Next-turn artifact analysis |
+| --- | --- | --- | --- |
+| CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local Markdown companion and print its path | The local `introspect` reader can consume the opaque session handle |
+| Server + TUI/CLI | Server lifecycle is authoritative; the client consumes the same typed stream and durable replay | The client may render a local companion for the human, but must not treat its path as server authority | The model can recover only through a reader backed by the same server/session store; otherwise the required context reports the artifact as unavailable |
+| Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | The server-owned database handle is discovered on the next turn and read through server `introspect` |
+| Server + Edge | Server and Edge facts retain producer, clock, parent, and gap metadata; reconnect uses the durable server cursor | The attached client renders one graph from merged facts; Edge never creates a second Explain semantics | Edge-local paths stay local; recovery uses the authorized host artifact backend and reports missing cross-host readers explicitly |
+
+Client-side rendering must therefore degrade to “shown locally, unavailable to
+the remote model” when the host stores differ. It must never put a physical
+client path into server model context or claim that a local handle is readable
+from a remote Server. The typed event stream remains useful in every topology,
+even when the richer artifact reader is not yet installed.
+
+The current implementation intentionally exposes one capability, `read_window`,
+through both the server and local bounded readers. Future capabilities such as
 `download`, `render`, or `cite` must be granted by the host and represented in
 the envelope; a content type alone never grants them. Binary artifacts require
 a byte/range reader or an authorized download capability rather than being
 decoded as UTF-8. Streaming artifacts use a cursor and expiry contract instead
 of pretending that a partial stream is a completed snapshot.
 
-The model-facing value is an opaque, session-scoped handle. The current local
-reader supports UTF-8 JSON windows with `offset` and a bounded `max_bytes`
-(64 KiB maximum), and returns a continuation offset. It never exposes the
-physical path. A failed write publishes an `unavailable` status for that run
-and turn; if the index itself cannot be written, the stale pointer is removed
-where possible, and the current CLI process suppresses that session's older
-pointer while reporting the publication failure. If the process is restarted
-while both index writes and cleanup are unavailable, no local mechanism can
-persist a new failure marker; that host limitation must be surfaced rather
-than presented as a valid current report.
+The model-facing value is an opaque, session-scoped handle. The server and
+local readers support UTF-8 JSON windows with `offset` and a bounded
+`max_bytes` (64 KiB maximum), and return a continuation offset. They never
+expose a physical path. A failed write publishes an `unavailable` status for
+that run and turn when the store is reachable. Server discovery is bound first
+to the latest durable `run_started` record that explicitly requested Explain
+Analyze, then to that run's deterministic artifact identity; a missing or
+invalid artifact is reported as unavailable and never falls back to an older
+run. The local index uses the same fail-closed status model for the host it
+owns.
 
 Future storage backends fit the same reference contract. A trusted local-path
 backend may be used by a host adapter for files it owns; an S3-compatible
@@ -332,19 +351,22 @@ publication, and audit behavior. A local file can disappear, an object store
 can return a stale version, and a signed URL can expire between pages; each
 case is an explicit unavailable/expired result with no silent fallback. Those
 adapters must check tenant, user, session, and run ownership before resolving a
-locator. The current CLI boundary is the active session, local host, and
-`source_policy` check described above.
+locator. The server boundary is the authenticated user and session owner; the
+local boundary is the active session, local host, and `source_policy` check
+described above.
 Derived artifacts retain their parent identity and checksum, while trace and
 debug artifacts keep their own authorization and redaction policy. This keeps
 large files, provider captures, screenshots, exports, and future multimodal
 payloads on the same reference model without widening Explain Analyze into a
 raw trace or file browser.
 
-The current CLI advertises the latest handle in the text `session` and
-`overview` introspect views when local recovery is permitted. Other facets and
-the structured observation JSON keep their observation schema and do not append
-an edge-local pointer. A host that offers a remote artifact backend can expose
-the same typed reference through its own structured observation contract.
+The server advertises the latest handle through the typed required-context lane
+on the next turn. The CLI/TUI may also print the path of a derived Markdown
+report for the human operator. That path is a presentation affordance; the
+model receives the server-owned opaque handle and reads the canonical artifact
+through the bounded reader. The physical path is never treated as model
+authority. A client-local companion is explicitly unavailable to a remote model
+when no shared artifact backend exists.
 The next turn receives only a short artifact handle through `introspect`. An
 agent that is explicitly asked to analyze the previous explain report reads
 that handle through the bounded artifact window API, then cites the recorded

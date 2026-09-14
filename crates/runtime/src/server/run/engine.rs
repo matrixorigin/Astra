@@ -326,6 +326,11 @@ pub struct RunStartContext {
     pub provider_request_fingerprint: Option<String>,
     pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     pub start_request_fingerprint: Option<String>,
+    /// Whether this root run explicitly requested the Explain Analyze
+    /// observation contract.  Persisting the admission bit lets a later
+    /// turn identify the exact latest Explain run even when publication of
+    /// its derived artifact failed.
+    pub explain_analyze_requested: bool,
     /// Explicit canonical Work authority for this exact run.
     ///
     /// `None` means detached even when a parent is Work-bound. Session,
@@ -359,6 +364,7 @@ impl Default for RunStartContext {
             provider_request_fingerprint: None,
             provider_run_owner: None,
             start_request_fingerprint: None,
+            explain_analyze_requested: false,
             work_binding: None,
             validated_work_item_assignment: false,
         }
@@ -725,6 +731,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "start_request_fingerprint".to_string(),
             serde_json::Value::String(fingerprint.clone()),
+        );
+    }
+    if context.explain_analyze_requested {
+        data.insert(
+            "explain_analyze_requested".to_string(),
+            serde_json::Value::Bool(true),
         );
     }
     if let Some(owner) = context.provider_run_owner.as_ref() {
@@ -3304,6 +3316,18 @@ impl RunEngine {
     ) -> Result<astra_services::runs::DurableSessionRunPage, String> {
         self.store
             .list_session_runs(user_id, session_id, limit)
+            .await
+    }
+
+    /// Find the latest root Explain Analyze run from the store's
+    /// durable authority. This deliberately bypasses the bounded UI tree.
+    pub async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        self.store
+            .find_latest_explain_analyze_root(user_id, session_id)
             .await
     }
 
@@ -5897,6 +5921,18 @@ mod tests {
             serde_json::json!(["binding-foundation", "binding-extension"])
         );
         assert_eq!(event["agent_binding_id"], "binding-extension");
+    }
+
+    #[test]
+    fn run_started_event_records_explain_admission_only_when_requested() {
+        let ordinary = run_started_event_data(&RunStartContext::default());
+        assert!(ordinary.get("explain_analyze_requested").is_none());
+
+        let explain = run_started_event_data(&RunStartContext {
+            explain_analyze_requested: true,
+            ..Default::default()
+        });
+        assert_eq!(explain["explain_analyze_requested"], true);
     }
 
     #[test]

@@ -221,6 +221,7 @@ pub(crate) fn run_start_context_from_request(
         provider_request_fingerprint: None,
         provider_run_owner: request.provider_run_owner.clone(),
         start_request_fingerprint: None,
+        explain_analyze_requested: request.explain,
         work_binding: None,
         validated_work_item_assignment: false,
     }

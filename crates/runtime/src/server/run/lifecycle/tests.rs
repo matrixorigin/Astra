@@ -1,6 +1,17 @@
 use super::*;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
+#[test]
+fn explain_artifact_publication_requires_a_durable_terminal_status() {
+    assert!(explain_artifact_publishable_status(RunStatus::Completed));
+    assert!(explain_artifact_publishable_status(RunStatus::Delegated));
+    assert!(explain_artifact_publishable_status(RunStatus::Failed));
+    assert!(explain_artifact_publishable_status(RunStatus::Cancelled));
+    assert!(!explain_artifact_publishable_status(RunStatus::Running));
+    assert!(!explain_artifact_publishable_status(RunStatus::Waiting));
+    assert!(!explain_artifact_publishable_status(RunStatus::Paused));
+}
+
 fn complete_tool_ledger_receipt(
     run_id: &str,
     attempted: u32,

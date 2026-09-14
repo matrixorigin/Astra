@@ -28,6 +28,7 @@ const ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const ARTIFACT_TYPE: &str = "explain_analyze_snapshot";
 const ARTIFACT_CONTENT_TYPE: &str = "application/json";
 const ARTIFACT_STORAGE: &str = "local_session";
+const RENDERED_REPORT_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct PublicationFailure {
@@ -147,6 +148,29 @@ struct ExplainAnalyzeArtifactV1 {
     capture_status: ExplainAnalyzeCaptureStatus,
     delivery_degraded: bool,
     events: Vec<ExplainAnalyzeEventV1>,
+}
+
+/// Result of publishing the canonical artifact and its local, human-readable
+/// companion. The opaque handle is the only identifier intended for model
+/// context; the rendered path is a local UI affordance for the user.
+#[derive(Debug, Clone)]
+pub(crate) struct PublishedArtifact {
+    pub(crate) handle: String,
+    pub(crate) rendered_path: Option<PathBuf>,
+    pub(crate) render_error: Option<String>,
+}
+
+impl PublishedArtifact {
+    pub(crate) fn user_notice(&self) -> String {
+        match &self.rendered_path {
+            Some(path) => format!(
+                "Explain Analyze artifact · {}\nRendered report · {}",
+                self.handle,
+                path.display()
+            ),
+            None => format!("Explain Analyze artifact · {}", self.handle),
+        }
+    }
 }
 
 pub(crate) fn artifact_handle(run_id: &str, turn_id: &str) -> String {
@@ -409,6 +433,71 @@ pub(crate) fn persist(
     }
 }
 
+/// Publish the canonical JSON snapshot and a bounded Markdown/plain-text
+/// rendering for the local user interface. The canonical handle remains
+/// readable even if the derived report cannot be written, so a rendering
+/// failure is returned as metadata instead of hiding the usable artifact.
+pub(crate) fn persist_rendered_report(
+    session_id: &str,
+    events: &[ExplainAnalyzeEventV1],
+    delivery_degraded: bool,
+    verbose: bool,
+) -> Result<Option<PublishedArtifact>, String> {
+    let Some(handle) = persist(session_id, events, delivery_degraded)? else {
+        return Ok(None);
+    };
+    let token = token_from_handle(&handle)
+        .map(str::to_owned)
+        .ok_or_else(|| "invalid Explain artifact handle after publication".to_string())?;
+    let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
+    let directory = artifact_directory(session_id)?;
+    let path = directory.join(format!("{token}.md"));
+    // Keep tree prefixes and aligned timing columns intact in Markdown
+    // previews. The report itself is deliberately plain text; a fenced block
+    // prevents proportional-font rendering from destroying its graph shape.
+    let rendered = markdown_report(&report);
+    if rendered.len() > RENDERED_REPORT_MAX_BYTES {
+        return Ok(Some(PublishedArtifact {
+            handle,
+            rendered_path: None,
+            render_error: Some(format!(
+                "rendered report exceeds the {} byte bound",
+                RENDERED_REPORT_MAX_BYTES
+            )),
+        }));
+    }
+    let render_result = (|| {
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("create Explain Analyze report directory: {error}"))?;
+        let temporary = path.with_extension("md.tmp");
+        std::fs::write(&temporary, rendered.as_bytes())
+            .map_err(|error| format!("write Explain Analyze rendered report: {error}"))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| format!("publish Explain Analyze rendered report: {error}"))?;
+        Ok::<(), String>(())
+    })();
+    match render_result {
+        Ok(()) => Ok(Some(PublishedArtifact {
+            handle,
+            rendered_path: Some(path),
+            render_error: None,
+        })),
+        Err(error) => Ok(Some(PublishedArtifact {
+            handle,
+            rendered_path: None,
+            render_error: Some(error),
+        })),
+    }
+}
+
+fn markdown_report(report: &str) -> String {
+    let mut fence = "```".to_string();
+    while report.contains(&fence) {
+        fence.push('`');
+    }
+    format!("# Explain Analyze\n\n{fence}text\n{report}\n{fence}\n")
+}
+
 fn latest_capture(session_dir: &Path) -> Result<Option<LatestExplainAnalyzeCapture>, String> {
     let path = session_dir.join(ARTIFACT_DIR).join("latest.json");
     let metadata = match std::fs::metadata(&path) {
@@ -469,19 +558,27 @@ fn latest_capture(session_dir: &Path) -> Result<Option<LatestExplainAnalyzeCaptu
 pub(crate) fn latest_notice(session_dir: &Path) -> Result<Option<String>, String> {
     let artifact_directory = session_dir.join(ARTIFACT_DIR);
     if let Some(failure) = publication_failure(&artifact_directory) {
-        let capture = match (failure.run_id.as_deref(), failure.turn_id.as_deref()) {
-            (Some(run_id), Some(turn_id)) => format!(" for run {run_id}, turn {turn_id}"),
-            _ => String::new(),
-        };
-        return Ok(Some(format!(
-            "Explain Analyze artifact unavailable{capture}: publication failed: {}",
-            failure.reason
-        )));
+        return Ok(Some(publication_failure_notice(&failure)));
     }
     let Some(capture) = latest_capture(session_dir)? else {
         return Ok(None);
     };
-    let notice = match capture.status {
+    Ok(latest_notice_for_capture(&capture))
+}
+
+fn publication_failure_notice(failure: &PublicationFailure) -> String {
+    let capture = match (failure.run_id.as_deref(), failure.turn_id.as_deref()) {
+        (Some(run_id), Some(turn_id)) => format!(" for run {run_id}, turn {turn_id}"),
+        _ => String::new(),
+    };
+    format!(
+        "Explain Analyze artifact unavailable{capture}: publication failed: {}",
+        failure.reason
+    )
+}
+
+fn latest_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> Option<String> {
+    match capture.status {
         ExplainAnalyzeCaptureStatus::Complete | ExplainAnalyzeCaptureStatus::Partial => {
             let status = match capture.status {
                 ExplainAnalyzeCaptureStatus::Complete => "complete",
@@ -489,7 +586,7 @@ pub(crate) fn latest_notice(session_dir: &Path) -> Result<Option<String>, String
                 ExplainAnalyzeCaptureStatus::InProgress
                 | ExplainAnalyzeCaptureStatus::Unavailable => unreachable!(),
             };
-            capture.handle.map(|handle| {
+            capture.handle.as_deref().map(|handle| {
                 format!(
                     "Explain Analyze artifact · type={} · content={} · storage={} · status={} · size={} bytes\nHandle: {handle}\nRead it with introspect(artifact=\"{handle}\", offset=0).",
                     capture.artifact_type,
@@ -511,8 +608,46 @@ pub(crate) fn latest_notice(session_dir: &Path) -> Result<Option<String>, String
                 .as_deref()
                 .unwrap_or("the runtime did not publish a report")
         )),
+    }
+}
+
+fn context_notice_for_capture(capture: &LatestExplainAnalyzeCapture) -> String {
+    let notice = latest_notice_for_capture(capture).unwrap_or_else(|| {
+        "Explain Analyze artifact is not currently readable; report that limitation instead of inferring runtime facts."
+            .to_string()
+    });
+    let read_instruction = capture
+        .handle
+        .as_deref()
+        .map(|handle| {
+            format!(
+                "If the user asks about the previous/latest Explain Analyze run, call introspect(artifact=\"{handle}\", offset=0, max_bytes=65536) before drawing conclusions. The handle is readable only through the host that owns this session artifact store; a remote Server may report it unavailable rather than reading a client path. If introspect is unavailable in the visible tool set, report that artifact recovery is unavailable instead of guessing."
+            )
+        })
+        .unwrap_or_else(|| {
+            "The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts."
+                .to_string()
+        });
+    format!(
+        "[Explain Analyze artifact discovery]\n{notice}\n{read_instruction}\nThe CLI may also show a local rendered report path to the user; that path is a presentation affordance, while the opaque artifact handle is the model-facing source. Treat the artifact as the runtime source of truth; do not infer timing from renderer text or source code."
+    )
+}
+
+/// Compact prompt-facing discovery notice for the next model turn. It names
+/// the typed artifact capability and the bounded reader without copying the
+/// report into the prompt or exposing a host filesystem path.
+pub(crate) fn latest_context_notice(session_dir: &Path) -> Result<Option<String>, String> {
+    let artifact_directory = session_dir.join(ARTIFACT_DIR);
+    if let Some(failure) = publication_failure(&artifact_directory) {
+        return Ok(Some(format!(
+            "[Explain Analyze artifact discovery]\n{}\nThe CLI may show a rendered report path to the user when available, but the local path is not a model authority. The latest Explain Analyze capture is not currently readable; report that limitation instead of inferring runtime facts.",
+            publication_failure_notice(&failure)
+        )));
+    }
+    let Some(capture) = latest_capture(session_dir)? else {
+        return Ok(None);
     };
-    Ok(notice)
+    Ok(Some(context_notice_for_capture(&capture)))
 }
 
 fn read_artifact_window(
@@ -626,6 +761,10 @@ pub(crate) fn resolve_request(session_dir: &Path, args: &Value) -> Option<Result
 mod tests {
     use super::*;
     use astra_services::SessionArtifactStore;
+    use astra_turn_types::{
+        EXPLAIN_ANALYZE_SCHEMA_VERSION, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+        ExplainAnalyzeTransitionV1,
+    };
 
     fn write_latest(temp: &Path, record: LatestExplainAnalyzeCapture) {
         let directory = temp.join(ARTIFACT_DIR);
@@ -654,12 +793,115 @@ mod tests {
         }
     }
 
+    fn complete_events() -> Vec<ExplainAnalyzeEventV1> {
+        let common = ExplainAnalyzeEventV1 {
+            schema_version: EXPLAIN_ANALYZE_SCHEMA_VERSION,
+            event_id: "clock-1:0".to_string(),
+            run_id: "run-1".to_string(),
+            turn_id: "turn-2".to_string(),
+            node_id: "turn-2".to_string(),
+            parent_node_id: None,
+            dependency_node_ids: Vec::new(),
+            producer_id: "test".to_string(),
+            clock_domain_id: "clock-1".to_string(),
+            kind: ExplainAnalyzeNodeKindV1::Turn,
+            round_index: None,
+            attempt_index: None,
+            label: "User turn".to_string(),
+            transition: ExplainAnalyzeTransitionV1::Started,
+            elapsed_ms: 0,
+            start_elapsed_ms: None,
+            duration_ms: None,
+            outcome: None,
+            usage: None,
+            context: None,
+            coverage_gaps: Vec::new(),
+        };
+        let mut finished = common.clone();
+        finished.event_id = "clock-1:1".to_string();
+        finished.transition = ExplainAnalyzeTransitionV1::Finished;
+        finished.elapsed_ms = 5;
+        finished.start_elapsed_ms = Some(0);
+        finished.duration_ms = Some(5);
+        finished.outcome = Some(ExplainAnalyzeOutcomeV1::Completed);
+        vec![common, finished]
+    }
+
     #[test]
     fn handle_round_trip_rejects_unscoped_paths() {
         let handle = artifact_handle("run-1", "turn-2");
         assert!(token_from_handle(&handle).is_some());
         assert!(token_from_handle("/tmp/explain.json").is_none());
         assert!(token_from_handle("artifact://session/explain-analyze/").is_none());
+    }
+
+    #[test]
+    fn markdown_report_preserves_tree_whitespace_and_escapes_fences() {
+        let report = "Explain Analyze\n  └─ provider · 2ms\n```\nuser label";
+        let markdown = markdown_report(report);
+        assert!(markdown.contains("```text"), "{markdown}");
+        assert!(markdown.contains("  └─ provider · 2ms"), "{markdown}");
+        assert!(markdown.contains("````text"), "{markdown}");
+    }
+
+    #[test]
+    fn persist_rendered_report_keeps_canonical_handle_and_local_markdown_in_sync() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f304";
+        let events = complete_events();
+        let publication = persist_rendered_report(session_id, &events, false, false)
+            .expect("publication should succeed")
+            .expect("non-empty capture should publish");
+        let rendered_path = publication
+            .rendered_path
+            .as_ref()
+            .expect("Markdown companion should be written");
+        let rendered = std::fs::read_to_string(rendered_path).expect("rendered report");
+        assert!(rendered.contains("# Explain Analyze"), "{rendered}");
+        assert!(rendered.contains("```text"), "{rendered}");
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session directory");
+        let resolved = resolve_request(
+            &session_dir,
+            &serde_json::json!({"artifact": publication.handle, "offset": 0}),
+        )
+        .expect("canonical handle should be recognized")
+        .expect("canonical artifact should be readable");
+        assert!(resolved.contains("Artifact handle:"), "{resolved}");
+    }
+
+    #[test]
+    fn rendered_report_failure_does_not_hide_the_canonical_artifact() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "a5c2f6e9-0f88-44db-a7a4-5e89c1d2f305";
+        let events = complete_events();
+        let handle = artifact_handle("run-1", "turn-2");
+        let token = token_from_handle(&handle).expect("encoded handle token");
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session directory");
+        std::fs::create_dir_all(
+            session_dir
+                .join(ARTIFACT_DIR)
+                .join(format!("{token}.md.tmp")),
+        )
+        .expect("block Markdown temporary path");
+
+        let publication = persist_rendered_report(session_id, &events, false, false)
+            .expect("canonical publication should succeed")
+            .expect("non-empty capture should publish");
+        assert!(publication.rendered_path.is_none());
+        assert!(publication.render_error.is_some());
+        let resolved = resolve_request(
+            &session_dir,
+            &serde_json::json!({"artifact": publication.handle, "offset": 0}),
+        )
+        .expect("canonical handle should be recognized")
+        .expect("canonical artifact must remain readable when rendering fails");
+        assert!(resolved.contains("Artifact handle:"), "{resolved}");
     }
 
     #[test]
@@ -686,6 +928,11 @@ mod tests {
             .expect("latest notice")
             .expect("completed notice");
         assert!(notice.contains(&handle), "{notice}");
+        let context = latest_context_notice(temp.path())
+            .expect("latest context notice")
+            .expect("completed context notice");
+        assert!(context.contains("introspect(artifact="), "{context}");
+        assert!(context.contains("runtime source of truth"), "{context}");
     }
 
     #[test]

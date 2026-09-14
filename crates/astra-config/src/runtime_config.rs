@@ -105,6 +105,41 @@ pub struct RuntimeConfig {
     /// Budget policy for auto-expansion based on outcome streaks.
     #[serde(default)]
     pub budget_policy: Option<BudgetPolicyConfig>,
+
+    /// Explain Analyze presentation and capture preferences.
+    #[serde(default)]
+    pub explain: ExplainConfig,
+}
+
+/// User-facing Explain Analyze presentation settings.
+///
+/// The live TUI projection is intentionally bounded: it is a compact status
+/// lane, not a second scrollback. The bound is also enforced by the renderer
+/// so hand-written config files cannot make the live pane take over the
+/// terminal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExplainConfig {
+    /// Maximum number of rows used by the live TUI Explain Analyze projection.
+    /// `None` means the built-in five-row default was not explicitly
+    /// configured. Keeping that distinction lets a project config explicitly
+    /// choose `5` over a user config choosing `3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_rows: Option<u8>,
+}
+
+fn default_explain_live_rows() -> u8 {
+    5
+}
+
+impl ExplainConfig {
+    /// Effective live-row value used by presentation surfaces. Keep this
+    /// helper public so every UI boundary applies the same defensive cap to
+    /// hand-edited config files.
+    pub fn effective_live_rows(&self) -> u8 {
+        self.live_rows
+            .unwrap_or_else(default_explain_live_rows)
+            .clamp(1, 5)
+    }
 }
 
 // ─── Budget Policy Configuration ────────────────────────────────────────────
@@ -338,6 +373,7 @@ impl Default for RuntimeConfig {
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
             budget_policy: None,
+            explain: ExplainConfig::default(),
         }
     }
 }
@@ -2102,6 +2138,7 @@ impl RuntimeConfig {
             runtime_limits,
             agent_binding_registry,
             budget_policy,
+            explain,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -2675,6 +2712,13 @@ impl RuntimeConfig {
             self.budget_policy = budget_policy;
         }
 
+        // Explain presentation keeps an explicit optional value so a higher
+        // precedence file can intentionally restore the built-in default
+        // (`5`) over a lower-precedence custom value.
+        if let Some(live_rows) = explain.live_rows {
+            self.explain.live_rows = Some(live_rows);
+        }
+
         self
     }
 
@@ -2908,6 +2952,7 @@ mod tests {
         assert!(toml.contains("[memory_pressure]"));
         assert!(toml.contains("[context_window]"));
         assert!(toml.contains("[agent_binding_registry]"));
+        assert_eq!(config.explain.effective_live_rows(), 5);
     }
 
     #[test]
@@ -3027,9 +3072,11 @@ mod tests {
                 max_ceiling: 1200,
                 reflect_after_consecutive_zero: 5,
             }),
+            explain: ExplainConfig { live_rows: Some(3) },
         });
 
         assert_eq!(merged.version, "2.0");
+        assert_eq!(merged.explain.live_rows, Some(3));
         assert_eq!(merged.compression.max_history_tokens, 12345);
         assert!((merged.compression.compression_threshold - 0.65).abs() < 0.001);
         assert!(!merged.compression.preserve_tool_calls);
@@ -3104,6 +3151,21 @@ mod tests {
         assert!((budget_policy.expand_factor - 2.0).abs() < f64::EPSILON);
         assert_eq!(budget_policy.max_ceiling, 1200);
         assert_eq!(budget_policy.reflect_after_consecutive_zero, 5);
+    }
+
+    #[test]
+    fn explicit_explain_default_overrides_a_lower_precedence_value() {
+        let user = RuntimeConfig {
+            explain: ExplainConfig { live_rows: Some(3) },
+            ..RuntimeConfig::default()
+        };
+        let project = RuntimeConfig {
+            explain: ExplainConfig { live_rows: Some(5) },
+            ..RuntimeConfig::default()
+        };
+        let merged = RuntimeConfig::default().merge(user).merge(project);
+        assert_eq!(merged.explain.live_rows, Some(5));
+        assert_eq!(merged.explain.effective_live_rows(), 5);
     }
 
     #[test]

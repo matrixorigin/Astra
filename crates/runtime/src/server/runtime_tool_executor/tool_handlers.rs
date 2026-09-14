@@ -868,6 +868,37 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         if args.get("artifact").is_some() {
+            // Explain Analyze snapshots are owned by the server run/session
+            // store.  Resolve this typed handle before the legacy local
+            // tool-result reader; a client-local Explain path/handle must
+            // never be treated as server authority.
+            if args
+                .get("artifact")
+                .and_then(Value::as_str)
+                .is_some_and(|handle| {
+                    handle.starts_with(crate::server::explain_analyze_artifact::ARTIFACT_URI_PREFIX)
+                })
+            {
+                return match crate::server::explain_analyze_artifact::resolve_request(
+                    context.session_artifact_store.as_deref(),
+                    &context.user_id,
+                    &context.session_id,
+                    args,
+                )
+                .await
+                {
+                    Some(Ok(output)) => {
+                        tool_result_from_output(output).with_source_bounded_model_projection()
+                    }
+                    Some(Err(error)) => tool_result_from_output(format!("Error: {error}"))
+                        .with_source_bounded_model_projection(),
+                    None => tool_result_from_output(
+                        "Error: server Explain Analyze artifact handle was not recognized"
+                            .to_string(),
+                    )
+                    .with_source_bounded_model_projection(),
+                };
+            }
             let owner = match OwnerScope::user(&context.user_id) {
                 Ok(owner) => owner,
                 Err(error) => {

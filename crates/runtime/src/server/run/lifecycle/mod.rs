@@ -187,6 +187,10 @@ const DURABLE_LIVE_BATCH_MAX_EVENTS: usize = 64;
 const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
+
+fn explain_artifact_publishable_status(status: RunStatus) -> bool {
+    RunStatus::TERMINAL.contains(&status)
+}
 const DURABLE_EVENT_COMMITTED_FIELD: &str = "_astra_durable_event_committed";
 
 fn terminal_batch_settlement_ready(event_count: usize, batch_committed: bool) -> bool {
@@ -10683,6 +10687,134 @@ impl AgenticRunLifecycleService {
         );
     }
 
+    async fn latest_explain_analyze_run(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        self.run_engine
+            .find_latest_explain_analyze_root(user_id, session_id)
+            .await
+    }
+
+    async fn append_latest_explain_artifact_context(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        edge_profile: &mut Map<String, Value>,
+    ) {
+        let run = match self.latest_explain_analyze_run(user_id, session_id).await {
+            Ok(run) => run,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    user_id,
+                    session_id,
+                    %error,
+                    "failed to discover the latest Explain Analyze run"
+                );
+                Self::append_runtime_required_prompt_text(
+                    edge_profile,
+                    crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
+                        "the server could not discover the latest Explain Analyze run: {error}"
+                    )),
+                );
+                return;
+            }
+        };
+        let Some((run_id, owner_generation)) = run else {
+            return;
+        };
+        match crate::server::explain_analyze_artifact::context_notice_for_run(
+            self.shared_pool.as_ref(),
+            user_id,
+            session_id,
+            &run_id,
+            owner_generation,
+        )
+        .await
+        {
+            Ok(Some(notice)) => Self::append_runtime_required_prompt_text(edge_profile, notice),
+            Ok(None) => {}
+            Err(error) => Self::append_runtime_required_prompt_text(
+                edge_profile,
+                crate::server::explain_analyze_artifact::unavailable_context_notice(&format!(
+                    "the server could not read Explain Analyze run {run_id}: {error}"
+                )),
+            ),
+        }
+    }
+
+    async fn publish_explain_artifact(
+        pool: Option<&SharedPool>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        session_turn: u32,
+        owner_generation: u64,
+        events: &[Value],
+    ) {
+        let turn_id = format!("turn-{session_turn}");
+        match crate::server::explain_analyze_artifact::persist_snapshot(
+            pool,
+            user_id,
+            session_id,
+            run_id,
+            &turn_id,
+            owner_generation,
+            events,
+        )
+        .await
+        {
+            Ok(Some(_handle)) => {}
+            Ok(None) => {
+                let reason =
+                    "Explain Analyze was requested, but the server produced no readable facts";
+                if let Err(error) = crate::server::explain_analyze_artifact::persist_unavailable(
+                    pool,
+                    user_id,
+                    session_id,
+                    run_id,
+                    &turn_id,
+                    owner_generation,
+                    reason,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id,
+                        session_id,
+                        run_id,
+                        %error,
+                        "failed to publish unavailable Explain Analyze artifact"
+                    );
+                }
+            }
+            Err(error) => {
+                let fallback = crate::server::explain_analyze_artifact::persist_unavailable(
+                    pool,
+                    user_id,
+                    session_id,
+                    run_id,
+                    &turn_id,
+                    owner_generation,
+                    &error,
+                )
+                .await;
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    user_id,
+                    session_id,
+                    run_id,
+                    fallback = ?fallback,
+                    %error,
+                    "server Explain Analyze artifact publication failed"
+                );
+            }
+        }
+    }
+
     fn apply_agent_binding_prompt_context(
         edge_profile: &mut Map<String, Value>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
@@ -13101,6 +13233,8 @@ impl AgenticRunLifecycleService {
         let bg_work_workspace = tool_runtime_workspace.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_shared_pool = self.shared_pool.clone();
+        let bg_explain = request.explain;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
@@ -13437,6 +13571,7 @@ impl AgenticRunLifecycleService {
                         user_cancellation = true;
                     }
                 }
+                let explain_events_for_artifact = bg_explain.then(|| events.clone());
                 let mut core_trace_result = Err(
                     "canonical terminal settlement did not acquire durable authority".to_string(),
                 );
@@ -13731,6 +13866,24 @@ impl AgenticRunLifecycleService {
                             "failed to retain observations after an independently committed terminal"
                         );
                     }
+                }
+
+                if bg_explain
+                    && owner_terminal_committed
+                    && explain_artifact_publishable_status(persisted_status)
+                    && core_trace_result.is_ok()
+                    && let Some(events) = explain_events_for_artifact.as_deref()
+                {
+                    Self::publish_explain_artifact(
+                        bg_shared_pool.as_ref(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        loop_state.session_turn,
+                        execution_owner_generation,
+                        events,
+                    )
+                    .await;
                 }
 
                 if owner_terminal_committed && core_trace_result.is_ok() {
@@ -14058,6 +14211,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
+        self.append_latest_explain_artifact_context(&user_id, &session_id, &mut edge_profile)
+            .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -14913,6 +15068,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
+        self.append_latest_explain_artifact_context(&user_id, &session_id, &mut edge_profile)
+            .await;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -16250,6 +16407,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_work_workspace = tool_runtime_workspace.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
+        let bg_shared_pool = self.shared_pool.clone();
+        let bg_explain = request.explain;
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -16670,6 +16829,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         user_cancellation = true;
                     }
                 }
+                let explain_events_for_artifact = bg_explain.then(|| final_events.clone());
                 // Ensure fast synchronous child-agent progress has reached both
                 // durable replay and the live SSE stream before parent terminal
                 // markers close the turn.
@@ -17117,6 +17277,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             "failed to retain streaming observations after an independently committed terminal"
                         );
                     }
+                }
+
+                if bg_explain
+                    && owner_terminal_committed
+                    && explain_artifact_publishable_status(persisted_status)
+                    && core_trace_result.is_ok()
+                    && let Some(events) = explain_events_for_artifact.as_deref()
+                {
+                    Self::publish_explain_artifact(
+                        bg_shared_pool.as_ref(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        state.session_turn,
+                        execution_owner_generation,
+                        events,
+                    )
+                    .await;
                 }
 
                 if owner_terminal_committed && core_trace_result.is_ok() {

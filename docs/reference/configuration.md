@@ -150,6 +150,22 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 - `ASTRA_AUX_LLM_POLICY` — policy for bounded auxiliary LLM calls. When unset, Astra uses `capacity_aware`: every eligible primary turn receives one bounded Work-admission decision, while provider admission accounts for its quota like any other inference; unrelated optional judges remain capacity-gated. Set `boundary_only` when a deployment deliberately prefers admission only at an executable boundary. An unavailable auxiliary decision is recorded as typed degradation and does not discard a primary response that already passed the canonical tool/lifecycle boundary; an explicitly `disabled` policy under Auto still fails closed before action or completion, and a client that deliberately omits classification must explicitly request `FixedDefault`. Set `always` to require all eligible auxiliary calls regardless of capacity policy.
 - `ASTRA_CAPTURE_TRACES`
 
+### Explain Analyze presentation
+
+The TUI keeps the live Explain Analyze tree in a compact status lane so it
+does not hide the conversation. Configure the row budget in
+`~/.astra/config/runtime.toml` (or the project override):
+
+```toml
+[explain]
+live_rows = 5 # 1–5, default 5
+```
+
+The same setting is available in the `/config` editor as **Live Explain
+Analyze rows (1–5)** and takes effect for the next live capture immediately.
+The settled Explain cell and the local Markdown report are not truncated by
+this live-row setting.
+
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
 
 Provider admission is intentionally configured by capacity inputs only. Scope is fixed at provider level; window size, retention, cleanup cadence, burst, and fail-closed behavior are internal runtime policy rather than deployment knobs.

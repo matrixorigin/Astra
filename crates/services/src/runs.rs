@@ -4369,6 +4369,17 @@ fn classify_atomic_run_terminal_facts(
     AtomicRunTerminalFactMatch::Exact
 }
 
+fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
+    run.depth == 0
+        && run.events.iter().any(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_started")
+                && event
+                    .pointer("/data/explain_analyze_requested")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+}
+
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     /// Process-local durable owner capability used to fence external action
@@ -4396,6 +4407,46 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
+
+    /// Find the newest root run that explicitly requested Explain Analyze.
+    /// Shared stores must answer this from their durable indexed
+    /// authority; callers must never infer it from a bounded UI run tree.
+    ///
+    /// The default is intentionally fail-closed when the session projection
+    /// is truncated. It remains useful for deterministic in-memory stores,
+    /// while a production store can override it with a direct indexed query.
+    async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        const FALLBACK_LIMIT: u32 = 100;
+        let page = self
+            .list_session_runs(user_id, session_id, FALLBACK_LIMIT)
+            .await?;
+        if page.truncated {
+            return Err(
+                "authoritative Explain Analyze discovery is unavailable because the session run projection is truncated"
+                    .to_string(),
+            );
+        }
+        let mut candidates = page
+            .runs
+            .into_iter()
+            .filter(|run| run.depth == 0 && run_requested_explain_analyze(run))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| right.run_id.cmp(&left.run_id))
+        });
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|run| (run.run_id, run.run_generation)))
+    }
 
     /// Read only the newest typed terminal cancellation origin.
     ///
@@ -6820,6 +6871,34 @@ impl RunStateStore for InMemoryRunStateStore {
             .get(run_id)
             .filter(|run| run.user_id == user_id)
             .cloned())
+    }
+
+    async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        let runs = self.runs.read().await;
+        let mut candidates = runs
+            .values()
+            .filter(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && run_requested_explain_analyze(run)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| right.run_id.cmp(&left.run_id))
+        });
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|run| (run.run_id, run.run_generation)))
     }
 
     async fn load_latest_terminal_cancellation_origin(
@@ -14364,6 +14443,38 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())?;
         Ok(Some(run))
+    }
+
+    async fn find_latest_explain_analyze_root(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(String, u64)>, String> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs runs \
+             WHERE runs.user_id = ? AND runs.session_id = ? AND runs.depth = 0 \
+               AND EXISTS ( \
+                   SELECT 1 FROM agent_run_events events \
+                   WHERE events.user_id = runs.user_id AND events.run_id = runs.run_id \
+                     AND events.event_type = 'run_started' \
+                     AND JSON_UNQUOTE(JSON_EXTRACT(events.payload_json, '$.data.explain_analyze_requested')) = 'true' \
+               ) \
+             ORDER BY runs.updated_at DESC, runs.created_at DESC, runs.run_id DESC \
+             LIMIT 1"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("find_latest_explain_analyze_root", session_id, source).to_string()
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+        Ok(Some((run.run_id, run.run_generation)))
     }
 
     async fn load_latest_terminal_cancellation_origin(
@@ -24662,6 +24773,52 @@ mod tests {
         run.ancestor_path = Some(format!("{root_run_id}/{run_id}"));
         run.depth = 1;
         run
+    }
+
+    #[tokio::test]
+    async fn in_memory_explain_discovery_is_not_limited_by_the_session_tree_page() {
+        let store = InMemoryRunStateStore::new();
+        for index in 0..101 {
+            let mut run = durable_run_record(&format!("history-{index:03}"));
+            run.status = STATUS_COMPLETED.to_string();
+            run.updated_at = "9999-01-01T00:00:00Z".to_string();
+            store.insert_run(run).await.unwrap();
+        }
+        let mut explain = durable_run_record("explain-target");
+        explain.status = STATUS_COMPLETED.to_string();
+        explain.updated_at = "2000-01-01T00:00:00Z".to_string();
+        explain.events = vec![json!({
+            "event_type": "run_started",
+            "data": {"explain_analyze_requested": true}
+        })];
+        store.insert_run(explain).await.unwrap();
+
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1")
+                .await
+                .unwrap()
+                .map(|(run_id, _)| run_id),
+            Some("explain-target".to_string())
+        );
+
+        let mut newer_paused = durable_run_record("explain-paused");
+        newer_paused.status = STATUS_PAUSED.to_string();
+        newer_paused.updated_at = "9999-01-02T00:00:00Z".to_string();
+        newer_paused.events = vec![json!({
+            "event_type": "run_started",
+            "data": {"explain_analyze_requested": true}
+        })];
+        store.insert_run(newer_paused).await.unwrap();
+
+        assert_eq!(
+            store
+                .find_latest_explain_analyze_root("u1", "s1")
+                .await
+                .unwrap()
+                .map(|(run_id, _)| run_id),
+            Some("explain-paused".to_string())
+        );
     }
 
     #[tokio::test]

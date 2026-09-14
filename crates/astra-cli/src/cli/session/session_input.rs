@@ -382,6 +382,21 @@ mod tests {
     }
 
     #[test]
+    fn explain_artifact_context_is_not_injected_from_a_client_local_store() {
+        let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f304";
+        let state = SessionState {
+            session_id: Some(session_id.to_string()),
+            ..SessionState::default()
+        };
+        let prepared = prepare_input(
+            "analyze the previous explain",
+            &state,
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
+        assert!(prepared.runtime_required_texts.is_empty());
+    }
+
+    #[test]
     fn clear_pending_recovery_for_ordinary_chat_input_drops_resume_state() {
         let mut state = SessionState {
             pending_recovery: Some("sess-stale".into()),

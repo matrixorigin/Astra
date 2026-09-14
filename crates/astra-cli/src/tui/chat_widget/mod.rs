@@ -1719,6 +1719,10 @@ pub(crate) struct ChatWidget {
     /// mode. The measured graph itself is identical for `on` and `verbose`;
     /// only the presentation detail level changes.
     explain_analyze_verbose: bool,
+    /// Maximum number of rows reserved for the live Explain Analyze lane.
+    /// This is configured through `/config` and remains bounded by the
+    /// renderer's hard five-row ceiling.
+    explain_analyze_live_rows: u8,
     /// Identity of the non-Task ToolCell in `active_cell`. Tool completion
     /// must match this id; a late completion for some other tool must never
     /// finalize the currently visible command by name or position alone.
@@ -1796,6 +1800,7 @@ impl ChatWidget {
             explain_analyze_capture_pending: false,
             explain_analyze_delivery_degraded: false,
             explain_analyze_verbose: false,
+            explain_analyze_live_rows: 5,
             active_tool_use_id: None,
             parked_tools: std::collections::HashMap::new(),
             parked_tool_order: Vec::new(),
@@ -2491,6 +2496,10 @@ impl ChatWidget {
         self.explain_analyze_verbose = verbose;
     }
 
+    pub(crate) fn set_explain_live_rows(&mut self, rows: u8) {
+        self.explain_analyze_live_rows = rows.clamp(1, 5);
+    }
+
     pub(crate) fn explain_analyze_live_lines(
         &self,
         width: u16,
@@ -2504,7 +2513,7 @@ impl ChatWidget {
             Some(ExplainAnalyzeCell::live_lines(
                 graph,
                 width,
-                rows,
+                rows.min(u16::from(self.explain_analyze_live_rows)),
                 self.explain_analyze_delivery_degraded,
                 self.explain_analyze_verbose,
             ))
@@ -2512,7 +2521,7 @@ impl ChatWidget {
             Some(ExplainAnalyzeCell::live_lines(
                 &Default::default(),
                 width,
-                rows,
+                rows.min(u16::from(self.explain_analyze_live_rows)),
                 true,
                 self.explain_analyze_verbose,
             ))
@@ -2556,17 +2565,39 @@ impl ChatWidget {
             return;
         };
         let events = std::mem::take(&mut self.explain_analyze_events);
-        if let Err(error) =
-            crate::explain_analyze_artifact::persist(&self.session_id, &events, delivery_degraded)
-        {
-            tracing::warn!("failed to persist Explain Analyze artifact: {error}");
-        }
+        let mut publication_error = None;
+        let publication = match crate::explain_analyze_artifact::persist_rendered_report(
+            &self.session_id,
+            &events,
+            delivery_degraded,
+            self.explain_analyze_verbose,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                tracing::warn!("failed to persist Explain Analyze artifact: {error}");
+                publication_error = Some(error);
+                None
+            }
+        };
         graph.finish_ingest();
         if !graph.nodes().is_empty() {
             self.commit_cell(Box::new(ExplainAnalyzeCell::new(
                 graph,
                 delivery_degraded,
                 self.explain_analyze_verbose,
+            )));
+        }
+        if let Some(publication) = publication {
+            self.commit_concurrent_system(SystemCell::info(publication.user_notice()));
+            if let Some(error) = publication.render_error {
+                self.commit_concurrent_system(SystemCell::warning(format!(
+                    "Explain Analyze report was not rendered: {error}"
+                )));
+            }
+        }
+        if let Some(error) = publication_error {
+            self.commit_concurrent_system(SystemCell::warning(format!(
+                "Explain Analyze artifact unavailable: {error}"
             )));
         }
     }

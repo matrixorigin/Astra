@@ -5144,6 +5144,7 @@ pub(crate) async fn run_tui_session(
         _ => chat_widget::ChatWidget::new(String::new()),
     };
     chat_widget.set_explain_verbose(matches!(state.explain, crate::ExplainMode::Verbose));
+    chat_widget.set_explain_live_rows(state.runtime_config.explain.effective_live_rows());
 
     if let Some(prompt) = state.perm_manager.workspace_trust_startup_prompt() {
         use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
@@ -5882,6 +5883,9 @@ pub(crate) async fn run_tui_session(
                                             state.explain,
                                             crate::ExplainMode::Verbose
                                         ));
+                                        chat_widget.set_explain_live_rows(
+                                            state.runtime_config.explain.effective_live_rows(),
+                                        );
                                         rebind_workbench_observers(
                                             Some(new_sid),
                                             &task_board,
@@ -8049,6 +8053,11 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     state.config_version_id =
                                                         Some(save.new_version_id.clone());
+                                                    state.runtime_config =
+                                                        astra_config::runtime_config::RuntimeConfig::load();
+                                                    chat_widget.set_explain_live_rows(
+                                                        state.runtime_config.explain.effective_live_rows(),
+                                                    );
                                                 }
                                                 history_cell::system::SystemCell::response(outcome.message)
                                             }

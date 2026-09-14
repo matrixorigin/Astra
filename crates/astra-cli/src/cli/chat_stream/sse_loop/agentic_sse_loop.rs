@@ -57,16 +57,19 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         current_session_id,
     } = ctx;
 
-    let explain_artifact_handle = if explain != ExplainMode::Off {
+    let mut explain_artifact_error = None;
+    let explain_artifact = if explain != ExplainMode::Off {
         current_session_id.and_then(|session_id| {
-            match crate::explain_analyze_artifact::persist(
+            match crate::explain_analyze_artifact::persist_rendered_report(
                 session_id,
                 explain_analyze_events,
                 explain_analyze_degraded,
+                explain == ExplainMode::Verbose,
             ) {
-                Ok(handle) => handle,
+                Ok(publication) => publication,
                 Err(error) => {
                     tracing::warn!("failed to persist Explain Analyze artifact: {error}");
+                    explain_artifact_error = Some(error);
                     None
                 }
             }
@@ -84,8 +87,14 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                 explain_analyze_degraded,
             )
         );
-        if let Some(handle) = explain_artifact_handle {
-            eprintln!("Explain Analyze artifact · {handle}");
+        if let Some(publication) = explain_artifact.as_ref() {
+            eprintln!("{}", publication.user_notice());
+            if let Some(error) = publication.render_error.as_deref() {
+                eprintln!("Explain Analyze report warning · {error}");
+            }
+        }
+        if let Some(error) = explain_artifact_error.as_deref() {
+            eprintln!("Explain Analyze artifact unavailable · {error}");
         }
     }
     if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
