@@ -54,6 +54,8 @@ if COMPOSE_LOG="$compose_log" \
     EVENT_LOG="$event_log" \
     ASTRA_MYSQL_CLIENT="$mysql_stub" \
     ASTRA_MYSQL_TLS_MODE=auto \
+    MEMORIA_DB_READY_RETRIES=1 \
+    MEMORIA_DB_READY_RETRY_DELAY_SECONDS=0 \
     make --no-print-directory -s -C "$repo_root" \
         STACK_ENV="$stack_env" STACK_COMPOSE="$compose_stub" stack-up \
         >"$test_root/failure.log" 2>&1; then
@@ -84,6 +86,8 @@ COMPOSE_LOG="$compose_log" \
 EVENT_LOG="$event_log" \
 ASTRA_MYSQL_CLIENT="$mysql_ok_stub" \
 ASTRA_MYSQL_TLS_MODE=auto \
+MEMORIA_DB_READY_RETRIES=1 \
+MEMORIA_DB_READY_RETRY_DELAY_SECONDS=0 \
     make --no-print-directory -s -C "$repo_root" \
         STACK_ENV="$stack_env" STACK_COMPOSE="$compose_stub" stack-up \
         >"$test_root/success.log" 2>&1
