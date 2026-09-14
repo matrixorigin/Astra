@@ -117,6 +117,12 @@ continuation, not automatic replay of an interrupted execution.
   reported as non-retryable at the carrier boundary. This does not prevent
   reassessment on a new turn or a supported context invalidation, nor change
   retryability of an already admitted durable operation.
+- Requested mutations must remain explicit admission actions; goal prose is
+  insufficient. Missing cancel/replace targets are malformed, never silently
+  removed. The model may choose an initial target when the user delegates that
+  choice, but cannot invent an externally bound identity. Mutation delivery
+  triggers govern graph changes; nested task prerequisites govern execution,
+  so immediate creation does not imply immediate execution.
 - Admission task and goal text use the canonical Work domain validators.
   Concise-generation targets are not validity limits: exceeding a brevity
   target alone cannot reject Work or trigger repair. Domain byte bounds,

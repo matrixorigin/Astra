@@ -389,6 +389,13 @@ pub enum Criterion {
         delivered_items: usize,
         #[serde(default)]
         cancellation_after_deliveries: usize,
+        /// Minimum delivered initial items before any added item is assigned
+        /// or observed executing. Creation alone does not satisfy execution.
+        #[serde(default)]
+        added_execution_after_initial_deliveries: usize,
+        /// The complete start receipt must already contain every added item.
+        #[serde(default)]
+        require_added_at_start: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -2408,6 +2415,8 @@ fn evaluate_one(
             added_items,
             delivered_items,
             cancellation_after_deliveries,
+            added_execution_after_initial_deliveries,
+            require_added_at_start,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -2418,7 +2427,12 @@ fn evaluate_one(
                 *cancelled_items,
                 *added_items,
                 *delivered_items,
-                *cancellation_after_deliveries,
+                work_replacement::Timing {
+                    cancellation_after_deliveries: *cancellation_after_deliveries,
+                    added_execution_after_initial_deliveries:
+                        *added_execution_after_initial_deliveries,
+                    require_added_at_start: *require_added_at_start,
+                },
             );
             CriterionResult {
                 criterion: c.clone(),
@@ -4067,6 +4081,8 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             added_items,
             delivered_items,
             cancellation_after_deliveries,
+            added_execution_after_initial_deliveries,
+            ..
         } => {
             if *initial_items == 0
                 || *cancelled_items == 0
@@ -4076,6 +4092,8 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                     .and_then(|remaining| remaining.checked_add(*added_items))
                     != Some(*delivered_items)
                 || *cancellation_after_deliveries > *delivered_items
+                || *added_execution_after_initial_deliveries
+                    > initial_items.saturating_sub(*cancelled_items)
             {
                 return Err("JournalWorkReplacementLifecycle requires consistent positive initial/cancel/add counts and a reachable delivery bound".into());
             }

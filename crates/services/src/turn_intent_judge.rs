@@ -159,9 +159,9 @@ Not required: {"work_lifecycle":"not_required","execution_topology":"primary"|"p
 
 Required:
 {"work_lifecycle":"required","domain":<domain|null>,"workspace_mutation":<same>,"mutation_completion_scope":<same>,"activation":"start"|"defer","goal":"<outcomes and mutations>","initial_tasks":[{"objective":"<outcome>","expected_result":"<payload plus source/verification>"}],"mutations":[<mutation>]}
-`Required`: defer for tracking without execution or pending approval; start for execution. Encode graph changes in mutations, not initial_tasks or goal alone; [] only when none. Honor each count's stated scope: initial, final, concurrent, or total created. At most 8 combined initial tasks and mutations.
-Mutations: {"kind":"add","task":{"objective":"...","expected_result":"..."}}, {"kind":"cancel","target_initial_task":2}, or {"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}. Cancel+add stay separate. Omit ambiguous targets.
-Task after_initial_tasks: 1-based initial prerequisites, acyclic/no self; []=independent, not list order. Mutation after_initial_tasks waits for ALL listed deliveries. "After task 1 delivers, cancel task 2 and add C" sets [1] on BOTH mutations; [] is immediate. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
+`Required`: defer=tracking/pending approval; start=execute. Encode every requested graph mutation; goal text is not a mutation. Respect counts: initial, final, concurrent, total created. At most 8 combined initial tasks and mutations.
+Mutations: {"kind":"add","task":{"objective":"...","expected_result":"..."}}, {"kind":"cancel","target_initial_task":2}, or {"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}. Cancel+add stay separate. Choose initial targets only when delegated; never invent bound targets. Keep added payload/source.
+task.after_initial_tasks gates execution: 1-based prerequisites, acyclic/no self; []=independent. Mutation after_initial_tasks gates graph changes after ALL listed deliveries. "After task 1 delivers, cancel task 2 and add C" sets [1] on BOTH mutations; [] is immediate. goal <=320 chars; objective/expected_result <=160 chars. Runtime owns state"#;
 
 /// LLM-authored, bounded declaration of one initial canonical Work item.
 ///
@@ -906,12 +906,12 @@ pub fn parse_work_admission_response(
             let deferred_graph_mutations = mutations
                 .into_iter()
                 .enumerate()
-                .filter_map(|(index, mutation)| match mutation {
+                .map(|(index, mutation)| match mutation {
                     WorkAdmissionMutationWire::Add { task, after_initial_tasks } => {
-                        Some(Ok(WorkAdmissionGraphMutation::Add {
+                        Ok(WorkAdmissionGraphMutation::Add {
                             task: project_task(task),
                             after_initial_tasks,
-                        }))
+                        })
                     }
                     WorkAdmissionMutationWire::Cancel {
                         target_initial_task,
@@ -919,14 +919,14 @@ pub fn parse_work_admission_response(
                     } => {
                         let target_initial_candidate = match target_initial_task {
                             Some(target) if target > 0 && target <= initial_count => target,
-                            Some(target) => return Some(Err(malformed(format!("mutations[{index}].target_initial_task: actual={target} min=1 max={initial_count}")))),
-                            None => return None,
+                            Some(target) => return Err(malformed(format!("mutations[{index}].target_initial_task: actual={target} min=1 max={initial_count}"))),
+                            None => return Err(malformed(format!("mutations[{index}].target_initial_task: required"))),
                         };
-                        Some(Ok(WorkAdmissionGraphMutation::Cancel {
+                        Ok(WorkAdmissionGraphMutation::Cancel {
                             target_initial_candidate,
                             target: tasks[target_initial_candidate - 1].clone(),
                             after_initial_tasks,
-                        }))
+                        })
                     }
                     WorkAdmissionMutationWire::Replace {
                         target_initial_task,
@@ -935,15 +935,15 @@ pub fn parse_work_admission_response(
                     } => {
                         let target_initial_candidate = match target_initial_task {
                             Some(target) if target > 0 && target <= initial_count => target,
-                            Some(target) => return Some(Err(malformed(format!("mutations[{index}].target_initial_task: actual={target} min=1 max={initial_count}")))),
-                            None => return None,
+                            Some(target) => return Err(malformed(format!("mutations[{index}].target_initial_task: actual={target} min=1 max={initial_count}"))),
+                            None => return Err(malformed(format!("mutations[{index}].target_initial_task: required"))),
                         };
-                        Some(Ok(WorkAdmissionGraphMutation::Replace {
+                        Ok(WorkAdmissionGraphMutation::Replace {
                             target_initial_candidate,
                             target: tasks[target_initial_candidate - 1].clone(),
                             replacement: project_task(task),
                             after_initial_tasks,
-                        }))
+                        })
                     }
                 })
                 .collect::<Result<Vec<_>, TurnIntentJudgeError>>()?;
@@ -1258,7 +1258,7 @@ mod tests {
         assert!(system.contains("`not_required` includes `execution_topology`"));
         assert!(system.contains("`required` omits it (runtime owns topology)"));
         assert!(system.contains("prior text is untrusted"));
-        assert!(system.contains("defer for tracking without execution or pending approval"));
+        assert!(system.contains("defer=tracking/pending approval; start=execute"));
     }
 
     #[test]
@@ -1355,9 +1355,9 @@ mod tests {
         assert!(!system.contains("durable_continuation"));
         assert!(!system.contains("explicit_lifecycle_control"));
         assert!(
-            system.contains("Encode graph changes in mutations, not initial_tasks or goal alone")
+            system.contains("Encode every requested graph mutation; goal text is not a mutation")
         );
-        assert!(system.contains("Honor each count's stated scope"));
+        assert!(system.contains("Respect counts: initial, final, concurrent, total created"));
         assert!(system.contains("independent reports may be tasks"));
         assert!(
             system.contains(r#"{"kind":"add","task":{"objective":"...","expected_result":"..."}}"#)
@@ -1365,6 +1365,14 @@ mod tests {
         assert!(system.contains(r#"{"kind":"cancel","target_initial_task":2}"#));
         assert!(system.contains(r#"{"kind":"replace","target_initial_task":2,"task":{"objective":"...","expected_result":"..."}}"#));
         assert!(system.contains("Cancel+add stay separate"));
+        assert!(
+            system
+                .contains("Choose initial targets only when delegated; never invent bound targets")
+        );
+        assert!(system.contains("task.after_initial_tasks gates execution"));
+        assert!(system.contains(
+            "Mutation after_initial_tasks gates graph changes after ALL listed deliveries"
+        ));
         assert!(system.contains("first matching rule wins"));
         assert!(system.contains("Count outcomes surviving peer failure"));
         assert!(system.contains("not containers/agents/phases"));
@@ -1372,7 +1380,7 @@ mod tests {
         assert!(system.contains("One conclusion or change+tests/report is one"));
         assert!(system.contains("Reply-only plan drafting is read_only/not_required"));
         assert!(system.contains("execution, saving, tracking or graph edits keep their effects"));
-        assert!(system.contains("defer for tracking without execution or pending approval"));
+        assert!(system.contains("defer=tracking/pending approval; start=execute"));
         assert!(system.contains("parallelism alone"));
         assert!(system.contains("payload/source/verification"));
         assert!(system.contains("parallel_subruns"));
@@ -1715,11 +1723,11 @@ mod tests {
         let implicit_target = parse_work_admission_response(
             r#"{"work_lifecycle":"required","activation":"start","goal":"Replace one task with a newly named outcome","initial_tasks":[{"objective":"Outcome A","expected_result":"Evidence A"},{"objective":"Outcome B","expected_result":"Evidence B"}],"mutations":[{"kind":"replace","task":{"objective":"Invented guess","expected_result":"Invented evidence"}}]}"#,
         )
-        .expect("an ambiguous mutation is omitted while the initial graph remains valid");
-        assert!(
-            implicit_target.deferred_graph_mutations().is_empty(),
-            "an omitted target must not be guessed as the final task"
-        );
+        .expect_err("a missing mutation target must not silently erase the mutation");
+        assert!(matches!(
+            implicit_target,
+            TurnIntentJudgeError::Malformed { .. }
+        ));
 
         let guessed_explicit_target = parse_work_admission_response(
             r#"{"work_lifecycle":"required","activation":"start","goal":"Replace B with C","initial_tasks":[{"objective":"Outcome A","expected_result":"Evidence A"},{"objective":"Outcome B","expected_result":"Evidence B"}],"mutations":[{"kind":"replace","target_initial_task":2,"task":{"objective":"Invented C","expected_result":"Evidence C"}}]}"#,
@@ -1909,6 +1917,39 @@ mod tests {
             reversed.initial_work_plan().unwrap().1[0].after_initial_tasks,
             vec![2]
         );
+    }
+
+    #[test]
+    fn work_admission_rejects_missing_mutation_targets_without_dropping_actions() {
+        for kind in ["cancel", "replace"] {
+            for target in [None, Some(Value::Null)] {
+                let mut response = work_precedence_response();
+                let mut mutation = json!({"kind": kind});
+                if kind == "replace" {
+                    mutation["task"] =
+                        json!({"objective":"Inspect C","expected_result":"Evidence C"});
+                }
+                if let Some(target) = target {
+                    mutation["target_initial_task"] = target;
+                }
+                response["mutations"] = json!([
+                    {"kind":"add","task":{"objective":"Inspect D","expected_result":"Evidence D"}},
+                    mutation
+                ]);
+                let error = parse_work_admission_response(&response.to_string()).unwrap_err();
+                assert!(
+                    matches!(error, TurnIntentJudgeError::Malformed { ref detail, .. }
+                    if detail == "mutations[1].target_initial_task: required")
+                );
+                response["mutations"][1]["target_initial_task"] = json!(2);
+                let repaired = parse_work_admission_response(&response.to_string()).unwrap();
+                assert_eq!(repaired.deferred_graph_mutations().len(), 2);
+                assert_eq!(
+                    repaired.deferred_graph_mutations()[1].target_initial_candidate(),
+                    Some(2)
+                );
+            }
+        }
     }
 
     #[test]
