@@ -31,7 +31,8 @@ pub(crate) struct SlashItem {
     pub extra_subcommands: Vec<(String, String)>,
     /// Frequency hint — higher means "show sooner on ties".
     pub usage_boost: u32,
-    /// Included in the curated list shown for a bare `/`.
+    /// Priority in the bare `/` list. All TUI-available commands remain
+    /// discoverable there; primary commands are ordered first.
     pub primary: bool,
     /// Command group for categorized rendering in the popup.
     pub group: Option<crate::cli::command_registry::CommandGroup>,
@@ -286,16 +287,16 @@ impl SlashMenu {
     }
 
     fn reset_to_all(&mut self) {
-        let mut idx: Vec<usize> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| item.primary.then_some(index))
-            .collect();
+        // A bare slash is the user's command palette. Keep featured actions
+        // at the top, but do not hide the rest of the TUI-native surface:
+        // typed search should refine the same complete set rather than being
+        // the only way to discover a command.
+        let mut idx: Vec<usize> = (0..self.items.len()).collect();
         idx.sort_by(|&a, &b| {
             self.items[b]
-                .usage_boost
-                .cmp(&self.items[a].usage_boost)
+                .primary
+                .cmp(&self.items[a].primary)
+                .then(self.items[b].usage_boost.cmp(&self.items[a].usage_boost))
                 .then(a.cmp(&b))
         });
         self.filtered = idx;

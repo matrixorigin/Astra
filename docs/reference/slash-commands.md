@@ -4,7 +4,11 @@ Complete reference for slash commands available in the `astra` TUI.
 
 ## Overview
 
-astra supports dozens of slash commands organized into 9 groups. Type `/help` to see all available commands, or `/help keys` for keyboard shortcuts.
+astra supports dozens of slash commands organized into 9 groups. Type `/` to
+open the complete palette of commands that can run inside the TUI; featured
+actions appear first and the remaining actions are available by scrolling or
+typing a filter. Type `/help` for grouped command help, or `/help keys` for
+keyboard shortcuts.
 
 ## Command Groups
 
