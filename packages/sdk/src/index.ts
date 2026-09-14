@@ -2,6 +2,7 @@
 export type {
   // Stream events
   StreamEventType,
+  ArtifactPublicationV1,
   StreamEvent,
   ConnectionState,
   SessionInfoEvent,
@@ -468,3 +469,5 @@ export type { AstraWebSocketOptions, ToolApproval } from "./websocket";
 
 export { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
 export type { ExplainAnalyzeLayoutNodeV1, ExplainAnalyzeLayoutEdgeKindV1, ExplainAnalyzeLayoutEdgeV1, ExplainAnalyzeLayoutDomainV1, ExplainAnalyzeLayoutV1, ExplainAnalyzeLayoutOptionsV1 } from "./explain-analyze-layout";
+
+export { isArtifactPublicationV1 } from "./artifact-publication";

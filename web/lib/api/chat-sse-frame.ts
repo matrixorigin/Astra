@@ -19,5 +19,5 @@ export function isReplayConnectionError(event: Record<string, unknown>): boolean
 }
 
 export function isReplayObservationEvent(event: Record<string, unknown>): boolean {
-  return event.type === "explain_analyze" || event.type === "stream_gap" || isReplayConnectionError(event);
+  return event.type === "artifact_publication" || event.type === "explain_analyze" || event.type === "stream_gap" || isReplayConnectionError(event);
 }

@@ -700,6 +700,7 @@ pub enum StreamEvent {
     },
     /// Canonical measured execution fact used by Explain Analyze consumers.
     ExplainAnalyze(ExplainAnalyzeEventV1),
+    ArtifactPublication(astra_turn_types::ArtifactPublicationV1),
     Ping,
     Done {
         tokens_used: Option<u64>,
@@ -972,6 +973,10 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 .map_err(|reason| crate::error::ThinClientError::SseParse(reason.to_string()))?;
             StreamEvent::ExplainAnalyze(fact)
         }
+        "artifact_publication" => StreamEvent::ArtifactPublication(
+            astra_turn_types::ArtifactPublicationV1::from_wire(&raw)
+                .map_err(|reason| crate::error::ThinClientError::SseParse(reason.to_string()))?,
+        ),
         "ping" => StreamEvent::Ping,
         "done" => StreamEvent::Done {
             tokens_used: obj.get("tokens_used").and_then(|v| v.as_u64()).or_else(|| {

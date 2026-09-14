@@ -288,6 +288,13 @@ export const MessageBubble = memo(function MessageBubble({
           live={assistantStillStreaming}
         />
       ) : null}
+      {message.artifactPublication ? (
+        <div role="status" className={`mt-2 rounded-md border px-3 py-2 text-xs ${message.artifactPublication.status === "unavailable" ? "border-amber-500/30 text-amber-600" : "border-border text-muted-foreground"}`}>
+          {message.artifactPublication.status === "published" ? (
+            <><p>Explain report saved · available to the agent</p><code className="mt-1 block break-all select-all">{message.artifactPublication.handle}</code></>
+          ) : <p>Explain report unavailable · {message.artifactPublication.message}</p>}
+        </div>
+      ) : null}
       {hasArtifacts ? <ArtifactList artifacts={artifacts} /> : null}
       {message.status !== "streaming" ? (
         <div className="mt-3 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">

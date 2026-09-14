@@ -492,6 +492,13 @@ export function useStreamLifecycle(
     [repairWorkSurfaceFromDurable, setDetail, setWorkSurface],
   );
 
+  const applyArtifactPublication = useCallback(
+    (assistantMessageId: string, event: import("@astra/sdk").ArtifactPublicationV1) => {
+      setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+        message.id === assistantMessageId ? { ...message, artifactPublication: event } : message) }));
+    }, [setDetail],
+  );
+
   const applyExplainAnalyzeEvent = useCallback(
     (assistantMessageId: string, event: import("@astra/sdk").ExplainAnalyzeEventV1) => {
       setDetail((current) => ({
@@ -541,6 +548,7 @@ export function useStreamLifecycle(
               detail.chat.id,
               runId,
               {
+                onArtifactPublication: (event) => applyArtifactPublication(repair.assistantMessageId, event),
                 onExplainAnalyzeEvent: (event) => {
                   sawExplainFact = true;
                   applyExplainAnalyzeEvent(repair.assistantMessageId, event);
@@ -585,7 +593,7 @@ export function useStreamLifecycle(
         }
       })();
     },
-    [applyExplainAnalyzeEvent, markExplainAnalyzeInvalid, detail.chat.id, setDetail],
+    [applyArtifactPublication, applyExplainAnalyzeEvent, markExplainAnalyzeInvalid, detail.chat.id, setDetail],
   );
 
   const loadAgentRunProjection = useCallback(
@@ -628,6 +636,7 @@ export function useStreamLifecycle(
         {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
           onExplainAnalyzeEvent: (event) =>
             applyExplainAnalyzeEvent(assistantMessageId, event),
           onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
@@ -750,7 +759,8 @@ export function useStreamLifecycle(
     },
     [
       applyWorkSurfaceStreamEvent,
-      applyExplainAnalyzeEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
       markExplainAnalyzeInvalid,
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
@@ -873,6 +883,7 @@ export function useStreamLifecycle(
         await streamChatMessage(detail.chat.id, streamPayload, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onArtifactPublication: (event) => applyArtifactPublication(currentAssistantId, event),
           onExplainAnalyzeEvent: (event) =>
             applyExplainAnalyzeEvent(currentAssistantId, event),
           onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(currentAssistantId),
@@ -1108,7 +1119,8 @@ export function useStreamLifecycle(
     },
     [
       applyWorkSurfaceStreamEvent,
-      applyExplainAnalyzeEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
       markExplainAnalyzeInvalid,
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
@@ -1180,6 +1192,7 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
             onExplainAnalyzeEvent: (event) =>
               applyExplainAnalyzeEvent(assistantMessageId, event),
           onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
@@ -1344,7 +1357,8 @@ export function useStreamLifecycle(
     [
       addToast,
       applyWorkSurfaceStreamEvent,
-      applyExplainAnalyzeEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
       markExplainAnalyzeInvalid,
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
@@ -1574,6 +1588,7 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
             onExplainAnalyzeEvent: (event) =>
               applyExplainAnalyzeEvent(assistantMessageId, event),
           onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
@@ -1759,6 +1774,7 @@ export function useStreamLifecycle(
   }, [
     addToast,
     applyWorkSurfaceStreamEvent,
+    applyArtifactPublication,
     applyExplainAnalyzeEvent,
     markExplainAnalyzeInvalid,
     repairExplainAnalyzeFromDurable,

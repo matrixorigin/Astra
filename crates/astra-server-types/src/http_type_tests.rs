@@ -657,6 +657,7 @@ fn chat_response_serializes_with_explain() {
 #[test]
 fn run_status_response_serializes() {
     let resp = RunStatusResponse {
+        artifact_publication: None,
         run_id: "r1".into(),
         session_id: "s1".into(),
         parent_run_id: None,
@@ -1056,6 +1057,7 @@ fn session_list_record_to_response() {
 fn run_list_record_to_response_preserves_optional_total_and_cursor() {
     let record = RunListRecord {
         runs: vec![RunStatusRecord {
+            artifact_publication: None,
             run_id: "run-1".into(),
             session_id: "session-1".into(),
             parent_run_id: None,
@@ -1124,6 +1126,7 @@ fn chat_run_record_to_response() {
 fn run_status_record_to_response() {
     // with waiting_for
     let record = RunStatusRecord {
+        artifact_publication: None,
         run_id: "r1".into(),
         session_id: "s1".into(),
         parent_run_id: Some("root".into()),
@@ -1147,6 +1150,7 @@ fn run_status_record_to_response() {
 
     // without waiting_for
     let record = RunStatusRecord {
+        artifact_publication: None,
         run_id: "r2".into(),
         session_id: "s2".into(),
         parent_run_id: None,
@@ -1190,6 +1194,7 @@ fn run_mutation_record_to_response() {
 #[test]
 fn run_mutation_continuation_to_response() {
     let record = RunMutationRecord {
+        artifact_publication: None,
         run_id: "child-run".into(),
         status: "paused".into(),
         previous_status: "paused".into(),

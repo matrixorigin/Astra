@@ -4,7 +4,7 @@ import type {
   RunInterruptedEvent,
   StreamErrorEvent,
 } from "@astra/sdk";
-import { isExplainAnalyzeEventV1 } from "@astra/sdk";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
 import {
   setChatActiveRun,
   updateStreamingAssistantMessage,
@@ -104,7 +104,9 @@ export function applyExplainAnalyzeObservation(
   ctx: StreamEventContext,
   replayOnly = false,
 ): void {
-  if (event.type === "explain_analyze") {
+  if (event.type === "artifact_publication" && isArtifactPublicationV1(event)) {
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { artifactPublication: event });
+  } else if (event.type === "explain_analyze") {
     updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId,
       isExplainAnalyzeEventV1(event)
         ? { explainAnalyzeEvent: event }
@@ -210,6 +212,12 @@ export function applyStreamEvent(
           waitingFor: null,
         });
       }
+      break;
+    }
+
+    case "artifact_publication": {
+      if (!isArtifactPublicationV1(event)) throw new Error("Invalid report publication result.");
+      updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { artifactPublication: event });
       break;
     }
 

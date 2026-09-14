@@ -4166,6 +4166,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.emit_stream_event(chat_stream::StreamEvent::ExplainAnalyze(fact))
                 .await;
         }
+        if event.get("type").and_then(Value::as_str) == Some("artifact_publication") {
+            let outcome = astra_turn_types::ArtifactPublicationV1::from_wire(event)?;
+            if self.last_bound_run_id.as_deref() != Some(outcome.run_id.as_str()) {
+                return Err("artifact publication belongs to another run".to_string());
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::ArtifactPublication(outcome))
+                .await;
+        }
         if self.explain_analyze_enabled
             && event.get("type").and_then(Value::as_str) == Some("stream_gap")
             && event

@@ -2770,6 +2770,7 @@ enum AgentWorkbenchOutcome {
         runs: Vec<crate::tui::local_agent_journal::LocalJournalAgentRun>,
     },
     ControlAccepted {
+        publication: Option<astra_turn_types::ArtifactPublicationV1>,
         agent_id: String,
         action: astra_thin_client::SessionRunAction,
     },
@@ -2842,7 +2843,7 @@ fn dispatch_local_agent_journal_load(
 const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum AgentControlExecution {
-    Applied,
+    Applied(Option<astra_turn_types::ArtifactPublicationV1>),
     SessionContinuationRequired {
         session_id: String,
         source_run_id: String,
@@ -2872,7 +2873,14 @@ fn project_agent_control_execution(
                 source_run_id: source_run_id.to_string(),
             })
         }
-        Some("applied") => Ok(AgentControlExecution::Applied),
+        Some("applied") => Ok(AgentControlExecution::Applied(
+            value
+                .get("artifact_publication")
+                .filter(|value| !value.is_null())
+                .map(astra_turn_types::ArtifactPublicationV1::from_wire)
+                .transpose()
+                .map_err(str::to_string)?,
+        )),
         Some(other) => Err(format!(
             "server returned unknown control disposition '{other}'"
         )),
@@ -2924,10 +2932,13 @@ fn dispatch_agent_control(
         )
         .await;
         let outcome = match result {
-            Ok(Ok(AgentControlExecution::Applied)) => AgentWorkbenchOutcome::ControlAccepted {
-                agent_id: agent_id_owned,
-                action,
-            },
+            Ok(Ok(AgentControlExecution::Applied(publication))) => {
+                AgentWorkbenchOutcome::ControlAccepted {
+                    publication,
+                    agent_id: agent_id_owned,
+                    action,
+                }
+            }
             Ok(Ok(AgentControlExecution::SessionContinuationRequired {
                 session_id,
                 source_run_id,
@@ -2977,7 +2988,7 @@ async fn execute_agent_control(
                 .await
                 .owns_local_stop()
             {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 Err("the local runtime no longer owns an active agent with this identity".into())
             }
@@ -2990,7 +3001,7 @@ async fn execute_agent_control(
                 return Err("the local delegation runtime is unavailable".into());
             };
             if engine.cancel_sub_run(&run_id).await {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 Err("the local delegated run is no longer active or controllable".into())
             }
@@ -3015,7 +3026,7 @@ async fn execute_agent_control(
             };
             let value = result.map_err(|error| error.to_string())?;
             if action == astra_thin_client::SessionRunAction::Cancel {
-                Ok(AgentControlExecution::Applied)
+                Ok(AgentControlExecution::Applied(None))
             } else {
                 project_agent_control_execution(&value)
             }
@@ -3056,7 +3067,22 @@ fn drain_agent_workbench_outcomes(
                     chat_widget.reconcile_local_agent_journal_runs(&runs);
                 }
             }
-            AgentWorkbenchOutcome::ControlAccepted { agent_id, action } => {
+            AgentWorkbenchOutcome::ControlAccepted {
+                agent_id,
+                action,
+                publication,
+            } => {
+                if let Some(outcome) = publication {
+                    let cell = match outcome.result {
+                        astra_turn_types::ArtifactPublicationResult::Published { .. } => {
+                            history_cell::system::SystemCell::info(outcome.user_notice())
+                        }
+                        astra_turn_types::ArtifactPublicationResult::Unavailable { .. } => {
+                            history_cell::system::SystemCell::warning(outcome.user_notice())
+                        }
+                    };
+                    chat_widget.commit_system(cell);
+                }
                 tracing::debug!(agent_id, ?action, "agent control accepted");
             }
             AgentWorkbenchOutcome::ControlContinuationRequired {

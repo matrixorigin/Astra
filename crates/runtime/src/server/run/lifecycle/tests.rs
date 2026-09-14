@@ -21974,8 +21974,223 @@ async fn resume_run_promotes_buffered_completed_pause_to_completed() {
 }
 
 #[tokio::test]
+async fn explain_publication_failure_is_returned_when_no_outcome_can_be_recorded() {
+    let svc = test_service();
+    let wire = AgenticRunLifecycleService::publish_explain_artifact(
+        None,
+        &svc.run_engine,
+        "user-1",
+        "session-1",
+        "missing-run",
+        1,
+        1,
+        &[],
+    )
+    .await;
+    let outcome = astra_turn_types::ArtifactPublicationV1::from_wire(&wire).unwrap();
+    assert!(!outcome.recorded);
+    assert!(matches!(
+        outcome.result,
+        astra_turn_types::ArtifactPublicationResult::Unavailable { .. }
+    ));
+    assert!(outcome.user_notice().contains("could not be saved"));
+    assert!(
+        wire.get("handle").is_none(),
+        "failed publication must never advertise a readable artifact"
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn db_pause_resume_promotes_buffered_completed_terminal() {
+async fn db_explain_publication_failure_survives_database_outage() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let svc = db_backed_test_service(&pool, "explain-outage-it");
+    let user = "explain-outage-user";
+    let session = format!("explain-outage-{}", Uuid::new_v4());
+    let run = Uuid::new_v4().to_string();
+    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    svc.run_engine
+        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
+        .await
+        .unwrap();
+    let generation = svc
+        .run_engine
+        .load_run(user, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .run_generation;
+    let event = json!({"type":"explain_analyze", "schema_version":1,
+        "event_id":"finished", "run_id":run, "turn_id":"turn-1", "node_id":"turn",
+        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+        "label":"User turn", "transition":"finished", "elapsed_ms":10,
+        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"});
+    // Close this test's pool, not the database. Every downstream SQL read and
+    // write now fails deterministically, without disrupting other sessions.
+    pool.close().await;
+    let outcome = AgenticRunLifecycleService::publish_explain_artifact(
+        Some(&pool),
+        &svc.run_engine,
+        user,
+        &session,
+        &run,
+        1,
+        generation,
+        &[event],
+    )
+    .await;
+    assert_eq!(outcome["status"], "unavailable");
+    assert_eq!(outcome["recorded"], false);
+    svc.runs
+        .write()
+        .await
+        .get_mut(&run)
+        .unwrap()
+        .events
+        .push(outcome.clone());
+    let (status, Json(error)) = svc
+        .get_run_status(run.clone(), user.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "never substitute local state for durable task status"
+    );
+    assert!(error.detail.contains("Explain report unavailable"));
+    assert_eq!(
+        error.metadata.as_ref().unwrap()["artifact_publication"],
+        outcome
+    );
+    assert_eq!(
+        error.metadata.as_ref().unwrap()["observation_source"],
+        "process_local"
+    );
+    let (_, Json(foreign)) = svc
+        .get_run_status(run.clone(), "another-user".into())
+        .await
+        .unwrap_err();
+    assert!(
+        foreign.metadata.is_none(),
+        "local publication must remain owner scoped"
+    );
+    let cleanup_pool = setup_lifecycle_run_db_it().await;
+    cleanup_lifecycle_run_fixture(&cleanup_pool, user, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&cleanup_pool, user, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_explain_publication_is_discoverable_and_readable() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = "explain-publication-it";
+    let session = format!("explain-it-{}", Uuid::new_v4());
+    let run = Uuid::new_v4().to_string();
+    let svc = db_backed_test_service(&pool, "explain-publication-it");
+    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    svc.run_engine
+        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
+        .await
+        .unwrap();
+    svc.run_engine
+        .append_event(
+            user,
+            &session,
+            &run,
+            json!({"event_type":"run_finished", "data":{}}),
+        )
+        .await
+        .unwrap();
+    let generation = svc
+        .run_engine
+        .load_run(user, &run)
+        .await
+        .unwrap()
+        .unwrap()
+        .run_generation;
+    let event = json!({"type":"explain_analyze", "schema_version":1,
+        "event_id":"finished", "run_id":run, "turn_id":"turn-1", "node_id":"turn",
+        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+        "label":"User turn", "transition":"finished", "elapsed_ms":10,
+        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"});
+    let artifact = crate::server::explain_analyze_artifact::persist_snapshot(
+        Some(&pool),
+        user,
+        &session,
+        &run,
+        "turn-1",
+        generation,
+        std::slice::from_ref(&event),
+    )
+    .await
+    .expect("production artifact ID must fit the database")
+    .expect("published handle");
+    let outcome = AgenticRunLifecycleService::publish_explain_artifact(
+        Some(&pool),
+        &svc.run_engine,
+        user,
+        &session,
+        &run,
+        1,
+        generation,
+        &[event],
+    )
+    .await;
+    assert_eq!(outcome["handle"], artifact);
+    assert_eq!(outcome["recorded"], true);
+    let durable = svc.run_engine.load_run(user, &run).await.unwrap().unwrap();
+    let replay = run_handlers::transform_stream_run_events_for_client(&run, durable.events);
+    assert!(
+        replay
+            .iter()
+            .any(|event| event["type"] == "artifact_publication" && event["handle"] == artifact)
+    );
+
+    let context = crate::server::explain_analyze_artifact::context_notice_for_run(
+        Some(&pool),
+        user,
+        &session,
+        &run,
+        generation,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(context.contains(&artifact));
+    let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
+        .with_pool(pool.clone());
+    let args = json!({"artifact":artifact, "offset":0, "max_bytes":65536});
+    let read = crate::server::explain_analyze_artifact::resolve_request(
+        Some(&store),
+        user,
+        &session,
+        &args,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        read.contains(&run),
+        "reader must return this run's actual facts"
+    );
+    assert!(
+        crate::server::explain_analyze_artifact::resolve_request(
+            Some(&store),
+            user,
+            "another-session",
+            &args,
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    cleanup_lifecycle_run_fixture(&pool, user, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, user, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publication() {
     let pool = setup_lifecycle_run_db_it().await;
     let svc = db_backed_test_service(&pool, "pause-resume-it-pod-completed");
     let user_id = "user-1";
@@ -21984,7 +22199,70 @@ async fn db_pause_resume_promotes_buffered_completed_terminal() {
     cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
     seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user_id, &run_id, &session_id).await;
 
+    svc.run_engine
+        .append_event(
+            user_id,
+            &session_id,
+            &run_id,
+            json!({"event_type":"run_started", "data":{"explain_analyze_requested":true}}),
+        )
+        .await
+        .unwrap();
     ok(svc.pause_run(run_id.clone(), user_id.to_string()).await);
+    svc.run_engine
+        .append_event(
+            user_id,
+            &session_id,
+            &run_id,
+            json!({"event_type":"explain_analyze", "data":{
+                "schema_version":1, "event_id":"done", "run_id":run_id, "turn_id":"turn-1",
+                "node_id":"turn", "producer_id":"server", "clock_domain_id":"clock",
+                "kind":"turn", "label":"User turn", "transition":"finished", "elapsed_ms":10,
+                "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"
+            }}),
+        )
+        .await
+        .unwrap();
+    let paused = svc
+        .run_engine
+        .load_run(user_id, &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::server::explain_analyze_artifact::recover_completed_snapshot(Some(&pool), &paused,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::server::explain_analyze_artifact::snapshot_missing(
+            Some(&pool),
+            user_id,
+            &session_id,
+            &run_id,
+        )
+        .await
+        .unwrap()
+    );
+
+    let previous_failure = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: run_id.clone(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: paused.run_generation,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Unavailable {
+            reason_code: "storage_failed".into(),
+            message: "Report storage failed.".into(),
+        },
+    };
+    svc.run_engine
+        .append_event(user_id, &session_id, &run_id, previous_failure.to_wire())
+        .await
+        .unwrap();
+
     svc.run_engine
         .append_event(
             user_id,
@@ -22010,7 +22288,60 @@ async fn db_pause_resume_promotes_buffered_completed_terminal() {
         .expect("durable run exists");
     assert_eq!(durable.status, STATUS_COMPLETED);
     assert!(durable.waiting_for.is_none());
-    assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
+    assert!(
+        !crate::server::explain_analyze_artifact::snapshot_missing(
+            Some(&pool),
+            user_id,
+            &session_id,
+            &run_id,
+        )
+        .await
+        .unwrap(),
+        "resume must publish without executing or waiting for discovery"
+    );
+    let handle =
+        crate::server::explain_analyze_artifact::recover_completed_snapshot(Some(&pool), &durable)
+            .await
+            .unwrap()
+            .expect("resume published the exact completed capture");
+    let notice = crate::server::explain_analyze_artifact::context_notice_for_run(
+        Some(&pool),
+        user_id,
+        &session_id,
+        &run_id,
+        durable.run_generation,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(notice.contains(&handle));
+    let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
+        .with_pool(pool.clone());
+    let read = crate::server::explain_analyze_artifact::resolve_request(
+        Some(&store),
+        user_id,
+        &session_id,
+        &json!({"artifact":handle, "max_bytes":65536}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(read.contains(&run_id));
+
+    assert!(
+        durable
+            .events
+            .iter()
+            .any(|event| event["event_type"] == "run_finished")
+    );
+    assert_eq!(
+        result.artifact_publication.as_ref().unwrap()["status"],
+        "published"
+    );
+    assert_eq!(
+        durable.events.last().unwrap()["event_type"],
+        "artifact_publication"
+    );
 
     {
         let runs = svc.runs.read().await;

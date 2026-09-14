@@ -163,12 +163,8 @@ pub(crate) struct PublishedArtifact {
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
         match &self.rendered_path {
-            Some(path) => format!(
-                "Explain Analyze artifact · {}\nRendered report · {}",
-                self.handle,
-                path.display()
-            ),
-            None => format!("Explain Analyze artifact · {}", self.handle),
+            Some(path) => format!("Local Explain report\n{}", path.display()),
+            None => format!("Local Explain data · {}", self.handle),
         }
     }
 }

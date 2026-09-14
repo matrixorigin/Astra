@@ -1063,6 +1063,8 @@ pub struct ChatResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub session_id: String,
     pub parent_run_id: Option<String>,
@@ -1089,6 +1091,8 @@ pub struct CancelRunResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunMutationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub status: String,
     pub previous_status: String,
@@ -1781,6 +1785,7 @@ impl From<ChatRunRecord> for ChatResponse {
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
+            artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             session_id: value.session_id,
             parent_run_id: value.parent_run_id,
@@ -1812,6 +1817,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
 impl From<RunMutationRecord> for RunMutationResponse {
     fn from(value: RunMutationRecord) -> Self {
         Self {
+            artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             status: value.status,
             previous_status: value.previous_status,

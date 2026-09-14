@@ -601,6 +601,7 @@ impl RunLifecycleService for JointRunLifecycle {
             return Err(forbidden("run belongs to another user"));
         }
         Ok(RunStatusRecord {
+            artifact_publication: None,
             run_id,
             session_id: run.session_id,
             parent_run_id: run.parent_run_id,

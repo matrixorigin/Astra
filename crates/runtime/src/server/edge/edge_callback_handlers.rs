@@ -2037,6 +2037,7 @@ mod edge_callback_insert_tests {
                 ));
             }
             Ok(RunStatusRecord {
+                artifact_publication: None,
                 root_run_id: Some(run_id.clone()),
                 run_id,
                 session_id: self.session_id.clone(),

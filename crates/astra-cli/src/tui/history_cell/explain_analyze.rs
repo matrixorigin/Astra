@@ -42,7 +42,52 @@ impl ExplainAnalyzeCell {
         // hard ceiling even when a caller supplies the terminal height or a
         // malformed config value; the settled cell remains the full report.
         let limit = usize::from(max_rows.clamp(1, 5));
-        render_graph(graph, width, true, Some(limit), delivery_degraded, verbose)
+        let mut lines = render_graph(graph, width, true, Some(limit), delivery_degraded, verbose);
+        // A bounded tree must not spend every row on ancestors while hiding
+        // the work actually in progress. Compact only when its path cannot fit.
+        if limit > 1
+            && let Some((index, _)) = graph
+                .nodes()
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, node)| !node.terminal_observed)
+        {
+            let mut path = vec![index];
+            while let Some(parent) = graph.nodes()[*path.last().unwrap()].parent_index {
+                if path.contains(&parent) {
+                    break;
+                }
+                path.push(parent);
+            }
+            path.reverse();
+            if path.len() >= limit {
+                lines.truncate(1);
+                let tail = &path[path.len() - (limit - 1)..];
+                for (depth, index) in tail.iter().enumerate() {
+                    let node = &graph.nodes()[*index];
+                    let prefix = if depth == 0 {
+                        "… ".to_string()
+                    } else {
+                        format!("{}└─ ", "  ".repeat(depth - 1))
+                    };
+                    let label = format!(
+                        "{prefix}{}{}",
+                        node.label,
+                        if depth + 1 == tail.len() {
+                            " · active"
+                        } else {
+                            ""
+                        }
+                    );
+                    lines.push(Line::from(Span::styled(
+                        truncate(&label, usize::from(width)),
+                        Style::default().fg(crate::tui::theme::current().fg),
+                    )));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -119,10 +164,16 @@ fn render_graph(
     } else {
         format!("{} clocks", clock_labels.len())
     };
-    let header = format!(
-        "Explain Analyze · {integrity} · {} stages · {parallel_label} {peak} · {clock_count}",
-        graph.nodes().len(),
+    let mut header = format!(
+        "Explain Analyze · {integrity} · {} stages",
+        graph.nodes().len()
     );
+    if verbose || graph.max_concurrency().is_some_and(|count| count > 1) {
+        header.push_str(&format!(" · {parallel_label} {peak}"));
+    }
+    if verbose || clock_labels.len() > 1 {
+        header.push_str(&format!(" · {clock_count}"));
+    }
     let mut lines = vec![Line::from(Span::styled(
         truncate(&header, width),
         Style::default().fg(theme.accent).bold(),
@@ -578,15 +629,30 @@ fn render_graph(
     }
     if !truncated {
         if !coverage_gaps.is_empty() {
-            let coverage = format!(
-                "Coverage · {} timing dimensions unavailable: {}",
-                coverage_gaps.len(),
-                coverage_gaps
+            let coverage = if verbose {
+                format!(
+                    "Coverage · {} timing dimensions unavailable: {}",
+                    coverage_gaps.len(),
+                    coverage_gaps
+                        .iter()
+                        .map(|gap| gap.label())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                )
+            } else {
+                let labels = coverage_gaps
                     .iter()
+                    .take(2)
                     .map(|gap| gap.label())
                     .collect::<Vec<_>>()
-                    .join(" · ")
-            );
+                    .join(" · ");
+                let more = if coverage_gaps.len() > 2 {
+                    format!(" · {} more in report", coverage_gaps.len() - 2)
+                } else {
+                    String::new()
+                };
+                format!("Not timed separately · {labels}{more}")
+            };
             let _ = push_wrapped_detail(
                 &mut lines,
                 &coverage,
@@ -1336,6 +1402,29 @@ mod tests {
     }
 
     #[test]
+    fn deep_live_tree_keeps_the_active_leaf_in_five_rows() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        for index in 0..9 {
+            let node = format!("stage-{index}");
+            let parent = (index > 0).then(|| format!("stage-{}", index - 1));
+            graph.apply(started(
+                &format!("event-{index}"),
+                &node,
+                parent.as_deref(),
+                ExplainAnalyzeNodeKindV1::ToolCall,
+                "clock",
+                index,
+            ));
+        }
+        let lines = ExplainAnalyzeCell::live_lines(&graph, 100, 5, false, false);
+        assert_eq!(lines.len(), 5);
+        let rendered = text(&lines);
+        assert!(rendered.contains("stage 8 · active"), "{rendered}");
+        assert!(rendered.contains("… stage 5"), "{rendered}");
+        assert!(rendered.contains("└─ stage 7"), "{rendered}");
+    }
+
+    #[test]
     fn live_tree_prioritizes_the_current_open_branch() {
         let rendered = text(&ExplainAnalyzeCell::live_lines(
             &active_branch_graph(),
@@ -1418,9 +1507,7 @@ mod tests {
         let rendered = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(120));
         assert!(rendered.contains("partial capture"), "{rendered}");
         assert!(
-            rendered.contains(
-                "Coverage · 2 timing dimensions unavailable: child-run timing · tool I/O wait breakdown",
-            ),
+            rendered.contains("Not timed separately · child-run timing · tool I/O wait breakdown",),
             "{rendered}"
         );
     }

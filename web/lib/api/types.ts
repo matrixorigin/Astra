@@ -1,5 +1,6 @@
 import type {
   ExplainAnalyzeEventV1,
+  ArtifactPublicationV1,
   ReflectReport,
   RuntimeSkillListCursor,
   RuntimeTranscriptItemResponse,
@@ -140,6 +141,7 @@ export type ChatMessage = {
   reasoningStatus?: 'streaming' | 'complete';
   attachments?: AttachmentRef[];
   artifacts?: ChatArtifactRef[];
+  artifactPublication?: ArtifactPublicationV1;
   explainAnalyzeEvents?: ExplainAnalyzeEventV1[];
   explainAnalyzeDegraded?: boolean;
   explainAnalyzeUnrecoverable?: boolean;

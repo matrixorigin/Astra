@@ -4052,6 +4052,7 @@ const WORK_TURN_RUNTIME_EVENT_TYPES: Record<
   error: true,
   warning: true,
   explain_analyze: true,
+  artifact_publication: true,
   plan_created: true,
   plan_revised: true,
   plan_step_start: true,

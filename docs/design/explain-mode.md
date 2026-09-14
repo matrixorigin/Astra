@@ -378,6 +378,22 @@ trace payloads.
 
 ## Correctness and failure behavior
 
+- Report publication has its own typed `artifact_publication` result, separate
+  from task completion and graph coverage. A successful result carries the
+  server-session handle; a failure carries a bounded safe reason. The current
+  stream receives this result before its terminal frames. If retaining the
+  result also fails, `recorded=false` makes that limitation explicit. A local
+  Markdown path never substitutes for server publication success.
+- Failed publication is a run observation, not an immutable empty snapshot.
+  Missing reports can be recovered from the exact completed run's durable
+  facts on discovery or buffered-completion resume. Paused or cancelled runs
+  cannot promote buffered successful facts into a completed report. Recovery
+  preserves turn and generation identity and records its publication result;
+  it does not rerun the model or overwrite a successful conflicting snapshot.
+- Artifact discovery is background capability metadata. The agent explains
+  unavailability when asked about that report, rather than inserting unrelated
+  storage warnings into ordinary answers. Clients surface failures when they
+  occur, independently of what the model chooses to say.
 - One runtime fact has one canonical producer; all clients consume its public
   projection.
 - Durable append is ordered before event publication. Reconnect replays after

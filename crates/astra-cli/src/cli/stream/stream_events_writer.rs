@@ -331,6 +331,7 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::PermissionAutoApproved { tool, reason } => {
             serde_json::json!({"type": "permission_auto_approved", "tool": tool, "reason": reason})
         }
+        StreamEvent::ArtifactPublication(outcome) => outcome.to_wire(),
         StreamEvent::ExplainAnalyze(event) => {
             let mut value = serde_json::to_value(event).unwrap_or_default();
             if let Some(object) = value.as_object_mut() {

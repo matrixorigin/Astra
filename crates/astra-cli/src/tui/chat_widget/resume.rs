@@ -17,6 +17,7 @@ const EXPLAIN_REPLAY_TOKEN_BUDGET: Duration = Duration::from_secs(5);
 struct RestoredExplainAnalyze {
     events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
     delivery_degraded: bool,
+    publication: Option<astra_turn_types::ArtifactPublicationV1>,
 }
 
 /// Read the root's canonical append-only transcript lane away from the UI
@@ -147,6 +148,9 @@ where
             }
         };
         match next {
+            Some(Ok(astra_thin_client::StreamEvent::ArtifactPublication(outcome))) => {
+                restored.publication = Some(outcome);
+            }
             Some(Ok(astra_thin_client::StreamEvent::ExplainAnalyze(fact))) => {
                 restored.events.push(fact);
             }
@@ -284,14 +288,30 @@ fn canonical_root_turn_events(
             }
             _ => {}
         }
-        if is_last_run_item
-            && let Some(restored) = explain_by_run.remove(&run_id)
-            && !restored.events.is_empty()
-        {
-            out.push(TurnEvent::ExplainAnalyze {
-                events: restored.events,
-                delivery_degraded: restored.delivery_degraded,
-            });
+        if is_last_run_item && let Some(restored) = explain_by_run.remove(&run_id) {
+            if !restored.events.is_empty() {
+                out.push(TurnEvent::ExplainAnalyze {
+                    events: restored.events,
+                    delivery_degraded: restored.delivery_degraded,
+                });
+            }
+            if let Some(outcome) = restored
+                .publication
+                .filter(|outcome| outcome.run_id == run_id)
+            {
+                out.push(TurnEvent::System {
+                    ts: None,
+                    level: match outcome.result {
+                        astra_turn_types::ArtifactPublicationResult::Published { .. } => {
+                            crate::tui::turn_event::SystemLevel::Info
+                        }
+                        astra_turn_types::ArtifactPublicationResult::Unavailable { .. } => {
+                            crate::tui::turn_event::SystemLevel::Warning
+                        }
+                    },
+                    text: outcome.user_notice(),
+                });
+            }
         }
     }
     out
@@ -460,6 +480,7 @@ mod tests {
                     RestoredExplainAnalyze {
                         events: vec![finished_turn("run-a", "turn-a", "First turn")],
                         delivery_degraded: false,
+                        publication: None,
                     },
                 ),
                 (
@@ -467,6 +488,7 @@ mod tests {
                     RestoredExplainAnalyze {
                         events: vec![finished_turn("run-b", "turn-b", "Second turn")],
                         delivery_degraded: true,
+                        publication: None,
                     },
                 ),
             ]),
@@ -505,6 +527,35 @@ mod tests {
             second_graph.contains("incomplete · stream gap"),
             "{second_graph}"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_reads_publication_after_the_task_terminal() {
+        let outcome = astra_turn_types::ArtifactPublicationV1 {
+            schema_version: 1,
+            run_id: "run-1".into(),
+            turn_id: "turn-1".into(),
+            execution_owner_generation: 1,
+            artifact_type: "explain_analyze_snapshot".into(),
+            recorded: true,
+            result: astra_turn_types::ArtifactPublicationResult::Unavailable {
+                reason_code: "storage_failed".into(),
+                message: "Report storage failed.".into(),
+            },
+        };
+        let stream = futures_util::stream::iter(vec![
+            astra_thin_client::classify_stream_event(
+                serde_json::json!({"type":"run_finished", "run_id":"run-1", "status":"completed"}),
+            ),
+            astra_thin_client::classify_stream_event(outcome.to_wire()),
+        ]);
+        let restored = collect_explain_analyze_replay(
+            stream,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(restored.publication, Some(outcome));
+        assert!(!restored.delivery_degraded);
     }
 
     #[tokio::test]

@@ -260,11 +260,15 @@ pub enum StreamEvent {
     AgentCommunication(astra_turn_types::AgentCommunicationEvent),
     /// One canonical, versioned Explain Analyze fact as accepted from the runtime stream.
     ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    ArtifactPublication(astra_turn_types::ArtifactPublicationV1),
     /// The active Explain Analyze stream lost coverage and could not recover
     /// all durable facts after a delivery gap.
     ExplainAnalyzeGap,
     /// Local policy approved a tool without showing an interactive prompt.
-    PermissionAutoApproved { tool: String, reason: String },
+    PermissionAutoApproved {
+        tool: String,
+        reason: String,
+    },
     /// Verdict audit events from the turn.
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event for real-time UX feedback.

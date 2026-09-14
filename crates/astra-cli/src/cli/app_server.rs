@@ -1066,6 +1066,9 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
                 }
             }),
         )),
+        StreamEvent::ArtifactPublication(outcome) => {
+            Some(("turn/artifactPublication", outcome.to_wire()))
+        }
         StreamEvent::ExplainAnalyze(event) => {
             let mut params = serde_json::to_value(event).ok()?;
             params.as_object_mut()?.insert(

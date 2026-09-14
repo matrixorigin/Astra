@@ -6,6 +6,8 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
+mod artifact_publication;
+pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod canonical_tool_pairing;
 mod completion_settlement;
 #[doc(hidden)]

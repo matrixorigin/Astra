@@ -269,6 +269,7 @@ function assertWorkCommitMessage(value: string): void {
 }
 
 type RunStatusWire = {
+  artifact_publication?: import("./types").ArtifactPublicationV1;
   run_id: string;
   session_id: string;
   parent_run_id?: string | null;
@@ -317,6 +318,7 @@ function normalizeSession(w: SessionWire): SessionInfo {
 
 function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
+    artifactPublication: w.artifact_publication,
     runId: w.run_id,
     sessionId: w.session_id,
     parentRunId: w.parent_run_id ?? null,
@@ -2259,8 +2261,8 @@ export class AstraClient {
     return normalizeRunInputResponse(raw);
   }
 
-  async resumeRun(runId: string): Promise<void> {
-    await this.post(chatRunResumePath(runId));
+  async resumeRun(runId: string): Promise<{ status: string; artifact_publication?: import("./types").ArtifactPublicationV1 }> {
+    return this.post(chatRunResumePath(runId));
   }
 
   /**

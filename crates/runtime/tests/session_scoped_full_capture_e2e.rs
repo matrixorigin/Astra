@@ -224,6 +224,7 @@ impl RunLifecycleService for RecordingLifecycle {
         _user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunStatusRecord {
+            artifact_publication: None,
             root_run_id: Some(run_id.clone()),
             run_id,
             session_id: "capture-session".to_string(),

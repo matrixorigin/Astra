@@ -1030,6 +1030,7 @@ pub struct ChatStreamRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStatusRecord {
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub session_id: String,
     /// Durable run-tree identity. A missing parent identifies the root
@@ -1107,6 +1108,7 @@ pub struct RunContinuationRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunMutationRecord {
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub status: String,
     pub previous_status: String,
@@ -1121,6 +1123,7 @@ impl RunMutationRecord {
         previous_status: impl Into<String>,
     ) -> Self {
         Self {
+            artifact_publication: None,
             run_id: run_id.into(),
             status: status.into(),
             previous_status: previous_status.into(),
@@ -4369,7 +4372,7 @@ fn classify_atomic_run_terminal_facts(
     AtomicRunTerminalFactMatch::Exact
 }
 
-fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
+pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
     run.depth == 0
         && run.events.iter().any(|event| {
             event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_started")
@@ -23555,6 +23558,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "user_input",
     "usage",
     "explain_analyze",
+    "artifact_publication",
     "error",
     "ping",
     // Canonical, bounded post-ingest runtime observation. Clients consume the
@@ -23770,7 +23774,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_runtime_feedback = client_type == "runtime_feedback";
         let is_stream_gap = client_type == "stream_gap";
         if is_external {
-            return if is_tool_call_end {
+            return if client_type == "artifact_publication" {
+                project_artifact_publication(event)
+            } else if is_tool_call_end {
                 project_external_tool_call_end(event)
             } else if is_work_task_board_update {
                 project_work_task_board_update(event)
@@ -24172,6 +24178,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             project_work_task_board_update(serde_json::Value::Object(data))
         }
         "explain_analyze" => project_explain_analyze(serde_json::Value::Object(data)),
+        "artifact_publication" => {
+            let mut wire = serde_json::Value::Object(data);
+            wire["type"] = "artifact_publication".into();
+            if let Some(index) = event.get("index") {
+                wire["index"] = index.clone();
+            }
+            project_artifact_publication(wire)
+        }
         "stream_gap" => project_stream_gap(serde_json::Value::Object(data)),
         "keepalive" => serde_json::json!({ "type": "ping" }),
         _ => {
@@ -24208,6 +24222,17 @@ fn project_work_task_board_update(event: serde_json::Value) -> serde_json::Value
 
 /// Project the closed Explain Analyze wire contract identically from live and
 /// durable event shapes. Raw diagnostic fields cannot leak across this edge.
+fn project_artifact_publication(event: serde_json::Value) -> serde_json::Value {
+    let Ok(outcome) = astra_turn_types::ArtifactPublicationV1::from_wire(&event) else {
+        return serde_json::Value::Null;
+    };
+    let mut wire = outcome.to_wire();
+    if let Some(index) = event.get("index") {
+        wire["index"] = index.clone();
+    }
+    wire
+}
+
 fn project_explain_analyze(event: serde_json::Value) -> serde_json::Value {
     let Some(source) = event.as_object() else {
         return serde_json::Value::Null;

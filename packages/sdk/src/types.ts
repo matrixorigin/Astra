@@ -30,6 +30,7 @@ export type StreamEventType =
   | "error"
   | "warning"
   | "explain_analyze"
+  | "artifact_publication"
   | "plan_created"
   | "plan_revised"
   | "plan_step_start"
@@ -790,6 +791,7 @@ export type StreamEvent = (
   | StreamErrorEvent
   | WarningEvent
   | ExplainAnalyzeEventV1
+  | ArtifactPublicationV1
   | PlanCreatedEvent
   | PlanRevisedEvent
   | PlanStepStartEvent
@@ -1105,6 +1107,7 @@ export type AgentBindingRecord = {
 };
 
 export type RunStatus = {
+  artifactPublication?: ArtifactPublicationV1;
   runId: string;
   sessionId: string;
   /** Durable run-tree identity. `null` means this is a root conversation run. */
@@ -2870,3 +2873,15 @@ export type WorkApiErrorV1 = {
   )[];
   request_id?: string;
 };
+
+/** Durable report publication, independent of the task's success or failure. */
+export type ArtifactPublicationV1 = {
+  type: "artifact_publication";
+  schema_version: 1;
+  run_id: string;
+  turn_id: string;
+  execution_owner_generation: number;
+  artifact_type: "explain_analyze_snapshot";
+  recorded: boolean;
+} & ({ status: "published"; handle: string } |
+     { status: "unavailable"; reason_code: string; message: string });

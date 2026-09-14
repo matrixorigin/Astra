@@ -1,8 +1,8 @@
 import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-frame";
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
-import { isExplainAnalyzeEventV1 } from "@astra/sdk";
-import type { ExplainAnalyzeEventV1 } from "@astra/sdk";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
+import type { ExplainAnalyzeEventV1, ArtifactPublicationV1 } from "@astra/sdk";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
 import {
   artifactsFromToolCallEnd,
@@ -216,6 +216,7 @@ export type ChatStreamHandlers = {
   onInteractionResolved?: () => void;
   onWorkSurfaceEvent?: (event: WorkSurfaceEvent) => void;
   onStreamGap?: (gap: { runId: string; nextEventIndex: number }) => void;
+  onArtifactPublication?: (event: ArtifactPublicationV1) => void;
   onExplainAnalyzeEvent?: (event: ExplainAnalyzeEventV1) => void;
   onExplainAnalyzeInvalid?: () => void;
   onCancelled?: (text: string) => void;
@@ -345,6 +346,12 @@ function applyStreamEvent(
       userMessage: event.user_message as ChatMessage,
       assistantMessage: event.assistant_message as ChatMessage,
     });
+    return;
+  }
+
+  if (type === "artifact_publication") {
+    if (isArtifactPublicationV1(event)) handlers.onArtifactPublication?.(event);
+    else throw new Error("Invalid report publication result.");
     return;
   }
 

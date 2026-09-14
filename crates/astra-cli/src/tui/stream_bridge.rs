@@ -479,6 +479,14 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             TuiAppEvent::PermissionAutoApproved { tool, reason }
         }
         StreamEvent::ExplainAnalyze(event) => TuiAppEvent::ExplainAnalyze(event),
+        StreamEvent::ArtifactPublication(outcome) => match outcome.result {
+            astra_turn_types::ArtifactPublicationResult::Published { .. } => {
+                TuiAppEvent::SystemInfo(outcome.user_notice())
+            }
+            astra_turn_types::ArtifactPublicationResult::Unavailable { .. } => {
+                TuiAppEvent::SystemWarning(outcome.user_notice())
+            }
+        },
         StreamEvent::ExplainAnalyzeGap => TuiAppEvent::ExplainAnalyzeGap,
         StreamEvent::VerdictReport(items) => TuiAppEvent::VerdictReport(items),
     })

@@ -32,11 +32,88 @@ fn artifact_id(run_id: &str) -> String {
     hasher.update(b"astra.explain-analyze.server-artifact.v1\0");
     hasher.update((run_id.len() as u64).to_be_bytes());
     hasher.update(run_id.as_bytes());
-    format!("explain-analyze-{:x}", hasher.finalize())
+    // session_artifacts.artifact_id is VARCHAR(64). The URI supplies the
+    // human-readable namespace; adding it here breaks every database write.
+    format!("{:x}", hasher.finalize())
+}
+
+/// Repair a missing snapshot only from the exact, completed durable run.
+/// Paused captures are still mutable and must not acquire an immutable report.
+pub(crate) async fn recover_completed_snapshot(
+    pool: Option<&SharedPool>,
+    run: &astra_services::runs::DurableRunRecord,
+) -> Result<Option<String>, String> {
+    if run.status != "completed" || !astra_services::runs::run_requested_explain_analyze(run) {
+        return Ok(None);
+    }
+    let Some(pool) = pool else { return Ok(None) };
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
+    let id = artifact_id(&run.run_id);
+    if let Some(existing) = store
+        .load_json_artifact(&run.user_id, &run.session_id, &id)
+        .await
+        .map_err(|error| format!("check recovered Explain artifact: {error}"))?
+    {
+        let status = validate_snapshot_payload(
+            &existing,
+            &run.session_id,
+            Some(&run.run_id),
+            Some(run.run_generation),
+        )?;
+        if status == "unavailable" {
+            return Err(
+                "the stored report is unavailable; it is not a readable snapshot".to_string(),
+            );
+        }
+        return Ok(Some(artifact_handle(&id)));
+    }
+    // Use the canonical durable-to-wire projection, including retained gaps.
+    let events: Vec<_> = run
+        .events
+        .iter()
+        .cloned()
+        .map(astra_services::runs::transform_run_event_for_client)
+        .filter(|event| !event.is_null())
+        .collect();
+    let turns: std::collections::BTreeSet<_> = events
+        .iter()
+        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(event).ok())
+        .filter(|fact| fact.run_id == run.run_id)
+        .map(|fact| fact.turn_id)
+        .collect();
+    if turns.len() != 1 {
+        return Err("completed Explain capture has missing or ambiguous turn identity".to_string());
+    }
+    let turn = turns.first().expect("one turn");
+    persist_snapshot(
+        Some(pool),
+        &run.user_id,
+        &run.session_id,
+        &run.run_id,
+        turn,
+        run.run_generation,
+        &events,
+    )
+    .await
 }
 
 pub(crate) fn artifact_handle(artifact_id: &str) -> String {
     format!("{ARTIFACT_URI_PREFIX}{artifact_id}")
+}
+
+pub(crate) async fn snapshot_missing(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+) -> Result<bool, String> {
+    let Some(pool) = pool else { return Ok(false) };
+    DatabaseSessionArtifactStore::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .load_json_artifact(user_id, session_id, &artifact_id(run_id))
+        .await
+        .map(|artifact| artifact.is_none())
+        .map_err(|error| error.to_string())
 }
 
 fn artifact_id_from_handle(handle: &str) -> Option<&str> {
@@ -309,53 +386,6 @@ pub(crate) async fn persist_snapshot(
     Ok(Some(handle))
 }
 
-/// Publish a durable unavailable marker for a requested Explain Analyze run.
-/// Discovery is bound to this run's deterministic identity, so an unavailable
-/// marker can never make the model silently analyze an older run.
-pub(crate) async fn persist_unavailable(
-    pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn_id: &str,
-    owner_generation: u64,
-    reason: &str,
-) -> Result<(), String> {
-    let Some(pool) = pool else {
-        return Ok(());
-    };
-    let artifact_id = artifact_id(run_id);
-    let payload = json!({
-        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
-        "artifact_kind": "explain_analyze",
-        "artifact_type": ARTIFACT_TYPE,
-        "content_type": CONTENT_TYPE,
-        "storage": STORAGE,
-        "representation": REPRESENTATION,
-        "schema_version": astra_turn_types::EXPLAIN_ANALYZE_SCHEMA_VERSION,
-        "session_id": session_id,
-        "run_id": run_id,
-        "turn_id": turn_id,
-        "execution_owner_generation": owner_generation,
-        "capture_status": "unavailable",
-        "delivery_degraded": true,
-        "reason": reason,
-        "events": [],
-    });
-    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
-    let record = record_for_payload(
-        artifact_id,
-        user_id,
-        session_id,
-        turn_id,
-        payload,
-        "unavailable",
-        Some(owner_generation),
-    )?;
-    persist_record_if_absent(&store, record).await?;
-    Ok(())
-}
-
 fn envelope_status(artifact: &StoredSessionArtifact) -> Result<&str, String> {
     if artifact.status.as_deref() != Some("active") {
         return Err(format!(
@@ -620,7 +650,7 @@ fn validate_snapshot_payload<'a>(
 
 pub(crate) fn unavailable_context_notice(reason: &str) -> String {
     format!(
-        "[Explain Analyze artifact discovery]\nThe latest Explain Analyze capture is unavailable. Reason: {reason}. Do not infer timing, token, wait, or graph facts from an older artifact or from the renderer."
+        "[Explain Analyze artifact discovery]\nThe latest Explain Analyze capture is unavailable. Reason: {reason}. This is background capability metadata, not a user request. Mention this limitation only when the user asks to analyze this capture. Do not infer missing timing, token, wait, or graph facts from an older artifact or from the renderer."
     )
 }
 

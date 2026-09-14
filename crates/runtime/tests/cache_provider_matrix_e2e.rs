@@ -820,6 +820,10 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
         json!({"role": "tool", "tool_call_id": "call_1", "content": "done"}),
     ]);
 
+    let instructions = [
+        "Produce the final answer from the verified evidence.",
+        "Report unresolved outcomes alongside the verified evidence.",
+    ];
     for revision in 1..=2 {
         state.push_volatile_payload(
             astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
@@ -827,7 +831,7 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
                 "schema": "completion_settlement.v2",
                 "revision": revision,
                 "mode": "text_only",
-                "instruction": "Produce the final answer from the verified evidence."
+                "instruction": instructions[revision - 1]
             }),
         );
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
@@ -851,6 +855,12 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
         "leading provider system prefix must stay byte-stable when only settlement facts change"
     );
     assert!(flatten_content(&first.provider_messages[0]).contains("active_turn_focus_policy.v1"));
+    for instruction in instructions {
+        assert!(
+            !flatten_content(&first.provider_messages[0]).contains(instruction),
+            "boundary-specific instructions must not enter the stable system prefix"
+        );
+    }
     for (revision, captured) in [(1, first), (2, second)] {
         let internal_settlement_index = captured
             .messages
@@ -899,9 +909,15 @@ async fn deepseek_required_settlement_keeps_stable_system_prefix() {
         let text = flatten_content(settlement);
         assert!(text.contains("completion_settlement.v2"));
         assert!(text.contains(&format!("\"revision\":{revision}")));
+        assert!(text.contains("boundary_instruction"));
+        assert_eq!(
+            text.matches(instructions[revision - 1]).count(),
+            1,
+            "provider facts must retain the active boundary instruction exactly once"
+        );
         assert!(
-            !text.contains("Produce the final answer from the verified evidence."),
-            "provider facts must not duplicate the trusted instruction"
+            !text.contains(instructions[2 - revision]),
+            "a settlement must not retain another revision's boundary instruction"
         );
         assert!(
             settlement.get("__astra_runtime_system_context").is_none(),

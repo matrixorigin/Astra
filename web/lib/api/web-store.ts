@@ -1,3 +1,4 @@
+import { isArtifactPublicationV1 } from "@astra/sdk";
 import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
@@ -1457,11 +1458,15 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     operation: `resume active run ${chat.activeRun.runId}`,
   });
 
-  await client.sdk.resumeRun(chat.activeRun.runId);
+  const resumed = await client.sdk.resumeRun(chat.activeRun.runId);
+  if (isArtifactPublicationV1(resumed.artifact_publication)) {
+    const message = chat.messages.find((item) => item.id === chat.activeRun?.assistantMessageId);
+    if (message) message.artifactPublication = resumed.artifact_publication;
+  }
   chat.activeRun = makeActiveRunRecord(
     {
       runId: chat.activeRun.runId,
-      status: "running",
+      status: resumed.status,
       waitingFor: null,
       assistantMessageId: chat.activeRun.assistantMessageId ?? null,
       nextEventIndex: chat.activeRun.nextEventIndex ?? null,
@@ -1484,6 +1489,7 @@ export function updateStreamingAssistantMessage(
     reasoningStatus?: ChatMessage["reasoningStatus"];
     status?: ChatMessage["status"];
     artifacts?: ChatMessage["artifacts"];
+    artifactPublication?: ChatMessage["artifactPublication"];
     explainAnalyzeEvent?: NonNullable<ChatMessage["explainAnalyzeEvents"]>[number];
     explainAnalyzeDegraded?: boolean;
     explainAnalyzeUnrecoverable?: boolean;
@@ -1520,6 +1526,7 @@ export function updateStreamingAssistantMessage(
       patch.artifacts,
     );
   }
+  if (patch.artifactPublication !== undefined) message.artifactPublication = patch.artifactPublication;
   if (patch.explainAnalyzeEvent !== undefined) {
     Object.assign(message, appendExplainFact(message, patch.explainAnalyzeEvent));
   }

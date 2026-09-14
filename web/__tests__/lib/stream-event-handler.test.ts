@@ -38,6 +38,19 @@ describe("applyStreamEvent", () => {
     vi.clearAllMocks();
   });
 
+  it("shows report publication failure independently of a successful answer", () => {
+    const state = makeState();
+    const event = { type: "artifact_publication" as const, schema_version: 1 as const,
+      run_id: "run-1", turn_id: "turn-1", execution_owner_generation: 1,
+      artifact_type: "explain_analyze_snapshot" as const, recorded: false,
+      status: "unavailable" as const, reason_code: "storage_failed", message: "Report storage failed." };
+    applyStreamEvent(event, ctx, state);
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a", "chat-1", "assistant-1", { artifactPublication: event });
+    expect(state.protocolError).toBe(false);
+    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+  });
+
   it("persists validated Explain Analyze facts and records a stream gap", () => {
     const state = makeState();
     const event = {

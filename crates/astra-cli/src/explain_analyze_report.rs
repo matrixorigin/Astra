@@ -41,7 +41,11 @@ pub(crate) fn render(
     let coverage_gaps = graph.coverage_gaps();
     let observation_incomplete = delivery_degraded || !coverage_gaps.is_empty();
     let status = if !delivery_degraded && graph.diagnostics().is_empty() && all_terminal {
-        "recorded"
+        if coverage_gaps.is_empty() {
+            "recorded"
+        } else {
+            "partial capture"
+        }
     } else {
         "incomplete"
     };
@@ -63,7 +67,9 @@ pub(crate) fn render(
         graph.nodes().len(),
         clocks.len(),
     )];
-    lines.push(format!("  Observed overlap · {overlap}"));
+    if verbose || graph.max_concurrency().is_none_or(|count| count > 1) {
+        lines.push(format!("  Observed overlap · {overlap}"));
+    }
 
     if delivery_degraded {
         lines.push(
@@ -77,12 +83,16 @@ pub(crate) fn render(
     if !coverage_gaps.is_empty() {
         let labels = coverage_gaps
             .iter()
+            .take(if verbose { usize::MAX } else { 2 })
             .map(|gap| gap.label())
             .collect::<Vec<_>>()
             .join(" · ");
-        lines.push(format!(
-            "  Coverage · timing dimensions unavailable: {labels}"
-        ));
+        let more = if !verbose && coverage_gaps.len() > 2 {
+            format!(" · {} more in report", coverage_gaps.len() - 2)
+        } else {
+            String::new()
+        };
+        lines.push(format!("  Not timed separately · {labels}{more}"));
     }
 
     if let Some(summary) = provider_usage_summary(&graph) {
@@ -149,10 +159,12 @@ fn append_tree(
             let state = node_state(node.terminal_observed, node.outcome);
             let round = node
                 .round_index
+                .filter(|round| verbose || *round > 0)
                 .map(|round| format!(" · round {}", round + 1))
                 .unwrap_or_default();
             let attempt = node
                 .attempt_index
+                .filter(|attempt| verbose || *attempt > 0)
                 .map(|attempt| format!(" · attempt {}", attempt + 1))
                 .unwrap_or_default();
             lines.push(format!(
@@ -175,17 +187,23 @@ fn append_tree(
             }
             if verbose && let Some(context) = &node.context {
                 if let Some(budget) = &context.budget {
+                    let prefix = detail_prefix(&ancestor_has_sibling, last);
                     lines.push(format!(
-                        "{}Request budget · pre-provider estimate · {} input / {} effective limit · {} system · {} tool schemas · {} requested output · {} protocol reserve · {} model context · {} visible tools",
-                        detail_prefix(&ancestor_has_sibling, last),
+                        "{prefix}Request budget (estimate) · {} input / {} limit",
                         format_tokens(budget.estimated_input_tokens),
-                        format_tokens(budget.effective_input_limit_tokens),
+                        format_tokens(budget.effective_input_limit_tokens)
+                    ));
+                    lines.push(format!(
+                        "{prefix}  System {} · tools {} · {} visible tools",
                         format_tokens(budget.estimated_system_tokens),
                         format_tokens(budget.tool_schema_tokens),
+                        budget.visible_tool_count
+                    ));
+                    lines.push(format!(
+                        "{prefix}  Output reserved {} · protocol {} · model context {}",
                         format_tokens(budget.requested_output_tokens),
                         format_tokens(budget.reserved_protocol_tokens),
-                        format_tokens(budget.model_context_limit_tokens),
-                        budget.visible_tool_count,
+                        format_tokens(budget.model_context_limit_tokens)
                     ));
                 }
                 if let Some(assembly) = &context.assembly {
@@ -272,7 +290,7 @@ fn provider_usage_summary(graph: &ExplainAnalyzeGraphV1) -> Option<String> {
     }
     let reported = attempts.iter().filter(|node| node.usage.is_some()).count();
     Some(format!(
-        "Provider usage · {reported}/{} physical attempts reported; per-attempt lanes below (cache lanes remain separate)",
+        "Provider usage · {reported}/{} requests reported tokens; cache counts are shown separately",
         attempts.len(),
     ))
 }
@@ -344,12 +362,12 @@ fn tree_prefix(ancestors: &[bool], last: bool) -> String {
 }
 
 fn detail_prefix(ancestors: &[bool], last: bool) -> String {
-    let mut prefix = tree_prefix(ancestors, last);
-    if let Some(index) = prefix.rfind("├─ ") {
-        prefix.replace_range(index.., "·  ");
-    } else if let Some(index) = prefix.rfind("└─ ") {
-        prefix.replace_range(index.., "·  ");
+    let mut prefix = String::from("  ");
+    for has_sibling in ancestors {
+        prefix.push_str(if *has_sibling { "│  " } else { "   " });
     }
+    prefix.push_str(if last { "   " } else { "│  " });
+    prefix.push_str("   ");
     prefix
 }
 
@@ -693,13 +711,13 @@ mod tests {
         ];
 
         let output = render(&[turn_start, turn_end], false, false);
-        assert!(output.contains("Explain Analyze · recorded"), "{output}");
         assert!(
-            output.contains("Observed overlap · at least 1 overlapping"),
+            output.contains("Explain Analyze · partial capture"),
             "{output}"
         );
+        assert!(!output.contains("Observed overlap"), "{output}");
         assert!(
-            output.contains("Coverage · timing dimensions unavailable: child-run timing · tool I/O wait breakdown"),
+            output.contains("Not timed separately · child-run timing · tool I/O wait breakdown"),
             "{output}"
         );
     }

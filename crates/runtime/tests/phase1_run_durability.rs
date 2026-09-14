@@ -333,6 +333,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             ));
         }
         Ok(RunStatusRecord {
+            artifact_publication: None,
             run_id,
             session_id: run.session_id,
             parent_run_id: run.parent_run_id,
