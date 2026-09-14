@@ -22,9 +22,9 @@ pub use astra_server_types::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
     SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
-    SessionRunTreeSnapshot, WorkBranchAttachRequestV1, WorkBranchControlCommandV1,
-    WorkBranchControlOperationRequestV1, WorkCreateCriterionV1, WorkCreateRequestV1,
-    WorkTurnRequestV1,
+    SessionRunTreeSnapshot, WorkBranchActivityResponseV1, WorkBranchActivityV1,
+    WorkBranchAttachRequestV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
+    WorkCreateCriterionV1, WorkCreateRequestV1, WorkTurnRequestV1,
 };
 pub use client::ThinClient;
 pub use device_proof::{

@@ -172,11 +172,15 @@ load only the first task-graph page for first paint, and fetch later pages on
 demand. Activity, transcript, branch control, provider health, and task graph
 may advance on separate durable cursors/revisions; the UI must label freshness
 per projection and recover retention gaps with a bounded snapshot. They must
-not scan all events or rebuild the entire Work view for every task update. A
-Server activity projection or bounded change feed discovers Runs started by
-other surfaces; a local Web composer flag is not evidence that a Run is active.
-Hidden tabs pause refresh. Reconnect resumes from durable cursors, uses bounded
-backoff with jitter, cancels obsolete requests, and does not overlap refreshes.
+not scan all events or rebuild the entire Work view for every task update. The
+owner-scoped Server activity read discovers Runs started by other surfaces; a
+local Web composer flag is not evidence that a Run is active. Each visible Work
+detail page polls one exact branch about every 1.2 seconds so a quiet page can
+discover a Run started elsewhere. The latest `/now` page refreshes its first
+20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
+refresh remains bounded to its first page while a Run can change it. Hidden tabs
+pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
+obsolete branch results, and never overlaps polls within a page.
 
 The initial scale acceptance profile is 25 independent owner identities, four
 Sessions per owner, 100 concurrent Work readers, and 25 actively changing Work
@@ -188,7 +192,12 @@ Two-second polling cannot establish a sub-two-second commit-to-render target;
 active discovery needs a change feed or a measured polling budget with latency
 headroom. Query count must remain bounded by pages and active Work views, not by
 total historical events or task count. Passing this profile is a tested
-baseline, not a claim of unbounded capacity.
+baseline, not a claim of unbounded capacity. At 100 readers, 1.2-second branch
+discovery adds about 80 indexed activity reads per second before task-graph and
+catalog refreshes. This is a workload estimate, not a capacity result; the load
+lane must record connection-pool waits and query latency. Deployments above this
+profile need measured fanout or event delivery instead of assuming the polling
+rate is free.
 
 Each authenticated read and mutation is scoped by the resolved principal and
 workspace authority. A foreign owner receives the same not-found behavior as a
@@ -248,13 +257,17 @@ workspace safe.
 
 - TUI `/work start` promotes its current durable Session through the Server Work
   binding API. It rejects a missing Session, reuses the Session on exact retry,
-  and currently prints the Work id plus `Ctrl+T` task-board hint; it has no
-  configured Web deep link yet.
-- Web `/now` lists Server Works. Opening a Work loads bounded, revision-pinned
-  Server projections and attaches a read-only branch view. The task graph polls
-  every 2 seconds only while a Web-originated turn is active and every 30 seconds
-  otherwise, so a TUI-originated active Run can look quiet for up to 30 seconds.
-  The local Web `turnActive` flag does not discover activity started elsewhere.
+  and prints the Work id, `Ctrl+T` task-board hint, and the Web `/now` entry
+  point. There is no configured Web deep link yet.
+- Web `/now` lists the first 20 Server Works and refreshes that bounded page
+  while visible. Opening a Work loads bounded, revision-pinned Server
+  projections, attaches a read-only branch view, and reads the selected
+  branch's authoritative activity. Visible Work pages discover remote Run
+  activity with an owner-scoped single-branch read about every 1.2 seconds;
+  active task graphs refresh their first bounded page every 2 seconds even for
+  TUI-originated Runs. Both
+  loops pause in hidden tabs, add jitter, back off after errors, and avoid
+  overlapping requests. Load targets remain unmeasured.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.

@@ -8,6 +8,7 @@ import {
   decodeWorkCatalogPageV1,
   decodeWorkArchivedBranchPageV1,
   decodeWorkBranchAttachmentV1,
+  decodeWorkBranchActivityResponseV1,
   decodeWorkBranchControlOperationV2,
   decodeWorkBranchCreationOperationV1,
   decodeWorkBranchDeletionOperationV1,
@@ -339,6 +340,7 @@ test("listWorks sends a stable keyset cursor and decodes server-owned attention"
   expect((init.headers as Record<string, string>)[ASTRA_WORK_API_MAJOR_HEADER]).toBe(
     ASTRA_WORK_API_MAJOR,
   );
+  expect(init.cache).toBe("no-store");
 });
 
 test("Work catalog rejects incoherent attention, ordering, and unbounded input", async () => {
@@ -944,6 +946,58 @@ test("listWorkBranches reads the complete bounded active catalog", async () => {
     "https://astra.example/v1/works/work-1/branches",
   );
   expect(JSON.stringify(branchCatalog)).not.toContain("session_id");
+});
+
+test("getWorkBranchActivity reads one owner-scoped, identity-checked status", async () => {
+  const activity = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    branch_revision: 3,
+    activity: "working",
+    observed_at: "2026-09-15T00:00:00Z",
+  } as const;
+  const fetchMock = vi.fn().mockResolvedValue(response(200, activity));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(client.getWorkBranchActivity("work-1", "branch-1")).resolves.toEqual(activity);
+  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(url).toBe("https://astra.example/v1/works/work-1/branches/branch-1/activity");
+  expect((init.headers as Record<string, string>)[ASTRA_WORK_API_MAJOR_HEADER]).toBe(
+    ASTRA_WORK_API_MAJOR,
+  );
+  expect(init.cache).toBe("no-store");
+  expect(JSON.stringify(activity)).not.toContain("session_id");
+
+  await expect(client.getWorkBranchActivity("work-1", "../branch")).rejects.toThrow(
+    "canonical Work resource identity",
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("Work branch activity decoder rejects drift and backing identities", () => {
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      branch_revision: 1,
+      activity: "running",
+      observed_at: "2026-09-15T00:00:00Z",
+    }),
+  ).toThrow("activity");
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      branch_revision: 1,
+      activity: "idle",
+      observed_at: "2026-09-15T00:00:00Z",
+      session_id: "must-not-leak",
+    }),
+  ).toThrow("field set");
 });
 
 test("Work branch catalog rejects incomplete lineage and delivery contradictions", () => {

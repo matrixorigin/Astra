@@ -5,6 +5,7 @@ import {
   type WorkArchivedBranchCursorV1,
   type WorkArchivedBranchPageV1,
   type WorkBranchControlOperationV2,
+  type WorkBranchActivityResponseV1,
   type WorkBranchCreationOperationV1,
   type WorkBranchDeletionOperationV1,
   type WorkBranchRetentionReceiptV1,
@@ -129,6 +130,56 @@ export type LoadWorkTaskGraphPageResult =
   | { ok: true; page: WorkTaskGraphPageV2 }
   | WorkActionError;
 export type RefreshWorkTaskGraphResult = LoadWorkTaskGraphPageResult;
+
+export type RefreshWorkBranchActivityResult =
+  | { ok: true; activity: WorkBranchActivityResponseV1 }
+  | WorkActionError;
+
+type RefreshWorkBranchActivityInput = {
+  workId: string;
+  branchId: string;
+};
+
+function validWorkBranchActivityInput(
+  input: RefreshWorkBranchActivityInput,
+): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId)
+  );
+}
+
+/** Read the current branch's server-owned Run activity without acquiring control. */
+export async function refreshWorkBranchActivityAction(
+  input: RefreshWorkBranchActivityInput,
+): Promise<RefreshWorkBranchActivityResult> {
+  if (!validWorkBranchActivityInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_branch_activity_query",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "refresh Work activity",
+    });
+    return {
+      ok: true,
+      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
 
 type RefreshWorkTaskGraphInput = {
   workId: string;

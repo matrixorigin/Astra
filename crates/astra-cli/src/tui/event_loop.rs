@@ -5366,7 +5366,9 @@ pub(crate) async fn run_tui_session(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("Work");
                         chat_widget.commit_system(history_cell::system::SystemCell::response(
-                            format!("Work started · {work_id} · Ctrl+T opens tasks"),
+                            format!(
+                                "Work started · {work_id} · Ctrl+T tasks · Web → Now follows automatically"
+                            ),
                         ));
                         if state.session_id.as_deref() == Some(completion.session_id.as_str()) {
                             board_user_pin = Some(true);

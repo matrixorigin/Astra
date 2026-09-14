@@ -284,6 +284,7 @@ test("observes typed delivery settlement without requiring a graph revision chan
 
 test("observes a read-only Work quietly without duplicating the initial read", async () => {
   vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
   try {
     refreshHead.mockResolvedValue({ ok: true, page: page() });
     render(<WorkTaskGraph initial={page()} />);
@@ -299,7 +300,62 @@ test("observes a read-only Work quietly without duplicating the initial read", a
     expect(refreshHead).toHaveBeenCalledTimes(1);
   } finally {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   }
+});
+
+test("ignores a pending graph refresh after the selected branch changes", async () => {
+  let finishOldBranch!: (result: {
+    ok: true;
+    page: WorkTaskGraphPageV2;
+  }) => void;
+  const branchA = page();
+  const branchB = page({
+    basis: { ...page().basis, branch_id: "branch-2" },
+    next_cursor: null,
+    items: {
+      offset: 0,
+      limit: 8,
+      total: 1,
+      entries: [item("root", "Selected branch plan")],
+    },
+    dependencies: { offset: 0, limit: 128, total: 0, entries: [] },
+  });
+  const oldBranchUpdate = page({
+    basis: {
+      ...page().basis,
+      graph_revision: 3,
+      graph_manifest_hash: `sha256:${"c".repeat(64)}`,
+    },
+    next_cursor: null,
+    items: {
+      offset: 0,
+      limit: 8,
+      total: 1,
+      entries: [item("root", "Stale branch plan")],
+    },
+    dependencies: { offset: 0, limit: 128, total: 0, entries: [] },
+  });
+  refreshHead.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishOldBranch = resolve;
+      }),
+  );
+  const rendered = render(<WorkTaskGraph initial={branchA} live />);
+  await waitFor(() => {
+    expect(refreshHead).toHaveBeenCalledWith({ workId: "work-1", branchId: "branch-1" });
+  });
+
+  rendered.rerender(<WorkTaskGraph initial={branchB} live />);
+  expect(await screen.findByText("Selected branch plan")).toBeInTheDocument();
+  await act(async () => {
+    finishOldBranch({ ok: true, page: oldBranchUpdate });
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("Selected branch plan")).toBeInTheDocument();
+  expect(screen.queryByText("Stale branch plan")).not.toBeInTheDocument();
 });
 
 test("loads the exact pinned continuation and exposes dependency identities", async () => {

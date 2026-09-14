@@ -617,6 +617,28 @@ async fn get_work_branches(
     (status, value, length)
 }
 
+async fn get_work_branch_activity(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+) -> (StatusCode, Value, usize) {
+    let request = Request::builder()
+        .uri(format!("/v1/works/{work_id}/branches/{branch_id}/activity"))
+        .header("authorization", format!("Bearer {user_id}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .body(body::Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 4 * 1024)
+        .await
+        .expect("branch activity response must stay constant-size");
+    let length = bytes.len();
+    let value = serde_json::from_slice(&bytes).expect("JSON branch activity");
+    (status, value, length)
+}
+
 async fn get_archived_work_branches(
     app: Router,
     user_id: &str,
@@ -2066,6 +2088,9 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     let newer_branch = newer["overview"]["delivery_branch"]["branch_id"]
         .as_str()
         .expect("newer branch");
+    let older_branch = older["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("older branch");
     let other_id = other["overview"]["work_id"].as_str().expect("other id");
     for (work_id, created_at) in [
         (older_id, "2026-08-01 00:00:00.000001"),
@@ -2181,6 +2206,32 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     assert_eq!(second["entries"][0]["work_id"], older_id);
     assert_eq!(second["entries"][0]["delivery_branch_activity"], "idle");
     assert_eq!(second["next_cursor"], Value::Null);
+
+    let (active_status, active, active_bytes) =
+        get_work_branch_activity(app.clone(), &owner_id, newer_id, newer_branch).await;
+    assert_eq!(active_status, StatusCode::OK, "activity: {active}");
+    assert!(active_bytes < 4 * 1024);
+    assert_eq!(active["schema_version"], 1);
+    assert_eq!(active["work_id"], newer_id);
+    assert_eq!(active["branch_id"], newer_branch);
+    assert_eq!(active["branch_revision"], 1);
+    assert_eq!(active["activity"], "working");
+    assert!(active["observed_at"].as_str().is_some());
+    assert_field_absent(&active, "session_id");
+    assert_field_absent(&active, "run_id");
+
+    let (idle_status, idle, idle_bytes) =
+        get_work_branch_activity(app.clone(), &owner_id, older_id, older_branch).await;
+    assert_eq!(idle_status, StatusCode::OK, "activity: {idle}");
+    assert!(idle_bytes < 4 * 1024);
+    assert_eq!(idle["activity"], "idle");
+    assert_eq!(idle["work_id"], older_id);
+    assert_eq!(idle["branch_id"], older_branch);
+
+    let (foreign_status, foreign, _) =
+        get_work_branch_activity(app.clone(), &other_owner_id, newer_id, newer_branch).await;
+    assert_eq!(foreign_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign["code"], "work_not_found");
 
     let (other_status, other_page, _) = get_works(app.clone(), &other_owner_id, "").await;
     assert_eq!(other_status, StatusCode::OK);

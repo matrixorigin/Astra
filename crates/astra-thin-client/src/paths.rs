@@ -108,6 +108,15 @@ pub fn work_branch_task_graph(work_id: &str, branch_id: &str) -> Option<String> 
     Some(format!("{WORKS}/{work_id}/branches/{branch_id}/task-graph"))
 }
 
+/// Read the durable execution activity for one Work branch.
+#[inline]
+pub fn work_branch_activity(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!("{WORKS}/{work_id}/branches/{branch_id}/activity"))
+}
+
 /// `GET` — optional tool capacity from server and connected edge providers.
 pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
 
@@ -737,6 +746,10 @@ mod tests {
             Some("/v1/works/work-1/branches/branch.main/task-graph")
         );
         assert_eq!(
+            work_branch_activity("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/activity")
+        );
+        assert_eq!(
             work_branch_attachment("work-1", "branch.main", "attachment-1").as_deref(),
             Some("/v1/works/work-1/branches/branch.main/attachments/attachment-1")
         );
@@ -750,6 +763,7 @@ mod tests {
             assert!(work_branch_attachments("work-1", unsafe_id).is_none());
             assert!(work_branch_turns(unsafe_id, "branch-1").is_none());
             assert!(work_branch_task_graph("work-1", unsafe_id).is_none());
+            assert!(work_branch_activity("work-1", unsafe_id).is_none());
             assert!(work_branch_attachment("work-1", "branch-1", unsafe_id).is_none());
             assert!(work_branch_control_operations("work-1", unsafe_id).is_none());
         }

@@ -1,13 +1,12 @@
 use super::catalog::{
     WorkBranchActivity, WorkCatalogAttention, WorkCatalogCursor, WorkCatalogEntry, WorkCatalogPage,
-    WorkCatalogQuery,
+    WorkCatalogQuery, activity_from_durable_run_status,
 };
 use super::proposal::WORK_PROPOSAL_MAX_PENDING_PER_BRANCH;
 use super::repository::{DatabaseWorkRepository, WorkRepositoryError};
 use super::{
     GraphRevision, WorkBranchId, WorkBranchRevision, WorkEventSeq, WorkGoal, WorkId, WorkRevision,
 };
-use crate::runs::{DurableRunStatusKind, durable_run_status_kind};
 use sqlx::{QueryBuilder, Row};
 
 pub(super) async fn list_catalog(
@@ -214,13 +213,10 @@ fn decode_active_run(
     let waiting_for = row
         .try_get::<Option<String>, _>("active_run_waiting_for")
         .map_err(|source| WorkRepositoryError::corrupt("Work catalog active run", source))?;
-    match (durable_run_status_kind(&status), waiting_for.is_some()) {
-        (DurableRunStatusKind::Running, _) => Ok(WorkBranchActivity::Working),
-        (DurableRunStatusKind::Waiting, _) => Ok(WorkBranchActivity::Waiting),
-        (DurableRunStatusKind::Paused, true) => Ok(WorkBranchActivity::Paused),
-        _ => Err(WorkRepositoryError::corrupt(
+    activity_from_durable_run_status(&status, waiting_for.is_some()).ok_or_else(|| {
+        WorkRepositoryError::corrupt(
             "Work catalog active run",
             std::io::Error::other("execution slot and durable run status disagree"),
-        )),
-    }
+        )
+    })
 }

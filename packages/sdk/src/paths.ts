@@ -312,6 +312,13 @@ export function workBranchTaskGraphPath(
   return `${workBranchPath(workId, branchId)}/task-graph`;
 }
 
+export function workBranchActivityPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/activity`;
+}
+
 export function workBranchCriteriaProposalsPath(
   workId: string,
   branchId: string,

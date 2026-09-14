@@ -228,6 +228,7 @@ export type {
   WorkObservationReportV1,
   WorkCatalogAttentionV1,
   WorkBranchActivityV1,
+  WorkBranchActivityResponseV1,
   WorkCatalogCursorV1,
   WorkCatalogEntryV1,
   WorkCatalogPageV1,
@@ -312,6 +313,7 @@ export type { ExplainAnalyzeCoverageGapV1 } from "./types";
 
 export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {
+  decodeWorkBranchActivityResponseV1,
   decodeWorkObservationReportV1,
   decodeWorkArchivedBranchPageV1,
   decodeWorkCatalogPageV1,
@@ -446,6 +448,7 @@ export {
   workBranchForksPath,
   workBranchForkPath,
   workBranchTaskGraphPath,
+  workBranchActivityPath,
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
   workBranchCriteriaProposalDecisionPath,

@@ -1954,6 +1954,15 @@ export type WorkObservationReportV1 = {
 export type WorkCatalogAttentionV1 = "needs_review" | "updated" | "none";
 export type WorkBranchActivityV1 = "working" | "waiting" | "paused" | "idle";
 
+export type WorkBranchActivityResponseV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  branch_revision: number;
+  activity: WorkBranchActivityV1;
+  observed_at: string;
+};
+
 export type WorkCatalogCursorV1 = {
   created_at: string;
   work_id: string;

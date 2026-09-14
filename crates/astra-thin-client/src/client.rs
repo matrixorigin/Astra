@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use astra_server_types::{
-    WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchAttachRequestV1,
+    WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchActivityResponseV1, WorkBranchAttachRequestV1,
     WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkSessionBindingResponseV1,
     WorkTurnRequestV1,
 };
@@ -976,6 +976,24 @@ impl ThinClient {
             .send()
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Read the owner-scoped durable Run activity for one Work branch.
+    pub async fn get_work_branch_activity(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<WorkBranchActivityResponseV1, ThinClientError> {
+        let path = paths::work_branch_activity(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        Self::typed_json_or_error(response).await
     }
 
     /// Resolve one already-known session to the public Work branch that owns
@@ -2289,6 +2307,44 @@ mod tests {
             .get_work_branch_task_graph_page("work-token", "work-1", "branch-1", Some(1), 1, 1)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_branch_activity_is_owner_scoped_and_path_safe() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/activity"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "branch_revision": 3,
+                "activity": "working",
+                "observed_at": "2026-09-15T00:00:00Z"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let activity = client
+            .get_work_branch_activity("work-token", "work-1", "branch-1")
+            .await
+            .unwrap();
+        assert_eq!(activity.work_id, "work-1");
+        assert_eq!(activity.branch_id, "branch-1");
+        assert_eq!(activity.branch_revision, 3);
+        assert_eq!(
+            activity.activity,
+            astra_server_types::WorkBranchActivityV1::Working
+        );
+
+        let unsafe_error = client
+            .get_work_branch_activity("work-token", "work-1", "../branch")
+            .await
+            .expect_err("path fragments must fail before transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
     }
 
     #[tokio::test]

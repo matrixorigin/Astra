@@ -107,6 +107,7 @@ import type {
   WorkTaskGraphCursorV1,
   WorkTaskGraphPageV2,
   WorkSessionBindingV1,
+  WorkBranchActivityResponseV1,
   WorkTurnInput,
   WorkTurnStreamEvent,
 } from "./types";
@@ -195,6 +196,7 @@ import {
   workBranchDeletionOperationPath,
   workBranchDeletionOperationsPath,
   workBranchTaskGraphPath,
+  workBranchActivityPath,
   workSessionBindingPath,
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
@@ -240,6 +242,7 @@ import {
   decodeWorkReadCursorReceiptV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
+  decodeWorkBranchActivityResponseV1,
   decodeWorkTurnStreamEventV1,
 } from "./work-wire";
 
@@ -783,7 +786,10 @@ export class AstraClient {
         before_work_id: options.cursor?.work_id,
         limit: options.limit,
       })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+      {
+        cache: "no-store",
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
     );
     return decodeWorkCatalogPageV1(raw);
   }
@@ -891,6 +897,22 @@ export class AstraClient {
       throw new TypeError("Work branch catalog identity disagrees with the requested Work");
     }
     return catalog;
+  }
+
+  /** Read the owner-scoped root Run status for one branch without attaching it. */
+  async getWorkBranchActivity(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkBranchActivityResponseV1> {
+    const raw = await this.fetch<unknown>(workBranchActivityPath(workId, branchId), {
+      cache: "no-store",
+      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+    });
+    const activity = decodeWorkBranchActivityResponseV1(raw);
+    if (activity.work_id !== workId || activity.branch_id !== branchId) {
+      throw new TypeError("Work branch activity identity disagrees with the request");
+    }
+    return activity;
   }
 
   /** Read one bounded archive-time page without scanning active alternatives. */

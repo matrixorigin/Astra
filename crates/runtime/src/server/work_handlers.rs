@@ -30,15 +30,16 @@ use sqlx::Row;
 use astra_server_types::{
     WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkActionRequestV1, WorkActionV1,
     WorkArchivedBranchesQueryV1, WorkBranchActionRequestV1, WorkBranchActionV1,
-    WorkBranchAttachRequestV1, WorkBranchAttachResponseV1, WorkBranchAttachmentModeV1,
-    WorkBranchComparisonRequestV1, WorkBranchControlBasisV1, WorkBranchControlCommandV1,
-    WorkBranchControlOperationRequestV1, WorkBranchCreationRequestV1, WorkBranchDeletionRequestV1,
-    WorkBranchSyncStateV1, WorkCatalogQueryV1, WorkCatalogResponseV1, WorkConversationHeadV1,
-    WorkCreateCriterionV1, WorkCreateRequestV1, WorkCriteriaProposalBasisV1,
-    WorkCriteriaProposalDecisionRequestV1, WorkCriteriaProposalDecisionV1,
-    WorkCriteriaProposalDetailResponseV1, WorkCriteriaProposalListResponseV1,
-    WorkCriteriaProposalResolutionV1, WorkCriteriaProposalSummaryV1, WorkCriteriaQueryV1,
-    WorkCriteriaResponseV1, WorkEventPageResponseV1, WorkEventsQueryV1, WorkObservationResponseV1,
+    WorkBranchActivityResponseV1, WorkBranchActivityV1, WorkBranchAttachRequestV1,
+    WorkBranchAttachResponseV1, WorkBranchAttachmentModeV1, WorkBranchComparisonRequestV1,
+    WorkBranchControlBasisV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
+    WorkBranchCreationRequestV1, WorkBranchDeletionRequestV1, WorkBranchSyncStateV1,
+    WorkCatalogQueryV1, WorkCatalogResponseV1, WorkConversationHeadV1, WorkCreateCriterionV1,
+    WorkCreateRequestV1, WorkCriteriaProposalBasisV1, WorkCriteriaProposalDecisionRequestV1,
+    WorkCriteriaProposalDecisionV1, WorkCriteriaProposalDetailResponseV1,
+    WorkCriteriaProposalListResponseV1, WorkCriteriaProposalResolutionV1,
+    WorkCriteriaProposalSummaryV1, WorkCriteriaQueryV1, WorkCriteriaResponseV1,
+    WorkEventPageResponseV1, WorkEventsQueryV1, WorkObservationResponseV1,
     WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1, WorkPatchCommitRequestV1,
     WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1, WorkReadCursorRequestV1,
     WorkReadCursorResponseV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
@@ -3746,6 +3747,82 @@ pub(super) async fn get_work_branches_handler(
             }
         })?;
     Ok(Json(catalog))
+}
+
+/// Read the current durable root Run state for one Work branch. This observer
+/// path is read-only and does not attach or acquire branch control.
+pub(super) async fn get_work_branch_activity_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+) -> WorkApiResult<WorkBranchActivityResponseV1> {
+    require_work_api_major(&headers)?;
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let pool = state.shared_pool.ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "work_read_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let observation = DatabaseWorkBranchCatalogService::new(pool)
+        .load_activity(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| match error {
+            astra_services::work::WorkBranchCatalogError::NotFound => work_error(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            ),
+            error => {
+                tracing::warn!(error = %error, "Work branch activity degraded");
+                work_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "work_branch_activity_unavailable",
+                    WorkApiErrorCategory::Degraded,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            }
+        })?;
+    let activity = match observation.activity {
+        astra_services::work::WorkBranchActivity::Working => WorkBranchActivityV1::Working,
+        astra_services::work::WorkBranchActivity::Waiting => WorkBranchActivityV1::Waiting,
+        astra_services::work::WorkBranchActivity::Paused => WorkBranchActivityV1::Paused,
+        astra_services::work::WorkBranchActivity::Idle => WorkBranchActivityV1::Idle,
+    };
+    Ok(Json(WorkBranchActivityResponseV1 {
+        schema_version: 1,
+        work_id: observation.work_id.as_str().to_owned(),
+        branch_id: observation.branch_id.as_str().to_owned(),
+        branch_revision: observation.branch_revision.get(),
+        activity,
+        observed_at: observation
+            .observed_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    }))
 }
 
 /// Bounded archived branch history. The cursor is an exact archive-time and

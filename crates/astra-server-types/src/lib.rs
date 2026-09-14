@@ -173,6 +173,28 @@ pub struct WorkSessionBindingResponseV1 {
     pub graph_revision: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkBranchActivityV1 {
+    Working,
+    Waiting,
+    Paused,
+    Idle,
+}
+
+/// Read-only, owner-scoped status used by Web observers to discover activity
+/// started by another client. It carries no Session or Run identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchActivityResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub branch_revision: i64,
+    pub activity: WorkBranchActivityV1,
+    pub observed_at: String,
+}
+
 #[cfg(feature = "server")]
 #[derive(Serialize)]
 #[serde(transparent)]

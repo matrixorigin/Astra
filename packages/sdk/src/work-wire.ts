@@ -16,6 +16,7 @@ import type {
   WorkCatalogEntryV1,
   WorkCatalogPageV1,
   WorkBranchAttachmentV1,
+  WorkBranchActivityResponseV1,
   WorkBranchControlBasisV1,
   WorkBranchControlOperationV2,
   WorkBranchCreationOperationV1,
@@ -78,6 +79,40 @@ export function decodeWorkSessionBindingV1(value: unknown): WorkSessionBindingV1
       object.graph_revision,
       `${path}.graph_revision`,
     ),
+  };
+}
+
+/** Strict decoder for the owner-scoped Work branch Run-activity projection. */
+export function decodeWorkBranchActivityResponseV1(
+  value: unknown,
+): WorkBranchActivityResponseV1 {
+  const path = "work_branch_activity";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "branch_revision",
+      "activity",
+      "observed_at",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    activity: oneOf(
+      object.activity,
+      ["working", "waiting", "paused", "idle"] as const,
+      `${path}.activity`,
+    ),
+    observed_at: timestamp(object.observed_at, `${path}.observed_at`),
   };
 }
 
