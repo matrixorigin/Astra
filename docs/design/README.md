@@ -19,6 +19,7 @@ These documents describe target contracts. They should not be read as proof that
 | Multi-session scale | [multi-session-scale.md](multi-session-scale.md) | Capacity budgets, admission alignment, and multi-server rollout invariants. |
 | Durable runs | [durable-agent-runs.md](durable-agent-runs.md) | Lease, checkpoint, resume, terminal outcome, crash recovery details. |
 | Background work journey | [background-work-user-journey.md](background-work-user-journey.md) | Foreground fan-in, explicit background handoff, visible states, and recovery UX. |
+| Durable Work journey | [durable-work-user-journey.md](durable-work-user-journey.md) | Cross-surface Work identity and observation; separates client control handoff, Edge provider changes, and Server Run recovery. |
 | Capabilities | [capability-system.md](capability-system.md) | Tools, skills, MCP, provider decisions, admission, fallback. |
 | Capability provider runtime | [capability-provider-runtime.md](capability-provider-runtime.md) | Provider adapters, discovery snapshots, internal tool identity, invocation and typed outcome contracts. |
 | Skills and tools | [skills-and-tools.md](skills-and-tools.md) | Skill maturity, packaging, lifecycle, compatibility, discovery, evaluation, and rollout. |
