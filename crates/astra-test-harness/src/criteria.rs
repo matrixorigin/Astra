@@ -188,6 +188,9 @@ pub enum Criterion {
         name: String,
         min: u32,
         max: u32,
+        /// Bind the structural predicate to this same call's typed outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
         #[serde(default)]
         document: Option<JournalToolDocument>,
         #[serde(default)]
@@ -389,6 +392,13 @@ pub enum Criterion {
         delivered_items: usize,
         #[serde(default)]
         cancellation_after_deliveries: usize,
+        /// Minimum delivered initial items before any added item is assigned
+        /// or observed executing. Creation alone does not satisfy execution.
+        #[serde(default)]
+        added_execution_after_initial_deliveries: usize,
+        /// The complete start receipt must already contain every added item.
+        #[serde(default)]
+        require_added_at_start: bool,
     },
 
     /// Proves a successful canonical graph patch was committed after Work was
@@ -1838,6 +1848,7 @@ fn evaluate_one(
             document,
             path,
             equals,
+            ok,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_call_count");
@@ -1846,7 +1857,7 @@ fn evaluate_one(
                 .journal_tool_calls()
                 .iter()
                 .filter(|call| {
-                    if call.name != *name {
+                    if call.name != *name || ok.is_some_and(|expected| call.ok != Some(expected)) {
                         return false;
                     }
                     let (Some(document), Some(path), Some(equals)) =
@@ -1862,6 +1873,7 @@ fn evaluate_one(
                 })
                 .count() as u32;
             let passed = count >= *min && count <= *max;
+            let outcome_filter = ok.map_or_else(String::new, |value| format!(" ok={value}"));
             let predicate = match (document, path, equals) {
                 (Some(document), Some(path), Some(equals)) => {
                     format!(" filtered by {document:?} {path:?} == {equals}")
@@ -1873,7 +1885,7 @@ fn evaluate_one(
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name}{predicate} full-call count={count}, expected {min}..={max}"
+                    "journal tool {name}{outcome_filter}{predicate} full-call count={count}, expected {min}..={max}"
                 ),
                 full_detail: None,
                 score: None,
@@ -2408,6 +2420,8 @@ fn evaluate_one(
             added_items,
             delivered_items,
             cancellation_after_deliveries,
+            added_execution_after_initial_deliveries,
+            require_added_at_start,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_work_replacement_lifecycle");
@@ -2418,7 +2432,12 @@ fn evaluate_one(
                 *cancelled_items,
                 *added_items,
                 *delivered_items,
-                *cancellation_after_deliveries,
+                work_replacement::Timing {
+                    cancellation_after_deliveries: *cancellation_after_deliveries,
+                    added_execution_after_initial_deliveries:
+                        *added_execution_after_initial_deliveries,
+                    require_added_at_start: *require_added_at_start,
+                },
             );
             CriterionResult {
                 criterion: c.clone(),
@@ -4067,6 +4086,8 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             added_items,
             delivered_items,
             cancellation_after_deliveries,
+            added_execution_after_initial_deliveries,
+            ..
         } => {
             if *initial_items == 0
                 || *cancelled_items == 0
@@ -4076,6 +4097,8 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
                     .and_then(|remaining| remaining.checked_add(*added_items))
                     != Some(*delivered_items)
                 || *cancellation_after_deliveries > *delivered_items
+                || *added_execution_after_initial_deliveries
+                    > initial_items.saturating_sub(*cancelled_items)
             {
                 return Err("JournalWorkReplacementLifecycle requires consistent positive initial/cancel/add counts and a reachable delivery bound".into());
             }
@@ -4111,6 +4134,7 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             document,
             path,
             equals,
+            ..
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolCallCount.name must not be empty".into());
@@ -5471,6 +5495,7 @@ mod tests {
         )]);
         let criteria = [
             Criterion::JournalToolCallCount {
+                ok: None,
                 name: "agent_fanout".into(),
                 min: 1,
                 max: 1,
@@ -7258,6 +7283,7 @@ mod tests {
     #[test]
     fn validate_journal_tool_count_rejects_partial_or_invalid_structural_filter() {
         let partial = Criterion::JournalToolCallCount {
+            ok: None,
             name: "agent_fanout".into(),
             min: 1,
             max: 1,
@@ -7272,6 +7298,7 @@ mod tests {
         );
 
         let invalid_pointer = Criterion::JournalToolCallCount {
+            ok: None,
             name: "agent_fanout".into(),
             min: 1,
             max: 1,

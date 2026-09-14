@@ -478,6 +478,7 @@ mod tests {
         let outcome = make_outcome().with_exit_code(124);
         let evidence = CriterionResult {
             criterion: Criterion::JournalToolCallCount {
+                ok: None,
                 name: "run_next_work_item".into(),
                 min: 1,
                 max: 2,
@@ -520,6 +521,7 @@ mod tests {
         let outcome = make_outcome().with_exit_code(124);
         let absence_check = CriterionResult {
             criterion: Criterion::JournalToolCallCount {
+                ok: None,
                 name: "ask_user".into(),
                 min: 0,
                 max: 0,

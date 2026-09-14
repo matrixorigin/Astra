@@ -2498,7 +2498,7 @@ impl SummaryClientWorkAdmissionJudge {
             } else if response_was_length {
                 "The prior response reached its output limit and is incomplete. Re-evaluate the original request and return one minimal complete JSON object within the declared limits. Do not repeat prose, reasoning, or the truncated object. Every not_required object includes execution_topology and only classification fields; every required object includes at most 8 combined initial tasks and mutations. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. For external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning."
             } else {
-                "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel units remain fanout outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add carries task only; cancel carries target_initial_task only; replace carries both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; if a later target is ambiguous, omit that mutation and let the primary agent use typed plan tools at the event boundary. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
+                "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel units remain fanout outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add requires task; cancel requires target_initial_task; replace requires both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; choose an initial target only when the user delegates that choice. Never invent an externally bound target or omit a requested mutation. Mutation after_initial_tasks gates graph changes; nested task.after_initial_tasks gates execution. Preserve the requested payload and source in additions. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
             };
             let repair_instruction = if let Some(hints) =
                 astra_services::work_admission_repair_hints(response.text.as_str())
@@ -22981,6 +22981,58 @@ mod tests {
                         && text.contains("\"activation\":\"defer\"")
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn missing_work_mutation_target_repairs_once_or_remains_malformed() {
+        let malformed = json!({
+            "work_lifecycle":"required", "workspace_mutation":"read_only", "activation":"start",
+            "goal":"Run A and B, cancel one and add its replacement",
+            "initial_tasks":[{"objective":"A","expected_result":"Evidence A"},
+                             {"objective":"B","expected_result":"Evidence B"}],
+            "mutations":[{"kind":"cancel"},
+                         {"kind":"add","task":{"objective":"B","expected_result":"Evidence B"}}]
+        });
+        for repaired_target in [None, Some(2)] {
+            let mut repaired = malformed.clone();
+            if let Some(target) = repaired_target {
+                repaired["mutations"][0]["target_initial_task"] = json!(target);
+            }
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    malformed.to_string(),
+                    repaired.to_string(),
+                ])),
+                requests: requests.clone(),
+            }));
+            let result = judge
+                .judge(&astra_services::TurnIntentJudgeContext {
+                    message: "Run A and B, choose one to cancel and add its replacement".into(),
+                    ..Default::default()
+                })
+                .await;
+            if repaired_target.is_some() {
+                let decision = result.expect("valid repair preserves both mutations");
+                assert_eq!(decision.deferred_graph_mutations().len(), 2);
+                assert_eq!(
+                    decision.deferred_graph_mutations()[0].target_initial_candidate(),
+                    Some(2)
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(astra_services::TurnIntentJudgeError::Malformed { .. })
+                ));
+            }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "one bounded repair, no partial success");
+            assert!(requests[1].iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("target_initial_task: required"))
+            }));
+        }
     }
 
     #[tokio::test]

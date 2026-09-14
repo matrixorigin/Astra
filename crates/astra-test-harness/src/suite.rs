@@ -1642,6 +1642,99 @@ mod tests {
         assert_eq!(original.stderr, before);
     }
 
+    #[test]
+    fn typed_work_states_survive_large_results_in_the_final_judge_prompt() {
+        for cancelled in [false, true] {
+            let board = |after: bool| {
+                serde_json::json!({
+                    "schema_version": 1, "work_id": "work-11111111111111111111111111111111111111111111111111", "branch_id": "branch-22222222222222222222222222222222222222222222222222",
+                    "kind": "snapshot", "goal": "bounded investigation",
+                    "graph_revision": if after { 2 } else { 1 },
+                    "criteria_member_count": 2,
+                    "tasks": [{
+                        "item_id": "task-2", "item_revision": if after { 2 } else { 1 },
+                        "objective": "long task text".repeat(200),
+                        "expected_result": "long acceptance text".repeat(200),
+                        "declaration_state": if after && cancelled { "cancelled" } else { "active" },
+                        "execution_status": "not_started", "delivery_status": "unreported",
+                        "delivery_summary": null, "blocker_kind": null,
+                        "unavailable_capabilities": []
+                    }]
+                })
+            };
+            let mut calls: Vec<_> = (0..15)
+                .map(|i| {
+                    serde_json::json!({
+                        "tool_call_id": format!("call-00-provider-identity-{i:032}"), "round": i, "name": "bash", "ok": true,
+                        "args_full": {"command": "read article"},
+                        "result_full": "large article content".repeat(1000)
+                    })
+                })
+                .collect();
+            for (index, after) in [(0, false), (7, true), (14, true)] {
+                calls[index]["name"] = if after {
+                    "settle_work_item"
+                } else {
+                    "start_work"
+                }
+                .into();
+                calls[index]["result_full"] = serde_json::json!({
+                    "padding": "large receipt".repeat(1000),
+                    "task_board_update": ({
+                        let mut board = board(after);
+                        let mut root = board["tasks"][0].clone();
+                        root["item_id"] = "root".into();
+                        root["declaration_state"] = "active".into();
+                        let mut peer = root.clone();
+                        peer["item_id"] = "task-1".into();
+                        board["tasks"].as_array_mut().unwrap().extend([root, peer]);
+                        board
+                    }),
+                    "tail": "large receipt".repeat(1000)
+                });
+            }
+            let session = SessionCapture {
+                events: vec![crate::session_capture::JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({"run_id": "00000000-0000-4000-8000-000000000001", "tool_calls": calls}),
+                }],
+                ..Default::default()
+            };
+            // Final prose must not create a cancellation absent from the journal.
+            let mut judged = outcome_ok("fixture", "task-2 was cancelled", &[]);
+            judged.stderr = "x".repeat(362);
+            attach_durable_judger_evidence(&mut judged, &session);
+            assert!(judged.stderr.chars().count() <= crate::judger::JUDGER_STDERR_CAP);
+            let (_, evidence) = judged
+                .stderr
+                .split_once("[durable-tool-evidence json]\n")
+                .unwrap();
+            let evidence: serde_json::Value = serde_json::from_str(evidence).unwrap();
+            assert_eq!(evidence["rendered_calls"], 15);
+            for (index, expected) in [
+                (0, "active"),
+                (7, if cancelled { "cancelled" } else { "active" }),
+                (14, if cancelled { "cancelled" } else { "active" }),
+            ] {
+                let excerpt = &evidence["calls"][index]["task_board_excerpt"];
+                assert_eq!(
+                    excerpt["work_id"],
+                    "work-11111111111111111111111111111111111111111111111111"
+                );
+                assert_eq!(
+                    excerpt["branch_id"],
+                    "branch-22222222222222222222222222222222222222222222222222"
+                );
+                assert_eq!(excerpt["omitted_tasks"], 0);
+                assert_eq!(excerpt["tasks"][0]["item_id"], "task-2");
+                assert_eq!(excerpt["tasks"][0]["declaration_state"], expected);
+                assert_eq!(excerpt["tasks"][0]["execution_status"], "not_started");
+            }
+            let prompt = crate::judger::build_judger_prompt("Was cancellation evidenced?", &judged);
+            assert!(prompt.contains(&judged.stderr));
+        }
+    }
+
     fn outcome_ok(model: &str, text: &str, tools: &[&str]) -> RunOutcome {
         RunOutcome {
             model: model.into(),

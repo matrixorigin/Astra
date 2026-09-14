@@ -1,18 +1,12 @@
 name: memory_tracking_intent_routes_correctly
 description: |
-  **What**: Express tracking/interest intent in Chinese ("我关注X") and verify the agent routes to
-  memory_store rather than codebase exploration tools.
-  **Tests**: Tool surface for tracking intents — "关注" (follow/track) should trigger memory persistence,
-  NOT file exploration (bash, list_dir, glob, grep). This is a regression test for session 292f7100 where
-  "我关注matrixorigin" caused the LLM to explore the codebase instead of storing the interest.
-  **Why**: Chinese-language tracking expressions ("关注", "追踪") are semantically memory-store operations,
-  not code search operations. The tool surface must expose memory tools, not exploration tools.
-  After removing "关注" from github(action=list_prs) triggers and deleting detect_store_signal, the system prompt
-  memory rules must carry the full burden of routing these intents correctly.
-  **Pass means**: The agent calls memory to persist the tracking interest, and does NOT waste turns
-  exploring the filesystem for "oceanbase" (which is just the name of what the user wants to track).
-  **Fail means**: The agent explored codebase files (bash/grep/glob/list_dir) trying to find information
-  about "oceanbase" instead of recognizing this as a memory-store intent.
+  **What**: Ask the assistant to remember an interest in a project.
+  **Tests**: The original natural-language request must produce a successful
+  memory write of the user's interest, not just a conversational acknowledgment
+  or a lookup. Unrelated filesystem exploration is unnecessary.
+  **Pass means**: A successful remember call stores the requested fact and returns
+  a real memory_id; the final answer accurately describes that write.
+  **Limits**: A write receipt proves storage, not future-session recall.
 prompt: |
   我关注oceanbase这个项目，帮我记住。
 capability: memory
@@ -27,6 +21,10 @@ criteria:
     name: memory
     min: 1
     max: 3
+    ok: true
+    document: arguments
+    path: /action
+    equals: remember
   - type: tools_count_between
     min: 1
     max: 6
@@ -49,3 +47,12 @@ criteria:
     name: list_dir
     min: 0
     max: 0
+  - type: hard_judger
+    question: |
+      From the canonical tool records, did a successful memory action=remember
+      store the user's interest in OceanBase and return a nonempty memory_id?
+      Bind the correct content, successful outcome, and receipt to the same call.
+      A recall, failed write, unrelated stored fact, or bare acknowledgment does
+      not satisfy this request. The final answer must accurately describe the
+      observed write; it must not claim future recall has already been tested.
+    threshold: 1.0

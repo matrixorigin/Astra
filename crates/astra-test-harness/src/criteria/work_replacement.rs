@@ -56,14 +56,26 @@ fn board_items(board: &Value) -> Result<BTreeMap<String, Item>, String> {
     Ok(items)
 }
 
+#[derive(Default)]
+pub(super) struct Timing {
+    pub cancellation_after_deliveries: usize,
+    pub added_execution_after_initial_deliveries: usize,
+    pub require_added_at_start: bool,
+}
+
 pub(super) fn verify(
     session: &SessionCapture,
     initial_count: usize,
     cancelled_count: usize,
     added_count: usize,
     delivered_count: usize,
-    after_deliveries: usize,
+    timing: Timing,
 ) -> Result<String, String> {
+    let Timing {
+        cancellation_after_deliveries: after_deliveries,
+        added_execution_after_initial_deliveries: added_after_initial_deliveries,
+        require_added_at_start,
+    } = timing;
     if session.has_integrity_errors() || session.skipped_lines > 0 || session.dropped_lines > 0 {
         return Err("replacement lifecycle requires an intact, complete journal".into());
     }
@@ -174,6 +186,16 @@ pub(super) fn verify(
             return Err("canonical graph revision moved backwards".into());
         }
         let items = board_items(board)?;
+        if call.name == "start_work"
+            && require_added_at_start
+            && items
+                .keys()
+                .filter(|id| !declared.contains_key(*id))
+                .count()
+                != added_count
+        {
+            return Err("initial board does not already contain every required added item".into());
+        }
         for (id, base_revision) in &declared {
             if !items
                 .get(id)
@@ -269,6 +291,15 @@ pub(super) fn verify(
                 executed.insert(id.to_owned());
             }
         }
+        let initial_deliveries = delivered
+            .keys()
+            .filter(|id| declared.contains_key(*id))
+            .count();
+        if initial_deliveries < added_after_initial_deliveries
+            && executed.iter().any(|id| !declared.contains_key(id))
+        {
+            return Err("added item executed before the required initial deliveries".into());
+        }
         previous = items;
         previous_graph = graph;
         intervening_mutation = false;
@@ -323,6 +354,61 @@ mod tests {
     use super::*;
     use crate::session_capture::JournalEvent;
     use serde_json::json;
+
+    fn verify(
+        session: &SessionCapture,
+        initial: usize,
+        cancelled: usize,
+        added: usize,
+        delivered: usize,
+        after: usize,
+    ) -> Result<String, String> {
+        super::verify(
+            session,
+            initial,
+            cancelled,
+            added,
+            delivered,
+            Timing {
+                cancellation_after_deliveries: after,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn added_execution_waits_for_initial_delivery_but_creation_can_be_immediate() {
+        let timing = || Timing {
+            added_execution_after_initial_deliveries: 1,
+            require_added_at_start: true,
+            ..Default::default()
+        };
+        let valid = fixture(false, false);
+        assert!(
+            super::verify(&fixture(false, true), 2, 1, 1, 2, timing())
+                .unwrap_err()
+                .contains("initial board")
+        );
+        assert!(super::verify(&valid, 2, 1, 1, 2, timing()).is_ok());
+        let mut early = valid.clone();
+        result(&mut early, 0)["task_board_update"]["tasks"][2]["execution_status"] =
+            json!("running");
+        assert!(
+            super::verify(&early, 2, 1, 1, 2, timing())
+                .unwrap_err()
+                .contains("added item executed")
+        );
+        let mut assigned = valid.clone();
+        result(&mut assigned, 0)["initial_task"] = json!({
+            "status":"assigned","item_id":"fresh","attempt_id":"early-attempt"
+        });
+        assert!(super::verify(&assigned, 2, 1, 1, 2, timing()).is_err());
+        let mut after_delivery = valid;
+        result(&mut after_delivery, 1)["next_task"] = json!({
+            "status":"assigned","item_id":"fresh","attempt_id":"attempt-b"
+        });
+        assert!(super::verify(&after_delivery, 2, 1, 1, 2, timing()).is_ok());
+    }
 
     fn item(id: &str, revision: u64, declaration: &str, execution: &str, delivery: &str) -> Value {
         json!({"item_id":id,"item_revision":revision,"declaration_state":declaration,
