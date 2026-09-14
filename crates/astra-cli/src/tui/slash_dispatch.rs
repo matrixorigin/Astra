@@ -3344,6 +3344,7 @@ mod routing_tests {
         context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
         keyboard_shortcut_pairs, memory_command_route, skill_command_route,
     };
+    use crate::cli::command_registry;
     use crate::cli::session::session_state::SessionState;
     use crate::tui::context_panel::{
         ContextSnapshot,
@@ -3407,7 +3408,20 @@ mod routing_tests {
     }
 
     #[test]
-    fn model_catalog_request_matches_only_picker_forms() {
+    fn hidden_model_list_alias_remains_a_typed_picker_dispatch() {
+        let model = command_registry::resolve_command_meta("/model").expect("model command");
+        assert!(
+            model.subcommands.iter().any(|(name, _)| *name == "list"),
+            "the shared command parser must retain the typed `/model list` alias"
+        );
+        assert!(
+            model
+                .visible_tui_subcommands()
+                .iter()
+                .all(|(name, _)| *name != "list"),
+            "the redundant picker alias must stay out of TUI completion"
+        );
+
         assert!(is_model_picker_request("/model"));
         assert!(is_model_picker_request("/model list"));
         assert!(!is_model_picker_request("/model info"));
