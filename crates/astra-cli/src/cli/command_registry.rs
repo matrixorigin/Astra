@@ -192,6 +192,13 @@ const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("clear", "Clear the active model selection"),
 ];
 
+// The picker is the default `/model` action, so its `list` alias is accepted
+// but does not need a second completion row.
+const TUI_MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("info", "Show details for the current model"),
+    ("clear", "Clear the active model selection"),
+];
+
 const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("cost", "Per-session API cost estimate"),
     ("health", "Tool health dashboard"),
@@ -244,6 +251,20 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ("history", "Recent MCP tool-call history"),
 ];
 
+// `/mcp` and `/mcp help` both show command guidance; `/mcp status` is an
+// alias for `/mcp list`. Keep one discoverable entry for each distinct action.
+const TUI_MCP_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "Overview of connected servers and capabilities"),
+    ("servers", "Server details and tool counts"),
+    ("tools", "List callable tools, optionally for one server"),
+    ("inspect", "Inspect a tool schema"),
+    ("prompts", "List prompt templates"),
+    ("resources", "List readable resources"),
+    ("read", "Read one resource"),
+    ("ping", "Check server connectivity"),
+    ("history", "Recent MCP tool-call history"),
+];
+
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     // ── Browse ──
     ("list", "List memories grouped by type"),
@@ -276,11 +297,9 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("health", "Memory hygiene status"),
 ];
 
-// The workbench exposes only memory actions that complete on a native
-// surface. Mutation/branch/checkpoint commands remain line-mode work until
-// they gain an inspectable scoped flow instead of a text-only fallback.
+// The default `/memory` action lists memories. Hide that alias and expose only
+// the other distinct actions with a complete workbench interaction.
 const TUI_MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("list", "Browse remembered facts"),
     ("search", "Search remembered facts (needs a query)"),
     ("stats", "Open memory statistics"),
     ("health", "Open memory health"),
@@ -308,6 +327,14 @@ const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("fork", "Branch a parallel session from a parent"),
     ("history", "Scroll a session's conversation history"),
     ("list", "Pick a session to resume"),
+];
+
+// `/session list` remains accepted as an alias for `/resume`; session fork is
+// line-mode only. Surface only actions that add a distinct workbench flow.
+const TUI_SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("analyze", "Show a concise session summary"),
+    ("export", "Export a session transcript to Markdown"),
+    ("history", "Open a session transcript"),
 ];
 
 const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -385,7 +412,13 @@ const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configu
 
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
-const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[("list", "Open the agent workbench")];
+// The bare command opens the agent workbench; `list` is only an alias.
+const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[];
+// The bare command opens the Work board; `status` is only an alias.
+const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] =
+    &[("start", "Track this conversation as durable Work")];
+// The bare command opens the editor; `edit` is only an alias.
+const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
 const WORK_SUBCOMMANDS: &[(&str, &str)] = &[
     ("start", "Track this conversation as durable Work"),
     ("status", "Open the canonical Work task board"),
@@ -414,7 +447,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
-    .with_arg_hint("[info | list | clear | <name>]")
+    .with_tui_subcommands(TUI_MODEL_SUBCOMMANDS)
+    .with_arg_hint("[info | clear | <name>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
 CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
@@ -507,7 +541,8 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
         CommandGroup::SessionPlan,
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
-    .with_arg_hint("[list | history | fork | analyze | export]")
+    .with_tui_subcommands(TUI_SESSION_SUBCOMMANDS)
+    .with_arg_hint("[analyze | history [id] | export [id]]")
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/plan",
@@ -525,12 +560,12 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
-        "Browse, search, and inspect remembered facts",
+        "Browse and search remembered facts",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(MEMORY_SUBCOMMANDS)
     .with_tui_subcommands(TUI_MEMORY_SUBCOMMANDS)
-    .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]")
+    .with_arg_hint("[search <query> | stats | health | session]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     CommandMeta::new(
@@ -539,7 +574,8 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(WORK_SUBCOMMANDS)
-    .with_arg_hint("[status | start <goal>]")
+    .with_tui_subcommands(TUI_WORK_SUBCOMMANDS)
+    .with_arg_hint("[start <goal>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     // ── Observability ─────────────────────────────────────────────────────
@@ -611,7 +647,7 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
         CommandGroup::Observability,
     )
     .with_subcommands(CONFIG_SUBCOMMANDS)
-    .with_arg_hint("[edit]")
+    .with_tui_subcommands(TUI_CONFIG_SUBCOMMANDS)
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/sync",
@@ -651,7 +687,6 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
     )
     .with_subcommands(SKILL_SUBCOMMANDS)
     .with_tui_subcommands(TUI_SKILL_SUBCOMMANDS)
-    .with_arg_hint("[browse|list|info|install|publish|search|new|test|dev|feedback|…]")
     .with_tui_route(TuiCommandRoute::Native),
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
@@ -660,7 +695,8 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[servers|tools|inspect|prompts|resources|read|ping|history]")
+    .with_tui_subcommands(TUI_MCP_SUBCOMMANDS)
+    .with_arg_hint("[list|servers|tools|inspect|prompts|resources|read|ping|history]")
     .with_usage_examples(&[
         "mcp list",
         "mcp tools",
@@ -1054,10 +1090,7 @@ mod tests {
     #[test]
     fn workbench_subcommands_only_advertise_native_actions() {
         let agent = resolve_command_meta("/agent").expect("agent command registered");
-        assert_eq!(
-            agent.visible_tui_subcommands(),
-            [("list", "Open the agent workbench")]
-        );
+        assert!(agent.visible_tui_subcommands().is_empty());
 
         let inspect = resolve_command_meta("/inspect").expect("inspect command registered");
         assert!(inspect.visible_tui_subcommands().is_empty());
@@ -1065,6 +1098,39 @@ mod tests {
 
         let plan = resolve_command_meta("/plan").expect("plan command registered");
         assert_eq!(plan.arg_hint, None);
+
+        let session = resolve_command_meta("/session").expect("session command registered");
+        assert_eq!(
+            session
+                .visible_tui_subcommands()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["analyze", "export", "history"]
+        );
+        assert_eq!(
+            session.arg_hint,
+            Some("[analyze | history [id] | export [id]]")
+        );
+
+        let model = resolve_command_meta("/model").expect("model command registered");
+        assert_eq!(
+            model
+                .visible_tui_subcommands()
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["info", "clear"]
+        );
+
+        let work = resolve_command_meta("/work").expect("work command registered");
+        assert_eq!(
+            work.visible_tui_subcommands(),
+            [("start", "Track this conversation as durable Work")]
+        );
+
+        let config = resolve_command_meta("/config").expect("config command registered");
+        assert!(config.visible_tui_subcommands().is_empty());
     }
 
     #[test]
@@ -1146,16 +1212,13 @@ mod tests {
     #[test]
     fn get_arg_hint_from_registry() {
         // Commands with arg_hint defined in registry
-        assert_eq!(
-            get_arg_hint("/model"),
-            Some("[info | list | clear | <name>]")
-        );
+        assert_eq!(get_arg_hint("/model"), Some("[info | clear | <name>]"));
         assert_eq!(get_arg_hint("/undo"), Some("[N]"));
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));
 
         // Commands with subcommands should also have arg hints
         assert!(get_arg_hint("/session").is_some());
-        assert!(get_arg_hint("/skill").is_some());
+        assert!(get_arg_hint("/skill").is_none());
         assert!(get_arg_hint("/team").is_some());
 
         // Command without arg_hint should return None
@@ -1237,6 +1300,42 @@ mod tests {
         let commands: Vec<_> = tui_commands().collect();
         assert!(!commands.is_empty());
         assert!(commands.iter().all(|command| command.is_available_in_tui()));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            vec![
+                "/help",
+                "/model",
+                "/clear",
+                "/history",
+                "/copy",
+                "/resume",
+                "/timeline",
+                "/worktrees",
+                "/exit",
+                "/stop",
+                "/session",
+                "/plan",
+                "/memory",
+                "/work",
+                "/explain",
+                "/reflect",
+                "/inspect",
+                "/stats",
+                "/config",
+                "/context",
+                "/info",
+                "/skill",
+                "/mcp",
+                "/agent",
+                "/login",
+                "/register",
+                "/allow",
+                "/instructions",
+            ]
+        );
         assert!(
             !commands.iter().any(|command| command.name == "/undo"),
             "a terminal-only command must not appear in the TUI command surface"
@@ -1244,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_subcommand_discovery_hides_line_mode_only_memory_and_skill_actions() {
+    fn tui_subcommand_discovery_shows_distinct_workbench_actions_only() {
         let memory = resolve_command_meta("/memory").expect("memory command");
         let memory_subcommands: Vec<_> = memory
             .visible_tui_subcommands()
@@ -1253,13 +1352,48 @@ mod tests {
             .collect();
         assert_eq!(
             memory_subcommands,
-            vec!["list", "search", "stats", "health", "session"]
+            vec!["search", "stats", "health", "session"]
         );
 
         let skill = resolve_command_meta("/skill").expect("skill command");
         assert!(
             skill.visible_tui_subcommands().is_empty(),
             "the workbench skill browser is the only native skill action"
+        );
+
+        let mcp = resolve_command_meta("/mcp").expect("MCP command");
+        let mcp_subcommands: Vec<_> = mcp
+            .visible_tui_subcommands()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            mcp_subcommands,
+            vec![
+                "list",
+                "servers",
+                "tools",
+                "inspect",
+                "prompts",
+                "resources",
+                "read",
+                "ping",
+                "history",
+            ]
+        );
+
+        let cli_session_subcommands = subcommand_completions("/session").unwrap();
+        assert!(
+            cli_session_subcommands
+                .iter()
+                .any(|(name, _)| *name == "fork")
+        );
+        let tui_session = resolve_command_meta("/session")
+            .unwrap()
+            .visible_tui_subcommands();
+        assert!(
+            tui_session.iter().all(|(name, _)| *name != "fork"),
+            "line-mode fork must not appear in workbench completion"
         );
     }
 }
