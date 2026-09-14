@@ -190,6 +190,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
 | `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
+| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start? }` | exact canonical replacement identities and outcomes; optional bounds separately require prior deliveries before cancellation and prior initial-item deliveries before any added assignment/execution; require_added_at_start checks all added identities are present in the complete genesis board | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | canonical mutation evidence comes from an admission snapshot, an accepted plan proposal, or a deferred mutation observed after its settlement boundary; retirement is cancellation or supersession, never prose | journal |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
 | `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
@@ -215,7 +216,21 @@ Deterministic cases do not create an extra product session for a generic
 quality opinion. This keeps tenant quotas, memory, cache metrics, and session
 inventories from being contaminated by the test oracle itself.
 
+The four-turn cache observation case checks actual reuse, bounded creation,
+exact ACK responses, and zero tool calls. Its historical 98% inclusive read-share
+threshold is not a product correctness requirement: stable requests can still
+incur fresh conversation and auxiliary input. The report retains absolute costs
+and the aggregate read share including warm-up; it does not label that aggregate
+as the former post-warm-up ratio. Exact prefix continuity requires request-level
+evidence. Cases with an independently justified cost SLO can still use the generic
+provider ratio criterion. Old reports retain their original criteria and verdicts.
+
 ### Session-based criteria semantics
+
+`journal_tool_call_count` can combine `ok` with its document/path/equality filter.
+Both conditions apply to the same durable invocation: a failed remember plus a
+successful recall cannot count as a successful remember. Missing outcome evidence
+fails an explicit `ok` filter.
 
 All journal criteria require a loaded session. `session_event_count` and
 `journal_tool_called` are hard requirements by default; set `optional: true`
@@ -471,3 +486,10 @@ rounds' worth of drift; the integration tests under
 - `astra journal diff A B` — compare two runs.
 - `.agent/skills/analyze_session` — human workflow for single-session
   analysis (superseded in automation by this harness).
+
+Canonical Work receipts include a bounded task-board excerpt in judge evidence.
+It preserves the producing call, Work/branch identity, graph and item revisions,
+and declaration/execution/delivery states before allocating space to large raw
+result previews. Snapshot and upsert remain distinct; omitted task counts are
+explicit. The excerpt copies typed receipt facts and never infers cancellation
+or completion from the assistant's answer.

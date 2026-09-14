@@ -546,6 +546,27 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     )
     .expect("the deferred canonical memory contract retains advanced fields");
 
+    let forget = json!({"action": "forget", "memory_id": "owned-memory", "reason": "user request"});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "memory",
+            &forget,
+            find(&resident, "memory"),
+        )
+        .is_err()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "memory",
+        &forget,
+        find(&full, "memory"),
+    )
+    .expect("forget requires the selected full memory contract");
+    let description = find(&resident, "memory")["function"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("forget/update"));
+    assert!(description.contains("tool_search select:memory; invoke_tool"));
+
     let resident_reflect = json!({
         "question": "What durable evidence explains the last failed turn?"
     });

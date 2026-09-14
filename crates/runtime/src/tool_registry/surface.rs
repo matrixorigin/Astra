@@ -437,7 +437,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "memory" => (
             &["action", "content", "query", "memory_type", "scope"][..],
-            "Store or recall persistent memory. remember requires content; recall requires query; use scope=session for strict current-session isolation. Select memory with tool_search first for advanced operations.",
+            "Store/recall memory: remember requires content; recall requires query; scope=session isolates this session. Other actions (forget/update): tool_search select:memory; invoke_tool.",
         ),
         "read_file" => (
             &["path", "start_line", "end_line", "outline"][..],
