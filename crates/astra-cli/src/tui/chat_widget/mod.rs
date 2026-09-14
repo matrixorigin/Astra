@@ -4779,6 +4779,34 @@ mod tests {
     }
 
     #[test]
+    fn deferred_token_reconciliation_reaches_the_final_tui_answer() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta("prefix ".into())));
+
+        // The stream host coalesces the suffix after its bounded observer
+        // queue starts sampling. It re-enters the same typed Token →
+        // AnswerDelta consumer path immediately before the settled marker.
+        let reconciled = crate::tui::stream_bridge::map_stream_event(
+            crate::cli::chat_stream::StreamEvent::Token("reconciled tail".into()),
+        )
+        .expect("token reconciliation remains a normal TUI event");
+        let translated = crate::tui::chat_widget::translate(
+            reconciled,
+            crate::tui::chat_widget::TurnContext::default(),
+        )
+        .expect("token reconciliation reaches ChatWidget");
+        widget.handle_event(translated);
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let answer = widget
+            .history
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<AssistantCell>())
+            .expect("final answer cell remains visible after reconciliation");
+        assert_eq!(answer.source(), "prefix reconciled tail");
+    }
+
+    #[test]
     fn explain_gap_without_facts_is_visible_live_and_at_turn_end() {
         let mut widget = fresh();
         widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeGap));

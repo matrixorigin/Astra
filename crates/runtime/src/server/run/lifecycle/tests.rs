@@ -1989,6 +1989,45 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
 }
 
 #[tokio::test]
+async fn attached_stream_publication_survives_full_queue_before_terminal() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.send(json!({"type": "text_delta", "content": "queued"}))
+        .await
+        .unwrap();
+    let mut attached = AttachedStreamDelivery::new(tx);
+    let publication = json!({
+        "type": "artifact_publication",
+        "schema_version": 1,
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "execution_owner_generation": 1,
+        "artifact_type": "explain_analyze_snapshot",
+        "recorded": false,
+        "status": "unavailable",
+        "reason_code": "storage_failed",
+        "message": "Report storage failed."
+    });
+
+    {
+        let delivery = send_attached_stream_event(&mut attached, publication.clone(), "run-1");
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "publication outcomes must use the reliable boundary instead of being dropped as progress"
+        );
+        assert_eq!(rx.recv().await.unwrap()["type"], "text_delta");
+        delivery.await;
+    }
+    assert_eq!(rx.recv().await.unwrap(), publication);
+
+    let terminal = json!({"type": "run_finished", "status": "completed"});
+    send_attached_stream_event(&mut attached, terminal.clone(), "run-1").await;
+    assert_eq!(rx.recv().await.unwrap(), terminal);
+}
+
+#[tokio::test]
 async fn attached_stream_never_drops_a_tool_terminal_while_the_observer_is_attached() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     tx.send(json!({"type": "text_delta", "content": "queued"}))
@@ -7397,6 +7436,13 @@ struct FaultInjectedStatusMutation {
     error_message: Option<String>,
 }
 
+struct FaultInjectedEventAppend {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    events: Vec<Value>,
+}
+
 struct FaultInjectedRunStateStore {
     inner: InMemoryRunStateStore,
     fail_status_calls: HashSet<usize>,
@@ -7406,6 +7452,7 @@ struct FaultInjectedRunStateStore {
     generation_append_cas_loss_calls: HashSet<usize>,
     mutate_before_status_call: HashMap<usize, FaultInjectedStatusMutation>,
     mutate_before_generation_append_call: HashMap<usize, FaultInjectedStatusMutation>,
+    append_events_before_load_call: HashMap<usize, FaultInjectedEventAppend>,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
     terminal_transition_delay: Duration,
@@ -7434,6 +7481,7 @@ impl FaultInjectedRunStateStore {
             generation_append_cas_loss_calls: HashSet::new(),
             mutate_before_status_call: HashMap::new(),
             mutate_before_generation_append_call: HashMap::new(),
+            append_events_before_load_call: HashMap::new(),
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
@@ -7583,6 +7631,26 @@ impl FaultInjectedRunStateStore {
         self
     }
 
+    fn with_events_before_load_call(
+        mut self,
+        call: usize,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        events: Vec<Value>,
+    ) -> Self {
+        self.append_events_before_load_call.insert(
+            call,
+            FaultInjectedEventAppend {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                events,
+            },
+        );
+        self
+    }
+
     fn next_status_call(&self) -> usize {
         let mut counters = self.counters.lock().expect("status counter lock");
         counters.status_calls += 1;
@@ -7723,10 +7791,21 @@ impl RunStateStore for FaultInjectedRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
-        self.counters
-            .lock()
-            .expect("load run counter lock")
-            .load_run_calls += 1;
+        let call = {
+            let mut counters = self.counters.lock().expect("load run counter lock");
+            counters.load_run_calls += 1;
+            counters.load_run_calls
+        };
+        if let Some(append) = self.append_events_before_load_call.get(&call) {
+            self.inner
+                .append_events_batch(
+                    &append.user_id,
+                    &append.session_id,
+                    &append.run_id,
+                    &append.events,
+                )
+                .await?;
+        }
         self.inner.load_run(user_id, run_id).await
     }
 
@@ -16969,6 +17048,315 @@ async fn durable_live_attach_follows_a_run_without_process_local_state() {
 }
 
 #[tokio::test]
+async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_settles() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("remote-explain", "user-1", "remote-session")
+        .await
+        .expect("seed remote Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-explain",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+
+    let mut stream = ok(svc
+        .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0)
+        .await);
+    let mut event_rx = stream.event_rx.take().expect("active Explain attachment");
+    for _ in 0..2 {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("run replay timeout")
+                .expect("run replay event")["event_type"],
+            "run_started"
+        );
+    }
+
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "remote-session",
+                "remote-explain",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete remote Explain run")
+    );
+    let finished = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("run_finished replay timeout")
+        .expect("run_finished replay");
+    assert_eq!(finished["event_type"], "run_finished");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), event_rx.recv())
+            .await
+            .is_err(),
+        "the observer must not close immediately after run_finished"
+    );
+
+    let outcome = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: "remote-explain".into(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: 1,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Published {
+            handle: format!("artifact://session/explain-analyze/{}", "a".repeat(64)),
+        },
+    };
+    engine
+        .append_events_batch(
+            "user-1",
+            "remote-session",
+            "remote-explain",
+            &[
+                json!({
+                    "event_type": "artifact_publication",
+                    "data": serde_json::to_value(&outcome).expect("publication payload")
+                }),
+                json!({"event_type": "run_settlement_finished", "data": {}}),
+            ],
+        )
+        .await
+        .expect("append delayed publication settlement");
+
+    let mut observed_publication = false;
+    let mut observed_settlement = false;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !(observed_publication && observed_settlement) {
+            let event = event_rx.recv().await.expect("delayed Explain event");
+            observed_publication |= event["event_type"] == "artifact_publication";
+            observed_settlement |= event["event_type"] == "run_settlement_finished";
+            assert_ne!(
+                event["event_type"], "artifact_publication_unavailable",
+                "a delayed real publication must not be replaced by a synthetic failure"
+            );
+        }
+    })
+    .await
+    .expect("delayed Explain publication timeout");
+    assert!(observed_publication && observed_settlement);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("attachment close timeout")
+            .is_none()
+    );
+
+    let durable = engine
+        .load_run("user-1", "remote-explain")
+        .await
+        .expect("load settled Explain run")
+        .expect("settled Explain run");
+    let publication_index = durable
+        .events
+        .iter()
+        .enumerate()
+        .find_map(|(position, event)| {
+            (event["event_type"] == "artifact_publication").then_some(position as u32)
+        })
+        .expect("publication index");
+    let resumed = ok(svc
+        .stream_run_live(
+            "remote-explain".to_string(),
+            "user-1".to_string(),
+            publication_index.saturating_add(1),
+        )
+        .await);
+    assert!(
+        resumed.event_rx.is_none(),
+        "a reconnect after publication and settlement must not reopen the attach"
+    );
+    assert!(
+        !resumed
+            .events
+            .iter()
+            .any(|event| event["type"] == "artifact_publication_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn durable_live_attach_replays_publication_added_between_initial_and_metadata_reads() {
+    let outcome = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: "race-explain".into(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: 1,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Published {
+            handle: format!("artifact://session/explain-analyze/{}", "b".repeat(64)),
+        },
+    };
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[]).with_events_before_load_call(
+            1,
+            "user-1",
+            "race-session",
+            "race-explain",
+            vec![json!({
+                "event_type": "artifact_publication",
+                "data": serde_json::to_value(&outcome).expect("publication payload"),
+            })],
+        ),
+    );
+    let engine = RunEngine::new(store.clone());
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("race-explain", "user-1", "race-session")
+        .await
+        .expect("seed Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "race-session",
+            "race-explain",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "race-session",
+                "race-explain",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete Explain run")
+    );
+    store.reset_read_counters();
+
+    let stream = ok(svc
+        .stream_run_live("race-explain".into(), "user-1".into(), 0)
+        .await);
+    assert!(
+        stream.event_rx.is_none(),
+        "a publication observed by the metadata read must complete the attach"
+    );
+    assert!(stream.events.iter().any(|event| {
+        event["event_type"] == "artifact_publication"
+            && event["data"]["handle"] == outcome.to_wire()["handle"]
+    }));
+    assert!(
+        !stream
+            .events
+            .iter()
+            .any(|event| event["type"] == "artifact_publication_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unread() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("unread-terminal", "user-1", "unread-session")
+        .await
+        .expect("seed terminal Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "unread-session",
+            "unread-terminal",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "unread-session",
+                "unread-terminal",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete terminal Explain run")
+    );
+    engine
+        .append_events_batch(
+            "user-1",
+            "unread-session",
+            "unread-terminal",
+            &(0..600)
+                .map(|index| json!({"event_type": "agent_progress", "data": {"index": index}}))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("append replay burst");
+
+    let mut stream = ok(svc
+        .stream_run_live("unread-terminal".into(), "user-1".into(), 0)
+        .await);
+    let mut event_rx = stream.event_rx.take().expect("terminal attach");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let drained = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("unread terminal attachment must eventually close");
+    assert_eq!(
+        drained.len(),
+        512,
+        "the bounded queue must cap unread replay"
+    );
+}
+
+#[tokio::test]
 async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     let llm = spawn_incremental_terminal_test_llm(Duration::from_millis(100)).await;
     let store = Arc::new(
@@ -23502,6 +23890,33 @@ async fn durable_stream_chat_persists_final_state() {
             .events
             .iter()
             .any(|event| event["event_type"] == "run_finished")
+    );
+}
+
+#[tokio::test]
+async fn stream_chat_explain_mode_finishes_a_short_turn() {
+    let (svc, _llm) = terminal_test_service().await;
+    let mut request = test_request("hi");
+    request.explain = true;
+    let mut stream = ok(svc.stream_chat("user-1".into(), request).await);
+    let mut event_rx = stream
+        .event_rx
+        .take()
+        .expect("Explain stream must expose a live event receiver");
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("short Explain turn must reach a terminal event");
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "run_finished" || event["type"] == "run_finished"
+        }),
+        "short Explain turn did not emit run_finished: {events:?}"
     );
 }
 

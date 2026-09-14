@@ -93,6 +93,11 @@ pub(crate) mod work_board_projection;
 mod worktrees;
 mod wrapping;
 
+#[cfg(test)]
+pub(crate) use app_event::TuiAppEvent;
+#[cfg(test)]
+pub(crate) use stream_bridge::{create_channels, create_controlled_per_turn_bridge};
+
 // Shared terminal palette for CLI output rendered outside the TUI.
 pub(crate) use custom_terminal::to_crossterm_color;
 pub(crate) use theme::current_stderr as current_stderr_theme;

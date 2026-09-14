@@ -163,10 +163,32 @@ pub(crate) struct PublishedArtifact {
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
         match &self.rendered_path {
-            Some(path) => format!("Local Explain report\n{}", path.display()),
-            None => format!("Local Explain data · {}", self.handle),
+            Some(path) => format!(
+                "Explain Analyze report saved locally · Markdown\n  Path: {}",
+                compact_local_path(path)
+            ),
+            None if self.render_error.is_some() => format!(
+                "Explain Analyze data saved locally · Markdown unavailable\n  Artifact: {}\n  Reason: {}",
+                self.handle,
+                self.render_error
+                    .as_deref()
+                    .unwrap_or("unknown rendering error")
+            ),
+            None => format!(
+                "Explain Analyze data saved locally · canonical JSON\n  Artifact: {}",
+                self.handle
+            ),
         }
     }
+}
+
+fn compact_local_path(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(&home)
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 pub(crate) fn artifact_handle(run_id: &str, turn_id: &str) -> String {
@@ -838,6 +860,34 @@ mod tests {
         assert!(markdown.contains("```text"), "{markdown}");
         assert!(markdown.contains("  └─ provider · 2ms"), "{markdown}");
         assert!(markdown.contains("````text"), "{markdown}");
+    }
+
+    #[test]
+    fn published_artifact_notice_labels_the_local_copy_and_model_handle() {
+        let local = PublishedArtifact {
+            handle: artifact_handle("run-1", "turn-1"),
+            rendered_path: Some(PathBuf::from("/tmp/explain-analyze.md")),
+            render_error: None,
+        };
+        let notice = local.user_notice();
+        assert!(notice.starts_with("Explain Analyze report saved locally · Markdown"));
+        assert!(notice.contains("Path: /tmp/explain-analyze.md"));
+        assert!(!notice.contains("Local Explain report\n/tmp"));
+
+        let server = PublishedArtifact {
+            rendered_path: None,
+            ..local
+        };
+        let notice = server.user_notice();
+        assert!(notice.contains("Artifact: artifact://session/explain-analyze/"));
+
+        let failed_render = PublishedArtifact {
+            render_error: Some("rendered report exceeds the bound".into()),
+            ..server
+        };
+        let notice = failed_render.user_notice();
+        assert!(notice.contains("Markdown unavailable"));
+        assert!(notice.contains("Reason: rendered report exceeds the bound"));
     }
 
     #[test]
