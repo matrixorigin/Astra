@@ -50,6 +50,8 @@ help:
 	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-memoria-databases - Verify Memoria database bootstrap contract"
+	@echo "  make test-stack-bootstrap - Verify stack startup bootstraps Memoria before API"
 	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
 	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
@@ -243,7 +245,9 @@ dev-deps-up:
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
-	@$(DEPS_COMPOSE) up -d
+	@$(DEPS_COMPOSE) up -d matrixone
+	@$(MAKE) dev-deps-wait-matrixone
+	@$(MAKE) dev-deps-ensure-memoria
 	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
 
 .PHONY: dev-deps-down
@@ -285,11 +289,13 @@ dev-deps-logs:
 dev-deps-logs-once:
 	@$(DEPS_COMPOSE) logs --no-color
 
-.PHONY: dev-deps-wait
-dev-deps-wait:
+.PHONY: dev-deps-wait-matrixone
+dev-deps-wait-matrixone:
 	@echo "Waiting for MatrixOne..."
-	@for i in $$(seq 1 90); do \
-		if curl --noproxy '*' -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	debug_port="$${MATRIXONE_DEBUG_HTTP_PORT:-6060}"; \
+	for i in $$(seq 1 90); do \
+		if curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:$$debug_port/debug/vars" >/dev/null 2>&1; then \
 			echo "✅ MatrixOne is healthy"; \
 			break; \
 		fi; \
@@ -301,6 +307,26 @@ dev-deps-wait:
 		echo "  Waiting for MatrixOne... ($$i/90)"; \
 		sleep 2; \
 	done
+
+.PHONY: dev-deps-ensure-memoria
+dev-deps-ensure-memoria:
+	@set -e; set -a; [ -f .env ] && . ./.env; set +a; \
+	./scripts/dev/ensure-memoria-databases.sh; \
+	( $(DEPS_COMPOSE) up -d memoria ); \
+	if [ -n "$${MEMORIA_MASTER_KEY:-}" ] && curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
+		-H "Authorization: Bearer $$MEMORIA_MASTER_KEY" \
+		"http://127.0.0.1:$${MEMORIA_PORT:-8100}/v1/health/analyze" >/dev/null 2>&1; then \
+		echo "✅ Memoria already healthy"; \
+	elif curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
+		"http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+		echo "Memoria listener is ready but authenticated storage is not; restarting Memoria..."; \
+		( $(DEPS_COMPOSE) restart memoria ); \
+	fi
+
+.PHONY: dev-deps-wait
+dev-deps-wait:
+	@$(MAKE) dev-deps-wait-matrixone
+	@$(MAKE) dev-deps-ensure-memoria
 	@echo "Waiting for Memoria..."
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ -z "$${MEMORIA_MASTER_KEY:-}" ]; then \
@@ -308,7 +334,7 @@ dev-deps-wait:
 		exit 2; \
 	fi; \
 	for i in $$(seq 1 60); do \
-		if curl --noproxy '*' -sf \
+		if curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
 			-H "Authorization: Bearer $$MEMORIA_MASTER_KEY" \
 			"http://127.0.0.1:$${MEMORIA_PORT:-8100}/v1/health/analyze" >/dev/null 2>&1; then \
 			echo "✅ Memoria is healthy"; \
@@ -688,7 +714,13 @@ stack-start: stack-env
 .PHONY: stack-up
 stack-up: stack-config
 	@echo "Starting compose stack..."
-	@if ! ( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 ); then \
+	@if ! ( \
+		set -e; \
+		( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 matrixone ) || exit 1; \
+		set -a; . "$(STACK_ENV)" || exit 1; set +a; \
+		scripts/dev/ensure-memoria-databases.sh || exit 1; \
+		( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 memoria api ) || exit 1; \
+	); then \
 		echo ""; \
 		echo "❌ Compose stack did not become healthy."; \
 		echo ""; \
@@ -849,6 +881,7 @@ dev-seed:
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
 	@echo "Stopping API server before dropping the database..."
 	@$(MAKE) dev-api-stop
+	@$(MAKE) dev-deps-wait
 	@sleep 2
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
@@ -1676,3 +1709,11 @@ db-reset:
 .PHONY: test-mysql-client
 test-mysql-client:
 	@bash scripts/dev/test-mysql-client.sh
+
+.PHONY: test-memoria-databases
+test-memoria-databases:
+	@bash scripts/dev/test-memoria-databases.sh
+
+.PHONY: test-stack-bootstrap
+test-stack-bootstrap:
+	@bash scripts/dev/test-stack-bootstrap-contract.sh

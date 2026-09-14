@@ -54,7 +54,7 @@ and reconnects the User Runner in one command.
 | `make dev-deps-clean`  | Delete all data (⚠️ destructive) |
 | `make dev-deps-status` | Show dependency status           |
 | `make dev-deps-logs`   | Tail all dependency logs         |
-| `make dev-deps-wait`   | Wait for dependencies (max 20s)  |
+| `make dev-deps-wait`   | Verify MatrixOne and authenticated Memoria storage readiness (90 MatrixOne retries, then 60 Memoria retries; each probe has a 2s timeout) |
 | `make dev-db-connect`  | Connect to MatrixOne CLI         |
 
 ### API Server (Source Code Mode)
