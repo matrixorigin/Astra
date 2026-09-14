@@ -72,9 +72,10 @@ pub enum TuiCommandRoute {
 /// How prominently an action appears in interactive discovery surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandDiscoverability {
-    /// Shown when the user opens `/` or command help with no query.
+    /// Featured in curated command help and ranked first in the slash list.
     Primary,
-    /// Hidden from the default list but available through typed search.
+    /// Available through the complete slash list and typed search, but not
+    /// featured in curated command help.
     SearchOnly,
 }
 
@@ -98,7 +99,8 @@ pub struct CommandMeta {
     pub arg_hint: Option<&'static str>,
     /// How this command is delivered inside the TUI.
     pub tui_route: TuiCommandRoute,
-    /// Whether this command belongs in the default curated action surface.
+    /// Whether this command is featured in curated command help and slash
+    /// completion ordering.
     pub discoverability: CommandDiscoverability,
     /// Usage examples for the help display (without leading `/`).
     pub usage_examples: &'static [&'static str],
@@ -159,7 +161,8 @@ impl CommandMeta {
         self
     }
 
-    /// Promote this command into the default curated action surface.
+    /// Promote this command into curated command help and the top of the
+    /// slash completion list.
     pub const fn primary(mut self) -> Self {
         self.discoverability = CommandDiscoverability::Primary;
         self
