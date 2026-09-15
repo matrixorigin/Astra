@@ -23714,9 +23714,9 @@ mod tests {
             start_payload["instruction"]
                 .as_str()
                 .is_some_and(|instruction| {
-                    instruction
-                        .contains("one successful non-lifecycle tool result after assignment")
+                    instruction.contains("a successful non-lifecycle tool result after assignment")
                         && instruction.contains("if unobtainable, settle blocked/failed")
+                        && instruction.contains("Stop and settle immediately when proved")
                 }),
             "the assignment frame must require fresh evidence before delivery"
         );
@@ -23855,9 +23855,9 @@ mod tests {
             continuation_payload["instruction"]
                 .as_str()
                 .is_some_and(|instruction| {
-                    instruction
-                        .contains("one successful non-lifecycle tool result after assignment")
+                    instruction.contains("a successful non-lifecycle tool result after assignment")
                         && instruction.contains("if unobtainable, settle blocked/failed")
+                        && instruction.contains("Stop and settle immediately when proved")
                 }),
             "continuations must keep the fresh-evidence boundary"
         );
