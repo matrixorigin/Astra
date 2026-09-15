@@ -76,17 +76,47 @@ pub struct PipelineHealthReport {
 ///
 /// This is deliberately a diagnostic projection: it never changes criterion
 /// truth and does not infer semantic task success from tool names or prose.
-/// A rejected call remains visible in `failed_tool_calls` and
-/// `runtime_rejection_reasons`, while successful lifecycle transitions are
-/// counted independently.
+/// `total_tool_calls` includes every canonical audit record, while the
+/// disposition buckets make it explicit which records reached an executor.
+/// In particular, suppressed/reused placeholders cannot inflate successful
+/// execution or settlement counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionTraceReport {
+    /// Every de-duplicated tool record in the invocation-scoped journal,
+    /// including records that were rejected or intentionally suppressed.
     pub total_tool_calls: u32,
+    /// Records whose canonical disposition was `executed`.
+    #[serde(default)]
+    pub executed_tool_calls: u32,
+    /// Executed records with an explicit successful outcome.
     pub successful_tool_calls: u32,
+    /// Executed records with an explicit failed outcome.
     pub failed_tool_calls: u32,
+    /// Records rejected before execution by the runtime.
+    #[serde(default)]
+    pub rejected_tool_calls: u32,
+    /// Records whose result was reused without executing a new request.
+    #[serde(default)]
+    pub reused_tool_calls: u32,
+    /// Audit-only records intentionally omitted by routing or deduplication.
+    #[serde(default)]
+    pub suppressed_tool_calls: u32,
+    /// Records deferred for a later activation or retry opportunity.
+    #[serde(default)]
+    pub deferred_tool_calls: u32,
+    /// Executed records whose outcome was not present in the journal.
     pub unknown_outcome_tool_calls: u32,
+    /// Records carrying a non-null disposition that the current reader does
+    /// not understand. They are excluded from execution buckets and make the
+    /// projection incomplete instead of being guessed as successes.
+    #[serde(default)]
+    pub unknown_disposition_tool_calls: u32,
+    /// Every `settle_work_item` request, including rejected or suppressed
+    /// requests. Successful transitions are counted separately below.
     pub settlement_attempts: u32,
+    /// Settlement records that both executed and returned `ok=true`.
     pub successful_settlements: u32,
+    /// Settlement records rejected before execution.
     pub rejected_settlements: u32,
     #[serde(default)]
     pub runtime_rejection_reasons: BTreeMap<String, u32>,
@@ -111,9 +141,15 @@ impl Default for ExecutionTraceReport {
     fn default() -> Self {
         Self {
             total_tool_calls: 0,
+            executed_tool_calls: 0,
             successful_tool_calls: 0,
             failed_tool_calls: 0,
+            rejected_tool_calls: 0,
+            reused_tool_calls: 0,
+            suppressed_tool_calls: 0,
+            deferred_tool_calls: 0,
             unknown_outcome_tool_calls: 0,
+            unknown_disposition_tool_calls: 0,
             settlement_attempts: 0,
             successful_settlements: 0,
             rejected_settlements: 0,
@@ -297,30 +333,57 @@ pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport
     };
     for call in capture.journal_tool_calls() {
         report.total_tool_calls = report.total_tool_calls.saturating_add(1);
-        match call.ok {
-            Some(true) => {
-                report.successful_tool_calls = report.successful_tool_calls.saturating_add(1)
-            }
-            Some(false) => report.failed_tool_calls = report.failed_tool_calls.saturating_add(1),
-            None => {
-                report.unknown_outcome_tool_calls =
-                    report.unknown_outcome_tool_calls.saturating_add(1)
-            }
-        }
-
         if call.name == "settle_work_item" {
             report.settlement_attempts = report.settlement_attempts.saturating_add(1);
-            if call.ok == Some(true) {
-                report.successful_settlements = report.successful_settlements.saturating_add(1);
+        }
+        let disposition = match journal_tool_call_disposition(&call) {
+            Ok(disposition) => disposition,
+            Err(()) => {
+                report.unknown_disposition_tool_calls =
+                    report.unknown_disposition_tool_calls.saturating_add(1);
+                report.evidence_complete = false;
+                continue;
+            }
+        };
+        match disposition {
+            astra_services::session_journal::ToolCallDisposition::Executed => {
+                report.executed_tool_calls = report.executed_tool_calls.saturating_add(1);
+                match call.ok {
+                    Some(true) => {
+                        report.successful_tool_calls =
+                            report.successful_tool_calls.saturating_add(1)
+                    }
+                    Some(false) => {
+                        report.failed_tool_calls = report.failed_tool_calls.saturating_add(1)
+                    }
+                    None => {
+                        report.unknown_outcome_tool_calls =
+                            report.unknown_outcome_tool_calls.saturating_add(1)
+                    }
+                }
+            }
+            astra_services::session_journal::ToolCallDisposition::Rejected => {
+                report.rejected_tool_calls = report.rejected_tool_calls.saturating_add(1);
+            }
+            astra_services::session_journal::ToolCallDisposition::Reused => {
+                report.reused_tool_calls = report.reused_tool_calls.saturating_add(1);
+            }
+            astra_services::session_journal::ToolCallDisposition::Suppressed => {
+                report.suppressed_tool_calls = report.suppressed_tool_calls.saturating_add(1);
+            }
+            astra_services::session_journal::ToolCallDisposition::Deferred => {
+                report.deferred_tool_calls = report.deferred_tool_calls.saturating_add(1);
             }
         }
 
-        let rejected = call
-            .runtime_metadata
-            .get("disposition")
-            .and_then(serde_json::Value::as_str)
-            == Some("rejected");
-        if rejected {
+        if call.name == "settle_work_item"
+            && disposition == astra_services::session_journal::ToolCallDisposition::Executed
+            && call.ok == Some(true)
+        {
+            report.successful_settlements = report.successful_settlements.saturating_add(1);
+        }
+
+        if disposition == astra_services::session_journal::ToolCallDisposition::Rejected {
             if call.name == "settle_work_item" {
                 report.rejected_settlements = report.rejected_settlements.saturating_add(1);
             }
@@ -340,6 +403,56 @@ pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport
         }
     }
     report
+}
+
+/// Parse the canonical producer disposition carried in the bounded journal
+/// projection. Older records omitted this field, so a missing/null value is
+/// classified with the same legacy markers as
+/// `ToolCallRecord::effective_disposition`; an explicit disposition always
+/// wins over the `ok` bit.
+fn journal_tool_call_disposition(
+    call: &crate::session_capture::JournalToolCall,
+) -> Result<astra_services::session_journal::ToolCallDisposition, ()> {
+    let metadata = &call.runtime_metadata;
+    if let Some(value) = metadata.get("disposition").filter(|value| !value.is_null()) {
+        // An explicit value is authoritative. Never silently reinterpret an
+        // unknown future enum variant as an executed success.
+        return serde_json::from_value(value.clone()).map_err(|_| ());
+    }
+
+    // Match ToolCallRecord::effective_disposition for journals written before
+    // the explicit field was added. These checks intentionally use only the
+    // bounded producer-authored metadata retained by journal_tool_calls.
+    if (call.ok != Some(true)
+        && metadata
+            .get("result_class")
+            .and_then(serde_json::Value::as_str)
+            == Some(astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS))
+        || metadata
+            .get("skill_locked_out")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return Ok(astra_services::session_journal::ToolCallDisposition::Rejected);
+    }
+    if metadata
+        .get("surgically_removed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        || metadata
+            .get("skill_reentry_count")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Ok(astra_services::session_journal::ToolCallDisposition::Suppressed);
+    }
+    if metadata
+        .get("result_class")
+        .and_then(serde_json::Value::as_str)
+        == Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS)
+    {
+        return Ok(astra_services::session_journal::ToolCallDisposition::Reused);
+    }
+    Ok(astra_services::session_journal::ToolCallDisposition::Executed)
 }
 
 fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent) -> Option<f64> {
@@ -599,11 +712,17 @@ fn render_execution_summary(report: &PipelineHealthReport, out: &mut String) {
         ));
     }
     out.push_str(&format!(
-        "  Execution: tools={} success={} failed={} unknown={}\n",
+        "  Execution: tools={} executed={} success={} failed={} rejected={} reused={} suppressed={} deferred={} unknown={} unknown_disposition={}\n",
         execution.total_tool_calls,
+        execution.executed_tool_calls,
         execution.successful_tool_calls,
         execution.failed_tool_calls,
+        execution.rejected_tool_calls,
+        execution.reused_tool_calls,
+        execution.suppressed_tool_calls,
+        execution.deferred_tool_calls,
         execution.unknown_outcome_tool_calls,
+        execution.unknown_disposition_tool_calls,
     ));
     if execution.settlement_attempts > 0 {
         out.push_str(&format!(
@@ -842,8 +961,10 @@ mod tests {
 
         let report = analyze_pipeline_health(&capture);
         assert_eq!(report.execution.total_tool_calls, 4);
+        assert_eq!(report.execution.executed_tool_calls, 3);
         assert_eq!(report.execution.successful_tool_calls, 3);
-        assert_eq!(report.execution.failed_tool_calls, 1);
+        assert_eq!(report.execution.failed_tool_calls, 0);
+        assert_eq!(report.execution.rejected_tool_calls, 1);
         assert_eq!(report.execution.settlement_attempts, 3);
         assert_eq!(report.execution.successful_settlements, 2);
         assert_eq!(report.execution.rejected_settlements, 1);
@@ -858,6 +979,121 @@ mod tests {
         let rendered = render_pipeline_health(&report);
         assert!(rendered.contains("Work settlements: attempts=3 success=2 rejected=1"));
         assert!(rendered.contains("Runtime rejections: 1 × work_settlement_evidence_required"));
+    }
+
+    #[test]
+    fn execution_trace_does_not_count_suppressed_placeholders_as_execution() {
+        let capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "bash-success",
+                "ok": true,
+                "disposition": "executed"
+            },
+            {
+                "name": "bash",
+                "call_id": "bash-failure",
+                "ok": false,
+                "disposition": "executed"
+            },
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-rejected",
+                "ok": false,
+                "disposition": "rejected",
+                "error_kind": "contract_violation"
+            },
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-success",
+                "ok": true,
+                "disposition": "executed"
+            },
+            {
+                "name": "(surgically_removed)",
+                "call_id": "suppressed-1",
+                "ok": true,
+                "disposition": "suppressed",
+                "surgically_removed": true,
+                "original_tool_name": "bash"
+            },
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-suppressed",
+                "ok": true,
+                "disposition": "suppressed"
+            }
+        ]))]);
+
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.execution.total_tool_calls, 6);
+        assert_eq!(report.execution.executed_tool_calls, 3);
+        assert_eq!(report.execution.successful_tool_calls, 2);
+        assert_eq!(report.execution.failed_tool_calls, 1);
+        assert_eq!(report.execution.rejected_tool_calls, 1);
+        assert_eq!(report.execution.suppressed_tool_calls, 2);
+        assert_eq!(report.execution.settlement_attempts, 3);
+        assert_eq!(report.execution.successful_settlements, 1);
+        assert_eq!(report.execution.rejected_settlements, 1);
+
+        let rendered = render_pipeline_health(&report);
+        assert!(rendered.contains(
+            "Execution: tools=6 executed=3 success=2 failed=1 rejected=1 reused=0 suppressed=2 deferred=0 unknown=0 unknown_disposition=0"
+        ));
+    }
+
+    #[test]
+    fn execution_trace_reuses_legacy_disposition_fallbacks_and_rejects_unknown_values() {
+        let capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "(surgically_removed)",
+                "call_id": "legacy-suppressed",
+                "ok": true,
+                "surgically_removed": true
+            },
+            {
+                "name": "skill",
+                "call_id": "legacy-reentry",
+                "ok": true,
+                "skill_reentry_count": 1
+            },
+            {
+                "name": "skill",
+                "call_id": "legacy-locked",
+                "ok": false,
+                "skill_locked_out": true
+            },
+            {
+                "name": "read_file",
+                "call_id": "legacy-reused",
+                "ok": true,
+                "result_class": "noop_or_cached"
+            },
+            {
+                "name": "bash",
+                "call_id": "explicit-deferred",
+                "ok": true,
+                "disposition": "deferred"
+            },
+            {
+                "name": "bash",
+                "call_id": "explicit-unknown",
+                "ok": true,
+                "disposition": "future_disposition"
+            }
+        ]))]);
+
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.execution.total_tool_calls, 6);
+        assert_eq!(report.execution.executed_tool_calls, 0);
+        assert_eq!(report.execution.successful_tool_calls, 0);
+        assert_eq!(report.execution.failed_tool_calls, 0);
+        assert_eq!(report.execution.rejected_tool_calls, 1);
+        assert_eq!(report.execution.reused_tool_calls, 1);
+        assert_eq!(report.execution.suppressed_tool_calls, 2);
+        assert_eq!(report.execution.deferred_tool_calls, 1);
+        assert_eq!(report.execution.unknown_disposition_tool_calls, 1);
+        assert!(!report.execution.evidence_complete);
     }
 
     #[test]

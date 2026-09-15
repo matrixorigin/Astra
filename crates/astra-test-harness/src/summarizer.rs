@@ -244,6 +244,7 @@ pub async fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_analysis::ExecutionTraceReport;
     use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, SuiteReport};
     use crate::runner::RunOutcome;
 
@@ -272,7 +273,13 @@ mod tests {
                 attempts: Vec::new(),
                 session: None,
                 session_captures: Vec::new(),
-                execution: None,
+                execution: Some(ExecutionTraceReport {
+                    total_tool_calls: 3,
+                    executed_tool_calls: 1,
+                    successful_tool_calls: 1,
+                    suppressed_tool_calls: 2,
+                    ..Default::default()
+                }),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -292,6 +299,9 @@ mod tests {
         assert!(run.get("criteria").is_some());
         assert!(run.get("output_preview").is_some());
         assert!(run.get("has_warnings").is_some());
+        assert_eq!(run["execution"]["executed_tool_calls"], 1);
+        assert_eq!(run["execution"]["successful_tool_calls"], 1);
+        assert_eq!(run["execution"]["suppressed_tool_calls"], 2);
         // Must NOT contain large fields
         assert!(run.get("stderr").is_none());
         assert!(run.get("session").is_none());
