@@ -680,7 +680,11 @@ mod tests {
                     .await
                     .expect("finish reasoning chunk");
                 socket.flush().await.expect("flush reasoning frame");
-                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                // Keep each reasoning gap comfortably below the watchdog while
+                // leaving enough scheduling headroom for the full parallel test
+                // suite. The total stream duration still exceeds the watchdog so
+                // the test proves every reasoning delta refreshes liveness.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             for frame in [
                 eventstream_frame(
@@ -889,7 +893,7 @@ mod tests {
             std::time::Duration::from_secs(1),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
-            std::time::Duration::from_millis(12),
+            std::time::Duration::from_millis(100),
             None,
             None,
         )

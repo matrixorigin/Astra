@@ -2009,22 +2009,7 @@ async fn load_provider_attempt_fact(
             error,
         )
     })?
-    .map(|row| {
-        Ok::<_, sqlx::Error>(PersistedProviderAttemptFact {
-            invocation_id: row.try_get("invocation_id")?,
-            attempt_index: row.try_get("attempt_index")?,
-            provider: row.try_get("provider")?,
-            admission_token: row.try_get("admission_token")?,
-            provider_protocol: row.try_get("provider_protocol")?,
-            provider_wire_hash: row.try_get("provider_wire_hash")?,
-            provider_wire_bytes: row.try_get("provider_wire_bytes")?,
-            canonical_transition_id: row.try_get("canonical_transition_id")?,
-            canonical_parent_transition_id: row.try_get("canonical_parent_transition_id")?,
-            canonical_transition_hash: row.try_get("canonical_transition_hash")?,
-            status: row.try_get("status")?,
-            terminal_fingerprint: row.try_get("terminal_fingerprint")?,
-        })
-    })
+    .map(decode_persisted_provider_attempt_fact)
     .transpose()
     .map_err(|error| {
         ServiceError::with_source(
@@ -2032,6 +2017,25 @@ async fn load_provider_attempt_fact(
             "decode inference provider attempt fact",
             error,
         )
+    })
+}
+
+fn decode_persisted_provider_attempt_fact(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<PersistedProviderAttemptFact, sqlx::Error> {
+    Ok(PersistedProviderAttemptFact {
+        invocation_id: row.try_get("invocation_id")?,
+        attempt_index: row.try_get("attempt_index")?,
+        provider: row.try_get("provider")?,
+        admission_token: row.try_get("admission_token")?,
+        provider_protocol: row.try_get("provider_protocol")?,
+        provider_wire_hash: row.try_get("provider_wire_hash")?,
+        provider_wire_bytes: row.try_get("provider_wire_bytes")?,
+        canonical_transition_id: row.try_get("canonical_transition_id")?,
+        canonical_parent_transition_id: row.try_get("canonical_parent_transition_id")?,
+        canonical_transition_hash: row.try_get("canonical_transition_hash")?,
+        status: row.try_get("status")?,
+        terminal_fingerprint: row.try_get("terminal_fingerprint")?,
     })
 }
 
@@ -4121,7 +4125,7 @@ async fn record_successful_attempt_debt_if_needed(
                 owner_token: &attempt.owner_token,
                 owner_generation: attempt.owner_generation,
                 terminal: terminal_state,
-                provider_attempt_id: Some(&attempt.attempt_id),
+                provider_attempt: Some(attempt),
                 provider_delivery_state: ProviderDeliveryState::DeliveryAuthorized,
                 mode: SettlementDebtMode::RequireQuiescent,
             },
@@ -5052,7 +5056,7 @@ struct InferenceSettlementDebtRequest<'a> {
     owner_token: &'a str,
     owner_generation: u64,
     terminal: &'a DurableInferenceTerminal,
-    provider_attempt_id: Option<&'a str>,
+    provider_attempt: Option<&'a InferenceProviderAttemptPlan>,
     provider_delivery_state: ProviderDeliveryState,
     mode: SettlementDebtMode,
 }
@@ -5067,10 +5071,11 @@ async fn record_inference_settlement_debt(
         owner_token,
         owner_generation,
         terminal,
-        provider_attempt_id,
+        provider_attempt,
         provider_delivery_state,
         mode,
     } = request;
+    let provider_attempt_id = provider_attempt.map(|attempt| attempt.attempt_id.as_str());
     let mut tx = db.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
@@ -5196,6 +5201,66 @@ async fn record_inference_settlement_debt(
     } else {
         None
     };
+    // A successful provider response can reach this path after the combined
+    // physical+logical terminal transaction was interrupted. In that case the
+    // provider attempt update was rolled back and the exact attempt is still
+    // `started`; requiring an already-succeeded attempt here would make the
+    // recovery debt impossible to record and leave the invocation retrying
+    // forever. Recover only the exact attempt whose complete immutable
+    // admission identity is still durable in this lifecycle transaction.
+    let exact_started_attempt =
+        if successful_terminal && mode == SettlementDebtMode::FenceOpenAttempts {
+            if let Some(provider_attempt) = provider_attempt {
+                let provider_wire_bytes = checked_i64(
+                    provider_attempt.wire.provider_wire_bytes,
+                    "provider_wire_bytes",
+                )?;
+                let persisted = sqlx::query(
+                    "SELECT invocation_id, attempt_index, provider, admission_token,
+                            provider_protocol, provider_wire_hash, provider_wire_bytes,
+                            canonical_transition_id, canonical_parent_transition_id,
+                            canonical_transition_hash, status, terminal_fingerprint
+                     FROM inference_provider_attempts
+                     WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
+                     FOR UPDATE",
+                )
+                .bind(user_id)
+                .bind(invocation_id)
+                .bind(&provider_attempt.attempt_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "verify exact provider attempt identity for settlement debt",
+                        error,
+                    )
+                })?
+                .map(decode_persisted_provider_attempt_fact)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode exact provider attempt identity for settlement debt",
+                        error,
+                    )
+                })?;
+                if let Some(persisted) = persisted {
+                    validate_persisted_provider_attempt_identity(
+                        &persisted,
+                        provider_attempt,
+                        provider_wire_bytes,
+                    )?;
+                    persisted.status == "started" && persisted.terminal_fingerprint.is_none()
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
     if mode == SettlementDebtMode::RequireQuiescent
         && attempt_state.is_some_and(|state| state.has_open_attempt)
     {
@@ -5203,7 +5268,10 @@ async fn record_inference_settlement_debt(
             "inference invocation {invocation_id} still has an active provider attempt"
         )));
     }
-    if successful_terminal && !attempt_state.is_some_and(|state| state.successful_attempt_matches) {
+    if successful_terminal
+        && !attempt_state.is_some_and(|state| state.successful_attempt_matches)
+        && !exact_started_attempt
+    {
         return Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} cannot succeed without a matching succeeded provider attempt"
         )));
@@ -5270,7 +5338,7 @@ pub async fn declare_inference_settlement(
             owner_token: &plan.owner_token,
             owner_generation: plan.owner_generation,
             terminal: &terminal,
-            provider_attempt_id: None,
+            provider_attempt: None,
             provider_delivery_state: ProviderDeliveryState::Unknown,
             mode: SettlementDebtMode::FenceOpenAttempts,
         },
@@ -5314,7 +5382,7 @@ pub async fn declare_inference_attempt_settlement(
             owner_token: &plan.owner_token,
             owner_generation: plan.owner_generation,
             terminal: &terminal,
-            provider_attempt_id: Some(&attempt.attempt_id),
+            provider_attempt: Some(attempt),
             provider_delivery_state: provider_delivery_state.into(),
             mode: SettlementDebtMode::FenceOpenAttempts,
         },
@@ -6480,7 +6548,7 @@ pub async fn finish_inference_invocation(
             owner_token: &plan.owner_token,
             owner_generation: plan.owner_generation,
             terminal: &terminal_state,
-            provider_attempt_id: None,
+            provider_attempt: None,
             provider_delivery_state: ProviderDeliveryState::Unknown,
             mode: SettlementDebtMode::RequireQuiescent,
         },

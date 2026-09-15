@@ -2343,6 +2343,145 @@ async fn exact_attempt_debt_recovers_success_without_degrading_provider_facts() 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn exact_started_attempt_debt_recovers_interrupted_success() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("exact-started-debt-user-{suffix}");
+    let session_id = format!("exact-started-debt-session-{suffix}");
+    let run_id = format!("exact-started-debt-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "exact_started_attempt_debt".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "exact-started-debt-offering".to_string(),
+        resolved_model_name: "exact-started-debt-model".to_string(),
+        upstream_model_name: "exact-started-debt-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan exact-started-debt invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit exact-started-debt invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin exact-started-debt provider request");
+    let conflicting_attempt = plan_inference_provider_attempt(
+        &plan,
+        0,
+        InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            3,
+        )
+        .expect("test conflicting provider wire identity"),
+    );
+    assert_eq!(attempt.attempt_id(), conflicting_attempt.attempt_id());
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("exact-started-provider-response".to_string()),
+    );
+
+    let conflict = declare_inference_attempt_settlement(
+        &shared_pool,
+        &plan,
+        &conflicting_attempt,
+        &terminal,
+        InferenceProviderDeliveryState::DeliveryAuthorized,
+    )
+    .await
+    .expect_err("a reconstructed attempt with drifted admission identity must fail closed");
+    assert_eq!(conflict.kind, ServiceErrorKind::Conflict);
+    let open_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load original started-attempt status after identity conflict");
+    assert_eq!(open_status, "started");
+
+    // Simulate the runtime losing the combined terminal write after the
+    // provider response was received. The exact attempt is still open, so the
+    // recovery debt must be accepted and then close that attempt authoritatively.
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+        InferenceProviderDeliveryState::DeliveryAuthorized,
+    )
+    .await
+    .expect("record exact started-attempt settlement debt");
+
+    let debt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact started-attempt settlement debt");
+    assert_eq!(debt_count, 1);
+
+    reconcile_inference_settlements(&shared_pool, 256)
+        .await
+        .expect("reconcile exact started-attempt settlement debt");
+
+    let state = sqlx::query(
+        "SELECT invocation.status AS invocation_status,
+                attempt.status AS attempt_status
+         FROM inference_invocations AS invocation
+         JOIN inference_provider_attempts AS attempt
+           ON attempt.user_id = invocation.user_id
+          AND attempt.invocation_id = invocation.invocation_id
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact started-attempt recovery state");
+    assert_eq!(state.get::<String, _>("invocation_status"), "succeeded");
+    assert_eq!(state.get::<String, _>("attempt_status"), "succeeded");
+
+    let remaining_debt: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact started-attempt debt after recovery");
+    assert_eq!(remaining_debt, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn conflicting_exact_attempt_settlement_is_rejected_without_promoting_logical_success() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();

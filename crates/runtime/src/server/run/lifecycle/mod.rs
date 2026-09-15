@@ -9294,7 +9294,14 @@ impl AgenticRunLifecycleService {
                 binding.transport
                     == Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger)
             });
-            if work_binding.is_none() && (!request_is_edge || edge_ledger) {
+            let edge_offline = request.executor_binding.as_ref().is_some_and(|binding| {
+                binding.status == Some(astra_services::runs::ExecutorStatusRequest::Offline)
+            });
+            // An offline Edge cannot dispatch provider I/O, so preserve the
+            // typed executor_offline waiting path even in an in-memory/test
+            // host without a durable coordinator. Online native Edge and all
+            // Work requests still fail closed until durable selection exists.
+            if work_binding.is_none() && (!request_is_edge || edge_ledger || edge_offline) {
                 request.execution_binding_generation = None;
                 return Ok(());
             }
