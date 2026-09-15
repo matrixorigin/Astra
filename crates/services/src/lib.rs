@@ -152,9 +152,10 @@ pub use auth::{
     ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
     ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, ExternalSessionRecord, FernetTokenEncryptor,
-    HttpExternalProviderClient, ProviderRequestDescriptor, ReauthenticationProofRecord,
-    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
-    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    HttpExternalProviderClient, ProviderRequestDescriptor, ProviderSessionCreationIdentity,
+    ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
+    SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{

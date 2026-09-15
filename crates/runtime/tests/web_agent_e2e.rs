@@ -830,8 +830,8 @@ async fn create_e2e_agent_binding(
         service,
         AgentBindingOwnerScope::from_principal(&AuthPrincipal {
             user: AuthUserRecord {
-                user_id: "provider_authorized:moi:web-agent-e2e-user".to_string(),
-                username: "web-agent-e2e-user".to_string(),
+                user_id: "provider_authorized:moi:agent-binding-registrar".to_string(),
+                username: "agent-binding-registrar".to_string(),
                 email: String::new(),
                 display_name: None,
             },
@@ -839,9 +839,9 @@ async fn create_e2e_agent_binding(
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
                     provider_id: "moi".to_string(),
-                    external_subject: "web-agent-e2e-user".to_string(),
-                    provider_scope_id: "web-agent-e2e-workspace".to_string(),
-                    request_authorization_id: "web-agent-e2e-authorization".to_string(),
+                    external_subject: "agent-binding-registrar".to_string(),
+                    provider_scope_id: "agent-binding-registry".to_string(),
+                    request_authorization_id: "agent-binding-registration".to_string(),
                     edge_agent_id: None,
                 },
             ),

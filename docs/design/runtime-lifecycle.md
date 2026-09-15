@@ -262,6 +262,46 @@ Recovery uses:
 
 Prompt cache artifacts are not recovery correctness inputs.
 
+### Provider chat session lookup
+
+`POST /sessions` accepts authenticated provider requests with a required
+`client_session_ref` (an exact, nonempty string, at most 255 bytes), plus the
+existing optional `agent_id`, `title` and `metadata`. Authentication covers the
+request method, route and exact body. Provider requests create an empty session;
+they do not start a model or import history. First-party creation without a
+client reference retains the ordinary creation path.
+
+The canonical session owner derives a 64-byte session ID from a domain-separated,
+length-delimited SHA-256 of the verified provider, subject, scope, user and client
+reference. The existing `(user_id, session_id)` primary key and session write
+fence serialize creation across replicas. An immutable `provider_creation_hash`
+column compares the canonical original creation payload: matching repeats return
+the same session (HTTP 200), while a new session returns HTTP 201 and a changed
+payload returns HTTP 409 `session_creation_conflict`. Mutable titles/metadata and
+run state never replace that original hash. Both creation paths share the same
+insert/read-before-commit implementation; a replay bypasses new-session quota
+denial and is not counted as another creation. The existing durable deletion
+fence remains authoritative and cannot be cleared by idempotent creation.
+
+For authenticated provider requests, a confirmed missing session before run
+creation is reported as HTTP 404 with `error_code: session_not_found` (including
+the SSE error envelope for `/chat/stream`). The session owner distinguishes
+absence from an owner-hidden 404; only a failed owner lookup requires the
+additional existence check. A healthy lookup retains its original query path.
+Foreign sessions, generic 404s and storage failures do not grant permission to
+recreate a session. First-party session APIs retain their hidden-not-found
+contract. This error does not assert that an earlier run did not execute: the
+provider must also preserve its own task/run execution identity when deciding
+whether the current operation can be retried.
+
+For an authenticated provider cancellation request, a confirmed lifecycle 404
+is returned with `error_code: run_not_found`. The lifecycle owner continues to
+hide whether the run is absent or belongs to another user. A provider may use
+this exact code to settle an already-requested local cancellation because the
+remote run cannot be cancelled; it must not infer the same result from a generic
+404, an authorization failure, timeout, or malformed response. This code never
+authorizes replaying the original run.
+
 ## Migration roadmap
 
 Runtime lifecycle migration should proceed in stages:

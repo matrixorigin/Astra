@@ -15,18 +15,9 @@ pub(crate) async fn create_session_with_resource_quota(
     user_id: String,
     request: SessionCreateRequestData,
 ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-    if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
-        state.resource_governor.check_session_create(&user_id).await
-    {
-        return Err(error_response_coded(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "Per-user session quota exceeded ({}): {reason}",
-                limit.as_str()
-            ),
-            limit.error_code(),
-        ));
-    }
+    astra_services::resource_governor::enforce_session_create_quota(
+        &state.resource_governor.check_session_create(&user_id).await,
+    )?;
 
     let session = state
         .session_service

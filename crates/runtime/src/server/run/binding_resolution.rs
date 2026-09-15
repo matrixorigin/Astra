@@ -557,7 +557,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            agent_binding_owner_scope: None,
         }
     }
 

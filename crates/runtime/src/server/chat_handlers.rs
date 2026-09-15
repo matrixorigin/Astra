@@ -136,6 +136,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
         requested_session_id,
         agent_id,
         session_id_is_trusted,
+        false,
     )
     .await
     .map(|resolved| resolved.session_id)
@@ -152,16 +153,24 @@ pub(super) async fn resolve_or_create_chat_session(
     requested_session_id: Option<String>,
     agent_id: Option<String>,
     session_id_is_trusted: bool,
+    provider_authorized: bool,
 ) -> Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)> {
     match requested_session_id {
         Some(session_id) => {
             validate_requested_chat_session_id(&session_id)?;
 
-            match state
-                .session_service
-                .get_session(session_id.clone(), user.user_id.clone())
-                .await
-            {
+            let session = if provider_authorized {
+                state
+                    .session_service
+                    .get_session_for_provider_request(session_id.clone(), user.user_id.clone())
+                    .await
+            } else {
+                state
+                    .session_service
+                    .get_session(session_id.clone(), user.user_id.clone())
+                    .await
+            };
+            match session {
                 Ok(session) => Ok(ResolvedChatSession {
                     session_id: Some(session_id),
                     full_llm_capture:
@@ -245,7 +254,15 @@ fn normalize_chat_session_error(
 ) -> (StatusCode, Json<ErrorResponse>) {
     let (status, detail) = error;
     if status == StatusCode::NOT_FOUND {
-        error_response(StatusCode::NOT_FOUND, "Session not found")
+        if detail.0.error_code.as_deref() == Some("session_not_found") {
+            error_response_coded(
+                StatusCode::NOT_FOUND,
+                "Session not found",
+                "session_not_found",
+            )
+        } else {
+            error_response(StatusCode::NOT_FOUND, "Session not found")
+        }
     } else {
         (status, detail)
     }
@@ -268,9 +285,6 @@ pub(super) async fn chat_handler(
     let request = parse_chat_request_body(&body)?;
     let user = principal.user.clone();
     let mut chat_data = chat_request_into_data(request);
-    chat_data.agent_binding_owner_scope = Some(
-        astra_services::AgentBindingOwnerScope::from_principal(&principal),
-    );
     chat_data.forward_headers = collect_forward_headers(&headers);
     let resolved = resolve_or_create_chat_session(
         &state,
@@ -278,6 +292,10 @@ pub(super) async fn chat_handler(
         chat_data.session_id.take(),
         chat_data.agent_id.clone(),
         false,
+        matches!(
+            &principal.origin,
+            astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+        ),
     )
     .await?;
     chat_data.session_id = resolved.session_id;
@@ -339,9 +357,6 @@ pub(super) async fn chat_stream_handler(
     let user = principal.user.clone();
 
     let mut chat_data = chat_request_into_data(request);
-    chat_data.agent_binding_owner_scope = Some(
-        astra_services::AgentBindingOwnerScope::from_principal(&principal),
-    );
     chat_data.forward_headers = collect_forward_headers(&headers);
     if let Some(Extension(trace)) = trace {
         chat_data
@@ -361,6 +376,10 @@ pub(super) async fn chat_stream_handler(
             requested_session_id.clone(),
             requested_agent_id,
             false,
+            matches!(
+                &principal.origin,
+                astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+            ),
         ),
         inject_effective_runtime_context(&state, &principal, &mut chat_data),
     );
@@ -463,6 +482,40 @@ mod session_resolution_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn session_error_normalization_preserves_only_confirmed_missing_code() {
+        for (status, code, expected_code) in [
+            (
+                StatusCode::NOT_FOUND,
+                Some("session_not_found"),
+                Some("session_not_found"),
+            ),
+            (StatusCode::NOT_FOUND, None, None),
+            (StatusCode::NOT_FOUND, Some("resource_not_found"), None),
+            (
+                StatusCode::FORBIDDEN,
+                Some("permission_denied"),
+                Some("permission_denied"),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("storage_unavailable"),
+                Some("storage_unavailable"),
+            ),
+        ] {
+            let error = match code {
+                Some(code) => error_response_coded(status, "private lookup detail", code),
+                None => error_response(status, "private lookup detail"),
+            };
+            let normalized = normalize_chat_session_error(error);
+            assert_eq!(normalized.0, status);
+            assert_eq!(normalized.1.0.error_code.as_deref(), expected_code);
+            if status == StatusCode::NOT_FOUND {
+                assert_eq!(normalized.1.0.detail, "Session not found");
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -571,6 +624,26 @@ mod session_resolution_tests {
             })
         }
 
+        async fn get_session_for_provider_request(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id)
+                .await
+                .map_err(|error| {
+                    if error.0 == StatusCode::NOT_FOUND {
+                        error_response_coded(
+                            StatusCode::NOT_FOUND,
+                            "confirmed absence",
+                            "session_not_found",
+                        )
+                    } else {
+                        error
+                    }
+                })
+        }
+
         async fn update_session(
             &self,
             session_id: String,
@@ -667,6 +740,35 @@ mod session_resolution_tests {
 
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert_eq!(error.1.0.detail, "Session not found");
+        assert_eq!(error.1.0.error_code, None);
+    }
+
+    #[tokio::test]
+    async fn provider_missing_session_is_reported_without_creating_a_replacement() {
+        let session_service = RecordingSessionService::default();
+        session_service.mark_missing("missing-session").await;
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let error = match resolve_or_create_chat_session(
+            &state,
+            &test_user(),
+            Some("missing-session".to_string()),
+            None,
+            false,
+            true,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing session must fail before run creation"),
+        };
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.1.0.error_code.as_deref(), Some("session_not_found"));
+        assert!(session_service.created_requests().await.is_empty());
+        assert_eq!(
+            session_service.looked_up_session_ids().await,
+            vec!["missing-session"]
+        );
     }
 
     #[tokio::test]

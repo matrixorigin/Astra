@@ -8,18 +8,19 @@ fn reads_insert_before_committing(source: &str) -> bool {
         .flat_map(str::chars)
         .filter(|c| !c.is_whitespace())
         .collect();
-    let Some((_, implementation)) =
-        source.split_once("implSessionServiceforDatabaseSessionService{")
-    else {
+    let Some((_, implementation)) = source.split_once("asyncfncreate_session_record(") else {
         return false;
     };
-    let Some((create, _)) = implementation.split_once("asyncfnlist_sessions(") else {
+    let Some((create, _)) = implementation.split_once("pubfnnew(") else {
+        return false;
+    };
+    let Some((_, create)) = create.split_once("INSERTINTOagent_sessions") else {
         return false;
     };
     let insert = create.find(".execute(&mut*tx).await.map_err(internal_error)?;");
     let read = create.find(".fetch_session_for_user(&mut*tx,&session_id,&user_id)");
     let commit = create.find("tx.commit().await.map_err(internal_error)?;");
-    let returned = create.find("Ok(record)");
+    let returned = create.find("Ok(SessionCreationResult{session:record,created:true,})");
     matches!((insert, read, commit, returned), (Some(i), Some(r), Some(c), Some(o)) if i < r && r < c && c < o)
         && !create.contains(".fetch_session_for_user(&pool,")
 }

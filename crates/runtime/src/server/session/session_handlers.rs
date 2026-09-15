@@ -428,18 +428,70 @@ fn default_transcript_limit() -> u32 {
 
 pub(crate) async fn create_session_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
-    Json(request): Json<SessionCreateRequest>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<SessionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(&method, &uri, &headers, "/sessions", &body),
+        )
+        .await?;
+    let request: SessionCreateRequest = serde_json::from_slice(&body).map_err(|_| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Invalid session creation request",
+            "session_request_invalid",
+        )
+    })?;
+    let data = SessionCreateRequestData {
+        agent_id: request.agent_id,
+        title: request.title,
+        metadata: request.metadata,
+    };
+    if matches!(
+        &principal.origin,
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+    ) || request.client_session_ref.is_some()
+    {
+        let client_ref = request.client_session_ref.as_deref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Provider session creation requires client_session_ref",
+                "client_session_ref_invalid",
+            )
+        })?;
+        let identity = astra_services::ProviderSessionCreationIdentity::from_principal(
+            &principal, client_ref,
+        )?;
+        let quota = state
+            .resource_governor
+            .check_session_create(&principal.user.user_id)
+            .await;
+        let result = state
+            .session_service
+            .create_provider_session(identity, data, quota)
+            .await?;
+        if result.created {
+            state
+                .resource_governor
+                .record_session_created(&principal.user.user_id)
+                .await;
+        }
+        let status = if result.created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        return Ok((status, Json(SessionResponse::from(result.session))));
+    }
     let session = super::session_quota::create_session_with_resource_quota(
         &state,
-        user.user_id,
-        SessionCreateRequestData {
-            agent_id: request.agent_id,
-            title: request.title,
-            metadata: request.metadata,
-        },
+        principal.user.user_id,
+        data,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(SessionResponse::from(session))))

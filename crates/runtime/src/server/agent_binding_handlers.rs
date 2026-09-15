@@ -86,7 +86,7 @@ pub(super) async fn get_agent_binding_handler(
     Path(id): Path<String>,
 ) -> Result<Json<AgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
     let empty_body = Bytes::new();
-    let principal = state
+    state
         .auth_service
         .current_principal_for_request(
             &headers,
@@ -99,8 +99,7 @@ pub(super) async fn get_agent_binding_handler(
             ),
         )
         .await?;
-    let scope = astra_services::AgentBindingOwnerScope::from_principal(&principal);
-    let record = state.agent_binding_service.get_binding(scope, id).await?;
+    let record = state.agent_binding_service.get_binding(id).await?;
     Ok(Json(record.into()))
 }
 
@@ -112,7 +111,7 @@ pub(super) async fn disable_agent_binding_handler(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let principal = state
+    state
         .auth_service
         .current_principal_for_request(
             &headers,
@@ -125,11 +124,7 @@ pub(super) async fn disable_agent_binding_handler(
             ),
         )
         .await?;
-    let scope = astra_services::AgentBindingOwnerScope::from_principal(&principal);
-    let record = state
-        .agent_binding_service
-        .disable_binding(scope, id)
-        .await?;
+    let record = state.agent_binding_service.disable_binding(id).await?;
     Ok(Json(record.into()))
 }
 

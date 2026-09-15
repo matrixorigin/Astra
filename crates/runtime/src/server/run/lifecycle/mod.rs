@@ -9815,13 +9815,12 @@ impl AgenticRunLifecycleService {
 
     async fn resolve_agent_binding_runtime(
         &self,
-        scope: &astra_services::AgentBindingOwnerScope,
         request: &AgentBindingRuntimeRequest,
     ) -> Result<ResolvedAgentBindingRuntime, (StatusCode, Json<ErrorResponse>)> {
         exact_runtime_id("agent_binding.id", &request.id)?;
         let binding = self
             .agent_binding_service
-            .get_binding(scope.clone(), request.id.clone())
+            .get_binding(request.id.clone())
             .await
             .map_err(|(status, Json(mut error))| {
                 if error.error_code.as_deref() == Some("agent_binding_not_found") {
@@ -9923,17 +9922,10 @@ impl AgenticRunLifecycleService {
                 agent_binding: None,
             });
         };
-        let binding_scope = request.agent_binding_owner_scope.as_ref().ok_or_else(|| {
-            error_response_coded(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "authenticated Agent Binding owner scope is missing",
-                "agent_binding_owner_scope_missing",
-            )
-        })?;
         let resolved = try_join_all(
             agent_bindings
                 .iter()
-                .map(|binding| self.resolve_agent_binding_runtime(binding_scope, binding)),
+                .map(|binding| self.resolve_agent_binding_runtime(binding)),
         )
         .await?;
         let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
