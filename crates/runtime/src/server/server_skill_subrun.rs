@@ -856,6 +856,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
                         expected_control_epoch,
                         expected_owner_generation: parent_owner_generation,
+                        expected_execution_binding_generation: None,
                     },
                 ),
             )
@@ -1725,6 +1726,7 @@ mod tests {
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
                         expected_control_epoch: 7,
                         expected_owner_generation: 0,
+                        expected_execution_binding_generation: None,
                     },
                 ),
                 None,
@@ -1766,6 +1768,7 @@ mod tests {
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
                         expected_control_epoch: 7,
                         expected_owner_generation: 0,
+                        expected_execution_binding_generation: None,
                     },
                 ),
                 None,
@@ -1899,6 +1902,7 @@ mod tests {
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
                         expected_control_epoch: 0,
                         expected_owner_generation: 0,
+                        expected_execution_binding_generation: None,
                     },
                 ),
             )

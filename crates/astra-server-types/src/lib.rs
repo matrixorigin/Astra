@@ -1961,6 +1961,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         enabled_tools: request.enabled_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
+        execution_binding_generation: None,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         context,
         edge_executor_id,

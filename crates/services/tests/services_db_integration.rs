@@ -8865,7 +8865,13 @@ async fn database_expired_reservation_fences_refreshed_writer() {
         other => panic!("expected new writer, got {other:?}"),
     };
     let reservation = match coordinator
-        .reserve_turn(&lease, None, Duration::from_secs(30), "turn-heartbeat")
+        .reserve_turn(
+            &lease,
+            None,
+            Duration::from_secs(30),
+            "turn-heartbeat",
+            None,
+        )
         .await
         .expect("reserve turn")
     {
@@ -8914,6 +8920,7 @@ async fn database_expired_reservation_fences_refreshed_writer() {
                 None,
                 Duration::from_secs(30),
                 "turn-heartbeat",
+                None,
             )
             .await,
         Err(SessionContextCoordinatorError::Expired)

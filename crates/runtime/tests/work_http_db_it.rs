@@ -1084,6 +1084,7 @@ async fn commit_test_conversation_turn(
             expected,
             std::time::Duration::from_secs(60),
             &format!("work-transcript-turn-{turn}"),
+            None,
         )
         .await
         .expect("reserve transcript turn")
@@ -3131,7 +3132,8 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
                 &source_lease,
                 None,
                 std::time::Duration::from_secs(10),
-                "work-force-stale-source"
+                "work-force-stale-source",
+                None,
             )
             .await,
         Err(astra_services::SessionContextCoordinatorError::Fenced)

@@ -478,6 +478,22 @@ pub trait EdgeRegistryService: Send + Sync {
         workspace_id: Option<&str>,
     ) -> Result<Option<EdgeAgentRecord>, String>;
 
+    /// Find one active Edge owned by this exact user, agent identity, and
+    /// workspace scope. The owner predicate is part of the lookup contract so
+    /// callers never need to load a user's full registry to authorize one
+    /// execution binding.
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        Ok(self
+            .find_by_agent_id_and_workspace(edge_agent_id, workspace_id)
+            .await?
+            .filter(|record| record.user_id == user_id))
+    }
+
     /// List all registered edge agents for a user (for cross-pod dispatch routing).
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String>;
 
@@ -1686,6 +1702,32 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .await
             .map_err(|e| format!("edge_registry find_by_agent_id_and_workspace: {e}"))?;
 
+        row.as_ref().map(decode_edge_agent_record).transpose()
+    }
+
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        let lookup_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ? \
+               AND registration_state = 1 \
+               AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
+             LIMIT 1"
+        );
+        let row = sqlx::query(&lookup_sql)
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry find_by_user_agent_and_workspace: {e}"))?;
         row.as_ref().map(decode_edge_agent_record).transpose()
     }
 

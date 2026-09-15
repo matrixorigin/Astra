@@ -3557,6 +3557,11 @@ impl RuntimeToolExecutor {
                     }
                 })
             });
+            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
+                admission.expected_execution_binding_generation =
+                    request.policy.execution_binding_generation;
+                admission
+            });
             let admitted_control_epoch = durable_dispatch_admission
                 .as_ref()
                 .map(|admission| admission.expected_control_epoch);

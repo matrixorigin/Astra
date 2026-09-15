@@ -663,6 +663,7 @@ mod tests {
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     expected_owner_pod_id: "compactor-test-owner".to_string(),
+                    expected_execution_binding_generation: None,
                 },
             )
             .await

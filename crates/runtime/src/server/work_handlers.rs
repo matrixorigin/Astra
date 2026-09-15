@@ -3551,7 +3551,10 @@ pub(super) async fn post_work_branch_turn_handler(
         // branch session. The runtime records the resolved binding before the
         // run becomes visible; clients never select a topology per turn.
         workspace_binding: Some(server_owned_work_workspace_binding()),
-        executor_binding: None,
+        executor_binding: Some(
+            astra_services::SessionExecutionBindingV1::server_work_executor_request(),
+        ),
+        execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id: None,

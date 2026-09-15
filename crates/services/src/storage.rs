@@ -4196,6 +4196,27 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "session_execution_bindings",
+        "CREATE TABLE IF NOT EXISTS session_execution_bindings (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            generation BIGINT NOT NULL,
+            binding_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
+            INDEX idx_session_execution_bindings_owner_session
+                (owner_user_id, session_id, branch_id),
+            CONSTRAINT chk_session_execution_binding_generation CHECK (generation > 0)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "conversation_segments",
         "CREATE TABLE IF NOT EXISTS conversation_segments (
             isolation_domain VARCHAR(128) NOT NULL,

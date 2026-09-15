@@ -883,6 +883,10 @@ pub struct ChatRequestData {
     pub enabled_tools: Option<Vec<String>>,
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
+    /// Server-derived Session provider-selection generation. This is never
+    /// accepted from client transports; durable admission and dispatch use it
+    /// to fence work after a provider handoff.
+    pub execution_binding_generation: Option<u64>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
@@ -28996,6 +29000,7 @@ mod tests {
                 Duration::from_secs(60),
                 "original-writer",
                 "original-turn",
+                None,
             )
             .await
             .unwrap()
@@ -33728,6 +33733,7 @@ mod tests {
                         "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
                         "interactive_client": true,
                         "turn_intent_policy": "fixed_default",
+                        "execution_binding_generation": 7,
                         "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                         "executor": {"kind": "server_local", "status": "online"},
                         "transport": "server_local"
@@ -33738,6 +33744,7 @@ mod tests {
                     assert_eq!(o["run_id"], "run-1");
                     assert_eq!(o["interaction_mode"], "auto");
                     assert_eq!(o["turn_intent_policy"], "fixed_default");
+                    assert!(o.get("execution_binding_generation").is_none());
                 },
             ),
             (
@@ -34289,6 +34296,7 @@ mod tests {
             enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
+            execution_binding_generation: None,
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
@@ -34373,6 +34381,7 @@ mod tests {
             enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
+            execution_binding_generation: None,
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
@@ -34485,6 +34494,7 @@ mod tests {
                     enabled_tools: None,
                     workspace_binding: None,
                     executor_binding: None,
+                    execution_binding_generation: None,
                     runtime_mcp_bindings: Vec::new(),
                     context: None,
                     edge_executor_id: None,

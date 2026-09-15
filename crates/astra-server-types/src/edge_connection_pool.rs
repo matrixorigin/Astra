@@ -527,6 +527,44 @@ impl EdgeConnectionPool {
             })
     }
 
+    /// Find one live connection owned by this exact user and workspace scope.
+    /// This is the authorization lookup for a native Work execution binding;
+    /// callers must not use the display-oriented all-edges view for it.
+    pub fn find_user_edge_by_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Option<EdgeConnectionInfo> {
+        self.connections
+            .iter()
+            .find(|entry| {
+                let conn = entry.value();
+                if conn.user_id != user_id
+                    || conn.edge_agent_id != edge_agent_id
+                    || conn.sender.is_closed()
+                {
+                    return false;
+                }
+                match (workspace_id, conn.workspace_id.as_deref()) {
+                    (Some(requested), Some(registered)) => requested == registered,
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .map(|entry| {
+                let conn = entry.value();
+                EdgeConnectionInfo {
+                    edge_agent_id: conn.edge_agent_id.clone(),
+                    hostname: conn.hostname.clone(),
+                    workspace_dir: conn.workspace_dir.clone(),
+                    capabilities: conn.capabilities.clone(),
+                    connected_at: conn.connected_at,
+                    workspace_id: conn.workspace_id.clone(),
+                }
+            })
+    }
+
     /// Get all connected edge agents for a user, regardless of workspace.
     /// Use this for status/display queries; use [`get_user_edges`] for dispatch
     /// to enforce workspace isolation.
@@ -1979,6 +2017,47 @@ mod tests {
         assert!(
             result.is_none(),
             "unscoped request must not resolve a workspace-bound edge"
+        );
+    }
+
+    #[test]
+    fn find_user_edge_by_agent_and_workspace_scopes_owner_and_workspace() {
+        let pool = EdgeConnectionPool::new();
+        let (tx_owner, _rx_owner) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-a",
+            "edge-x",
+            None,
+            Some("/repo/a".into()),
+            None,
+            None,
+            tx_owner,
+        );
+        let (tx_other, _rx_other) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-b",
+            "edge-x",
+            None,
+            Some("/repo/b".into()),
+            None,
+            None,
+            tx_other,
+        );
+
+        assert_eq!(
+            pool.find_user_edge_by_agent_and_workspace("user-a", "edge-x", None)
+                .and_then(|edge| edge.workspace_dir),
+            Some("/repo/a".to_string())
+        );
+        assert!(
+            pool.find_user_edge_by_agent_and_workspace("user-c", "edge-x", None)
+                .is_none(),
+            "another user must not authorize this executor"
+        );
+        assert!(
+            pool.find_user_edge_by_agent_and_workspace("user-a", "edge-x", Some("ws-a"))
+                .is_none(),
+            "an unscoped request must not resolve a workspace-scoped edge"
         );
     }
 

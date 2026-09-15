@@ -271,6 +271,21 @@ workspace safe.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
+- Work now has a durable execution-selection record keyed by isolation domain,
+  owner, Session, and branch. First use pins the canonical Server sandbox for a
+  Server Work, or records an already authenticated Edge placement when an Edge
+  Session is promoted; API callers cannot choose or override that selection.
+  Run admission checks the selected generation while holding the canonical
+  Session authority, and tool dispatch checks it again in the same transaction
+  as Run action admission and the invocation claim. A selection change is
+  rejected while writer/reservation authority, a Run slot, or a prepared,
+  dispatched, or outcome-unknown invocation remains active. Exact composite-key
+  reads and the existing owner/Session/state invocation index keep coordination
+  scoped to the affected Session; dispatch does not lock the selection row, so
+  the binding fence adds no serialization to parallel tool fan-out. Live
+  MatrixOne coverage exists for owner/Session isolation, stale generations,
+  switching-state admission, and busy-switch rejection, but this environment
+  cannot execute those database tests. No multi-user capacity claim is made.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be
@@ -288,6 +303,7 @@ The current implementation status and owning contracts are tracked in the
 [runtime lifecycle](runtime-lifecycle.md), [durable runs](durable-agent-runs.md),
 [Edge-cloud execution](edge-cloud-execution.md), and
 [client surfaces](client-surfaces-and-deployment.md). Do not advertise a
-between-Run Edge provider transfer as supported until the binding-switch implementation
-and Edge handoff E2E above both exist. Do not advertise Server Run-owner crash
+between-Run Edge provider transfer as supported until the complete binding-switch
+flow and Edge handoff E2E above both exist. Activity polling and multi-user
+capacity targets remain unmeasured. Do not advertise Server Run-owner crash
 recovery until its production recovery consumer and separate lifecycle E2E exist.

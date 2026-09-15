@@ -330,8 +330,9 @@ pub use session_artifact_store::{
 pub use session_context_coordinator::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, DatabaseSessionContextCoordinator,
     MaterializedConversationV1, RenewedTurnAuthority, ReserveTurnOutcome,
-    SessionAdmissionSnapshotV1, SessionAuthorityEventV1, SessionContextCoordinator,
-    SessionContextCoordinatorError, TransferWriterOutcome, WriterTransferConflictV1,
+    SESSION_EXECUTION_BINDING_SCHEMA_VERSION, SessionAdmissionSnapshotV1, SessionAuthorityEventV1,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionExecutionBindingStateV1,
+    SessionExecutionBindingV1, TransferWriterOutcome, WriterTransferConflictV1,
     WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{

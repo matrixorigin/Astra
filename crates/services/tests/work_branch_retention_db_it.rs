@@ -234,6 +234,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             None,
             std::time::Duration::from_secs(60),
             "branch-deletion-turn",
+            None,
         )
         .await
         .expect("reserve turn")

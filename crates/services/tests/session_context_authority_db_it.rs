@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use astra_services::{
     AcquireWriterOutcome, DatabaseSessionContextCoordinator, ReserveTurnOutcome,
-    SessionContextCoordinator,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionExecutionBindingStateV1,
+    SessionExecutionBindingV1,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -39,7 +40,7 @@ async fn complete_turn_authority_renews_atomically_in_database() {
         other => panic!("unexpected writer outcome: {other:?}"),
     };
     let reservation = match coordinator
-        .reserve_turn(&lease, None, Duration::from_secs(30), "reserve")
+        .reserve_turn(&lease, None, Duration::from_secs(30), "reserve", None)
         .await
         .expect("reserve turn")
     {
@@ -109,6 +110,168 @@ async fn complete_turn_authority_renews_atomically_in_database() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
+    let pool = common::setup_pool().await;
+    let suffix = Uuid::new_v4();
+    let owner_a = format!("execution-binding-owner-a-{suffix}");
+    let owner_b = format!("execution-binding-owner-b-{suffix}");
+    let shared_session = format!("execution-binding-session-{suffix}");
+    let other_session = format!("execution-binding-other-session-{suffix}");
+    let key_a = SessionKeyV1::owner_session("server", &owner_a, &shared_session, "main");
+    let key_a_other = SessionKeyV1::owner_session("server", &owner_a, &other_session, "main");
+    // Deliberately reuse the session id across owners to prove the owner key
+    // remains part of selection identity.
+    let key_b = SessionKeyV1::owner_session("server", &owner_b, &shared_session, "main");
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let initial_a = SessionExecutionBindingV1::server_work_default("work:shared:branch:main");
+    let initial_a_other = SessionExecutionBindingV1::server_work_default("work:other:branch:main");
+    let initial_b = SessionExecutionBindingV1::server_work_default("work:shared:branch:main");
+
+    for (key, initial) in [
+        (&key_a, &initial_a),
+        (&key_a_other, &initial_a_other),
+        (&key_b, &initial_b),
+    ] {
+        let loaded = coordinator
+            .load_or_initialize_execution_binding(key, initial)
+            .await
+            .expect("initialize owner-scoped execution binding");
+        assert_eq!(loaded.generation, 1);
+    }
+
+    let mut switching = initial_a.clone();
+    switching.generation = 2;
+    switching.state = SessionExecutionBindingStateV1::Switching;
+    let switched = coordinator
+        .compare_and_swap_execution_binding(&key_a, 1, &switching)
+        .await
+        .expect("advance exactly the selected Session binding");
+    assert_eq!(switched.state, SessionExecutionBindingStateV1::Switching);
+
+    let actor_a = ActorContextV1::owner_user(
+        &owner_a,
+        "execution-binding-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    assert!(matches!(
+        coordinator
+            .acquire_writer_and_reserve_turn(
+                &key_a,
+                None,
+                &actor_a,
+                Duration::from_secs(30),
+                "stale-writer",
+                "stale-turn",
+                Some(1),
+            )
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+            expected: 1,
+            current: Some(2),
+        })
+    ));
+    assert!(matches!(
+        coordinator
+            .acquire_writer_and_reserve_turn(
+                &key_a,
+                None,
+                &actor_a,
+                Duration::from_secs(30),
+                "switching-writer",
+                "switching-turn",
+                Some(2),
+            )
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
+            SessionExecutionBindingStateV1::Switching
+        ))
+    ));
+
+    let other_a = coordinator
+        .load_execution_binding(&key_a_other)
+        .await
+        .expect("load second Session binding")
+        .expect("second Session binding");
+    let other_owner = coordinator
+        .load_execution_binding(&key_b)
+        .await
+        .expect("load second owner binding")
+        .expect("second owner binding");
+    assert_eq!(other_a.generation, 1);
+    assert_eq!(other_a.state, SessionExecutionBindingStateV1::Ready);
+    assert_eq!(other_owner.generation, 1);
+    assert_eq!(other_owner.state, SessionExecutionBindingStateV1::Ready);
+
+    let lease = match coordinator
+        .acquire_writer(
+            &key_a_other,
+            None,
+            &actor_a,
+            Duration::from_secs(30),
+            "active-writer",
+        )
+        .await
+        .expect("acquire a live writer on the second Session")
+    {
+        AcquireWriterOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected writer outcome: {other:?}"),
+    };
+    let mut blocked_switch = other_a.clone();
+    blocked_switch.generation = 2;
+    blocked_switch.state = SessionExecutionBindingStateV1::Switching;
+    assert!(matches!(
+        coordinator
+            .compare_and_swap_execution_binding(&key_a_other, 1, &blocked_switch)
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionBindingBusy)
+    ));
+
+    // A live writer on one Session does not hold a global provider-selection
+    // lock or block another Session owned by the same user.
+    let mut ready_a = initial_a.clone();
+    ready_a.generation = 3;
+    let ready_a = coordinator
+        .compare_and_swap_execution_binding(&key_a, 2, &ready_a)
+        .await
+        .expect("unrelated Session remains independently writable");
+    assert_eq!(ready_a.state, SessionExecutionBindingStateV1::Ready);
+
+    coordinator
+        .release_writer(&lease)
+        .await
+        .expect("release fixture writer");
+
+    for key in [&key_a, &key_a_other, &key_b] {
+        sqlx::query(
+            "DELETE FROM session_execution_bindings WHERE isolation_domain = ? \
+             AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(pool.get())
+        .await
+        .expect("clean execution binding fixture");
+        sqlx::query(
+            "DELETE FROM session_context_heads WHERE isolation_domain = ? \
+             AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(pool.get())
+        .await
+        .expect("clean Session coordination fixture");
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn commit_reactivates_matching_legacy_staged_manifest() {
     let pool = common::setup_pool().await;
     let owner_id = format!("staged-manifest-owner-{}", Uuid::new_v4());
@@ -132,7 +295,7 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
         other => panic!("unexpected writer outcome: {other:?}"),
     };
     let reservation = match coordinator
-        .reserve_turn(&lease, None, Duration::from_secs(30), "reserve")
+        .reserve_turn(&lease, None, Duration::from_secs(30), "reserve", None)
         .await
         .expect("reserve turn")
     {

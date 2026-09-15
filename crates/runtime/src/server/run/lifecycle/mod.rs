@@ -3235,9 +3235,9 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
 
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
-    execution_bindings_from_metadata, execution_bindings_from_metadata_with_authority,
-    executor_binding_from_request, request_uses_server_workspace,
-    resolve_request_execution_bindings,
+    binding_snapshot_fields, execution_bindings_from_metadata,
+    execution_bindings_from_metadata_with_authority, executor_binding_from_request,
+    request_uses_server_workspace, resolve_request_execution_bindings,
     resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
 };
 
@@ -5537,6 +5537,7 @@ impl AgenticRunLifecycleService {
                         head.as_ref().map(|head| &head.cursor),
                         admission_ttl,
                         &format!("server-run:{run_id}:turn"),
+                        request.execution_binding_generation,
                     )
                     .await
                 {
@@ -5554,6 +5555,18 @@ impl AgenticRunLifecycleService {
                     }
                     Err(error) => {
                         let _ = distributed_permit.release().await;
+                        if matches!(
+                            &error,
+                            astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
+                                | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_)
+                                | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
+                        ) {
+                            return Err(error_response_coded(
+                                StatusCode::CONFLICT,
+                                "Work execution selection changed before this turn was admitted; refresh and retry",
+                                "session_execution_binding_fenced",
+                            ));
+                        }
                         return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
                             format!("failed to reserve canonical turn: {error}"),
@@ -5597,6 +5610,7 @@ impl AgenticRunLifecycleService {
                     admission_ttl,
                     &writer_idempotency_key,
                     &reservation_idempotency_key,
+                    request.execution_binding_generation,
                 );
                 let (distributed_result, prior_messages_result, canonical_result) = tokio::join!(
                     distributed_reservation,
@@ -5608,6 +5622,18 @@ impl AgenticRunLifecycleService {
                     Err(error) => {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
+                        }
+                        if matches!(
+                            &error,
+                            astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
+                                | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_)
+                                | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
+                        ) {
+                            return Err(error_response_coded(
+                                StatusCode::CONFLICT,
+                                "Work execution selection changed before this turn was admitted; refresh and retry",
+                                "session_execution_binding_fenced",
+                            ));
                         }
                         return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -9103,6 +9129,327 @@ impl AgenticRunLifecycleService {
             item: item.map(|(_, item)| item),
             context_payload,
         }))
+    }
+
+    /// Resolve provider selection once per validated Work Session. The public
+    /// request cannot choose this value; the durable owner/session/branch row
+    /// is authoritative, and its generation is carried to both Run admission
+    /// and tool dispatch.
+    async fn bind_work_execution_selection(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request: &mut ChatRequestData,
+        work_binding: Option<&ValidatedWorkRuntimeBinding>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let Some(work_binding) = work_binding else {
+            request.execution_binding_generation = None;
+            return Ok(());
+        };
+        let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
+            binding.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+        }) || request.executor_binding.as_ref().is_some_and(|binding| {
+            binding.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+        }) || request.edge_executor_id.is_some();
+        let request_is_server = request.workspace_binding.as_ref().is_some_and(|binding| {
+            binding.kind == astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
+        }) || request.executor_binding.as_ref().is_some_and(|binding| {
+            binding.kind == astra_services::runs::ExecutorBindingRequestKind::ServerLocal
+        });
+        let Some(pool) = self.shared_pool.clone() else {
+            #[cfg(test)]
+            {
+                if request_is_edge {
+                    // Unit-test services do not have a durable coordinator;
+                    // retain the explicitly supplied Edge placement so tests
+                    // exercise the same no-reroute behavior as production.
+                    request.execution_binding_generation = None;
+                    return Ok(());
+                }
+                request.workspace_binding = Some(
+                    astra_services::SessionExecutionBindingV1::server_work_workspace_request(),
+                );
+                request.executor_binding =
+                    Some(astra_services::SessionExecutionBindingV1::server_work_executor_request());
+                request.execution_binding_generation = None;
+                return Ok(());
+            }
+            #[cfg(not(test))]
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable Work execution selection is unavailable",
+                "execution_binding_unavailable",
+            ));
+        };
+        let logical_workspace_id = format!(
+            "work:{}:branch:{}",
+            work_binding.work_id.as_str(),
+            work_binding.branch_id.as_str()
+        );
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            user_id,
+            session_id,
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool);
+        // The durable row is the sole provider-selection authority. A Work
+        // created from a new Session starts on the Server; an Edge-backed
+        // request must establish its typed, authenticated Edge binding here.
+        // Provider changes are handled by the explicit handoff flow, never by
+        // silently interpreting a later chat request as a switch.
+        let existing = coordinator
+            .load_execution_binding(&key)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    owner_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to load durable Work execution selection"
+                );
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "durable Work execution selection is temporarily unavailable",
+                    "execution_binding_unavailable",
+                )
+            })?;
+        let initial = match (existing.as_ref(), request_is_edge) {
+            (None, true) => {
+                self.authorize_native_edge_execution(user_id, request)
+                    .await?;
+                let workspace = request.workspace_binding.clone().ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::PRECONDITION_FAILED,
+                        "this Edge Session did not provide a complete workspace binding",
+                        "execution_binding_provider_unavailable",
+                    )
+                })?;
+                let executor = request.executor_binding.clone().ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::PRECONDITION_FAILED,
+                        "this Edge Session did not provide a complete executor binding",
+                        "execution_binding_provider_unavailable",
+                    )
+                })?;
+                astra_services::SessionExecutionBindingV1 {
+                    schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
+                    generation: 1,
+                    state: astra_services::SessionExecutionBindingStateV1::Ready,
+                    logical_workspace_id: logical_workspace_id.clone(),
+                    workspace,
+                    executor,
+                }
+            }
+            (None, false) if request_is_server => {
+                astra_services::SessionExecutionBindingV1::server_work_default(
+                    logical_workspace_id.clone(),
+                )
+            }
+            (None, false) => {
+                return Err(error_response_coded(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "this existing Work has no durable execution provider; continue from its owning Edge or choose a provider before starting a turn",
+                    "execution_binding_provider_required",
+                ));
+            }
+            (Some(existing), _) => existing.clone(),
+        };
+        let binding = if let Some(existing) = existing {
+            // Existing rows have already been decoded and validated. They may
+            // legitimately be on a later generation or in Switching/
+            // NeedsAttention; send those states through typed readiness
+            // handling instead of the generation-1 initializer.
+            existing
+        } else {
+            coordinator
+                .load_or_initialize_execution_binding(&key, &initial)
+                .await
+                .map_err(|error| {
+                    let (status, code, detail) = match &error {
+                    astra_services::SessionContextCoordinatorError::ExecutionBindingBusy => (
+                        StatusCode::CONFLICT,
+                        "execution_binding_busy",
+                        "Work execution selection cannot change while this Session is active",
+                    ),
+                    astra_services::SessionContextCoordinatorError::ExecutionBindingFenced {
+                        ..
+                    }
+                    | astra_services::SessionContextCoordinatorError::NeedsRepair(_) => (
+                        StatusCode::CONFLICT,
+                        "execution_binding_needs_repair",
+                        "Work execution selection is inconsistent; refresh before continuing",
+                    ),
+                    astra_services::SessionContextCoordinatorError::Invalid(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "execution_binding_invalid",
+                        "Work execution selection is invalid",
+                    ),
+                    _ => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "execution_binding_unavailable",
+                        "Work execution selection is temporarily unavailable",
+                    ),
+                };
+                    tracing::warn!(
+                        owner_id = %user_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "failed to resolve durable Work execution selection"
+                    );
+                    error_response_coded(status, detail, code)
+                })?
+        };
+        let binding_is_edge = binding.workspace.kind
+            == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+            || binding.executor.kind == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent;
+        if binding_is_edge {
+            if request_is_server {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "this Work is bound to an Edge; continue it from an authenticated Edge instead of switching it implicitly",
+                    "execution_binding_provider_mismatch",
+                ));
+            }
+            let requested_matches =
+                request.workspace_binding.as_ref().is_some_and(|workspace| {
+                    workspace.kind == binding.workspace.kind
+                        && workspace.root.as_deref().map(str::trim)
+                            == binding.workspace.root.as_deref().map(str::trim)
+                }) && request.executor_binding.as_ref().is_some_and(|executor| {
+                    executor.kind == binding.executor.kind
+                        && executor.executor_id.as_deref().map(str::trim)
+                            == binding.executor.executor_id.as_deref().map(str::trim)
+                });
+            if !requested_matches {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "this Work is bound to another Edge; use Continue on another Edge to switch it",
+                    "execution_binding_provider_mismatch",
+                ));
+            }
+            self.authorize_native_edge_execution(user_id, request)
+                .await?;
+        } else if request_is_edge {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "this Work is currently bound to the Server; use Continue on another Edge to switch it",
+                "execution_binding_provider_mismatch",
+            ));
+        }
+        if binding.state != astra_services::SessionExecutionBindingStateV1::Ready {
+            let (code, message) = match binding.state {
+                astra_services::SessionExecutionBindingStateV1::Switching => (
+                    "execution_binding_switching",
+                    "Work is switching execution providers. Refresh and try again shortly.",
+                ),
+                astra_services::SessionExecutionBindingStateV1::NeedsAttention => (
+                    "execution_binding_needs_attention",
+                    "Work execution needs attention before another turn can start.",
+                ),
+                astra_services::SessionExecutionBindingStateV1::Ready => unreachable!(),
+            };
+            return Err(error_response_coded(StatusCode::CONFLICT, message, code));
+        }
+        request.workspace_binding = Some(binding.workspace);
+        request.executor_binding = Some(binding.executor);
+        request.execution_binding_generation = Some(binding.generation);
+        Ok(())
+    }
+
+    /// A first-party user request may select only an Edge connection that is
+    /// already authenticated for that same user and advertises the exact
+    /// workspace path. Provider-authorized runtime requests have a separate
+    /// credential and capability contract, so they are checked by the
+    /// provider-runtime admission path instead of this user-owned registry
+    /// lookup.
+    async fn authorize_native_edge_execution(
+        &self,
+        user_id: &str,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if request.provider_runtime_authorized {
+            return Ok(());
+        }
+        let workspace = request.workspace_binding.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::PRECONDITION_FAILED,
+                "an Edge execution request must include a typed workspace binding",
+                "execution_binding_provider_unavailable",
+            )
+        })?;
+        let root = workspace
+            .root
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::PRECONDITION_FAILED,
+                    "an Edge execution request must include its workspace root",
+                    "execution_binding_provider_unavailable",
+                )
+            })?;
+        let executor_id = request
+            .executor_binding
+            .as_ref()
+            .and_then(|executor| executor.executor_id.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .filter(|id| request.edge_executor_id.as_deref().map(str::trim) == Some(*id))
+            .ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::PRECONDITION_FAILED,
+                    "an Edge execution request must identify the same executor in both typed fields",
+                    "execution_binding_provider_unavailable",
+                )
+            })?;
+
+        let path_matches = |path: Option<&str>| {
+            path.map(str::trim)
+                .is_some_and(|candidate| candidate == root)
+        };
+        // Native first-party registrations are intentionally unscoped. A
+        // workspace-scoped Edge can only be selected through the provider
+        // authorization path, where the authenticated provider scope is
+        // available; never widen an unscoped request to match one.
+        let workspace_scope: Option<&str> = None;
+        if let Some(pool) = self.edge_connection_pool.as_ref()
+            && pool
+                .find_user_edge_by_agent_and_workspace(user_id, executor_id, workspace_scope)
+                .is_some_and(|edge| path_matches(edge.workspace_dir.as_deref()))
+        {
+            return Ok(());
+        }
+
+        if let Some(registry) = self.edge_registry_service.as_ref() {
+            let agent = registry
+                .find_by_user_agent_and_workspace(user_id, executor_id, workspace_scope)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        owner_id = %user_id,
+                        executor_id,
+                        error = %error,
+                        "native Edge authorization lookup failed"
+                    );
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "the Edge registry is temporarily unavailable",
+                        "execution_binding_provider_unavailable",
+                    )
+                })?;
+            if agent.is_some_and(|agent| path_matches(agent.worktree_path.as_deref())) {
+                return Ok(());
+            }
+        }
+
+        Err(error_response_coded(
+            StatusCode::PRECONDITION_REQUIRED,
+            "the selected Edge is not connected for this user and workspace",
+            "execution_binding_provider_required",
+        ))
     }
 
     async fn validate_optional_tool_availability(
@@ -12612,6 +12959,11 @@ impl AgenticRunLifecycleService {
             {
                 snapshot.transport = Some(transport.to_string());
             }
+            if snapshot.execution_binding_generation.is_none() {
+                snapshot.execution_binding_generation = payload
+                    .get("execution_binding_generation")
+                    .and_then(Value::as_u64);
+            }
         }
         snapshot
     }
@@ -14484,6 +14836,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
+        self.bind_work_execution_selection(
+            &user_id,
+            &session_id,
+            &mut request,
+            work_runtime_binding.as_ref(),
+        )
+        .await?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
@@ -14569,7 +14928,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             } else {
                 None
             };
-        let execution_bindings = cloud_execution_bindings
+        let mut execution_bindings = cloud_execution_bindings
             .or_else(|| {
                 server_workspace.as_deref().map(|workspace| {
                     let (workspace, executor) =
@@ -14583,6 +14942,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Some(generation) = request.execution_binding_generation {
+            let Some(snapshot) = execution_bindings.as_mut() else {
+                self.runs.write().await.remove(&run_id);
+                return Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Work execution provider could not be materialized",
+                    "execution_binding_unavailable",
+                ));
+            };
+            snapshot.execution_binding_generation = Some(generation);
+        }
         if let Err(error) = self
             .validate_optional_tool_availability(
                 &user_id,
@@ -14746,10 +15116,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         host.set_interaction_sink(Arc::clone(&interaction_sink));
         if let Some(snapshot) = execution_bindings.as_ref() {
-            host.set_execution_metadata(Value::Object(binding_event_fields(
-                &snapshot.workspace,
-                &snapshot.executor,
-            )));
+            host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
         }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas_with_native_ids(
@@ -15345,6 +15712,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
+        self.bind_work_execution_selection(
+            &user_id,
+            &session_id,
+            &mut request,
+            work_runtime_binding.as_ref(),
+        )
+        .await?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
@@ -15541,7 +15915,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             } else {
                 None
             };
-        let execution_bindings = cloud_execution_bindings
+        let mut execution_bindings = cloud_execution_bindings
             .or_else(|| {
                 server_workspace.as_deref().map(|workspace| {
                     let (workspace, executor) =
@@ -15555,6 +15929,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Some(generation) = request.execution_binding_generation {
+            let Some(snapshot) = execution_bindings.as_mut() else {
+                self.fail_claimed_idempotent_run_before_spawn(
+                    execution_owner_generation,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "Work execution provider could not be materialized",
+                )
+                .await;
+                return Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Work execution provider could not be materialized",
+                    "execution_binding_unavailable",
+                ));
+            };
+            snapshot.execution_binding_generation = Some(generation);
+        }
         if let Err(error) = self
             .validate_optional_tool_availability(
                 &user_id,
@@ -15584,12 +15976,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(error);
         }
         if idempotent_run_claimed && let Some(snapshot) = execution_bindings.as_ref() {
-            let binding_events = binding_snapshot_events(
-                &run_id,
-                &session_id,
-                &snapshot.workspace,
-                &snapshot.executor,
-            );
+            let binding_events = binding_snapshot_events(&run_id, &session_id, snapshot);
             if let Err(error) = self
                 .run_engine
                 .append_events_batch(&user_id, &session_id, &run_id, &binding_events)
@@ -16187,10 +16574,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         host.set_interaction_sink(interaction_sink);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
-            host.set_execution_metadata(Value::Object(binding_event_fields(
-                &snapshot.workspace,
-                &snapshot.executor,
-            )));
+            host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
         }
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
@@ -16344,12 +16728,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             );
         }
         if let Some(snapshot) = execution_bindings.as_ref() {
-            for mut event in binding_snapshot_events(
-                &run_id,
-                &session_id,
-                &snapshot.workspace,
-                &snapshot.executor,
-            ) {
+            for mut event in binding_snapshot_events(&run_id, &session_id, snapshot) {
                 if idempotent_run_claimed && let Some(object) = event.as_object_mut() {
                     object.insert(DURABLE_EVENT_COMMITTED_FIELD.to_string(), Value::Bool(true));
                 }

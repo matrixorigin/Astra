@@ -218,6 +218,11 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Server-derived Session provider-selection generation. It is runtime
+    /// authority only and is deliberately omitted from serialized provider
+    /// requests and durable tool decisions.
+    #[serde(skip)]
+    pub execution_binding_generation: Option<u64>,
     /// Trusted control epoch returned by durable action admission for this
     /// exact dispatch. It is installed only after the ledger grants Execute,
     /// never serialized to an external executor or accepted from tool args.
@@ -396,6 +401,8 @@ pub struct ExecutionBindingSnapshot {
     pub executor: ExecutorBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding_generation: Option<u64>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -408,6 +415,7 @@ impl ExecutionBindingSnapshot {
             workspace,
             executor,
             runtime: Some(runtime),
+            execution_binding_generation: None,
         }
     }
 
@@ -416,6 +424,7 @@ impl ExecutionBindingSnapshot {
             workspace,
             executor,
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 }
@@ -426,6 +435,7 @@ pub(crate) struct ExecutionBindingState {
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     executor: ExecutorBinding,
     runtime: Option<astra_runtime_env::RuntimeBinding>,
+    execution_binding_generation: Option<u64>,
 }
 
 impl ExecutionBindingState {
@@ -435,6 +445,7 @@ impl ExecutionBindingState {
             workspace_record: None,
             executor: ExecutorBinding::server_control_plane(),
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 
@@ -445,6 +456,7 @@ impl ExecutionBindingState {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 
@@ -470,6 +482,7 @@ impl ExecutionBindingState {
         self.workspace = snapshot.workspace;
         self.executor = snapshot.executor;
         self.runtime = snapshot.runtime;
+        self.execution_binding_generation = snapshot.execution_binding_generation;
     }
 
     pub(crate) fn set_workspace_record(
@@ -568,10 +581,16 @@ impl ExecutionBindingState {
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
         }
+        .with_execution_binding_generation(self.execution_binding_generation)
     }
 }
 
 impl ToolExecutionRequest {
+    fn with_execution_binding_generation(mut self, generation: Option<u64>) -> Self {
+        self.policy.execution_binding_generation = generation;
+        self
+    }
+
     pub(crate) fn with_selected_offer(mut self, offer: SelectedToolOfferSnapshot) -> Self {
         self.selected_offer = Some(offer);
         self

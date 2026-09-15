@@ -57,6 +57,14 @@ pub enum SessionContextCoordinatorError {
     SegmentNotFound,
     #[error("coordinator clock is outside the supported range")]
     Clock,
+    #[error(
+        "session execution binding is fenced: expected generation {expected}, current generation {current:?}"
+    )]
+    ExecutionBindingFenced { expected: u64, current: Option<u64> },
+    #[error("session execution binding is busy with an active Run or unresolved invocation")]
+    ExecutionBindingBusy,
+    #[error("session execution binding is not ready: {0:?}")]
+    ExecutionBindingNotReady(SessionExecutionBindingStateV1),
     #[error("coordinator database operation {operation} failed: {source}")]
     Database {
         operation: &'static str,
@@ -69,6 +77,134 @@ pub enum SessionContextCoordinatorError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+pub const SESSION_EXECUTION_BINDING_SCHEMA_VERSION: u16 = 1;
+
+/// The durable provider selection for one canonical Session branch. The
+/// generation is independent from an Edge connection generation and is
+/// checked again when a Run reserves the Session and when a tool crosses the
+/// provider boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionExecutionBindingV1 {
+    pub schema_version: u16,
+    pub generation: u64,
+    pub state: SessionExecutionBindingStateV1,
+    pub logical_workspace_id: String,
+    pub workspace: crate::runs::WorkspaceBindingRequest,
+    pub executor: crate::runs::ExecutorBindingRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecutionBindingStateV1 {
+    Ready,
+    Switching,
+    NeedsAttention,
+}
+
+impl SessionExecutionBindingV1 {
+    pub fn server_work_default(logical_workspace_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
+            generation: 1,
+            state: SessionExecutionBindingStateV1::Ready,
+            logical_workspace_id: logical_workspace_id.into(),
+            workspace: Self::server_work_workspace_request(),
+            executor: Self::server_work_executor_request(),
+        }
+    }
+
+    pub fn server_work_workspace_request() -> crate::runs::WorkspaceBindingRequest {
+        crate::runs::WorkspaceBindingRequest {
+            kind: crate::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: Some("Work workspace".to_string()),
+            root: None,
+            source: None,
+            authority: Some(crate::runs::WorkspaceAuthorityRequest::ReadWrite),
+        }
+    }
+
+    pub fn server_work_executor_request() -> crate::runs::ExecutorBindingRequest {
+        crate::runs::ExecutorBindingRequest {
+            kind: crate::runs::ExecutorBindingRequestKind::ServerLocal,
+            executor_id: None,
+            display_name: None,
+            transport: None,
+            status: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SessionContextCoordinatorError> {
+        if self.schema_version != SESSION_EXECUTION_BINDING_SCHEMA_VERSION {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "unsupported Session execution-binding schema version".into(),
+            ));
+        }
+        if self.generation == 0 {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Session execution-binding generation must be positive".into(),
+            ));
+        }
+        if self.generation > i64::MAX as u64 {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Session execution-binding generation exceeds the durable integer range".into(),
+            ));
+        }
+        if self.logical_workspace_id.trim().is_empty() || self.logical_workspace_id.len() > 256 {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "logical workspace identity must be non-empty and at most 256 bytes".into(),
+            ));
+        }
+        use crate::runs::{ExecutorBindingRequestKind, WorkspaceBindingRequestKind};
+        let valid_server_binding = matches!(
+            (self.workspace.kind, self.executor.kind),
+            (
+                WorkspaceBindingRequestKind::ServerSandbox,
+                ExecutorBindingRequestKind::ServerLocal
+            )
+        ) && self.workspace.root.is_none()
+            && self.workspace.source.is_none()
+            && self.workspace.authority == Some(crate::runs::WorkspaceAuthorityRequest::ReadWrite)
+            && self.executor.executor_id.is_none()
+            && self.executor.transport.is_none()
+            && self.executor.status.is_none();
+        let edge_workspace_root = self.workspace.root.as_deref().map(str::trim);
+        let edge_source_matches_root = matches!(
+            self.workspace.source.as_ref(),
+            Some(crate::runs::WorkspaceSourceRequest::EdgePath { path })
+                if edge_workspace_root == Some(path.trim())
+        );
+        let edge_transport_supported = matches!(
+            self.executor.transport,
+            Some(crate::runs::ToolTransportKindRequest::EdgeWs)
+                | Some(crate::runs::ToolTransportKindRequest::EdgeWsAuthorized)
+                | Some(crate::runs::ToolTransportKindRequest::EdgeLedger)
+        );
+        let valid_edge_binding = matches!(
+            (self.workspace.kind, self.executor.kind),
+            (
+                WorkspaceBindingRequestKind::EdgeWorkspace,
+                ExecutorBindingRequestKind::EdgeAgent
+            )
+        ) && self.workspace.root.as_deref().is_some_and(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty() && trimmed.len() <= 4096 && !trimmed.contains('\0')
+        }) && edge_source_matches_root
+            && self.executor.executor_id.as_deref().is_some_and(|value| {
+                let trimmed = value.trim();
+                !trimmed.is_empty() && trimmed.len() <= 255 && !trimmed.contains('\0')
+            })
+            && edge_transport_supported
+            && self.workspace.authority != Some(crate::runs::WorkspaceAuthorityRequest::None);
+        if !valid_server_binding && !valid_edge_binding {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Session execution binding does not identify a complete supported workspace/executor pair".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +415,7 @@ pub trait SessionContextCoordinator: Send + Sync {
         expected_cursor: Option<&SessionCursorV1>,
         ttl: Duration,
         idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
     ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError>;
 
     /// Acquire the branch writer and reserve its next turn as one logical
@@ -293,6 +430,7 @@ pub trait SessionContextCoordinator: Send + Sync {
         ttl: Duration,
         writer_idempotency_key: &str,
         reservation_idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
     ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
         let lease = match self
             .acquire_writer(key, expected_cursor, actor, ttl, writer_idempotency_key)
@@ -311,7 +449,13 @@ pub trait SessionContextCoordinator: Send + Sync {
             }
         };
         match self
-            .reserve_turn(&lease, expected_cursor, ttl, reservation_idempotency_key)
+            .reserve_turn(
+                &lease,
+                expected_cursor,
+                ttl,
+                reservation_idempotency_key,
+                expected_execution_binding_generation,
+            )
             .await
         {
             Ok(ReserveTurnOutcome::Reserved(reservation))
@@ -659,6 +803,242 @@ impl DatabaseSessionContextCoordinator {
 
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    /// Load the provider selection for one Work Session, creating the supplied
+    /// server-owned initial binding exactly once when upgrading an existing
+    /// Work branch. Session-head locking serializes concurrent first reads
+    /// with Run admission and later binding changes.
+    pub async fn load_or_initialize_execution_binding(
+        &self,
+        key: &SessionKeyV1,
+        initial: &SessionExecutionBindingV1,
+    ) -> Result<SessionExecutionBindingV1, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        initial.validate()?;
+        if initial.generation != 1 || initial.state != SessionExecutionBindingStateV1::Ready {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "initial Session execution binding must be ready at generation 1".into(),
+            ));
+        }
+        if let Some(binding) = self.load_execution_binding(key).await? {
+            if binding.logical_workspace_id != initial.logical_workspace_id {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "Session execution binding belongs to another logical workspace".into(),
+                ));
+            }
+            return Ok(binding);
+        }
+
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_execution_binding_initialize", source))?;
+        ensure_database_state(&mut tx, key, AuthorityEpochsV1::default()).await?;
+        let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
+        if state
+            .active_writer
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            || state
+                .active_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+        {
+            return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
+        }
+
+        let binding_json = database_to_json("session_execution_binding", initial)?;
+        sqlx::query(
+            "INSERT IGNORE INTO session_execution_bindings \
+             (isolation_domain, owner_user_id, session_id, branch_id, generation, binding_json, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(i64_from_u64(
+            "execution binding generation",
+            initial.generation,
+        )?)
+        .bind(binding_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("insert_execution_binding", source))?;
+
+        let binding = load_execution_binding_in_tx(&mut tx, key, true)
+            .await?
+            .ok_or_else(|| {
+                SessionContextCoordinatorError::NeedsRepair(
+                    "execution binding disappeared during initialization".into(),
+                )
+            })?;
+        if binding.logical_workspace_id != initial.logical_workspace_id {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "Session execution binding belongs to another logical workspace".into(),
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_execution_binding_initialize", source))?;
+        Ok(binding)
+    }
+
+    pub async fn load_execution_binding(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<Option<SessionExecutionBindingV1>, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let row = sqlx::query(
+            "SELECT generation, binding_json FROM session_execution_bindings \
+             WHERE isolation_domain = ? AND owner_user_id = ? \
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_execution_binding", source))?;
+        row.map(|row| decode_execution_binding_row(&row))
+            .transpose()
+    }
+
+    /// Compare-and-swap one provider selection while holding the canonical
+    /// Session head. A switch cannot cross an active turn, Run, or unresolved
+    /// tool invocation, and callers cannot change the logical workspace.
+    pub async fn compare_and_swap_execution_binding(
+        &self,
+        key: &SessionKeyV1,
+        expected_generation: u64,
+        next: &SessionExecutionBindingV1,
+    ) -> Result<SessionExecutionBindingV1, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        next.validate()?;
+        let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+            SessionContextCoordinatorError::Invalid("execution binding generation overflow".into())
+        })?;
+        if next.generation != next_generation {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "next execution binding must advance exactly one generation".into(),
+            ));
+        }
+
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_execution_binding_cas", source))?;
+        ensure_database_state(&mut tx, key, AuthorityEpochsV1::default()).await?;
+        let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
+        if state
+            .active_writer
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            || state
+                .active_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
+        {
+            return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
+        }
+        let current = load_execution_binding_in_tx(&mut tx, key, true).await?;
+        let Some(current) = current else {
+            return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                expected: expected_generation,
+                current: None,
+            });
+        };
+        if current.generation != expected_generation {
+            return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                expected: expected_generation,
+                current: Some(current.generation),
+            });
+        }
+        if current.logical_workspace_id != next.logical_workspace_id {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "a Session execution binding cannot change logical workspace".into(),
+            ));
+        }
+        let valid_state_transition = matches!(
+            (current.state, next.state),
+            (
+                SessionExecutionBindingStateV1::Ready,
+                SessionExecutionBindingStateV1::Switching
+            ) | (
+                SessionExecutionBindingStateV1::Switching,
+                SessionExecutionBindingStateV1::Ready
+            ) | (
+                SessionExecutionBindingStateV1::Switching,
+                SessionExecutionBindingStateV1::NeedsAttention
+            ) | (
+                SessionExecutionBindingStateV1::NeedsAttention,
+                SessionExecutionBindingStateV1::Switching
+            ) | (
+                SessionExecutionBindingStateV1::NeedsAttention,
+                SessionExecutionBindingStateV1::Ready
+            )
+        );
+        if !valid_state_transition {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "Session execution binding state transition is not allowed".into(),
+            ));
+        }
+        // Selection changes serialize with Run admission on the canonical
+        // Session head and lock this Session's binding row. Tool dispatch uses
+        // an exact, non-locking binding read so parallel tool calls in one Run
+        // do not serialize on the selection row. Its Run must retain an active
+        // Session slot or unresolved invocation record until dispatch can no
+        // longer start; the indexed evidence checks below enforce that fence.
+        if session_execution_slot_exists(&mut tx, key).await?
+            || unresolved_session_invocation_exists(&mut tx, key).await?
+        {
+            return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
+        }
+
+        let binding_json = database_to_json("session_execution_binding", next)?;
+        let updated = sqlx::query(
+            "UPDATE session_execution_bindings \
+             SET generation = ?, binding_json = ?, updated_at = NOW(6) \
+             WHERE isolation_domain = ? AND owner_user_id = ? \
+               AND session_id = ? AND branch_id = ? AND generation = ?",
+        )
+        .bind(i64_from_u64(
+            "execution binding generation",
+            next.generation,
+        )?)
+        .bind(binding_json)
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(i64_from_u64(
+            "expected execution binding generation",
+            expected_generation,
+        )?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("compare_and_swap_execution_binding", source))?
+        .rows_affected();
+        if updated != 1 {
+            return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                expected: expected_generation,
+                current: Some(current.generation),
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_execution_binding_cas", source))?;
+        Ok(next.clone())
     }
 
     pub async fn list_authority_events(
@@ -2017,6 +2397,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         expected_cursor: Option<&SessionCursorV1>,
         ttl: Duration,
         idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
     ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError> {
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
         validate_idempotency_key(idempotency_key)?;
@@ -2028,6 +2409,12 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
+        validate_execution_binding_generation_in_tx(
+            &mut tx,
+            &lease.key,
+            expected_execution_binding_generation,
+        )
+        .await?;
         let request_hash = reservation_request_hash(lease, expected_cursor);
         if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
             &mut tx,
@@ -2227,6 +2614,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         ttl: Duration,
         writer_idempotency_key: &str,
         reservation_idempotency_key: &str,
+        expected_execution_binding_generation: Option<u64>,
     ) -> Result<AcquireWriterAndReserveTurnOutcome, SessionContextCoordinatorError> {
         validate_ttl(ttl, MAX_LEASE_TTL.min(MAX_RESERVATION_TTL))?;
         validate_idempotency_key(writer_idempotency_key)?;
@@ -2244,6 +2632,12 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .map_err(|source| database_error("begin_acquire_and_reserve_turn", source))?;
         ensure_database_state(&mut tx, key, actor.authority_epochs).await?;
         let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
+        validate_execution_binding_generation_in_tx(
+            &mut tx,
+            key,
+            expected_execution_binding_generation,
+        )
+        .await?;
         let expected_cursor_owned = expected_cursor.cloned();
 
         let (lease, acquire_outcome) = if let Some(active) = state.active_writer.clone()
@@ -3594,6 +3988,128 @@ async fn lock_database_state_at_now(
     Ok((state, now))
 }
 
+async fn load_execution_binding_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    for_update: bool,
+) -> Result<Option<SessionExecutionBindingV1>, SessionContextCoordinatorError> {
+    let row = if for_update {
+        sqlx::query(
+            "SELECT generation, binding_json FROM session_execution_bindings \
+             WHERE isolation_domain = ? AND owner_user_id = ? \
+               AND session_id = ? AND branch_id = ? FOR UPDATE",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut **tx)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT generation, binding_json FROM session_execution_bindings \
+             WHERE isolation_domain = ? AND owner_user_id = ? \
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut **tx)
+        .await
+    }
+    .map_err(|source| database_error("load_execution_binding_in_tx", source))?;
+    row.as_ref().map(decode_execution_binding_row).transpose()
+}
+
+fn decode_execution_binding_row(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<SessionExecutionBindingV1, SessionContextCoordinatorError> {
+    let generation = row
+        .try_get::<i64, _>("generation")
+        .map_err(|source| database_error("decode_execution_binding_generation", source))?;
+    let generation = u64::try_from(generation).map_err(|_| {
+        SessionContextCoordinatorError::NeedsRepair(
+            "stored Session execution-binding generation is not positive".into(),
+        )
+    })?;
+    let binding_json = row
+        .try_get::<String, _>("binding_json")
+        .map_err(|source| database_error("decode_execution_binding_json", source))?;
+    let binding: SessionExecutionBindingV1 =
+        database_json("session_execution_binding", &binding_json)?;
+    binding.validate()?;
+    if generation != binding.generation {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "Session execution-binding generation disagrees with its payload".into(),
+        ));
+    }
+    Ok(binding)
+}
+
+async fn validate_execution_binding_generation_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    expected_generation: Option<u64>,
+) -> Result<(), SessionContextCoordinatorError> {
+    let Some(expected_generation) = expected_generation else {
+        return Ok(());
+    };
+    let current = load_execution_binding_in_tx(tx, key, true).await?;
+    let Some(current) = current else {
+        return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+            expected: expected_generation,
+            current: None,
+        });
+    };
+    if current.generation != expected_generation {
+        return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+            expected: expected_generation,
+            current: Some(current.generation),
+        });
+    }
+    if current.state != SessionExecutionBindingStateV1::Ready {
+        return Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
+            current.state,
+        ));
+    }
+    Ok(())
+}
+
+async fn session_execution_slot_exists(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<bool, SessionContextCoordinatorError> {
+    let row = sqlx::query(
+        "SELECT 1 FROM agent_session_execution_slots \
+         WHERE user_id = ? AND session_id = ? LIMIT 1",
+    )
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| database_error("check_session_execution_slot", source))?;
+    Ok(row.is_some())
+}
+
+async fn unresolved_session_invocation_exists(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<bool, SessionContextCoordinatorError> {
+    let row = sqlx::query(
+        "SELECT 1 FROM tool_invocation_ledger \
+         WHERE user_id = ? AND session_id = ? \
+           AND state IN ('prepared', 'dispatched', 'outcome_unknown') \
+         LIMIT 1",
+    )
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| database_error("check_unresolved_session_invocations", source))?;
+    Ok(row.is_some())
+}
+
 async fn update_database_state(
     tx: &mut Transaction<'_, MySql>,
     state: &CoordinatorStateV1,
@@ -4890,6 +5406,35 @@ fn hash_field(digest: &mut Sha256, value: &str) {
 #[cfg(test)]
 mod adoption_tests {
     use super::*;
+
+    #[test]
+    fn server_work_execution_binding_is_valid_and_has_no_caller_path() {
+        let binding = SessionExecutionBindingV1::server_work_default("work:w1:branch:b1");
+        binding
+            .validate()
+            .expect("canonical Server binding is valid");
+        assert_eq!(binding.generation, 1);
+        assert_eq!(binding.state, SessionExecutionBindingStateV1::Ready);
+        assert_eq!(binding.workspace.root, None);
+        assert_eq!(binding.workspace.source, None);
+        assert_eq!(binding.executor.executor_id, None);
+    }
+
+    #[test]
+    fn execution_binding_rejects_unsafe_or_incomplete_provider_pairs() {
+        let mut rooted_server = SessionExecutionBindingV1::server_work_default("work:w1:b1");
+        rooted_server.workspace.root = Some("/".to_string());
+        assert!(rooted_server.validate().is_err());
+
+        let mut incomplete_edge = SessionExecutionBindingV1::server_work_default("work:w1:b1");
+        incomplete_edge.workspace.kind = crate::runs::WorkspaceBindingRequestKind::EdgeWorkspace;
+        incomplete_edge.executor.kind = crate::runs::ExecutorBindingRequestKind::EdgeAgent;
+        assert!(incomplete_edge.validate().is_err());
+
+        let mut overflow = SessionExecutionBindingV1::server_work_default("work:w1:b1");
+        overflow.generation = i64::MAX as u64 + 1;
+        assert!(overflow.validate().is_err());
+    }
 
     #[test]
     fn turn_adoption_preserves_logical_turn_without_reviving_authority() {

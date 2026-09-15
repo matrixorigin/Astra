@@ -9,8 +9,11 @@ mod common;
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission, ToolInvocationLedgerStoreError,
 };
+use astra_services::{
+    DatabaseSessionContextCoordinator, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+};
 use astra_turn_types::{
-    DispatchCertainty, DurableToolReference, ToolInvocationCompletionSource,
+    DispatchCertainty, DurableToolReference, SessionKeyV1, ToolInvocationCompletionSource,
     ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationResultPayload, ToolInvocationState,
     ToolInvocationTerminalOutcome,
@@ -56,6 +59,7 @@ fn dispatch_admission() -> ToolInvocationDispatchAdmission {
         expected_control_epoch: -1,
         expected_owner_generation: 0,
         expected_owner_pod_id: "tool-invocation-ledger-test-owner".to_string(),
+        expected_execution_binding_generation: None,
     }
 }
 
@@ -86,6 +90,14 @@ fn failure(output: &str) -> ToolInvocationTerminalOutcome {
 }
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdentity) {
+    let _ = sqlx::query(
+        "DELETE FROM session_execution_bindings WHERE isolation_domain = 'server' \
+         AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
         .bind(&identity.user_id)
         .bind(&identity.run_id)
@@ -195,7 +207,7 @@ async fn large_terminal_outcome_commits_and_roundtrips_without_a_varchar_project
     cleanup(&pool, &invocation).await;
     insert_active_run(&pool, &invocation).await;
 
-    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let ledger = DatabaseToolInvocationLedger::new(shared.clone());
     let invocation_fingerprint = fingerprint("large-result");
     let invocation_decision = decision();
     ledger
@@ -615,6 +627,74 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     ));
 
     cleanup(&pool, &identities[0]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let invocation = identity(&prefix, "stale-provider-generation");
+    cleanup(&pool, &invocation).await;
+    let binding =
+        SessionExecutionBindingV1::server_work_default(format!("work:{prefix}:branch:main"));
+    sqlx::query(
+        "INSERT INTO session_execution_bindings \
+         (isolation_domain, owner_user_id, session_id, branch_id, generation, binding_json) \
+         VALUES ('server', ?, ?, 'main', ?, ?)",
+    )
+    .bind(&invocation.user_id)
+    .bind(&invocation.session_id)
+    .bind(i64::try_from(binding.generation).unwrap())
+    .bind(serde_json::to_string(&binding).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_active_run(&pool, &invocation).await;
+
+    let ledger = DatabaseToolInvocationLedger::new(shared.clone());
+    let invocation_fingerprint = fingerprint("stale provider selection");
+    ledger
+        .prepare(&invocation, &invocation_fingerprint, &decision())
+        .await
+        .unwrap();
+    let coordinator = DatabaseSessionContextCoordinator::new(shared.clone());
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &invocation.user_id,
+        &invocation.session_id,
+        "main",
+    );
+    let mut switching = binding.clone();
+    switching.generation = 2;
+    switching.state = SessionExecutionBindingStateV1::Switching;
+    assert!(matches!(
+        coordinator
+            .compare_and_swap_execution_binding(&key, 1, &switching)
+            .await,
+        Err(astra_services::SessionContextCoordinatorError::ExecutionBindingBusy)
+    ));
+    let mut stale_admission = dispatch_admission();
+    stale_admission.expected_execution_binding_generation = Some(2);
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&invocation, "stale-worker", 90_000, stale_admission)
+            .await,
+        Err(ToolInvocationLedgerStoreError::ExecutionBindingFenced {
+            expected: 2,
+            current: Some(1),
+        })
+    ));
+
+    let mut current_admission = dispatch_admission();
+    current_admission.expected_execution_binding_generation = Some(1);
+    let dispatched = ledger
+        .claim_dispatch(&invocation, "current-worker", 90_000, current_admission)
+        .await
+        .expect("the exact ready provider generation may dispatch");
+    assert_eq!(dispatched.state, ToolInvocationState::Dispatched);
+    cleanup(&pool, &invocation).await;
 }
 
 async fn insert_active_run(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdentity) {
