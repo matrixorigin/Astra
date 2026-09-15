@@ -456,6 +456,37 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     ));
                 }
             }
+            if health.execution.total_tool_calls > 0 || !health.execution.evidence_complete {
+                if !health.execution.evidence_complete {
+                    s.push_str(&format!(
+                        "    execution: evidence=incomplete lower_bound=true skipped_lines={} dropped_lines={} integrity_errors={}\n",
+                        health.execution.skipped_lines,
+                        health.execution.dropped_lines,
+                        health.execution.integrity_errors,
+                    ));
+                }
+                s.push_str(&format!(
+                    "    execution: tools={} success={} failed={} unknown={}\n",
+                    health.execution.total_tool_calls,
+                    health.execution.successful_tool_calls,
+                    health.execution.failed_tool_calls,
+                    health.execution.unknown_outcome_tool_calls,
+                ));
+                if health.execution.settlement_attempts > 0 {
+                    s.push_str(&format!(
+                        "    execution: settlements={} success={} rejected={}\n",
+                        health.execution.settlement_attempts,
+                        health.execution.successful_settlements,
+                        health.execution.rejected_settlements,
+                    ));
+                }
+                for (reason, count) in &health.execution.runtime_rejection_reasons {
+                    s.push_str(&format!(
+                        "    execution: runtime_rejections={} × {}\n",
+                        count, reason
+                    ));
+                }
+            }
         }
         // Diagnostic hints on FAIL — copy-paste debugging commands.
         if !run.is_passed() {

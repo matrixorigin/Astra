@@ -5,6 +5,8 @@
 //! SessionCapture and produces structured diagnostics: cache trend, compaction
 //! frequency, pressure evolution, and alert timeline.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -62,6 +64,66 @@ pub struct PipelineHealthReport {
     /// value means the measured health report is incomplete and cannot certify
     /// cache/alert criteria.
     pub invalid_events: u32,
+    /// Execution facts derived from the same durable journal. These counters
+    /// keep a correctly rejected model action distinct from a successful
+    /// state transition, so efficiency failures cannot be mistaken for
+    /// runtime correctness failures.
+    #[serde(default)]
+    pub execution: ExecutionTraceReport,
+}
+
+/// Bounded, typed execution counters for one captured invocation.
+///
+/// This is deliberately a diagnostic projection: it never changes criterion
+/// truth and does not infer semantic task success from tool names or prose.
+/// A rejected call remains visible in `failed_tool_calls` and
+/// `runtime_rejection_reasons`, while successful lifecycle transitions are
+/// counted independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionTraceReport {
+    pub total_tool_calls: u32,
+    pub successful_tool_calls: u32,
+    pub failed_tool_calls: u32,
+    pub unknown_outcome_tool_calls: u32,
+    pub settlement_attempts: u32,
+    pub successful_settlements: u32,
+    pub rejected_settlements: u32,
+    #[serde(default)]
+    pub runtime_rejection_reasons: BTreeMap<String, u32>,
+    /// False when the journal capture dropped or skipped rows, or detected an
+    /// integrity conflict. Counters are then lower bounds (or unavailable)
+    /// and must not be read as a complete execution trace.
+    #[serde(default = "default_evidence_complete")]
+    pub evidence_complete: bool,
+    #[serde(default)]
+    pub skipped_lines: u32,
+    #[serde(default)]
+    pub dropped_lines: u32,
+    #[serde(default)]
+    pub integrity_errors: u32,
+}
+
+fn default_evidence_complete() -> bool {
+    true
+}
+
+impl Default for ExecutionTraceReport {
+    fn default() -> Self {
+        Self {
+            total_tool_calls: 0,
+            successful_tool_calls: 0,
+            failed_tool_calls: 0,
+            unknown_outcome_tool_calls: 0,
+            settlement_attempts: 0,
+            successful_settlements: 0,
+            rejected_settlements: 0,
+            runtime_rejection_reasons: BTreeMap::new(),
+            evidence_complete: true,
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +273,72 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
         );
     }
 
+    report.execution = analyze_execution_trace(capture);
+
+    report
+}
+
+/// Analyze complete canonical tool records without interpreting assistant
+/// prose. Runtime rejection reasons prefer the typed result payload because it
+/// carries the actionable contract code (for example
+/// `work_settlement_evidence_required`) rather than a broad journal category.
+pub fn analyze_execution_trace(capture: &SessionCapture) -> ExecutionTraceReport {
+    let has_integrity_errors = capture.has_integrity_errors();
+    let mut report = ExecutionTraceReport {
+        evidence_complete: capture.skipped_lines == 0
+            && capture.dropped_lines == 0
+            && !has_integrity_errors,
+        skipped_lines: capture.skipped_lines,
+        dropped_lines: capture.dropped_lines,
+        integrity_errors: capture.integrity_errors.max(u32::from(
+            has_integrity_errors && capture.integrity_errors == 0,
+        )),
+        ..ExecutionTraceReport::default()
+    };
+    for call in capture.journal_tool_calls() {
+        report.total_tool_calls = report.total_tool_calls.saturating_add(1);
+        match call.ok {
+            Some(true) => {
+                report.successful_tool_calls = report.successful_tool_calls.saturating_add(1)
+            }
+            Some(false) => report.failed_tool_calls = report.failed_tool_calls.saturating_add(1),
+            None => {
+                report.unknown_outcome_tool_calls =
+                    report.unknown_outcome_tool_calls.saturating_add(1)
+            }
+        }
+
+        if call.name == "settle_work_item" {
+            report.settlement_attempts = report.settlement_attempts.saturating_add(1);
+            if call.ok == Some(true) {
+                report.successful_settlements = report.successful_settlements.saturating_add(1);
+            }
+        }
+
+        let rejected = call
+            .runtime_metadata
+            .get("disposition")
+            .and_then(serde_json::Value::as_str)
+            == Some("rejected");
+        if rejected {
+            if call.name == "settle_work_item" {
+                report.rejected_settlements = report.rejected_settlements.saturating_add(1);
+            }
+            let reason = call
+                .result
+                .as_ref()
+                .and_then(|result| result.get("error_kind"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    call.runtime_metadata
+                        .get("error_kind")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("unknown")
+                .to_string();
+            *report.runtime_rejection_reasons.entry(reason).or_default() += 1;
+        }
+    }
     report
 }
 
@@ -379,6 +507,7 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
             ));
         }
         out.push_str("  No pipeline feedback events found.\n");
+        render_execution_summary(report, &mut out);
         return out;
     }
 
@@ -451,7 +580,42 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
         }
     }
 
+    render_execution_summary(report, &mut out);
+
     out
+}
+
+fn render_execution_summary(report: &PipelineHealthReport, out: &mut String) {
+    let execution = &report.execution;
+    if execution.total_tool_calls == 0 && execution.evidence_complete {
+        return;
+    }
+    if !execution.evidence_complete {
+        out.push_str(&format!(
+            "  Execution evidence: incomplete (counts are lower bounds; skipped_lines={} dropped_lines={} integrity_errors={})\n",
+            execution.skipped_lines,
+            execution.dropped_lines,
+            execution.integrity_errors,
+        ));
+    }
+    out.push_str(&format!(
+        "  Execution: tools={} success={} failed={} unknown={}\n",
+        execution.total_tool_calls,
+        execution.successful_tool_calls,
+        execution.failed_tool_calls,
+        execution.unknown_outcome_tool_calls,
+    ));
+    if execution.settlement_attempts > 0 {
+        out.push_str(&format!(
+            "  Work settlements: attempts={} success={} rejected={}\n",
+            execution.settlement_attempts,
+            execution.successful_settlements,
+            execution.rejected_settlements,
+        ));
+    }
+    for (reason, count) in &execution.runtime_rejection_reasons {
+        out.push_str(&format!("  Runtime rejections: {} × {}\n", count, reason));
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +674,16 @@ mod tests {
                         "was_truncated": false
                     }
                 }
+            }),
+        }
+    }
+
+    fn make_tool_event(tool_calls: serde_json::Value) -> JournalEvent {
+        JournalEvent {
+            event_type: "turn".into(),
+            raw: serde_json::json!({
+                "turn": 1,
+                "tool_calls": tool_calls,
             }),
         }
     }
@@ -632,6 +806,100 @@ mod tests {
         let report = analyze_pipeline_health(&capture);
         assert_eq!(report.turns_with_feedback, 0);
         assert_eq!(report.avg_cache_hit_ratio, 0.0);
+        assert_eq!(report.execution, ExecutionTraceReport::default());
+    }
+
+    #[test]
+    fn execution_trace_separates_rejected_settlement_from_successful_transitions() {
+        let capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-1",
+                "ok": true,
+                "disposition": "executed"
+            },
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-2",
+                "ok": false,
+                "disposition": "rejected",
+                "error_kind": "contract_violation",
+                "result_full": "{\"error_kind\":\"work_settlement_evidence_required\"}"
+            },
+            {
+                "name": "bash",
+                "call_id": "bash-1",
+                "ok": true,
+                "disposition": "executed"
+            },
+            {
+                "name": "settle_work_item",
+                "call_id": "settle-3",
+                "ok": true,
+                "disposition": "executed"
+            }
+        ]))]);
+
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.execution.total_tool_calls, 4);
+        assert_eq!(report.execution.successful_tool_calls, 3);
+        assert_eq!(report.execution.failed_tool_calls, 1);
+        assert_eq!(report.execution.settlement_attempts, 3);
+        assert_eq!(report.execution.successful_settlements, 2);
+        assert_eq!(report.execution.rejected_settlements, 1);
+        assert_eq!(
+            report
+                .execution
+                .runtime_rejection_reasons
+                .get("work_settlement_evidence_required"),
+            Some(&1)
+        );
+
+        let rendered = render_pipeline_health(&report);
+        assert!(rendered.contains("Work settlements: attempts=3 success=2 rejected=1"));
+        assert!(rendered.contains("Runtime rejections: 1 × work_settlement_evidence_required"));
+    }
+
+    #[test]
+    fn execution_trace_marks_skipped_rows_as_lower_bound() {
+        let mut capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "bash-1",
+                "ok": true,
+                "disposition": "executed"
+            }
+        ]))]);
+        capture.skipped_lines = 2;
+
+        let report = analyze_pipeline_health(&capture);
+        assert!(!report.execution.evidence_complete);
+        assert_eq!(report.execution.total_tool_calls, 1);
+        assert_eq!(report.execution.skipped_lines, 2);
+        let rendered = render_pipeline_health(&report);
+        assert!(rendered.contains("counts are lower bounds"));
+        assert!(rendered.contains("skipped_lines=2"));
+    }
+
+    #[test]
+    fn execution_trace_does_not_turn_integrity_conflict_into_complete_zero() {
+        let mut capture = make_capture(vec![make_tool_event(serde_json::json!([
+            {
+                "name": "bash",
+                "call_id": "bash-1",
+                "ok": true,
+                "disposition": "executed"
+            }
+        ]))]);
+        capture.integrity_errors = 1;
+
+        let report = analyze_pipeline_health(&capture);
+        assert!(!report.execution.evidence_complete);
+        assert_eq!(report.execution.total_tool_calls, 0);
+        assert_eq!(report.execution.integrity_errors, 1);
+        let rendered = render_pipeline_health(&report);
+        assert!(rendered.contains("Execution evidence: incomplete"));
+        assert!(rendered.contains("integrity_errors=1"));
     }
 
     #[test]
