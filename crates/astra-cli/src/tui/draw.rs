@@ -2057,3 +2057,259 @@ mod multi_agent_strip_tests {
         assert_eq!(truncate_label("anything", 0), "");
     }
 }
+
+/// A deterministic presentation-pressure harness. It deliberately drives the
+/// real `ChatWidget` event router and `active_viewport` projection while
+/// rendering only every few update batches. This models delayed presentation
+/// checkpoints without sleeping in CI. Runtime facts remain lossless in the
+/// reducer; only sampled render checkpoints are skipped.
+#[cfg(test)]
+mod sustained_presentation_pressure_tests {
+    use super::{
+        ActiveView, LiveFramedCell, ViewportFrame, active_viewport, multi_agent_strip_header,
+    };
+    use crate::tui::bottom_pane::BottomPane;
+    use crate::tui::chat_widget::{AppEvent, ChatWidget, WireEvent};
+    use crate::tui::history_cell::assistant::AssistantCell;
+    use crate::tui::render::renderable::Renderable;
+    use crate::tui::status_indicator::{IndicatorState, StatusIndicator};
+    use crate::tui::testing::render::buffer_to_string;
+    use astra_turn_core::agent_live_event::{
+        AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::{Line, Text};
+    use ratatui::widgets::{Paragraph, Widget};
+    use std::time::Instant;
+
+    const AGENT_COUNT: usize = 8;
+    const UPDATE_ROUNDS: usize = 32;
+    const RENDER_EVERY: usize = 8;
+
+    fn live_event(agent_index: usize, text: String) -> AgentLiveEvent {
+        AgentLiveEvent {
+            run_id: format!("run-{agent_index}"),
+            agent_id: format!("agent-{agent_index}"),
+            kind: AgentLiveEventKind::OutputDelta(text),
+        }
+    }
+
+    fn render_projection_components(frame: ViewportFrame, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        let mut row = 0u16;
+
+        if let Some(cells) = frame.multi_agent {
+            let header = Line::from(multi_agent_strip_header(&cells));
+            LiveFramedCell {
+                lines: vec![header],
+                live: true,
+            }
+            .render(Rect::new(0, row, width, 1), &mut buffer);
+            row = row.saturating_add(1);
+        }
+
+        let remaining = height.saturating_sub(row);
+        if remaining == 0 {
+            return buffer_to_string(&buffer);
+        }
+        match frame.active {
+            ActiveView::Empty => {}
+            ActiveView::Status(line) => {
+                Paragraph::new(Text::from(vec![line]))
+                    .render(Rect::new(0, row, width, remaining), &mut buffer);
+            }
+            ActiveView::Active { lines, live } => {
+                let lines = lines
+                    .into_iter()
+                    .take(remaining as usize)
+                    .collect::<Vec<_>>();
+                LiveFramedCell { lines, live }
+                    .render(Rect::new(0, row, width, remaining), &mut buffer);
+            }
+        }
+        buffer_to_string(&buffer)
+    }
+
+    fn run_started(agent_index: usize) -> AgentLiveEvent {
+        AgentLiveEvent {
+            run_id: format!("run-{agent_index}"),
+            agent_id: format!("agent-{agent_index}"),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                parent_run_id: None,
+                depth: 1,
+                spawn_tool_call_id: None,
+                transcript_location: astra_turn_types::AgentTranscriptLocation::LocalJournal,
+            }),
+        }
+    }
+
+    #[test]
+    fn sustained_multi_agent_updates_preserve_projection_and_composer_input() {
+        let mut widget = ChatWidget::new("pressure-session");
+        let mut pane = BottomPane::new();
+        let mut status = StatusIndicator::new();
+        let turn_started = Instant::now();
+        status.begin_turn(turn_started);
+        status.set_state(IndicatorState::Thinking {
+            started_at: turn_started,
+        });
+        widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
+            "parent-start ".into(),
+        )));
+
+        for agent_index in 0..AGENT_COUNT {
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(run_started(
+                agent_index,
+            ))));
+        }
+
+        let mut rendered_frames = 0usize;
+        for round in 0..UPDATE_ROUNDS {
+            widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta(format!(
+                "parent-round-{round} "
+            ))));
+            let batch = (0..AGENT_COUNT)
+                .map(|agent_index| {
+                    live_event(agent_index, format!("agent-{agent_index}-round-{round} "))
+                })
+                .collect();
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLiveBatch(batch)));
+
+            // Input is interleaved with a busy update stream. This uses the
+            // same BottomPane key path as the event loop; a draw opportunity
+            // is intentionally withheld until the end of each batch group.
+            if round % RENDER_EVERY == 0 {
+                let ch = char::from(b'a' + (round / RENDER_EVERY) as u8);
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                    crate::tui::bottom_pane::BottomPaneAction::Consumed
+                ));
+            }
+
+            if (round + 1) % RENDER_EVERY == 0 {
+                let (width, height) = if (round / RENDER_EVERY) % 2 == 0 {
+                    (120, 24)
+                } else {
+                    (40, 12)
+                };
+                let frame = active_viewport(&widget, &status, None, false, None, width, height);
+                assert_eq!(
+                    frame.multi_agent.as_ref().map(Vec::len),
+                    Some(AGENT_COUNT),
+                    "all logical agent rows must survive delayed render checkpoints"
+                );
+                assert!(
+                    frame
+                        .multi_agent
+                        .as_ref()
+                        .is_some_and(|cells| multi_agent_strip_header(cells).contains("agents")),
+                    "the aggregate strip must remain discoverable"
+                );
+                let snapshot = render_projection_components(frame, width, height);
+                assert!(
+                    snapshot.contains(&format!("parent-round-{round}")),
+                    "latest parent output did not reach the rendered components: {snapshot}"
+                );
+                assert!(snapshot.contains("8 agents"), "{snapshot}");
+                rendered_frames += 1;
+            }
+        }
+
+        // A gap is an explicit incomplete-observation fact, never synthetic
+        // transcript text. The later render still contains the latest known
+        // projection for every other run.
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLiveGap(AgentLiveGap {
+            run_id: "run-3".into(),
+            agent_id: "agent-3".into(),
+            dropped_event_count: 4,
+        })));
+        let gap_snapshot = widget.agent_monitor_snapshot(0);
+        let gap_row = gap_snapshot
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("run-3"))
+            .expect("gapped run remains discoverable");
+        assert_eq!(
+            gap_row.state.status,
+            super::super::agent_run_projection::AgentRunStatus::Running
+        );
+        let attention = gap_row
+            .attention_summary
+            .as_deref()
+            .expect("gap attention remains visible");
+        assert!(attention.contains("Live activity incomplete"));
+        assert!(attention.contains("4 updates skipped"));
+        assert!(
+            widget
+                .agent_run_cell("agent-2")
+                .and_then(|cell| cell.output_summary.as_deref())
+                .is_some_and(|output| output.contains("round-31")),
+            "a gap in one run must not erase another run's latest output"
+        );
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-3".into(),
+            agent_id: "agent-3".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                duration_ms: 321,
+                reason: Some("fixture failure".into()),
+            },
+        })));
+
+        let final_frame = active_viewport(&widget, &status, None, false, None, 80, 24);
+        let final_snapshot = render_projection_components(final_frame, 80, 24);
+
+        assert_eq!(
+            rendered_frames,
+            UPDATE_ROUNDS / RENDER_EVERY,
+            "the fixture renders one checkpoint per eight update batches"
+        );
+        assert_eq!(pane.composer.text(), "abcd");
+        assert!(
+            final_snapshot.contains("parent-round-31"),
+            "{final_snapshot}"
+        );
+        assert!(final_snapshot.contains("7 agents"), "{final_snapshot}");
+        assert_eq!(widget.agent_run_ids().len(), AGENT_COUNT);
+        assert_eq!(
+            widget
+                .agent_run_state("agent-3")
+                .expect("failed run remains addressable")
+                .status,
+            super::super::agent_run_projection::AgentRunStatus::Failed
+        );
+        for agent_index in 0..AGENT_COUNT {
+            let cell = widget
+                .agent_run_cell(&format!("agent-{agent_index}"))
+                .expect("each run remains in the canonical projection");
+            if agent_index == 3 {
+                assert!(
+                    cell.output_summary
+                        .as_deref()
+                        .is_some_and(|output| output.contains("fixture failure")),
+                    "the terminal failure summary must remain in the projection"
+                );
+            } else {
+                assert!(
+                    cell.output_summary.as_deref().is_some_and(
+                        |output| output.contains(&format!("round-{}", UPDATE_ROUNDS - 1))
+                    ),
+                    "agent-{agent_index} lost its latest output"
+                );
+            }
+        }
+
+        let active = widget.active_cell().expect("parent reply stays live");
+        assert!(active.as_any_ref().is::<AssistantCell>());
+        assert!(
+            active
+                .as_any_ref()
+                .downcast_ref::<AssistantCell>()
+                .expect("assistant active cell")
+                .source()
+                .contains("parent-round-31")
+        );
+    }
+}

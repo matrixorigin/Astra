@@ -22,7 +22,7 @@ pub(crate) enum TuiEvent {
 
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
-    crossterm_stream: EventStream,
+    crossterm_stream: Option<EventStream>,
     draw_stream: ReceiverStream<()>,
     poll_draw_first: bool,
 }
@@ -31,7 +31,17 @@ impl TuiEventStream {
     pub(crate) fn new(draw_rx: mpsc::Receiver<()>) -> Self {
         Self {
             pending: VecDeque::new(),
-            crossterm_stream: EventStream::new(),
+            crossterm_stream: Some(EventStream::new()),
+            draw_stream: ReceiverStream::new(draw_rx),
+            poll_draw_first: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(draw_rx: mpsc::Receiver<()>) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            crossterm_stream: None,
             draw_stream: ReceiverStream::new(draw_rx),
             poll_draw_first: false,
         }
@@ -42,8 +52,11 @@ impl TuiEventStream {
     }
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
+        let Some(crossterm_stream) = self.crossterm_stream.as_mut() else {
+            return Poll::Pending;
+        };
         loop {
-            let event = Pin::new(&mut self.crossterm_stream).poll_next(cx);
+            let event = Pin::new(&mut *crossterm_stream).poll_next(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -152,8 +165,9 @@ impl Stream for TuiEventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiEvent, map_crossterm_event};
+    use super::{TuiEvent, TuiEventStream, map_crossterm_event};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use tokio_stream::StreamExt;
 
     #[test]
     fn raw_ctrl_c_char_is_normalized_to_ctrl_c_key() {
@@ -188,5 +202,22 @@ mod tests {
         };
 
         assert_eq!(mapped.code, KeyCode::Esc);
+    }
+
+    #[tokio::test]
+    async fn queued_input_is_processed_before_pending_draw() {
+        let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
+        draw_tx.try_send(()).expect("draw wake should be queued");
+        let mut stream = TuiEventStream::new_for_test(draw_rx);
+        stream.push_front(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(TuiEvent::Key(key)) if key.code == KeyCode::Char('x')
+        ));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
     }
 }

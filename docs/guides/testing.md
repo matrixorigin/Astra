@@ -188,6 +188,33 @@ EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 
+### Sustained TUI presentation pressure
+
+The deterministic `astra-cli` pressure harness drives the real `ChatWidget`
+event router and `active_viewport` projection with eight interleaved logical
+agent runs. It applies 32 state and output update rounds, skips rendering
+between batches, checks the latest output through rendering components at
+alternating sizes, interleaves composer input, and then exercises a dropped
+event gap and a failed run. The assertions cover the canonical projection,
+aggregate agent discovery, gap attention, retained failure state, and input
+preservation.
+
+The event-stream test separately proves that an input already queued for the
+TUI is delivered before a pending redraw wake. Both tests are deterministic
+and provider-free. The pressure harness uses a test layout and does not
+exercise the production draw loop, terminal backpressure, or input scheduling
+latency; PTY throughput and deployment-level multi-user capacity still require
+the opt-in load or system lanes described below.
+
+Run only the focused checks while iterating:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p astra-cli \
+  sustained_multi_agent_updates_preserve_projection_and_composer_input --lib
+CARGO_INCREMENTAL=0 cargo test -p astra-cli \
+  queued_input_is_processed_before_pending_draw --lib
+```
+
 ### Durable Work mixed pressure
 
 The public Work pressure probe validates the durable read/write boundary with
