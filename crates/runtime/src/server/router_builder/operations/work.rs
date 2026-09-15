@@ -25,6 +25,30 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::work_handlers::get_work_branches_handler),
         )
         .route(
+            "/v1/works/{work_id}/branches/{branch_id}/activity",
+            get(crate::server::work_handlers::get_work_branch_activity_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/execution",
+            get(crate::server::work_handlers::get_work_branch_execution_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/execution/targets",
+            get(crate::server::work_handlers::get_work_branch_execution_targets_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/execution/switches",
+            post(crate::server::work_handlers::post_work_branch_execution_switch_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/execution/switches/{operation_id}",
+            get(crate::server::work_handlers::get_work_branch_execution_switch_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/execution/switches/{operation_id}/retry",
+            post(crate::server::work_handlers::post_work_branch_execution_switch_retry_handler),
+        )
+        .route(
             "/v1/works/{work_id}/branches/archived",
             get(crate::server::work_handlers::get_archived_work_branches_handler),
         )

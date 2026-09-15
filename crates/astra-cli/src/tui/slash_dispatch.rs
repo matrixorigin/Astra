@@ -75,6 +75,11 @@ pub(crate) enum SlashBackgroundRead {
     Timeline {
         session_id: String,
     },
+    WorkExecution {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        session_id: String,
+    },
     ResumePicker,
     SessionHub {
         snapshot: Box<SessionHubSnapshot>,
@@ -99,6 +104,26 @@ pub(crate) enum SlashBackgroundRead {
         session_id: Option<String>,
         journal_dir_override: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkCommandRoute {
+    Tasks,
+    Execution,
+    Start(String),
+    MissingGoal,
+    Unsupported,
+}
+
+pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
+    let (subcommand, remainder) = split_sub(args.trim());
+    match subcommand {
+        "" | "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
+        "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
+        "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
+        "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
+        _ => WorkCommandRoute::Unsupported,
+    }
 }
 
 /// Immutable request captured when a read-only memory surface is submitted.
@@ -314,45 +339,63 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         "/mcp" => handle_mcp_dispatch(args, ctx),
 
-        "/work" => {
-            let (subcommand, remainder) = split_sub(args.trim());
-            match subcommand {
-                "" | "status" => {
-                    ctx.show_response("Opened Work tasks".to_string());
-                    SlashResult::OpenWorkTasks
-                }
-                "start" if remainder.trim().is_empty() => {
-                    ctx.show_error("Usage: /work start <goal>".to_string());
-                    SlashResult::Handled
-                }
-                "start" => {
-                    let Some(session_id) = ctx
-                        .state
-                        .session_id
-                        .as_deref()
-                        .filter(|session_id| !session_id.is_empty())
-                        .map(str::to_owned)
-                    else {
-                        ctx.show_error(
-                            "This conversation has no durable session yet. Send one message, then start Work."
-                                .to_string(),
-                        );
-                        return SlashResult::Handled;
-                    };
-                    ctx.show_response("Starting Work…".to_string());
-                    SlashResult::StartWork(Box::new(WorkStartRequest {
-                        api: ctx.api.clone(),
-                        profile: ctx.profile.map(str::to_owned),
-                        session_id,
-                        goal: remainder.trim().to_string(),
-                    }))
-                }
-                _ => {
-                    ctx.show_error("Usage: /work [status | start <goal>]".to_string());
-                    SlashResult::Handled
-                }
+        "/work" => match work_command_route(args) {
+            WorkCommandRoute::Tasks => {
+                ctx.show_response("Opened Work tasks".to_string());
+                SlashResult::OpenWorkTasks
             }
-        }
+            WorkCommandRoute::Execution => {
+                let Some(session_id) = ctx
+                    .state
+                    .session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+                else {
+                    ctx.show_error(
+                        "This conversation has no durable session yet. Send one message, then inspect Work execution."
+                            .to_string(),
+                    );
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Loading Work execution…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkExecution {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id,
+                })
+            }
+            WorkCommandRoute::MissingGoal => {
+                ctx.show_error("Usage: /work start <goal>".to_string());
+                SlashResult::Handled
+            }
+            WorkCommandRoute::Start(goal) => {
+                let Some(session_id) = ctx
+                    .state
+                    .session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+                else {
+                    ctx.show_error(
+                        "This conversation has no durable session yet. Send one message, then start Work."
+                            .to_string(),
+                    );
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Starting Work…".to_string());
+                SlashResult::StartWork(Box::new(WorkStartRequest {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id,
+                    goal,
+                }))
+            }
+            WorkCommandRoute::Unsupported => {
+                ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                SlashResult::Handled
+            }
+        },
 
         "/agent" if matches!(args.trim(), "" | "list") => {
             if crate::tui::agent_view::open_agents_view(ctx.chat_widget, ctx.bottom_pane) {
@@ -2816,6 +2859,7 @@ fn fmt_tokens(n: u64) -> String {
 #[derive(Clone)]
 pub(crate) struct SessionHubSnapshot {
     pub(crate) session_id: String,
+    pending_recovery: Option<String>,
     turn: u32,
     model: String,
     total_cost: f64,
@@ -2845,6 +2889,7 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         .unwrap_or_else(|_| "?".into());
     SessionHubSnapshot {
         session_id: state.session_id.clone().unwrap_or_default(),
+        pending_recovery: state.pending_recovery.clone(),
         turn: state.turn,
         model: state.model.clone().unwrap_or_else(|| "—".into()),
         total_cost: state.total_session_cost,
@@ -2940,6 +2985,21 @@ pub(crate) fn session_hub_view(
         ));
     } else {
         pairs.push(("cwd", snapshot.cwd_fallback.clone()));
+    }
+    if let Some(owner) = snapshot
+        .pending_recovery
+        .as_deref()
+        .filter(|owner| !owner.is_empty() && Some(*owner) != Some(snapshot.session_id.as_str()))
+    {
+        if snapshot.session_id.is_empty() {
+            pairs.push(("recovery", format!("available via /resume {owner}")));
+        } else {
+            pairs.push((
+                "execution",
+                format!("not admitted · checkout belongs to Session {owner}"),
+            ));
+            pairs.push(("next", format!("/resume {owner}")));
+        }
     }
     if let Some(error) =
         session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())
@@ -3340,9 +3400,9 @@ mod routing_tests {
     use super::{
         CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
         MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
-        SkillCommandRoute, config_command_route, context_breakdown_for_panel,
+        SkillCommandRoute, WorkCommandRoute, config_command_route, context_breakdown_for_panel,
         context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
-        keyboard_shortcut_pairs, memory_command_route, skill_command_route,
+        keyboard_shortcut_pairs, memory_command_route, skill_command_route, work_command_route,
     };
     use crate::cli::command_registry;
     use crate::cli::session::session_state::SessionState;
@@ -3462,6 +3522,30 @@ mod routing_tests {
         assert_eq!(
             memory_command_route("help"),
             Ok(MemoryCommandRoute::Unsupported)
+        );
+    }
+
+    #[test]
+    fn work_route_has_one_explicit_read_only_execution_surface() {
+        assert_eq!(work_command_route(""), WorkCommandRoute::Tasks);
+        assert_eq!(work_command_route("status"), WorkCommandRoute::Tasks);
+        assert_eq!(
+            work_command_route(" execution "),
+            WorkCommandRoute::Execution
+        );
+        assert_eq!(
+            work_command_route("start ship the durable flow"),
+            WorkCommandRoute::Start("ship the durable flow".into())
+        );
+        assert_eq!(work_command_route("start"), WorkCommandRoute::MissingGoal);
+        assert_eq!(
+            work_command_route("execution extra"),
+            WorkCommandRoute::Unsupported
+        );
+        assert_eq!(
+            work_command_route("list"),
+            WorkCommandRoute::Unsupported,
+            "the old list alias adds no distinct TUI behavior"
         );
     }
 

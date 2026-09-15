@@ -714,6 +714,28 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         )
         .await
         .expect("create Work");
+    // Work turns now require an explicit durable provider selection. This
+    // fixture exercises continuation on the server-owned default, so seed the
+    // same canonical Session binding that a newly created Work receives in
+    // production before admitting the first continuation turn.
+    let execution_coordinator =
+        astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
+    let execution_key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        &owner,
+        &session,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    execution_coordinator
+        .load_or_initialize_execution_binding(
+            &execution_key,
+            &astra_services::SessionExecutionBindingV1::server_work_default(format!(
+                "session:{session}:branch:{}",
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            )),
+        )
+        .await
+        .expect("initialize server execution binding");
     repository
         .replace_graph(WorkGraphChange {
             owner_id: owner_id.clone(),
@@ -815,6 +837,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         )
         .await;
         cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
+        cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
         crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
         for table in [
             "work_runtime_event_outbox_slots",
@@ -918,6 +941,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
 
     cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
     cleanup_lifecycle_run_fixture(&pool, &owner, &new_run).await;
+    cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
     crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
 }
 
@@ -9796,6 +9820,29 @@ async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id:
     }
 }
 
+async fn cleanup_lifecycle_execution_binding(
+    pool: &SharedPool,
+    key: &astra_turn_types::SessionKeyV1,
+) {
+    for table in [
+        "session_execution_switches",
+        "session_execution_workspace_claims",
+        "session_execution_bindings",
+        "session_context_heads",
+    ] {
+        let _ = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? \
+             AND session_id = ? AND branch_id = ?"
+        ))
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(pool.get())
+        .await;
+    }
+}
+
 #[derive(Debug)]
 struct DurableEventPressureBatch {
     raw_event_count: usize,
@@ -10141,6 +10188,7 @@ fn test_request(message: &str) -> ChatRequestData {
         enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
+        execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
         context: None,
         edge_executor_id: None,
@@ -13376,6 +13424,99 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     assert_eq!(executor.executor_id, "edge-macbook-1");
     assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
     assert_eq!(executor.status, ExecutorStatus::Online);
+}
+
+#[tokio::test]
+async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
+    let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    edge_pool.register_with_capabilities_registry_and_materialization_id(
+        "owner-1",
+        "edge-owner-1",
+        None,
+        Some("/workspace/owner".to_string()),
+        None,
+        None,
+        Some("registry-owner-1".to_string()),
+        Some("materialization-owner-1".to_string()),
+        sender,
+    );
+    let service = test_service().with_edge_connection_pool(edge_pool);
+    let mut request = test_request("continue");
+    request.edge_executor_id = Some("edge-owner-1".to_string());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Owner workspace".to_string()),
+        root: Some("/workspace/owner".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace/owner".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("edge-owner-1".to_string()),
+        display_name: Some("Owner edge".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    service
+        .authorize_native_edge_execution("owner-1", &request)
+        .await
+        .expect("owned native Edge should be authorized");
+    let denied = service
+        .authorize_native_edge_execution("other-user", &request)
+        .await
+        .expect_err("a different user must not authorize the Edge");
+    assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+
+    request.workspace_binding.as_mut().unwrap().root = Some("/workspace/other".to_string());
+    let denied = service
+        .authorize_native_edge_execution("owner-1", &request)
+        .await
+        .expect_err("a different workspace path must not authorize the Edge");
+    assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[tokio::test]
+async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is_request_scoped() {
+    let service = test_service();
+    let mut request = test_request("continue");
+    request.session_id = Some("session-no-coordinator".to_string());
+    request.edge_executor_id = Some("edge-no-coordinator".to_string());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Edge".to_string()),
+        root: Some("/workspace/edge".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace/edge".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("edge-no-coordinator".to_string()),
+        display_name: Some("Edge".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    let denied = service
+        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .await
+        .expect_err("native Edge must not bypass durable binding admission");
+    assert_eq!(denied.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        denied.1.error_code.as_deref(),
+        Some("execution_binding_unavailable")
+    );
+
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    service
+        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .await
+        .expect("request-scoped EdgeLedger does not need native coordinator state");
+    assert_eq!(request.execution_binding_generation, None);
 }
 
 #[test]
@@ -19640,7 +19781,10 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
         executor_id: Some("edge-macbook-1".to_string()),
         display_name: Some("MacBook Pro".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        // The in-memory fixture has no durable coordinator; exercise the
+        // request-scoped ledger path explicitly. Native EdgeWs admission is
+        // covered by the fail-closed test above.
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
     let run = ok(svc.create_run("user-1".into(), req).await);
@@ -19665,7 +19809,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         durable.events[0]["data"]["executor"]["executor_id"],
         "edge-macbook-1"
     );
-    assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
+    assert_eq!(durable.events[0]["data"]["transport"], "edge_ledger");
     assert_eq!(
         durable.events[0]["data"]["admission_source"]["capability_source"],
         "bound_executor"
@@ -19684,7 +19828,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         status.executor.as_ref().unwrap()["executor_id"],
         "edge-macbook-1"
     );
-    assert_eq!(status.transport.as_deref(), Some("edge_ws"));
+    assert_eq!(status.transport.as_deref(), Some("edge_ledger"));
 }
 
 #[tokio::test]
@@ -20380,6 +20524,7 @@ fn extract_edge_tools_from_context() {
         enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
+        execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,
@@ -20468,6 +20613,7 @@ fn extract_edge_profile_from_context() {
         enabled_tools: None,
         workspace_binding: None,
         executor_binding: None,
+        execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
         context: Some(ctx),
         edge_executor_id: None,

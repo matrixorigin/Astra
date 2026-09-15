@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::runner::parse_strict_cli_outcome;
-use crate::session_identity::cancel_server_session;
+use crate::session_identity::delete_server_session;
 
 /// Errors surfaced by pre-flight checks.
 #[derive(Debug, Error)]
@@ -358,7 +358,7 @@ async fn release_model_probe_session(
     let Some(session_id) = session_id else {
         return Ok(());
     };
-    cancel_server_session(astra_bin, profile, session_id).await
+    delete_server_session(astra_bin, profile, session_id).await
 }
 
 async fn check_model(

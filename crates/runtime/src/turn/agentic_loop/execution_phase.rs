@@ -6,8 +6,9 @@ use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CompletionAction, ContinuationAuthority,
     HostTurnResult, RejectedToolCall, RunControlProvider, TerminalExecutionAuthority,
     ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome, UserIntentState,
-    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase, finalize_and_render,
-    finalize_turn_trace, try_write_heavy_checkpoint,
+    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
+    context_manifest_identity_from_result, finalize_and_render, finalize_turn_trace,
+    try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -3680,12 +3681,14 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
     if let Some(session_id) = snap.session_id.as_ref() {
         state.current_session_id = Some(session_id.clone());
         host.on_session_bound(session_id);
-        if state.context_manifest_user_id.is_some() {
-            state.step_recorder.attach_persistence(session_id);
-        }
     }
-    if snap.run_id.is_some() {
-        state.current_run_id = snap.run_id.clone();
+    if let Some(run_id) = snap.run_id.as_deref() {
+        state.current_run_id = Some(run_id.to_string());
+        if let Some(session_id) = snap.session_id.as_deref() {
+            state
+                .step_recorder
+                .bind_authoritative_run(session_id, run_id);
+        }
     }
     state.total_prompt += snap.prompt_tokens;
     state.total_completion += snap.completion_tokens;
@@ -3849,6 +3852,7 @@ async fn persist_context_manifest_for_llm_call(
     llm_attempt_index: u32,
     pre_llm_messages: &[serde_json::Value],
     turn_result: Option<&HostTurnResult>,
+    identity: Option<(String, String)>,
 ) {
     if !context_manifest_db_persistence_enabled() {
         return;
@@ -3856,11 +3860,15 @@ async fn persist_context_manifest_for_llm_call(
     if turn_result.is_none() && state.last_llm_context_manifest_trace.is_none() {
         return;
     }
-    let (Some(pool), Some(user_id), Some(session_id), Some(run_id)) = (
+    // The host chooses the authority boundary: remote clients require the
+    // response pair, while a Server host may use its already-admitted state
+    // identity for a provider transport error with no accumulator.
+    let Some((session_id, run_id)) = identity else {
+        return;
+    };
+    let (Some(pool), Some(user_id)) = (
         state.context_manifest_pool.clone(),
         state.context_manifest_user_id.as_deref(),
-        state.current_session_id.as_deref(),
-        state.current_run_id.as_deref(),
     ) else {
         return;
     };
@@ -3884,8 +3892,8 @@ async fn persist_context_manifest_for_llm_call(
     let projection = crate::turn::llm::context::build_context_manifest_projection(
         crate::turn::llm::context::ContextManifestProjectionInput {
             owner_id: user_id,
-            session_id,
-            run_id,
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
             turn_index,
             llm_attempt_index,
             pre_llm_messages,
@@ -4543,28 +4551,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.last_llm_context_manifest_trace = Some(trace);
     }
     if !providerless_control_plane_turn {
-        match &turn_result {
-            Ok(result) => {
-                persist_context_manifest_for_llm_call(
-                    state,
-                    turn_index,
-                    llm_attempt_index,
-                    &pre_llm_messages,
-                    Some(result),
-                )
-                .await;
-            }
-            Err(_) => {
-                persist_context_manifest_for_llm_call(
-                    state,
-                    turn_index,
-                    llm_attempt_index,
-                    &pre_llm_messages,
-                    None,
-                )
-                .await;
-            }
-        }
+        let manifest_identity = host.context_manifest_identity(state, turn_result.as_ref().ok());
+        persist_context_manifest_for_llm_call(
+            state,
+            turn_index,
+            llm_attempt_index,
+            &pre_llm_messages,
+            turn_result.as_ref().ok(),
+            manifest_identity,
+        )
+        .await;
     }
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
@@ -17892,6 +17888,29 @@ mod tests {
         // The function signature enforces ordering: it takes a
         // turn_result: Option<&HostTurnResult>, which only exists after
         // execute_turn returns.
+    }
+
+    #[test]
+    fn context_manifest_requires_server_owned_session_and_run_identity() {
+        let rejected = HostTurnResult {
+            accum: ChatTurnSseAccum::default(),
+            ttft_ms: None,
+            edge_tool_round: Vec::new(),
+            error_kind: Some(astra_core::ErrorKind::InvalidRequest),
+        };
+        assert_eq!(
+            context_manifest_identity_from_result(Some(&rejected)),
+            None,
+            "an admission rejection must not use the edge correlation id for a manifest"
+        );
+
+        let mut admitted = rejected;
+        admitted.accum.session_id = Some("session-server".to_string());
+        admitted.accum.run_id = Some("run-server".to_string());
+        assert_eq!(
+            context_manifest_identity_from_result(Some(&admitted)),
+            Some(("session-server".to_string(), "run-server".to_string()))
+        );
     }
 
     #[test]

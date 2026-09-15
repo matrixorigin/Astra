@@ -55,7 +55,8 @@ use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
     TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
-    complete_turn_phase, interaction_scoped_tool_restrictions,
+    complete_turn_phase, context_manifest_identity_from_result,
+    interaction_scoped_tool_restrictions,
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute,
@@ -16276,8 +16277,36 @@ impl ServerAgenticLoopHost {
     }
 }
 
+fn server_context_manifest_identity(
+    session_id: &str,
+    state_run_id: Option<&str>,
+    result: Option<&HostTurnResult>,
+) -> Option<(String, String)> {
+    // Server-owned state is admitted before the host is constructed, so its
+    // state run id remains authoritative even when a provider transport
+    // failure returns no SSE accumulator identity. A streamed pair, when
+    // present, is still preferred because it is the exact physical attempt
+    // observed by this boundary.
+    context_manifest_identity_from_result(result).or_else(|| {
+        let session_id = session_id.trim();
+        let run_id = state_run_id?.trim();
+        if session_id.is_empty() || run_id.is_empty() {
+            return None;
+        }
+        Some((session_id.to_string(), run_id.to_string()))
+    })
+}
+
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn context_manifest_identity(
+        &self,
+        state: &AgenticLoopState,
+        result: Option<&HostTurnResult>,
+    ) -> Option<(String, String)> {
+        server_context_manifest_identity(&self.session_id, state.current_run_id.as_deref(), result)
+    }
+
     fn execution_handoff_requested(&self) -> bool {
         self.execution_handoff
             .as_ref()
@@ -20884,6 +20913,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_manifest_identity_uses_admitted_state_when_result_has_no_ids() {
+        let result = HostTurnResult {
+            accum: ChatTurnSseAccum::default(),
+            ttft_ms: None,
+            edge_tool_round: Vec::new(),
+            error_kind: Some(astra_core::ErrorKind::StreamTransport),
+        };
+        assert_eq!(
+            server_context_manifest_identity("session-server", Some("run-server"), Some(&result)),
+            Some(("session-server".to_string(), "run-server".to_string()))
+        );
+        assert_eq!(
+            server_context_manifest_identity("session-server", Some("run-server"), None),
+            Some(("session-server".to_string(), "run-server".to_string()))
+        );
+    }
+
+    #[test]
     fn canonical_edge_evidence_rejects_foreign_custody_and_changed_payload() {
         use astra_thin_client::{ToolResultRequest, ToolResultRequestParts};
         let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
@@ -21714,6 +21761,7 @@ mod tests {
                 Duration::from_secs(60),
                 "writer",
                 "turn",
+                None,
             )
             .await
             .unwrap()

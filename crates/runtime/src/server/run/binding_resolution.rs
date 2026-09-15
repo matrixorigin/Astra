@@ -100,7 +100,11 @@ pub(crate) fn execution_bindings_from_metadata_with_authority(
     }
     let executor: ExecutorBinding =
         serde_json::from_value(metadata.get("executor")?.clone()).ok()?;
-    Some(ExecutionBindingSnapshot::inferred(workspace, executor))
+    let mut snapshot = ExecutionBindingSnapshot::inferred(workspace, executor);
+    snapshot.execution_binding_generation = metadata
+        .get("execution_binding_generation")
+        .and_then(Value::as_u64);
+    Some(snapshot)
 }
 
 #[derive(Default)]
@@ -108,6 +112,18 @@ pub(crate) struct RunExecutionBindingSnapshot {
     pub workspace: Option<Value>,
     pub executor: Option<Value>,
     pub transport: Option<String>,
+    pub execution_binding_generation: Option<u64>,
+}
+
+pub(crate) fn binding_snapshot_fields(snapshot: &ExecutionBindingSnapshot) -> Map<String, Value> {
+    let mut fields = binding_event_fields(&snapshot.workspace, &snapshot.executor);
+    if let Some(generation) = snapshot.execution_binding_generation {
+        fields.insert(
+            "execution_binding_generation".to_string(),
+            Value::from(generation),
+        );
+    }
+    fields
 }
 
 pub(crate) fn agent_working_dir_for_bindings(
@@ -133,8 +149,7 @@ pub(crate) fn agent_working_dir_for_bindings(
 pub(crate) fn binding_snapshot_events(
     run_id: &str,
     session_id: &str,
-    workspace: &WorkspaceBinding,
-    executor: &ExecutorBinding,
+    snapshot: &ExecutionBindingSnapshot,
 ) -> [Value; 2] {
     let mut workspace_event = Map::new();
     workspace_event.insert(
@@ -146,7 +161,7 @@ pub(crate) fn binding_snapshot_events(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
-    for (key, value) in binding_event_fields(workspace, executor) {
+    for (key, value) in binding_event_fields(&snapshot.workspace, &snapshot.executor) {
         workspace_event.insert(key, value);
     }
 
@@ -160,7 +175,7 @@ pub(crate) fn binding_snapshot_events(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
-    for (key, value) in binding_event_fields(workspace, executor) {
+    for (key, value) in binding_event_fields(&snapshot.workspace, &snapshot.executor) {
         executor_event.insert(key, value);
     }
 
@@ -204,8 +219,18 @@ pub(crate) fn run_start_context_from_request(
         interactive_client: Some(request.interactive_client),
         turn_intent_policy: request.execution_policy.turn_intent,
         skill_auto_route_policy: request.execution_policy.skill_auto_route,
-        execution_metadata: execution_bindings
-            .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
+        execution_metadata: {
+            let mut fields = execution_bindings
+                .map(binding_snapshot_fields)
+                .unwrap_or_default();
+            if let Some(generation) = request.execution_binding_generation {
+                fields.insert(
+                    "execution_binding_generation".to_string(),
+                    Value::from(generation),
+                );
+            }
+            (!fields.is_empty()).then_some(fields)
+        },
         execution_restrictions: None,
         admission_source: None,
         agent_binding_ids,
@@ -543,6 +568,7 @@ mod tests {
             enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
+            execution_binding_generation: None,
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,
@@ -588,6 +614,37 @@ mod tests {
             context.skill_auto_route_policy,
             astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled
         );
+    }
+
+    #[test]
+    fn execution_binding_generation_is_durable_but_not_in_live_binding_events() {
+        let mut request = test_request("continue Work");
+        request.execution_binding_generation = Some(7);
+        let mut snapshot = ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox("/server/workspaces/session-1"),
+            ExecutorBinding::server_local(),
+        );
+        snapshot.execution_binding_generation = Some(7);
+
+        let context = run_start_context_from_request(&request, Some(&snapshot), None);
+        assert_eq!(
+            context
+                .execution_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("execution_binding_generation"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            binding_snapshot_fields(&snapshot)
+                .get("execution_binding_generation")
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+
+        for event in binding_snapshot_events("run-1", "session-1", &snapshot) {
+            assert!(event.get("execution_binding_generation").is_none());
+        }
     }
 
     #[test]

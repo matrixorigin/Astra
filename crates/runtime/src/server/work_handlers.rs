@@ -2,8 +2,7 @@ use super::*;
 use crate::server::header_utils::collect_forward_headers;
 use astra_services::runs::{
     ChatRequestData, ModelSelectionMode, RunStartIdempotency, RunStartIdempotencyKind,
-    WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest, WorkspaceAuthorityRequest,
-    WorkspaceBindingRequest, WorkspaceBindingRequestKind,
+    WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest,
 };
 use astra_services::work::{
     CriterionCommand, CriterionDefinition, CriterionId, CriterionSetRevision, CriterionStatement,
@@ -26,24 +25,34 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use uuid::Uuid;
+
+#[cfg(test)]
+use astra_services::runs::{
+    WorkspaceAuthorityRequest, WorkspaceBindingRequest, WorkspaceBindingRequestKind,
+};
 
 use astra_server_types::{
     WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkActionRequestV1, WorkActionV1,
     WorkArchivedBranchesQueryV1, WorkBranchActionRequestV1, WorkBranchActionV1,
-    WorkBranchAttachRequestV1, WorkBranchAttachResponseV1, WorkBranchAttachmentModeV1,
-    WorkBranchComparisonRequestV1, WorkBranchControlBasisV1, WorkBranchControlCommandV1,
-    WorkBranchControlOperationRequestV1, WorkBranchCreationRequestV1, WorkBranchDeletionRequestV1,
-    WorkBranchSyncStateV1, WorkCatalogQueryV1, WorkCatalogResponseV1, WorkConversationHeadV1,
-    WorkCreateCriterionV1, WorkCreateRequestV1, WorkCriteriaProposalBasisV1,
-    WorkCriteriaProposalDecisionRequestV1, WorkCriteriaProposalDecisionV1,
-    WorkCriteriaProposalDetailResponseV1, WorkCriteriaProposalListResponseV1,
-    WorkCriteriaProposalResolutionV1, WorkCriteriaProposalSummaryV1, WorkCriteriaQueryV1,
-    WorkCriteriaResponseV1, WorkEventPageResponseV1, WorkEventsQueryV1, WorkObservationResponseV1,
-    WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1, WorkPatchCommitRequestV1,
-    WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1, WorkReadCursorRequestV1,
-    WorkReadCursorResponseV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
-    WorkTaskGraphResponseV1, WorkTranscriptItemV1, WorkTranscriptPageResponseV1,
-    WorkTranscriptQueryV1, WorkTurnRequestV1,
+    WorkBranchActivityResponseV1, WorkBranchActivityV1, WorkBranchAttachRequestV1,
+    WorkBranchAttachResponseV1, WorkBranchAttachmentModeV1, WorkBranchComparisonRequestV1,
+    WorkBranchControlBasisV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
+    WorkBranchCreationRequestV1, WorkBranchDeletionRequestV1, WorkBranchSyncStateV1,
+    WorkCatalogQueryV1, WorkCatalogResponseV1, WorkConversationHeadV1, WorkCreateCriterionV1,
+    WorkCreateRequestV1, WorkCriteriaProposalBasisV1, WorkCriteriaProposalDecisionRequestV1,
+    WorkCriteriaProposalDecisionV1, WorkCriteriaProposalDetailResponseV1,
+    WorkCriteriaProposalListResponseV1, WorkCriteriaProposalResolutionV1,
+    WorkCriteriaProposalSummaryV1, WorkCriteriaQueryV1, WorkCriteriaResponseV1,
+    WorkEventPageResponseV1, WorkEventsQueryV1, WorkExecutionPlacementV1, WorkExecutionStateV1,
+    WorkExecutionSwitchOperationV1, WorkExecutionSwitchRequestV1,
+    WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
+    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
+    WorkObservationResponseV1, WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1,
+    WorkPatchCommitRequestV1, WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1,
+    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkSessionBindingResponseV1,
+    WorkTaskGraphQueryV1, WorkTaskGraphResponseV1, WorkTranscriptItemV1,
+    WorkTranscriptPageResponseV1, WorkTranscriptQueryV1, WorkTurnRequestV1,
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
@@ -1024,6 +1033,7 @@ pub(super) fn derive_work_creation(
     })
 }
 
+#[cfg(test)]
 fn server_owned_work_workspace_binding() -> WorkspaceBindingRequest {
     WorkspaceBindingRequest {
         kind: WorkspaceBindingRequestKind::ServerSandbox,
@@ -3461,7 +3471,7 @@ pub(super) async fn post_work_branch_turn_handler(
         )
     })?;
     let turn = derive_work_turn(&owner_id, &work_id, &branch_id, payload)?;
-    let pool = state.shared_pool.ok_or_else(|| {
+    let pool = state.shared_pool.clone().ok_or_else(|| {
         work_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "work_write_unavailable",
@@ -3470,11 +3480,8 @@ pub(super) async fn post_work_branch_turn_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let binding = repository
-        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
-        .await
-        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let (binding, key, execution_coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
     let coordinator = state.session_context_coordinator.clone().ok_or_else(|| {
         work_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3484,12 +3491,6 @@ pub(super) async fn post_work_branch_turn_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let key = astra_turn_types::SessionKeyV1::owner_session(
-        "server",
-        owner_id.as_str(),
-        binding.session_id.as_str(),
-        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-    );
     let handoff = astra_services::DatabaseSessionHandoffService::new(pool, coordinator);
     match handoff
         .claim_idle_controller(&key, &turn.attachment_id)
@@ -3508,6 +3509,23 @@ pub(super) async fn post_work_branch_turn_handler(
             ));
         }
     }
+    // Resolve the canonical provider selection after taking conversation
+    // control. The durable Session row is authoritative for both Server and
+    // Edge Work; the Web client never gets to project a per-turn topology.
+    // Initialization is idempotent and only creates the explicit Server
+    // default when this Work has never selected a provider.
+    let logical_workspace_id = execution_logical_workspace_id(&key);
+    let execution = execution_coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &astra_services::SessionExecutionBindingV1::server_work_default(logical_workspace_id),
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+    let edge_executor_id = (execution.executor.kind
+        == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent)
+        .then(|| execution.executor.executor_id.clone())
+        .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
         message: turn.message,
@@ -3546,14 +3564,14 @@ pub(super) async fn post_work_branch_turn_handler(
         allow_skill_sources: None,
         allow_tools: None,
         enabled_tools: None,
-        // Server-owned Work turns use one persistent workspace per internal
-        // branch session. The runtime records the resolved binding before the
-        // run becomes visible; clients never select a topology per turn.
-        workspace_binding: Some(server_owned_work_workspace_binding()),
-        executor_binding: None,
+        // The runtime receives the durable selection resolved above. Clients
+        // cannot choose or override a provider on an individual Work turn.
+        workspace_binding: Some(execution.workspace),
+        executor_binding: Some(execution.executor),
+        execution_binding_generation: Some(execution.generation),
         runtime_mcp_bindings: Vec::new(),
         context: None,
-        edge_executor_id: None,
+        edge_executor_id,
         capabilities: Vec::new(),
         forward_headers: collect_forward_headers(&headers),
         provider_run_owner: None,
@@ -3746,6 +3764,1566 @@ pub(super) async fn get_work_branches_handler(
             }
         })?;
     Ok(Json(catalog))
+}
+
+/// Read the current durable root Run state for one Work branch. This observer
+/// path is read-only and does not attach or acquire branch control.
+pub(super) async fn get_work_branch_activity_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+) -> WorkApiResult<WorkBranchActivityResponseV1> {
+    require_work_api_major(&headers)?;
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let pool = state.shared_pool.ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "work_read_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let observation = DatabaseWorkBranchCatalogService::new(pool)
+        .load_activity(&owner_id, &work_id, &branch_id)
+        .await
+        .map_err(|error| match error {
+            astra_services::work::WorkBranchCatalogError::NotFound => work_error(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            ),
+            error => {
+                tracing::warn!(error = %error, "Work branch activity degraded");
+                work_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "work_branch_activity_unavailable",
+                    WorkApiErrorCategory::Degraded,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            }
+        })?;
+    let activity = match observation.activity {
+        astra_services::work::WorkBranchActivity::Working => WorkBranchActivityV1::Working,
+        astra_services::work::WorkBranchActivity::Waiting => WorkBranchActivityV1::Waiting,
+        astra_services::work::WorkBranchActivity::Paused => WorkBranchActivityV1::Paused,
+        astra_services::work::WorkBranchActivity::Idle => WorkBranchActivityV1::Idle,
+    };
+    Ok(Json(WorkBranchActivityResponseV1 {
+        schema_version: 1,
+        work_id: observation.work_id.as_str().to_owned(),
+        branch_id: observation.branch_id.as_str().to_owned(),
+        branch_revision: observation.branch_revision.get(),
+        activity,
+        observed_at: observation
+            .observed_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    }))
+}
+
+const WORK_EXECUTION_SCHEMA_VERSION: u16 = 1;
+const WORK_EXECUTION_TARGET_LIMIT: u16 = 25;
+const WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS: u64 = 30;
+const WORK_EXECUTION_ATTESTATION_START: &str = "__ASTRA_WORKSPACE_ATTESTATION_V1_START__";
+const WORK_EXECUTION_ATTESTATION_END: &str = "__ASTRA_WORKSPACE_ATTESTATION_V1_END__";
+
+fn execution_logical_workspace_id(key: &astra_turn_types::SessionKeyV1) -> String {
+    // A Work branch is permanently bound to one durable Session branch. Keep
+    // the canonical SessionKey identity here so a normal Session can be
+    // promoted to a Work branch without invalidating its execution binding.
+    format!("session:{}:branch:{}", key.session_id, key.branch_id)
+}
+
+fn public_execution_view(
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    binding: &astra_services::SessionExecutionBindingV1,
+    initialized: bool,
+    receipt: Option<&astra_services::SessionExecutionSwitchReceiptV1>,
+) -> WorkExecutionViewV1 {
+    let placement = if matches!(
+        binding.workspace.kind,
+        astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+    ) {
+        WorkExecutionPlacementV1::Edge
+    } else {
+        WorkExecutionPlacementV1::Server
+    };
+    WorkExecutionViewV1 {
+        schema_version: WORK_EXECUTION_SCHEMA_VERSION,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        initialized,
+        generation: binding.generation,
+        state: match binding.state {
+            astra_services::SessionExecutionBindingStateV1::Ready => WorkExecutionStateV1::Ready,
+            astra_services::SessionExecutionBindingStateV1::Switching => {
+                WorkExecutionStateV1::Switching
+            }
+            astra_services::SessionExecutionBindingStateV1::NeedsAttention => {
+                WorkExecutionStateV1::NeedsAttention
+            }
+        },
+        placement,
+        executor_id: binding.executor.executor_id.clone(),
+        executor_name: binding.executor.display_name.clone(),
+        operation_id: receipt.map(|receipt| receipt.operation_id.clone()),
+        attempt: receipt.map(|receipt| receipt.attempt),
+        failure_code: receipt.and_then(|receipt| receipt.failure_code.clone()),
+    }
+}
+
+fn public_execution_target(
+    record: &astra_services::multi_agent::EdgeAgentRecord,
+    connected: bool,
+) -> WorkExecutionTargetV1 {
+    let capabilities = record
+        .capabilities
+        .as_ref()
+        .and_then(|value| value.get("protocol_capabilities"))
+        .and_then(serde_json::Value::as_object)
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| key.len() <= 128)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    WorkExecutionTargetV1 {
+        executor_id: record.edge_agent_id.clone(),
+        display_name: record.hostname.clone(),
+        hostname: record.hostname.clone(),
+        capabilities,
+        connected,
+    }
+}
+
+fn public_execution_target_request(
+    binding: &astra_services::SessionExecutionBindingV1,
+) -> WorkExecutionTargetRequestV1 {
+    WorkExecutionTargetRequestV1::Edge {
+        executor_id: binding.executor.executor_id.clone().unwrap_or_default(),
+    }
+}
+
+fn edge_record_from_pool(
+    owner_id: &str,
+    edge: astra_server_types::edge_connection_pool::EdgeConnectionInfo,
+) -> Option<astra_services::multi_agent::EdgeAgentRecord> {
+    let registry_id = edge.registry_id?;
+    let workspace_dir = edge.workspace_dir?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    Some(astra_services::multi_agent::EdgeAgentRecord {
+        registry_id: registry_id.clone(),
+        user_id: owner_id.to_owned(),
+        edge_agent_id: edge.edge_agent_id,
+        edge_id: registry_id,
+        hostname: edge.hostname,
+        worktree_path: Some(workspace_dir),
+        capabilities: edge.capabilities,
+        workspace_id: edge.workspace_id,
+        materialization_id: edge.materialization_id,
+        registered_at: now.clone(),
+        last_heartbeat_at: now,
+    })
+}
+
+fn is_native_execution_target(record: &astra_services::multi_agent::EdgeAgentRecord) -> bool {
+    record.workspace_id.is_none()
+        && record
+            .materialization_id
+            .as_deref()
+            .is_some_and(|identity| !identity.trim().is_empty())
+        && record
+            .worktree_path
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty())
+}
+
+fn public_execution_switch_operation(
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+    receipt: &astra_services::SessionExecutionSwitchReceiptV1,
+) -> WorkExecutionSwitchOperationV1 {
+    WorkExecutionSwitchOperationV1 {
+        schema_version: WORK_EXECUTION_SCHEMA_VERSION,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        operation_id: receipt.operation_id.clone(),
+        request_id: receipt.request_id.clone(),
+        state: match receipt.state {
+            astra_services::SessionExecutionSwitchStateV1::Switching => {
+                WorkExecutionSwitchStateV1::Switching
+            }
+            astra_services::SessionExecutionSwitchStateV1::Succeeded => {
+                WorkExecutionSwitchStateV1::Succeeded
+            }
+            astra_services::SessionExecutionSwitchStateV1::Failed => {
+                WorkExecutionSwitchStateV1::Failed
+            }
+        },
+        expected_generation: receipt.expected_generation,
+        switching_generation: receipt.switching_generation,
+        completed_generation: receipt.completed_generation,
+        attempt: receipt.attempt,
+        target: public_execution_target_request(&receipt.target),
+        failure_code: receipt.failure_code.clone(),
+    }
+}
+
+fn map_execution_switch_error(
+    error: astra_services::SessionContextCoordinatorError,
+) -> (StatusCode, Json<WorkApiErrorV1>) {
+    match error {
+        astra_services::SessionContextCoordinatorError::Invalid(_) => work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ),
+        astra_services::SessionContextCoordinatorError::Unauthorized => work_error(
+            StatusCode::FORBIDDEN,
+            "execution_switch_forbidden",
+            WorkApiErrorCategory::Authentication,
+            false,
+            Vec::new(),
+        ),
+        astra_services::SessionContextCoordinatorError::IdempotencyMismatch => work_error(
+            StatusCode::CONFLICT,
+            "idempotency_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            Vec::new(),
+        ),
+        astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
+        | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
+        | astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. }
+        | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_) => {
+            work_error(
+                StatusCode::CONFLICT,
+                "execution_switch_conflict",
+                WorkApiErrorCategory::Conflict,
+                true,
+                vec![
+                    WorkApiActionHint::RefreshWork,
+                    WorkApiActionHint::RetryWrite,
+                ],
+            )
+        }
+        error => {
+            tracing::warn!(error = %error, "Work execution switch unavailable");
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_switch_unavailable",
+                WorkApiErrorCategory::Degraded,
+                true,
+                vec![WorkApiActionHint::RetryRead],
+            )
+        }
+    }
+}
+
+async fn load_work_execution_context(
+    state: &AppState,
+    owner_id: &WorkOwnerId,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+) -> Result<
+    (
+        astra_services::work::WorkBranchRuntimeBinding,
+        astra_turn_types::SessionKeyV1,
+        astra_services::DatabaseSessionContextCoordinator,
+    ),
+    (StatusCode, Json<WorkApiErrorV1>),
+> {
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "execution_switch_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(owner_id, work_id, branch_id)
+        .await
+        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        owner_id.as_str(),
+        binding.session_id.as_str(),
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    Ok((
+        binding,
+        key,
+        astra_services::DatabaseSessionContextCoordinator::new(pool),
+    ))
+}
+
+fn attestation_markers(nonce: &str) -> (String, String) {
+    (
+        format!("{WORK_EXECUTION_ATTESTATION_START}:{nonce}"),
+        format!("{WORK_EXECUTION_ATTESTATION_END}:{nonce}"),
+    )
+}
+
+fn parse_workspace_attestation(
+    output: &str,
+    expected_root: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Result<serde_json::Value, &'static str> {
+    let lines = output.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| *line == start_marker)
+        .ok_or("attestation_start_missing")?;
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|line| *line == end_marker)
+        .map(|offset| start + 1 + offset)
+        .ok_or("attestation_end_missing")?;
+    if end <= start + 7 {
+        return Err("attestation_payload_incomplete");
+    }
+    let pwd = lines[start + 1].trim();
+    let root = lines[start + 2].trim();
+    let head = lines[start + 3].trim();
+    let tree = lines[start + 4].trim();
+    let object_format = lines[start + 5].trim();
+    let reference = lines[start + 6].trim();
+    let repository = lines[start + 7].trim();
+    if pwd != expected_root
+        || root != expected_root
+        || head.is_empty()
+        || tree.is_empty()
+        || object_format.is_empty()
+        || reference.is_empty()
+        || repository.is_empty()
+    {
+        return Err("attestation_identity_mismatch");
+    }
+    let dirty = lines[start + 8..end]
+        .iter()
+        .any(|line| !line.trim().is_empty());
+    if dirty {
+        return Err("attestation_workspace_dirty");
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "root": root,
+        "head": head,
+        "tree": tree,
+        "object_format": object_format,
+        "reference": reference,
+        "repository": repository,
+        "clean": true,
+    }))
+}
+
+async fn attest_edge_workspace(
+    state: &AppState,
+    record: &astra_services::multi_agent::EdgeAgentRecord,
+    session_id: &str,
+    operation_id: &str,
+    attempt: u32,
+    phase: &str,
+    attestation_nonce: &str,
+) -> Result<(serde_json::Value, u64), &'static str> {
+    let expected_root = record
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .ok_or("edge_workspace_root_missing")?;
+    let connection = state
+        .edge_connection_pool
+        .find_user_edge_by_agent_and_workspace(
+            &record.user_id,
+            &record.edge_agent_id,
+            record.workspace_id.as_deref(),
+        );
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        &record.user_id,
+        session_id,
+        format!("work-execution-switch:{operation_id}:{attempt}:{phase}:{attestation_nonce}"),
+        format!("work-execution-switch:{operation_id}:{attempt}:{phase}:{attestation_nonce}"),
+        format!("workspace-attestation:{phase}:{attestation_nonce}"),
+    )
+    .map_err(|_| "attestation_identity_invalid")?;
+    let (start_marker, end_marker) = attestation_markers(attestation_nonce);
+    let command = format!(
+        "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
+    );
+    let mut args = serde_json::json!({
+        "command": command,
+        "mode": "verify",
+        "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+    });
+    let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
+        // A same-pod socket is still checked before dispatch. The local pool
+        // is authoritative for its live generation and must agree with the
+        // durable registry row selected by the Work switch.
+        if connection.workspace_dir.as_deref().map(str::trim) != Some(expected_root) {
+            return Err("edge_workspace_root_mismatch");
+        }
+        if connection.registry_id.as_deref() != Some(record.registry_id.as_str()) {
+            return Err("edge_connection_identity_mismatch");
+        }
+        if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
+            return Err("edge_materialization_identity_mismatch");
+        }
+        let result = state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_on_connection_with_cancel(
+                astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                    connection_user_id: &record.user_id,
+                    identity: &identity,
+                    edge_agent_id: &record.edge_agent_id,
+                    tool: "bash",
+                    args: &args,
+                    runtime_process_authorization: None,
+                    timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+                    cancel_token: None,
+                },
+            )
+            .await
+            .ok_or("edge_attestation_no_result")?;
+        if result.is_error {
+            return Err("edge_attestation_command_failed");
+        }
+        (result.output, connection.generation)
+    } else {
+        // The target may be connected to another Server pod. Route through
+        // the durable Edge ledger so admission, retry, reconnect and result
+        // custody follow the same identity fence as ordinary Edge tools.
+        let materialization_id = record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or("edge_materialization_identity_mismatch")?;
+        args.as_object_mut()
+            .ok_or("attestation_identity_invalid")?
+            .insert(
+                "__astra_attestation".to_string(),
+                serde_json::json!({
+                    "registry_id": record.registry_id,
+                    "materialization_id": materialization_id,
+                }),
+            );
+        let request_id = identity.storage_key();
+        let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            record.user_id.clone(),
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.turn_chain_id.clone(),
+            request_id.clone(),
+        );
+        let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            request_id: request_id.clone(),
+            identity: Box::new(identity.clone()),
+            delivery_generation: 1,
+            tool: "bash".to_string(),
+            args,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+        };
+        let payload_json =
+            serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;
+        let dispatch = &state.execution.edge_dispatch_service;
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
+            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload_json),
+        )
+        .await;
+        let result_json = match admission {
+            Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
+            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
+            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
+                let wait_timeout = std::time::Duration::from_secs(
+                    WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS
+                        .saturating_add(astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS),
+                );
+                let result = tokio::time::timeout(
+                    wait_timeout,
+                    dispatch.wait_result(&dispatch_identity, wait_timeout),
+                )
+                .await
+                .map_err(|_| "edge_attestation_no_result")?
+                .map_err(|_| "edge_attestation_dispatch_unavailable")?;
+                match result {
+                    Some(result) => result,
+                    None => {
+                        let _ = dispatch
+                            .fail_dispatch(
+                                &dispatch_identity,
+                                &record.edge_agent_id,
+                                "edge_attestation_timeout",
+                            )
+                            .await;
+                        return Err("edge_attestation_no_result");
+                    }
+                }
+            }
+            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_))) => {
+                return Err("edge_attestation_dispatch_rejected");
+            }
+            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(_))) => {
+                return Err("edge_attestation_dispatch_outcome_unknown");
+            }
+        };
+        let result: astra_thin_client::ToolResultRequest =
+            serde_json::from_str(&result_json).map_err(|_| "edge_attestation_result_invalid")?;
+        if result.session_id != identity.session_id
+            || result.run_id != identity.run_id
+            || result.turn_chain_id != identity.turn_chain_id
+            || result.request_id != request_id
+            || result.edge_agent_id != record.edge_agent_id
+            || astra_thin_client::ToolResultRequest::compute_result_hash(
+                astra_thin_client::ToolResultHashParts {
+                    session_id: &result.session_id,
+                    run_id: &result.run_id,
+                    turn_chain_id: &result.turn_chain_id,
+                    request_id: &result.request_id,
+                    edge_agent_id: &result.edge_agent_id,
+                    status: &result.status,
+                    output: &result.output,
+                    duration_ms: result.duration_ms,
+                    tool_result_fields: result.tool_result_fields.as_ref(),
+                },
+            ) != result.result_hash
+        {
+            return Err("edge_attestation_result_identity_mismatch");
+        }
+        match astra_thin_client::tool_result_status_is_error(&result.status) {
+            Some(false) => (result.output, 0),
+            Some(true) => return Err("edge_attestation_command_failed"),
+            None => return Err("edge_attestation_result_invalid"),
+        }
+    };
+    let evidence = parse_workspace_attestation(&output, expected_root, &start_marker, &end_marker)?;
+    if connection_generation != 0 {
+        let after = state
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(
+                &record.user_id,
+                &record.edge_agent_id,
+                record.workspace_id.as_deref(),
+            )
+            .ok_or("edge_connection_changed")?;
+        if after.generation != connection_generation
+            || after.workspace_dir.as_deref().map(str::trim) != Some(expected_root)
+            || after.registry_id.as_deref() != Some(record.registry_id.as_str())
+            || after.materialization_id.as_deref() != record.materialization_id.as_deref()
+        {
+            return Err("edge_connection_changed");
+        }
+    }
+    Ok((evidence, connection_generation))
+}
+
+fn evidence_revision(evidence: &serde_json::Value) -> Option<(&str, &str, &str)> {
+    Some((
+        evidence.get("root")?.as_str()?,
+        evidence.get("head")?.as_str()?,
+        evidence.get("tree")?.as_str()?,
+    ))
+}
+
+fn evidence_repository_identity(evidence: &serde_json::Value) -> Option<(&str, &str, &str)> {
+    Some((
+        evidence.get("object_format")?.as_str()?,
+        evidence.get("reference")?.as_str()?,
+        evidence.get("repository")?.as_str()?,
+    ))
+}
+
+fn evidence_matches(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+    evidence_revision(expected) == evidence_revision(actual)
+        && evidence_repository_identity(expected) == evidence_repository_identity(actual)
+        && actual.get("clean").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn evidence_pair_matches(source: &serde_json::Value, target: &serde_json::Value) -> bool {
+    evidence_revision(source)
+        .zip(evidence_revision(target))
+        .is_some_and(
+            |((_, source_head, source_tree), (_, target_head, target_tree))| {
+                source_head == target_head && source_tree == target_tree
+            },
+        )
+        && evidence_repository_identity(source) == evidence_repository_identity(target)
+        && source.get("clean").and_then(serde_json::Value::as_bool) == Some(true)
+        && target.get("clean").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+async fn load_owned_execution_edge(
+    state: &AppState,
+    owner_id: &WorkOwnerId,
+    executor_id: &str,
+    unavailable_code: &'static str,
+) -> Result<astra_services::multi_agent::EdgeAgentRecord, (StatusCode, Json<WorkApiErrorV1>)> {
+    let registry_record = state
+        .execution
+        .edge_registry_service
+        .find_by_user_agent_and_workspace(owner_id.as_str(), executor_id, None)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, executor_id, "execution target registry unavailable");
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_targets_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryRead],
+            )
+        })?;
+    if let Some(record) = registry_record {
+        return Ok(record);
+    }
+    if let Some(connection) = state
+        .edge_connection_pool
+        .find_user_edge_by_agent_and_workspace(owner_id.as_str(), executor_id, None)
+        && let Some(record) = edge_record_from_pool(owner_id.as_str(), connection)
+    {
+        return Ok(record);
+    }
+    Err(work_error(
+        StatusCode::PRECONDITION_FAILED,
+        unavailable_code,
+        WorkApiErrorCategory::Availability,
+        true,
+        vec![WorkApiActionHint::RetryWrite],
+    ))
+}
+
+fn execution_target_executor(
+    target: &WorkExecutionTargetRequestV1,
+) -> Result<&str, (StatusCode, Json<WorkApiErrorV1>)> {
+    match target {
+        WorkExecutionTargetRequestV1::Edge { executor_id } => Ok(executor_id),
+    }
+}
+
+fn binding_executor_id(
+    binding: &astra_services::SessionExecutionBindingV1,
+) -> Result<&str, (StatusCode, Json<WorkApiErrorV1>)> {
+    binding.executor.executor_id.as_deref().ok_or_else(|| {
+        work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "source_workspace_unverifiable",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        )
+    })
+}
+
+fn edge_record_matches_binding(
+    record: &astra_services::multi_agent::EdgeAgentRecord,
+    binding: &astra_services::SessionExecutionBindingV1,
+) -> bool {
+    let Some(root) = record
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    else {
+        return false;
+    };
+    let Some(materialization_id) = record
+        .materialization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    record.edge_agent_id == binding.executor.executor_id.as_deref().unwrap_or_default()
+        && Some(root) == binding.workspace.root.as_deref().map(str::trim)
+        && binding.physical_workspace_id.as_deref()
+            == Some(physical_workspace_identity(materialization_id, root).as_str())
+}
+
+fn physical_workspace_identity(materialization_id: &str, root: &str) -> String {
+    astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+        materialization_id,
+        root,
+    )
+}
+
+async fn attest_execution_pair(
+    state: &AppState,
+    source: &astra_services::multi_agent::EdgeAgentRecord,
+    target: &astra_services::multi_agent::EdgeAgentRecord,
+    session_id: &str,
+    operation_id: &str,
+    attempt: u32,
+    phase: &str,
+    attestation_nonce: &str,
+) -> Result<(serde_json::Value, serde_json::Value), &'static str> {
+    let source_phase = format!("source-{phase}");
+    let target_phase = format!("target-{phase}");
+    let (source_result, target_result) = tokio::join!(
+        attest_edge_workspace(
+            state,
+            source,
+            session_id,
+            operation_id,
+            attempt,
+            &source_phase,
+            attestation_nonce,
+        ),
+        attest_edge_workspace(
+            state,
+            target,
+            session_id,
+            operation_id,
+            attempt,
+            &target_phase,
+            attestation_nonce,
+        )
+    );
+    Ok((source_result?.0, target_result?.0))
+}
+
+/// Read the canonical execution location. A missing row is projected as the
+/// explicit Server Work default; no database row is written and no historical
+/// Run metadata is consulted.
+pub(super) async fn get_work_branch_execution_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+) -> WorkApiResult<WorkExecutionViewV1> {
+    require_work_api_major(&headers)?;
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let (binding, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let logical = execution_logical_workspace_id(&key);
+    let fallback = astra_services::SessionExecutionBindingV1::server_work_default(logical);
+    let (execution, initialized) = coordinator
+        .load_execution_binding(&key)
+        .await
+        .map_err(map_execution_switch_error)?
+        .map_or((fallback, false), |binding| (binding, true));
+    let receipt = coordinator
+        .load_latest_execution_switch(&key)
+        .await
+        .map_err(map_execution_switch_error)?;
+    Ok(Json(public_execution_view(
+        &binding.work_id,
+        &binding.branch_id,
+        &execution,
+        initialized,
+        receipt.as_ref(),
+    )))
+}
+
+pub(super) async fn get_work_branch_execution_targets_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+) -> WorkApiResult<WorkExecutionTargetPageV1> {
+    require_work_api_major(&headers)?;
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let _ = load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let mut records = state
+        .execution
+        .edge_registry_service
+        .list_native_execution_targets(owner_id.as_str(), WORK_EXECUTION_TARGET_LIMIT)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "execution target registry unavailable");
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_targets_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryRead],
+            )
+        })?;
+    // Single-pod deployments intentionally have no durable registry rows. In
+    // that mode the authenticated live pool is the only target directory; it
+    // still must carry a registration identity so a target cannot be confused
+    // with another materialization sharing its label or hostname.
+    let registry_backed = !records.is_empty();
+    if records.is_empty() {
+        records = state
+            .edge_connection_pool
+            .get_all_user_edges(owner_id.as_str())
+            .into_iter()
+            .filter(|edge| edge.workspace_id.is_none())
+            .filter_map(|edge| edge_record_from_pool(owner_id.as_str(), edge))
+            .filter(is_native_execution_target)
+            .take(usize::from(WORK_EXECUTION_TARGET_LIMIT))
+            .collect();
+    }
+    let targets = records
+        .iter()
+        .map(|record| {
+            // A durable registry row may be live on another Server pod. The
+            // local socket pool can only answer for this pod, so registry
+            // backed targets are selectable even when no local connection is
+            // present; the switch attestation will use the durable relay.
+            let connected = registry_backed
+                || state
+                    .edge_connection_pool
+                    .find_user_edge_by_agent_and_workspace(
+                        owner_id.as_str(),
+                        &record.edge_agent_id,
+                        record.workspace_id.as_deref(),
+                    )
+                    .is_some();
+            public_execution_target(record, connected)
+        })
+        .collect();
+    Ok(Json(WorkExecutionTargetPageV1 {
+        schema_version: WORK_EXECUTION_SCHEMA_VERSION,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        targets,
+    }))
+}
+
+pub(super) async fn post_work_branch_execution_switch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+    payload: Result<Json<WorkExecutionSwitchRequestV1>, JsonRejection>,
+) -> WorkApiResult<WorkExecutionSwitchOperationV1> {
+    require_work_api_major(&headers)?;
+    let Json(payload) = payload.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let target_executor = execution_target_executor(&payload.target)?;
+    if !valid_work_request_id(&payload.request_id)
+        || !valid_work_attachment_id(&payload.attachment_id)
+        || !valid_work_operation_id(target_executor)
+        || payload.expected_generation == 0
+    {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let (runtime_binding, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let logical = execution_logical_workspace_id(&key);
+    let current = coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &astra_services::SessionExecutionBindingV1::server_work_default(logical.clone()),
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+
+    // A retried POST is safe to answer from the durable receipt. Do this before
+    // registry or Edge work so a lost target device cannot turn a successful
+    // first request into a misleading availability error.
+    if let Some(existing) = coordinator
+        .load_execution_switch_by_request(&key, &payload.request_id)
+        .await
+        .map_err(map_execution_switch_error)?
+    {
+        let existing_target = existing.target.executor.executor_id.as_deref();
+        if existing.controller_attachment_id != payload.attachment_id
+            || existing.expected_generation != payload.expected_generation
+            || existing_target != Some(target_executor)
+        {
+            return Err(work_error(
+                StatusCode::CONFLICT,
+                "idempotency_mismatch",
+                WorkApiErrorCategory::Conflict,
+                false,
+                Vec::new(),
+            ));
+        }
+        return Ok(Json(public_execution_switch_operation(
+            &work_id, &branch_id, &existing,
+        )));
+    }
+
+    if !matches!(
+        (current.workspace.kind, current.executor.kind),
+        (
+            astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        )
+    ) {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "source_workspace_unverifiable",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    if current.generation != payload.expected_generation {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "execution_switch_conflict",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![
+                WorkApiActionHint::RefreshWork,
+                WorkApiActionHint::RetryWrite,
+            ],
+        ));
+    }
+
+    // Keep the fast HTTP check for a friendly error. The coordinator repeats
+    // it under the Session row lock before committing the generation fence.
+    let handoff = astra_services::DatabaseSessionHandoffService::new(
+        state.shared_pool.clone().ok_or_else(|| {
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_switch_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?,
+        state.session_context_coordinator.clone().ok_or_else(|| {
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_switch_unavailable",
+                WorkApiErrorCategory::Availability,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?,
+    );
+    let attachment = handoff
+        .load_attachment(&key, &payload.attachment_id)
+        .await
+        .map_err(map_work_attachment_error)?;
+    if attachment.mode != astra_turn_types::SessionAttachmentModeV1::Controller
+        || attachment.expires_at_unix_ms <= chrono::Utc::now().timestamp_millis()
+    {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "controller_attachment_required",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RetryAttach],
+        ));
+    }
+
+    let source_executor = binding_executor_id(&current)?;
+    let source_record = load_owned_execution_edge(
+        &state,
+        &owner_id,
+        source_executor,
+        "source_edge_unavailable",
+    )
+    .await?;
+    if !edge_record_matches_binding(&source_record, &current) {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "source_workspace_changed",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![
+                WorkApiActionHint::RefreshWork,
+                WorkApiActionHint::RetryWrite,
+            ],
+        ));
+    }
+    if source_executor == target_executor {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "execution_target_is_current",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let target_record = load_owned_execution_edge(
+        &state,
+        &owner_id,
+        target_executor,
+        "target_edge_unavailable",
+    )
+    .await?;
+    let target_root = target_record
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::PRECONDITION_FAILED,
+                "edge_workspace_root_missing",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?
+        .to_owned();
+    let target_materialization_id = target_record
+        .materialization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::PRECONDITION_FAILED,
+                "edge_materialization_identity_missing",
+                WorkApiErrorCategory::Conflict,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        })?
+        .to_owned();
+
+    let operation_id = format!("switch-{}", Uuid::new_v4());
+    // Preflight happens before the durable CAS. A dirty or divergent source
+    // therefore leaves the old Ready binding untouched and is immediately
+    // actionable by the user.
+    let (source_preflight, target_preflight) = attest_execution_pair(
+        &state,
+        &source_record,
+        &target_record,
+        runtime_binding.session_id.as_str(),
+        &operation_id,
+        1,
+        "preflight",
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .map_err(|code| {
+        work_error(
+            StatusCode::PRECONDITION_FAILED,
+            code,
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    if !evidence_pair_matches(&source_preflight, &target_preflight) {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "workspace_revision_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+
+    let target_binding = astra_services::SessionExecutionBindingV1 {
+        schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
+        generation: payload.expected_generation.saturating_add(1),
+        state: astra_services::SessionExecutionBindingStateV1::Switching,
+        logical_workspace_id: current.logical_workspace_id.clone(),
+        physical_workspace_id: Some(physical_workspace_identity(
+            &target_materialization_id,
+            &target_root,
+        )),
+        workspace: astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: target_record.hostname.clone(),
+            root: Some(target_root.clone()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: target_root,
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        },
+        executor: astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some(target_record.edge_agent_id.clone()),
+            display_name: target_record.hostname.clone(),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        },
+    };
+    let begun = coordinator
+        .begin_execution_switch(
+            &key,
+            &astra_services::BeginSessionExecutionSwitchV1 {
+                request_id: payload.request_id.clone(),
+                operation_id,
+                controller_attachment_id: payload.attachment_id.clone(),
+                expected_generation: payload.expected_generation,
+                target: target_binding,
+                source_evidence: source_preflight.clone(),
+            },
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+    if begun.state != astra_services::SessionExecutionSwitchStateV1::Switching {
+        return Ok(Json(public_execution_switch_operation(
+            &work_id, &branch_id, &begun,
+        )));
+    }
+
+    let (source_postflight, target_postflight) = match attest_execution_pair(
+        &state,
+        &source_record,
+        &target_record,
+        runtime_binding.session_id.as_str(),
+        &begun.operation_id,
+        begun.attempt,
+        "postflight",
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(code) => {
+            let failed = coordinator
+                .complete_execution_switch(
+                    &key,
+                    &begun.operation_id,
+                    Some(&payload.attachment_id),
+                    begun.attempt,
+                    begun.switching_generation,
+                    false,
+                    Some(serde_json::json!({"source": source_preflight})),
+                    Some(code.to_owned()),
+                )
+                .await
+                .map_err(map_execution_switch_error)?;
+            return Ok(Json(public_execution_switch_operation(
+                &work_id, &branch_id, &failed,
+            )));
+        }
+    };
+    let evidence = serde_json::json!({
+        "preflight": {"source": source_preflight, "target": target_preflight},
+        "postflight": {"source": source_postflight, "target": target_postflight},
+    });
+    let complete_ok = evidence_matches(&begun.source_evidence, &source_postflight)
+        && evidence_pair_matches(&source_postflight, &target_postflight)
+        && evidence_matches(&target_preflight, &target_postflight);
+    let completed = coordinator
+        .complete_execution_switch(
+            &key,
+            &begun.operation_id,
+            Some(&payload.attachment_id),
+            begun.attempt,
+            begun.switching_generation,
+            complete_ok,
+            Some(evidence),
+            (!complete_ok).then_some("workspace_revision_mismatch".to_string()),
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+    Ok(Json(public_execution_switch_operation(
+        &work_id, &branch_id, &completed,
+    )))
+}
+
+pub(super) async fn get_work_branch_execution_switch_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
+) -> WorkApiResult<WorkExecutionSwitchOperationV1> {
+    require_work_api_major(&headers)?;
+    if !valid_work_operation_id(&operation_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let (_, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let receipt = coordinator
+        .load_execution_switch(&key, &operation_id)
+        .await
+        .map_err(map_execution_switch_error)?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::NOT_FOUND,
+                "execution_switch_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            )
+        })?;
+    Ok(Json(public_execution_switch_operation(
+        &work_id, &branch_id, &receipt,
+    )))
+}
+
+pub(super) async fn post_work_branch_execution_switch_retry_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, operation_id)): Path<(String, String, String)>,
+    payload: Result<Json<WorkExecutionSwitchRetryRequestV1>, JsonRejection>,
+) -> WorkApiResult<WorkExecutionSwitchOperationV1> {
+    require_work_api_major(&headers)?;
+    if !valid_work_operation_id(&operation_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let Json(payload) = payload.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch_retry",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    if !valid_work_attachment_id(&payload.attachment_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_switch_retry",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let (runtime_binding, key, coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
+    let receipt = coordinator
+        .authorize_execution_switch_retry(&key, &operation_id, &payload.attachment_id)
+        .await
+        .map_err(|error| match error {
+            astra_services::SessionContextCoordinatorError::NeedsRepair(message)
+                if message == "execution switch receipt is missing" =>
+            {
+                work_error(
+                    StatusCode::NOT_FOUND,
+                    "execution_switch_not_found",
+                    WorkApiErrorCategory::NotFound,
+                    false,
+                    Vec::new(),
+                )
+            }
+            error => map_execution_switch_error(error),
+        })?;
+    if receipt.state == astra_services::SessionExecutionSwitchStateV1::Succeeded {
+        return Ok(Json(public_execution_switch_operation(
+            &work_id, &branch_id, &receipt,
+        )));
+    }
+
+    let source_executor = receipt
+        .source
+        .executor
+        .executor_id
+        .as_deref()
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::PRECONDITION_FAILED,
+                "source_workspace_unverifiable",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    let target_executor = receipt
+        .target
+        .executor
+        .executor_id
+        .as_deref()
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_switch_requires_repair",
+                WorkApiErrorCategory::Degraded,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+    if source_executor == target_executor {
+        return Err(work_error(
+            StatusCode::CONFLICT,
+            "execution_target_is_current",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+    let source_record = load_owned_execution_edge(
+        &state,
+        &owner_id,
+        source_executor,
+        "source_edge_unavailable",
+    )
+    .await?;
+    let target_record = load_owned_execution_edge(
+        &state,
+        &owner_id,
+        target_executor,
+        "target_edge_unavailable",
+    )
+    .await?;
+    if !edge_record_matches_binding(&source_record, &receipt.source)
+        || !edge_record_matches_binding(&target_record, &receipt.target)
+    {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "workspace_binding_changed",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![
+                WorkApiActionHint::RefreshWork,
+                WorkApiActionHint::RetryWrite,
+            ],
+        ));
+    }
+
+    // Always attest both sides against the immutable source proof. This closes
+    // the crash-after-begin and stale-retry windows where checking only the
+    // target could accept a different repository revision.
+    let (source_preflight, target_preflight) = attest_execution_pair(
+        &state,
+        &source_record,
+        &target_record,
+        runtime_binding.session_id.as_str(),
+        &receipt.operation_id,
+        receipt.attempt,
+        "retry-preflight",
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .map_err(|code| {
+        work_error(
+            StatusCode::PRECONDITION_FAILED,
+            code,
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    if !evidence_matches(&receipt.source_evidence, &source_preflight)
+        || !evidence_pair_matches(&source_preflight, &target_preflight)
+    {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "workspace_revision_mismatch",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
+    }
+
+    let begun = if receipt.state == astra_services::SessionExecutionSwitchStateV1::Failed {
+        let expected_generation = receipt.completed_generation.ok_or_else(|| {
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "execution_switch_requires_repair",
+                WorkApiErrorCategory::Degraded,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            )
+        })?;
+        coordinator
+            .retry_execution_switch(
+                &key,
+                &operation_id,
+                &payload.attachment_id,
+                expected_generation,
+            )
+            .await
+            .map_err(map_execution_switch_error)?
+    } else {
+        receipt.clone()
+    };
+    if begun.state == astra_services::SessionExecutionSwitchStateV1::Succeeded {
+        return Ok(Json(public_execution_switch_operation(
+            &work_id, &branch_id, &begun,
+        )));
+    }
+
+    let (source_postflight, target_postflight) = match attest_execution_pair(
+        &state,
+        &source_record,
+        &target_record,
+        runtime_binding.session_id.as_str(),
+        &begun.operation_id,
+        begun.attempt,
+        "retry-postflight",
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(code) => {
+            let failed = coordinator
+                .complete_execution_switch(
+                    &key,
+                    &begun.operation_id,
+                    Some(&payload.attachment_id),
+                    begun.attempt,
+                    begun.switching_generation,
+                    false,
+                    Some(serde_json::json!({
+                        "preflight": {"source": source_preflight, "target": target_preflight}
+                    })),
+                    Some(code.to_owned()),
+                )
+                .await
+                .map_err(map_execution_switch_error)?;
+            return Ok(Json(public_execution_switch_operation(
+                &work_id, &branch_id, &failed,
+            )));
+        }
+    };
+    let evidence = serde_json::json!({
+        "preflight": {"source": source_preflight, "target": target_preflight},
+        "postflight": {"source": source_postflight, "target": target_postflight},
+    });
+    let complete_ok = evidence_matches(&begun.source_evidence, &source_postflight)
+        && evidence_pair_matches(&source_postflight, &target_postflight)
+        && evidence_matches(&target_preflight, &target_postflight);
+    let result = coordinator
+        .complete_execution_switch(
+            &key,
+            &begun.operation_id,
+            Some(&payload.attachment_id),
+            begun.attempt,
+            begun.switching_generation,
+            complete_ok,
+            Some(evidence),
+            (!complete_ok).then_some("workspace_revision_mismatch".to_string()),
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+    Ok(Json(public_execution_switch_operation(
+        &work_id, &branch_id, &result,
+    )))
 }
 
 /// Bounded archived branch history. The cursor is an exact archive-time and
@@ -5843,6 +7421,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn execution_identity_is_session_stable_and_directory_scoped() {
+        let branch = WorkBranchId::parse("feature-work-branch").expect("branch");
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            "owner-1",
+            "session-1",
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        assert_eq!(
+            execution_logical_workspace_id(&key),
+            "session:session-1:branch:main"
+        );
+        assert_ne!(branch.as_str(), key.branch_id);
+        assert_eq!(
+            physical_workspace_identity("materialization-a", "/workspace/project"),
+            physical_workspace_identity("materialization-a", "/workspace/project")
+        );
+        assert_ne!(
+            physical_workspace_identity("materialization-a", "/workspace/project"),
+            physical_workspace_identity("materialization-a", "/workspace/other")
+        );
+        assert_ne!(
+            physical_workspace_identity("materialization-a", "/workspace/project"),
+            physical_workspace_identity("materialization-b", "/workspace/project")
+        );
+    }
+
     fn creation(owner: &str, request_id: &str, goal: &str) -> DerivedWorkCreation {
         creation_with_criteria(owner, request_id, goal, Vec::new())
     }
@@ -6434,5 +8040,40 @@ mod tests {
         ] {
             assert!(!valid_committed_work_cursor(&invalid));
         }
+    }
+
+    #[test]
+    fn execution_attestation_requires_exact_root_and_clean_porcelain() {
+        let (start_marker, end_marker) = attestation_markers("test-nonce");
+        let output = format!(
+            "noise\n{start_marker}\n/work/tree\n/work/tree\nabc123\ndef456\nsha1\nmain\nrepo\n{end_marker}\n"
+        );
+        let evidence =
+            parse_workspace_attestation(&output, "/work/tree", &start_marker, &end_marker)
+                .expect("clean proof");
+        assert_eq!(evidence["head"], "abc123");
+        assert_eq!(evidence["tree"], "def456");
+        let dirty = format!(
+            "{start_marker}\n/work/tree\n/work/tree\nabc123\ndef456\nsha1\nmain\nrepo\n M src/lib.rs\n{end_marker}"
+        );
+        assert_eq!(
+            parse_workspace_attestation(&dirty, "/work/tree", &start_marker, &end_marker),
+            Err("attestation_workspace_dirty")
+        );
+        let wrong_root = output.replace("/work/tree", "/other/tree");
+        assert_eq!(
+            parse_workspace_attestation(&wrong_root, "/work/tree", &start_marker, &end_marker),
+            Err("attestation_identity_mismatch")
+        );
+
+        // A repository file may contain the legacy marker text. The nonce
+        // makes it impossible for that output to terminate this attestation.
+        let injected = format!(
+            "{start_marker}\n/work/tree\n/work/tree\nabc123\ndef456\nsha1\nmain\nrepo\n{WORK_EXECUTION_ATTESTATION_END}\n M generated\n{end_marker}"
+        );
+        assert_eq!(
+            parse_workspace_attestation(&injected, "/work/tree", &start_marker, &end_marker),
+            Err("attestation_workspace_dirty")
+        );
     }
 }

@@ -5,6 +5,10 @@ import {
   type WorkArchivedBranchCursorV1,
   type WorkArchivedBranchPageV1,
   type WorkBranchControlOperationV2,
+  type WorkBranchActivityResponseV1,
+  type WorkExecutionViewV1,
+  type WorkExecutionTargetPageV1,
+  type WorkExecutionSwitchOperationV1,
   type WorkBranchCreationOperationV1,
   type WorkBranchDeletionOperationV1,
   type WorkBranchRetentionReceiptV1,
@@ -129,6 +133,274 @@ export type LoadWorkTaskGraphPageResult =
   | { ok: true; page: WorkTaskGraphPageV2 }
   | WorkActionError;
 export type RefreshWorkTaskGraphResult = LoadWorkTaskGraphPageResult;
+
+export type RefreshWorkBranchActivityResult =
+  | { ok: true; activity: WorkBranchActivityResponseV1 }
+  | WorkActionError;
+
+export type LoadWorkExecutionResult =
+  | { ok: true; execution: WorkExecutionViewV1 }
+  | WorkActionError;
+
+export type LoadWorkExecutionTargetsResult =
+  | { ok: true; page: WorkExecutionTargetPageV1 }
+  | WorkActionError;
+
+export type SwitchWorkExecutionResult =
+  | { ok: true; operation: WorkExecutionSwitchOperationV1 }
+  | WorkActionError;
+
+export type ObserveWorkExecutionSwitchResult = SwitchWorkExecutionResult;
+export type RetryWorkExecutionSwitchResult = SwitchWorkExecutionResult;
+
+type RefreshWorkBranchActivityInput = {
+  workId: string;
+  branchId: string;
+};
+
+function validWorkBranchActivityInput(
+  input: RefreshWorkBranchActivityInput,
+): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId)
+  );
+}
+
+/** Read the current branch's server-owned Run activity without acquiring control. */
+export async function refreshWorkBranchActivityAction(
+  input: RefreshWorkBranchActivityInput,
+): Promise<RefreshWorkBranchActivityResult> {
+  if (!validWorkBranchActivityInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_branch_activity_query",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "refresh Work activity",
+    });
+    return {
+      ok: true,
+      activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type WorkExecutionIdentityInput = { workId: string; branchId: string };
+
+function validWorkExecutionIdentity(input: WorkExecutionIdentityInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "branchId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId)
+  );
+}
+
+/** Read the authoritative provider/generation without acquiring control. */
+export async function loadWorkExecutionAction(
+  input: WorkExecutionIdentityInput,
+): Promise<LoadWorkExecutionResult> {
+  if (!validWorkExecutionIdentity(input)) {
+    return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "read Work execution",
+    });
+    return {
+      ok: true,
+      execution: await runtime.sdk.getWorkBranchExecution(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+/** Read the bounded owner-scoped Edge target directory on demand. */
+export async function loadWorkExecutionTargetsAction(
+  input: WorkExecutionIdentityInput,
+): Promise<LoadWorkExecutionTargetsResult> {
+  if (!validWorkExecutionIdentity(input)) {
+    return { ok: false, status: 400, code: "invalid_work_execution_query", retryable: false };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "list Work execution targets",
+    });
+    return {
+      ok: true,
+      page: await runtime.sdk.listWorkBranchExecutionTargets(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type SwitchWorkExecutionInput = WorkExecutionIdentityInput & {
+  requestId: string;
+  attachmentId: string;
+  expectedGeneration: number;
+  targetExecutorId: string;
+};
+
+function validWorkExecutionSwitchInput(input: SwitchWorkExecutionInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") ===
+      "attachmentId\0branchId\0expectedGeneration\0requestId\0targetExecutorId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId) &&
+    canonicalAttachmentIdentity(object.attachmentId) &&
+    typeof object.requestId === "string" &&
+    object.requestId.length >= 1 &&
+    object.requestId.length <= 256 &&
+    !/[\u0000-\u001f\u007f]/.test(object.requestId) &&
+    Number.isSafeInteger(object.expectedGeneration) &&
+    Number(object.expectedGeneration) >= 1 &&
+    canonicalAttachmentIdentity(object.targetExecutorId)
+  );
+}
+
+/** Begin an explicit Edge to Edge Work execution handoff. */
+export async function switchWorkExecutionAction(
+  input: SwitchWorkExecutionInput,
+): Promise<SwitchWorkExecutionResult> {
+  if (!validWorkExecutionSwitchInput(input)) {
+    return { ok: false, status: 400, code: "invalid_work_execution_switch", retryable: false };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "move Work execution",
+    });
+    return {
+      ok: true,
+      operation: await runtime.sdk.switchWorkBranchExecution(input.workId, input.branchId, {
+        requestId: input.requestId,
+        attachmentId: input.attachmentId,
+        expectedGeneration: input.expectedGeneration,
+        target: { kind: "edge", executorId: input.targetExecutorId },
+      }),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type WorkExecutionSwitchIdentityInput = WorkExecutionIdentityInput & {
+  operationId: string;
+};
+
+function validWorkExecutionSwitchIdentity(input: WorkExecutionSwitchIdentityInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "branchId\0operationId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId) &&
+    canonicalAttachmentIdentity(object.operationId)
+  );
+}
+
+/** Observe a durable handoff without repeating workspace attestation. */
+export async function observeWorkExecutionSwitchAction(
+  input: WorkExecutionSwitchIdentityInput,
+): Promise<ObserveWorkExecutionSwitchResult> {
+  if (!validWorkExecutionSwitchIdentity(input)) {
+    return { ok: false, status: 400, code: "invalid_work_execution_switch", retryable: false };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "observe Work execution move",
+    });
+    return {
+      ok: true,
+      operation: await runtime.sdk.getWorkBranchExecutionSwitch(
+        input.workId,
+        input.branchId,
+        input.operationId,
+      ),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type RetryWorkExecutionSwitchInput = WorkExecutionSwitchIdentityInput & {
+  attachmentId: string;
+};
+
+function validWorkExecutionRetryInput(input: RetryWorkExecutionSwitchInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") ===
+      "attachmentId\0branchId\0operationId\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    canonicalWorkIdentity(object.branchId) &&
+    canonicalAttachmentIdentity(object.operationId) &&
+    canonicalAttachmentIdentity(object.attachmentId)
+  );
+}
+
+/** Retry a failed handoff with the current controller attachment. */
+export async function retryWorkExecutionSwitchAction(
+  input: RetryWorkExecutionSwitchInput,
+): Promise<RetryWorkExecutionSwitchResult> {
+  if (!validWorkExecutionRetryInput(input)) {
+    return { ok: false, status: 400, code: "invalid_work_execution_switch", retryable: false };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "retry Work execution move",
+    });
+    return {
+      ok: true,
+      operation: await runtime.sdk.retryWorkBranchExecutionSwitch(
+        input.workId,
+        input.branchId,
+        input.operationId,
+        input.attachmentId,
+      ),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
 
 type RefreshWorkTaskGraphInput = {
   workId: string;

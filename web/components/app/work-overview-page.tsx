@@ -5,6 +5,7 @@ import type {
   WorkCriteriaProposalMemberV1,
   WorkCriteriaProposalSummaryV1,
   WorkBranchAttachmentV1,
+  WorkBranchActivityResponseV1,
   WorkArchivedBranchEntryV1,
   WorkArchivedBranchPageV1,
   WorkBranchCatalogEntryV1,
@@ -18,6 +19,7 @@ import type {
   WorkPatchArtifactPageV1,
   WorkPatchMaterializationPageV2,
   WorkPatchCommitPageV1,
+  WorkExecutionViewV1,
 } from "@astra/sdk";
 import {
   Archive,
@@ -47,6 +49,7 @@ import {
   observeWorkBranchDeletionAction,
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
+  refreshWorkBranchActivityAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -56,9 +59,11 @@ import { WorkActivityCard } from "@/components/app/work-activity-card";
 import { WorkTranscriptCard } from "@/components/app/work-transcript-card";
 import { WorkPatchReviewCard } from "@/components/app/work-patch-review-card";
 import { WorkTaskGraph } from "@/components/app/work-task-graph";
+import { WorkExecutionCard } from "@/components/app/work-execution-card";
 import type { WorkOverviewSnapshot } from "@/lib/work-overview";
 import type { WorkActionError } from "@/lib/work-action-error";
 import { cn } from "@/lib/utils/cn";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
 
 const deliveryLabels: Record<
   WorkObservationFactCodeV1,
@@ -97,6 +102,7 @@ const ARCHIVE_DATE_FORMATTER = new Intl.DateTimeFormat("en", {
   dateStyle: "medium",
   timeZone: "UTC",
 });
+const ACTIVE_BRANCH_ACTIVITY_REFRESH_MS = 1_200;
 
 function deletionProgressLabel(
   phase: WorkBranchDeletionOperationV1["phase"],
@@ -117,9 +123,26 @@ function deletionProgressLabel(
   }
 }
 
+function branchActivityLabel(activity: WorkBranchActivityResponseV1["activity"]): string {
+  switch (activity) {
+    case "working":
+      return "Astra is working";
+    case "waiting":
+      return "Astra is waiting";
+    case "paused":
+      return "Run paused";
+    case "idle":
+      return "Ready to continue";
+    default:
+      return "Activity status unavailable";
+  }
+}
+
 export function WorkOverviewPage({
   initial,
   attachment,
+  initialActivity,
+  initialExecution,
   transcript,
   branchCatalog,
   selectedBranch,
@@ -130,6 +153,8 @@ export function WorkOverviewPage({
 }: {
   initial: WorkOverviewSnapshot;
   attachment?: WorkBranchAttachmentV1 | null;
+  initialActivity?: WorkBranchActivityResponseV1 | null;
+  initialExecution?: WorkExecutionViewV1 | null;
   transcript?: WorkTranscriptPageV1 | null;
   branchCatalog: WorkBranchCatalogV1;
   selectedBranch: WorkBranchCatalogEntryV1;
@@ -140,6 +165,10 @@ export function WorkOverviewPage({
 }) {
   const [snapshot, setSnapshot] = useState(initial);
   const [turnActive, setTurnActive] = useState(false);
+  const [branchActivity, setBranchActivity] = useState(initialActivity ?? null);
+  const [branchActivityHealth, setBranchActivityHealth] = useState<"live" | "delayed">(
+    initialActivity ? "live" : "delayed",
+  );
   const [expandedProposalId, setExpandedProposalId] = useState<string | null>(
     null,
   );
@@ -178,6 +207,47 @@ export function WorkOverviewPage({
   const router = useRouter();
   const toast = useToast();
 
+  const workId = initial.report.overview.work_id;
+  const selectedBranchId = selectedBranch.branch_id;
+
+  useEffect(() => {
+    setBranchActivity(initialActivity ?? null);
+    setBranchActivityHealth(initialActivity ? "live" : "delayed");
+  }, [initialActivity, workId, selectedBranchId]);
+
+  const refreshBranchActivity = useCallback(async () => {
+    try {
+      const result = await refreshWorkBranchActivityAction({
+        workId,
+        branchId: selectedBranchId,
+      });
+      if (!result.ok) {
+        setBranchActivityHealth("delayed");
+        return false;
+      }
+      if (
+        result.activity.work_id !== workId ||
+        result.activity.branch_id !== selectedBranchId
+      ) {
+        setBranchActivityHealth("delayed");
+        return false;
+      }
+      setBranchActivity(result.activity);
+      setBranchActivityHealth("live");
+      return true;
+    } catch {
+      setBranchActivityHealth("delayed");
+      return false;
+    }
+  }, [selectedBranchId, workId]);
+
+  useVisiblePoll({
+    enabled: true,
+    intervalMs: ACTIVE_BRANCH_ACTIVITY_REFRESH_MS,
+    maximumIntervalMs: 30_000,
+    refresh: refreshBranchActivity,
+  });
+
   useEffect(() => {
     setSnapshot((current) => {
       if (
@@ -194,6 +264,12 @@ export function WorkOverviewPage({
 
   const overview = snapshot.report.overview;
   const branchId = selectedBranch.branch_id;
+  const currentActivity =
+    branchActivity?.work_id === overview.work_id && branchActivity.branch_id === branchId
+      ? branchActivity.activity
+      : null;
+  const activityNeedsGraphRefresh =
+    currentActivity === "working" || currentActivity === "waiting";
   const branchLabel = workBranchLabel(branchCatalog, selectedBranch);
   const isDeliveryBranch = selectedBranch.is_delivery;
   const deliveryBranch = branchCatalog.branches.find((branch) => branch.is_delivery)!;
@@ -813,7 +889,18 @@ export function WorkOverviewPage({
                 ? attachment.head
                   ? `Synced · ${attachment.head.completed_turn} committed ${attachment.head.completed_turn === 1 ? "turn" : "turns"}`
                   : "Synced · no committed turns yet"
-                : "Live continuity unavailable · durable Work facts remain readable"}
+                  : "Live continuity unavailable · durable Work facts remain readable"}
+            </p>
+            <p
+              className="mt-2 text-xs font-medium text-text-secondary"
+              role="status"
+              aria-live="polite"
+            >
+              {currentActivity
+                ? branchActivityHealth === "live"
+                  ? `${branchActivityLabel(currentActivity)} · Live`
+                  : `Connection delayed · last confirmed ${branchActivityLabel(currentActivity)}`
+                : "Activity status unavailable · reconnecting"}
             </p>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-2">
@@ -847,6 +934,15 @@ export function WorkOverviewPage({
 
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
+            <WorkExecutionCard
+              key={branchId}
+              workId={overview.work_id}
+              branchId={branchId}
+              initialExecution={initialExecution}
+              attachment={attachment}
+              branchRevision={attachment?.branch_revision}
+              controlBasis={attachment?.control_basis}
+            />
             <Card className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -1191,7 +1287,10 @@ export function WorkOverviewPage({
               </Card>
             ) : null}
 
-            <WorkTaskGraph initial={snapshot.taskGraph} live={turnActive} />
+            <WorkTaskGraph
+              initial={snapshot.taskGraph}
+              live={turnActive || activityNeedsGraphRefresh}
+            />
 
             <Card>
               <div className="flex items-center justify-between gap-3">

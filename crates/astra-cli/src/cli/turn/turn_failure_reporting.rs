@@ -50,6 +50,48 @@ pub(crate) async fn reconcile_and_report_turn_failure(
     report_turn_failure(state, profile, line, failure, turn_start, ui);
 }
 
+/// Render a server admission rejection without pretending that a model turn
+/// or durable Run existed. The HTTP request reached the server, but admission
+/// stopped it before any model or tool work ran. Keep the newly-created Session
+/// attached and make recovery explicit; never silently restore another Session.
+pub(crate) fn report_admission_rejection(
+    state: &mut SessionState,
+    failure: &crate::TurnFailure,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+) {
+    let metadata = failure.partial.error_metadata.as_ref();
+    if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
+        let owner = metadata
+            .and_then(|value| value.get("owner_session_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        // Keep the newly-created Session attached. It is a real, empty
+        // Session whose execution has not been admitted; clearing only the
+        // local identity would leave the remote row and long-lived producers
+        // out of sync. The owner is retained as an explicit recovery target
+        // for `/session` and `/resume`, never auto-restored.
+        if state.turn == 0
+            && state.history.is_empty()
+            && let Some(owner) = owner
+        {
+            state.pending_recovery = Some(owner.to_string());
+        }
+        let mut message = String::from("Workspace unavailable\n");
+        if let Some(owner) = owner {
+            message.push_str(&format!("  Session {owner} owns this checkout.\n"));
+            message.push_str(&format!("  Resume it explicitly with: /resume {owner}\n"));
+        }
+        message.push_str(
+            "  Request was not admitted; no model or tool ran.\n  Use another worktree, or retry this new Session after the checkout is available.",
+        );
+        ui.show_error(&message);
+        return;
+    }
+    ui.show_error(
+        "Session execution is busy\n  Request was not admitted; no model or tool ran.\n  Retry this new Session after the current operation finishes, then send the same input again.",
+    );
+}
+
 async fn reconcile_failure_accounting(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -165,6 +207,30 @@ pub(crate) fn report_turn_failure(
         ));
     }
 
+    // A failed turn can still be a real, resumable session. Publish the
+    // profile pointer at the first authoritative admission boundary (the
+    // server session plus its physical Run), while keeping pure admission
+    // rejections out of recovery state. Waiting for success here would lose
+    // the only recovery pointer after provider/tool/stream failures.
+    if !failure.partial.admission_rejected
+        && failure
+            .partial
+            .run_id
+            .as_deref()
+            .is_some_and(|run_id| !run_id.trim().is_empty())
+        && let Some(session_id) = failure
+            .partial
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.trim().is_empty())
+    {
+        persist_profile_last_session_or_warn(
+            profile,
+            session_id,
+            "turn_failure_reporting:admitted_turn_failure",
+        );
+    }
+
     if state.journal.is_none()
         && let Some(sid) = failure
             .partial
@@ -173,11 +239,6 @@ pub(crate) fn report_turn_failure(
             .filter(|session_id| !session_id.is_empty())
     {
         session_startup::initialize_journal_pub(state, sid);
-        persist_profile_last_session_or_warn(
-            profile,
-            sid,
-            "turn_failure_reporting:report_turn_failure",
-        );
         state.set_session_id(sid.to_string());
     }
 
@@ -279,7 +340,7 @@ pub(crate) fn report_turn_failure(
 mod tests {
     use super::{
         apply_durable_run_accounting, await_failure_reconciliation_before_deadline,
-        reconcile_and_report_turn_failure, report_turn_failure,
+        reconcile_and_report_turn_failure, report_admission_rejection, report_turn_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
@@ -683,6 +744,95 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == session_journal::JournalEventType::TurnError),
             "turn error should be persisted after journal bootstrap"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admission_rejection_keeps_the_previous_recovery_pointer() {
+        let _credentials = crate::tests::isolate_credentials();
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".to_string(),
+            crate::cli::cli_config::cli_utils::Profile {
+                last_session_id: Some("previous-session".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "workspace is busy".into(),
+            partial: crate::PartialTurnData {
+                session_id: Some("draft-session".into()),
+                error_code: Some("execution_workspace_claimed".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "owner_session_id": "owner-session"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, &failure, &mut ui);
+
+        assert_eq!(
+            crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
+                .last_session_id
+                .as_deref(),
+            Some("previous-session"),
+            "a rejected draft must never replace the last resumable session"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admitted_turn_failure_publishes_the_new_recovery_pointer() {
+        let (_tmp, _sessions) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".to_string(),
+            crate::cli::cli_config::cli_utils::Profile {
+                last_session_id: Some("previous-session".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+
+        let session_id = format!("admitted-failure-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&session_id).unwrap()),
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "provider stream ended".into(),
+            partial: crate::PartialTurnData {
+                session_id: Some(session_id.clone()),
+                run_id: Some("run-authoritative".into()),
+                ..Default::default()
+            },
+        };
+
+        report_turn_failure(
+            &mut state,
+            None,
+            "continue",
+            &failure,
+            Instant::now(),
+            &mut crate::tests::TestUi::default(),
+        );
+
+        assert_eq!(
+            crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
+                .last_session_id
+                .as_deref(),
+            Some(session_id.as_str()),
+            "an admitted failed turn must remain explicitly resumable"
         );
     }
 }

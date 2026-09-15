@@ -747,6 +747,16 @@ mod token_refresh_error_tests {
             })))
             .mount(&server)
             .await;
+        // Headless chat performs the same explicit Edge admission as the TUI
+        // when the registry is enabled. Keep this test focused on gateway
+        // auth/model selection by providing that protocol boundary too.
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
 
         let parsed = Cli::try_parse_from([
             "astra",
@@ -1460,6 +1470,16 @@ async fn execute_cli_command_impl(
             } else {
                 fresh_access_token_or_error(api, profile.as_deref()).await?
             };
+            // One-shot chat bypasses the interactive session-startup path, but
+            // it still advertises a native CLI Edge executor in every turn.
+            // Register the same stable workspace materialization before the
+            // first request so durable execution admission has an authenticated
+            // physical identity instead of a random process id or a stale row.
+            if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
+                crate::cli::edge_lifecycle::register_edge_once(api, &token)
+                    .await
+                    .map_err(|error| format!("Edge registration failed before chat: {error}"))?;
+            }
             let explicit_session_id = args.session_id.clone();
             let session_routing_future = resolve_one_shot_session_routing(
                 api,

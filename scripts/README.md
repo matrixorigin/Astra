@@ -149,6 +149,32 @@ admission limits, DB pressure, and DB saturation. Do not treat slow SQL count
 alone as proof that production DB capacity is insufficient; a production claim
 also needs multi-pod or staging/prod MatrixOne metrics.
 
+### `scripts/load/work_surface_capacity_probe.py`
+
+Runs a read-only, concurrent `GET /v1/works/{work_id}/branches/{branch_id}/execution`
+probe for the cross-surface Work journey. The `cross-surface-100` profile maps
+100 readers over 25 owners and four Session/Work pairs per owner, records p50,
+p95, and p99 projection latency, and reports the expected active-view polling
+rate. Identifier templates accept `{owner_index}`, `{session_index}`,
+`{reader_index}`, `{round_index}`, and `{request_id}`. Use distinct access
+tokens for owner isolation; `--check-owner-isolation` sends a paired foreign
+owner request and requires the API's not-found response without recording
+credentials.
+
+```sh
+python3 scripts/load/work_surface_capacity_probe.py --profile cross-surface-100 \
+  --base-url http://127.0.0.1:3000 \
+  --work-id-template 'work-{owner_index}-{session_index}' \
+  --branch-id-template 'branch-{owner_index}-{session_index}' \
+  --token-file tokens.json --require-distinct-users --check-owner-isolation \
+  --max-p95-ms 1000 --max-p99-ms 2000 \
+  --output-dir tmp/capacity-probe/work-surface-100
+```
+
+Run with `--dry-run` first to verify the owner/Session mapping. The probe
+does not claim database capacity by itself; combine its summary with API,
+database, browser, and Edge metrics from the same deployment window.
+
 ### `scripts/load/cleanup_pressure_probe.py`
 Runs ignored live MatrixOne cleanup pressure probes for the current retention
 hot paths: `agent_message_queue`, `conversation_log`, and prompt retention.

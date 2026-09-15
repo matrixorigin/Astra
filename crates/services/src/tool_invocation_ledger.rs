@@ -7,10 +7,11 @@ use std::collections::BTreeMap;
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    DispatchCertainty, ToolInvocationCompletionSource, ToolInvocationDecision,
-    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome,
+    DEFAULT_CONVERSATION_BRANCH_ID, DispatchCertainty, SessionKeyV1,
+    ToolInvocationCompletionSource, ToolInvocationDecision, ToolInvocationDispatchLease,
+    ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationPrepareOutcome,
+    ToolInvocationRecord, ToolInvocationResultPayload, ToolInvocationState,
+    ToolInvocationTerminalOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +32,7 @@ pub struct ToolInvocationDispatchAdmission {
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
     pub expected_owner_pod_id: String,
+    pub expected_execution_binding_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,6 +944,16 @@ impl DatabaseToolInvocationLedger {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut tx = self.pool.get().begin().await?;
+        // Check Work's provider generation before granting Run action
+        // authority. Provider switching must first clear the active Session
+        // slot and unresolved invocation ledger, so a live dispatch cannot be
+        // overtaken by the selection change.
+        validate_execution_binding_generation_in_tx(
+            &mut tx,
+            identity,
+            admission.expected_execution_binding_generation,
+        )
+        .await?;
         let action_id = tool_invocation_action_id(identity);
         let admission_outcome = crate::runs::admit_run_action_in_existing_transaction(
             &mut tx,
@@ -1191,6 +1203,12 @@ impl DatabaseToolInvocationLedger {
         original_commit_error: sqlx::Error,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         let mut tx = self.pool.get().begin().await?;
+        validate_execution_binding_generation_in_tx(
+            &mut tx,
+            identity,
+            admission.expected_execution_binding_generation,
+        )
+        .await?;
         let action_id = tool_invocation_action_id(identity);
         let action = crate::runs::admit_run_action_in_existing_transaction(
             &mut tx,
@@ -1802,6 +1820,92 @@ fn validate_lease_input(
     Ok(())
 }
 
+async fn validate_execution_binding_generation_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    identity: &ToolInvocationIdentity,
+    expected_generation: Option<u64>,
+) -> Result<(), ToolInvocationLedgerStoreError> {
+    let Some(expected_generation) = expected_generation else {
+        return Ok(());
+    };
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &identity.user_id,
+        &identity.session_id,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    // This point read intentionally stays non-locking. Work permits parallel
+    // independent tool calls within one Session, and an exclusive selection
+    // row lock would serialize every dispatch in that fanout. A binding CAS
+    // is already fenced by the active Session slot or the durable Prepared
+    // invocation that precedes this claim; the exact generation is still
+    // checked in the same transaction as Run action admission and dispatch.
+    let row = sqlx::query(
+        "SELECT generation, binding_json FROM session_execution_bindings \
+         WHERE isolation_domain = ? AND owner_user_id = ? \
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(ToolInvocationLedgerStoreError::ExecutionBindingFenced {
+            expected: expected_generation,
+            current: None,
+        });
+    };
+    let raw_generation = row.try_get::<i64, _>("generation")?;
+    let generation = u64::try_from(raw_generation).map_err(|_| {
+        ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
+            "generation is outside the durable positive integer range".to_string(),
+        )
+    })?;
+    let binding_json = row.try_get::<String, _>("binding_json")?;
+    let binding: crate::SessionExecutionBindingV1 =
+        serde_json::from_str(&binding_json).map_err(|error| {
+            ToolInvocationLedgerStoreError::ExecutionBindingInvalid(error.to_string())
+        })?;
+    binding.validate().map_err(|error| {
+        ToolInvocationLedgerStoreError::ExecutionBindingInvalid(error.to_string())
+    })?;
+    if generation != binding.generation {
+        return Err(ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
+            "column generation disagrees with the durable binding payload".to_string(),
+        ));
+    }
+    if generation != expected_generation {
+        return Err(ToolInvocationLedgerStoreError::ExecutionBindingFenced {
+            expected: expected_generation,
+            current: Some(generation),
+        });
+    }
+    if binding.state != crate::SessionExecutionBindingStateV1::Ready {
+        return Err(ToolInvocationLedgerStoreError::ExecutionBindingNotReady(
+            binding.state,
+        ));
+    }
+    // Claim creation belongs to binding/admission transactions. Dispatch is a
+    // hot path and must not INSERT/DELETE/lock the claim for every tool call;
+    // observe the already-established owner mapping instead.
+    crate::session_context_coordinator::verify_execution_workspace_claim_in_tx(tx, &key, &binding)
+        .await
+        .map_err(|error| match error {
+            crate::SessionContextCoordinatorError::ExecutionBindingBusy => {
+                ToolInvocationLedgerStoreError::ExecutionBindingBusy
+            }
+            crate::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. } => {
+                ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
+                    "execution workspace claim changed owner during tool dispatch".to_string(),
+                )
+            }
+            other => ToolInvocationLedgerStoreError::ExecutionBindingInvalid(other.to_string()),
+        })?;
+    Ok(())
+}
+
 fn tool_invocation_action_id(identity: &ToolInvocationIdentity) -> String {
     // `agent_run_events.idempotency_key` is bounded. Hash the full structured
     // identity rather than truncating provider call ids, which could alias two
@@ -1960,6 +2064,16 @@ pub enum ToolInvocationLedgerStoreError {
         expected_owner_pod_id: String,
         actual_owner_pod_id: Option<String>,
     },
+    #[error(
+        "Session execution binding is fenced: expected generation {expected}, current generation {current:?}"
+    )]
+    ExecutionBindingFenced { expected: u64, current: Option<u64> },
+    #[error("Session execution binding is not ready: {0:?}")]
+    ExecutionBindingNotReady(crate::SessionExecutionBindingStateV1),
+    #[error("stored Session execution binding is invalid: {0}")]
+    ExecutionBindingInvalid(String),
+    #[error("Session execution binding is busy with another physical workspace claim")]
+    ExecutionBindingBusy,
     #[error(
         "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"
     )]

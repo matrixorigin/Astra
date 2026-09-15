@@ -497,6 +497,7 @@ async fn main() -> Result<()> {
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
+    runner_cfg.cleanup_created_sessions = true;
 
     let judger_cfg = JudgerConfig {
         astra_bin: astra_bin.clone(),

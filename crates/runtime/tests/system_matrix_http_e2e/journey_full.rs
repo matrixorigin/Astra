@@ -9,10 +9,10 @@ use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
-    get_json, maybe_tool_result_payload_from_sse, post_empty, post_json, post_json_with_headers,
-    put_json, row_get_opt_i64, row_get_opt_str, row_get_str, seed_pending_approval,
-    seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
+    MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
+    delete_json, delete_no_content, get_json, maybe_tool_result_payload_from_sse, post_empty,
+    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
+    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -41,7 +41,11 @@ async fn run_tool_backed_chat_turn(
         "workspace_binding": {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
-            "root": "/tmp/astra-system-matrix-edge",
+            "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -55,7 +59,7 @@ async fn run_tool_backed_chat_turn(
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
-                "cwd": "/tmp/astra-system-matrix-edge",
+                "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },
@@ -729,6 +733,7 @@ pub async fn run_product_matrix_full_journey(
             json!({
                 "edge_agent_id": edge_agent_id,
                 "hostname": "matrix-e2e-host",
+                "worktree_path": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "capabilities": { "tools": ["read_file"] }
             })
             .to_string(),

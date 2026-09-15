@@ -903,6 +903,7 @@ fn edge_agent_record(edge_agent_id: &str) -> astra_services::multi_agent::EdgeAg
         worktree_path: Some("/Users/test/project".to_string()),
         capabilities: Some(edge_runtime_environment_advertisement(edge_agent_id)),
         workspace_id: None,
+        materialization_id: Some(format!("materialization-{edge_agent_id}")),
         registered_at: "2026-06-11T00:00:00Z".to_string(),
         last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
     }

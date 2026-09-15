@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v73";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v77";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4196,6 +4196,78 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "session_execution_bindings",
+        "CREATE TABLE IF NOT EXISTS session_execution_bindings (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            generation BIGINT NOT NULL,
+            binding_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
+            INDEX idx_session_execution_bindings_owner_session
+                (owner_user_id, session_id, branch_id),
+            CONSTRAINT chk_session_execution_binding_generation CHECK (generation > 0)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_execution_workspace_claims",
+        "CREATE TABLE IF NOT EXISTS session_execution_workspace_claims (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            workspace_identity_hash CHAR(64) NOT NULL,
+            workspace_identity VARCHAR(8192) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, workspace_identity_hash),
+            UNIQUE KEY uq_session_execution_workspace_claim_session
+                (isolation_domain, owner_user_id, session_id, branch_id),
+            INDEX idx_session_execution_workspace_claim_owner_session
+                (owner_user_id, session_id, branch_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_execution_switches",
+        "CREATE TABLE IF NOT EXISTS session_execution_switches (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            operation_id VARCHAR(128) NOT NULL,
+            request_id VARCHAR(512) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            expected_generation BIGINT NOT NULL,
+            switching_generation BIGINT NOT NULL,
+            completed_generation BIGINT NULL,
+            record_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, operation_id),
+            UNIQUE KEY uq_session_execution_switch_request
+                (isolation_domain, owner_user_id, session_id, branch_id, request_id),
+            INDEX idx_session_execution_switches_owner_session
+                (owner_user_id, session_id, branch_id, updated_at),
+            CONSTRAINT chk_session_execution_switch_expected_generation CHECK (expected_generation > 0),
+            CONSTRAINT chk_session_execution_switch_switching_generation CHECK (switching_generation > 0)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "conversation_segments",
         "CREATE TABLE IF NOT EXISTS conversation_segments (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -7597,6 +7669,7 @@ async fn ensure_core_schema_while_leased(
             edge_id VARCHAR(128) NOT NULL,
             hostname VARCHAR(255) NULL,
             worktree_path VARCHAR(512) NULL,
+            materialization_id VARCHAR(128) NULL,
             capabilities_json TEXT NULL,
             workspace_id VARCHAR(512) NULL,
             registration_claim_id VARCHAR(64) NULL,
@@ -7608,7 +7681,8 @@ async fn ensure_core_schema_while_leased(
             PRIMARY KEY (user_id, registry_id),
             UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
             INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
-            INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)
+            INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id),
+            INDEX idx_edge_registry_user_workspace_agent (user_id, workspace_id, edge_agent_id)
         )",
     )
     .execute(&pool)
@@ -7627,6 +7701,14 @@ async fn ensure_core_schema_while_leased(
         "edge_agent_registry",
         "workspace_id",
         "ALTER TABLE edge_agent_registry ADD COLUMN workspace_id VARCHAR(512) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "materialization_id",
+        "ALTER TABLE edge_agent_registry ADD COLUMN materialization_id VARCHAR(128) NULL",
     )
     .await?;
     add_column_if_missing(
@@ -7667,6 +7749,14 @@ async fn ensure_core_schema_while_leased(
         "edge_agent_registry",
         "idx_edge_registry_agent_workspace",
         "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)",
+    )
+    .await?;
+    add_index_if_missing(
+        &pool,
+        &settings.database,
+        "edge_agent_registry",
+        "idx_edge_registry_user_workspace_agent",
+        "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_user_workspace_agent (user_id, workspace_id, edge_agent_id)",
     )
     .await?;
 

@@ -99,6 +99,10 @@ struct EdgeConfig {
     token_manager: Arc<token_manager::TokenManager>,
     workspace_dir: PathBuf,
     edge_id: String,
+    /// Stable identity of this local checkout. It is persisted in the Edge
+    /// local state directory so reconnects and agent-label changes cannot
+    /// make one materialization look like a new checkout or dirty the repo.
+    materialization_id: String,
     reconnect: bool,
     invocation_journal_root: Option<PathBuf>,
 }
@@ -476,11 +480,13 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         .edge_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
+    let materialization_id = load_or_create_materialization_id(&workspace_dir)?;
     Ok(EdgeConfig {
         server_url: edge_ws_url(&raw_server_url)?,
         token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
         workspace_dir,
         edge_id,
+        materialization_id,
         reconnect: args.reconnect,
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
     })
@@ -494,6 +500,12 @@ fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
         )
     })
 }
+
+use astra_runtime_env::load_or_create_materialization_id;
+#[cfg(test)]
+use astra_runtime_env::{
+    load_or_create_materialization_id_in_roots, materialization_id_path_in_state,
+};
 
 fn edge_invocation_journal_path_in_root(
     edge_id: &str,
@@ -970,6 +982,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     })?;
     let auth_msg = EdgeClientMessage::Auth {
         edge_agent_id: config.edge_id.clone(),
+        materialization_id: config.materialization_id.clone(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
@@ -1561,6 +1574,97 @@ mod tests {
             Some(std::ffi::OsStr::new("edge-invocations"))
         );
         assert_eq!(path.extension(), Some(std::ffi::OsStr::new("json")));
+    }
+
+    #[test]
+    fn materialization_identity_is_stable_across_state_roots_and_distinct_per_checkout() {
+        let state_a = tempfile::tempdir().expect("state A");
+        let state_b = tempfile::tempdir().expect("state B");
+        let device_state = tempfile::tempdir().expect("device state");
+        let independent_device_state = tempfile::tempdir().expect("independent device state");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = load_or_create_materialization_id_in_roots(
+            workspace.path(),
+            state_a.path(),
+            device_state.path(),
+        )
+        .expect("create materialization identity");
+        let reconnect = load_or_create_materialization_id_in_roots(
+            workspace.path(),
+            state_a.path(),
+            device_state.path(),
+        )
+        .expect("reuse materialization identity");
+        let other_state_same_workspace = load_or_create_materialization_id_in_roots(
+            workspace.path(),
+            state_b.path(),
+            device_state.path(),
+        )
+        .expect("reuse materialization identity from another state root");
+        assert_eq!(first, reconnect);
+        assert_eq!(first, other_state_same_workspace);
+        let independent_device_state_root = tempfile::tempdir().expect("independent device cache");
+        let same_path_independent_device = load_or_create_materialization_id_in_roots(
+            workspace.path(),
+            independent_device_state_root.path(),
+            independent_device_state.path(),
+        )
+        .expect("create independent device identity");
+        assert_ne!(first, same_path_independent_device);
+        let independent_checkout = tempfile::tempdir().expect("independent checkout");
+        let independent_checkout_id = load_or_create_materialization_id_in_roots(
+            independent_checkout.path(),
+            state_b.path(),
+            device_state.path(),
+        )
+        .expect("create independent checkout identity");
+        assert_ne!(first, independent_checkout_id);
+        std::fs::write(workspace.path().join("content-change"), b"changed")
+            .expect("change workspace contents");
+        let after_content_change = load_or_create_materialization_id_in_roots(
+            workspace.path(),
+            state_a.path(),
+            device_state.path(),
+        )
+        .expect("identity after workspace content change");
+        assert_eq!(first, after_content_change);
+        assert!(
+            materialization_id_path_in_state(workspace.path(), state_a.path())
+                .starts_with(state_a.path())
+        );
+    }
+
+    #[test]
+    fn materialization_identity_publication_converges_under_concurrent_startup() {
+        let state = tempfile::tempdir().expect("state");
+        let device_state = tempfile::tempdir().expect("device state");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let state_root = Arc::new(state.path().to_path_buf());
+        let device_root = Arc::new(device_state.path().to_path_buf());
+        let workspace_root = Arc::new(workspace.path().to_path_buf());
+        let workers = (0..16)
+            .map(|_| {
+                let state_root = Arc::clone(&state_root);
+                let device_root = Arc::clone(&device_root);
+                let workspace_root = Arc::clone(&workspace_root);
+                std::thread::spawn(move || {
+                    load_or_create_materialization_id_in_roots(
+                        &workspace_root,
+                        &state_root,
+                        &device_root,
+                    )
+                    .expect("concurrent materialization identity")
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("identity worker must not panic"))
+            .collect::<Vec<_>>();
+        assert!(identities.windows(2).all(|pair| pair[0] == pair[1]));
+        let identity_path = materialization_id_path_in_state(workspace.path(), state.path());
+        let persisted = std::fs::read_to_string(identity_path).expect("published identity");
+        assert_eq!(persisted, identities[0]);
     }
 
     #[test]

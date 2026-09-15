@@ -4,9 +4,9 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use astra_server_types::{
-    WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchAttachRequestV1,
-    WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkSessionBindingResponseV1,
-    WorkTurnRequestV1,
+    WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchActivityResponseV1, WorkBranchAttachRequestV1,
+    WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkExecutionTargetPageV1,
+    WorkExecutionViewV1, WorkSessionBindingResponseV1, WorkTurnRequestV1,
 };
 use astra_sync_protocol::{
     SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
@@ -976,6 +976,80 @@ impl ThinClient {
             .send()
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Read the owner-scoped durable Run activity for one Work branch.
+    pub async fn get_work_branch_activity(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<WorkBranchActivityResponseV1, ThinClientError> {
+        let path = paths::work_branch_activity(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        Self::typed_json_or_error(response).await
+    }
+
+    /// Read the authoritative provider and generation for one Work branch.
+    /// The response is deliberately owner-scoped and contains no private
+    /// Session identity, so it is safe to show in every client surface.
+    pub async fn get_work_branch_execution(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<WorkExecutionViewV1, ThinClientError> {
+        let path = paths::work_branch_execution(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        let execution: WorkExecutionViewV1 = Self::typed_json_or_error(response).await?;
+        if execution.work_id != work_id || execution.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Work execution identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        Ok(execution)
+    }
+
+    /// Read the bounded owner-scoped Edge target directory for one Work
+    /// branch. Target metadata is fetched only when a user explicitly asks
+    /// to inspect or move execution, keeping ordinary Work status cheap.
+    pub async fn get_work_branch_execution_targets(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<WorkExecutionTargetPageV1, ThinClientError> {
+        let path = paths::work_branch_execution_targets(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        let targets: WorkExecutionTargetPageV1 = Self::typed_json_or_error(response).await?;
+        if targets.work_id != work_id || targets.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Work execution target identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        Ok(targets)
     }
 
     /// Resolve one already-known session to the public Work branch that owns
@@ -2292,6 +2366,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_branch_activity_is_owner_scoped_and_path_safe() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/activity"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "branch_revision": 3,
+                "activity": "working",
+                "observed_at": "2026-09-15T00:00:00Z"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let activity = client
+            .get_work_branch_activity("work-token", "work-1", "branch-1")
+            .await
+            .unwrap();
+        assert_eq!(activity.work_id, "work-1");
+        assert_eq!(activity.branch_id, "branch-1");
+        assert_eq!(activity.branch_revision, 3);
+        assert_eq!(
+            activity.activity,
+            astra_server_types::WorkBranchActivityV1::Working
+        );
+
+        let unsafe_error = client
+            .get_work_branch_activity("work-token", "work-1", "../branch")
+            .await
+            .expect_err("path fragments must fail before transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn work_execution_reads_are_typed_owner_scoped_and_identity_checked() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/execution"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "generation": 4,
+                "state": "ready",
+                "initialized": true,
+                "placement": "edge",
+                "executor_id": "edge-2",
+                "executor_name": "laptop",
+                "operation_id": null,
+                "attempt": null,
+                "failure_code": null
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/execution/targets"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "targets": [{
+                    "executor_id": "edge-2",
+                    "display_name": "laptop",
+                    "hostname": "laptop.local",
+                    "capabilities": ["shell"],
+                    "connected": true
+                }]
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let execution = client
+            .get_work_branch_execution("work-token", "work-1", "branch-1")
+            .await
+            .unwrap();
+        assert_eq!(execution.generation, 4);
+        assert_eq!(execution.executor_id.as_deref(), Some("edge-2"));
+        let targets = client
+            .get_work_branch_execution_targets("work-token", "work-1", "branch-1")
+            .await
+            .unwrap();
+        assert_eq!(targets.targets.len(), 1);
+        assert!(targets.targets[0].connected);
+
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-2/execution"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-other",
+                "branch_id": "branch-2",
+                "generation": 1,
+                "state": "ready",
+                "initialized": true,
+                "placement": "server",
+                "executor_id": null,
+                "executor_name": null,
+                "operation_id": null,
+                "attempt": null,
+                "failure_code": null
+            })))
+            .mount(&srv)
+            .await;
+        let error = client
+            .get_work_branch_execution("work-token", "work-1", "branch-2")
+            .await
+            .expect_err("a response for another Work must never be projected");
+        assert!(matches!(error, ThinClientError::Json(_)));
+    }
+
+    #[tokio::test]
     async fn work_session_binding_is_typed_owner_transport_and_path_safe() {
         let srv = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3507,6 +3700,7 @@ mod tests {
             edge_agent_id: "agent-logical".into(),
             hostname: Some("host-a".into()),
             worktree_path: Some("/workspace/app".into()),
+            materialization_id: None,
             capabilities: Some(crate::edge::edge_runtime_environment_capabilities(
                 "agent-logical",
                 "/workspace/app",

@@ -1,3 +1,5 @@
+"use client";
+
 import type {
   WorkCatalogAttentionV1,
   WorkCatalogEntryV1,
@@ -5,8 +7,19 @@ import type {
 } from "@astra/sdk";
 import { ArrowRight, Inbox, Plus } from "lucide-react";
 import Link from "next/link";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { refreshNowWorkAction } from "@/app/(workspace)/now/actions";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils/cn";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
+
+const NOW_REFRESH_INTERVAL_MS = 10_000;
 
 const GROUPS: Array<{
   attention: WorkCatalogAttentionV1;
@@ -37,6 +50,65 @@ export function WorkNowPage({
   page: WorkCatalogPageV1;
   isLatest: boolean;
 }) {
+  const [currentPage, setCurrentPage] = useState(page);
+  const [connectionHealthy, setConnectionHealthy] = useState(true);
+  const latestPageGeneration = useRef(0);
+  const latestPageActive = useRef(isLatest);
+
+  useLayoutEffect(() => {
+    latestPageActive.current = isLatest;
+    latestPageGeneration.current += 1;
+    const generation = latestPageGeneration.current;
+    return () => {
+      if (latestPageGeneration.current === generation) {
+        latestPageGeneration.current += 1;
+      }
+      latestPageActive.current = false;
+    };
+  }, [isLatest, page]);
+
+  useEffect(() => {
+    setCurrentPage(page);
+    setConnectionHealthy(true);
+  }, [page]);
+
+  const refreshPage = useCallback(async () => {
+    if (!latestPageActive.current) return true;
+    const requestGeneration = latestPageGeneration.current;
+    try {
+      const result = await refreshNowWorkAction();
+      if (
+        requestGeneration !== latestPageGeneration.current ||
+        !latestPageActive.current
+      ) {
+        return true;
+      }
+      if (!result.ok) {
+        setConnectionHealthy(false);
+        return false;
+      }
+      setCurrentPage(result.page);
+      setConnectionHealthy(true);
+      return true;
+    } catch {
+      if (
+        requestGeneration !== latestPageGeneration.current ||
+        !latestPageActive.current
+      ) {
+        return true;
+      }
+      setConnectionHealthy(false);
+      return false;
+    }
+  }, []);
+
+  useVisiblePoll({
+    enabled: isLatest,
+    intervalMs: NOW_REFRESH_INTERVAL_MS,
+    maximumIntervalMs: 60_000,
+    refresh: refreshPage,
+  });
+
   return (
     <div className="h-full overflow-y-auto">
       <main className="mx-auto w-full max-w-5xl px-5 py-8 sm:px-8 lg:py-12">
@@ -51,6 +123,17 @@ export function WorkNowPage({
             <p className="mt-3 max-w-2xl text-sm leading-6 text-text-secondary">
               Decisions first, then unread updates and the rest of your current Work.
             </p>
+            {isLatest ? (
+              <p
+                className="mt-2 text-xs text-text-muted"
+                role="status"
+                aria-live="polite"
+              >
+                {connectionHealthy
+                  ? "Auto-refreshing · about every 10 seconds"
+                  : "Update delayed · showing the last confirmed Work"}
+              </p>
+            ) : null}
           </div>
           <Link
             href="/works"
@@ -61,7 +144,7 @@ export function WorkNowPage({
           </Link>
         </header>
 
-        {page.entries.length === 0 ? (
+        {currentPage.entries.length === 0 ? (
           <Card className="mt-8 flex flex-col items-center px-6 py-14 text-center">
             <div className="flex size-10 items-center justify-center rounded-control bg-surface-muted text-text-muted">
               <Inbox className="size-5" />
@@ -78,7 +161,7 @@ export function WorkNowPage({
         ) : (
           <div className="mt-8 space-y-10">
             {GROUPS.map((group) => {
-              const entries = page.entries.filter(
+              const entries = currentPage.entries.filter(
                 (entry) => entry.attention === group.attention,
               );
               if (entries.length === 0) return null;
@@ -123,9 +206,9 @@ export function WorkNowPage({
           ) : (
             <span />
           )}
-          {page.next_cursor ? (
+          {currentPage.next_cursor ? (
             <Link
-              href={olderPageHref(page.next_cursor)}
+              href={olderPageHref(currentPage.next_cursor)}
               className="inline-flex items-center gap-2 text-sm font-medium text-text-secondary hover:text-text"
             >
               Older Work

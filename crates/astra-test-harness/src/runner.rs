@@ -200,6 +200,10 @@ pub struct RunnerConfig {
     /// Maximum time to wait for the server's durable asynchronous settlement
     /// marker after the visible chat process exits.
     pub session_settle_timeout: std::time::Duration,
+    /// Delete sessions created by this harness after their evidence has been
+    /// captured. A resumed `--session-id` is never owned by the harness and
+    /// is therefore left untouched.
+    pub cleanup_created_sessions: bool,
 }
 
 impl RunnerConfig {
@@ -213,6 +217,7 @@ impl RunnerConfig {
             require_session_subsystem_health: false,
             require_memoria_subsystem_health: false,
             session_settle_timeout: std::time::Duration::ZERO,
+            cleanup_created_sessions: false,
         }
     }
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {

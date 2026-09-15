@@ -125,6 +125,7 @@ enum SlashBackgroundReadEffect {
         session_id: String,
         timeline: crate::tui::timeline::Timeline,
     },
+    WorkExecution(Result<WorkExecutionSurface, WorkExecutionLoadError>),
     ResumePicker(crate::tui::session_picker::SessionDiscovery),
     SessionHub {
         snapshot: Box<slash_dispatch::SessionHubSnapshot>,
@@ -143,6 +144,46 @@ enum SlashBackgroundReadEffect {
         action: &'static str,
         error: String,
     },
+}
+
+/// Errors returned while loading the read-only Work execution panel. A
+/// Session that has not been promoted to Work is a valid empty state, not a
+/// failed command; keep that protocol fact structured until the UI decides how
+/// to render it.
+enum WorkExecutionLoadError {
+    SessionNotBound,
+    Request(String),
+}
+
+/// The complete read-only projection needed by `/work execution`. The
+/// execution placement is authoritative; target discovery is a separately
+/// degradable read so a registry outage never hides the location of the next
+/// write.
+struct WorkExecutionSurface {
+    session_id: String,
+    execution: astra_thin_client::WorkExecutionViewV1,
+    targets: Result<astra_thin_client::WorkExecutionTargetPageV1, String>,
+}
+
+fn classify_work_execution_error(
+    error: astra_thin_client::ThinClientError,
+) -> WorkExecutionLoadError {
+    if let astra_thin_client::ThinClientError::Api { status, body } = &error {
+        let code = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if *status == reqwest::StatusCode::NOT_FOUND
+            && code.as_deref() == Some("work_session_binding_not_found")
+        {
+            return WorkExecutionLoadError::SessionNotBound;
+        }
+    }
+    WorkExecutionLoadError::Request(error.to_string())
 }
 
 /// Structured completion for a `/memory` read. The event loop receives facts,
@@ -442,6 +483,47 @@ fn dispatch_slash_background_read(
                         error: error.to_string(),
                     },
                 }
+            }
+            slash_dispatch::SlashBackgroundRead::WorkExecution {
+                api,
+                profile,
+                session_id,
+            } => {
+                let token = crate::cli::session::session_runtime::fresh_access_token(
+                    &api,
+                    profile.as_deref(),
+                )
+                .await;
+                let result = match token {
+                    Some(token) => match api.get_work_session_binding(&token, &session_id).await {
+                        Ok(binding) => match api
+                            .get_work_branch_execution(&token, &binding.work_id, &binding.branch_id)
+                            .await
+                        {
+                            Ok(execution) => {
+                                let targets = api
+                                    .get_work_branch_execution_targets(
+                                        &token,
+                                        &binding.work_id,
+                                        &binding.branch_id,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string());
+                                Ok(WorkExecutionSurface {
+                                    session_id,
+                                    execution,
+                                    targets,
+                                })
+                            }
+                            Err(error) => Err(classify_work_execution_error(error)),
+                        },
+                        Err(error) => Err(classify_work_execution_error(error)),
+                    },
+                    None => Err(WorkExecutionLoadError::Request(
+                        "Not logged in. Use /login.".to_string(),
+                    )),
+                };
+                SlashBackgroundReadEffect::WorkExecution(result)
             }
             slash_dispatch::SlashBackgroundRead::ResumePicker => {
                 match tokio::task::spawn_blocking(load_session_picker).await {
@@ -785,6 +867,28 @@ fn apply_slash_background_read_effect(
                 bottom_pane.push_view(Box::new(TimelineView::new(timeline)));
             }
         }
+        SlashBackgroundReadEffect::WorkExecution(result) => match result {
+            Ok(surface) => {
+                let title = format!(
+                    "Work execution · {}",
+                    &surface.session_id[..surface.session_id.len().min(8)]
+                );
+                chat_widget.commit_system(history_cell::system::SystemCell::response(
+                    "Opened Work execution",
+                ));
+                bottom_pane.push_view(Box::new(work_execution_view(surface, &title)));
+            }
+            Err(WorkExecutionLoadError::SessionNotBound) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "This Session is not attached to Work yet. Use `/work start <goal>` to create Work, then run `/work execution` again.",
+                ));
+            }
+            Err(WorkExecutionLoadError::Request(error)) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Work execution unavailable: {error}"
+                )));
+            }
+        },
         SlashBackgroundReadEffect::ResumePicker(discovery) => {
             if discovery.total() == 0 {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(
@@ -892,6 +996,101 @@ fn apply_slash_background_read_effect(
             )));
         }
     }
+}
+
+fn work_execution_view(
+    surface: WorkExecutionSurface,
+    title: &str,
+) -> crate::tui::bottom_pane::info_view::InfoView {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let execution = surface.execution;
+    let state = match execution.state {
+        astra_thin_client::WorkExecutionStateV1::Ready => "ready",
+        astra_thin_client::WorkExecutionStateV1::Switching => "switching",
+        astra_thin_client::WorkExecutionStateV1::NeedsAttention => "needs attention",
+    };
+    let placement = match execution.placement {
+        astra_thin_client::WorkExecutionPlacementV1::Server => "Server",
+        astra_thin_client::WorkExecutionPlacementV1::Edge => "Edge",
+    };
+    let executor = execution
+        .executor_name
+        .clone()
+        .or(execution.executor_id.clone())
+        .unwrap_or_else(|| "—".into());
+    let mut pairs = vec![
+        ("work", execution.work_id.clone()),
+        ("branch", execution.branch_id.clone()),
+        (
+            "binding",
+            (if execution.initialized {
+                "durable"
+            } else {
+                "not initialized"
+            })
+            .to_string(),
+        ),
+        ("state", state.to_string()),
+        ("next write", placement.to_string()),
+        ("generation", execution.generation.to_string()),
+        ("executor", executor),
+    ];
+    if let Some(operation_id) = execution.operation_id {
+        pairs.push(("operation", operation_id));
+    }
+    if let Some(attempt) = execution.attempt {
+        pairs.push(("attempt", attempt.to_string()));
+    }
+    if let Some(failure_code) = execution.failure_code {
+        pairs.push(("failure", failure_code));
+    }
+
+    pairs.push(("", String::new()));
+    match surface.targets {
+        Ok(page) if page.targets.is_empty() => {
+            pairs.push(("targets", "none currently registered".into()));
+        }
+        Ok(page) => {
+            pairs.push(("targets", format!("{} available", page.targets.len())));
+            for target in page.targets.iter().take(32) {
+                let name = target
+                    .display_name
+                    .as_deref()
+                    .or(target.hostname.as_deref())
+                    .unwrap_or(target.executor_id.as_str());
+                let status = if target.connected {
+                    "connected"
+                } else {
+                    "offline"
+                };
+                let capabilities = if target.capabilities.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", target.capabilities.join(", "))
+                };
+                pairs.push((
+                    "edge",
+                    format!("{name} · {} · {status}{capabilities}", target.executor_id),
+                ));
+            }
+            if page.targets.len() > 32 {
+                pairs.push((
+                    "targets",
+                    format!("… {} more hidden", page.targets.len() - 32),
+                ));
+            }
+        }
+        Err(error) => {
+            let error = error.replace(['\n', '\r'], " ");
+            pairs.push(("targets", format!("unavailable · {error}")));
+        }
+    }
+    pairs.push((
+        "handoff",
+        "Use the Web Work card to move to another Edge.".into(),
+    ));
+    InfoView::from_key_value(title, pairs).with_primary_workspace()
 }
 
 fn should_reset_agent_scope(previous: Option<&str>, next: Option<&str>) -> bool {
@@ -5366,7 +5565,9 @@ pub(crate) async fn run_tui_session(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("Work");
                         chat_widget.commit_system(history_cell::system::SystemCell::response(
-                            format!("Work started · {work_id} · Ctrl+T opens tasks"),
+                            format!(
+                                "Work started · {work_id} · Ctrl+T tasks · Web → Now follows automatically"
+                            ),
                         ));
                         if state.session_id.as_deref() == Some(completion.session_id.as_str()) {
                             board_user_pin = Some(true);
@@ -5892,33 +6093,44 @@ pub(crate) async fn run_tui_session(
                                     // (resume/new-session paths), swap the
                                     // ChatWidget so its scrollback + persistence
                                     // attach to the restored session.
-                                    if state.session_id != pre_sid
-                                        && let Some(ref new_sid) = state.session_id
-                                        && !new_sid.is_empty()
-                                    {
-                                        chat_widget = replay_session_into_widget(
-                                            &mut guard,
-                                            new_sid,
-                                            w,
-                                            api,
-                                            profile,
-                                            state.explain != crate::ExplainMode::Off,
-                                        )
-                                        .await;
-                                        chat_widget.set_explain_verbose(matches!(
-                                            state.explain,
-                                            crate::ExplainMode::Verbose
-                                        ));
-                                        chat_widget.set_explain_live_rows(
-                                            state.runtime_config.explain.effective_live_rows(),
-                                        );
-                                        rebind_workbench_observers(
-                                            Some(new_sid),
-                                            &task_board,
-                                            &server_agent_observer,
-                                            &plan_task_observer,
-                                            &mut board_user_pin,
-                                        );
+                                    if state.session_id != pre_sid {
+                                        // A completion captured for the old
+                                        // session must never paint the new
+                                        // session. Cancel the work and advance
+                                        // the generation before rebinding the
+                                        // widgets, so multi-session resumes
+                                        // cannot leak stale observations.
+                                        slash_background_read_tasks.abort_all();
+                                        slash_background_read_count = 0;
+                                        slash_background_read_generation =
+                                            slash_background_read_generation.wrapping_add(1);
+                                        if let Some(ref new_sid) = state.session_id
+                                            && !new_sid.is_empty()
+                                        {
+                                            chat_widget = replay_session_into_widget(
+                                                &mut guard,
+                                                new_sid,
+                                                w,
+                                                api,
+                                                profile,
+                                                state.explain != crate::ExplainMode::Off,
+                                            )
+                                            .await;
+                                            chat_widget.set_explain_verbose(matches!(
+                                                state.explain,
+                                                crate::ExplainMode::Verbose
+                                            ));
+                                            chat_widget.set_explain_live_rows(
+                                                state.runtime_config.explain.effective_live_rows(),
+                                            );
+                                            rebind_workbench_observers(
+                                                Some(new_sid),
+                                                &task_board,
+                                                &server_agent_observer,
+                                                &plan_task_observer,
+                                                &mut board_user_pin,
+                                            );
+                                        }
                                     }
                                     refresh_footer_from_state(&mut bottom_pane, &state);
                                     // After any /mcp command refresh the dynamic
@@ -9305,6 +9517,32 @@ fn apply_terminal_explain_analyze_degraded_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbound_work_session_is_an_empty_state_not_a_command_error() {
+        let error = classify_work_execution_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: serde_json::json!({
+                "code": "work_session_binding_not_found",
+                "category": "not_found",
+            })
+            .to_string(),
+        });
+
+        assert!(matches!(error, WorkExecutionLoadError::SessionNotBound));
+    }
+
+    #[test]
+    fn unrelated_work_execution_not_found_remains_visible_as_an_error() {
+        let error = classify_work_execution_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: serde_json::json!({ "code": "work_branch_not_found" }).to_string(),
+        });
+
+        assert!(
+            matches!(error, WorkExecutionLoadError::Request(message) if message.contains("404"))
+        );
+    }
 
     fn explain_analyze_fact() -> astra_turn_types::ExplainAnalyzeEventV1 {
         astra_turn_types::ExplainAnalyzeEventV1 {

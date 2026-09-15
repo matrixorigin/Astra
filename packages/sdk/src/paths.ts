@@ -134,6 +134,43 @@ export function workBranchActionsPath(workId: string, branchId: string): string 
   return `${workBranchPath(workId, branchId)}/actions`;
 }
 
+export function workBranchExecutionPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/execution`;
+}
+
+export function workBranchExecutionTargetsPath(workId: string, branchId: string): string {
+  return `${workBranchExecutionPath(workId, branchId)}/targets`;
+}
+
+export function workBranchExecutionSwitchesPath(workId: string, branchId: string): string {
+  return `${workBranchExecutionPath(workId, branchId)}/switches`;
+}
+
+export function workBranchExecutionSwitchPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work execution operation identity");
+  }
+  return `${workBranchExecutionSwitchesPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workBranchExecutionSwitchRetryPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  return `${workBranchExecutionSwitchPath(workId, branchId, operationId)}/retry`;
+}
+
 export function workBranchPatchArtifactPath(
   workId: string,
   branchId: string,
@@ -310,6 +347,13 @@ export function workBranchTaskGraphPath(
   branchId: string,
 ): string {
   return `${workBranchPath(workId, branchId)}/task-graph`;
+}
+
+export function workBranchActivityPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/activity`;
 }
 
 export function workBranchCriteriaProposalsPath(

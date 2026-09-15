@@ -1179,6 +1179,7 @@ mod tests {
                     cursor.as_ref(),
                     Duration::from_secs(30),
                     &format!("parent-reserve-{turn}"),
+                    None,
                 )
                 .await
                 .expect("reserve parent")
@@ -1288,6 +1289,7 @@ mod tests {
                 Some(&activation.child_head.cursor),
                 Duration::from_secs(30),
                 "child-reserve-3",
+                None,
             )
             .await
             .expect("reserve child")
@@ -1309,6 +1311,7 @@ mod tests {
                 Some(&current_parent_cursor),
                 Duration::from_secs(30),
                 "parent-reserve-4",
+                None,
             )
             .await
             .expect("reserve parent after fork")
@@ -1407,6 +1410,7 @@ mod tests {
                 None,
                 Duration::from_secs(60),
                 "large-parent-reservation",
+                None,
             )
             .await
             .expect("reserve large-prefix turn")

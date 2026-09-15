@@ -717,6 +717,24 @@ fn apply_one_event(
             }
         }
     }
+    if matches!(etype, "session_info" | "error")
+        && let Some(sid) = event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|sid| !sid.is_empty())
+    {
+        match accum.session_id.as_deref() {
+            None => accum.session_id = Some(sid.to_string()),
+            Some(bound) if bound != sid => {
+                accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                accum.error_message = Some(format!(
+                    "Invalid SSE session identity: one SSE stream changed session identity from `{bound}` to `{sid}`"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
     match etype {
         "text_delta" => {
             if accum.thinking_active {
@@ -1174,25 +1192,7 @@ fn apply_one_event(
                 }
             }
         }
-        "session_info" => {
-            if let Some(sid) = event
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|sid| !sid.is_empty())
-            {
-                match accum.session_id.as_deref() {
-                    None => accum.session_id = Some(sid.to_string()),
-                    Some(bound) if bound != sid => {
-                        accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
-                        accum.error_message = Some(format!(
-                            "Invalid SSE session identity: one SSE stream changed session identity from `{bound}` to `{sid}`"
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
+        "session_info" => {}
         "usage" => {
             // Canonical wire shape produced by the runtime (see
             // `astra_runtime::turn::token_usage::TokenUsage`). Fields may be
@@ -1971,6 +1971,49 @@ mod tests {
         );
         assert_eq!(a.session_id.as_deref(), Some("abc-123"));
         assert_eq!(a.run_id.as_deref(), Some("run-123"));
+    }
+
+    #[test]
+    fn admission_error_preserves_server_session_identity() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "error",
+                ",\"session_id\":\"session-created-before-admission-error\",\"message\":\"busy\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(
+            a.session_id.as_deref(),
+            Some("session-created-before-admission-error")
+        );
+    }
+
+    #[test]
+    fn conflicting_sse_session_identity_is_a_sticky_contract_violation() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "session_info",
+                ",\"session_id\":\"session-owner\",\"run_id\":\"run-owner\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "error",
+                ",\"session_id\":\"session-other\",\"message\":\"busy\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.session_id.as_deref(), Some("session-owner"));
+        assert_eq!(a.error_kind, Some(astra_core::ErrorKind::ContractViolation));
+        assert!(a.error_message.as_deref().is_some_and(
+            |message| message.contains("session-owner") && message.contains("session-other")
+        ));
     }
 
     #[test]

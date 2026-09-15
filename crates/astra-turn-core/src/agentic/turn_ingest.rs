@@ -140,12 +140,14 @@ pub fn ingest_agentic_turn_stream(
         *st.first_ttft_ms = snap.ttft_ms;
     }
 
-    if let Some(sid) = snap.session_id.as_ref() {
-        *st.current_session_id = Some(sid.clone());
-        st.step_recorder.attach_persistence_if_configured(sid);
-    }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
+    }
+    if let (Some(sid), Some(run_id)) = (snap.session_id.as_deref(), snap.run_id.as_deref()) {
+        *st.current_session_id = Some(sid.to_string());
+        st.step_recorder.bind_authoritative_run(sid, run_id);
+    } else if let Some(sid) = snap.session_id.as_ref() {
+        *st.current_session_id = Some(sid.clone());
     }
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
     let preserve_prior_final_after_runtime_scaffolding_retry = !snap.full_text.is_empty()
@@ -440,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_attaches_step_persistence_using_recorder_owner() {
+    fn ingest_binds_step_persistence_only_after_authoritative_run_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let mut p = Pack::new();
@@ -450,6 +452,7 @@ mod tests {
             "task-1",
             "test-run",
         );
+        p.step_recorder.begin_turn(1);
 
         let session_id = Some("authoritative-session".to_string());
         let run_id = None;
@@ -488,7 +491,49 @@ mod tests {
         );
         let summary = p.step_recorder.summary();
         assert_eq!(summary.user_id, TEST_USER_ID);
+        assert_eq!(
+            summary.session_id, "ephemeral",
+            "a session-only frame may update in-memory identity, but it cannot persist recorder events"
+        );
+
+        // A later frame carrying both identities establishes the durable run
+        // owner and flushes the buffered observations under that pair.
+        let run_id = Some("authoritative-run".to_string());
+        let full_text = "done";
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text,
+            tool_calls: &tool_calls,
+            server_execution_summary: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &error_message,
+            error_kind: None,
+        };
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "continue this session",
+            &[],
+            true,
+            p.ingest_mut(),
+        );
+        assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+        let summary = p.step_recorder.summary();
         assert_eq!(summary.session_id, "authoritative-session");
+        assert!(!p.step_recorder.events().is_empty());
+        assert!(
+            p.step_recorder
+                .events()
+                .iter()
+                .all(|event| event.run_id == "authoritative-run")
+        );
     }
 
     #[test]

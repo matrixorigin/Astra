@@ -3557,6 +3557,11 @@ impl RuntimeToolExecutor {
                     }
                 })
             });
+            let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
+                admission.expected_execution_binding_generation =
+                    request.policy.execution_binding_generation;
+                admission
+            });
             let admitted_control_epoch = durable_dispatch_admission
                 .as_ref()
                 .map(|admission| admission.expected_control_epoch);
@@ -9319,6 +9324,7 @@ esac
                 worktree_path: Some("/Users/test/project".to_string()),
                 capabilities: Some(edge_runtime_environment_advertisement(&self.edge_agent_id)),
                 workspace_id: None,
+                materialization_id: Some(format!("materialization-{}", self.edge_agent_id)),
                 registered_at: "2026-06-11T00:00:00Z".to_string(),
                 last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
             }))
@@ -9337,6 +9343,7 @@ esac
                 worktree_path: Some("/Users/test/project".to_string()),
                 capabilities: Some(edge_runtime_environment_advertisement(&self.edge_agent_id)),
                 workspace_id: None,
+                materialization_id: Some(format!("materialization-{}", self.edge_agent_id)),
                 registered_at: "2026-06-11T00:00:00Z".to_string(),
                 last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
             }])

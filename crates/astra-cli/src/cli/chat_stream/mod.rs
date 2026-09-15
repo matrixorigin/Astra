@@ -11,7 +11,7 @@ mod verdict_reports;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use edge_executor::edge_executor_instance_id;
+pub(crate) use edge_executor::try_edge_executor_instance_id;
 #[cfg(test)]
 pub(crate) use params::AskUserChoice;
 pub(crate) use params::BasicCliChatContext;

@@ -1,6 +1,14 @@
 import type { WorkCatalogPageV1 } from "@astra/sdk";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { WorkNowPage } from "@/components/app/work-now-page";
+
+vi.mock("@/app/(workspace)/now/actions", () => ({
+  refreshNowWorkAction: vi.fn(),
+}));
+
+import { refreshNowWorkAction } from "@/app/(workspace)/now/actions";
+
+const refreshNow = vi.mocked(refreshNowWorkAction);
 
 const page: WorkCatalogPageV1 = {
   schema_version: 1,
@@ -63,6 +71,11 @@ const page: WorkCatalogPageV1 = {
   },
 };
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  refreshNow.mockResolvedValue({ ok: true, page });
+});
+
 test("groups Work by server-owned attention without exposing runtime identity", () => {
   render(<WorkNowPage page={page} isLatest />);
 
@@ -94,4 +107,168 @@ test("renders a useful bounded empty state on the latest page", () => {
     "/works",
   );
   expect(screen.queryByRole("link", { name: /older work/i })).not.toBeInTheDocument();
+});
+
+test("latest Now discovers a Work created on another surface", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    refreshNow.mockResolvedValue({
+      ok: true,
+      page: {
+        ...page,
+        entries: page.entries.map((entry) =>
+          entry.work_id === "work-updated"
+            ? { ...entry, goal: "Work started from TUI" }
+            : entry,
+        ),
+      },
+    });
+    render(<WorkNowPage page={page} isLatest />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Work started from TUI")).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Auto-refreshing");
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("ignores a pending latest refresh after navigating to an older page", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  let finishLatest!: (result: { ok: true; page: WorkCatalogPageV1 }) => void;
+  const latestUpdate: WorkCatalogPageV1 = {
+    ...page,
+    entries: page.entries.map((entry) =>
+      entry.work_id === "work-updated"
+        ? { ...entry, goal: "Stale latest response" }
+        : entry,
+    ),
+  };
+  const historicalPage: WorkCatalogPageV1 = {
+    ...page,
+    entries: page.entries.map((entry) =>
+      entry.work_id === "work-updated"
+        ? { ...entry, goal: "Selected historical page" }
+        : entry,
+    ),
+    next_cursor: null,
+  };
+  refreshNow.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishLatest = resolve;
+      }),
+  );
+  try {
+    const rendered = render(<WorkNowPage page={page} isLatest />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+
+    rendered.rerender(<WorkNowPage page={historicalPage} isLatest={false} />);
+    expect(screen.getByText("Selected historical page")).toBeVisible();
+    await act(async () => {
+      finishLatest({ ok: true, page: latestUpdate });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Selected historical page")).toBeVisible();
+    expect(screen.queryByText("Stale latest response")).not.toBeInTheDocument();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("keeps historical Now pages quiet", async () => {
+  vi.useFakeTimers();
+  try {
+    render(<WorkNowPage page={page} isLatest={false} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(refreshNow).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("pauses catalog refresh in a hidden tab and catches up when visible", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: "hidden",
+  });
+  try {
+    render(<WorkNowPage page={page} isLatest />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(refreshNow).not.toHaveBeenCalled();
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+  } finally {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
+});
+
+test("does not overlap catalog reads when the server response is slow", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const finishers: Array<() => void> = [];
+  refreshNow.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishers.push(() => resolve({ ok: true, page }));
+      }),
+  );
+  try {
+    render(<WorkNowPage page={page} isLatest />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      finishers.shift()?.();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(refreshNow).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      finishers.shift()?.();
+      await Promise.resolve();
+    });
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });

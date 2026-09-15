@@ -16,6 +16,12 @@ import type {
   WorkCatalogEntryV1,
   WorkCatalogPageV1,
   WorkBranchAttachmentV1,
+  WorkBranchActivityResponseV1,
+  WorkExecutionTargetRequestV1,
+  WorkExecutionViewV1,
+  WorkExecutionTargetV1,
+  WorkExecutionTargetPageV1,
+  WorkExecutionSwitchOperationV1,
   WorkBranchControlBasisV1,
   WorkBranchControlOperationV2,
   WorkBranchCreationOperationV1,
@@ -81,6 +87,212 @@ export function decodeWorkSessionBindingV1(value: unknown): WorkSessionBindingV1
   };
 }
 
+/** Strict decoder for the owner-scoped Work branch Run-activity projection. */
+export function decodeWorkBranchActivityResponseV1(
+  value: unknown,
+): WorkBranchActivityResponseV1 {
+  const path = "work_branch_activity";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "branch_revision",
+      "activity",
+      "observed_at",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    activity: oneOf(
+      object.activity,
+      ["working", "waiting", "paused", "idle"] as const,
+      `${path}.activity`,
+    ),
+    observed_at: timestamp(object.observed_at, `${path}.observed_at`),
+  };
+}
+
+function decodeWorkExecutionTargetRequest(
+  value: unknown,
+  path: string,
+): WorkExecutionTargetRequestV1 {
+  const object = exactObject(value, ["kind", "executor_id"], path);
+  return {
+    kind: oneOf(object.kind, ["edge"] as const, `${path}.kind`),
+    executor_id: resourceIdentity(object.executor_id, `${path}.executor_id`),
+  };
+}
+
+function nullableExecutionIdentity(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  return opaqueIdentity(value, path);
+}
+
+function executionFailureCode(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  const code = nonEmptyString(value, path);
+  if (code.length > 128 || /[\u0000-\u001f\u007f]/u.test(code)) {
+    throw new TypeError(`${path} must be a bounded control-free identity`);
+  }
+  return code;
+}
+
+export function decodeWorkExecutionViewV1(value: unknown): WorkExecutionViewV1 {
+  const path = "work_execution";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "initialized",
+      "generation",
+      "state",
+      "placement",
+      "executor_id",
+      "executor_name",
+      "operation_id",
+      "attempt",
+      "failure_code",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) throw new TypeError(`${path}.schema_version must be 1`);
+  if (typeof object.initialized !== "boolean") {
+    throw new TypeError(`${path}.initialized must be a boolean`);
+  }
+  const attempt = object.attempt === null
+    ? null
+    : positiveRevision(object.attempt, `${path}.attempt`);
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    initialized: object.initialized,
+    generation: positiveRevision(object.generation, `${path}.generation`),
+    state: oneOf(
+      object.state,
+      ["ready", "switching", "needs_attention"] as const,
+      `${path}.state`,
+    ),
+    placement: oneOf(object.placement, ["server", "edge"] as const, `${path}.placement`),
+    executor_id: nullableExecutionIdentity(object.executor_id, `${path}.executor_id`),
+    executor_name: nullableExecutionIdentity(object.executor_name, `${path}.executor_name`),
+    operation_id: nullableExecutionIdentity(object.operation_id, `${path}.operation_id`),
+    attempt,
+    failure_code: executionFailureCode(object.failure_code, `${path}.failure_code`),
+  };
+}
+
+export function decodeWorkExecutionTargetPageV1(
+  value: unknown,
+): WorkExecutionTargetPageV1 {
+  const path = "work_execution_targets";
+  const object = exactObject(value, ["schema_version", "work_id", "branch_id", "targets"], path);
+  if (object.schema_version !== 1) throw new TypeError(`${path}.schema_version must be 1`);
+  if (!Array.isArray(object.targets) || object.targets.length > 100) {
+    throw new TypeError(`${path}.targets must contain at most 100 entries`);
+  }
+  const targetIds = new Set<string>();
+  const targets = object.targets.map((value, index): WorkExecutionTargetV1 => {
+    const targetPath = `${path}.targets[${index}]`;
+    const target = exactObject(
+      value,
+      ["executor_id", "display_name", "hostname", "capabilities", "connected"],
+      targetPath,
+    );
+    if (!Array.isArray(target.capabilities) || target.capabilities.length > 128) {
+      throw new TypeError(`${targetPath}.capabilities must contain at most 128 entries`);
+    }
+    const executorId = resourceIdentity(target.executor_id, `${targetPath}.executor_id`);
+    if (targetIds.has(executorId)) {
+      throw new TypeError(`${targetPath}.executor_id is a duplicate executor_id`);
+    }
+    targetIds.add(executorId);
+    return {
+      executor_id: executorId,
+      display_name: nullableExecutionIdentity(target.display_name, `${targetPath}.display_name`),
+      hostname: nullableExecutionIdentity(target.hostname, `${targetPath}.hostname`),
+      capabilities: target.capabilities.map((capability, capabilityIndex) =>
+        capabilityIdentity(capability, `${targetPath}.capabilities[${capabilityIndex}]`)),
+      connected: booleanValue(target.connected, `${targetPath}.connected`),
+    };
+  });
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    targets,
+  };
+}
+
+export function decodeWorkExecutionSwitchOperationV1(
+  value: unknown,
+): WorkExecutionSwitchOperationV1 {
+  const path = "work_execution_switch";
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "operation_id",
+      "request_id",
+      "state",
+      "expected_generation",
+      "switching_generation",
+      "completed_generation",
+      "attempt",
+      "target",
+      "failure_code",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) throw new TypeError(`${path}.schema_version must be 1`);
+  const operation = {
+    schema_version: 1 as const,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    operation_id: resourceIdentity(object.operation_id, `${path}.operation_id`),
+    request_id: opaqueIdentity(object.request_id, `${path}.request_id`),
+    state: oneOf(
+      object.state,
+      ["switching", "succeeded", "failed"] as const,
+      `${path}.state`,
+    ),
+    expected_generation: positiveRevision(
+      object.expected_generation,
+      `${path}.expected_generation`,
+    ),
+    switching_generation: positiveRevision(
+      object.switching_generation,
+      `${path}.switching_generation`,
+    ),
+    completed_generation: object.completed_generation === null
+      ? null
+      : positiveRevision(object.completed_generation, `${path}.completed_generation`),
+    attempt: positiveRevision(object.attempt, `${path}.attempt`),
+    target: decodeWorkExecutionTargetRequest(object.target, `${path}.target`),
+    failure_code: executionFailureCode(object.failure_code, `${path}.failure_code`),
+  };
+  if (
+    (operation.state === "switching" && operation.completed_generation !== null) ||
+    (operation.state !== "switching" && operation.completed_generation === null)
+  ) {
+    throw new TypeError(`${path} terminal state and completed_generation disagree`);
+  }
+  return operation;
+}
+
 type WireObject = Record<string, unknown>;
 
 function exactObject(
@@ -106,6 +318,13 @@ function exactObject(
 function nonEmptyString(value: unknown, path: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new TypeError(`${path} must be a non-empty string`);
+  }
+  return value;
+}
+
+function booleanValue(value: unknown, path: string): boolean {
+  if (value !== true && value !== false) {
+    throw new TypeError(`${path} must be boolean`);
   }
   return value;
 }

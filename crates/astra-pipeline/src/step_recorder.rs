@@ -396,9 +396,22 @@ impl StepRecorder {
         task_id: &str,
         run_id: &str,
     ) -> Self {
+        let mut recorder =
+            Self::with_deferred_persistence(user_id, provisional_session_id, task_id);
+        recorder.invocation_run_id = Some(run_id.to_string());
+        recorder
+    }
+
+    /// Create an in-memory recorder whose session and run identity are both
+    /// unresolved until the server admits the request.  The task id remains a
+    /// local correlation label; it is never written as a durable run id.
+    pub fn with_deferred_persistence(
+        user_id: &str,
+        provisional_session_id: &str,
+        task_id: &str,
+    ) -> Self {
         let mut recorder = Self::new(user_id, provisional_session_id, task_id);
         recorder.attach_persistence_on_session_adoption = true;
-        recorder.invocation_run_id = Some(run_id.to_string());
         recorder
     }
 
@@ -413,9 +426,65 @@ impl StepRecorder {
     /// Attach persistence only when this recorder was explicitly constructed
     /// in deferred-persistence mode.
     pub fn attach_persistence_if_configured(&mut self, session_id: &str) {
+        if self.attach_persistence_on_session_adoption
+            && self
+                .invocation_run_id
+                .as_deref()
+                .is_some_and(|run_id| !run_id.trim().is_empty())
+        {
+            self.attach_persistence(session_id);
+        }
+    }
+
+    /// Bind the recorder to the authoritative server session/run pair.
+    ///
+    /// A CLI turn starts recording before HTTP admission so the live UI can
+    /// show useful phases.  Those observations stay in memory until both
+    /// identities arrive from the server.  Rewriting the buffered event ids
+    /// here is what prevents a client correlation id (or an empty id) from
+    /// becoming durable trace identity.
+    pub fn bind_authoritative_run(&mut self, session_id: &str, run_id: &str) {
+        if session_id.trim().is_empty() || run_id.trim().is_empty() {
+            return;
+        }
+
+        self.invocation_run_id = Some(run_id.to_string());
+        for event in &mut self.events {
+            event.run_id = run_id.to_string();
+            if let Some(payload) = event.payload.as_mut()
+                && let Some(trace_context) = payload
+                    .get_mut("trace_context")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                trace_context.insert(
+                    "run_id".to_string(),
+                    serde_json::Value::String(run_id.to_string()),
+                );
+            }
+        }
+
         if self.attach_persistence_on_session_adoption {
             self.attach_persistence(session_id);
         }
+    }
+
+    /// Drop observations from a turn rejected before durable admission.
+    ///
+    /// This intentionally has no effect on an already-bound recorder: once a
+    /// server-owned run exists, its persisted evidence is authoritative even
+    /// when a later stream phase fails.
+    pub fn discard_uncommitted(&mut self) {
+        if !self.attach_persistence_on_session_adoption || self.file_store.is_some() {
+            return;
+        }
+        self.events.clear();
+        self.current_step = None;
+        self.current_step_sequence = None;
+        self.phase_log.clear();
+        self.tool_timings.clear();
+        self.invocation_run_id = None;
+        self.attach_persistence_on_session_adoption = false;
+        self.persistence_error = None;
     }
 
     /// Attach file-backed persistence after the authoritative session id becomes known.
@@ -2467,6 +2536,73 @@ mod tests {
                 .all_events()
                 .is_empty(),
             "ordinary in-memory recorders must not gain disk side effects merely because a response carries a session id"
+        );
+    }
+
+    #[test]
+    fn deferred_persistence_binds_authoritative_run_before_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut recorder = StepRecorder::with_deferred_persistence(
+            TEST_USER_ID,
+            "session-local",
+            "client-correlation",
+        );
+        recorder.begin_turn(0);
+        recorder.record_plan(&["bash".into()], 0.0, 4000);
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| event.run_id.is_empty())
+        );
+        assert!(
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-authoritative")
+                .all_events()
+                .is_empty()
+        );
+
+        recorder.bind_authoritative_run("sess-authoritative", "run-server-1");
+        recorder.end_turn(true);
+
+        let persisted =
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-authoritative")
+                .all_events()
+                .to_vec();
+        assert!(!persisted.is_empty());
+        assert!(persisted.iter().all(|event| event.run_id == "run-server-1"));
+        assert!(persisted.iter().all(|event| {
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trace_context"))
+                .and_then(|context| context.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some("run-server-1")
+        }));
+    }
+
+    #[test]
+    fn deferred_persistence_discards_pre_admission_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut recorder = StepRecorder::with_deferred_persistence(
+            TEST_USER_ID,
+            "session-local",
+            "client-correlation",
+        );
+        recorder.begin_turn(0);
+        recorder.record_plan(&["bash".into()], 0.0, 4000);
+        recorder.discard_uncommitted();
+
+        assert!(recorder.events().is_empty());
+        assert!(recorder.current_step().is_none());
+        assert!(
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "session-local")
+                .all_events()
+                .is_empty()
         );
     }
 

@@ -102,6 +102,40 @@ pub(crate) async fn cancel_server_session(
     Ok(())
 }
 
+/// Cancel and then delete exactly one harness-owned session through the normal
+/// authenticated CLI surface. Cancellation converges active work and deletion
+/// releases durable execution claims that `session close` intentionally keeps.
+pub(crate) async fn delete_server_session(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    session_id: &str,
+) -> Result<(), String> {
+    cancel_server_session(astra_bin, profile, session_id).await?;
+
+    let mut command = Command::new(astra_bin);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    command
+        .args(["session", "delete", session_id])
+        .env("NO_PROXY", "localhost,127.0.0.1")
+        .env("no_proxy", "localhost,127.0.0.1");
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .map_err(|_| "session deletion timed out after 15s".to_string())
+        .and_then(|result| {
+            result.map_err(|error| format!("failed to spawn session delete: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "session delete exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -2820,7 +2820,13 @@ mod tests {
         );
         let reservation = reserved(
             coordinator
-                .reserve_turn(&source_lease, None, Duration::from_secs(30), "source-turn")
+                .reserve_turn(
+                    &source_lease,
+                    None,
+                    Duration::from_secs(30),
+                    "source-turn",
+                    None,
+                )
                 .await
                 .expect("reserve source turn"),
         );
@@ -3372,6 +3378,7 @@ mod tests {
                     Some(&cursor),
                     Duration::from_secs(10),
                     "stale-source-turn",
+                    None,
                 )
                 .await,
             Err(SessionContextCoordinatorError::Fenced)
@@ -3383,6 +3390,7 @@ mod tests {
                     Some(&cursor),
                     Duration::from_secs(10),
                     "target-turn",
+                    None,
                 )
                 .await
                 .expect("target reserve"),
