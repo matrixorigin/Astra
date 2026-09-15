@@ -19734,7 +19734,10 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
         executor_id: Some("edge-macbook-1".to_string()),
         display_name: Some("MacBook Pro".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        // The in-memory fixture has no durable coordinator; exercise the
+        // request-scoped ledger path explicitly. Native EdgeWs admission is
+        // covered by the fail-closed test above.
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
     let run = ok(svc.create_run("user-1".into(), req).await);
@@ -19759,7 +19762,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         durable.events[0]["data"]["executor"]["executor_id"],
         "edge-macbook-1"
     );
-    assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
+    assert_eq!(durable.events[0]["data"]["transport"], "edge_ledger");
     assert_eq!(
         durable.events[0]["data"]["admission_source"]["capability_source"],
         "bound_executor"
@@ -19778,7 +19781,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         status.executor.as_ref().unwrap()["executor_id"],
         "edge-macbook-1"
     );
-    assert_eq!(status.transport.as_deref(), Some("edge_ws"));
+    assert_eq!(status.transport.as_deref(), Some("edge_ledger"));
 }
 
 #[tokio::test]
