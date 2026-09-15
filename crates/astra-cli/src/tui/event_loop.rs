@@ -125,7 +125,7 @@ enum SlashBackgroundReadEffect {
         session_id: String,
         timeline: crate::tui::timeline::Timeline,
     },
-    WorkExecution(Result<WorkExecutionSurface, String>),
+    WorkExecution(Result<WorkExecutionSurface, WorkExecutionLoadError>),
     ResumePicker(crate::tui::session_picker::SessionDiscovery),
     SessionHub {
         snapshot: Box<slash_dispatch::SessionHubSnapshot>,
@@ -146,6 +146,15 @@ enum SlashBackgroundReadEffect {
     },
 }
 
+/// Errors returned while loading the read-only Work execution panel. A
+/// Session that has not been promoted to Work is a valid empty state, not a
+/// failed command; keep that protocol fact structured until the UI decides how
+/// to render it.
+enum WorkExecutionLoadError {
+    SessionNotBound,
+    Request(String),
+}
+
 /// The complete read-only projection needed by `/work execution`. The
 /// execution placement is authoritative; target discovery is a separately
 /// degradable read so a registry outage never hides the location of the next
@@ -154,6 +163,27 @@ struct WorkExecutionSurface {
     session_id: String,
     execution: astra_thin_client::WorkExecutionViewV1,
     targets: Result<astra_thin_client::WorkExecutionTargetPageV1, String>,
+}
+
+fn classify_work_execution_error(
+    error: astra_thin_client::ThinClientError,
+) -> WorkExecutionLoadError {
+    if let astra_thin_client::ThinClientError::Api { status, body } = &error {
+        let code = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if *status == reqwest::StatusCode::NOT_FOUND
+            && code.as_deref() == Some("work_session_binding_not_found")
+        {
+            return WorkExecutionLoadError::SessionNotBound;
+        }
+    }
+    WorkExecutionLoadError::Request(error.to_string())
 }
 
 /// Structured completion for a `/memory` read. The event loop receives facts,
@@ -485,11 +515,13 @@ fn dispatch_slash_background_read(
                                     targets,
                                 })
                             }
-                            Err(error) => Err(error.to_string()),
+                            Err(error) => Err(classify_work_execution_error(error)),
                         },
-                        Err(error) => Err(error.to_string()),
+                        Err(error) => Err(classify_work_execution_error(error)),
                     },
-                    None => Err("Not logged in. Use /login.".to_string()),
+                    None => Err(WorkExecutionLoadError::Request(
+                        "Not logged in. Use /login.".to_string(),
+                    )),
                 };
                 SlashBackgroundReadEffect::WorkExecution(result)
             }
@@ -846,7 +878,12 @@ fn apply_slash_background_read_effect(
                 ));
                 bottom_pane.push_view(Box::new(work_execution_view(surface, &title)));
             }
-            Err(error) => {
+            Err(WorkExecutionLoadError::SessionNotBound) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "This Session is not attached to Work yet. Use `/work start <goal>` to create Work, then run `/work execution` again.",
+                ));
+            }
+            Err(WorkExecutionLoadError::Request(error)) => {
                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
                     "Work execution unavailable: {error}"
                 )));
@@ -9480,6 +9517,32 @@ fn apply_terminal_explain_analyze_degraded_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbound_work_session_is_an_empty_state_not_a_command_error() {
+        let error = classify_work_execution_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: serde_json::json!({
+                "code": "work_session_binding_not_found",
+                "category": "not_found",
+            })
+            .to_string(),
+        });
+
+        assert!(matches!(error, WorkExecutionLoadError::SessionNotBound));
+    }
+
+    #[test]
+    fn unrelated_work_execution_not_found_remains_visible_as_an_error() {
+        let error = classify_work_execution_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::NOT_FOUND,
+            body: serde_json::json!({ "code": "work_branch_not_found" }).to_string(),
+        });
+
+        assert!(
+            matches!(error, WorkExecutionLoadError::Request(message) if message.contains("404"))
+        );
+    }
 
     fn explain_analyze_fact() -> astra_turn_types::ExplainAnalyzeEventV1 {
         astra_turn_types::ExplainAnalyzeEventV1 {
