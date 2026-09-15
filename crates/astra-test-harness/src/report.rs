@@ -194,6 +194,20 @@ pub struct SuiteReport {
     /// Real wall-clock time in milliseconds (not sum of per-case durations).
     #[serde(default)]
     pub wall_time_ms: u64,
+    /// Effective benchmark identity. CLI runs populate this before rendering;
+    /// reports assembled by embedders may leave it absent and are therefore
+    /// not eligible for a baseline comparison.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub manifest: Option<crate::benchmark::BenchmarkManifest>,
+    /// Pure aggregate of the rows in `runs`, persisted so dashboards and
+    /// offline consumers use the same denominator and cost buckets.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub aggregate: Option<crate::benchmark::BenchmarkAggregate>,
+    /// Optional comparison against a prior report requested with
+    /// `--baseline`. A comparison is diagnostic and never changes the
+    /// current run's pass/fail exit status.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub baseline_comparison: Option<crate::benchmark::BenchmarkComparison>,
 }
 
 impl SuiteReport {
@@ -220,6 +234,13 @@ impl SuiteReport {
     }
     pub fn non_passed(&self) -> usize {
         self.total() - self.passed()
+    }
+
+    /// Build the canonical benchmark aggregate. Callers that need to persist
+    /// it should assign the returned value to `aggregate`; recomputation is
+    /// cheap and intentionally scans only report rows, never raw journals.
+    pub fn benchmark_aggregate(&self) -> crate::benchmark::BenchmarkAggregate {
+        crate::benchmark::BenchmarkAggregate::from_report(self)
     }
 }
 
@@ -287,23 +308,46 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
 
-    let total_prompt: u64 = report.runs.iter().map(|r| r.outcome.prompt_tokens).sum();
+    // Recompute from rows instead of trusting a persisted projection.  This
+    // keeps text output on the same canonical denominator and complete-cost
+    // buckets as evaluation, dashboards, and baseline comparisons.
+    let aggregate = report.benchmark_aggregate();
+
+    if report.manifest.is_some() || report.aggregate.is_some() {
+        s.push_str(&format!(
+            "benchmark: planned={} executed={} passed={} failed={} cancelled={} unavailable={} evidence_incomplete={} groups={}\n",
+            aggregate.totals.planned,
+            aggregate.totals.executed,
+            aggregate.totals.passed,
+            aggregate.totals.failed,
+            aggregate.totals.cancelled,
+            aggregate.totals.unavailable,
+            aggregate.totals.evidence_incomplete,
+            aggregate.groups.len(),
+        ));
+    }
+
+    let observed_runs = report.runs.iter().filter(|run| run.is_evidence());
+    let total_prompt: u64 = observed_runs.clone().map(|r| r.outcome.prompt_tokens).sum();
     let total_completion: u64 = report
         .runs
         .iter()
+        .filter(|run| run.is_evidence())
         .map(|r| r.outcome.completion_tokens)
         .sum();
     let total_cache_read: u64 = report
         .runs
         .iter()
+        .filter(|run| run.is_evidence())
         .map(|r| r.outcome.cached_input_tokens)
         .sum();
     let total_cache_create: u64 = report
         .runs
         .iter()
+        .filter(|run| run.is_evidence())
         .map(|r| r.outcome.cache_creation_tokens)
         .sum();
-    let sum_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
+    let sum_dur: u64 = aggregate.all_cost.total_duration_ms;
     let wall_ms = if report.wall_time_ms > 0 {
         report.wall_time_ms
     } else {
@@ -601,11 +645,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
-    // Collect distinct raw execution identities; display labels are not keys.
+    // Collect distinct scoreable execution identities; cancelled rows stay in
+    // the denominator while unavailable rows remain outside a model's matrix.
     let models: BTreeSet<&str> = report
         .runs
         .iter()
-        .filter(|r| r.is_evidence())
+        .filter(|r| !r.is_unavailable())
         .map(|r| r.model.as_str())
         .collect();
     let multi_model = models.len() > 1;
@@ -620,25 +665,34 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             pass_dur_ms: u64,
             pass_turns: u64,
             pass_tools: u64,
-            all_tokens: u64,
-            all_dur_ms: u64,
+            pass_samples: u32,
         }
         let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
-        for r in &report.runs {
-            if !r.is_evidence() {
+        for group in &aggregate.groups {
+            if group.counts.planned == group.counts.unavailable {
                 continue;
             }
-            let e = stats.entry(r.model.as_str()).or_default();
-            e.total += 1;
-            let tok = r.outcome.prompt_tokens + r.outcome.completion_tokens;
-            e.all_tokens += tok;
-            e.all_dur_ms += r.outcome.duration_ms;
-            if r.is_passed() {
-                e.pass += 1;
-                e.pass_tokens += tok;
-                e.pass_dur_ms += r.outcome.duration_ms;
-                e.pass_turns += r.outcome.turn_rounds as u64;
-                e.pass_tools += r.outcome.tool_calls_count as u64;
+            let e = stats.entry(group.model.as_str()).or_default();
+            e.total += (group.counts.planned - group.counts.unavailable) as u32;
+            e.pass += group.counts.passed as u32;
+            e.pass_tokens += group.successful_cost.total_tokens;
+            e.pass_dur_ms += group.successful_cost.total_duration_ms;
+            e.pass_turns += group.successful_cost.total_turns;
+            e.pass_samples += group.successful_cost.sample_count as u32;
+        }
+        // Tool counts are not part of the cost distribution, so retain the
+        // row-level value while applying the same complete-success filter.
+        for run in &report.runs {
+            if !run.is_passed()
+                || run
+                    .execution
+                    .as_ref()
+                    .is_some_and(|execution| !execution.evidence_complete)
+            {
+                continue;
+            }
+            if let Some(stats) = stats.get_mut(run.model.as_str()) {
+                stats.pass_tools += u64::from(run.outcome.tool_calls_count);
             }
         }
         s.push_str("=== model comparison ===\n");
@@ -662,16 +716,36 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             } else {
                 0.0
             };
-            let p = st.pass.max(1) as u64;
+            let p = st.pass_samples as u64;
+            let tok_per_pass = st.pass_tokens.checked_div(p).unwrap_or_default();
+            let dur_per_pass = st.pass_dur_ms.checked_div(p).unwrap_or_default();
+            let turns_per_pass = if p > 0 {
+                st.pass_turns as f64 / p as f64
+            } else {
+                0.0
+            };
+            let tools_per_pass = if p > 0 {
+                st.pass_tools as f64 / p as f64
+            } else {
+                0.0
+            };
             s.push_str(&format!(
                 "  {model}: pass={}/{} ({pct:.0}%) \
                  | tok/pass={} dur/pass={}ms turns/pass={:.1} tools/pass={:.1}\n",
                 st.pass,
                 st.total,
-                st.pass_tokens / p,
-                st.pass_dur_ms / p,
-                st.pass_turns as f64 / p as f64,
-                st.pass_tools as f64 / p as f64,
+                if p > 0 {
+                    tok_per_pass.to_string()
+                } else {
+                    "n/a".to_string()
+                },
+                if p > 0 {
+                    dur_per_pass.to_string()
+                } else {
+                    "n/a".to_string()
+                },
+                turns_per_pass,
+                tools_per_pass,
             ));
         }
         s.push('\n');
@@ -681,12 +755,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let has_capabilities = report
         .runs
         .iter()
-        .any(|r| r.is_evidence() && r.capability.is_some());
+        .any(|r| !r.is_unavailable() && r.capability.is_some());
     if has_capabilities {
         s.push_str("=== capability × model ===\n");
         let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
-            if !r.is_evidence() {
+            if r.is_unavailable() {
                 continue;
             }
             if let Some(ref cap) = r.capability {
@@ -710,14 +784,14 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let has_difficulty = report
         .runs
         .iter()
-        .any(|r| r.is_evidence() && r.difficulty.is_some());
+        .any(|r| !r.is_unavailable() && r.difficulty.is_some());
     if has_difficulty {
         s.push_str("=== difficulty curve ===\n");
         // (difficulty, model) → (weighted_pass, weighted_total)
         let mut diff_groups: BTreeMap<(u8, &str), (f64, f64)> = BTreeMap::new();
         let mut diff_all: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
-            if !r.is_evidence() {
+            if r.is_unavailable() {
                 continue;
             }
             if let Some(d) = r.difficulty {
@@ -752,7 +826,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push_str("=== capability × difficulty × model ===\n");
         let mut cdm: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
-            if !r.is_evidence() {
+            if r.is_unavailable() {
                 continue;
             }
             if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
@@ -772,7 +846,62 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push('\n');
     }
 
+    if let Some(comparison) = &report.baseline_comparison {
+        s.push_str(&format!(
+            "=== baseline comparison ===\n  comparable={} performance_comparable={} binary_changed={} quality_improved={} quality_regressed={} efficiency_improved={} efficiency_regressed={} insufficient={} incomparable={}\n",
+            comparison.comparable,
+            comparison.performance_comparable,
+            comparison.binary_changed,
+            comparison.summary.quality_improved,
+            comparison.summary.quality_regressed,
+            comparison.summary.efficiency_improved,
+            comparison.summary.efficiency_regressed,
+            comparison.summary.insufficient_evidence,
+            comparison.summary.incomparable,
+        ));
+        for reason in &comparison.reasons {
+            s.push_str(&format!("  cannot compare: {reason}\n"));
+        }
+        for reason in &comparison.performance_reasons {
+            s.push_str(&format!("  performance unavailable: {reason}\n"));
+        }
+        for group in &comparison.groups {
+            if group.quality_status == crate::benchmark::ComparisonStatus::Unchanged
+                && group.efficiency_status == crate::benchmark::ComparisonStatus::Unchanged
+            {
+                continue;
+            }
+            s.push_str(&format!(
+                "  {} × {}: quality={} efficiency={} pass_delta={} ({})\n",
+                group.case_name,
+                group.model,
+                comparison_status_label(group.quality_status),
+                comparison_status_label(group.efficiency_status),
+                format_delta(group.pass_rate_delta),
+                group.note,
+            ));
+        }
+        s.push('\n');
+    }
+
     s
+}
+
+fn comparison_status_label(status: crate::benchmark::ComparisonStatus) -> &'static str {
+    match status {
+        crate::benchmark::ComparisonStatus::Improved => "improved",
+        crate::benchmark::ComparisonStatus::Regressed => "regressed",
+        crate::benchmark::ComparisonStatus::Unchanged => "unchanged",
+        crate::benchmark::ComparisonStatus::Mixed => "mixed",
+        crate::benchmark::ComparisonStatus::InsufficientEvidence => "insufficient_evidence",
+        crate::benchmark::ComparisonStatus::Incomparable => "incomparable",
+    }
+}
+
+fn format_delta(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:+.1}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 /// Extract scannable lines from a `astra journal digest --focus summary`

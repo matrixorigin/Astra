@@ -60,6 +60,33 @@ A change should not activate if it causes material regression in:
 - task success on critical workflows;
 - cost/latency beyond policy budget.
 
+## Comparable benchmark runs
+
+The `astra-test` harness persists a typed manifest with each JSON suite
+report. It records the case digest, effective model matrix, effective working
+directory, profile and repeat/concurrency settings, full capture and judger
+configuration, executor kind, and the embedded build identity of the process
+that actually ran the cases. External command text is represented only by a
+digest; the manifest does not contain credentials or command stderr.
+
+The report also contains one canonical aggregate keyed by `(case, model)`.
+Planned, executed, passed, failed, cancelled, unavailable, and incomplete
+evidence rows remain separate. Token, duration, and provider-round samples
+are retained as p50/p95 summaries for all executed rows, complete successful
+rows, and incomplete successful rows. Only the complete-success bucket is
+eligible for efficiency scoring. Execution attribution (including rejected,
+reused, suppressed, and deferred calls) is counted only when durable evidence
+is present and only for rows the runner says actually executed.
+
+`astra-test --baseline <report.json>` compares two manifests before producing
+quality or efficiency deltas. A case/model/configuration mismatch is
+`incomparable`. Efficiency is considered only with at least three successful,
+complete observations in each report and only when the quality rate has not
+decreased; an earlier failure, cancellation, or unavailable row therefore
+cannot masquerade as a cheaper run. Missing case-executor identity makes
+performance comparison unavailable while keeping the current product result
+visible.
+
 ## Relationship to learning
 
 Evaluation produces labels and quality signals. It is not itself a training pipeline. Learning artifacts require the additional consent/redaction/lineage rules in [evaluation-and-learning.md](evaluation-and-learning.md).

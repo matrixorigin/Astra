@@ -24,6 +24,11 @@ pub struct EvalReport {
     pub model_scores: Vec<ModelScore>,
     /// Astra runtime health assessment.
     pub runtime_health: RuntimeHealth,
+    /// Canonical row/cost/attribution aggregate shared with report and
+    /// summarizer consumers. Keeping it here avoids silently inventing a
+    /// second denominator for historical comparisons.
+    #[serde(default)]
+    pub benchmark: crate::benchmark::BenchmarkAggregate,
     /// Overall composite score (0-100).
     pub overall_score: f64,
     /// Optional LLM-generated narrative summary.
@@ -100,11 +105,12 @@ pub struct RuntimeHealth {
 
 /// Build a structured evaluation from a completed suite report.
 pub fn evaluate(report: &SuiteReport) -> EvalReport {
+    let benchmark = report.benchmark_aggregate();
     let models: Vec<String> = {
         let mut m: Vec<String> = report
             .runs
             .iter()
-            .filter(|r| r.is_evidence())
+            .filter(|r| !r.is_unavailable())
             .map(|r| r.model.clone())
             .collect();
         m.sort();
@@ -112,8 +118,11 @@ pub fn evaluate(report: &SuiteReport) -> EvalReport {
         m
     };
 
-    let run_summary = build_run_summary(report, &models);
-    let model_scores: Vec<ModelScore> = models.iter().map(|m| score_model(report, m)).collect();
+    let run_summary = build_run_summary(report, &models, &benchmark);
+    let model_scores: Vec<ModelScore> = models
+        .iter()
+        .map(|m| score_model(report, m, &benchmark))
+        .collect();
     let runtime_health = assess_runtime_health(report, &models);
 
     let overall = if model_scores.is_empty() {
@@ -128,12 +137,17 @@ pub fn evaluate(report: &SuiteReport) -> EvalReport {
         run_summary,
         model_scores,
         runtime_health,
+        benchmark,
         overall_score: overall,
         narrative: None,
     }
 }
 
-fn build_run_summary(report: &SuiteReport, models: &[String]) -> RunSummary {
+fn build_run_summary(
+    report: &SuiteReport,
+    models: &[String],
+    benchmark: &crate::benchmark::BenchmarkAggregate,
+) -> RunSummary {
     let hard_fails = report
         .runs
         .iter()
@@ -146,8 +160,13 @@ fn build_run_summary(report: &SuiteReport, models: &[String]) -> RunSummary {
         })
         .count();
     let warnings = report.runs.iter().filter(|r| r.has_warnings).count();
-    let unavailable_count = report.unavailable();
-    let available_runs = report.total().saturating_sub(unavailable_count);
+    let unavailable_count = benchmark.totals.unavailable;
+    // Cancelled rows remain in the planned denominator; only deliberately
+    // unavailable model-resolution rows are excluded from the pass rate.
+    let available_runs = benchmark
+        .totals
+        .planned
+        .saturating_sub(benchmark.totals.unavailable);
 
     RunSummary {
         total_cases: {
@@ -156,26 +175,33 @@ fn build_run_summary(report: &SuiteReport, models: &[String]) -> RunSummary {
             names.dedup();
             names.len()
         },
-        total_runs: report.total(),
+        total_runs: benchmark.totals.planned,
         models_tested: models.to_vec(),
         wall_time_ms: report.wall_time_ms,
         pass_rate: if available_runs > 0 {
-            report.passed() as f64 / available_runs as f64 * 100.0
+            benchmark.totals.passed as f64 / available_runs as f64 * 100.0
         } else {
             0.0
         },
         unavailable_count,
-        cancelled_count: report.cancelled(),
+        cancelled_count: benchmark.totals.cancelled,
         hard_fail_count: hard_fails,
         soft_warning_count: warnings,
     }
 }
 
-fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
+fn score_model(
+    report: &SuiteReport,
+    model: &str,
+    benchmark: &crate::benchmark::BenchmarkAggregate,
+) -> ModelScore {
     let runs: Vec<_> = report
         .runs
         .iter()
-        .filter(|r| r.is_evidence() && r.model == model)
+        // Cancelled rows remain planned failures in capability scores.  Only
+        // deliberately unavailable rows are outside the selected model's
+        // scoreable matrix.
+        .filter(|r| !r.is_unavailable() && r.model == model)
         .collect();
 
     // Group by capability
@@ -214,6 +240,7 @@ fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
             let avg_quality: f64 = {
                 let scores: Vec<f64> = cap_runs
                     .iter()
+                    .filter(|r| r.is_evidence())
                     .flat_map(|r| {
                         r.criteria.iter().filter_map(|c| {
                             (c.severity == CriterionSeverity::Quality)
@@ -222,7 +249,9 @@ fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
                         })
                     })
                     .collect();
-                if scores.is_empty() {
+                if !cap_runs.iter().any(|run| run.is_evidence()) {
+                    0.0
+                } else if scores.is_empty() {
                     1.0
                 } else {
                     scores.iter().sum::<f64>() / scores.len() as f64
@@ -254,7 +283,7 @@ fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
         })
         .collect();
 
-    let efficiency = compute_efficiency(&runs);
+    let efficiency = compute_efficiency(benchmark, model);
 
     let dim_avg = if dimensions.is_empty() {
         0.0
@@ -271,11 +300,22 @@ fn score_model(report: &SuiteReport, model: &str) -> ModelScore {
     }
 }
 
-fn compute_efficiency(runs: &[&crate::report::CaseRunReport]) -> EfficiencyScore {
-    let passed: Vec<_> = runs.iter().filter(|r| r.is_passed()).collect();
+fn compute_efficiency(
+    benchmark: &crate::benchmark::BenchmarkAggregate,
+    model: &str,
+) -> EfficiencyScore {
+    let successful: Vec<_> = benchmark
+        .groups
+        .iter()
+        .filter(|group| group.model == model && group.successful_cost.sample_count > 0)
+        .collect();
+    let successful_samples: usize = successful
+        .iter()
+        .map(|group| group.successful_cost.sample_count)
+        .sum();
 
     // No passes → zero efficiency; there is nothing to measure.
-    if passed.is_empty() {
+    if successful_samples == 0 {
         return EfficiencyScore {
             avg_tokens_per_pass: 0.0,
             avg_duration_per_pass: 0.0,
@@ -284,23 +324,22 @@ fn compute_efficiency(runs: &[&crate::report::CaseRunReport]) -> EfficiencyScore
         };
     }
 
-    let n = passed.len() as f64;
-
-    let avg_tok: f64 = passed
+    let n = successful_samples as f64;
+    let total_tokens: u64 = successful
         .iter()
-        .map(|r| (r.outcome.prompt_tokens + r.outcome.completion_tokens) as f64)
-        .sum::<f64>()
-        / n;
-    let avg_dur: f64 = passed
+        .map(|group| group.successful_cost.total_tokens)
+        .sum();
+    let total_duration: u64 = successful
         .iter()
-        .map(|r| r.outcome.duration_ms as f64)
-        .sum::<f64>()
-        / n;
-    let avg_turns: f64 = passed
+        .map(|group| group.successful_cost.total_duration_ms)
+        .sum();
+    let total_turns: u64 = successful
         .iter()
-        .map(|r| r.outcome.turn_rounds as f64)
-        .sum::<f64>()
-        / n;
+        .map(|group| group.successful_cost.total_turns)
+        .sum();
+    let avg_tok = total_tokens as f64 / n;
+    let avg_dur = total_duration as f64 / n;
+    let avg_turns = total_turns as f64 / n;
 
     // Efficiency score: penalize high token/duration usage.
     // Baseline: 10k tokens, 15s, 3 turns = 100 score.
@@ -565,6 +604,31 @@ mod tests {
         assert_eq!(eval.run_summary.pass_rate, 50.0);
         assert_eq!(eval.runtime_health.evidence_count, 1);
         assert_eq!(eval.run_summary.models_tested, vec!["A"]);
+        let dimension = &eval.model_scores[0].dimensions[0];
+        assert_eq!(dimension.case_count, 2);
+        assert!(
+            dimension.score < 70.0,
+            "cancelled work must stay in the denominator"
+        );
+    }
+
+    #[test]
+    fn incomplete_success_is_visible_but_excluded_from_efficiency_cost() {
+        let mut incomplete = mk("incomplete", "A", true, Some("tool_use"), 1);
+        incomplete.outcome.prompt_tokens = 1_000_000;
+        incomplete.execution = Some(crate::pipeline_analysis::ExecutionTraceReport {
+            evidence_complete: false,
+            ..Default::default()
+        });
+        let report = SuiteReport {
+            runs: vec![incomplete, mk("complete", "A", true, Some("tool_use"), 1)],
+            ..Default::default()
+        };
+        let eval = evaluate(&report);
+        let model = eval.model_scores.iter().find(|m| m.model == "A").unwrap();
+        assert_eq!(eval.benchmark.successful_incomplete_cost.sample_count, 1);
+        assert_eq!(eval.benchmark.successful_cost.sample_count, 1);
+        assert_eq!(model.efficiency.avg_tokens_per_pass, 5_500.0);
     }
 
     #[test]

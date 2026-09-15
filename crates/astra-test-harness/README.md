@@ -88,7 +88,35 @@ therefore does not manufacture compaction pressure; compaction mechanics and
     --filter fork_prefix \
     --force-model us.anthropic.claude-sonnet-4-6 \
     --runs 3 --parallel 2
+
+# Compare a new run with a prior JSON report. The prior report must have been
+# produced with the same effective case/model/configuration matrix.
+./target/release/astra-test \
+    --suite crates/astra-test-harness/cases \
+    --force-model qwen-flash --runs 3 --parallel 2 \
+    --report-file target/benchmark-current.json \
+    --baseline target/benchmark-baseline.json
 ```
+
+Every CLI report carries an `astra.benchmark.manifest.v1` identity and a canonical
+row aggregate. The manifest records the tested binary's typed build identity,
+case digest, effective model matrix, effective working directory, profile,
+repeat/concurrency settings, judger kind/model/timeout/quorum, capture mode,
+and executor kind (external command contents are stored only as SHA-256
+digests). The aggregate keeps planned, executed, passed, failed, cancelled,
+unavailable, and incomplete-evidence rows separate, and reports token,
+duration, and turn p50/p95 values for all executions, complete successful
+executions, and incomplete successful executions. An external executor has no
+trusted performance identity by default, so it cannot produce a performance
+comparison merely by reusing the same command string.
+
+`--baseline <PATH>` reads a prior JSON report and adds a comparison to the
+current report. Case/model/configuration mismatches are marked
+`incomparable`. Efficiency is evaluated only with at least three successful,
+complete observations in both reports and only when quality has not regressed;
+cancelled rows and early failures therefore cannot manufacture a cost win.
+Unknown or missing binary identity makes performance comparison unavailable,
+while still leaving the current run's product result visible.
 
 ### `--astra-bin` resolution
 
@@ -375,6 +403,7 @@ Main options:
   --astra-bin <PATH>           astra CLI to spawn (auto-detected otherwise)
   --working-dir <DIR>          cd subprocess here
   --format text|json           output format
+  --baseline <PATH>            compare with a prior JSON suite report
   --verbose                    always dump text+stderr + load session journal
   --skip-preflight             skip login/model availability checks
   --retry-on-429              retry rate-limited cases (default: classify as infra fail)

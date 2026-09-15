@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use astra_test_harness::benchmark::{
+    BenchmarkComparison, BenchmarkConfig, BenchmarkManifest, ExecutorKind, JudgerKind,
+    digest_command, effective_model_ids, effective_working_dir, probe_binary_identity,
+};
 use astra_test_harness::case::{Case, expand_prompt_variants, matches_filter};
 use astra_test_harness::criteria::{Criterion, requires_session_capture};
 use astra_test_harness::digest::AstraCliDigestCollector;
@@ -173,6 +177,12 @@ struct Args {
     /// health, efficiency metrics) to a JSON file.
     #[arg(long, value_name = "PATH")]
     eval_file: Option<PathBuf>,
+
+    /// Compare this run with a prior JSON suite report. The reports must have
+    /// matching effective cases/models/configuration; incompatible runs are
+    /// reported explicitly instead of receiving a misleading improvement.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
 
     /// Start a live dashboard server for real-time test visualization.
     /// Opens http://localhost:PORT (default 9100) in your browser.
@@ -589,6 +599,64 @@ async fn main() -> Result<()> {
         runs: args.runs.max(1),
     };
 
+    // Capture the effective run identity before the executor starts. The
+    // binary probe is side-effect-free and records the exact executable build
+    // rather than trusting the harness package version or a source checkout.
+    let tested_binary = probe_binary_identity(&astra_bin).await;
+    if let Some(error) = &tested_binary.probe_error {
+        eprintln!(
+            "[astra-test] WARNING: could not identify tested binary {}: {}",
+            tested_binary.path, error
+        );
+    }
+    let effective_models = effective_model_ids(&cases, &runner_cfg);
+    let executor_kind = if args.executor_cmd.is_some() {
+        ExecutorKind::External
+    } else {
+        ExecutorKind::Builtin
+    };
+    let judger_kind = if args.no_judger {
+        JudgerKind::Disabled
+    } else if args.judger_cmd.is_some() {
+        JudgerKind::External
+    } else {
+        JudgerKind::Builtin
+    };
+    let executor_identity =
+        matches!(executor_kind, ExecutorKind::Builtin).then(|| tested_binary.clone());
+    let session_capture_mode = match session_mode {
+        SessionCaptureMode::Never => "never",
+        SessionCaptureMode::OnDebugLog => "on_debug_log",
+        SessionCaptureMode::Always => "always",
+    };
+    let benchmark_manifest = BenchmarkManifest::new(
+        &cases,
+        &effective_models,
+        BenchmarkConfig {
+            profile: runner_profile.clone(),
+            working_dir: effective_working_dir(args.working_dir.as_deref()),
+            runs: suite_cfg.runs,
+            parallel: suite_cfg.parallel,
+            circuit_breaker_threshold: suite_cfg.circuit_breaker_threshold,
+            retry_on_429: suite_cfg.retry_on_429,
+            session_capture_mode: session_capture_mode.to_string(),
+            no_judger: args.no_judger,
+            judger_kind,
+            judger_command_digest: digest_command(args.judger_cmd.as_deref()),
+            judger_model: args.judger_model.clone(),
+            judger_n: args.judger_n.max(1),
+            judger_agg: args.judger_agg.clone(),
+            judger_timeout_seconds: args.judger_timeout,
+            capability_probes: args.capability_probes,
+            prompt_variants: args.prompt_variants,
+            executor_kind,
+            executor_command_digest: digest_command(args.executor_cmd.as_deref()),
+        },
+        tested_binary,
+        executor_identity,
+        chrono::Utc::now().to_rfc3339(),
+    );
+
     let runner = SuiteRunner {
         executor: executor.as_ref(),
         judger: judger.as_ref(),
@@ -603,7 +671,22 @@ async fn main() -> Result<()> {
         cancel_flag: None,
     };
 
-    let suite = runner.run_all(&cases).await;
+    let mut suite = runner.run_all(&cases).await;
+    suite.manifest = Some(benchmark_manifest);
+    suite.aggregate = Some(suite.benchmark_aggregate());
+
+    if let Some(ref baseline_path) = args.baseline {
+        let baseline_text = std::fs::read_to_string(baseline_path)
+            .with_context(|| format!("read baseline report {}", baseline_path.display()))?;
+        let baseline: astra_test_harness::report::SuiteReport =
+            serde_json::from_str(&baseline_text).with_context(|| {
+                format!(
+                    "parse baseline report {} as SuiteReport",
+                    baseline_path.display()
+                )
+            })?;
+        suite.baseline_comparison = Some(BenchmarkComparison::compare(&suite, &baseline));
+    }
 
     // Persist artifacts if requested.
     if let Some(ref dir) = args.artifacts_dir {
