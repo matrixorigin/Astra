@@ -54,6 +54,7 @@ const TERMINAL_STREAM_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn terminal_stream_projection_warning(
     pending_ordered: &std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+    pending_explain_analyze_snapshot: bool,
     pending_publication: Option<&astra_turn_types::ArtifactPublicationV1>,
     last_publication: Option<&astra_turn_types::ArtifactPublicationV1>,
 ) -> String {
@@ -89,8 +90,69 @@ fn terminal_stream_projection_warning(
         None => "Explain Analyze publication status could not be confirmed in the live display."
             .to_string(),
     };
+    let capture_status = if pending_explain_analyze_snapshot {
+        " The complete Explain Analyze capture is still awaiting repair before it can be considered complete."
+    } else {
+        ""
+    };
     format!(
-        "Live turn display fell behind; the model response completed but some terminal events need reconciliation. {publication_status} Reopen the session or run /explain to reconcile."
+        "Live turn display fell behind; the model response completed but some terminal events need reconciliation.{capture_status} {publication_status} Reopen the session or run /explain to reconcile."
+    )
+}
+
+/// Merge per-exchange canonical snapshots into the logical turn snapshot.
+/// Edge tool rounds can open more than one physical SSE exchange; retaining
+/// only the latest snapshot would silently discard Explain Analyze facts from
+/// an earlier round when the observer queue stays full.
+fn merge_explain_analyze_snapshot(
+    existing: Option<crate::cli::chat_stream::StreamEvent>,
+    incoming: crate::cli::chat_stream::StreamEvent,
+) -> Option<crate::cli::chat_stream::StreamEvent> {
+    let crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+        events: incoming_events,
+        delivery_degraded: incoming_degraded,
+    } = incoming
+    else {
+        return Some(incoming);
+    };
+    let Some(crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+        mut events,
+        delivery_degraded,
+    }) = existing
+    else {
+        return Some(
+            crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events: incoming_events,
+                delivery_degraded: incoming_degraded,
+            },
+        );
+    };
+
+    let mut positions = std::collections::HashMap::with_capacity(events.len());
+    for (index, fact) in events.iter().enumerate() {
+        positions.insert(fact.event_id.clone(), index);
+    }
+    let mut degraded = delivery_degraded || incoming_degraded;
+    for fact in incoming_events {
+        if let Some(index) = positions.get(&fact.event_id).copied() {
+            if events[index] != fact {
+                // A reused event id with different content is itself an
+                // integrity failure. Keep the newest fact for rendering but
+                // preserve the degraded marker so the report cannot claim
+                // an unqualified capture.
+                degraded = true;
+                events[index] = fact;
+            }
+        } else {
+            positions.insert(fact.event_id.clone(), events.len());
+            events.push(fact);
+        }
+    }
+    Some(
+        crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded: degraded,
+        },
     )
 }
 
@@ -253,6 +315,9 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
+    /// Shared outer-turn marker used when the terminal Explain Analyze repair
+    /// cannot reach the structured stream consumer.
+    pub explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
     /// Strict machine observation stream for one-shot `stream-json`.
     pub stream_json_emitter:
         Option<std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
@@ -269,6 +334,10 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// publication is a terminal state fact and therefore gets its own slot
     /// instead of competing with an arbitrary burst of tool edges.
     pub pending_artifact_publication: Option<astra_turn_types::ArtifactPublicationV1>,
+    /// Complete canonical Explain Analyze facts retained outside the lossy
+    /// observer queue. The TUI must apply this snapshot before settlement so
+    /// a dropped live suffix cannot be mistaken for a complete capture.
+    pub pending_explain_analyze_snapshot: Option<crate::cli::chat_stream::StreamEvent>,
     /// Token suffix retained by the SSE host after interactive observation
     /// backpressure. It is delivered before the settled marker so the TUI can
     /// reconcile the complete answer in stream order.
@@ -333,6 +402,14 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// the outer CLI can settle the durable run before choosing exit 141.
     pub output_transport_failure:
         Option<crate::cli::stream::streaming_types::OutputTransportFailure>,
+}
+
+impl CliServerAdmissionHost<'_> {
+    fn mark_explain_analyze_terminal_degraded(&self) {
+        if let Some(marker) = self.explain_analyze_terminal_degraded {
+            marker.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 fn derive_turn_interaction_mode(
@@ -493,6 +570,12 @@ impl CliServerAdmissionHost<'_> {
 
     fn retain_ordered_stream_event(&mut self, event: crate::cli::chat_stream::StreamEvent) {
         match event {
+            crate::cli::chat_stream::StreamEvent::ExplainAnalyzeSnapshot { .. } => {
+                self.pending_explain_analyze_snapshot = merge_explain_analyze_snapshot(
+                    self.pending_explain_analyze_snapshot.take(),
+                    event,
+                );
+            }
             crate::cli::chat_stream::StreamEvent::ArtifactPublication(publication) => {
                 self.last_artifact_publication = Some(publication.clone());
                 self.pending_artifact_publication = Some(publication);
@@ -644,12 +727,14 @@ fn returned_user_intent_stream_event(
 async fn emit_final_output_ready(
     stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
     pending_ordered: &mut std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+    pending_explain_analyze_snapshot: &mut Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: &mut Option<astra_turn_types::ArtifactPublicationV1>,
     deferred_token_projection: &mut Option<String>,
-) -> bool {
+) -> (bool, bool) {
     let Some(tx) = stream_event_tx else {
-        return true;
+        return (true, false);
     };
+    let mut explain_snapshot_delivered = false;
     while let Some(event) = pending_ordered.pop_front() {
         let retry = event.clone();
         match tokio::time::timeout(TERMINAL_STREAM_DRAIN_TIMEOUT, tx.send(event)).await {
@@ -657,12 +742,31 @@ async fn emit_final_output_ready(
             Ok(Err(error)) => {
                 tracing::debug!(%error, "ordered stream receiver closed during terminal drain");
                 pending_ordered.push_front(retry);
-                return false;
+                return (false, explain_snapshot_delivered);
             }
             Err(_) => {
                 tracing::warn!("timed out delivering an ordered terminal stream event");
                 pending_ordered.push_front(retry);
-                return false;
+                return (false, explain_snapshot_delivered);
+            }
+        }
+    }
+    if let Some(snapshot) = pending_explain_analyze_snapshot.as_ref().cloned() {
+        let retry = snapshot.clone();
+        match tokio::time::timeout(TERMINAL_STREAM_DRAIN_TIMEOUT, tx.send(snapshot)).await {
+            Ok(Ok(())) => {
+                *pending_explain_analyze_snapshot = None;
+                explain_snapshot_delivered = true;
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "Explain Analyze snapshot receiver closed during terminal drain");
+                *pending_explain_analyze_snapshot = Some(retry);
+                return (false, explain_snapshot_delivered);
+            }
+            Err(_) => {
+                tracing::warn!("timed out delivering the Explain Analyze snapshot");
+                *pending_explain_analyze_snapshot = Some(retry);
+                return (false, explain_snapshot_delivered);
             }
         }
     }
@@ -682,12 +786,12 @@ async fn emit_final_output_ready(
             Ok(Err(error)) => {
                 tracing::debug!(%error, "artifact publication receiver closed during terminal drain");
                 *pending_artifact_publication = Some(retry);
-                return false;
+                return (false, explain_snapshot_delivered);
             }
             Err(_) => {
                 tracing::warn!("timed out delivering the artifact publication");
                 *pending_artifact_publication = Some(retry);
-                return false;
+                return (false, explain_snapshot_delivered);
             }
         }
     }
@@ -710,24 +814,24 @@ async fn emit_final_output_ready(
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "deferred token projection receiver closed during terminal drain");
-                return false;
+                return (false, explain_snapshot_delivered);
             }
             Err(_) => {
                 tracing::warn!("timed out delivering the deferred token projection");
-                return false;
+                return (false, explain_snapshot_delivered);
             }
         }
     }
     let retry = crate::cli::chat_stream::StreamEvent::AssistantOutputSettled;
     match tokio::time::timeout(TERMINAL_STREAM_DRAIN_TIMEOUT, tx.send(retry)).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => (true, explain_snapshot_delivered),
         Ok(Err(error)) => {
             tracing::debug!(%error, "output-settled stream receiver closed");
-            false
+            (false, explain_snapshot_delivered)
         }
         Err(_) => {
             tracing::warn!("timed out delivering output-settled stream marker");
-            false
+            (false, explain_snapshot_delivered)
         }
     }
 }
@@ -739,19 +843,25 @@ async fn emit_final_output_ready(
 async fn reconcile_terminal_stream_projection(
     tx: crate::cli::chat_stream::StreamEventTx,
     mut pending_ordered: std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+    pending_explain_analyze_snapshot: Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: Option<astra_turn_types::ArtifactPublicationV1>,
     deferred_token_projection: Option<String>,
     warning: Option<String>,
-) -> bool {
+) -> (bool, bool) {
     let deadline = tokio::time::Instant::now() + TERMINAL_STREAM_RECONCILIATION_TIMEOUT;
+    let mut explain_snapshot_delivered = false;
 
     let send = |event: crate::cli::chat_stream::StreamEvent| async {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return false;
         }
+        // Bound each terminal item independently. A failed canonical
+        // snapshot still needs a small second attempt for the explicit gap
+        // marker before the overall reconciliation deadline expires.
+        let budget = remaining.min(TERMINAL_STREAM_DRAIN_TIMEOUT);
         matches!(
-            tokio::time::timeout(remaining, tx.send(event)).await,
+            tokio::time::timeout(budget, tx.send(event)).await,
             Ok(Ok(()))
         )
     };
@@ -759,11 +869,26 @@ async fn reconcile_terminal_stream_projection(
     if let Some(warning) = warning
         && !send(crate::cli::chat_stream::StreamEvent::StatusLine(warning)).await
     {
-        return false;
+        return (false, explain_snapshot_delivered);
     }
     while let Some(event) = pending_ordered.pop_front() {
         if !send(event).await {
-            return false;
+            return (false, explain_snapshot_delivered);
+        }
+    }
+    if let Some(snapshot) = pending_explain_analyze_snapshot {
+        if !send(snapshot).await {
+            // The canonical repair itself did not reach the consumer. Give
+            // the consumer one reliable terminal marker before settlement so
+            // it cannot mistake the already-rendered live prefix for a
+            // complete capture. If the receiver is still unavailable, the
+            // caller records the same failure for the outer TurnComplete /
+            // TurnError path.
+            if !send(crate::cli::chat_stream::StreamEvent::ExplainAnalyzeGap).await {
+                return (false, explain_snapshot_delivered);
+            }
+        } else {
+            explain_snapshot_delivered = true;
         }
     }
     if let Some(publication) = pending_artifact_publication
@@ -772,14 +897,17 @@ async fn reconcile_terminal_stream_projection(
         ))
         .await
     {
-        return false;
+        return (false, explain_snapshot_delivered);
     }
     if let Some(text) = deferred_token_projection.filter(|text| !text.is_empty())
         && !send(crate::cli::chat_stream::StreamEvent::Token(text)).await
     {
-        return false;
+        return (false, explain_snapshot_delivered);
     }
-    send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled).await
+    (
+        send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled).await,
+        explain_snapshot_delivered,
+    )
 }
 
 fn permission_mode_change_audit_event(
@@ -1158,11 +1286,15 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
 
         let turn_result = turn_result?;
 
-        // A saturated interactive projection may have retained one terminal
-        // publication and the answer suffix outside the normal stream queue.
-        // Reattach both to the outer host before finalization: publication is
-        // stateful and has a dedicated latest-value slot, while the token
-        // suffix is flushed immediately before `AssistantOutputSettled`.
+        // A saturated interactive projection may have retained terminal
+        // Explain Analyze facts, a publication, and the answer suffix outside
+        // the normal stream queue. Reattach them to the outer host before
+        // finalization: the canonical snapshot and publication each have a
+        // dedicated latest-value slot, while the token suffix is flushed
+        // immediately before `AssistantOutputSettled`.
+        if let Some(event) = turn_result.pending_explain_analyze_snapshot.clone() {
+            self.retain_ordered_stream_event(event);
+        }
         if let Some(event) = turn_result.pending_reliable_stream_event.clone() {
             self.retain_ordered_stream_event(event);
         }
@@ -1842,9 +1974,11 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
     }
 
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
-        let delivered = emit_final_output_ready(
+        let snapshot_was_pending = self.pending_explain_analyze_snapshot.is_some();
+        let (delivered, snapshot_delivered) = emit_final_output_ready(
             self.stream_event_tx.as_ref(),
             &mut self.pending_ordered_stream_events,
+            &mut self.pending_explain_analyze_snapshot,
             &mut self.pending_artifact_publication,
             &mut self.deferred_token_projection,
         )
@@ -1856,12 +1990,15 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             // settlement forever, while a healthy bridge can drain the exact
             // publication and answer suffix before its TurnComplete barrier.
             let pending = std::mem::take(&mut self.pending_ordered_stream_events);
+            let pending_snapshot = self.pending_explain_analyze_snapshot.take();
             let pending_publication = self.pending_artifact_publication.take();
             let deferred = self.deferred_token_projection.take();
             let pending_count = pending.len();
+            let snapshot_pending = pending_snapshot.is_some();
             let deferred_present = deferred.is_some();
             let warning = terminal_stream_projection_warning(
                 &pending,
+                snapshot_pending,
                 pending_publication.as_ref(),
                 self.last_artifact_publication.as_ref(),
             );
@@ -1871,14 +2008,19 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             }
             if let Some(tx) = self.stream_event_tx.clone() {
                 let warning = warning_for_stream.then_some(warning);
-                let reconciled = reconcile_terminal_stream_projection(
-                    tx,
-                    pending,
-                    pending_publication,
-                    deferred,
-                    warning,
-                )
-                .await;
+                let (reconciled, reconciled_snapshot_delivered) =
+                    reconcile_terminal_stream_projection(
+                        tx,
+                        pending,
+                        pending_snapshot,
+                        pending_publication,
+                        deferred,
+                        warning,
+                    )
+                    .await;
+                if snapshot_pending && !reconciled_snapshot_delivered {
+                    self.mark_explain_analyze_terminal_degraded();
+                }
                 if !reconciled {
                     // The structured receiver may already be gone (for
                     // example a non-TUI caller). Keep the failure visible even
@@ -1888,6 +2030,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                             "{}",
                             terminal_stream_projection_warning(
                                 &std::collections::VecDeque::new(),
+                                snapshot_pending,
                                 self.pending_artifact_publication.as_ref(),
                                 self.last_artifact_publication.as_ref(),
                             )
@@ -1903,12 +2046,21 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 // host would otherwise make this terminal projection failure
                 // silent, so use the explicit stderr fallback.
                 eprintln!("{}", warning.yellow());
+                if snapshot_pending {
+                    self.mark_explain_analyze_terminal_degraded();
+                }
             }
             tracing::error!(
                 pending = pending_count,
                 deferred = deferred_present,
                 "terminal stream projection moved to bounded reconciliation"
             );
+        } else if snapshot_was_pending && !snapshot_delivered {
+            // With no structured stream sender, emit_final_output_ready can
+            // report the output as settled while retaining the snapshot. The
+            // direct outer completion path must still know that canonical
+            // Explain Analyze confirmation was unavailable.
+            self.mark_explain_analyze_terminal_degraded();
         }
     }
 
@@ -1916,6 +2068,13 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         &mut self,
         state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
     ) {
+        // A turn without terminal text does not enter
+        // `on_final_output_ready`. If a canonical Explain Analyze snapshot is
+        // still retained at the full settlement boundary, preserve the same
+        // outer integrity signal before the caller publishes TurnComplete.
+        if self.pending_explain_analyze_snapshot.is_some() {
+            self.mark_explain_analyze_terminal_degraded();
+        }
         // Drop the per-turn ask_user channel so a stale sender from
         // this turn doesn't leak into background sub-runs that share
         // the same `Arc<ToolExecutor>` (the channel is reinstalled at
@@ -2072,14 +2231,17 @@ fn request_allowlist_restriction_names(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        SandboxPolicyGuard, accumulated_control_duration_ms, authoritative_provider_surface_report,
-        derive_turn_interaction_mode, emit_final_output_ready,
-        emit_ordered_control_event_with_backpressure, permission_mode_change_audit_event,
-        plan_mode_restriction_names, reconcile_terminal_stream_projection,
-        record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
-        request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
-        stream_event_requires_ordered_delivery, user_intent_stream_event,
+        SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, accumulated_control_duration_ms,
+        authoritative_provider_surface_report, derive_turn_interaction_mode,
+        emit_final_output_ready, emit_ordered_control_event_with_backpressure,
+        permission_mode_change_audit_event, plan_mode_restriction_names,
+        reconcile_terminal_stream_projection, record_remote_applied_user_intents,
+        recovered_agent_fanout_completion_event, request_allowlist_restriction_names,
+        retain_ordered_stream_event_in_queue, stream_event_requires_ordered_delivery,
+        user_intent_stream_event,
     };
 
     #[test]
@@ -2352,6 +2514,7 @@ mod tests {
         emit_final_output_ready(
             Some(&tx),
             &mut std::collections::VecDeque::new(),
+            &mut None,
             &mut pending_publication,
             &mut deferred,
         )
@@ -2406,6 +2569,7 @@ mod tests {
         emit_final_output_ready(
             Some(&tx),
             &mut pending,
+            &mut None,
             &mut pending_publication,
             &mut deferred,
         )
@@ -2430,11 +2594,12 @@ mod tests {
         let mut pending_publication = None;
         let mut deferred = None;
 
-        let delivered = tokio::time::timeout(
+        let (delivered, _) = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
             emit_final_output_ready(
                 Some(&tx),
                 &mut pending,
+                &mut None,
                 &mut pending_publication,
                 &mut deferred,
             ),
@@ -2473,11 +2638,12 @@ mod tests {
         let mut pending_publication = Some(publication);
         let mut deferred = Some("answer suffix".to_string());
 
-        let delivered = tokio::time::timeout(
+        let (delivered, _) = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
             emit_final_output_ready(
                 Some(&tx),
                 &mut pending,
+                &mut None,
                 &mut pending_publication,
                 &mut deferred,
             ),
@@ -2507,10 +2673,15 @@ mod tests {
                 handle: "artifact://session/explain-analyze/reconcile".into(),
             },
         };
+        let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
+            events: Vec::new(),
+            delivery_degraded: true,
+        };
         let pending = std::collections::VecDeque::new();
-        let delivered = reconcile_terminal_stream_projection(
+        let (delivered, snapshot_delivered) = reconcile_terminal_stream_projection(
             tx,
             pending,
+            Some(snapshot),
             Some(publication.clone()),
             Some("answer suffix".into()),
             Some("display warning".into()),
@@ -2518,9 +2689,17 @@ mod tests {
         .await;
 
         assert!(delivered);
+        assert!(snapshot_delivered);
         assert!(matches!(
             rx.recv().await,
             Some(StreamEvent::StatusLine(message)) if message == "display warning"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded: true,
+            }) if events.is_empty()
         ));
         assert!(matches!(
             rx.recv().await,
@@ -2534,6 +2713,48 @@ mod tests {
             rx.recv().await,
             Some(StreamEvent::AssistantOutputSettled)
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_reconciliation_marks_snapshot_failure_before_settlement() {
+        use crate::cli::chat_stream::StreamEvent;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(StreamEvent::StatusLine("renderer paused".into()))
+            .expect("queue fixture");
+        let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
+            events: Vec::new(),
+            delivery_degraded: false,
+        };
+        let reconciliation = tokio::spawn(reconcile_terminal_stream_projection(
+            tx,
+            std::collections::VecDeque::new(),
+            Some(snapshot),
+            None,
+            None,
+            None,
+        ));
+
+        // The first bounded attempt expires while the receiver is paused.
+        // Once it resumes, the fallback gap marker must arrive before the
+        // settled barrier; the consumer can therefore persist an incomplete
+        // report instead of freezing the live subset as complete.
+        tokio::time::sleep(TERMINAL_STREAM_DRAIN_TIMEOUT + Duration::from_millis(100)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::StatusLine(text)) if text == "renderer paused"
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::ExplainAnalyzeGap)
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::AssistantOutputSettled)
+        ));
+        let (settled, snapshot_delivered) = reconciliation.await.expect("reconciliation task");
+        assert!(settled);
+        assert!(!snapshot_delivered);
     }
 
     #[tokio::test]
@@ -2577,10 +2798,15 @@ mod tests {
                 handle: "artifact://session/explain-analyze/bridge".into(),
             },
         };
+        let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
+            events: Vec::new(),
+            delivery_degraded: true,
+        };
         let pending = std::collections::VecDeque::new();
         let reconciliation = tokio::spawn(reconcile_terminal_stream_projection(
             stream_tx.clone(),
             pending,
+            Some(snapshot),
             Some(publication.clone()),
             Some("answer suffix".into()),
             Some("display warning".into()),
@@ -2593,17 +2819,29 @@ mod tests {
         );
 
         let mut warning_seen = false;
+        let mut snapshot_seen = false;
         let mut publication_seen = false;
         let mut answer_seen = false;
         let mut settled_seen = false;
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !(warning_seen && publication_seen && answer_seen && settled_seen) {
+            while !(warning_seen
+                && snapshot_seen
+                && publication_seen
+                && answer_seen
+                && settled_seen)
+            {
                 let Some(event) = tui_rx.recv().await else {
                     panic!("bridge closed before terminal reconciliation completed");
                 };
                 match event {
                     TuiAppEvent::StatusLine(text) if text == "display warning" => {
                         warning_seen = true;
+                    }
+                    TuiAppEvent::ExplainAnalyzeSnapshot {
+                        events,
+                        delivery_degraded: true,
+                    } if events.is_empty() => {
+                        snapshot_seen = true;
                     }
                     TuiAppEvent::SystemInfo(text)
                         if text.contains("artifact://session/explain-analyze/bridge") =>
@@ -2620,10 +2858,9 @@ mod tests {
         })
         .await
         .expect("foreground drain should unblock reconciliation before close");
-        assert!(
-            reconciliation.await.expect("reconciliation task"),
-            "bridge should accept every terminal projection"
-        );
+        let (delivered, snapshot_delivered) = reconciliation.await.expect("reconciliation task");
+        assert!(delivered, "bridge should accept every terminal projection");
+        assert!(snapshot_delivered);
 
         // This models the actual turn owner ordering: only after terminal
         // state has reached the bridge is receiver admission closed.

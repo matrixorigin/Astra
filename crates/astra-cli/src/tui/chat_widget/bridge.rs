@@ -133,6 +133,13 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::SystemWarning(msg) => Some(AppEvent::wire(WireEvent::SystemWarning(msg))),
         TuiAppEvent::SystemInfo(msg) => Some(AppEvent::wire(WireEvent::SystemInfo(msg))),
         TuiAppEvent::ExplainAnalyze(fact) => Some(AppEvent::wire(WireEvent::ExplainAnalyze(fact))),
+        TuiAppEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => Some(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        })),
         TuiAppEvent::ExplainAnalyzeGap => Some(AppEvent::wire(WireEvent::ExplainAnalyzeGap)),
         TuiAppEvent::VerdictReport(items) => Some(AppEvent::wire(WireEvent::VerdictReport(items))),
         TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),

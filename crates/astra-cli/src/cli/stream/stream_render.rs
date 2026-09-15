@@ -889,7 +889,7 @@ fn persist_scoped_allow_rule(
 /// Synchronous callers are limited to lifecycle edges and destructor-time
 /// snapshots. They must never block a Tokio worker; bounded-queue saturation
 /// is observable and durable state remains authoritative.
-fn try_send_stream_event(tx: &chat_stream::StreamEventTx, event: chat_stream::StreamEvent) {
+fn try_send_stream_event(tx: &chat_stream::StreamEventTx, event: chat_stream::StreamEvent) -> bool {
     if let Err(error) = tx.try_send(event) {
         // Never enqueue a warning into the same queue that just rejected the
         // original event: under saturation that warning is lost too and gives
@@ -899,7 +899,9 @@ fn try_send_stream_event(tx: &chat_stream::StreamEventTx, event: chat_stream::St
         // explicit to telemetry without blocking a Tokio worker or spawning an
         // unbounded retry task.
         tracing::error!(%error, "bounded stream projection dropped a lifecycle event");
+        return false;
     }
+    true
 }
 
 fn apply_approval_memory_action(
@@ -1280,6 +1282,15 @@ struct CliSseStreamHost<'a> {
     /// exchange can coordinate its delivery. This is intentionally bounded:
     /// a run has at most one canonical Explain Analyze publication.
     pending_reliable_stream_event: Option<chat_stream::StreamEvent>,
+    /// Complete canonical Explain Analyze facts held outside the lossy
+    /// observation lane until the terminal output boundary. A live TUI can
+    /// therefore repair dropped fact events before freezing its graph.
+    pending_explain_analyze_snapshot: Option<chat_stream::StreamEvent>,
+    /// A typed Explain Analyze observation was sampled because the
+    /// interactive queue was full/closed. The terminal accumulator remains
+    /// authoritative, but this marker forces a repair snapshot even when the
+    /// live observer saw no fact at all.
+    explain_analyze_observer_gap: bool,
     /// Once token observation starts falling behind, retain the remaining
     /// answer suffix in order. It is sent immediately before
     /// `AssistantOutputSettled`, allowing the TUI to reconcile a complete
@@ -1703,6 +1714,8 @@ impl<'a> CliSseStreamHost<'a> {
             stream_event_sink: ctx.stream_event_sink,
             stream_json_exchange: None,
             pending_reliable_stream_event: None,
+            pending_explain_analyze_snapshot: None,
+            explain_analyze_observer_gap: false,
             deferred_token_projection: None,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
@@ -3304,13 +3317,18 @@ impl CliSseStreamHost<'_> {
             self.emit_stream_event(event).await;
             return;
         }
-        // There is only one canonical publication per run. If the queue is
-        // still full when a later outcome arrives (for example a durable
-        // unavailable record followed by a successful recovery), retain the
-        // latest outcome instead of dropping it or allowing it to overtake
-        // the earlier pending result.
-        if self.pending_reliable_stream_event.is_some() {
-            self.pending_reliable_stream_event = Some(event.clone());
+        let slot = match &event {
+            chat_stream::StreamEvent::ExplainAnalyzeSnapshot { .. } => {
+                &mut self.pending_explain_analyze_snapshot
+            }
+            _ => &mut self.pending_reliable_stream_event,
+        };
+        // There is at most one canonical value of each terminal kind per
+        // exchange. If the queue is still full when a later value arrives,
+        // retain the latest value in its own slot instead of dropping it or
+        // allowing publication and capture repair to overwrite each other.
+        if slot.is_some() {
+            *slot = Some(event.clone());
             if let Some(sink) = &self.stream_event_sink {
                 sink.send(event);
             }
@@ -3320,15 +3338,45 @@ impl CliSseStreamHost<'_> {
             match tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                    self.pending_reliable_stream_event = Some(event);
+                    *slot = Some(event);
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                    *slot = Some(event);
                     tracing::error!("reliable terminal stream event receiver closed");
                 }
             }
         }
         if let Some(sink) = &self.stream_event_sink {
             sink.send(event);
+        }
+    }
+
+    /// Try to put one retained terminal event back into the interactive
+    /// channel without waiting on a potentially unread receiver. Keeping the
+    /// value on Full/Closed lets the outer turn owner reconcile it before the
+    /// TUI bridge closes.
+    fn try_flush_reliable_stream_event_slot(
+        tx: Option<&chat_stream::StreamEventTx>,
+        slot: &mut Option<chat_stream::StreamEvent>,
+    ) {
+        let Some(event) = slot.take() else {
+            return;
+        };
+        let Some(tx) = tx else {
+            *slot = Some(event);
+            return;
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                *slot = Some(event);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                *slot = Some(event);
+                tracing::error!(
+                    "reliable terminal stream event receiver closed before terminal delivery"
+                );
+            }
         }
     }
 
@@ -3363,6 +3411,35 @@ impl CliSseStreamHost<'_> {
             }
             if let Some(sink) = &self.stream_event_sink {
                 sink.send(chat_stream::StreamEvent::Token(text));
+            }
+            return;
+        }
+        // Explain Analyze facts are live observations, but dropping one must
+        // leave an integrity marker outside the same lossy queue. The
+        // terminal accumulator can repair the projection; if that repair
+        // cannot be delivered, the outer turn owner reports it as incomplete
+        // before freezing the TUI transcript.
+        if matches!(
+            event,
+            chat_stream::StreamEvent::ExplainAnalyze(_)
+                | chat_stream::StreamEvent::ExplainAnalyzeGap
+        ) {
+            let mut dropped = false;
+            if let Some(tx) = self.stream_event_tx.as_ref() {
+                if tx.capacity() <= RELIABLE_STREAM_EVENT_RESERVE {
+                    tracing::debug!(
+                        "bounded Explain Analyze observation sampled; terminal repair required"
+                    );
+                    dropped = true;
+                } else if !try_send_stream_event(tx, event.clone()) {
+                    dropped = true;
+                }
+            }
+            if dropped {
+                self.explain_analyze_observer_gap = true;
+            }
+            if let Some(sink) = &self.stream_event_sink {
+                sink.send(event);
             }
             return;
         }
@@ -4380,32 +4457,44 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 unresolved.join(", ")
             ));
         }
+        // The accumulator is the canonical source for Explain Analyze. Emit
+        // one bounded repair snapshot after `[DONE]` has been observed and
+        // before the exchange/settlement boundary. Live fact events remain
+        // non-blocking, while this snapshot is retained outside that lossy
+        // lane until the consumer can apply the complete set.
+        if self.explain_analyze_enabled
+            && (self.explain_analyze_observer_gap
+                || !accum.explain_analyze_events.is_empty()
+                || accum.explain_analyze_degraded)
+        {
+            self.emit_reliable_stream_event(chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events: accum.explain_analyze_events.clone(),
+                delivery_degraded: accum.explain_analyze_degraded,
+            })
+            .await;
+        }
         let result = match self.stream_json_exchange.as_mut() {
             Some(exchange) => exchange.finish(accum),
             None => Ok(()),
         };
         if result.is_ok() {
-            if let Some(event) = self.pending_reliable_stream_event.take() {
-                if let Some(tx) = &self.stream_event_tx {
-                    match tx.try_send(event) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                            // The caller captures this slot in TurnResult and
-                            // gives the outer turn owner one more reconciliation
-                            // point. Never await an unread interactive queue here.
-                            self.pending_reliable_stream_event = Some(event);
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
-                            self.pending_reliable_stream_event = Some(event);
-                            tracing::error!(
-                                "reliable terminal stream event receiver closed before publication delivery"
-                            );
-                        }
-                    }
-                } else {
-                    self.pending_reliable_stream_event = Some(event);
-                }
+            // Snapshot precedes publication so a TUI repairs its graph before
+            // rendering the artifact notice. Each slot remains independent if
+            // the channel has no room for both values.
+            Self::try_flush_reliable_stream_event_slot(
+                self.stream_event_tx.as_ref(),
+                &mut self.pending_explain_analyze_snapshot,
+            );
+            if self.pending_explain_analyze_snapshot.is_none() {
+                // The canonical snapshot has entered the consumer queue (or
+                // the direct stream path had no retained slot), so this
+                // physical exchange's observer gap is now repairable.
+                self.explain_analyze_observer_gap = false;
             }
+            Self::try_flush_reliable_stream_event_slot(
+                self.stream_event_tx.as_ref(),
+                &mut self.pending_reliable_stream_event,
+            );
             // State is scoped to one physical SSE exchange and may be cleared
             // only after the exchange's terminal contract has been validated.
             self.server_tool_calls.clear();
@@ -6717,6 +6806,9 @@ pub(crate) struct TurnResult {
     /// queue without waiting. The outer turn owner may reconcile it after the
     /// stream host has returned; it is never silently discarded here.
     pub(crate) pending_reliable_stream_event: Option<chat_stream::StreamEvent>,
+    /// Complete canonical Explain Analyze facts retained outside the lossy
+    /// observer lane. The outer turn owner reconciles this before settlement.
+    pub(crate) pending_explain_analyze_snapshot: Option<chat_stream::StreamEvent>,
     /// Answer suffix held after token observation backpressure. It is emitted
     /// before `AssistantOutputSettled` by the Server-admission host.
     pub(crate) deferred_token_projection: Option<String>,
@@ -6748,6 +6840,7 @@ impl TurnResult {
             callback_failure_run_id: None,
             output_transport_failure: None,
             pending_reliable_stream_event: None,
+            pending_explain_analyze_snapshot: None,
             deferred_token_projection: None,
         }
     }
@@ -8441,6 +8534,7 @@ pub(crate) async fn consume_turn_sse(
         refreshed_token,
         output_transport_failure,
         pending_reliable_stream_event,
+        pending_explain_analyze_snapshot,
         deferred_token_projection,
     ) = if let Some(mut ctx) = edge {
         // The stream owns a child scope even when the caller supplies a
@@ -8465,7 +8559,7 @@ pub(crate) async fn consume_turn_sse(
         if host.render.md.is_none() {
             host.render.lines_written = pre_clear_lines;
         }
-        let (result, _abort) = consume_sse_stream_cancellable(
+        let (mut result, abort) = consume_sse_stream_cancellable(
             &mut byte_stream,
             &mut host,
             idle,
@@ -8473,6 +8567,18 @@ pub(crate) async fn consume_turn_sse(
             None,
         )
         .await;
+        if explain_analyze_enabled && abort.is_some() {
+            // An interrupted physical stream cannot establish complete
+            // Explain Analyze coverage. Mark that fact explicitly and emit a
+            // terminal snapshot even when the accumulator is empty, so a
+            // TUI that saw only a live prefix never freezes it as complete.
+            result.accum.explain_analyze_degraded = true;
+            host.emit_reliable_stream_event(chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events: result.accum.explain_analyze_events.clone(),
+                delivery_degraded: true,
+            })
+            .await;
+        }
         let lw = host.render.lines_written;
         let md = host.render.md.take();
         let pending = std::mem::take(&mut host.xml_tag_buffer);
@@ -8490,6 +8596,7 @@ pub(crate) async fn consume_turn_sse(
         let refreshed_token = (host.token != original_token).then(|| host.token.clone());
         let output_transport_failure = host.output_transport_failure;
         let pending_reliable_stream_event = host.pending_reliable_stream_event.take();
+        let pending_explain_analyze_snapshot = host.pending_explain_analyze_snapshot.take();
         let deferred_token_projection = host.deferred_token_projection.take();
         (
             result,
@@ -8504,6 +8611,7 @@ pub(crate) async fn consume_turn_sse(
             refreshed_token,
             output_transport_failure,
             pending_reliable_stream_event,
+            pending_explain_analyze_snapshot,
             deferred_token_projection,
         )
     } else {
@@ -8539,6 +8647,7 @@ pub(crate) async fn consume_turn_sse(
             None,
             None,
             None,
+            None,
         )
     };
     apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
@@ -8566,6 +8675,7 @@ pub(crate) async fn consume_turn_sse(
         callback_failure_run_id,
         output_transport_failure,
         pending_reliable_stream_event,
+        pending_explain_analyze_snapshot,
         deferred_token_projection,
     };
     sanitize_final_stream_text(&mut result);
@@ -9875,6 +9985,10 @@ mod tests {
         .await
         .expect("full TUI observation queue must not block")
         .expect("valid Explain Analyze event is accepted");
+        assert!(
+            host.explain_analyze_observer_gap,
+            "a dropped typed fact must retain an integrity marker outside the lossy queue"
+        );
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
@@ -9920,8 +10034,65 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
                 .await
                 .expect("reliable publication forwarding timeout"),
+            Some(chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded: false,
+            }) if events.is_empty()
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("reliable publication forwarding timeout"),
             Some(chat_stream::StreamEvent::ArtifactPublication(outcome))
                 if outcome == publication
+        ));
+
+        // The lossy live lane may have dropped one or more typed facts while
+        // the renderer was busy. The terminal accumulator still owns the
+        // canonical set; `[DONE]` must retain and later deliver that snapshot
+        // before settlement instead of allowing the local graph to look
+        // complete from a partial live suffix.
+        let canonical_fact = super::explain_analyze_event_from_server_event(&event)
+            .expect("the fixture is a canonical Explain Analyze fact");
+        for _ in 0..8 {
+            fill_tx
+                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .expect("test queue accepts the snapshot saturation fixture");
+        }
+        let canonical_accum = ChatTurnSseAccum {
+            stream_complete: true,
+            explain_analyze_events: vec![canonical_fact.clone()],
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            host.on_sse_done(&canonical_accum),
+        )
+        .await
+        .expect("canonical snapshot emission must not block an unread queue")
+        .expect("canonical snapshot closes the exchange");
+        assert!(matches!(
+            host.pending_explain_analyze_snapshot.as_ref(),
+            Some(chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded: false,
+            }) if events == &vec![canonical_fact.clone()]
+        ));
+        for _ in 0..8 {
+            assert!(matches!(
+                rx.recv().await,
+                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+            ));
+        }
+        host.on_sse_done(&canonical_accum)
+            .await
+            .expect("snapshot is flushed once the renderer catches up");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded: false,
+            }) if events == vec![canonical_fact]
         ));
 
         // A receiver can remain alive while the interactive queue is fully

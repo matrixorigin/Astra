@@ -98,6 +98,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
@@ -139,6 +140,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {

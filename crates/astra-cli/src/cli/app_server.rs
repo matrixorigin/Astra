@@ -1077,6 +1077,16 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             );
             Some(("turn/explainAnalyze", params))
         }
+        StreamEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => Some((
+            "turn/explainAnalyzeSnapshot",
+            serde_json::json!({
+                "events": events,
+                "deliveryDegraded": delivery_degraded,
+            }),
+        )),
         StreamEvent::ExplainAnalyzeGap => Some((
             "turn/explainAnalyzeGap",
             serde_json::json!({"recovered": false}),

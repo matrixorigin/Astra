@@ -100,6 +100,7 @@ async fn try_retry_after_session_not_found(
             input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
             session_id: &session_id,
             semantic_query_override: dispatch.semantic_query_override,
+            explain_analyze_terminal_degraded: dispatch.ctx.explain_analyze_terminal_degraded,
         },
     })
     .await;
@@ -133,6 +134,7 @@ async fn try_retry_after_auth_refresh(
             input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
             session_id: dispatch.session_id,
             semantic_query_override: dispatch.semantic_query_override,
+            explain_analyze_terminal_degraded: dispatch.ctx.explain_analyze_terminal_degraded,
         },
     })
     .await;
@@ -193,6 +195,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {

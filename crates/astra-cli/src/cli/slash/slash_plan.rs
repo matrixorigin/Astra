@@ -94,6 +94,7 @@ pub(crate) async fn handle_plan_command(
             api,
             profile,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         },
     )
     .await?;

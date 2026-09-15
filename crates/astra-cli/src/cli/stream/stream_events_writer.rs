@@ -344,6 +344,14 @@ fn event_to_json(event: &StreamEvent) -> String {
             }
             value
         }
+        StreamEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => serde_json::json!({
+            "type": "explain_analyze_snapshot",
+            "events": events,
+            "delivery_degraded": delivery_degraded,
+        }),
         StreamEvent::ExplainAnalyzeGap => serde_json::json!({
             "type": "stream_gap",
             "explain_analyze_recovered": false,

@@ -479,6 +479,13 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             TuiAppEvent::PermissionAutoApproved { tool, reason }
         }
         StreamEvent::ExplainAnalyze(event) => TuiAppEvent::ExplainAnalyze(event),
+        StreamEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => TuiAppEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        },
         StreamEvent::ArtifactPublication(outcome) => match outcome.result {
             astra_turn_types::ArtifactPublicationResult::Published { .. } => {
                 TuiAppEvent::SystemInfo(outcome.user_notice())
@@ -634,6 +641,21 @@ mod tests {
         assert!(matches!(
             map_stream_event(StreamEvent::ExplainAnalyzeGap),
             Some(TuiAppEvent::ExplainAnalyzeGap)
+        ));
+    }
+
+    #[test]
+    fn explain_analyze_snapshot_maps_to_the_tui_repair_event() {
+        let fact = explain_analyze_event();
+        assert!(matches!(
+            map_stream_event(StreamEvent::ExplainAnalyzeSnapshot {
+                events: vec![fact],
+                delivery_degraded: true,
+            }),
+            Some(TuiAppEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded: true,
+            }) if events.len() == 1 && events[0].event_id == "clock-1:1"
         ));
     }
 

@@ -15,7 +15,7 @@ pub(crate) use agentic_loop_turn::{
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use astra_core::RuntimeLimits;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -726,10 +726,12 @@ pub(crate) async fn stream_chat_sse(
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx.clone(),
+        explain_analyze_terminal_degraded: p.explain_analyze_terminal_degraded,
         stream_json_emitter: p.stream_json_emitter.clone(),
         pending_ordered_stream_events: std::collections::VecDeque::new(),
         last_artifact_publication: None,
         pending_artifact_publication: None,
+        pending_explain_analyze_snapshot: None,
         deferred_token_projection: None,
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
@@ -1133,6 +1135,42 @@ pub(crate) async fn stream_chat_sse(
             .map(|failure| failure.message().to_string()),
     };
     if let Some(error) = loop_failure {
+        // A failed logical turn does not reach the normal final-output hook,
+        // but the TUI may already have rendered a lossy Explain Analyze
+        // prefix. Repair that projection from the accumulated canonical facts
+        // before the caller publishes TurnError; otherwise the prefix can be
+        // frozen as a complete local report or disappear silently.
+        if p.explain != crate::ExplainMode::Off
+            && (!state.telemetry.explain_analyze_events.is_empty()
+                || state.telemetry.explain_analyze_degraded)
+        {
+            let snapshot = StreamEvent::ExplainAnalyzeSnapshot {
+                events: state.telemetry.explain_analyze_events.clone(),
+                // A logical failure leaves coverage/settlement unresolved even
+                // when the last physical exchange itself had no stream gap.
+                delivery_degraded: true,
+            };
+            if let Some(tx) = p.stream_event_tx.clone() {
+                let delivered = tokio::time::timeout(Duration::from_secs(2), tx.send(snapshot))
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                if !delivered {
+                    if let Some(marker) = p.explain_analyze_terminal_degraded {
+                        marker.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    tracing::error!(
+                        "Explain Analyze snapshot could not reach the TUI before TurnError"
+                    );
+                }
+            } else {
+                if let Some(marker) = p.explain_analyze_terminal_degraded {
+                    marker.store(true, std::sync::atomic::Ordering::Release);
+                }
+                tracing::error!(
+                    "Explain Analyze snapshot was unavailable because the structured stream receiver is not attached"
+                );
+            }
+        }
         if let Some(slot) = &mut p.deferred_tool_activations {
             **slot = state.deferred_tool_activations.clone();
         }

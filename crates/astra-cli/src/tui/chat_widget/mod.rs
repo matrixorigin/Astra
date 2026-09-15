@@ -165,6 +165,10 @@ pub(crate) enum WireEvent {
     /// System-level informational message. Rendered as `SystemCell::info` in scrollback.
     SystemInfo(String),
     ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    ExplainAnalyzeSnapshot {
+        events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+        delivery_degraded: bool,
+    },
     ExplainAnalyzeGap,
     VerdictReport(Vec<crate::VerdictEvent>),
     /// Structured compaction event — renders as a system info cell
@@ -1715,6 +1719,20 @@ pub(crate) struct ChatWidget {
     explain_analyze_capture_pending: bool,
     /// Transport coverage for the active Explain Analyze projection.
     explain_analyze_delivery_degraded: bool,
+    /// A live observer fact or gap has not yet been confirmed by the
+    /// terminal canonical snapshot for the current logical turn. This is a
+    /// recoverable projection condition: a later snapshot can repair it.
+    explain_analyze_snapshot_pending: bool,
+    /// A server-reported Explain Analyze stream gap is visible immediately
+    /// in the live lane, but is cleared when a canonical snapshot repairs the
+    /// projection. This is intentionally separate from sticky integrity
+    /// failures carried by a snapshot.
+    explain_analyze_live_gap: bool,
+    /// Whether the current logical turn has received its terminal canonical
+    /// Explain Analyze snapshot. This is kept separate from the durable
+    /// degradation bit so a stalled/closed stream cannot freeze a lossy
+    /// prefix as a complete report.
+    explain_analyze_snapshot_confirmed: bool,
     /// Whether Explain Analyze detail rows are expanded for the current UI
     /// mode. The measured graph itself is identical for `on` and `verbose`;
     /// only the presentation detail level changes.
@@ -1799,6 +1817,9 @@ impl ChatWidget {
             explain_analyze_events: Vec::new(),
             explain_analyze_capture_pending: false,
             explain_analyze_delivery_degraded: false,
+            explain_analyze_snapshot_pending: false,
+            explain_analyze_live_gap: false,
+            explain_analyze_snapshot_confirmed: false,
             explain_analyze_verbose: false,
             explain_analyze_live_rows: 5,
             active_tool_use_id: None,
@@ -2514,15 +2535,15 @@ impl ChatWidget {
                 graph,
                 width,
                 rows.min(u16::from(self.explain_analyze_live_rows)),
-                self.explain_analyze_delivery_degraded,
+                self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap,
                 self.explain_analyze_verbose,
             ))
-        } else if self.explain_analyze_delivery_degraded {
+        } else if self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap {
             Some(ExplainAnalyzeCell::live_lines(
                 &Default::default(),
                 width,
                 rows.min(u16::from(self.explain_analyze_live_rows)),
-                true,
+                self.explain_analyze_delivery_degraded || self.explain_analyze_live_gap,
                 self.explain_analyze_verbose,
             ))
         } else {
@@ -2532,7 +2553,17 @@ impl ChatWidget {
 
     fn commit_explain_analyze_projection(&mut self) {
         let capture_pending = std::mem::take(&mut self.explain_analyze_capture_pending);
-        let delivery_degraded = std::mem::take(&mut self.explain_analyze_delivery_degraded);
+        let snapshot_pending = std::mem::take(&mut self.explain_analyze_snapshot_pending);
+        let snapshot_confirmed = std::mem::take(&mut self.explain_analyze_snapshot_confirmed);
+        let live_gap = std::mem::take(&mut self.explain_analyze_live_gap);
+        // A live fact/gap is only a projection. If its terminal canonical
+        // confirmation never arrived, the report must remain explicitly
+        // incomplete even when the local prefix happens to contain a finished
+        // looking node. Canonical integrity failures are sticky across all
+        // physical SSE rounds in the logical turn.
+        let delivery_degraded = std::mem::take(&mut self.explain_analyze_delivery_degraded)
+            || live_gap
+            || (capture_pending && snapshot_pending && !snapshot_confirmed);
         if !capture_pending
             && self.explain_analyze_projection.is_none()
             && self.explain_analyze_events.is_empty()
@@ -2822,9 +2853,15 @@ impl ChatWidget {
             WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
             WireEvent::SystemInfo(msg) => self.on_system_info(msg),
             WireEvent::ExplainAnalyze(fact) => self.on_explain_analyze(fact),
+            WireEvent::ExplainAnalyzeSnapshot {
+                events,
+                delivery_degraded,
+            } => self.on_explain_analyze_snapshot(events, delivery_degraded),
             WireEvent::ExplainAnalyzeGap => {
                 self.explain_analyze_capture_pending = true;
-                self.explain_analyze_delivery_degraded = true;
+                self.explain_analyze_snapshot_pending = true;
+                self.explain_analyze_snapshot_confirmed = false;
+                self.explain_analyze_live_gap = true;
             }
             WireEvent::VerdictReport(items) => self.on_verdict_report(items),
             WireEvent::Compaction(event) => {
@@ -4145,11 +4182,68 @@ impl ChatWidget {
     fn on_explain_analyze(&mut self, fact: astra_turn_types::ExplainAnalyzeEventV1) {
         if fact.is_valid() {
             self.explain_analyze_capture_pending = true;
+            self.explain_analyze_snapshot_pending = true;
+            self.explain_analyze_snapshot_confirmed = false;
             self.explain_analyze_events.push(fact.clone());
             self.explain_analyze_projection
                 .get_or_insert_with(Default::default)
                 .apply(fact);
         }
+    }
+
+    fn on_explain_analyze_snapshot(
+        &mut self,
+        events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+        delivery_degraded: bool,
+    ) {
+        // The terminal snapshot is authoritative for the facts it carries.
+        // Merge by event id because one logical turn can span several
+        // physical SSE exchanges around Edge tool rounds; replacing the
+        // previous snapshot would discard an earlier round. A later snapshot
+        // can still repair a lossy live suffix because conflicting ids are
+        // replaced and the graph is rebuilt from this canonical set.
+        let mut canonical = std::mem::take(&mut self.explain_analyze_events);
+        let mut positions = HashSet::with_capacity(canonical.len() + events.len());
+        for fact in &canonical {
+            positions.insert(fact.event_id.clone());
+        }
+        let mut by_id = std::collections::HashMap::with_capacity(canonical.len());
+        for (index, fact) in canonical.iter().enumerate() {
+            by_id.insert(fact.event_id.clone(), index);
+        }
+        let mut snapshot_degraded = delivery_degraded;
+        for fact in events {
+            if !fact.is_valid() {
+                snapshot_degraded = true;
+                continue;
+            }
+            if let Some(index) = by_id.get(&fact.event_id).copied() {
+                if canonical[index] != fact {
+                    snapshot_degraded = true;
+                    canonical[index] = fact;
+                }
+            } else if positions.insert(fact.event_id.clone()) {
+                by_id.insert(fact.event_id.clone(), canonical.len());
+                canonical.push(fact);
+            }
+        }
+        let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+        for fact in &canonical {
+            graph.apply(fact.clone());
+        }
+        self.explain_analyze_events = canonical;
+        self.explain_analyze_projection = Some(graph);
+        // A terminal snapshot confirms the current live projection, so a
+        // recoverable observer gap can be cleared here. Integrity failures
+        // carried by a canonical snapshot are different: once observed in
+        // any physical SSE round they remain sticky for the whole logical
+        // turn and cannot be erased by a later healthy round.
+        self.explain_analyze_snapshot_pending = false;
+        self.explain_analyze_live_gap = false;
+        self.explain_analyze_snapshot_confirmed = true;
+        self.explain_analyze_capture_pending =
+            !self.explain_analyze_events.is_empty() || snapshot_degraded;
+        self.explain_analyze_delivery_degraded |= snapshot_degraded;
     }
 
     fn on_verdict_report(&mut self, items: Vec<VerdictEvent>) {
@@ -4779,6 +4873,130 @@ mod tests {
     }
 
     #[test]
+    fn terminal_explain_snapshot_replaces_lossy_live_suffix_before_freeze() {
+        let mut widget = fresh();
+        let started = explain_turn_start();
+        let finished = explain_turn_finish();
+
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(started.clone())));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeGap));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![started],
+            delivery_degraded: false,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![finished],
+            delivery_degraded: false,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let explain = widget
+            .history
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<ExplainAnalyzeCell>())
+            .expect("the canonical snapshot should freeze an Explain Analyze cell");
+        let frozen = history_cell_text(explain, 100);
+        assert!(frozen.contains("User turn"), "{frozen}");
+        assert!(
+            frozen.contains("End recorded") || frozen.contains("15ms"),
+            "the terminal finish fact must be retained: {frozen}"
+        );
+        assert!(!frozen.contains("incomplete"), "{frozen}");
+        assert!(
+            !frozen.contains("stream gap"),
+            "stale live gap leaked: {frozen}"
+        );
+    }
+
+    #[test]
+    fn explain_snapshot_integrity_failure_is_sticky_across_physical_rounds() {
+        let mut widget = fresh();
+        let started = explain_turn_start();
+        let finished = explain_turn_finish();
+
+        // The first physical exchange has an unrepairable canonical gap. A
+        // later healthy exchange must add facts without clearing that
+        // logical-turn integrity marker.
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![started],
+            delivery_degraded: true,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![finished],
+            delivery_degraded: false,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let explain = widget
+            .history
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<ExplainAnalyzeCell>())
+            .expect("the canonical snapshot should freeze an Explain Analyze cell");
+        let frozen = history_cell_text(explain, 100);
+        assert!(
+            frozen.contains("incomplete"),
+            "a later healthy physical round cannot erase an earlier integrity gap: {frozen}"
+        );
+        assert!(
+            frozen.contains("End recorded") || frozen.contains("15ms"),
+            "the later round's facts still belong in the report: {frozen}"
+        );
+    }
+
+    #[test]
+    fn later_live_round_invalidates_an_earlier_snapshot_confirmation() {
+        let mut widget = fresh();
+        let started = explain_turn_start();
+        let finished = explain_turn_finish();
+
+        // A healthy first physical exchange confirms its snapshot. A later
+        // live fact starts a new logical projection obligation; if that
+        // exchange loses both its snapshot and gap marker, TurnComplete must
+        // still freeze the report as incomplete.
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![started],
+            delivery_degraded: false,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(finished)));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let explain = widget
+            .history
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<ExplainAnalyzeCell>())
+            .expect("the live graph should remain visible at turn end");
+        let frozen = history_cell_text(explain, 100);
+        assert!(
+            frozen.contains("incomplete"),
+            "an earlier physical snapshot cannot confirm a later live suffix: {frozen}"
+        );
+        assert!(
+            frozen.contains("End recorded") || frozen.contains("15ms"),
+            "the later live fact remains visible even though the capture is incomplete: {frozen}"
+        );
+    }
+
+    #[test]
+    fn missing_terminal_explain_snapshot_freezes_as_incomplete() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(
+            explain_turn_start(),
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+        let explain = widget
+            .history
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<ExplainAnalyzeCell>())
+            .expect("the live Explain Analyze prefix should remain visible");
+        let frozen = history_cell_text(explain, 100);
+        assert!(
+            frozen.contains("incomplete"),
+            "without terminal canonical confirmation the report must stay incomplete: {frozen}"
+        );
+    }
+
+    #[test]
     fn deferred_token_reconciliation_reaches_the_final_tui_answer() {
         let mut widget = fresh();
         widget.handle_event(AppEvent::wire(WireEvent::AnswerDelta("prefix ".into())));
@@ -4840,6 +5058,10 @@ mod tests {
         widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyze(
             explain_turn_finish(),
         )));
+        widget.handle_event(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events: vec![explain_turn_start(), explain_turn_finish()],
+            delivery_degraded: false,
+        }));
         widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
 
         let store = astra_services::local_session_artifact_store();

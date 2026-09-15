@@ -38,6 +38,7 @@ pub(crate) struct TurnExecutionInput<'a> {
     /// provisional or display-only identity.
     pub(crate) session_id: &'a str,
     pub(crate) semantic_query_override: Option<&'a str>,
+    pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) struct TurnExecutionRequest<'a> {
@@ -138,6 +139,7 @@ fn build_turn_stream_params<'a>(
         input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
         session_id: Some(input.session_id),
+        explain_analyze_terminal_degraded: input.explain_analyze_terminal_degraded,
         offering_id: crate::cli::slash::slash_config::active_offering_id_for_request(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
@@ -440,6 +442,7 @@ mod tests {
                 input_runtime_volatile_texts: &[],
                 session_id: &session_id,
                 semantic_query_override: None,
+                explain_analyze_terminal_degraded: None,
             },
             &prepared,
         );
@@ -553,6 +556,7 @@ mod tests {
                 input_runtime_volatile_texts: &[],
                 session_id: "sess-1",
                 semantic_query_override: None,
+                explain_analyze_terminal_degraded: None,
             },
             &prepared,
         );

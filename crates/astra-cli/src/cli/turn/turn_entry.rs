@@ -141,6 +141,9 @@ pub(crate) struct TurnContext<'a> {
     /// callers leave this empty and await their own derived projections.
     pub(crate) post_commit_tx:
         Option<tokio::sync::mpsc::Sender<super::turn_post_commit::TurnPostCommitJob>>,
+    /// Shared outer-turn marker used to keep a TUI Explain Analyze projection
+    /// incomplete when terminal repair cannot reach its stream consumer.
+    pub(crate) explain_analyze_terminal_degraded: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
@@ -330,6 +333,7 @@ pub(crate) async fn handle_chat_input_with_ui(
             input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
             session_id: &session_id,
             semantic_query_override: None,
+            explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
     })
     .await;
@@ -437,6 +441,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
             input_runtime_volatile_texts: &[],
             session_id: &session_id,
             semantic_query_override: Some(user_intent.as_str()),
+            explain_analyze_terminal_degraded: ctx.explain_analyze_terminal_degraded,
         },
     })
     .await;
@@ -582,6 +587,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 
@@ -593,6 +599,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         handle_chat_input_with_ui(
             "hi".to_string(),
@@ -679,6 +686,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 
@@ -713,6 +721,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
 

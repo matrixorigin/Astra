@@ -6032,6 +6032,12 @@ pub(crate) async fn run_tui_session(
                                     // still draining its final transport events.
                                     let mut foreground_lifecycle_transferred = false;
                                     let mut deferred_active_bg_notifications = Vec::new();
+                                    // The host normally reports Explain Analyze repair through
+                                    // the ordered stream. Keep one outer-turn bit as a final
+                                    // integrity backstop for the case where both the canonical
+                                    // snapshot and its gap marker miss a saturated/closed lane.
+                                    let explain_analyze_terminal_degraded =
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                                     let (turn_tx, turn_stream_bridge_control) =
                                         stream_bridge::create_controlled_per_turn_bridge(
@@ -6088,6 +6094,9 @@ pub(crate) async fn run_tui_session(
                                             api,
                                             profile,
                                             post_commit_tx: Some(turn_post_commit_tx.clone()),
+                                            explain_analyze_terminal_degraded: Some(
+                                                explain_analyze_terminal_degraded.as_ref(),
+                                            ),
                                         };
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
                                         // Authentication is part of the polled turn future, not
@@ -7204,6 +7213,7 @@ pub(crate) async fn run_tui_session(
                                                         !matches!(
                                                             &ae,
                                                             TuiAppEvent::ExplainAnalyze(_)
+                                                                | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
                                                                 | TuiAppEvent::ExplainAnalyzeGap
                                                         )
                                                             || explain_mode_observes_graph(
@@ -7728,6 +7738,14 @@ pub(crate) async fn run_tui_session(
 
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
+                                    // The host's outer terminal result proves that the canonical
+                                    // Explain Analyze repair was not delivered. Route the same
+                                    // typed gap reducer used by the stream so a direct
+                                    // TurnComplete cannot freeze a lossy prefix as complete.
+                                    apply_terminal_explain_analyze_degraded_marker(
+                                        &mut chat_widget,
+                                        explain_analyze_terminal_degraded.as_ref(),
+                                    );
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                     set_bash_background_hint_enabled(
                                         &mut chat_widget,
@@ -9209,6 +9227,7 @@ fn handle_app_event(
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainAnalyze(_)
+        | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
         | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
@@ -9268,6 +9287,21 @@ fn event_may_have_committed_work_graph(event: &TuiAppEvent) -> bool {
     matches!(event, TuiAppEvent::WorkTaskBoardUpdate(_))
 }
 
+/// Apply an outer host terminal-integrity result before the direct turn
+/// completion reducer runs. The marker is deliberately consumed exactly once;
+/// stream-delivered ExplainAnalyzeGap events remain idempotent if both paths
+/// report the same loss.
+fn apply_terminal_explain_analyze_degraded_marker(
+    chat_widget: &mut chat_widget::ChatWidget,
+    marker: &std::sync::atomic::AtomicBool,
+) {
+    if marker.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ExplainAnalyzeGap,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9311,6 +9345,33 @@ mod tests {
         ));
         let event = TuiAppEvent::ExplainAnalyze(explain_analyze_fact());
         assert!(matches!(event, TuiAppEvent::ExplainAnalyze(_)));
+    }
+
+    #[test]
+    fn outer_explain_integrity_marker_downgrades_direct_completion() {
+        let mut widget = chat_widget::ChatWidget::new("");
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::ExplainAnalyze(explain_analyze_fact()),
+        ));
+        let marker = std::sync::atomic::AtomicBool::new(true);
+
+        apply_terminal_explain_analyze_degraded_marker(&mut widget, &marker);
+        assert!(!marker.load(std::sync::atomic::Ordering::Acquire));
+        widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::TurnComplete(Box::default()),
+        ));
+
+        let rendered = widget
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(100))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(
+            rendered.contains("incomplete"),
+            "outer terminal loss must remain visible at direct completion: {rendered}"
+        );
     }
 
     #[test]

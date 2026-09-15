@@ -105,6 +105,12 @@ pub(crate) enum TuiAppEvent {
     SystemInfo(String),
     /// One canonical measured Explain Analyze fact from the active run stream.
     ExplainAnalyze(astra_turn_types::ExplainAnalyzeEventV1),
+    /// Terminal canonical Explain Analyze snapshot used to repair any lossy
+    /// live projection before the turn is considered settled.
+    ExplainAnalyzeSnapshot {
+        events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
+        delivery_degraded: bool,
+    },
     /// Explain Analyze facts were truncated by an unrecovered stream gap.
     ExplainAnalyzeGap,
     VerdictReport(Vec<crate::VerdictEvent>),
