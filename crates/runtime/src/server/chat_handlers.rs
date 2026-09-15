@@ -1561,7 +1561,7 @@ mod chat_stream_lifecycle_tests {
             post(|| async {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "upstream echoed Bearer abc and abc".to_string(),
+                    "upstream echoed Bearer astra-chat-runtime-secret-9f3c1d and astra-chat-runtime-secret-9f3c1d".to_string(),
                 )
             }),
         );
@@ -1597,7 +1597,7 @@ mod chat_stream_lifecycle_tests {
                                 "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391"
                             },
                             "runtime_auth": {
-                                "authorization": "Bearer abc"
+                                "authorization": "Bearer astra-chat-runtime-secret-9f3c1d"
                             }
                         }"#,
                     ))
@@ -1617,8 +1617,8 @@ mod chat_stream_lifecycle_tests {
             "unexpected SSE body: {text}"
         );
         assert!(text.contains("[REDACTED]"));
-        assert!(!text.contains("Bearer abc"));
-        assert!(!text.contains("abc"));
+        assert!(!text.contains("Bearer astra-chat-runtime-secret-9f3c1d"));
+        assert!(!text.contains("astra-chat-runtime-secret-9f3c1d"));
         assert!(!text.contains("\"type\":\"session_info\""));
         server.abort();
     }

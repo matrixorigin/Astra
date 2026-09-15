@@ -154,6 +154,58 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+/// Keep the final settlement boundary aware of execution outcomes that may be
+/// hidden by a compacted or very long tool history. This is evidence only: it
+/// does not decide whether the user goal is blocked, and it does not constrain
+/// the tools available before settlement.
+fn settlement_tool_outcome_evidence(state: &AgenticLoopState) -> Value {
+    let executed = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.was_executed())
+        .count();
+    let failed = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.was_executed() && !record.ok)
+        .count();
+    let rejected = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| {
+            record.effective_disposition()
+                == astra_services::session_journal::ToolCallDisposition::Rejected
+        })
+        .count();
+    let latest_failure = state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .find(|record| {
+            (record.was_executed() && !record.ok)
+                || record.effective_disposition()
+                    == astra_services::session_journal::ToolCallDisposition::Rejected
+        })
+        .map(|record| {
+            serde_json::json!({
+                "tool": record.name,
+                "error_kind": record.error_kind.map(|kind| format!("{kind:?}")),
+                "disposition": format!("{:?}", record.effective_disposition()),
+            })
+        });
+
+    serde_json::json!({
+        "tool_calls_completed": executed,
+        "tool_calls_failed": failed,
+        "tool_calls_rejected": rejected,
+        "latest_failure": latest_failure,
+    })
+}
+
 fn apply_judged_turn_intent_to_observability(
     state: &AgenticLoopState,
     intent: &TurnIntent,
@@ -2719,6 +2771,7 @@ fn begin_budget_settlement_for_work_state(
         && super::execution_phase::completion_action_window_is_batchable(state, &action)
         && !matches!(action, super::host::CompletionAction::CompletionTaskAction)
     {
+        let tool_outcome_evidence = settlement_tool_outcome_evidence(state);
         // Reserve exactly one matching completion action and one closing
         // boundary. For an active Work attempt the second boundary is the
         // canonical settle_work_item operation; otherwise it is final text.
@@ -2749,6 +2802,7 @@ fn begin_budget_settlement_for_work_state(
                 ),
                 "declarations_may_remain_visible_for_cache": true,
                 "execution_authority": "one_matching_action",
+                "evidence": tool_outcome_evidence,
                 "instruction": if active_work_attempt {
                     "Perform exactly one action matching the declared completion obligation, then settle the currently owned WorkItem truthfully with settle_work_item. Do not resume ordinary exploration or request an unrelated tool."
                 } else {
@@ -2768,10 +2822,11 @@ fn begin_budget_settlement_for_work_state(
     state.remaining_turns = state.remaining_turns.saturating_add(1);
     state.hooks.completion_settlement.text_only = !active_work_attempt;
     state.budget_wrapup_injected = !active_work_attempt;
+    let tool_outcome_evidence = settlement_tool_outcome_evidence(state);
     let instruction = if active_work_attempt {
-        "Exploration is no longer making sufficient progress. Settle the currently owned WorkItem now with its truthful typed outcome (delivered, blocked, or failed). Do not request any other tool, create tasks, or delegate work."
+        "Exploration is no longer making sufficient progress. Settle the currently owned WorkItem now with its truthful typed outcome (delivered, blocked, or failed). Account for failed or rejected tool calls when they remain relevant, and state any evidence limitation they create. Do not request any other tool, create tasks, or delegate work."
     } else {
-        "The bounded tool-execution slice is complete. Answer the user now from the evidence already gathered. Do not narrate this runtime boundary, request tools, create tasks, delegate work, or promise a future action (for example, `I will run` or `let me check`). If requested work remains, state it as unfinished rather than describing it as about to happen."
+        "The bounded tool-execution slice is complete. Answer the user now from the evidence already gathered, mentioning failed or rejected tool calls when they remain relevant and stating any evidence limitation they create. Do not narrate this runtime boundary, request tools, create tasks, delegate work, or promise a future action (for example, `I will run` or `let me check`). If requested work remains, state it as unfinished rather than describing it as about to happen."
     };
     state.push_volatile_payload(
         super::host::VolatileKind::FinalAnswerSettlement,
@@ -2785,6 +2840,7 @@ fn begin_budget_settlement_for_work_state(
             "execution_authority": if active_work_attempt { "one_matching_action" } else { "none" },
             "evidence": {
                 "tool_calls_completed": completed_tool_calls(state),
+                "tool_outcomes": tool_outcome_evidence,
                 "rounds_completed": current_agentic_step(state),
             },
             "instruction": instruction,
@@ -5269,6 +5325,29 @@ mod tests {
             "policy feedback is an alert; concrete recent progress still earns a bounded slice"
         );
         assert!(!state.hooks.completion_settlement.text_only);
+    }
+
+    #[test]
+    fn settlement_evidence_keeps_failed_and_rejected_calls_visible() {
+        let mut state = make_state();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "read_file".into(),
+            ok: false,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        });
+
+        let evidence = settlement_tool_outcome_evidence(&state);
+        assert_eq!(evidence["tool_calls_completed"], 1);
+        assert_eq!(evidence["tool_calls_failed"], 1);
+        assert_eq!(evidence["tool_calls_rejected"], 1);
+        assert_eq!(evidence["latest_failure"]["tool"], "read_file");
     }
 
     #[test]

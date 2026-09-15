@@ -1308,13 +1308,17 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
         return String::new();
     }
-    // Informational only — the model can see the pattern and decide whether
-    // to batch or continue sequentially. No prescriptive language.
+    // This remains advisory — the model still decides whether a dependency
+    // requires sequential execution. Make the next action explicit enough to
+    // survive a long read-only investigation without turning a useful
+    // sequential dependency into a false batching requirement.
     format!(
         "\n\n## Sequential Tool Calls Detected\n\
-         Last {streak} rounds each ran one tool. Consider batching independent \
-         calls (different files, greps, reads) into a single parallel round \
-         when they don't depend on each other's output.\n"
+         Last {streak} rounds each ran one tool. For the next round, group \
+         already-known independent reads/searches (for example, different files \
+         or unrelated greps) into one round of parallel tool calls. Keep a call \
+         sequential when its input depends on the previous result; if no new \
+         evidence is needed, synthesize from the evidence already collected.\n"
     )
 }
 
@@ -2075,6 +2079,35 @@ mod tests {
         let (g_batch, s_batch) = tool_round_guidance_trace(&batch_msgs, 0);
         assert!(g_batch.contains("2 tools executed in parallel"));
         assert!(s_batch.parallel_feedback);
+    }
+
+    #[test]
+    fn batching_nudge_survives_runtime_context_between_single_tool_rounds() {
+        let mut messages = Vec::new();
+        for index in 0..PARALLEL_BATCHING_NUDGE_THRESHOLD {
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": format!("call-{index}")}],
+            }));
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "content": format!("evidence-{index}"),
+            }));
+            // Server-owned required context is interleaved before the next
+            // provider response. It must not make the history look like the
+            // single-tool streak ended.
+            messages.push(astra_turn_types::runtime_owned_message(
+                "user",
+                format!("runtime frame {index}"),
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ));
+        }
+
+        let (guidance, signals) = tool_round_guidance_trace(&messages, 0);
+        assert!(signals.parallel_batching_nudge);
+        assert!(guidance.contains("For the next round, group"));
+        assert!(guidance.contains("Keep a call sequential"));
     }
 
     #[test]
