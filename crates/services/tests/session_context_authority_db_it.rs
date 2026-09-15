@@ -1,11 +1,11 @@
 mod common;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use astra_services::{
-    AcquireWriterOutcome, BeginSessionExecutionSwitchV1, DatabaseSessionContextCoordinator,
-    ReserveTurnOutcome, SessionContextCoordinator, SessionContextCoordinatorError,
-    SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+    AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
+    DatabaseSessionContextCoordinator, ReserveTurnOutcome, SessionContextCoordinator,
+    SessionContextCoordinatorError, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -273,6 +273,128 @@ async fn execution_binding_is_owner_scoped_fenced_and_quiescent_per_session() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
+    let pool = common::setup_pool().await;
+    let suffix = Uuid::new_v4();
+    let owner_id = format!("execution-race-owner-{suffix}");
+    let session_id = format!("execution-race-session-{suffix}");
+    let key = SessionKeyV1::owner_session("server", &owner_id, &session_id, "main");
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let initial =
+        SessionExecutionBindingV1::server_work_default(format!("session:{session_id}:branch:main"));
+    coordinator
+        .load_or_initialize_execution_binding(&key, &initial)
+        .await
+        .expect("initialize execution binding");
+
+    let actor = ActorContextV1::owner_user(
+        &owner_id,
+        "execution-race-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let mut switching = initial.clone();
+    switching.generation = 2;
+    switching.state = SessionExecutionBindingStateV1::Switching;
+
+    // Both paths start together.  The coordinator locks the canonical
+    // Session head before checking the binding, so exactly one can cross the
+    // admission/switch boundary and the other must observe the durable result.
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let switch_coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let reserve_coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let reserve_task_coordinator = reserve_coordinator.clone();
+    let switch_barrier = Arc::clone(&barrier);
+    let reserve_barrier = Arc::clone(&barrier);
+    let switch_key = key.clone();
+    let reserve_key = key.clone();
+    let switch = async move {
+        switch_barrier.wait().await;
+        switch_coordinator
+            .compare_and_swap_execution_binding(&switch_key, 1, &switching)
+            .await
+    };
+    let reserve = async move {
+        reserve_barrier.wait().await;
+        reserve_task_coordinator
+            .acquire_writer_and_reserve_turn(
+                &reserve_key,
+                None,
+                &actor,
+                Duration::from_secs(30),
+                "execution-race-writer",
+                "execution-race-turn",
+                Some(1),
+            )
+            .await
+    };
+    let (switch_result, reserve_result) = tokio::join!(switch, reserve);
+
+    let switch_won = switch_result.is_ok();
+    let reserve_won = matches!(
+        &reserve_result,
+        Ok(AcquireWriterAndReserveTurnOutcome::Ready { .. })
+    );
+    assert_eq!(
+        usize::from(switch_won) + usize::from(reserve_won),
+        1,
+        "one and only one path may cross the binding fence: switch={switch_result:?}; reserve={reserve_result:?}"
+    );
+    match (switch_result, reserve_result) {
+        (
+            Ok(binding),
+            Err(SessionContextCoordinatorError::ExecutionBindingFenced {
+                expected: 1,
+                current: Some(2),
+            }),
+        ) => {
+            assert_eq!(binding.generation, 2);
+            assert_eq!(binding.state, SessionExecutionBindingStateV1::Switching);
+        }
+        (
+            Err(SessionContextCoordinatorError::ExecutionBindingBusy),
+            Ok(AcquireWriterAndReserveTurnOutcome::Ready { lease, .. }),
+        ) => {
+            reserve_coordinator
+                .release_writer(&lease)
+                .await
+                .expect("release race fixture writer");
+            let current = coordinator
+                .load_execution_binding(&key)
+                .await
+                .expect("load binding after race")
+                .expect("binding after race");
+            assert_eq!(current, initial);
+        }
+        (switch_result, reserve_result) => panic!(
+            "unexpected switch/admission race outcome: switch={switch_result:?}; reserve={reserve_result:?}"
+        ),
+    }
+
+    for table in [
+        "session_execution_switches",
+        "session_execution_workspace_claims",
+        "session_execution_bindings",
+        "session_context_operation_receipts",
+        "session_context_authority_events",
+        "session_context_heads",
+    ] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?"
+        ))
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean execution race fixture");
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn execution_read_is_non_mutating_during_an_active_turn() {
     let pool = common::setup_pool().await;
     let suffix = Uuid::new_v4().to_string();
@@ -456,18 +578,28 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
             status: Some(astra_services::runs::ExecutorStatusRequest::Online),
         },
     };
-    let source = edge_binding(
+    let source_switching = edge_binding(
         2,
+        SessionExecutionBindingStateV1::Switching,
+        "edge-source",
+        "/workspace/source",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&key, 1, &source_switching)
+        .await
+        .expect("prepare source Edge");
+    let source = edge_binding(
+        3,
         SessionExecutionBindingStateV1::Ready,
         "edge-source",
         "/workspace/source",
     );
     coordinator
-        .compare_and_swap_execution_binding(&key, 1, &source)
+        .compare_and_swap_execution_binding(&key, 2, &source)
         .await
-        .expect("bind source Edge");
+        .expect("confirm source Edge");
     let target = edge_binding(
-        3,
+        4,
         SessionExecutionBindingStateV1::Switching,
         "edge-target",
         "/workspace/target",
@@ -489,7 +621,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
                 request_id: "switch-request".into(),
                 operation_id: "switch-operation".into(),
                 controller_attachment_id: attachment.attachment_id.clone(),
-                expected_generation: 2,
+                expected_generation: 3,
                 target,
                 source_evidence: evidence.clone(),
             },
@@ -514,16 +646,16 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         failed.state,
         astra_services::SessionExecutionSwitchStateV1::Failed
     );
-    assert_eq!(failed.completed_generation, Some(4));
+    assert_eq!(failed.completed_generation, Some(5));
 
     let retried = coordinator
-        .retry_execution_switch(&key, &begun.operation_id, &attachment.attachment_id, 4)
+        .retry_execution_switch(&key, &begun.operation_id, &attachment.attachment_id, 5)
         .await
         .expect("retry failed switch");
     assert_eq!(retried.attempt, 2);
-    assert_eq!(retried.expected_generation, 2);
-    assert_eq!(retried.attempt_expected_generation, 4);
-    assert_eq!(retried.switching_generation, 5);
+    assert_eq!(retried.expected_generation, 3);
+    assert_eq!(retried.attempt_expected_generation, 5);
+    assert_eq!(retried.switching_generation, 6);
     assert!(
         coordinator
             .load_execution_switch(&key, &begun.operation_id)
@@ -548,7 +680,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         completed.state,
         astra_services::SessionExecutionSwitchStateV1::Succeeded
     );
-    assert_eq!(completed.completed_generation, Some(6));
+    assert_eq!(completed.completed_generation, Some(7));
 
     let duplicate = coordinator
         .begin_execution_switch(
@@ -557,9 +689,9 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
                 request_id: "switch-request".into(),
                 operation_id: "switch-operation-replay".into(),
                 controller_attachment_id: attachment.attachment_id.clone(),
-                expected_generation: 2,
+                expected_generation: 3,
                 target: edge_binding(
-                    3,
+                    4,
                     SessionExecutionBindingStateV1::Switching,
                     "edge-target",
                     "/workspace/target",
@@ -687,23 +819,35 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         }
     };
 
-    let work_edge = edge_binding(
+    let mut work_preparing = edge_binding(
         &work_initial.logical_workspace_id,
         2,
         "edge-shared",
         "materialization-shared-device",
     );
+    work_preparing.state = SessionExecutionBindingStateV1::Switching;
     coordinator
-        .compare_and_swap_execution_binding(&work_key, 1, &work_edge)
+        .compare_and_swap_execution_binding(&work_key, 1, &work_preparing)
+        .await
+        .expect("the first Session prepares the checkout");
+    let work_edge = edge_binding(
+        &work_initial.logical_workspace_id,
+        3,
+        "edge-shared",
+        "materialization-shared-device",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&work_key, 2, &work_edge)
         .await
         .expect("the first Session claims the checkout");
 
-    let ordinary_edge = edge_binding(
+    let mut ordinary_edge = edge_binding(
         &ordinary_initial.logical_workspace_id,
         2,
         "edge-renamed",
         "materialization-shared-device",
     );
+    ordinary_edge.state = SessionExecutionBindingStateV1::Switching;
     let error = coordinator
         .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_edge)
         .await
@@ -723,14 +867,25 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
     );
 
-    let other_device_edge = edge_binding(
+    let mut other_device_preparing = edge_binding(
         &other_device_initial.logical_workspace_id,
         2,
         "edge-other-device",
         "materialization-independent-device",
     );
+    other_device_preparing.state = SessionExecutionBindingStateV1::Switching;
     coordinator
-        .compare_and_swap_execution_binding(&other_device_key, 1, &other_device_edge)
+        .compare_and_swap_execution_binding(&other_device_key, 1, &other_device_preparing)
+        .await
+        .expect("an independent device may prepare the same path");
+    let other_device_edge = edge_binding(
+        &other_device_initial.logical_workspace_id,
+        3,
+        "edge-other-device",
+        "materialization-independent-device",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&other_device_key, 2, &other_device_edge)
         .await
         .expect("an independent device may materialize the same path");
 
@@ -738,25 +893,48 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     // claim and install the new one in the same transaction. The old checkout
     // is then available to a different Session without a transient self-
     // conflict from the per-Session unique claim key.
+    let mut work_preparing = edge_binding(
+        &work_initial.logical_workspace_id,
+        4,
+        "edge-other-device",
+        "materialization-handoff-device",
+    );
+    work_preparing.state = SessionExecutionBindingStateV1::Switching;
+    let switched = coordinator
+        .compare_and_swap_execution_binding(&work_key, 3, &work_preparing)
+        .await
+        .expect("the Session can prepare another materialization");
+    assert_eq!(switched.generation, 4);
     let work_switching = edge_binding(
         &work_initial.logical_workspace_id,
-        3,
+        5,
         "edge-other-device",
         "materialization-handoff-device",
     );
     let switched = coordinator
-        .compare_and_swap_execution_binding(&work_key, 2, &work_switching)
+        .compare_and_swap_execution_binding(&work_key, 4, &work_switching)
         .await
         .expect("the Session can move its claim to another materialization");
-    assert_eq!(switched.generation, 3);
-    let ordinary_reclaim = edge_binding(
+    assert_eq!(switched.generation, 5);
+    let mut ordinary_reclaim = edge_binding(
         &ordinary_initial.logical_workspace_id,
         2,
         "edge-reclaimed",
         "materialization-shared-device",
     );
+    ordinary_reclaim.state = SessionExecutionBindingStateV1::Switching;
     coordinator
         .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_reclaim)
+        .await
+        .expect("the old materialization can be prepared after the handoff");
+    let ordinary_reclaim = edge_binding(
+        &ordinary_initial.logical_workspace_id,
+        3,
+        "edge-reclaimed",
+        "materialization-shared-device",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_reclaim)
         .await
         .expect("the old materialization is released after the handoff");
 

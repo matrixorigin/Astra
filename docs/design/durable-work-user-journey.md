@@ -105,9 +105,12 @@ in-flight model loop. The next Work turn uses the same Server-owned Session,
 branch, and task graph. Cross-Edge automatic recovery of an active Run is a
 separate, later capability.
 
-The first release supports a target **first-party, unscoped** Edge only when it
-already has a verified, clean materialization of the same logical workspace,
-repository identity, ref, and committed tree. Provider-scoped Edge
+The first release supports **Edge-to-Edge** transfer only. The current source
+must already be an authenticated first-party, unscoped Edge, and the target
+must have a verified, clean materialization of the same logical workspace,
+repository identity, ref, and committed tree. A Server binding cannot be
+converted through this handoff action because there is no source Edge
+materialization or attestation to prove. Provider-scoped Edge
 registrations belong to the provider-authorized runtime path and are not exposed
 as native Work handoff targets because their scope is request authority. The
 user commits or saves changes on the source Edge before switching; Astra does
@@ -124,9 +127,12 @@ facts captured for this Work's relevant invocations and workspace revision
 must be acknowledged; a busy shared Edge must not block on unrelated Sessions.
 The prior binding is fenced for this selected Session/workspace scope, while
 the same Edge may continue serving unrelated Sessions. Before the binding
-commit, cancellation can abort with no change. After commit, cancellation may
-block future execution, but it does not restore the old binding. The target
-must confirm the logical workspace and tree before a new Run is admitted.
+commit, an abandoned preflight leaves the current provider unchanged. There is
+no user-visible execution-switch cancel endpoint after the switch request is
+admitted: a browser or Edge disconnect leaves the durable operation to recover
+or retry. After commit, cancellation may block future execution, but it does
+not restore the old binding. The target must confirm the logical workspace and
+tree before a new Run is admitted.
 
 Reuse the existing provider, workspace, Run, invocation, and Work branch
 control ownership contracts; do not create a second Work-level or per-UI writer
@@ -142,9 +148,9 @@ The user-visible states are:
 
 | State | User sees | Safe action |
 | --- | --- | --- |
-| Ready | Current Edge and last verified workspace revision | Continue or choose a target |
+| Ready | Current provider and last verified workspace revision | Continue or choose a target |
 | Run in progress | This Run must finish, or be explicitly stopped, before switching | Wait or stop this Run |
-| Checking target | Identity, capabilities, repository, and workspace are being checked | Cancel before switching starts |
+| Checking target | Identity, capabilities, repository, and workspace are being checked | Leave and retry; no durable provider change has been committed |
 | Source preparation required | Commit changes on the current Edge and prepare a clean matching workspace on the target, then retry | Keep the current provider; do not start another Run |
 | Switching | The provider binding generation is changing between Run generations | Wait for target confirmation |
 | Ready on target | New provider binding and workspace hash are confirmed | Continue on this Work |
@@ -201,6 +207,14 @@ lane must record connection-pool waits and query latency. Deployments above this
 profile need measured fanout or event delivery instead of assuming the polling
 rate is free.
 
+The reproducible read lane is
+`scripts/load/work_surface_capacity_probe.py --profile cross-surface-100`. It
+uses Work and branch identifier templates plus one access token per owner,
+records bounded projection latency and response sizes, and can pair every read
+with a foreign-owner request that must return not-found. Run it against the
+same deployment window as database, API, browser, and Edge metrics; a dry run
+prints the 25-owner/four-Session mapping without contacting the service.
+
 Each authenticated read and mutation is scoped by the resolved principal and
 workspace authority. A foreign owner receives the same not-found behavior as a
 missing Work. Runs in different Sessions must not share cursors, attachments,
@@ -227,7 +241,7 @@ workspace safe.
 | Source Edge lost during a tool call | Preserve ambiguous side effects as unresolved; do not replay until the invocation ledger proves retry safety |
 | Source stops before binding commit | Keep the old binding authoritative or show the last confirmed provider/revision |
 | Target validation fails after binding commit | Keep the prior Edge fenced for this binding, preserve evidence, and show `Needs attention` |
-| Cancel races with transfer | Before binding commit, cancel without changing provider; after commit, keep the new binding but admit no execution until resumed |
+| Disconnect or cancel races with transfer | Before binding commit, an abandoned preflight leaves the current provider unchanged; after commit, keep the new binding and admit no execution until resumed |
 | Transfer races with a new Run | Serialize at canonical admission or binding compare-and-swap; exactly one transition wins |
 | Different Sessions share a checkout | Serialize conflicting workspace mutations or require isolated worktrees |
 | DB or event service degraded | Show last confirmed revision and staleness; retry with bounded backoff |
@@ -264,6 +278,8 @@ workspace safe.
   point. There is no configured Web deep link yet.
 - TUI `/work execution` reads the current Work binding, authoritative provider
   generation, and a bounded target directory without blocking the render loop.
+  It is a read-only diagnostic surface; provider switching and retry are
+  initiated from the Web Work card (or an equivalent explicit API client).
   It captures the session identity at submission, cancels stale reads when a
   session is rebound, and keeps target-directory failure separate from the
   current placement so the user can still diagnose the next write.
@@ -311,14 +327,19 @@ workspace safe.
 - Work creation/promotion is owner-scoped and idempotent; foreign-owner reads
   return not-found. Runtime DB tests cover preserving the existing Session,
   multiple read attachments, and exactly one winner among concurrent writers.
+  The public Work execution/turn regression also proves that a persisted Edge
+  binding is carried into Web admission without exposing the internal Session
+  id; it does not claim a live Edge relay or socket dispatch.
 - Edge registration, capability advertisement, connected-provider routing, and
-  the Work-to-Edge switch API/Web flow exist. The switch is fail-closed when
+  the Edge-to-Edge switch API/Web flow exist. The switch is fail-closed when
   either materialization lacks an authenticated identity/root, when the source or
   target attestation changes, or when another Session claims the same physical
   checkout. Live database and real Edge cross-surface tests remain opt-in; the
   checked-in offline contracts cover request identity, target bounds, stale
-  generations, and the TUI read path. Automatic Server Run-owner recovery is
-  still not a production consumer.
+  generations, and the TUI read path. A Server binding has no source Edge
+  materialization, so Server-to-Edge conversion is outside this handoff
+  contract. Automatic Server Run-owner recovery is still not a production
+  consumer.
 
 The current implementation status and owning contracts are tracked in the
 [runtime lifecycle](runtime-lifecycle.md), [durable runs](durable-agent-runs.md),

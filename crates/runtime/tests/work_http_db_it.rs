@@ -352,6 +352,9 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("session_handoffs", "owner_user_id"),
         ("session_attachments", "owner_user_id"),
         ("session_handoff_slots", "owner_user_id"),
+        ("session_execution_switches", "owner_user_id"),
+        ("session_execution_workspace_claims", "owner_user_id"),
+        ("session_execution_bindings", "owner_user_id"),
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),
         ("work_branch_deletion_operations", "owner_id"),
@@ -1262,6 +1265,29 @@ async fn post_work_turn(
         .map(|json| serde_json::from_str(json).expect("SSE data JSON"))
         .collect();
     (status, events, raw)
+}
+
+async fn get_work_execution(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!(
+            "/v1/works/{work_id}/branches/{branch_id}/execution"
+        ))
+        .header("authorization", format!("Bearer {user_id}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .body(body::Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 16 * 1024)
+        .await
+        .expect("bounded execution response");
+    let value = serde_json::from_slice(&bytes).expect("JSON execution response");
+    (status, value)
 }
 
 async fn get_work_task_graph(
@@ -4619,6 +4645,162 @@ async fn work_turn_route_binds_server_runtime_without_exposing_internal_session(
 
     cleanup_owner(&pool, &owner_id).await;
     cleanup_owner(&pool, &other_owner_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_turn_route_uses_durable_edge_selection_without_server_override() {
+    let lifecycle = Arc::new(WorkTurnRecordingLifecycle::default());
+    let Some((app, pool)) = setup_with_run_lifecycle(lifecycle.clone()).await else {
+        return;
+    };
+    let owner_id = id("edge-turn-owner");
+    cleanup_owner(&pool, &owner_id).await;
+
+    let (create_status, created) = post_work(
+        app.clone(),
+        &owner_id,
+        serde_json::json!({
+            "request_id": "start-for-edge-turn",
+            "goal": "Continue a TUI-created Work on its durable Edge selection.",
+            "criteria": []
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "created: {created}");
+    let work_id = created["overview"]["work_id"].as_str().expect("work id");
+    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("branch id");
+
+    let (attach_status, attachment) = attach_work_branch(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "edge-turn-controller",
+    )
+    .await;
+    assert_eq!(attach_status, StatusCode::OK, "attachment: {attachment}");
+    let attachment_id = attachment["attachment_id"].as_str().expect("attachment id");
+    let (control_status, control) = post_work_control(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        serde_json::json!({
+            "request_id": "edge-turn-acquire-control",
+            "expected_branch_revision": 1,
+            "expected_writer_epoch": 0,
+            "expected_canonical_root_hash": null,
+            "command": {
+                "kind": "acquire_branch_control",
+                "attachment_id": attachment_id
+            }
+        }),
+    )
+    .await;
+    assert_eq!(control_status, StatusCode::CREATED, "control: {control}");
+    assert_eq!(control["state"], "succeeded");
+
+    let runtime_binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(
+            &WorkOwnerId::parse(&owner_id).expect("owner"),
+            &WorkId::parse(work_id).expect("work"),
+            &WorkBranchId::parse(branch_id).expect("branch"),
+        )
+        .await
+        .expect("Work runtime binding");
+    let session_id = runtime_binding.session_id.as_str();
+    let key = SessionKeyV1::owner_session("server", &owner_id, session_id, "main");
+    let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+    let edge_root = "/workspace/web-edge";
+    let edge_binding = astra_services::SessionExecutionBindingV1 {
+        schema_version: astra_services::SESSION_EXECUTION_BINDING_SCHEMA_VERSION,
+        generation: 1,
+        state: astra_services::SessionExecutionBindingStateV1::Ready,
+        logical_workspace_id: format!("session:{session_id}:branch:main"),
+        physical_workspace_id: Some(
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "materialization-web-edge",
+                edge_root,
+            ),
+        ),
+        workspace: astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+            display_name: Some("Web Edge".into()),
+            root: Some(edge_root.into()),
+            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+                path: edge_root.into(),
+            }),
+            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+        },
+        executor: astra_services::runs::ExecutorBindingRequest {
+            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+            executor_id: Some("edge-web-1".into()),
+            display_name: Some("Web Edge".into()),
+            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+        },
+    };
+    let selected = coordinator
+        .load_or_initialize_execution_binding(&key, &edge_binding)
+        .await
+        .expect("select the durable Edge provider");
+    assert_eq!(selected.generation, 1);
+
+    let (execution_status, execution) =
+        get_work_execution(app.clone(), &owner_id, work_id, branch_id).await;
+    assert_eq!(execution_status, StatusCode::OK, "execution: {execution}");
+    assert_eq!(execution["placement"], "edge");
+    assert_eq!(execution["generation"], 1);
+    assert_eq!(execution["executor_id"], "edge-web-1");
+    assert_eq!(execution["state"], "ready");
+
+    let (turn_status, events, raw) = post_work_turn(
+        app,
+        &owner_id,
+        work_id,
+        branch_id,
+        serde_json::json!({
+            "request_id": "continue-on-durable-edge",
+            "attachment_id": attachment_id,
+            "message": "Continue on the selected Edge without changing Work identity."
+        }),
+    )
+    .await;
+    assert_eq!(turn_status, StatusCode::OK, "turn: {raw}");
+    assert_eq!(events[0]["type"], "work_turn_started");
+    assert_eq!(events[0]["work_id"], work_id);
+    assert_eq!(events[0]["branch_id"], branch_id);
+    for event in &events {
+        assert_field_absent(event, "session_id");
+    }
+
+    let requests = lifecycle.requests.lock().expect("recorded request");
+    assert_eq!(requests.len(), 1);
+    let (recorded_owner, request) = &requests[0];
+    assert_eq!(recorded_owner, &owner_id);
+    assert_eq!(request.session_id.as_deref(), Some(session_id));
+    assert_eq!(request.edge_executor_id.as_deref(), Some("edge-web-1"));
+    assert_eq!(request.execution_binding_generation, Some(1));
+    assert_eq!(
+        request
+            .workspace_binding
+            .as_ref()
+            .map(|binding| binding.kind),
+        Some(astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace)
+    );
+    assert_eq!(
+        request
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.executor_id.as_deref()),
+        Some("edge-web-1")
+    );
+    assert!(!raw.contains(session_id));
+
+    cleanup_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
