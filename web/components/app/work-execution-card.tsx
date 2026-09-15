@@ -104,6 +104,72 @@ export function WorkExecutionCard({
   const mounted = useRef(true);
   const router = useRouter();
 
+  const loadExecutionState = useCallback(
+    async (generation: number, reportError = true): Promise<WorkExecutionViewV1 | null> => {
+      try {
+        const result = await loadWorkExecutionAction({ workId, branchId });
+        if (!mounted.current || operationGeneration.current !== generation) return null;
+        if (!result.ok) {
+          if (reportError) setError(actionErrorMessage(result.code ?? "execution_unavailable"));
+          return null;
+        }
+        setExecution(result.execution);
+        return result.execution;
+      } catch {
+        if (reportError && mounted.current && operationGeneration.current === generation) {
+          setError("The current execution could not be refreshed yet.");
+        }
+        return null;
+      }
+    },
+    [branchId, workId],
+  );
+
+  const hydrateOperation = useCallback(
+    async (currentExecution: WorkExecutionViewV1 | null | undefined, generation: number) => {
+      const operationId = currentExecution?.operation_id;
+      if (!operationId) {
+        if (mounted.current && operationGeneration.current === generation) setOperation(null);
+        return;
+      }
+      try {
+        const result = await observeWorkExecutionSwitchAction({ workId, branchId, operationId });
+        if (!mounted.current || operationGeneration.current !== generation) return;
+        if (!result.ok) {
+          setError(actionErrorMessage(result.code ?? "execution_switch_unavailable"));
+          return;
+        }
+        setOperation(result.operation);
+        if (result.operation.state !== "switching") {
+          if (result.operation.state === "failed") {
+            setError(actionErrorMessage(result.operation.failure_code ?? "execution_switch_failed"));
+          }
+          await loadExecutionState(generation, false);
+          return;
+        }
+        const settled = await waitForOperation(
+          workId,
+          branchId,
+          operationId,
+          () => mounted.current && operationGeneration.current === generation,
+          setOperation,
+        );
+        if (!mounted.current || operationGeneration.current !== generation) return;
+        if (settled === null) {
+          setError("The move is still recorded. Check again to see its durable result.");
+        } else if (settled.state === "failed") {
+          setError(actionErrorMessage(settled.failure_code ?? "execution_switch_failed"));
+        }
+        if (settled) await loadExecutionState(generation, false);
+      } catch {
+        if (mounted.current && operationGeneration.current === generation) {
+          setError("The durable move could not be checked yet. Refresh to try again.");
+        }
+      }
+    },
+    [branchId, loadExecutionState, workId],
+  );
+
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -116,30 +182,37 @@ export function WorkExecutionCard({
     setExecution(initialExecution ?? null);
     setTargets(null);
     setTargetsOpen(false);
+    setTargetsLoading(false);
     setOperation(null);
+    setBusy(false);
+    setRefreshing(false);
     setControllerReady(attachment?.mode === "controller");
     setError(null);
     requestId.current = null;
     controlRequestId.current = null;
-    operationGeneration.current += 1;
-  }, [attachment?.mode, branchId, initialExecution]);
+    const generation = operationGeneration.current + 1;
+    operationGeneration.current = generation;
+    void hydrateOperation(initialExecution ?? null, generation);
+  }, [attachment?.mode, branchId, hydrateOperation, initialExecution]);
 
-  const refreshExecution = useCallback(async () => {
+  const refreshExecution = useCallback(async (actionGeneration?: number) => {
+    const generation = actionGeneration ?? operationGeneration.current + 1;
+    if (actionGeneration === undefined) {
+      operationGeneration.current = generation;
+      // A refresh supersedes any in-flight target read. Its stale response
+      // must not leave the picker stuck in a loading state.
+      setTargetsLoading(false);
+    }
     setRefreshing(true);
     try {
-      const result = await loadWorkExecutionAction({ workId, branchId });
-      if (!mounted.current) return;
-      if (!result.ok) {
-        setError(actionErrorMessage(result.code ?? "execution_unavailable"));
-        return;
+      const loaded = await loadExecutionState(generation);
+      if (loaded && mounted.current && operationGeneration.current === generation) {
+        void hydrateOperation(loaded, generation);
       }
-      setExecution(result.execution);
-    } catch {
-      if (mounted.current) setError("The current execution could not be refreshed yet.");
     } finally {
-      if (mounted.current) setRefreshing(false);
+      if (mounted.current && operationGeneration.current === generation) setRefreshing(false);
     }
-  }, [branchId, workId]);
+  }, [hydrateOperation, loadExecutionState]);
 
   async function openTargets() {
     if (targetsOpen) {
@@ -148,25 +221,30 @@ export function WorkExecutionCard({
     }
     setTargetsOpen(true);
     if (targets || targetsLoading) return;
+    const generation = operationGeneration.current;
     setTargetsLoading(true);
     setError(null);
     try {
       const result = await loadWorkExecutionTargetsAction({ workId, branchId });
-      if (!mounted.current) return;
+      if (!mounted.current || operationGeneration.current !== generation) return;
       if (!result.ok) {
         setError(actionErrorMessage(result.code ?? "execution_targets_unavailable"));
         return;
       }
       setTargets(result.page);
     } catch {
-      if (mounted.current) setError("Edge targets could not be loaded. Try again when the device is online.");
+      if (mounted.current && operationGeneration.current === generation) {
+        setError("Edge targets could not be loaded. Try again when the device is online.");
+      }
     } finally {
-      if (mounted.current) setTargetsLoading(false);
+      if (mounted.current && operationGeneration.current === generation) setTargetsLoading(false);
     }
   }
 
-  async function ensureController(): Promise<boolean> {
+  async function ensureController(expectedGeneration = operationGeneration.current): Promise<boolean> {
+    const isCurrent = () => mounted.current && operationGeneration.current === expectedGeneration;
     if (controllerReady) return true;
+    if (!isCurrent()) return false;
     if (!attachment?.attachment_id || branchRevision === undefined || !controlBasis) {
       setError("Take control of this Work here before moving its execution.");
       return false;
@@ -182,7 +260,7 @@ export function WorkExecutionCard({
       expectedBranchRevision: branchRevision,
       expectedControlBasis: controlBasis,
     });
-    if (!mounted.current) return false;
+    if (!isCurrent()) return false;
     if (!result.ok) {
       setError(actionErrorMessage(result.code ?? "controller_attachment_required"));
       if (!result.retryable) controlRequestId.current = null;
@@ -191,20 +269,29 @@ export function WorkExecutionCard({
     if (result.operation.state === "pending") {
       setBusy(true);
       try {
-        const operation = await waitForControl(workId, branchId, result.operation.operation_id);
+        const operation = await waitForControl(
+          workId,
+          branchId,
+          result.operation.operation_id,
+          isCurrent,
+        );
         if (!operation || operation.state !== "succeeded") {
+          if (!isCurrent()) return false;
           setError("Control was not confirmed. The Work remains safe to view on the other device.");
           return false;
         }
       } finally {
-        setBusy(false);
+        if (isCurrent()) setBusy(false);
       }
     } else if (result.operation.state !== "succeeded") {
+      if (!isCurrent()) return false;
       setError("Control was not confirmed. The Work remains safe to view on the other device.");
       return false;
     }
-    controlRequestId.current = null;
-    setControllerReady(true);
+    if (isCurrent()) {
+      controlRequestId.current = null;
+      setControllerReady(true);
+    }
     return true;
   }
 
@@ -212,16 +299,17 @@ export function WorkExecutionCard({
     currentWorkId: string,
     currentBranchId: string,
     operationId: string,
+    isCurrent: () => boolean,
   ) {
     for (let attempt = 0; attempt < OPERATION_POLL_DELAYS_MS.length; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, OPERATION_POLL_DELAYS_MS[attempt]));
-      if (!mounted.current) return null;
+      if (!isCurrent()) return null;
       const result = await observeWorkBranchControlAction({
         workId: currentWorkId,
         branchId: currentBranchId,
         operationId,
       });
-      if (!mounted.current) return null;
+      if (!isCurrent()) return null;
       if (!result.ok) throw new Error(result.code ?? "control_unavailable");
       if (result.operation.state !== "pending") return result.operation;
     }
@@ -238,10 +326,13 @@ export function WorkExecutionCard({
     ) {
       return;
     }
+    const generation = operationGeneration.current + 1;
+    operationGeneration.current = generation;
     setBusy(true);
     setError(null);
     try {
-      if (!(await ensureController())) return;
+      if (!(await ensureController(generation))) return;
+      if (!mounted.current || operationGeneration.current !== generation) return;
       const currentRequestId =
         requestId.current ?? `web-execution-switch:${crypto.randomUUID()}`;
       requestId.current = currentRequestId;
@@ -253,15 +344,13 @@ export function WorkExecutionCard({
         expectedGeneration: execution.generation,
         targetExecutorId: executorId,
       });
-      if (!mounted.current) return;
+      if (!mounted.current || operationGeneration.current !== generation) return;
       if (!result.ok) {
         setError(actionErrorMessage(result.code ?? "execution_switch_unavailable"));
         if (!result.retryable) requestId.current = null;
         return;
       }
       setOperation(result.operation);
-      const generation = operationGeneration.current + 1;
-      operationGeneration.current = generation;
       if (result.operation.state === "switching") {
         const settled = await waitForOperation(
           workId,
@@ -270,6 +359,7 @@ export function WorkExecutionCard({
           () => mounted.current && operationGeneration.current === generation,
           setOperation,
         );
+        if (!mounted.current || operationGeneration.current !== generation) return;
         if (settled === null) {
           setError("The move is still recorded. Check again to see its durable result.");
           return;
@@ -282,19 +372,30 @@ export function WorkExecutionCard({
         setError(actionErrorMessage(result.operation.failure_code ?? "execution_switch_failed"));
         return;
       }
+      if (!mounted.current || operationGeneration.current !== generation) return;
       requestId.current = null;
       setTargetsOpen(false);
-      await refreshExecution();
-      router.refresh();
+      await refreshExecution(generation);
+      if (mounted.current) router.refresh();
     } catch {
-      if (mounted.current) setError("The move could not be confirmed. Its durable state is safe to check again.");
+      if (mounted.current && operationGeneration.current === generation) {
+        setError("The move could not be confirmed. Its durable state is safe to check again.");
+      }
     } finally {
-      if (mounted.current) setBusy(false);
+      if (mounted.current && operationGeneration.current === generation) setBusy(false);
     }
   }
 
   async function retryMove() {
-    if (busy || !operation || operation.state !== "failed" || !attachment?.attachment_id) return;
+    if (
+      busy ||
+      !operation ||
+      (operation.state !== "failed" && operation.state !== "switching") ||
+      !attachment?.attachment_id
+    )
+      return;
+    const generation = operationGeneration.current + 1;
+    operationGeneration.current = generation;
     setBusy(true);
     setError(null);
     try {
@@ -304,15 +405,13 @@ export function WorkExecutionCard({
         operationId: operation.operation_id,
         attachmentId: attachment.attachment_id,
       });
-      if (!mounted.current) return;
+      if (!mounted.current || operationGeneration.current !== generation) return;
       if (!result.ok) {
         setError(actionErrorMessage(result.code ?? "execution_switch_unavailable"));
         return;
       }
       setOperation(result.operation);
       if (result.operation.state === "switching") {
-        const generation = operationGeneration.current + 1;
-        operationGeneration.current = generation;
         const settled = await waitForOperation(
           workId,
           branchId,
@@ -320,6 +419,7 @@ export function WorkExecutionCard({
           () => mounted.current && operationGeneration.current === generation,
           setOperation,
         );
+        if (!mounted.current || operationGeneration.current !== generation) return;
         if (!settled || settled.state !== "succeeded") {
           setError("The retry is still recorded. Check again to see its durable result.");
           return;
@@ -328,13 +428,16 @@ export function WorkExecutionCard({
         setError(actionErrorMessage(result.operation.failure_code ?? "execution_switch_failed"));
         return;
       }
+      if (!mounted.current || operationGeneration.current !== generation) return;
       setOperation(null);
-      await refreshExecution();
-      router.refresh();
+      await refreshExecution(generation);
+      if (mounted.current) router.refresh();
     } catch {
-      if (mounted.current) setError("The retry could not be confirmed. The previous durable result remains available.");
+      if (mounted.current && operationGeneration.current === generation) {
+        setError("The retry could not be confirmed. The previous durable result remains available.");
+      }
     } finally {
-      if (mounted.current) setBusy(false);
+      if (mounted.current && operationGeneration.current === generation) setBusy(false);
     }
   }
 
@@ -382,11 +485,19 @@ export function WorkExecutionCard({
             <span>{operationStateLabel(operation)}</span>
             <span className="tabular-nums text-text-muted">Attempt {operation.attempt}</span>
           </div>
-          {operation.state === "failed" ? (
+          {operation.state === "failed" || operation.state === "switching" ? (
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <span className="text-danger">{operation.failure_code ?? "workspace checks did not match"}</span>
+              {operation.state === "failed" ? (
+                <span className="text-danger">
+                  {operation.failure_code ?? "workspace checks did not match"}
+                </span>
+              ) : (
+                <span className="text-text-muted">
+                  If the other device disconnected, resume the recorded move here.
+                </span>
+              )}
               <Button size="sm" onClick={() => void retryMove()} disabled={busy}>
-                {busy ? "Retrying…" : "Retry move"}
+                {busy ? "Retrying…" : operation.state === "switching" ? "Resume move" : "Retry move"}
               </Button>
             </div>
           ) : null}

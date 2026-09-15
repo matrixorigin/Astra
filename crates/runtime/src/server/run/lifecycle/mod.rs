@@ -5531,16 +5531,21 @@ impl AgenticRunLifecycleService {
                         return Err(error);
                     }
                 };
-                let reservation = match coordinator
+                let turn_idempotency_key = format!("server-run:{run_id}:turn");
+                let expected_execution_binding_generation = request
+                    .provider_runtime_authorized
+                    .then_some(0_u64)
+                    .or(request.execution_binding_generation);
+                let reservation_result = coordinator
                     .reserve_turn(
                         &active,
                         head.as_ref().map(|head| &head.cursor),
                         admission_ttl,
-                        &format!("server-run:{run_id}:turn"),
-                        request.execution_binding_generation,
+                        &turn_idempotency_key,
+                        expected_execution_binding_generation,
                     )
-                    .await
-                {
+                    .await;
+                let reservation = match reservation_result {
                     Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
                     | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => {
                         reservation
@@ -5555,6 +5560,18 @@ impl AgenticRunLifecycleService {
                     }
                     Err(error) => {
                         let _ = distributed_permit.release().await;
+                        if request.provider_runtime_authorized
+                            && matches!(
+                                &error,
+                                astra_services::SessionContextCoordinatorError::ExecutionBindingPresent { .. }
+                            )
+                        {
+                            return Err(error_response_coded(
+                                StatusCode::CONFLICT,
+                                "provider-authorized execution cannot reuse a Session with a native execution binding",
+                                "execution_binding_provider_mismatch",
+                            ));
+                        }
                         if matches!(
                             &error,
                             astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
@@ -5603,6 +5620,10 @@ impl AgenticRunLifecycleService {
                 );
                 let writer_idempotency_key = format!("server-run:{run_id}:writer");
                 let reservation_idempotency_key = format!("server-run:{run_id}:turn");
+                let expected_execution_binding_generation = request
+                    .provider_runtime_authorized
+                    .then_some(0_u64)
+                    .or(request.execution_binding_generation);
                 let acquire_and_reserve = coordinator.acquire_writer_and_reserve_turn(
                     &key,
                     head.as_ref().map(|head| &head.cursor),
@@ -5610,7 +5631,7 @@ impl AgenticRunLifecycleService {
                     admission_ttl,
                     &writer_idempotency_key,
                     &reservation_idempotency_key,
-                    request.execution_binding_generation,
+                    expected_execution_binding_generation,
                 );
                 let (distributed_result, prior_messages_result, canonical_result) = tokio::join!(
                     distributed_reservation,
@@ -5622,6 +5643,18 @@ impl AgenticRunLifecycleService {
                     Err(error) => {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
+                        }
+                        if request.provider_runtime_authorized
+                            && matches!(
+                                &error,
+                                astra_services::SessionContextCoordinatorError::ExecutionBindingPresent { .. }
+                            )
+                        {
+                            return Err(error_response_coded(
+                                StatusCode::CONFLICT,
+                                "provider-authorized execution cannot reuse a Session with a native execution binding",
+                                "execution_binding_provider_mismatch",
+                            ));
                         }
                         if matches!(
                             &error,
@@ -9153,42 +9186,77 @@ impl AgenticRunLifecycleService {
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::ExecutorBindingRequestKind::ServerLocal
         });
-        let Some(pool) = self.shared_pool.clone() else {
-            #[cfg(test)]
-            {
-                if request_is_edge {
-                    // Unit-test services do not have a durable coordinator;
-                    // retain the explicitly supplied Edge placement so tests
-                    // exercise the same no-reroute behavior as production.
-                    request.execution_binding_generation = None;
-                    return Ok(());
-                }
-                request.workspace_binding = Some(
-                    astra_services::SessionExecutionBindingV1::server_work_workspace_request(),
+
+        // Provider-authorized runtime requests arrive with an independently
+        // authenticated execution grant. They are admitted and dispatched by
+        // the provider-runtime path below; they must never be materialized as
+        // a native Session binding (which has no physical checkout identity).
+        // A Work binding would mix the two topology authorities, so reject it
+        // explicitly instead of silently dropping its durable fence.
+        if request.provider_runtime_authorized {
+            if work_binding.is_some() || request.work_binding.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "provider-authorized execution cannot be combined with a durable Work binding",
+                    "execution_binding_provider_mismatch",
+                ));
+            }
+            if let Some(pool) = self.shared_pool.clone() {
+                let key = astra_turn_types::SessionKeyV1::owner_session(
+                    "server",
+                    user_id,
+                    session_id,
+                    astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
                 );
-                request.executor_binding =
-                    Some(astra_services::SessionExecutionBindingV1::server_work_executor_request());
+                let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool);
+                if coordinator
+                    .load_execution_binding(&key)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            owner_id = %user_id,
+                            session_id = %session_id,
+                            error = %error,
+                            "failed to verify provider/native execution topology"
+                        );
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "durable Work execution selection is temporarily unavailable",
+                            "execution_binding_unavailable",
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "provider-authorized execution cannot reuse a Session with a native execution binding",
+                        "execution_binding_provider_mismatch",
+                    ));
+                }
+            }
+            request.execution_binding_generation = None;
+            return Ok(());
+        }
+
+        let Some(pool) = self.shared_pool.clone() else {
+            // A request-scoped EdgeLedger owns its callback authority in the
+            // request itself and does not need a durable native registration.
+            // Native Edge WebSocket and Work requests still require the
+            // coordinator so physical claims and generations cannot be
+            // bypassed by an in-memory host.
+            let edge_ledger = request.executor_binding.as_ref().is_some_and(|binding| {
+                binding.transport
+                    == Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger)
+            });
+            if work_binding.is_none() && (!request_is_edge || edge_ledger) {
                 request.execution_binding_generation = None;
                 return Ok(());
             }
-            #[cfg(not(test))]
-            {
-                if work_binding.is_none() && !request_is_edge {
-                    // Ordinary Sessions keep the historical unbound
-                    // execution path when this test/in-memory host has no
-                    // durable coordinator. The downstream server runtime
-                    // still supplies its own sandbox defaults when needed;
-                    // projecting a binding here would make child agents look
-                    // workspace-bound even though no durable provider exists.
-                    request.execution_binding_generation = None;
-                    return Ok(());
-                }
-                return Err(error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "durable Work execution selection is unavailable",
-                    "execution_binding_unavailable",
-                ));
-            }
+            return Err(error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable Work execution selection is unavailable",
+                "execution_binding_unavailable",
+            ));
         };
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",

@@ -34,6 +34,10 @@ const MAX_STAGED_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STAGED_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
+// Execution-binding generations are strictly positive in durable rows. Zero
+// is reserved for the internal admission expectation that no native binding
+// may exist; it is never persisted into a binding row or run snapshot.
+const NO_EXECUTION_BINDING_EXPECTATION: u64 = 0;
 const RECEIPT_HASH_DOMAIN: &[u8] = b"astra.session-coordinator-receipt.v1\0";
 const TURN_DELTA_HASH_DOMAIN: &[u8] = b"astra.canonical-turn-delta.v1\0";
 
@@ -61,6 +65,8 @@ pub enum SessionContextCoordinatorError {
         "session execution binding is fenced: expected generation {expected}, current generation {current:?}"
     )]
     ExecutionBindingFenced { expected: u64, current: Option<u64> },
+    #[error("session already has a native execution binding at generation {generation}")]
+    ExecutionBindingPresent { generation: u64 },
     #[error("session execution binding is busy with an active Run or unresolved invocation")]
     ExecutionBindingBusy,
     #[error("session execution binding is not ready: {0:?}")]
@@ -5243,6 +5249,9 @@ async fn validate_execution_binding_generation_in_tx(
     let Some(expected_generation) = expected_generation else {
         return Ok(());
     };
+    if expected_generation == NO_EXECUTION_BINDING_EXPECTATION {
+        return validate_no_execution_binding_in_tx(tx, key).await;
+    }
     let current = load_execution_binding_in_tx(tx, key, true).await?;
     let Some(current) = current else {
         return Err(SessionContextCoordinatorError::ExecutionBindingFenced {
@@ -5262,6 +5271,22 @@ async fn validate_execution_binding_generation_in_tx(
         ));
     }
     ensure_execution_workspace_claim_in_tx(tx, key, &current).await?;
+    Ok(())
+}
+
+/// Atomically assert that no native Session execution binding exists. The
+/// caller already holds the canonical Session-head lock, so this read and the
+/// writer/reservation installation share one transaction and close the race
+/// with native binding initialization.
+async fn validate_no_execution_binding_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    if let Some(current) = load_execution_binding_in_tx(tx, key, true).await? {
+        return Err(SessionContextCoordinatorError::ExecutionBindingPresent {
+            generation: current.generation,
+        });
+    }
     Ok(())
 }
 
@@ -5455,6 +5480,9 @@ fn authority_error_outcome(error: &SessionContextCoordinatorError) -> &'static s
         SessionContextCoordinatorError::IdempotencyMismatch => "idempotency_mismatch",
         SessionContextCoordinatorError::Unauthorized => "unauthorized",
         SessionContextCoordinatorError::NeedsRepair(_) => "needs_repair",
+        SessionContextCoordinatorError::ExecutionBindingPresent { .. } => {
+            "execution_binding_present"
+        }
         _ => "rejected",
     }
 }

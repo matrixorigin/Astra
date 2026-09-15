@@ -2,8 +2,7 @@ use super::*;
 use crate::server::header_utils::collect_forward_headers;
 use astra_services::runs::{
     ChatRequestData, ModelSelectionMode, RunStartIdempotency, RunStartIdempotencyKind,
-    WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest, WorkspaceAuthorityRequest,
-    WorkspaceBindingRequest, WorkspaceBindingRequestKind,
+    WorkItemRuntimeBindingRequest, WorkRuntimeBindingRequest,
 };
 use astra_services::work::{
     CriterionCommand, CriterionDefinition, CriterionId, CriterionSetRevision, CriterionStatement,
@@ -27,6 +26,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
+
+#[cfg(test)]
+use astra_services::runs::{
+    WorkspaceAuthorityRequest, WorkspaceBindingRequest, WorkspaceBindingRequestKind,
+};
 
 use astra_server_types::{
     WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkActionRequestV1, WorkActionV1,
@@ -1029,6 +1033,7 @@ pub(super) fn derive_work_creation(
     })
 }
 
+#[cfg(test)]
 fn server_owned_work_workspace_binding() -> WorkspaceBindingRequest {
     WorkspaceBindingRequest {
         kind: WorkspaceBindingRequestKind::ServerSandbox,
@@ -3466,7 +3471,7 @@ pub(super) async fn post_work_branch_turn_handler(
         )
     })?;
     let turn = derive_work_turn(&owner_id, &work_id, &branch_id, payload)?;
-    let pool = state.shared_pool.ok_or_else(|| {
+    let pool = state.shared_pool.clone().ok_or_else(|| {
         work_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "work_write_unavailable",
@@ -3475,11 +3480,8 @@ pub(super) async fn post_work_branch_turn_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let binding = repository
-        .load_branch_runtime_binding(&owner_id, &work_id, &branch_id)
-        .await
-        .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
+    let (binding, key, execution_coordinator) =
+        load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
     let coordinator = state.session_context_coordinator.clone().ok_or_else(|| {
         work_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3489,12 +3491,6 @@ pub(super) async fn post_work_branch_turn_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let key = astra_turn_types::SessionKeyV1::owner_session(
-        "server",
-        owner_id.as_str(),
-        binding.session_id.as_str(),
-        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-    );
     let handoff = astra_services::DatabaseSessionHandoffService::new(pool, coordinator);
     match handoff
         .claim_idle_controller(&key, &turn.attachment_id)
@@ -3513,6 +3509,23 @@ pub(super) async fn post_work_branch_turn_handler(
             ));
         }
     }
+    // Resolve the canonical provider selection after taking conversation
+    // control. The durable Session row is authoritative for both Server and
+    // Edge Work; the Web client never gets to project a per-turn topology.
+    // Initialization is idempotent and only creates the explicit Server
+    // default when this Work has never selected a provider.
+    let logical_workspace_id = execution_logical_workspace_id(&key);
+    let execution = execution_coordinator
+        .load_or_initialize_execution_binding(
+            &key,
+            &astra_services::SessionExecutionBindingV1::server_work_default(logical_workspace_id),
+        )
+        .await
+        .map_err(map_execution_switch_error)?;
+    let edge_executor_id = (execution.executor.kind
+        == astra_services::runs::ExecutorBindingRequestKind::EdgeAgent)
+        .then(|| execution.executor.executor_id.clone())
+        .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
         message: turn.message,
@@ -3551,17 +3564,14 @@ pub(super) async fn post_work_branch_turn_handler(
         allow_skill_sources: None,
         allow_tools: None,
         enabled_tools: None,
-        // Server-owned Work turns use one persistent workspace per internal
-        // branch session. The runtime records the resolved binding before the
-        // run becomes visible; clients never select a topology per turn.
-        workspace_binding: Some(server_owned_work_workspace_binding()),
-        executor_binding: Some(
-            astra_services::SessionExecutionBindingV1::server_work_executor_request(),
-        ),
-        execution_binding_generation: None,
+        // The runtime receives the durable selection resolved above. Clients
+        // cannot choose or override a provider on an individual Work turn.
+        workspace_binding: Some(execution.workspace),
+        executor_binding: Some(execution.executor),
+        execution_binding_generation: Some(execution.generation),
         runtime_mcp_bindings: Vec::new(),
         context: None,
-        edge_executor_id: None,
+        edge_executor_id,
         capabilities: Vec::new(),
         forward_headers: collect_forward_headers(&headers),
         provider_run_owner: None,
@@ -4157,17 +4167,7 @@ async fn attest_edge_workspace(
             &record.user_id,
             &record.edge_agent_id,
             record.workspace_id.as_deref(),
-        )
-        .ok_or("edge_connection_unavailable")?;
-    if connection.workspace_dir.as_deref().map(str::trim) != Some(expected_root) {
-        return Err("edge_workspace_root_mismatch");
-    }
-    if connection.registry_id.as_deref() != Some(record.registry_id.as_str()) {
-        return Err("edge_connection_identity_mismatch");
-    }
-    if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
-        return Err("edge_materialization_identity_mismatch");
-    }
+        );
     let identity = astra_turn_types::ToolInvocationIdentity::new(
         &record.user_id,
         session_id,
@@ -4180,47 +4180,173 @@ async fn attest_edge_workspace(
     let command = format!(
         "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
     );
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "command": command,
         "mode": "verify",
         "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
     });
-    let result = state
-        .edge_connection_pool
-        .execute_durably_admitted_invocation_on_connection_with_cancel(
-            astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
-                connection_user_id: &record.user_id,
-                identity: &identity,
-                edge_agent_id: &record.edge_agent_id,
-                tool: "bash",
-                args: &args,
-                runtime_process_authorization: None,
-                timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
-                cancel_token: None,
-            },
+    let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
+        // A same-pod socket is still checked before dispatch. The local pool
+        // is authoritative for its live generation and must agree with the
+        // durable registry row selected by the Work switch.
+        if connection.workspace_dir.as_deref().map(str::trim) != Some(expected_root) {
+            return Err("edge_workspace_root_mismatch");
+        }
+        if connection.registry_id.as_deref() != Some(record.registry_id.as_str()) {
+            return Err("edge_connection_identity_mismatch");
+        }
+        if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
+            return Err("edge_materialization_identity_mismatch");
+        }
+        let result = state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_on_connection_with_cancel(
+                astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                    connection_user_id: &record.user_id,
+                    identity: &identity,
+                    edge_agent_id: &record.edge_agent_id,
+                    tool: "bash",
+                    args: &args,
+                    runtime_process_authorization: None,
+                    timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+                    cancel_token: None,
+                },
+            )
+            .await
+            .ok_or("edge_attestation_no_result")?;
+        if result.is_error {
+            return Err("edge_attestation_command_failed");
+        }
+        (result.output, connection.generation)
+    } else {
+        // The target may be connected to another Server pod. Route through
+        // the durable Edge ledger so admission, retry, reconnect and result
+        // custody follow the same identity fence as ordinary Edge tools.
+        let materialization_id = record
+            .materialization_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or("edge_materialization_identity_mismatch")?;
+        args.as_object_mut()
+            .ok_or("attestation_identity_invalid")?
+            .insert(
+                "__astra_attestation".to_string(),
+                serde_json::json!({
+                    "registry_id": record.registry_id,
+                    "materialization_id": materialization_id,
+                }),
+            );
+        let request_id = identity.storage_key();
+        let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            record.user_id.clone(),
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.turn_chain_id.clone(),
+            request_id.clone(),
+        );
+        let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            request_id: request_id.clone(),
+            identity: Box::new(identity.clone()),
+            delivery_generation: 1,
+            tool: "bash".to_string(),
+            args,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+        };
+        let payload_json =
+            serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;
+        let dispatch = &state.execution.edge_dispatch_service;
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
+            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload_json),
         )
-        .await
-        .ok_or("edge_attestation_no_result")?;
-    if result.is_error {
-        return Err("edge_attestation_command_failed");
+        .await;
+        let result_json = match admission {
+            Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
+            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
+            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
+                let wait_timeout = std::time::Duration::from_secs(
+                    WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS
+                        .saturating_add(astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS),
+                );
+                let result = tokio::time::timeout(
+                    wait_timeout,
+                    dispatch.wait_result(&dispatch_identity, wait_timeout),
+                )
+                .await
+                .map_err(|_| "edge_attestation_no_result")?
+                .map_err(|_| "edge_attestation_dispatch_unavailable")?;
+                match result {
+                    Some(result) => result,
+                    None => {
+                        let _ = dispatch
+                            .fail_dispatch(
+                                &dispatch_identity,
+                                &record.edge_agent_id,
+                                "edge_attestation_timeout",
+                            )
+                            .await;
+                        return Err("edge_attestation_no_result");
+                    }
+                }
+            }
+            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_))) => {
+                return Err("edge_attestation_dispatch_rejected");
+            }
+            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(_))) => {
+                return Err("edge_attestation_dispatch_outcome_unknown");
+            }
+        };
+        let result: astra_thin_client::ToolResultRequest =
+            serde_json::from_str(&result_json).map_err(|_| "edge_attestation_result_invalid")?;
+        if result.session_id != identity.session_id
+            || result.run_id != identity.run_id
+            || result.turn_chain_id != identity.turn_chain_id
+            || result.request_id != request_id
+            || result.edge_agent_id != record.edge_agent_id
+            || astra_thin_client::ToolResultRequest::compute_result_hash(
+                astra_thin_client::ToolResultHashParts {
+                    session_id: &result.session_id,
+                    run_id: &result.run_id,
+                    turn_chain_id: &result.turn_chain_id,
+                    request_id: &result.request_id,
+                    edge_agent_id: &result.edge_agent_id,
+                    status: &result.status,
+                    output: &result.output,
+                    duration_ms: result.duration_ms,
+                    tool_result_fields: result.tool_result_fields.as_ref(),
+                },
+            ) != result.result_hash
+        {
+            return Err("edge_attestation_result_identity_mismatch");
+        }
+        match astra_thin_client::tool_result_status_is_error(&result.status) {
+            Some(false) => (result.output, 0),
+            Some(true) => return Err("edge_attestation_command_failed"),
+            None => return Err("edge_attestation_result_invalid"),
+        }
+    };
+    let evidence = parse_workspace_attestation(&output, expected_root, &start_marker, &end_marker)?;
+    if connection_generation != 0 {
+        let after = state
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(
+                &record.user_id,
+                &record.edge_agent_id,
+                record.workspace_id.as_deref(),
+            )
+            .ok_or("edge_connection_changed")?;
+        if after.generation != connection_generation
+            || after.workspace_dir.as_deref().map(str::trim) != Some(expected_root)
+            || after.registry_id.as_deref() != Some(record.registry_id.as_str())
+            || after.materialization_id.as_deref() != record.materialization_id.as_deref()
+        {
+            return Err("edge_connection_changed");
+        }
     }
-    let evidence =
-        parse_workspace_attestation(&result.output, expected_root, &start_marker, &end_marker)?;
-    let after = state
-        .edge_connection_pool
-        .find_user_edge_by_agent_and_workspace(
-            &record.user_id,
-            &record.edge_agent_id,
-            record.workspace_id.as_deref(),
-        )
-        .ok_or("edge_connection_changed")?;
-    if after.generation != connection.generation
-        || after.workspace_dir.as_deref().map(str::trim) != Some(expected_root)
-        || after.registry_id.as_deref() != Some(record.registry_id.as_str())
-    {
-        return Err("edge_connection_changed");
-    }
-    Ok((evidence, connection.generation))
+    Ok((evidence, connection_generation))
 }
 
 fn evidence_revision(evidence: &serde_json::Value) -> Option<(&str, &str, &str)> {
@@ -4483,6 +4609,7 @@ pub(super) async fn get_work_branch_execution_targets_handler(
     // that mode the authenticated live pool is the only target directory; it
     // still must carry a registration identity so a target cannot be confused
     // with another materialization sharing its label or hostname.
+    let registry_backed = !records.is_empty();
     if records.is_empty() {
         records = state
             .edge_connection_pool
@@ -4497,14 +4624,19 @@ pub(super) async fn get_work_branch_execution_targets_handler(
     let targets = records
         .iter()
         .map(|record| {
-            let connected = state
-                .edge_connection_pool
-                .find_user_edge_by_agent_and_workspace(
-                    owner_id.as_str(),
-                    &record.edge_agent_id,
-                    record.workspace_id.as_deref(),
-                )
-                .is_some();
+            // A durable registry row may be live on another Server pod. The
+            // local socket pool can only answer for this pod, so registry
+            // backed targets are selectable even when no local connection is
+            // present; the switch attestation will use the durable relay.
+            let connected = registry_backed
+                || state
+                    .edge_connection_pool
+                    .find_user_edge_by_agent_and_workspace(
+                        owner_id.as_str(),
+                        &record.edge_agent_id,
+                        record.workspace_id.as_deref(),
+                    )
+                    .is_some();
             public_execution_target(record, connected)
         })
         .collect();

@@ -13383,7 +13383,7 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-    edge_pool.register_with_capabilities_and_registry_id(
+    edge_pool.register_with_capabilities_registry_and_materialization_id(
         "owner-1",
         "edge-owner-1",
         None,
@@ -13391,6 +13391,7 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         None,
         None,
         Some("registry-owner-1".to_string()),
+        Some("materialization-owner-1".to_string()),
         sender,
     );
     let service = test_service().with_edge_connection_pool(edge_pool);
@@ -13428,6 +13429,47 @@ async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
         .await
         .expect_err("a different workspace path must not authorize the Edge");
     assert_eq!(denied.0, StatusCode::PRECONDITION_REQUIRED);
+}
+
+#[tokio::test]
+async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is_request_scoped() {
+    let service = test_service();
+    let mut request = test_request("continue");
+    request.session_id = Some("session-no-coordinator".to_string());
+    request.edge_executor_id = Some("edge-no-coordinator".to_string());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Edge".to_string()),
+        root: Some("/workspace/edge".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace/edge".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("edge-no-coordinator".to_string()),
+        display_name: Some("Edge".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    let denied = service
+        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .await
+        .expect_err("native Edge must not bypass durable binding admission");
+    assert_eq!(denied.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        denied.1.error_code.as_deref(),
+        Some("execution_binding_unavailable")
+    );
+
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    service
+        .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
+        .await
+        .expect("request-scoped EdgeLedger does not need native coordinator state");
+    assert_eq!(request.execution_binding_generation, None);
 }
 
 #[test]

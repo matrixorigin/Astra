@@ -15,7 +15,9 @@ vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   acquireWorkBranchControlAction,
+  loadWorkExecutionAction,
   loadWorkExecutionTargetsAction,
+  observeWorkExecutionSwitchAction,
   retryWorkExecutionSwitchAction,
   switchWorkExecutionAction,
 } from "@/app/(workspace)/works/[workId]/actions";
@@ -23,7 +25,9 @@ import { WorkExecutionCard } from "@/components/app/work-execution-card";
 
 const refreshMock = vi.fn();
 const acquireControl = vi.mocked(acquireWorkBranchControlAction);
+const loadExecution = vi.mocked(loadWorkExecutionAction);
 const loadTargets = vi.mocked(loadWorkExecutionTargetsAction);
+const observeExecution = vi.mocked(observeWorkExecutionSwitchAction);
 const switchExecution = vi.mocked(switchWorkExecutionAction);
 const retryExecution = vi.mocked(retryWorkExecutionSwitchAction);
 
@@ -96,6 +100,9 @@ const succeeded = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  loadExecution.mockReset();
+  loadExecution.mockResolvedValue({ ok: true, execution });
+  observeExecution.mockReset();
   loadTargets.mockResolvedValue({ ok: true, page: targets });
   acquireControl.mockResolvedValue({
     ok: true,
@@ -116,6 +123,123 @@ beforeEach(() => {
   });
   switchExecution.mockResolvedValue({ ok: true, operation: succeeded });
   retryExecution.mockResolvedValue({ ok: true, operation: succeeded });
+});
+
+test("hydrates a persisted failed move after a page reload", async () => {
+  const failed = {
+    ...succeeded,
+    state: "failed" as const,
+    failure_code: "edge_attestation_command_failed",
+  };
+  observeExecution.mockResolvedValue({ ok: true, operation: failed });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: failed.operation_id, state: "needs_attention" }}
+      attachment={{ ...attachment, mode: "controller" }}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: "Retry move" })).toBeInTheDocument();
+  expect(observeExecution).toHaveBeenCalledWith({
+    workId: "work-1",
+    branchId: "branch-1",
+    operationId: "switch-1",
+  });
+});
+
+test("keeps an interrupted switching move recoverable after reload", async () => {
+  const switching = { ...succeeded, state: "switching" as const };
+  observeExecution
+    .mockResolvedValueOnce({ ok: true, operation: switching })
+    .mockResolvedValueOnce({ ok: true, operation: succeeded });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: switching.operation_id, state: "switching" }}
+      attachment={{ ...attachment, mode: "controller" }}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  expect(await screen.findByRole("button", { name: "Resume move" })).toBeInTheDocument();
+  await waitFor(() => expect(observeExecution).toHaveBeenCalledTimes(2));
+  expect(screen.queryByRole("button", { name: "Resume move" })).not.toBeInTheDocument();
+});
+
+test("refreshes placement and generation after a switching move settles", async () => {
+  const moved = {
+    ...execution,
+    generation: 5,
+    executor_id: "edge-desktop",
+    executor_name: "Desktop",
+    operation_id: "switch-1",
+  };
+  loadExecution.mockResolvedValueOnce({ ok: true, execution: moved });
+  const switching = { ...succeeded, state: "switching" as const };
+  observeExecution
+    .mockResolvedValueOnce({ ok: true, operation: switching })
+    .mockResolvedValueOnce({ ok: true, operation: succeeded });
+
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: switching.operation_id, state: "switching" }}
+      attachment={{ ...attachment, mode: "controller" }}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  await waitFor(() => expect(screen.getByText("Running on Edge · Desktop")).toBeInTheDocument());
+  expect(screen.getByText("Durable generation 5")).toBeInTheDocument();
+});
+
+test("ignores a delayed refresh from a previous branch", async () => {
+  let resolveOld: ((value: { ok: true; execution: typeof execution }) => void) | undefined;
+  loadExecution.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveOld = resolve as typeof resolveOld;
+      }),
+  );
+  const { rerender } = render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={execution}
+      attachment={{ ...attachment, branch_id: "branch-1" }}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+  const nextExecution = {
+    ...execution,
+    branch_id: "branch-2",
+    executor_id: "edge-next",
+    executor_name: "Next",
+  };
+  rerender(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-2"
+      initialExecution={nextExecution}
+      attachment={{ ...attachment, branch_id: "branch-2" }}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+  resolveOld?.({ ok: true, execution: { ...execution, executor_id: "stale-old" } });
+  await waitFor(() => expect(screen.getByText("Running on Edge · Next")).toBeInTheDocument());
+  expect(screen.queryByText(/stale-old/)).not.toBeInTheDocument();
 });
 
 test("loads owner targets only when the user opens the move picker", async () => {
@@ -164,6 +288,9 @@ test("takes control explicitly before moving and uses the displayed generation",
   );
   expect(acquireControl).toHaveBeenCalledTimes(1);
   expect(refreshMock).toHaveBeenCalled();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
+  );
 });
 
 test("keeps a failed durable move retryable without submitting a new target", async () => {
@@ -189,4 +316,40 @@ test("keeps a failed durable move retryable without submitting a new target", as
     operationId: "switch-1",
     attachmentId: "attachment-1",
   })));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /Desktop/i })).not.toBeDisabled(),
+  );
+});
+
+test("does not leave target loading stuck after a refresh supersedes its request", async () => {
+  let resolveTargets: ((value: { ok: true; page: typeof targets }) => void) | undefined;
+  loadTargets.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveTargets = resolve as typeof resolveTargets;
+      }),
+  );
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={execution}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Hide Edges" })).not.toBeDisabled(),
+  );
+
+  resolveTargets?.({ ok: true, page: targets });
+  fireEvent.click(screen.getByRole("button", { name: "Hide Edges" }));
+  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("Desktop")).toBeInTheDocument();
 });

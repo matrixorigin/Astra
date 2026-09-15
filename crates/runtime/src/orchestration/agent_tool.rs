@@ -9,9 +9,12 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -78,6 +81,49 @@ static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
+
+/// Keep preparation owned by the tool call while still polling the large
+/// spawner future from a fresh Tokio scheduler frame. Dropping the handler
+/// aborts preparation just as dropping the original inline future did; a
+/// completed task releases its handle before this guard is dropped.
+struct AbortOnDropJoinHandle<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let handle = this
+            .handle
+            .as_mut()
+            .expect("AbortOnDropJoinHandle polled after completion");
+        match Pin::new(handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                this.handle.take();
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// Authoritative storage for the child run's canonical transcript.
 ///
@@ -2366,14 +2412,21 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     // Allocate the outer async state before constructing the dynamically sized
     // spawn supervisor future. This keeps its first construction and poll off
     // the already-deep generic tool pipeline stack on debug Tokio workers.
+    // Yield once before invoking the supervisor so this handler is polled from
+    // a fresh scheduler boundary; dynamic child startup must not inherit the
+    // parent tool pipeline's large synchronous stack.
+    tokio::task::yield_now().await;
     let spawner = Arc::clone(&ctx.spawner);
-    let spawn = Box::pin(async move { spawner.spawn(input, &spawn_ctx).await });
+    let spawn = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+        spawner.spawn(input, &spawn_ctx).await
+    }));
     match spawn.await {
-        Ok(output) => render_spawn_agent_output(output, ctx.transcript_location),
-        Err(SpawnError::ExecutorUnavailable) => {
+        Ok(Ok(output)) => render_spawn_agent_output(output, ctx.transcript_location),
+        Ok(Err(SpawnError::ExecutorUnavailable)) => {
             render_agent_runtime_binding_error("agent", "spawn")
         }
-        Err(e) => render_agent_tool_error(None, &e.to_string()),
+        Ok(Err(e)) => render_agent_tool_error(None, &e.to_string()),
+        Err(e) => render_agent_tool_error(None, &format!("agent spawn task failed: {e}")),
     }
 }
 
@@ -2725,7 +2778,26 @@ mod tests {
     use crate::server::delegation::engine::DelegationTracker;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn spawn_preparation_is_aborted_when_handler_future_is_dropped() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_gate = Arc::clone(&gate);
+        let task_completed = Arc::clone(&completed);
+        let guard = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+            task_gate.notified().await;
+            task_completed.store(true, AtomicOrdering::SeqCst);
+        }));
+
+        tokio::task::yield_now().await;
+        drop(guard);
+        gate.notify_one();
+        tokio::task::yield_now().await;
+        assert!(!completed.load(AtomicOrdering::SeqCst));
+    }
 
     #[test]
     fn direct_agent_output_publishes_the_generic_work_contract() {
