@@ -1126,6 +1126,7 @@ mod tests {
             steps: vec![],
             attempts: vec![],
             session: None,
+            session_captures: Vec::new(),
             execution: None,
             reproducer: None,
             digest: None,

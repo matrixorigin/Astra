@@ -338,6 +338,7 @@ mod tests {
                 steps: vec![],
                 attempts: vec![],
                 session: None,
+                session_captures: Vec::new(),
                 execution: Some(ExecutionTraceReport {
                     evidence_complete: false,
                     ..Default::default()
