@@ -1863,6 +1863,10 @@ fn stream_payload(
             "kind": "edge_workspace",
             "display_name": "Phase-0 edge workspace",
             "root": workspace,
+            "source": {
+                "kind": "edge_path",
+                "path": workspace,
+            },
             "authority": "read_write",
         });
         payload["executor_binding"] = json!({

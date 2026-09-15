@@ -2,6 +2,7 @@ use super::{
     GraphRevision, WorkBranchId, WorkBranchRevision, WorkDomainError, WorkEventSeq, WorkGoal,
     WorkId, WorkOwnerId, WorkRevision,
 };
+use crate::runs::{DurableRunStatusKind, durable_run_status_kind};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -56,6 +57,20 @@ pub enum WorkBranchActivity {
     Idle,
 }
 
+/// Project durable root-run state into the single Work activity vocabulary.
+/// Keep catalog and branch-detail reads on the same interpretation.
+pub(super) fn activity_from_durable_run_status(
+    status: &str,
+    has_waiting_reason: bool,
+) -> Option<WorkBranchActivity> {
+    match (durable_run_status_kind(status), has_waiting_reason) {
+        (DurableRunStatusKind::Running, _) => Some(WorkBranchActivity::Working),
+        (DurableRunStatusKind::Waiting, _) => Some(WorkBranchActivity::Waiting),
+        (DurableRunStatusKind::Paused, true) => Some(WorkBranchActivity::Paused),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkCatalogEntry {
     pub work_id: WorkId,
@@ -91,5 +106,24 @@ mod tests {
         assert!(WorkCatalogPageLimit::new(WORK_CATALOG_PAGE_MAX_ITEMS).is_ok());
         assert!(WorkCatalogPageLimit::new(0).is_err());
         assert!(WorkCatalogPageLimit::new(WORK_CATALOG_PAGE_MAX_ITEMS + 1).is_err());
+    }
+
+    #[test]
+    fn durable_run_activity_is_shared_and_rejects_terminal_or_inconsistent_states() {
+        assert_eq!(
+            activity_from_durable_run_status("running", false),
+            Some(WorkBranchActivity::Working)
+        );
+        assert_eq!(
+            activity_from_durable_run_status("waiting", true),
+            Some(WorkBranchActivity::Waiting)
+        );
+        assert_eq!(
+            activity_from_durable_run_status("paused", true),
+            Some(WorkBranchActivity::Paused)
+        );
+        assert_eq!(activity_from_durable_run_status("paused", false), None);
+        assert_eq!(activity_from_durable_run_status("completed", false), None);
+        assert_eq!(activity_from_durable_run_status("unknown", false), None);
     }
 }

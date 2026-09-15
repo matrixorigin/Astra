@@ -6440,6 +6440,7 @@ mod tests {
             enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
+            execution_binding_generation: None,
             runtime_mcp_bindings: Vec::new(),
             context: None,
             edge_executor_id: None,

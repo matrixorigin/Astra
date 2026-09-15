@@ -21,7 +21,7 @@ const CURRENT_READ_BASE_BACKOFF_MS: u64 = 25;
 // both the canonical TEXT schema and legacy JSON-typed columns to the same JSON
 // value. Keep every EdgeAgentRecord read on this projection so no query asks
 // sqlx to decode JSON directly or uses VARCHAR(65535)-bounded CAST(... AS CHAR).
-const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, materialization_id, \
      CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
        SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$'))), 2, \
          CHAR_LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
@@ -102,8 +102,23 @@ pub struct EdgeAgentRecord {
     /// Owning workspace (provider_scope_id from edge-registration token binding).
     /// None only for explicitly unscoped first-party registrations.
     pub workspace_id: Option<String>,
+    /// Stable identity persisted beside the local checkout. It is distinct
+    /// from the connection-scoped registry row and edge-agent label.
+    pub materialization_id: Option<String>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
+}
+
+fn is_native_execution_target(record: &EdgeAgentRecord) -> bool {
+    record.workspace_id.is_none()
+        && record
+            .materialization_id
+            .as_deref()
+            .is_some_and(|identity| !identity.trim().is_empty())
+        && record
+            .worktree_path
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty())
 }
 
 /// Result of claiming an edge registry generation.
@@ -404,6 +419,38 @@ pub trait EdgeRegistryService: Send + Sync {
         })
     }
 
+    /// Register a connection while carrying the stable identity of the local
+    /// checkout it materializes. Backends that persist registrations override
+    /// this method; the default enriches the lease returned by the historical
+    /// registration path so in-memory/test backends retain the same contract.
+    #[allow(clippy::too_many_arguments)]
+    async fn register_or_update_with_lease_and_materialization(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let mut lease = self
+            .register_or_update_with_lease(
+                user_id,
+                edge_agent_id,
+                edge_id_header,
+                hostname,
+                worktree_path,
+                capabilities,
+                workspace_id,
+            )
+            .await?;
+        let materialization_id = materialization_id.map(ToOwned::to_owned);
+        lease.current.materialization_id = materialization_id;
+        Ok(lease)
+    }
+
     /// Undo a claimed generation only if it still owns the registry row.
     /// Durable claiming backends return true when rollback is applied or was
     /// already applied, false only after verifying another generation, and an
@@ -477,6 +524,50 @@ pub trait EdgeRegistryService: Send + Sync {
         edge_agent_id: &str,
         workspace_id: Option<&str>,
     ) -> Result<Option<EdgeAgentRecord>, String>;
+
+    /// Find one active Edge owned by this exact user, agent identity, and
+    /// workspace scope. The owner predicate is part of the lookup contract so
+    /// callers never need to load a user's full registry to authorize one
+    /// execution binding.
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        Ok(self
+            .list_by_user(user_id)
+            .await?
+            .into_iter()
+            .find(|record| {
+                record.edge_agent_id == edge_agent_id
+                    && match (workspace_id, record.workspace_id.as_deref()) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }))
+    }
+
+    /// List the bounded set of authenticated, first-party Edge targets that a
+    /// Work owner may hand off to. Provider-scoped registrations are excluded:
+    /// their provider scope is request authority and is not part of the native
+    /// Work handoff contract. Eligibility is applied before the database
+    /// limit, so stale rows cannot hide a usable target.
+    async fn list_native_execution_targets(
+        &self,
+        user_id: &str,
+        limit: u16,
+    ) -> Result<Vec<EdgeAgentRecord>, String> {
+        let limit = usize::from(limit.clamp(1, 100));
+        Ok(self
+            .list_by_user(user_id)
+            .await?
+            .into_iter()
+            .filter(is_native_execution_target)
+            .take(limit)
+            .collect())
+    }
 
     /// List all registered edge agents for a user (for cross-pod dispatch routing).
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String>;
@@ -899,7 +990,7 @@ impl DatabaseEdgeRegistryService {
                     sqlx::query(
                         "UPDATE edge_agent_registry \
                          SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                             workspace_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
+                             workspace_id = ?, materialization_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
                              registration_previous_edge_id = ? \
                          WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
                     )
@@ -908,6 +999,7 @@ impl DatabaseEdgeRegistryService {
                     .bind(&lease.current.worktree_path)
                     .bind(&current_capabilities)
                     .bind(&lease.current.workspace_id)
+                    .bind(&lease.current.materialization_id)
                     .bind(live_previous.map(|previous| previous.edge_id.as_str()))
                     .bind(&lease.current.user_id)
                     .bind(registry_id)
@@ -935,7 +1027,7 @@ impl DatabaseEdgeRegistryService {
                         sqlx::query(
                             "UPDATE edge_agent_registry \
                              SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                                 workspace_id = ?, last_heartbeat_at = NOW(6), \
+                                 workspace_id = ?, materialization_id = ?, last_heartbeat_at = NOW(6), \
                                  registration_claim_id = NULL, registration_claim_expires_at = NULL, \
                                  registration_state = 1, registration_previous_edge_id = NULL \
                              WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
@@ -945,6 +1037,7 @@ impl DatabaseEdgeRegistryService {
                         .bind(&previous.worktree_path)
                         .bind(&previous_capabilities)
                         .bind(&previous.workspace_id)
+                        .bind(&previous.materialization_id)
                         .bind(&lease.current.user_id)
                         .bind(registry_id)
                         .bind(claim_id)
@@ -1055,6 +1148,7 @@ impl DatabaseEdgeRegistryService {
         worktree_path: Option<&str>,
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
     ) -> Result<EdgeRegistrationLease, String> {
         serialize_edge_capabilities(capabilities.as_ref())?;
         const MAX_RETRIES: u32 = 5;
@@ -1095,6 +1189,20 @@ impl DatabaseEdgeRegistryService {
                 .unwrap_or(1);
 
             if let Some(previous) = previous {
+                if let (Some(previous_id), Some(next_id)) =
+                    (previous.materialization_id.as_deref(), materialization_id)
+                    && previous_id != next_id
+                {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry lease rollback after materialization identity change: {error}"
+                        )
+                    })?;
+                    return Err(
+                        "edge materialization identity changed for this edge id; use a new edge id or restore the original checkout"
+                            .to_string(),
+                    );
+                }
                 // Acquire only the setup claim. Keep every active routing field
                 // unchanged until finalize_registration(), so the published
                 // predecessor remains heartbeatable and routable while setup is
@@ -1111,6 +1219,7 @@ impl DatabaseEdgeRegistryService {
                          worktree_path = CASE WHEN registration_state = 1 THEN worktree_path ELSE NULL END, \
                          capabilities_json = CASE WHEN registration_state = 1 THEN capabilities_json ELSE NULL END, \
                          workspace_id = CASE WHEN registration_state = 1 THEN workspace_id ELSE NULL END, \
+                         materialization_id = CASE WHEN registration_state = 1 THEN materialization_id ELSE NULL END, \
                          registration_previous_edge_id = CASE WHEN registration_state = 2 \
                              THEN NULL ELSE registration_previous_edge_id END, \
                          registration_state = CASE WHEN registration_state = 2 \
@@ -1156,6 +1265,7 @@ impl DatabaseEdgeRegistryService {
                             .as_ref()
                             .and_then(|record| record.workspace_id.clone())
                     }),
+                    materialization_id: materialization_id.map(ToString::to_string),
                     registered_at: previous.registered_at.clone(),
                     last_heartbeat_at: now,
                 };
@@ -1174,15 +1284,16 @@ impl DatabaseEdgeRegistryService {
             let registry_id = uuid::Uuid::new_v4().to_string();
             let inserted = sqlx::query(
                 "INSERT INTO edge_agent_registry \
-                 (registry_id, user_id, edge_agent_id, edge_id, registered_at, last_heartbeat_at, \
+                 (registry_id, user_id, edge_agent_id, edge_id, materialization_id, registered_at, last_heartbeat_at, \
                   registration_claim_id, registration_claim_expires_at, registration_state) \
-                 VALUES (?, ?, ?, ?, NOW(6), NOW(6), ?, \
+                 VALUES (?, ?, ?, ?, ?, NOW(6), NOW(6), ?, \
                          DATE_ADD(NOW(6), INTERVAL 120 SECOND), 0)",
             )
             .bind(&registry_id)
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(edge_id_header)
+            .bind(materialization_id)
             .bind(&claim_id)
             .execute(&mut *transaction)
             .await;
@@ -1201,6 +1312,7 @@ impl DatabaseEdgeRegistryService {
                             worktree_path: worktree_path.map(ToString::to_string),
                             capabilities: capabilities.clone(),
                             workspace_id: workspace_id.map(ToString::to_string),
+                            materialization_id: materialization_id.map(ToString::to_string),
                             registered_at: now.clone(),
                             last_heartbeat_at: now,
                         },
@@ -1271,6 +1383,9 @@ fn decode_edge_agent_record(row: &impl EdgeRegistryDbRow) -> Result<EdgeAgentRec
         worktree_path: row
             .optional_string_column("worktree_path")
             .map_err(|e| edge_registry_decode_error("list_by_user row", "worktree_path", e))?,
+        materialization_id: row
+            .optional_string_column("materialization_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "materialization_id", e))?,
         capabilities,
         workspace_id: row
             .optional_string_column("workspace_id")
@@ -1381,6 +1496,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     worktree_path: worktree_path.map(|s| s.to_string()),
                     capabilities: capabilities_for_record.clone(),
                     workspace_id: workspace_id.map(|s| s.to_string()),
+                    materialization_id: None,
                     registered_at,
                     last_heartbeat_at: now,
                 };
@@ -1396,8 +1512,8 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             match sqlx::query(
                 "INSERT INTO edge_agent_registry \
                  (registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-                  capabilities_json, workspace_id, registered_at, last_heartbeat_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                  capabilities_json, workspace_id, materialization_id, registered_at, last_heartbeat_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&registry_id)
             .bind(user_id)
@@ -1407,6 +1523,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .bind(worktree_path)
             .bind(&cap_json)
             .bind(workspace_id)
+            .bind(None::<&str>)
             .execute(&mut *transaction)
             .await
             {
@@ -1456,6 +1573,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                         worktree_path: worktree_path.map(|s| s.to_string()),
                         capabilities: capabilities_for_record.clone(),
                         workspace_id: workspace_id.map(|s| s.to_string()),
+                        materialization_id: None,
                         registered_at,
                         last_heartbeat_at,
                     };
@@ -1501,6 +1619,41 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             worktree_path,
             capabilities,
             workspace_id,
+            None,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, capabilities), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn register_or_update_with_lease_and_materialization(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let materialization_id = materialization_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "edge materialization identity is required".to_string())?;
+        if materialization_id.len() > 128
+            || !astra_runtime_env::is_valid_provider_id(materialization_id)
+        {
+            return Err("edge materialization identity is invalid".to_string());
+        }
+        self.claim_registration(
+            user_id,
+            edge_agent_id,
+            edge_id_header,
+            hostname,
+            worktree_path,
+            capabilities,
+            workspace_id,
+            Some(materialization_id),
         )
         .await
     }
@@ -1689,6 +1842,32 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         row.as_ref().map(decode_edge_agent_record).transpose()
     }
 
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        let lookup_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ? \
+               AND registration_state = 1 \
+               AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
+             LIMIT 1"
+        );
+        let row = sqlx::query(&lookup_sql)
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry find_by_user_agent_and_workspace: {e}"))?;
+        row.as_ref().map(decode_edge_agent_record).transpose()
+    }
+
     #[tracing::instrument(skip(self), fields(user_id = %user_id))]
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
         let list_sql = format!(
@@ -1702,6 +1881,31 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .await
             .map_err(|e| format!("edge_registry list_by_user: {e}"))?;
 
+        rows.iter().map(decode_edge_agent_record).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(user_id = %user_id))]
+    async fn list_native_execution_targets(
+        &self,
+        user_id: &str,
+        limit: u16,
+    ) -> Result<Vec<EdgeAgentRecord>, String> {
+        let list_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
+             WHERE user_id = ? AND registration_state = 1 \
+               AND workspace_id IS NULL \
+               AND materialization_id IS NOT NULL \
+               AND CHAR_LENGTH(TRIM(materialization_id)) > 0 \
+               AND worktree_path IS NOT NULL \
+               AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
+             ORDER BY edge_agent_id ASC LIMIT ?"
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(user_id)
+            .bind(i64::from(limit.clamp(1, 100)))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry list_native_execution_targets: {e}"))?;
         rows.iter().map(decode_edge_agent_record).collect()
     }
 }
@@ -1737,6 +1941,7 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
             worktree_path: worktree_path.map(|s| s.to_string()),
             capabilities,
             workspace_id: workspace_id.map(|s| s.to_string()),
+            materialization_id: None,
             registered_at: now.clone(),
             last_heartbeat_at: now,
         })
@@ -1790,6 +1995,7 @@ mod tests {
             worktree_path: None,
             capabilities: None,
             workspace_id: Some("workspace-1".to_string()),
+            materialization_id: None,
             registered_at: "2026-09-02 00:00:00.000000".to_string(),
             last_heartbeat_at: "2026-09-02 00:00:00.000000".to_string(),
         };
@@ -2056,6 +2262,7 @@ mod tests {
         capabilities_json: Option<&'static str>,
         hostname: Option<&'static str>,
         worktree_path: Option<&'static str>,
+        materialization_id: Option<&'static str>,
     }
 
     impl FakeEdgeRegistryRow {
@@ -2065,6 +2272,7 @@ mod tests {
                 capabilities_json: Some(r#"{"tools":["agent_fanout"]}"#),
                 hostname: Some("edge-host"),
                 worktree_path: Some("/worktree"),
+                materialization_id: Some("materialization-1"),
             }
         }
 
@@ -2081,6 +2289,7 @@ mod tests {
                 capabilities_json: None,
                 hostname: None,
                 worktree_path: None,
+                materialization_id: None,
             }
         }
 
@@ -2118,6 +2327,7 @@ mod tests {
             Ok(match column {
                 "hostname" => self.hostname,
                 "worktree_path" => self.worktree_path,
+                "materialization_id" => self.materialization_id,
                 "capabilities_json" => self.capabilities_json,
                 "workspace_id" => None,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -2137,6 +2347,10 @@ mod tests {
         assert_eq!(record.hostname.as_deref(), Some("edge-host"));
         assert_eq!(record.worktree_path.as_deref(), Some("/worktree"));
         assert_eq!(
+            record.materialization_id.as_deref(),
+            Some("materialization-1")
+        );
+        assert_eq!(
             record.capabilities.as_ref().and_then(|v| v.get("tools")),
             Some(&serde_json::json!(["agent_fanout"]))
         );
@@ -2151,6 +2365,7 @@ mod tests {
 
         assert_eq!(record.hostname, None);
         assert_eq!(record.worktree_path, None);
+        assert_eq!(record.materialization_id, None);
         assert_eq!(record.capabilities, None);
     }
 
@@ -2163,6 +2378,7 @@ mod tests {
             "edge_id",
             "hostname",
             "worktree_path",
+            "materialization_id",
             "capabilities_json",
             "registered_at",
             "last_heartbeat_at",

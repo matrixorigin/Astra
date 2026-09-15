@@ -64,6 +64,7 @@ pub(crate) enum InvocationPrepareDisposition {
 pub struct DurableDispatchAdmission {
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
+    pub expected_execution_binding_generation: Option<u64>,
 }
 
 pub(crate) const DISPATCH_LEASE_DURATION: Duration = Duration::from_secs(90);
@@ -508,6 +509,8 @@ impl RuntimeToolInvocationLedger {
                             expected_control_epoch: admission.expected_control_epoch,
                             expected_owner_generation: admission.expected_owner_generation,
                             expected_owner_pod_id: expected_owner_pod_id.to_string(),
+                            expected_execution_binding_generation: admission
+                                .expected_execution_binding_generation,
                         },
                     )
                     .await?)
@@ -1628,7 +1631,11 @@ impl RuntimeInvocationLedgerError {
             | Self::ProcessLocalCapacity { .. } => true,
             Self::Database(error) => matches!(
                 error.as_ref(),
-                astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionSuperseded { .. }
+                astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingFenced { .. }
+                    | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingNotReady(_)
+                    | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingInvalid(_)
+                    | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingBusy
+                    | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionSuperseded { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAdmissionFailed { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::RunNotFound { .. }
@@ -1780,6 +1787,7 @@ mod tests {
                     Some(DurableDispatchAdmission {
                         expected_control_epoch: -1,
                         expected_owner_generation: 0,
+                        expected_execution_binding_generation: None,
                     }),
                 )
                 .await
@@ -1911,6 +1919,7 @@ mod tests {
                 Some(DurableDispatchAdmission {
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
+                    expected_execution_binding_generation: None,
                 }),
             )
             .await
@@ -2073,6 +2082,7 @@ mod tests {
                         Some(DurableDispatchAdmission {
                             expected_control_epoch: -1,
                             expected_owner_generation: 0,
+                            expected_execution_binding_generation: None,
                         }),
                     )
                     .await
@@ -2150,6 +2160,7 @@ mod tests {
                         Some(DurableDispatchAdmission {
                             expected_control_epoch: -1,
                             expected_owner_generation: 0,
+                            expected_execution_binding_generation: None,
                         }),
                     )
                     .await
@@ -2273,6 +2284,7 @@ mod tests {
                 Some(DurableDispatchAdmission {
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
+                    expected_execution_binding_generation: None,
                 }),
             )
             .await;
@@ -2336,6 +2348,7 @@ mod tests {
                     Some(DurableDispatchAdmission {
                         expected_control_epoch: -1,
                         expected_owner_generation: 0,
+                        expected_execution_binding_generation: None,
                     }),
                 )
                 .await,

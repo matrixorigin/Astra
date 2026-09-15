@@ -78,8 +78,9 @@ pub use basis::WorkBranchBasisChange;
 pub use branch_catalog::{
     DatabaseWorkBranchCatalogService, WORK_ARCHIVED_BRANCH_PAGE_MAX_ITEMS,
     WORK_BRANCH_CATALOG_SCHEMA_VERSION, WorkArchivedBranchCursor, WorkArchivedBranchEntry,
-    WorkArchivedBranchPage, WorkBranchCatalog, WorkBranchCatalogEntry, WorkBranchCatalogError,
-    WorkBranchDimension, WorkBranchDimensionDisposition, WorkBranchDimensionSummary,
+    WorkArchivedBranchPage, WorkBranchActivityObservation, WorkBranchCatalog,
+    WorkBranchCatalogEntry, WorkBranchCatalogError, WorkBranchDimension,
+    WorkBranchDimensionDisposition, WorkBranchDimensionSummary,
 };
 pub use branch_comparison::{
     DatabaseWorkBranchComparisonService, WORK_BRANCH_COMPARISON_SCHEMA_VERSION,

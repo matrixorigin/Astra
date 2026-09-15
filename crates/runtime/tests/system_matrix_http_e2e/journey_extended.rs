@@ -8,8 +8,8 @@ use sqlx::Row;
 use std::time::Duration;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content,
-    durable_interaction_event_count, get_json, grant_astra_admin_role,
+    E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, collect_sse_body_text, delete_json,
+    delete_no_content, durable_interaction_event_count, get_json, grant_astra_admin_role,
     maybe_tool_result_payload_from_sse, post_empty, post_json, put_json, seed_pending_approval,
     seeded_model_selection, tool_result_payload,
 };
@@ -396,7 +396,11 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
         "workspace_binding": {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
-            "root": "/tmp/astra-system-matrix-edge",
+            "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -410,7 +414,7 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
-                "cwd": "/tmp/astra-system-matrix-edge",
+                "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },
@@ -626,7 +630,11 @@ pub async fn run_server_stream_partial_batch_failure() {
         "workspace_binding": {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
-            "root": "/tmp/astra-system-matrix-edge",
+            "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -640,7 +648,7 @@ pub async fn run_server_stream_partial_batch_failure() {
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
-                "cwd": "/tmp/astra-system-matrix-edge",
+                "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },
@@ -914,7 +922,11 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         "workspace_binding": {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
-            "root": "/tmp/astra-system-matrix-edge",
+            "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -928,7 +940,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
-                "cwd": "/tmp/astra-system-matrix-edge",
+                "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },

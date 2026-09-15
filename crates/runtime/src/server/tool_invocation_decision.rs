@@ -353,8 +353,10 @@ impl ToolInvocationDecisionSnapshot {
             .task_resolution_authority
             .take()
             .filter(|authority| authority.for_call(&request.tool_call_id).is_some());
+        let execution_binding_generation = request.policy.execution_binding_generation;
         request.policy = self.transport_policy.clone();
         request.policy.task_resolution_authority = task_resolution_authority;
+        request.policy.execution_binding_generation = execution_binding_generation;
         request.policy.resolved_provider_policy = self.provider_policy.clone();
         request.policy.permission_grant = self.permission_grant.as_ref().map(|grant| {
             super::tool_execution_binding::ToolPermissionGrantSnapshot {

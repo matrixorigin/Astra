@@ -13,7 +13,14 @@ import {
   Loader2,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   loadWorkTaskGraphPageAction,
   refreshWorkTaskGraphAction,
@@ -21,6 +28,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils/cn";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
 import {
   isWorkTaskOpen,
   workTaskCounts,
@@ -52,11 +60,25 @@ export function WorkTaskGraph({ initial, live = false }: WorkTaskGraphProps) {
   const [recentlyChanged, setRecentlyChanged] = useState<Set<string>>(new Set());
   const [consumedCursors, setConsumedCursors] = useState<Set<string>>(new Set());
   const headRef = useRef(initial);
+  const selectedBranchKey = branchKey(initial);
+  const selectedBranchKeyRef = useRef(selectedBranchKey);
+  const selectionGeneration = useRef(0);
   const liveRefreshInFlight = useRef(false);
   const pageLoadInFlight = useRef(false);
   const liveFailureCount = useRef(0);
   const changeMarkerTimer = useRef<number | null>(null);
   const router = useRouter();
+
+  useLayoutEffect(() => {
+    selectedBranchKeyRef.current = selectedBranchKey;
+    selectionGeneration.current += 1;
+    const generation = selectionGeneration.current;
+    return () => {
+      if (selectionGeneration.current === generation) {
+        selectionGeneration.current += 1;
+      }
+    };
+  }, [selectedBranchKey]);
 
   const revealTaskChanges = useCallback(
     (previous: WorkTaskGraphItemV2[], next: WorkTaskGraphItemV2[]) => {
@@ -95,86 +117,94 @@ export function WorkTaskGraph({ initial, live = false }: WorkTaskGraphProps) {
     [],
   );
 
-  useEffect(() => {
-    let cancelled = false;
-
-    async function refreshHead() {
-      if (liveRefreshInFlight.current || pageLoadInFlight.current) return;
-      liveRefreshInFlight.current = true;
-      try {
-        const currentHead = headRef.current;
-        const result = await refreshWorkTaskGraphAction({
-          workId: currentHead.basis.work_id,
-          branchId: currentHead.basis.branch_id,
-        });
-        if (cancelled) return;
-        if (!result.ok) {
-          liveFailureCount.current += 1;
-          if (liveFailureCount.current >= 3) setLiveError(true);
-          return;
-        }
-        const next = result.page;
-        if (
-          next.basis.work_id !== currentHead.basis.work_id ||
-          next.basis.branch_id !== currentHead.basis.branch_id ||
-          next.cursor.item_offset !== 0 ||
-          next.cursor.dependency_offset !== 0
-        ) {
-          liveFailureCount.current = 3;
-          setLiveError(true);
-          return;
-        }
-        if (next.basis.graph_revision < currentHead.basis.graph_revision) return;
-        if (next.basis.graph_revision > currentHead.basis.graph_revision) {
-          revealTaskChanges(currentHead.items.entries, next.items.entries);
-          headRef.current = next;
-          setHead(next);
-          setItems(next.items.entries);
-          setDependencies(next.dependencies.entries);
-          setNextCursor(next.next_cursor);
-          setConsumedCursors(new Set());
-          setExpanded(new Set());
-          setError(null);
-          liveFailureCount.current = 0;
-          setLiveError(false);
-          return;
-        }
-        if (!sameGraph(currentHead, next)) {
-          liveFailureCount.current = 3;
-          setLiveError(true);
-          return;
-        }
-        const refreshed = new Map(
-          next.items.entries.map((item) => [`${item.item_id}:${item.revision}`, item]),
-        );
+  const refreshHead = useCallback(async () => {
+    if (liveRefreshInFlight.current || pageLoadInFlight.current) return false;
+    const currentHead = headRef.current;
+    const requestedBranchKey = branchKey(currentHead);
+    if (requestedBranchKey !== selectedBranchKeyRef.current) return true;
+    const requestedGeneration = selectionGeneration.current;
+    liveRefreshInFlight.current = true;
+    try {
+      const result = await refreshWorkTaskGraphAction({
+        workId: currentHead.basis.work_id,
+        branchId: currentHead.basis.branch_id,
+      });
+      if (
+        requestedGeneration !== selectionGeneration.current ||
+        requestedBranchKey !== selectedBranchKeyRef.current
+      ) {
+        return true;
+      }
+      if (!result.ok) {
+        liveFailureCount.current += 1;
+        if (liveFailureCount.current >= 3) setLiveError(true);
+        return false;
+      }
+      const next = result.page;
+      if (
+        next.basis.work_id !== currentHead.basis.work_id ||
+        next.basis.branch_id !== currentHead.basis.branch_id ||
+        next.cursor.item_offset !== 0 ||
+        next.cursor.dependency_offset !== 0
+      ) {
+        liveFailureCount.current = 3;
+        setLiveError(true);
+        return false;
+      }
+      if (next.basis.graph_revision < currentHead.basis.graph_revision) return true;
+      if (next.basis.graph_revision > currentHead.basis.graph_revision) {
         revealTaskChanges(currentHead.items.entries, next.items.entries);
         headRef.current = next;
         setHead(next);
-        setItems((current) =>
-          current.map((item) => refreshed.get(`${item.item_id}:${item.revision}`) ?? item),
-        );
+        setItems(next.items.entries);
+        setDependencies(next.dependencies.entries);
+        setNextCursor(next.next_cursor);
+        setConsumedCursors(new Set());
+        setExpanded(new Set());
+        setError(null);
         liveFailureCount.current = 0;
         setLiveError(false);
-      } catch {
-        if (!cancelled) {
-          liveFailureCount.current += 1;
-          if (liveFailureCount.current >= 3) setLiveError(true);
-        }
-      } finally {
-        liveRefreshInFlight.current = false;
+        return true;
       }
+      if (!sameGraph(currentHead, next)) {
+        liveFailureCount.current = 3;
+        setLiveError(true);
+        return false;
+      }
+      const refreshed = new Map(
+        next.items.entries.map((item) => [`${item.item_id}:${item.revision}`, item]),
+      );
+      revealTaskChanges(currentHead.items.entries, next.items.entries);
+      headRef.current = next;
+      setHead(next);
+      setItems((current) =>
+        current.map((item) => refreshed.get(`${item.item_id}:${item.revision}`) ?? item),
+      );
+      liveFailureCount.current = 0;
+      setLiveError(false);
+      return true;
+    } catch {
+      if (
+        requestedGeneration !== selectionGeneration.current ||
+        requestedBranchKey !== selectedBranchKeyRef.current
+      ) {
+        return true;
+      }
+      liveFailureCount.current += 1;
+      if (liveFailureCount.current >= 3) setLiveError(true);
+      return false;
+    } finally {
+      liveRefreshInFlight.current = false;
     }
+  }, [revealTaskChanges]);
 
-    if (live) void refreshHead();
-    const timer = window.setInterval(
-      () => void refreshHead(),
-      live ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
-    );
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [initial.basis.branch_id, initial.basis.work_id, live, revealTaskChanges]);
+  useVisiblePoll({
+    enabled: true,
+    intervalMs: live ? LIVE_REFRESH_INTERVAL_MS : QUIET_REFRESH_INTERVAL_MS,
+    maximumIntervalMs: 120_000,
+    immediate: live,
+    refresh: refreshHead,
+  });
 
   const topology = useMemo(
     () => taskTopology(items, dependencies),
@@ -612,6 +642,10 @@ function taskToneClasses(tone: WorkTaskTone): { dot: string; text: string } {
 
 function cursorKey(cursor: WorkTaskGraphCursorV1): string {
   return `${cursor.graph_revision}:${cursor.item_offset}:${cursor.dependency_offset}`;
+}
+
+function branchKey(page: WorkTaskGraphPageV2): string {
+  return JSON.stringify([page.basis.work_id, page.basis.branch_id]);
 }
 
 function sameGraph(initial: WorkTaskGraphPageV2, page: WorkTaskGraphPageV2): boolean {

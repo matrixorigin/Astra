@@ -21714,6 +21714,7 @@ mod tests {
                 Duration::from_secs(60),
                 "writer",
                 "turn",
+                None,
             )
             .await
             .unwrap()

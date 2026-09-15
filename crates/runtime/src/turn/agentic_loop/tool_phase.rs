@@ -2452,6 +2452,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         )
                         .unwrap_or(i64::MAX),
                         expected_owner_generation,
+                        expected_execution_binding_generation: None,
                     }
                 },
             ),

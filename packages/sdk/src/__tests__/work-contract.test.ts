@@ -8,6 +8,7 @@ import {
   decodeWorkCatalogPageV1,
   decodeWorkArchivedBranchPageV1,
   decodeWorkBranchAttachmentV1,
+  decodeWorkBranchActivityResponseV1,
   decodeWorkBranchControlOperationV2,
   decodeWorkBranchCreationOperationV1,
   decodeWorkBranchDeletionOperationV1,
@@ -32,6 +33,9 @@ import {
   reconcileWorkEventPageV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
+  decodeWorkExecutionViewV1,
+  decodeWorkExecutionTargetPageV1,
+  decodeWorkExecutionSwitchOperationV1,
 } from "../index";
 
 const fixture = JSON.parse(
@@ -339,6 +343,7 @@ test("listWorks sends a stable keyset cursor and decodes server-owned attention"
   expect((init.headers as Record<string, string>)[ASTRA_WORK_API_MAJOR_HEADER]).toBe(
     ASTRA_WORK_API_MAJOR,
   );
+  expect(init.cache).toBe("no-store");
 });
 
 test("Work catalog rejects incoherent attention, ordering, and unbounded input", async () => {
@@ -944,6 +949,58 @@ test("listWorkBranches reads the complete bounded active catalog", async () => {
     "https://astra.example/v1/works/work-1/branches",
   );
   expect(JSON.stringify(branchCatalog)).not.toContain("session_id");
+});
+
+test("getWorkBranchActivity reads one owner-scoped, identity-checked status", async () => {
+  const activity = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    branch_revision: 3,
+    activity: "working",
+    observed_at: "2026-09-15T00:00:00Z",
+  } as const;
+  const fetchMock = vi.fn().mockResolvedValue(response(200, activity));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(client.getWorkBranchActivity("work-1", "branch-1")).resolves.toEqual(activity);
+  const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(url).toBe("https://astra.example/v1/works/work-1/branches/branch-1/activity");
+  expect((init.headers as Record<string, string>)[ASTRA_WORK_API_MAJOR_HEADER]).toBe(
+    ASTRA_WORK_API_MAJOR,
+  );
+  expect(init.cache).toBe("no-store");
+  expect(JSON.stringify(activity)).not.toContain("session_id");
+
+  await expect(client.getWorkBranchActivity("work-1", "../branch")).rejects.toThrow(
+    "canonical Work resource identity",
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("Work branch activity decoder rejects drift and backing identities", () => {
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      branch_revision: 1,
+      activity: "running",
+      observed_at: "2026-09-15T00:00:00Z",
+    }),
+  ).toThrow("activity");
+  expect(() =>
+    decodeWorkBranchActivityResponseV1({
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      branch_revision: 1,
+      activity: "idle",
+      observed_at: "2026-09-15T00:00:00Z",
+      session_id: "must-not-leak",
+    }),
+  ).toThrow("field set");
 });
 
 test("Work branch catalog rejects incomplete lineage and delivery contradictions", () => {
@@ -2619,4 +2676,124 @@ test("Work turn boundary rejects ambiguous input and session-bearing events", ()
   expect(() => decodeWorkTurnStreamEventV1({ type: "future_event" })).toThrow(
     "unsupported",
   );
+});
+
+const executionView = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  initialized: true,
+  generation: 3,
+  state: "ready",
+  placement: "edge",
+  executor_id: "edge-laptop",
+  executor_name: "Laptop",
+  operation_id: null,
+  attempt: null,
+  failure_code: null,
+} as const;
+
+const executionTargets = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  targets: [
+    {
+      executor_id: "edge-laptop",
+      display_name: "Laptop",
+      hostname: "laptop.local",
+      capabilities: ["runtime_process_authorization_v1"],
+      connected: true,
+    },
+    {
+      executor_id: "edge-desktop",
+      display_name: "Desktop",
+      hostname: null,
+      capabilities: [],
+      connected: true,
+    },
+  ],
+} as const;
+
+const executionOperation = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  operation_id: "switch-operation-1",
+  request_id: "switch-request-1",
+  state: "succeeded",
+  expected_generation: 3,
+  switching_generation: 4,
+  completed_generation: 5,
+  attempt: 1,
+  target: { kind: "edge", executor_id: "edge-desktop" },
+  failure_code: null,
+} as const;
+
+test("execution decoders enforce identity, bounded targets, and terminal generations", () => {
+  expect(decodeWorkExecutionViewV1(executionView).generation).toBe(3);
+  expect(decodeWorkExecutionViewV1({ ...executionView, initialized: false }).initialized).toBe(false);
+  expect(decodeWorkExecutionTargetPageV1(executionTargets).targets).toHaveLength(2);
+  expect(decodeWorkExecutionSwitchOperationV1(executionOperation).state).toBe("succeeded");
+
+  const duplicate = structuredClone(executionTargets);
+  duplicate.targets[1].executor_id = duplicate.targets[0].executor_id;
+  // Duplicate target identities make selection ambiguous and are rejected by
+  // the client before a user can submit a move.
+  expect(() => decodeWorkExecutionTargetPageV1(duplicate)).toThrow(
+    "duplicate executor_id",
+  );
+
+  const inconsistent = { ...executionOperation, completed_generation: null };
+  expect(() => decodeWorkExecutionSwitchOperationV1(inconsistent)).toThrow(
+    "terminal state and completed_generation disagree",
+  );
+});
+
+test("execution client methods use no-store reads and sealed mutation bodies", async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce(response(200, executionView))
+    .mockResolvedValueOnce(response(200, executionTargets))
+    .mockResolvedValueOnce(response(201, executionOperation))
+    .mockResolvedValueOnce(response(200, executionOperation))
+    .mockResolvedValueOnce(response(200, executionOperation));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(client.getWorkBranchExecution("work-1", "branch-1")).resolves.toEqual(executionView);
+  await expect(
+    client.listWorkBranchExecutionTargets("work-1", "branch-1"),
+  ).resolves.toEqual(executionTargets);
+  await expect(
+    client.switchWorkBranchExecution("work-1", "branch-1", {
+      requestId: "switch-request-1",
+      attachmentId: "attachment-1",
+      expectedGeneration: 3,
+      target: { kind: "edge", executorId: "edge-desktop" },
+    }),
+  ).resolves.toEqual(executionOperation);
+  await expect(
+    client.getWorkBranchExecutionSwitch("work-1", "branch-1", "switch-operation-1"),
+  ).resolves.toEqual(executionOperation);
+  await expect(
+    client.retryWorkBranchExecutionSwitch(
+      "work-1",
+      "branch-1",
+      "switch-operation-1",
+      "attachment-1",
+    ),
+  ).resolves.toEqual(executionOperation);
+
+  const calls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+  expect(calls[0]?.[1].cache).toBe("no-store");
+  expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({
+    request_id: "switch-request-1",
+    attachment_id: "attachment-1",
+    expected_generation: 3,
+    target: { kind: "edge", executor_id: "edge-desktop" },
+  });
+  expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({
+    attachment_id: "attachment-1",
+  });
 });

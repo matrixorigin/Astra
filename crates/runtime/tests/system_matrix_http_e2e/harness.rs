@@ -569,6 +569,12 @@ pub async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_a
         .await;
 }
 
+/// Workspace advertised by the synthetic Edge used by the live Matrix E2E
+/// journeys. The production admission path requires a registered,
+/// materialized checkout before an Edge can start a turn, so bootstrap seeds
+/// the same durable identity that a real Edge WebSocket handshake publishes.
+pub const MATRIX_E2E_EDGE_WORKSPACE_ROOT: &str = "/tmp/astra-system-matrix-edge";
+
 pub fn row_get_str(r: &MySqlRow, col: &str) -> String {
     r.try_get::<String, _>(col)
         .unwrap_or_else(|_| panic!("missing string column {col}"))
@@ -1074,6 +1080,42 @@ pub async fn bootstrap() -> BootstrapResult {
     // Do not call `cleanup_session_data` here — it would delete the row we just created via POST
     // /sessions, breaking list/get/cancel and the full product journey.
     cleanup_edge_registry(&pool, &user_id, &edge_agent_id).await;
+
+    // A native Edge turn is admitted only after the Edge has published a
+    // stable checkout materialization. The REST registration route exercises
+    // the public registry contract; the SQL update mirrors the materialization
+    // identity that the real Edge WebSocket handshake supplies separately.
+    let (st_edge, edge) = post_json(
+        &app,
+        "/agents/edge",
+        Some(&auth_header),
+        json!({
+            "edge_agent_id": edge_agent_id,
+            "hostname": "system-matrix-edge",
+            "worktree_path": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "capabilities": { "tools": ["read_file"] }
+        }),
+    )
+    .await;
+    assert_eq!(st_edge, StatusCode::OK, "seed Matrix E2E Edge: {edge}");
+    let materialization_id = format!("materialization-{suffix}");
+    let materialized = sqlx::query(
+        "UPDATE edge_agent_registry
+         SET materialization_id = ?
+         WHERE user_id = ? AND edge_agent_id = ? AND worktree_path = ?",
+    )
+    .bind(&materialization_id)
+    .bind(&user_id)
+    .bind(&edge_agent_id)
+    .bind(MATRIX_E2E_EDGE_WORKSPACE_ROOT)
+    .execute(&pool)
+    .await
+    .expect("seed Matrix E2E Edge materialization");
+    assert_eq!(
+        materialized.rows_affected(),
+        1,
+        "Matrix E2E Edge registration must have one materialized row"
+    );
 
     // Register a mock model so run-lifecycle tests don't need a real LLM.
     grant_astra_admin_role(&pool, &user_id).await;

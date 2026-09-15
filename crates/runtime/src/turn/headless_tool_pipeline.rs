@@ -2338,6 +2338,7 @@ mod tests {
                 crate::server::tool_invocation_runtime::DurableDispatchAdmission {
                     expected_control_epoch: 7,
                     expected_owner_generation: 0,
+                    expected_execution_binding_generation: None,
                 },
             );
             assert!(

@@ -328,10 +328,12 @@ pub use session_artifact_store::{
     local_owner_scope, local_owner_user_id, local_session_artifact_store,
 };
 pub use session_context_coordinator::{
-    AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, DatabaseSessionContextCoordinator,
-    MaterializedConversationV1, RenewedTurnAuthority, ReserveTurnOutcome,
-    SessionAdmissionSnapshotV1, SessionAuthorityEventV1, SessionContextCoordinator,
-    SessionContextCoordinatorError, TransferWriterOutcome, WriterTransferConflictV1,
+    AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
+    DatabaseSessionContextCoordinator, MaterializedConversationV1, RenewedTurnAuthority,
+    ReserveTurnOutcome, SESSION_EXECUTION_BINDING_SCHEMA_VERSION, SessionAdmissionSnapshotV1,
+    SessionAuthorityEventV1, SessionContextCoordinator, SessionContextCoordinatorError,
+    SessionExecutionBindingStateV1, SessionExecutionBindingV1, SessionExecutionSwitchReceiptV1,
+    SessionExecutionSwitchStateV1, TransferWriterOutcome, WriterTransferConflictV1,
     WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{

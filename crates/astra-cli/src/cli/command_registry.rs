@@ -409,8 +409,13 @@ const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 // The bare command opens the agent workbench; `list` is only an alias.
 const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[];
 // The bare command opens the Work board; `status` is only an alias.
-const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] =
-    &[("start", "Track this conversation as durable Work")];
+const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("start", "Track this conversation as durable Work"),
+    (
+        "execution",
+        "Show live execution placement and handoff targets",
+    ),
+];
 // The bare command opens the editor; `edit` is only an alias.
 const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
 const WORK_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -1121,7 +1126,13 @@ mod tests {
         let work = resolve_command_meta("/work").expect("work command registered");
         assert_eq!(
             work.visible_tui_subcommands(),
-            [("start", "Track this conversation as durable Work")]
+            [
+                ("start", "Track this conversation as durable Work"),
+                (
+                    "execution",
+                    "Show live execution placement and handoff targets"
+                )
+            ]
         );
 
         let config = resolve_command_meta("/config").expect("config command registered");

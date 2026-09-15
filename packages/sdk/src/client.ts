@@ -107,6 +107,11 @@ import type {
   WorkTaskGraphCursorV1,
   WorkTaskGraphPageV2,
   WorkSessionBindingV1,
+  WorkBranchActivityResponseV1,
+  WorkExecutionSwitchInputV1,
+  WorkExecutionViewV1,
+  WorkExecutionTargetPageV1,
+  WorkExecutionSwitchOperationV1,
   WorkTurnInput,
   WorkTurnStreamEvent,
 } from "./types";
@@ -195,6 +200,12 @@ import {
   workBranchDeletionOperationPath,
   workBranchDeletionOperationsPath,
   workBranchTaskGraphPath,
+  workBranchActivityPath,
+  workBranchExecutionPath,
+  workBranchExecutionTargetsPath,
+  workBranchExecutionSwitchesPath,
+  workBranchExecutionSwitchPath,
+  workBranchExecutionSwitchRetryPath,
   workSessionBindingPath,
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
@@ -240,6 +251,10 @@ import {
   decodeWorkReadCursorReceiptV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
+  decodeWorkBranchActivityResponseV1,
+  decodeWorkExecutionViewV1,
+  decodeWorkExecutionTargetPageV1,
+  decodeWorkExecutionSwitchOperationV1,
   decodeWorkTurnStreamEventV1,
 } from "./work-wire";
 
@@ -252,6 +267,16 @@ function assertWorkRequestId(value: string): void {
     throw new TypeError(
       "requestId must be non-empty, control-free, and at most 256 UTF-8 bytes",
     );
+  }
+}
+
+function assertWorkExecutionExecutorId(value: string): void {
+  if (
+    value.length === 0 ||
+    Array.from(value).length > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(value)
+  ) {
+    throw new TypeError("executorId is not a canonical Work execution identity");
   }
 }
 
@@ -783,7 +808,10 @@ export class AstraClient {
         before_work_id: options.cursor?.work_id,
         limit: options.limit,
       })}`,
-      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+      {
+        cache: "no-store",
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
     );
     return decodeWorkCatalogPageV1(raw);
   }
@@ -891,6 +919,128 @@ export class AstraClient {
       throw new TypeError("Work branch catalog identity disagrees with the requested Work");
     }
     return catalog;
+  }
+
+  /** Read the owner-scoped root Run status for one branch without attaching it. */
+  async getWorkBranchActivity(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkBranchActivityResponseV1> {
+    const raw = await this.fetch<unknown>(workBranchActivityPath(workId, branchId), {
+      cache: "no-store",
+      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+    });
+    const activity = decodeWorkBranchActivityResponseV1(raw);
+    if (activity.work_id !== workId || activity.branch_id !== branchId) {
+      throw new TypeError("Work branch activity identity disagrees with the request");
+    }
+    return activity;
+  }
+
+  /** Read the authoritative provider and generation for a Work branch. */
+  async getWorkBranchExecution(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkExecutionViewV1> {
+    const raw = await this.fetch<unknown>(workBranchExecutionPath(workId, branchId), {
+      cache: "no-store",
+      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+    });
+    const execution = decodeWorkExecutionViewV1(raw);
+    if (execution.work_id !== workId || execution.branch_id !== branchId) {
+      throw new TypeError("Work execution identity disagrees with the requested branch");
+    }
+    return execution;
+  }
+
+  /** List a bounded set of owner-scoped Edge targets for a Work branch. */
+  async listWorkBranchExecutionTargets(
+    workId: string,
+    branchId: string,
+  ): Promise<WorkExecutionTargetPageV1> {
+    const raw = await this.fetch<unknown>(workBranchExecutionTargetsPath(workId, branchId), {
+      cache: "no-store",
+      headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+    });
+    const page = decodeWorkExecutionTargetPageV1(raw);
+    if (page.work_id !== workId || page.branch_id !== branchId) {
+      throw new TypeError("Work execution target page identity disagrees with the request");
+    }
+    return page;
+  }
+
+  /** Request an Edge→Edge handoff using one controller attachment and CAS generation. */
+  async switchWorkBranchExecution(
+    workId: string,
+    branchId: string,
+    input: WorkExecutionSwitchInputV1,
+  ): Promise<WorkExecutionSwitchOperationV1> {
+    assertWorkRequestId(input.requestId);
+    workBranchAttachmentPath(workId, branchId, input.attachmentId);
+    assertWorkExecutionExecutorId(input.target.executorId);
+    if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 1) {
+      throw new TypeError("expectedGeneration must be a positive safe integer");
+    }
+    const raw = await this.post<unknown>(
+      workBranchExecutionSwitchesPath(workId, branchId),
+      {
+        request_id: input.requestId,
+        attachment_id: input.attachmentId,
+        expected_generation: input.expectedGeneration,
+        target: { kind: "edge", executor_id: input.target.executorId },
+      },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const operation = decodeWorkExecutionSwitchOperationV1(raw);
+    if (operation.work_id !== workId || operation.branch_id !== branchId) {
+      throw new TypeError("Work execution switch identity disagrees with the request");
+    }
+    return operation;
+  }
+
+  /** Observe one durable handoff without replaying its workspace proof. */
+  async getWorkBranchExecutionSwitch(
+    workId: string,
+    branchId: string,
+    operationId: string,
+  ): Promise<WorkExecutionSwitchOperationV1> {
+    const raw = await this.fetch<unknown>(
+      workBranchExecutionSwitchPath(workId, branchId, operationId),
+      { cache: "no-store", headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const operation = decodeWorkExecutionSwitchOperationV1(raw);
+    if (
+      operation.work_id !== workId ||
+      operation.branch_id !== branchId ||
+      operation.operation_id !== operationId
+    ) {
+      throw new TypeError("Work execution switch identity disagrees with the requested resource");
+    }
+    return operation;
+  }
+
+  /** Retry a failed or interrupted handoff with the caller's current controller attachment. */
+  async retryWorkBranchExecutionSwitch(
+    workId: string,
+    branchId: string,
+    operationId: string,
+    attachmentId: string,
+  ): Promise<WorkExecutionSwitchOperationV1> {
+    workBranchAttachmentPath(workId, branchId, attachmentId);
+    const raw = await this.post<unknown>(
+      workBranchExecutionSwitchRetryPath(workId, branchId, operationId),
+      { attachment_id: attachmentId },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const operation = decodeWorkExecutionSwitchOperationV1(raw);
+    if (
+      operation.work_id !== workId ||
+      operation.branch_id !== branchId ||
+      operation.operation_id !== operationId
+    ) {
+      throw new TypeError("Work execution retry identity disagrees with the requested resource");
+    }
+    return operation;
   }
 
   /** Read one bounded archive-time page without scanning active alternatives. */

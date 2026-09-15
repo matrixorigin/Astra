@@ -28,6 +28,8 @@ export default async function WorkPage({
     const deliveryBranch = catalog.branches.find((branch) => branch.is_delivery)!;
     const [
       attachmentResult,
+      activityResult,
+      executionResult,
       transcriptResult,
       archivedBranchesResult,
       patchArtifactsResult,
@@ -38,6 +40,8 @@ export default async function WorkPage({
       runtime.sdk.attachWorkBranch(workId, branchId, {
         requestId: `web-open:${crypto.randomUUID()}`,
       }),
+      runtime.sdk.getWorkBranchActivity(workId, branchId),
+      runtime.sdk.getWorkBranchExecution(workId, branchId),
       runtime.sdk.getWorkBranchTranscript(workId, branchId, { limit: 50 }),
       runtime.sdk.listArchivedWorkBranches(workId, { limit: 20 }),
       runtime.sdk.listWorkPatchArtifacts(workId, branchId, { limit: 10 }),
@@ -66,6 +70,8 @@ export default async function WorkPage({
         branchCatalog={catalog}
         selectedBranch={selectedBranch}
         attachment={readOrThrow(attachmentResult)}
+        initialActivity={readOrThrow(activityResult)}
+        initialExecution={readOrThrow(executionResult)}
         transcript={readOrThrow(transcriptResult)}
         archivedBranches={readOrThrow(archivedBranchesResult)}
         patchArtifacts={readOrThrow(patchArtifactsResult)}

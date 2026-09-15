@@ -1402,6 +1402,82 @@ async fn edge_registry_registration_claim_serializes_cross_pod_setup() {
 
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_native_targets_filter_before_limit_and_exclude_scoped_rows() {
+    require_env();
+    let pool = common::setup_pool().await.get().clone();
+    let svc = DatabaseEdgeRegistryService::new(pool.clone());
+    let user_id = format!("user_{}", unique_suffix());
+
+    // Seed stale registrations first. A target query limited before applying
+    // eligibility would return an empty page and hide the usable 26th row.
+    for index in 0..25 {
+        sqlx::query(
+            "INSERT INTO edge_agent_registry
+             (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
+              materialization_id, workspace_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("registry-invalid-{index}"))
+        .bind(format!("agent-invalid-{index}"))
+        .bind(format!("edge-invalid-{index}"))
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
+        .execute(&pool)
+        .await
+        .expect("seed stale native target row");
+    }
+    sqlx::query(
+        "INSERT INTO edge_agent_registry
+         (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
+          materialization_id, workspace_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind("registry-valid")
+    .bind("agent-valid")
+    .bind("edge-valid")
+    .bind("/workspace/project")
+    .bind("materialization-valid")
+    .bind(Option::<&str>::None)
+    .execute(&pool)
+    .await
+    .expect("seed usable native target row");
+    sqlx::query(
+        "INSERT INTO edge_agent_registry
+         (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
+          materialization_id, workspace_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind("registry-scoped")
+    .bind("agent-scoped")
+    .bind("edge-scoped")
+    .bind("/workspace/provider")
+    .bind("materialization-scoped")
+    .bind("provider-scope")
+    .execute(&pool)
+    .await
+    .expect("seed provider-scoped target row");
+
+    let targets = svc
+        .list_native_execution_targets(&user_id, 25)
+        .await
+        .expect("list native execution targets");
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].edge_agent_id, "agent-valid");
+    assert_eq!(targets[0].workspace_id, None);
+
+    sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ?")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean native target fixture");
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn edge_registry_finalized_claim_is_renewed_and_fences_a_third_generation() {
     expired_finalized_claim_survives_displaced_cleanup(false).await;
 }

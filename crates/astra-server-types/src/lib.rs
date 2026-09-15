@@ -173,6 +173,130 @@ pub struct WorkSessionBindingResponseV1 {
     pub graph_revision: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkBranchActivityV1 {
+    Working,
+    Waiting,
+    Paused,
+    Idle,
+}
+
+/// Read-only, owner-scoped status used by Web observers to discover activity
+/// started by another client. It carries no Session or Run identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchActivityResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub branch_revision: i64,
+    pub activity: WorkBranchActivityV1,
+    pub observed_at: String,
+}
+
+/// Public execution location for one Work branch. The canonical Session
+/// binding remains private; this projection exposes only the information a
+/// surface needs to explain where the next write will run.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionPlacementV1 {
+    Server,
+    Edge,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionStateV1 {
+    Ready,
+    Switching,
+    NeedsAttention,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionSwitchStateV1 {
+    Switching,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkExecutionTargetRequestV1 {
+    Edge { executor_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchRequestV1 {
+    pub request_id: String,
+    pub attachment_id: String,
+    pub expected_generation: u64,
+    pub target: WorkExecutionTargetRequestV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchRetryRequestV1 {
+    pub attachment_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionViewV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    /// `false` means the Work has not selected a durable provider yet. Reads
+    /// expose that state without creating a binding or taking mutation locks.
+    pub initialized: bool,
+    pub generation: u64,
+    pub state: WorkExecutionStateV1,
+    pub placement: WorkExecutionPlacementV1,
+    pub executor_id: Option<String>,
+    pub executor_name: Option<String>,
+    pub operation_id: Option<String>,
+    pub attempt: Option<u32>,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionTargetV1 {
+    pub executor_id: String,
+    pub display_name: Option<String>,
+    pub hostname: Option<String>,
+    pub capabilities: Vec<String>,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionTargetPageV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub targets: Vec<WorkExecutionTargetV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchOperationV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub operation_id: String,
+    pub request_id: String,
+    pub state: WorkExecutionSwitchStateV1,
+    pub expected_generation: u64,
+    pub switching_generation: u64,
+    pub completed_generation: Option<u64>,
+    pub attempt: u32,
+    pub target: WorkExecutionTargetRequestV1,
+    pub failure_code: Option<String>,
+}
+
 #[cfg(feature = "server")]
 #[derive(Serialize)]
 #[serde(transparent)]
@@ -1939,6 +2063,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         enabled_tools: request.enabled_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
+        execution_binding_generation: None,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
         context,
         edge_executor_id,

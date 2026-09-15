@@ -3,6 +3,7 @@ import type {
   WorkCriteriaProposalSummaryV1,
   WorkBranchAttachmentV1,
   WorkBranchCreationOperationV1,
+  WorkBranchActivityResponseV1,
   WorkBranchComparisonReportV2,
   WorkOverviewV1,
 } from "@astra/sdk";
@@ -28,6 +29,8 @@ vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
   loadArchivedWorkBranchesAction: vi.fn(),
   deleteWorkBranchAction: vi.fn(),
   observeWorkBranchDeletionAction: vi.fn(),
+  refreshWorkBranchActivityAction: vi.fn(),
+  refreshWorkTaskGraphAction: vi.fn(),
   loadWorkTaskGraphPageAction: vi.fn(),
 }));
 
@@ -41,6 +44,8 @@ import {
   loadArchivedWorkBranchesAction,
   observeWorkBranchCreationAction,
   observeWorkBranchDeletionAction,
+  refreshWorkBranchActivityAction,
+  refreshWorkTaskGraphAction,
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
 } from "@/app/(workspace)/works/[workId]/actions";
@@ -131,6 +136,17 @@ const changeRetention = vi.mocked(changeWorkBranchRetentionAction);
 const loadArchivedBranches = vi.mocked(loadArchivedWorkBranchesAction);
 const deleteBranch = vi.mocked(deleteWorkBranchAction);
 const observeDeletion = vi.mocked(observeWorkBranchDeletionAction);
+const refreshActivity = vi.mocked(refreshWorkBranchActivityAction);
+const refreshTaskGraph = vi.mocked(refreshWorkTaskGraphAction);
+
+const idleActivity: WorkBranchActivityResponseV1 = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  branch_revision: 1,
+  activity: "idle",
+  observed_at: "2026-08-01T00:00:00Z",
+};
 
 const proposal: WorkCriteriaProposalSummaryV1 = {
   work_id: "work-1",
@@ -474,10 +490,38 @@ function comparison(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  refreshActivity.mockResolvedValue({ ok: true, activity: idleActivity });
+  refreshTaskGraph.mockResolvedValue({ ok: true, page: snapshot().taskGraph });
   Object.defineProperty(globalThis.crypto, "randomUUID", {
     configurable: true,
     value: vi.fn(() => "00000000-0000-4000-8000-000000000001"),
   });
+});
+
+test("discovers activity started on another surface and refreshes this branch's graph", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  try {
+    refreshActivity.mockResolvedValue({
+      ok: true,
+      activity: { ...idleActivity, activity: "working" },
+    });
+    render(<TestWorkOverviewPage initial={snapshot()} initialActivity={idleActivity} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Ready to continue · Live");
+    expect(screen.queryByText("Live", { exact: true })).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_200);
+    });
+
+    expect(refreshActivity).toHaveBeenCalledWith({ workId: "work-1", branchId: "branch-1" });
+    expect(screen.getByRole("status")).toHaveTextContent("Astra is working · Live");
+    expect(screen.getByText("Live", { exact: true })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  }
 });
 
 test("keeps proposal payload lazy until the user opens the suggestion", async () => {

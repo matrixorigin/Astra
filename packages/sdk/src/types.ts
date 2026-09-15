@@ -1954,6 +1954,76 @@ export type WorkObservationReportV1 = {
 export type WorkCatalogAttentionV1 = "needs_review" | "updated" | "none";
 export type WorkBranchActivityV1 = "working" | "waiting" | "paused" | "idle";
 
+export type WorkBranchActivityResponseV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  branch_revision: number;
+  activity: WorkBranchActivityV1;
+  observed_at: string;
+};
+
+export type WorkExecutionPlacementV1 = "server" | "edge";
+export type WorkExecutionStateV1 = "ready" | "switching" | "needs_attention";
+export type WorkExecutionSwitchStateV1 = "switching" | "succeeded" | "failed";
+
+export type WorkExecutionTargetRequestV1 = {
+  kind: "edge";
+  executor_id: string;
+};
+
+export type WorkExecutionSwitchInputV1 = {
+  requestId: string;
+  attachmentId: string;
+  expectedGeneration: number;
+  target: { kind: "edge"; executorId: string };
+};
+
+export type WorkExecutionViewV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  initialized: boolean;
+  generation: number;
+  state: WorkExecutionStateV1;
+  placement: WorkExecutionPlacementV1;
+  executor_id: string | null;
+  executor_name: string | null;
+  operation_id: string | null;
+  attempt: number | null;
+  failure_code: string | null;
+};
+
+export type WorkExecutionTargetV1 = {
+  executor_id: string;
+  display_name: string | null;
+  hostname: string | null;
+  capabilities: string[];
+  connected: boolean;
+};
+
+export type WorkExecutionTargetPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  targets: WorkExecutionTargetV1[];
+};
+
+export type WorkExecutionSwitchOperationV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  operation_id: string;
+  request_id: string;
+  state: WorkExecutionSwitchStateV1;
+  expected_generation: number;
+  switching_generation: number;
+  completed_generation: number | null;
+  attempt: number;
+  target: WorkExecutionTargetRequestV1;
+  failure_code: string | null;
+};
+
 export type WorkCatalogCursorV1 = {
   created_at: string;
   work_id: string;

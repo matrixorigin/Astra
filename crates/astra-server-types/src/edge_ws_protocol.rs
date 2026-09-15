@@ -8,7 +8,7 @@
 //!
 //! **Edge → Server** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth", "edge_agent_id": "...", "interaction_api_major": "3", "hostname": "...", "workspace_dir": "..."}
+//! {"type": "edge_auth", "edge_agent_id": "...", "materialization_id": "...", "interaction_api_major": "3", "hostname": "...", "workspace_dir": "..."}
 //! {"type": "edge_tool_result", "request_id": "...", "output": "...", "is_error": false, "tool_result_fields": {"exit_code": 0}}
 //! {"type": "edge_ping"}
 //! ```
@@ -102,6 +102,10 @@ pub enum EdgeClientMessage {
     #[serde(rename = "edge_auth")]
     Auth {
         edge_agent_id: String,
+        /// Stable identity persisted by the Edge beside its checkout. It
+        /// survives reconnects and Edge-agent label changes, while separate
+        /// devices materializing the same path receive different identities.
+        materialization_id: String,
         interaction_api_major: String,
         #[serde(default)]
         hostname: Option<String>,
@@ -228,6 +232,7 @@ mod tests {
         let msg: EdgeClientMessage = serde_json::from_value(json!({
             "type": "edge_auth",
             "edge_agent_id": "my-edge",
+            "materialization_id": "materialization-1",
             "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
             "hostname": "laptop",
             "workspace_dir": "/home/user/project"
@@ -236,11 +241,13 @@ mod tests {
         match msg {
             EdgeClientMessage::Auth {
                 edge_agent_id,
+                materialization_id,
                 interaction_api_major,
                 hostname,
                 ..
             } => {
                 assert_eq!(edge_agent_id, "my-edge");
+                assert_eq!(materialization_id, "materialization-1");
                 assert_eq!(interaction_api_major, crate::AGENT_INTERACTION_API_MAJOR);
                 assert_eq!(hostname.as_deref(), Some("laptop"));
             }
@@ -415,6 +422,7 @@ mod tests {
     fn edge_client_auth_serializes() {
         let msg = EdgeClientMessage::Auth {
             edge_agent_id: "e1".into(),
+            materialization_id: "materialization-1".into(),
             interaction_api_major: crate::AGENT_INTERACTION_API_MAJOR.into(),
             hostname: Some("h".into()),
             workspace_dir: None,

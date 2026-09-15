@@ -28,6 +28,14 @@ pub fn local_state_root() -> PathBuf {
     )
 }
 
+/// Resolve the per-user default root without honoring the process-local cache
+/// override. Device identities use this root so `ASTRA_LOCAL_STATE_ROOT` can
+/// isolate caches without creating a second identity for one physical device.
+#[must_use]
+pub fn default_local_state_root() -> PathBuf {
+    local_state_root_from(None, dirs::home_dir().as_deref())
+}
+
 fn local_state_root_override_from(value: Option<&OsStr>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }

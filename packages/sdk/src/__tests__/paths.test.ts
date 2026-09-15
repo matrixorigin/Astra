@@ -13,6 +13,11 @@ import {
   sessionTranscriptPath,
   skillPath,
   skillUnpublishPath,
+  workBranchExecutionPath,
+  workBranchExecutionTargetsPath,
+  workBranchExecutionSwitchesPath,
+  workBranchExecutionSwitchPath,
+  workBranchExecutionSwitchRetryPath,
 } from "../paths";
 
 describe("paths — buildQueryString", () => {
@@ -111,5 +116,28 @@ describe("paths — helpers encode ids", () => {
       `/models/${encodeURIComponent("bedrock/claude")}`,
     );
     expect(modelCheckPath("gpt-4")).toBe("/models/gpt-4/check");
+  });
+
+  test("Work execution paths keep every identity segment canonical", () => {
+    expect(workBranchExecutionPath("work-1", "branch-1")).toBe(
+      "/v1/works/work-1/branches/branch-1/execution",
+    );
+    expect(workBranchExecutionTargetsPath("work-1", "branch-1")).toBe(
+      "/v1/works/work-1/branches/branch-1/execution/targets",
+    );
+    expect(workBranchExecutionSwitchesPath("work-1", "branch-1")).toBe(
+      "/v1/works/work-1/branches/branch-1/execution/switches",
+    );
+    expect(
+      workBranchExecutionSwitchPath("work-1", "branch-1", "switch-1"),
+    ).toBe("/v1/works/work-1/branches/branch-1/execution/switches/switch-1");
+    expect(
+      workBranchExecutionSwitchRetryPath("work-1", "branch-1", "switch-1"),
+    ).toBe(
+      "/v1/works/work-1/branches/branch-1/execution/switches/switch-1/retry",
+    );
+    expect(() => workBranchExecutionSwitchPath("work-1", "branch-1", "../x")).toThrow(
+      "operationId",
+    );
   });
 });

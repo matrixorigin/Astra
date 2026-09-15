@@ -167,6 +167,7 @@ async fn handle_edge_connection(
                 match serde_json::from_str::<EdgeClientMessage>(&text) {
                     Ok(EdgeClientMessage::Auth {
                         edge_agent_id,
+                        materialization_id,
                         interaction_api_major,
                         hostname,
                         workspace_dir,
@@ -188,7 +189,13 @@ async fn handle_edge_connection(
                             .await;
                             return None;
                         }
-                        return Some((edge_agent_id, hostname, workspace_dir, capabilities));
+                        return Some((
+                            edge_agent_id,
+                            materialization_id,
+                            hostname,
+                            workspace_dir,
+                            capabilities,
+                        ));
                     }
                     _ => {
                         let _ = send_edge_msg(
@@ -207,34 +214,38 @@ async fn handle_edge_connection(
     })
     .await;
 
-    let (edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
-        Ok(Some(auth)) => auth,
-        _ => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                "edge WebSocket auth timeout or closed before edge_auth"
-            );
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "auth timeout or connection closed".into(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
+    let (edge_agent_id, materialization_id, hostname, workspace_dir, capabilities) =
+        match auth_result {
+            Ok(Some(auth)) => auth,
+            _ => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    "edge WebSocket auth timeout or closed before edge_auth"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "auth timeout or connection closed".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
 
-    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id) {
+    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id)
+        || materialization_id.len() > 128
+        || !astra_runtime_env::is_valid_provider_id(&materialization_id)
+    {
         tracing::warn!(
             target: "astra_runtime::edge_ws",
             edge_agent_id = %edge_agent_id,
-            "edge WebSocket auth failed: invalid edge_agent_id"
+            "edge WebSocket auth failed: invalid edge or materialization identity"
         );
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
-                message: "invalid edge_agent_id".into(),
+                message: "invalid edge or materialization identity".into(),
             },
         )
         .await;
@@ -440,15 +451,18 @@ async fn handle_edge_connection(
     // replaced by this connection. Its DB implementation uses an edge_id CAS,
     // so this predecessor remains correct even when another pod reconnects the
     // same edge concurrently.
-    let mut registration = Box::pin(edge_registry.register_or_update_with_lease(
-        &user_id,
-        &edge_agent_id,
-        &edge_id_for_registry,
-        hostname.as_deref(),
-        workspace_dir.as_deref(),
-        capabilities.clone(),
-        workspace_id.as_deref(),
-    ));
+    let mut registration = Box::pin(
+        edge_registry.register_or_update_with_lease_and_materialization(
+            &user_id,
+            &edge_agent_id,
+            &edge_id_for_registry,
+            hostname.as_deref(),
+            workspace_dir.as_deref(),
+            capabilities.clone(),
+            workspace_id.as_deref(),
+            Some(&materialization_id),
+        ),
+    );
     let mut socket_closed_during_registration = false;
     let registration_result = loop {
         tokio::select! {
@@ -666,16 +680,20 @@ async fn handle_edge_connection(
     // Only after DB success and with the forward loop already running: the new
     // sender becomes selectable inheriting the pending map. Release the reconnect
     // lock immediately afterward so it never spans the connection's lifetime.
-    let pool_generation = state.edge_connection_pool.commit_reconnect(
-        reconnect,
-        &user_id,
-        &edge_agent_id,
-        hostname.clone(),
-        workspace_dir.clone(),
-        capabilities,
-        workspace_id.clone(),
-        pool_tx,
-    );
+    let pool_generation = state
+        .edge_connection_pool
+        .commit_reconnect_with_registry_and_materialization_id(
+            reconnect,
+            &user_id,
+            &edge_agent_id,
+            hostname.clone(),
+            workspace_dir.clone(),
+            capabilities,
+            workspace_id.clone(),
+            Some(registration_lease.current.registry_id.clone()),
+            registration_lease.current.materialization_id.clone(),
+            pool_tx,
+        );
     // Independently poll publication and its deadline even while a message or
     // heartbeat handler awaits database resources. JoinSet aborts on owner drop;
     // normal teardown also joins cancellation before durable unregister.
@@ -699,6 +717,8 @@ async fn handle_edge_connection(
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
     let dispatch_sink = ws_sink.clone();
     let dispatch_inflight = inflight_dispatches.clone();
+    let relay_registry_id = registration_lease.current.registry_id.clone();
+    let relay_materialization_id = registration_lease.current.materialization_id.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let mut dispatch_wakeup = dispatch_svc
         .subscribe_pending_wakeup(&dispatch_user_id, &dispatch_agent_id)
@@ -755,6 +775,22 @@ async fn handle_edge_connection(
                                 continue;
                             }
                         };
+                        if let Err(reason) = validate_relay_attestation(
+                            &msg,
+                            &relay_registry_id,
+                            relay_materialization_id.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %row.user_id,
+                                edge_agent_id = %row.edge_agent_id,
+                                request_id = %row.request_id,
+                                reason,
+                                "Edge dispatch relay rejected workspace attestation for this materialization"
+                            );
+                            fail_claimed_edge_dispatch(dispatch_svc.as_ref(), row, reason).await;
+                            continue;
+                        }
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),
@@ -1319,6 +1355,41 @@ fn decode_relay_edge_dispatch_payload(
     serde_json::from_str(payload_json)
 }
 
+/// A cross-pod workspace attestation carries the durable registration and
+/// checkout identities inside the existing args object. The relay checks them
+/// against the authenticated socket before delivery; ordinary tool requests
+/// without this private marker are unaffected.
+fn validate_relay_attestation(
+    message: &EdgeServerMessage,
+    registry_id: &str,
+    materialization_id: Option<&str>,
+) -> Result<(), &'static str> {
+    let EdgeServerMessage::ToolRequest { tool, args, .. } = message else {
+        return Ok(());
+    };
+    let Some(marker) = args.get("__astra_attestation") else {
+        return Ok(());
+    };
+    if tool != "bash" {
+        return Err("edge_attestation_tool_mismatch");
+    }
+    let Some(marker) = marker.as_object() else {
+        return Err("edge_attestation_marker_invalid");
+    };
+    if marker
+        .get("registry_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(registry_id)
+        || marker
+            .get("materialization_id")
+            .and_then(serde_json::Value::as_str)
+            != materialization_id
+    {
+        return Err("edge_attestation_materialization_mismatch");
+    }
+    Ok(())
+}
+
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
 async fn send_edge_msg(
     sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
@@ -1814,6 +1885,91 @@ mod tests {
                 .expect("edge advertisement parses");
         advert.binding.executor.executor_id = executor_id.to_string();
         serde_json::to_value(advert).expect("edge advertisement serializes")
+    }
+
+    fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
+        EdgeServerMessage::ToolRequest {
+            request_id: "dispatch-request".to_string(),
+            identity: Box::new(
+                astra_turn_types::ToolInvocationIdentity::new(
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    "chain-1",
+                    "invocation-1",
+                )
+                .expect("test invocation identity"),
+            ),
+            delivery_generation: 1,
+            tool: tool.to_string(),
+            args,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn relay_attestation_accepts_exact_authenticated_materialization() {
+        let message = relay_tool_request(
+            serde_json::json!({
+                "command": "pwd",
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "materialization-1"
+                }
+            }),
+            "bash",
+        );
+
+        assert_eq!(
+            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn relay_attestation_rejects_topology_or_materialization_mismatch() {
+        let wrong_materialization = relay_tool_request(
+            serde_json::json!({
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "other-materialization"
+                }
+            }),
+            "bash",
+        );
+        assert_eq!(
+            validate_relay_attestation(
+                &wrong_materialization,
+                "registry-1",
+                Some("materialization-1")
+            ),
+            Err("edge_attestation_materialization_mismatch")
+        );
+
+        let wrong_tool = relay_tool_request(
+            serde_json::json!({
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "materialization-1"
+                }
+            }),
+            "read_file",
+        );
+        assert_eq!(
+            validate_relay_attestation(&wrong_tool, "registry-1", Some("materialization-1")),
+            Err("edge_attestation_tool_mismatch")
+        );
+    }
+
+    #[test]
+    fn relay_attestation_marker_is_optional_for_ordinary_tool_requests() {
+        let message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
+        assert_eq!(
+            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            Ok(())
+        );
     }
 
     #[test]

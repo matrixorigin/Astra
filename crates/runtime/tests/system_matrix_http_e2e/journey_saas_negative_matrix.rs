@@ -13,10 +13,10 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, build_e2e_access_token, get_json, grant_astra_admin_role,
-    load_durable_interaction_event, maybe_tool_result_payload_from_sse, model_selection,
-    post_empty, post_json, put_json, revoke_astra_admin_role, seed_pending_approval,
-    seeded_model_selection,
+    E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, build_e2e_access_token, get_json,
+    grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
+    model_selection, post_empty, post_json, put_json, revoke_astra_admin_role,
+    seed_pending_approval, seeded_model_selection,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
@@ -478,7 +478,11 @@ pub async fn run_saas_edge_tool_result_success_path() {
         "workspace_binding": {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
-            "root": "/tmp/astra-system-matrix-edge",
+            "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -492,7 +496,7 @@ pub async fn run_saas_edge_tool_result_success_path() {
         "message": "read saas probe file",
         "context": {
             "edge_profile": {
-                "cwd": "/tmp/astra-system-matrix-edge",
+                "cwd": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },

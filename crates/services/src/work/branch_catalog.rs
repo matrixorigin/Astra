@@ -1,3 +1,4 @@
+use super::catalog::{WorkBranchActivity, activity_from_durable_run_status};
 use super::{
     CriterionSetRevision, ForkCursorRef, GoalRevision, GraphRevision, WORK_ACTIVE_BRANCH_MAX,
     WorkBranchId, WorkBranchRevision, WorkId, WorkOwnerId, WorkRevision,
@@ -62,6 +63,18 @@ pub struct WorkBranchCatalog {
     pub work_revision: WorkRevision,
     pub delivery_branch_id: WorkBranchId,
     pub branches: Vec<WorkBranchCatalogEntry>,
+}
+
+/// Point-in-time, owner-scoped runtime status for one active branch. This is a
+/// read projection of the existing Session execution slot and durable root
+/// Run; it does not create or acquire controller authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkBranchActivityObservation {
+    pub work_id: WorkId,
+    pub branch_id: WorkBranchId,
+    pub branch_revision: WorkBranchRevision,
+    pub activity: WorkBranchActivity,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -213,6 +226,87 @@ impl DatabaseWorkBranchCatalogService {
             work_revision,
             delivery_branch_id,
             branches,
+        })
+    }
+
+    /// Read the selected branch's current root Run state using one bounded,
+    /// owner-scoped statement. This deliberately exposes neither the backing
+    /// Session id nor the internal Run id to the caller.
+    pub async fn load_activity(
+        &self,
+        owner_id: &WorkOwnerId,
+        work_id: &WorkId,
+        branch_id: &WorkBranchId,
+    ) -> Result<WorkBranchActivityObservation, WorkBranchCatalogError> {
+        let row = sqlx::query(
+            "SELECT b.branch_revision, b.session_id AS branch_session_id,
+                    slot.run_id AS active_run_id,
+                    active.status AS active_run_status,
+                    active.waiting_for AS active_run_waiting_for,
+                    active.session_id AS active_run_session_id,
+                    active.work_id AS active_run_work_id,
+                    active.work_branch_id AS active_run_branch_id,
+                    active.parent_run_id AS active_run_parent_id
+             FROM works w
+             JOIN work_branches b
+               ON b.owner_id = w.owner_id AND b.work_id = w.work_id
+              AND b.archived_at IS NULL
+             LEFT JOIN agent_session_execution_slots slot
+               ON slot.user_id = w.owner_id AND slot.session_id = b.session_id
+             LEFT JOIN agent_runs active
+               ON active.user_id = slot.user_id AND active.run_id = slot.run_id
+             WHERE w.owner_id = ? AND w.work_id = ? AND w.archived_at IS NULL
+               AND b.branch_id = ?
+             LIMIT 1",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .fetch_optional(self.pool.get())
+        .await?
+        .ok_or(WorkBranchCatalogError::NotFound)?;
+
+        let branch_session_id = text(&row, "branch_session_id")?;
+        let activity = match optional_text(&row, "active_run_id")? {
+            None => WorkBranchActivity::Idle,
+            Some(_) => {
+                let active_run_status =
+                    optional_text(&row, "active_run_status")?.ok_or_else(|| {
+                        WorkBranchCatalogError::NeedsRepair(
+                            "branch execution slot references a missing Run".into(),
+                        )
+                    })?;
+                if optional_text(&row, "active_run_session_id")?.as_deref()
+                    != Some(branch_session_id.as_str())
+                    || optional_text(&row, "active_run_work_id")?.as_deref()
+                        != Some(work_id.as_str())
+                    || optional_text(&row, "active_run_branch_id")?.as_deref()
+                        != Some(branch_id.as_str())
+                    || optional_text(&row, "active_run_parent_id")?.is_some()
+                {
+                    return Err(WorkBranchCatalogError::NeedsRepair(
+                        "execution slot does not reference this branch's root Run".into(),
+                    ));
+                }
+                activity_from_durable_run_status(
+                    &active_run_status,
+                    optional_text(&row, "active_run_waiting_for")?.is_some(),
+                )
+                .ok_or_else(|| {
+                    WorkBranchCatalogError::NeedsRepair(
+                        "execution slot and durable Run status disagree".into(),
+                    )
+                })?
+            }
+        };
+
+        Ok(WorkBranchActivityObservation {
+            work_id: work_id.clone(),
+            branch_id: branch_id.clone(),
+            branch_revision: WorkBranchRevision::new(integer(&row, "branch_revision")?)
+                .map_err(repair)?,
+            activity,
+            observed_at: Utc::now(),
         })
     }
 
