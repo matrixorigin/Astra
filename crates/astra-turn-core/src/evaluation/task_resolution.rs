@@ -243,8 +243,7 @@ fn validate_assessment_records(
             .flatten()
             .ok_or(Error::UnavailableReference)
     };
-    let mut last_failure = 0;
-    let mut last_failure_round = None;
+    let mut failed_positions = Vec::with_capacity(assessment.failed_call_ids.len());
     for id in &assessment.failed_call_ids {
         let (index, record) = lookup(id)?;
         let classified_failure = effective_tool_result_class(record)
@@ -254,30 +253,59 @@ fn validate_assessment_records(
         {
             return Err(Error::NotExecutedFailure);
         }
-        last_failure = last_failure.max(index);
-        last_failure_round = last_failure_round.max(record.round);
+        failed_positions.push((index, record.round));
     }
-    let mut positive_observation = false;
+    let mut failure_covered = vec![false; failed_positions.len()];
+    let mut failure_positive_covered = vec![false; failed_positions.len()];
     for id in &assessment.evidence_call_ids {
         let (index, record) = lookup(id)?;
-        if record.disposition != Some(ToolCallDisposition::Executed)
-            || index <= last_failure
-            || record
-                .round
-                .zip(last_failure_round)
-                .is_some_and(|(evidence, failure)| evidence <= failure)
-        {
+        if record.disposition != Some(ToolCallDisposition::Executed) {
             return Err(Error::NotLaterExecution);
         }
-        positive_observation |= is_assessment_observation_candidate(record);
+        let observation_candidate = is_assessment_observation_candidate(record);
+        let mut covers_failure = false;
+        for ((covered, positive_covered), (failure_index, failure_round)) in failure_covered
+            .iter_mut()
+            .zip(&mut failure_positive_covered)
+            .zip(&failed_positions)
+        {
+            let later = index > *failure_index
+                && record
+                    .round
+                    .zip(*failure_round)
+                    .is_none_or(|(evidence, failure)| evidence > failure);
+            if later {
+                *covered = true;
+                if observation_candidate {
+                    *positive_covered = true;
+                }
+                covers_failure = true;
+            }
+        }
+        // Every declared supporting reference must be a later execution for
+        // at least one referenced failure. This keeps an unrelated or stale
+        // success from being presented as recovery while allowing independent
+        // failure/evidence pairs to be reconciled in one bounded submission.
+        if !covers_failure {
+            return Err(Error::NotLaterExecution);
+        }
     }
-    if assessment.conclusion == TaskResolutionConclusion::Supported && !positive_observation {
-        return Err(Error::MissingPositiveObservation);
-    }
-    if assessment.conclusion == TaskResolutionConclusion::Supported
-        && !assessment.remaining_gaps.is_empty()
-    {
-        return Err(Error::UnresolvedGaps);
+    if assessment.conclusion == TaskResolutionConclusion::Supported {
+        if failure_covered.iter().any(|covered| !covered) {
+            if assessment.evidence_call_ids.is_empty() {
+                return Err(Error::MissingPositiveObservation);
+            }
+            return Err(Error::NotLaterExecution);
+        }
+        if failure_positive_covered
+            .iter()
+            .any(|positive_covered| !positive_covered)
+        {
+            return Err(Error::MissingPositiveObservation);
+        }
+        if !assessment.remaining_gaps.is_empty() {
+            return Err(Error::UnresolvedGaps);
+        }
     }
     Ok(())
 }
@@ -439,6 +467,39 @@ mod tests {
                 &[failed_row, later_row]
             ),
             Err(AssessmentEvidenceError::LedgerMismatch)
+        );
+    }
+
+    #[test]
+    fn owner_bound_interleaved_evidence_keeps_ledger_integrity_checks() {
+        let (mut failed_first, failed_first_row) = bound_record("failed-first", false);
+        failed_first.round = Some(16);
+        let (mut evidence_first, evidence_first_row) = bound_record("evidence-first", true);
+        evidence_first.round = Some(17);
+        let (mut failed_second, failed_second_row) = bound_record("failed-second", false);
+        failed_second.round = Some(22);
+        let (mut evidence_second, evidence_second_row) = bound_record("evidence-second", true);
+        evidence_second.round = Some(23);
+
+        let mut assessment = claim();
+        assessment.failed_call_ids = vec!["failed-first".into(), "failed-second".into()];
+        assessment.evidence_call_ids = vec!["evidence-second".into(), "evidence-first".into()];
+
+        assert_eq!(
+            validate_bound_assessment_evidence(
+                &assessment,
+                "current-intent",
+                "boundary-1",
+                owner(),
+                &[failed_first, evidence_first, failed_second, evidence_second],
+                &[
+                    failed_first_row,
+                    evidence_first_row,
+                    failed_second_row,
+                    evidence_second_row
+                ]
+            ),
+            Ok(())
         );
     }
 
@@ -628,6 +689,92 @@ mod tests {
             1
         );
         assert!(!records[0].ok);
+    }
+
+    #[test]
+    fn supported_assessment_reconciles_interleaved_failure_evidence_pairs() {
+        let mut failed_first = record("failed-first", "inspect-one", false);
+        failed_first.round = Some(16);
+        let mut evidence_first = record("evidence-first", "inspect-one-scoped", true);
+        evidence_first.round = Some(17);
+        let mut failed_second = record("failed-second", "inspect-two", false);
+        failed_second.round = Some(22);
+        let mut evidence_second = record("evidence-second", "inspect-two-scoped", true);
+        evidence_second.round = Some(23);
+
+        let mut assessment = claim();
+        assessment.failed_call_ids = vec!["failed-first".into(), "failed-second".into()];
+        // The declaration order is intentionally independent of execution
+        // order. The validator must use the recorded positions and rounds.
+        assessment.evidence_call_ids = vec!["evidence-second".into(), "evidence-first".into()];
+
+        assert_eq!(
+            validate_assessment_evidence(
+                &assessment,
+                "current-intent",
+                &[failed_first, evidence_first, failed_second, evidence_second]
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn supported_assessment_requires_later_positive_observation_for_each_failure() {
+        let mut failed_first = record("failed-first", "inspect-one", false);
+        failed_first.round = Some(1);
+        let mut evidence_first = record("evidence-first", "inspect-one-scoped", true);
+        evidence_first.round = Some(2);
+        let mut failed_second = record("failed-second", "inspect-two", false);
+        failed_second.round = Some(3);
+
+        let mut assessment = claim();
+        assessment.failed_call_ids = vec!["failed-first".into(), "failed-second".into()];
+        assessment.evidence_call_ids = vec!["evidence-first".into()];
+        assert_eq!(
+            validate_assessment_evidence(
+                &assessment,
+                "current-intent",
+                &[
+                    failed_first.clone(),
+                    evidence_first.clone(),
+                    failed_second.clone()
+                ]
+            ),
+            Err(AssessmentEvidenceError::NotLaterExecution)
+        );
+
+        let mut evidence_second = record("evidence-second", "inspect-two-scoped", false);
+        evidence_second.round = Some(4);
+        assessment.evidence_call_ids.push("evidence-second".into());
+        assert_eq!(
+            validate_assessment_evidence(
+                &assessment,
+                "current-intent",
+                &[failed_first, evidence_first, failed_second, evidence_second]
+            ),
+            Err(AssessmentEvidenceError::MissingPositiveObservation)
+        );
+    }
+
+    #[test]
+    fn evidence_before_all_failures_cannot_be_declared_as_recovery() {
+        let mut early_evidence = record("early-evidence", "inspect-before", true);
+        early_evidence.round = Some(1);
+        let mut failed = record("failed", "inspect", false);
+        failed.round = Some(2);
+        let mut later_evidence = record("later-evidence", "inspect-after", true);
+        later_evidence.round = Some(3);
+
+        let mut assessment = claim();
+        assessment.evidence_call_ids = vec!["early-evidence".into(), "later-evidence".into()];
+        assert_eq!(
+            validate_assessment_evidence(
+                &assessment,
+                "current-intent",
+                &[early_evidence, failed, later_evidence]
+            ),
+            Err(AssessmentEvidenceError::NotLaterExecution)
+        );
     }
 
     #[test]
