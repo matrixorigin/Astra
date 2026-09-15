@@ -479,6 +479,10 @@ pub async fn run_saas_edge_tool_result_success_path() {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
             "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {

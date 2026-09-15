@@ -397,6 +397,10 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
             "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -627,6 +631,10 @@ pub async fn run_server_stream_partial_batch_failure() {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
             "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
@@ -915,6 +923,10 @@ pub async fn run_server_stream_out_of_order_tool_results() {
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
             "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {

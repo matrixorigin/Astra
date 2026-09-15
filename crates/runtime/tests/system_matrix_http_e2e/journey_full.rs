@@ -42,6 +42,10 @@ async fn run_tool_backed_chat_turn(
             "kind": "edge_workspace",
             "display_name": "system-matrix-edge",
             "root": MATRIX_E2E_EDGE_WORKSPACE_ROOT,
+            "source": {
+                "kind": "edge_path",
+                "path": MATRIX_E2E_EDGE_WORKSPACE_ROOT
+            },
             "authority": "read_write"
         },
         "executor_binding": {
