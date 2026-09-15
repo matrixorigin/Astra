@@ -4777,28 +4777,30 @@ async fn work_turn_route_uses_durable_edge_selection_without_server_override() {
         assert_field_absent(event, "session_id");
     }
 
-    let requests = lifecycle.requests.lock().expect("recorded request");
-    assert_eq!(requests.len(), 1);
-    let (recorded_owner, request) = &requests[0];
-    assert_eq!(recorded_owner, &owner_id);
-    assert_eq!(request.session_id.as_deref(), Some(session_id));
-    assert_eq!(request.edge_executor_id.as_deref(), Some("edge-web-1"));
-    assert_eq!(request.execution_binding_generation, Some(1));
-    assert_eq!(
-        request
-            .workspace_binding
-            .as_ref()
-            .map(|binding| binding.kind),
-        Some(astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace)
-    );
-    assert_eq!(
-        request
-            .executor_binding
-            .as_ref()
-            .and_then(|binding| binding.executor_id.as_deref()),
-        Some("edge-web-1")
-    );
-    assert!(!raw.contains(session_id));
+    {
+        let requests = lifecycle.requests.lock().expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        let (recorded_owner, request) = &requests[0];
+        assert_eq!(recorded_owner, &owner_id);
+        assert_eq!(request.session_id.as_deref(), Some(session_id));
+        assert_eq!(request.edge_executor_id.as_deref(), Some("edge-web-1"));
+        assert_eq!(request.execution_binding_generation, Some(1));
+        assert_eq!(
+            request
+                .workspace_binding
+                .as_ref()
+                .map(|binding| binding.kind),
+            Some(astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace)
+        );
+        assert_eq!(
+            request
+                .executor_binding
+                .as_ref()
+                .and_then(|binding| binding.executor_id.as_deref()),
+            Some("edge-web-1")
+        );
+        assert!(!raw.contains(session_id));
+    }
 
     cleanup_owner(&pool, &owner_id).await;
 }
