@@ -1835,6 +1835,18 @@ mod tests {
         }
     }
 
+    struct NeverSettledSessionLoader {
+        capture: SessionCapture,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionLoader for NeverSettledSessionLoader {
+        fn load(&self, _id: &str) -> Option<SessionCapture> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(self.capture.clone())
+        }
+    }
+
     #[tokio::test]
     async fn required_subsystem_health_is_runner_wide_and_forces_capture() {
         let exec = FakeExecutor::new();
@@ -2031,6 +2043,166 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.passed(), 1);
         assert!(loader.calls.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
+    async fn nested_memoria_health_without_target_keeps_post_loop_barrier() {
+        let exec = FakeExecutor::new();
+        exec.seed("nested-memory-no-target", "m", outcome_ok("m", "done", &[]));
+        let turn = crate::session_capture::JournalEvent {
+            event_type: "turn".into(),
+            raw: serde_json::json!({
+                "type": "turn",
+                "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                "turn": 1,
+                "metadata": {"run_id": "run-test"}
+            }),
+        };
+        let clean_unsettled = SessionCapture {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            journal_path: PathBuf::from("/nested-no-target-unsettled"),
+            events: vec![turn.clone()],
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        };
+        let settled_with_error = SessionCapture {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            journal_path: PathBuf::from("/nested-no-target-settled-error"),
+            events: vec![
+                turn,
+                crate::session_capture::JournalEvent {
+                    event_type: "session_memory_extraction".into(),
+                    raw: serde_json::json!({
+                        "turn": 1,
+                        "metadata": {"run_id": "run-test", "outcome": "errored", "reason": "owner auth rejected"}
+                    }),
+                },
+                crate::session_capture::JournalEvent {
+                    event_type: "subsystem_settled".into(),
+                    raw: serde_json::json!({
+                        "turn": 1,
+                        "metadata": {"run_id": "run-test", "subsystem": "post_loop_memory"}
+                    }),
+                },
+            ],
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        };
+        let loader = DelayedSessionLoader {
+            unsettled: clean_unsettled,
+            settled: settled_with_error,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_memoria_subsystem_health();
+        cfg.session_settle_timeout = Duration::from_secs(1);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let case = case_with(
+            "nested-memory-no-target",
+            vec![Criterion::AllOf {
+                criteria: vec![Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: None,
+                }],
+            }],
+        );
+
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.passed(), 0);
+        assert!(loader.calls.load(Ordering::Relaxed) >= 2);
+        assert!(report.runs[0].criteria.iter().any(|result| {
+            matches!(
+                result.criterion,
+                Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: Some(ref subsystem)
+                } if subsystem == "post_loop_memory"
+            ) && !result.passed
+        }));
+    }
+
+    #[tokio::test]
+    async fn nested_memoria_health_never_settling_cannot_pass() {
+        let exec = FakeExecutor::new();
+        exec.seed(
+            "nested-memory-never-settles",
+            "m",
+            outcome_ok("m", "done", &[]),
+        );
+        let capture = SessionCapture {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            journal_path: PathBuf::from("/nested-never-settles"),
+            events: vec![crate::session_capture::JournalEvent {
+                event_type: "turn".into(),
+                raw: serde_json::json!({
+                    "type": "turn",
+                    "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "turn": 1,
+                    "metadata": {"run_id": "run-test"}
+                }),
+            }],
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        };
+        let loader = NeverSettledSessionLoader {
+            capture,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_memoria_subsystem_health();
+        cfg.session_settle_timeout = Duration::from_millis(120);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let case = case_with(
+            "nested-memory-never-settles",
+            vec![Criterion::AllOf {
+                criteria: vec![Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: None,
+                }],
+            }],
+        );
+
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.passed(), 0);
+        assert!(loader.calls.load(Ordering::Relaxed) >= 2);
+        assert!(report.runs[0].criteria.iter().any(|result| {
+            matches!(
+                result.criterion,
+                Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: Some(ref subsystem)
+                } if subsystem == "post_loop_memory"
+            ) && !result.passed
+        }));
     }
 
     #[tokio::test]

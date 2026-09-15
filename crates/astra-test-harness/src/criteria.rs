@@ -887,9 +887,13 @@ pub fn requires_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
 /// runner keeps the injected hard gate in that case.
 pub fn has_unconditional_memoria_subsystem_health(criteria: &[Criterion]) -> bool {
     criteria.iter().any(|criterion| match criterion {
-        Criterion::SessionSubsystemHealthy { settled_subsystem } => settled_subsystem
-            .as_deref()
-            .is_none_or(|subsystem| subsystem == "post_loop_memory"),
+        // An omitted settlement target only validates the capture that is
+        // already available. It must not suppress the runner-injected
+        // post-loop barrier, because asynchronous memory work may still
+        // publish an error after that first capture.
+        Criterion::SessionSubsystemHealthy {
+            settled_subsystem: Some(subsystem),
+        } => subsystem == "post_loop_memory",
         Criterion::AllOf { criteria } => has_unconditional_memoria_subsystem_health(criteria),
         Criterion::AnyOf { .. } => false,
         _ => false,
@@ -5451,8 +5455,14 @@ mod tests {
 
     #[test]
     fn memoria_health_deduplication_is_not_bypassed_by_any_of() {
-        let health = Criterion::SessionSubsystemHealthy {
+        let health_without_settlement = Criterion::SessionSubsystemHealthy {
             settled_subsystem: None,
+        };
+        assert!(!has_unconditional_memoria_subsystem_health(
+            std::slice::from_ref(&health_without_settlement,)
+        ));
+        let health = Criterion::SessionSubsystemHealthy {
+            settled_subsystem: Some("post_loop_memory".into()),
         };
         assert!(has_unconditional_memoria_subsystem_health(
             std::slice::from_ref(&health,)
@@ -5460,6 +5470,11 @@ mod tests {
         assert!(has_unconditional_memoria_subsystem_health(&[
             Criterion::AllOf {
                 criteria: vec![health.clone(), Criterion::ExitCode { code: 0 }],
+            },
+        ]));
+        assert!(!has_unconditional_memoria_subsystem_health(&[
+            Criterion::AnyOf {
+                criteria: vec![health_without_settlement, Criterion::ExitCode { code: 0 }],
             },
         ]));
         assert!(!has_unconditional_memoria_subsystem_health(&[
