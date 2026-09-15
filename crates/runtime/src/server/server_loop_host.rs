@@ -23699,16 +23699,26 @@ mod tests {
         );
         let system = body["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains("boundary_instruction"));
-        assert!(!system.contains("Execute only this assignment"));
+        assert!(!system.contains("Execute this assignment"));
         assert!(!system.contains("One direct evidence result"));
         let facts = body["messages"][1]["content"].as_str().unwrap();
         assert!(facts.contains("boundary_instruction"));
-        assert!(facts.contains("Execute only this assignment"));
+        assert!(facts.contains("Execute this assignment"));
         assert!(facts.contains("One direct evidence result"));
         assert!(
             start_payload["instruction"]
                 .as_str()
                 .is_some_and(|instruction| instruction.len() < 240)
+        );
+        assert!(
+            start_payload["instruction"]
+                .as_str()
+                .is_some_and(|instruction| {
+                    instruction
+                        .contains("one successful non-lifecycle tool result after assignment")
+                        && instruction.contains("if unobtainable, settle blocked/failed")
+                }),
+            "the assignment frame must require fresh evidence before delivery"
         );
         assert_eq!(
             start_payload["objective"], "Inspect the bounded subject",
@@ -23840,6 +23850,16 @@ mod tests {
                 .as_str()
                 .is_some_and(|instruction| instruction.len() < 240),
             "continuation must not repeat the full lifecycle contract"
+        );
+        assert!(
+            continuation_payload["instruction"]
+                .as_str()
+                .is_some_and(|instruction| {
+                    instruction
+                        .contains("one successful non-lifecycle tool result after assignment")
+                        && instruction.contains("if unobtainable, settle blocked/failed")
+                }),
+            "continuations must keep the fresh-evidence boundary"
         );
 
         // The durable state may still retain the original frame even when a
