@@ -74,9 +74,9 @@ use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
 pub use session::{
-    DatabaseSessionService, SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData,
-    SessionListCursor, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    DatabaseSessionService, ProviderSessionCreationIdentity, SessionActivityCursor,
+    SessionActivityRecord, SessionCreateRequestData, SessionCreationResult, SessionListCursor,
+    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 use validation::validate_register_request;
 

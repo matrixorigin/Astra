@@ -10155,7 +10155,6 @@ fn test_request(message: &str) -> ChatRequestData {
         interactive_client: false,
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
     }
 }
 
@@ -10868,10 +10867,6 @@ fn runtime_binding_request(id: String, _mcp: &str, _skills: &str) -> AgentBindin
     AgentBindingRuntimeRequest { id }
 }
 
-fn test_agent_binding_owner_scope() -> astra_services::AgentBindingOwnerScope {
-    astra_services::AgentBindingOwnerScope::for_internal_user("test-user")
-}
-
 async fn service_with_in_memory_binding() -> (
     AgenticRunLifecycleService,
     Arc<astra_services::InMemoryAgentBindingService>,
@@ -10880,7 +10875,7 @@ async fn service_with_in_memory_binding() -> (
     let binding_service = Arc::new(astra_services::InMemoryAgentBindingService::new());
     let record = astra_services::AgentBindingService::create_binding(
         binding_service.as_ref(),
-        test_agent_binding_owner_scope(),
+        astra_services::AgentBindingOwnerScope::for_internal_user("test-user"),
         test_agent_binding_create_request(),
     )
     .await
@@ -10894,17 +10889,13 @@ async fn resolve_agent_binding_runtime_rejects_disabled_binding() {
     let (service, binding_service, record) = service_with_in_memory_binding().await;
     astra_services::AgentBindingService::disable_binding(
         binding_service.as_ref(),
-        test_agent_binding_owner_scope(),
         record.id.clone(),
     )
     .await
     .expect("binding disable");
 
     let err = match service
-        .resolve_agent_binding_runtime(
-            &test_agent_binding_owner_scope(),
-            &runtime_binding_request(record.id, "tools", "skills"),
-        )
+        .resolve_agent_binding_runtime(&runtime_binding_request(record.id, "tools", "skills"))
         .await
     {
         Ok(_) => panic!("disabled binding should not start new turns"),
@@ -10924,10 +10915,11 @@ async fn resolve_agent_binding_runtime_reports_exact_missing_binding_id() {
     let missing_id = "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7392";
 
     let error = service
-        .resolve_agent_binding_runtime(
-            &test_agent_binding_owner_scope(),
-            &runtime_binding_request(missing_id.to_string(), "tools", "skills"),
-        )
+        .resolve_agent_binding_runtime(&runtime_binding_request(
+            missing_id.to_string(),
+            "tools",
+            "skills",
+        ))
         .await
         .err()
         .expect("missing binding must fail");
@@ -10945,52 +10937,6 @@ async fn resolve_agent_binding_runtime_reports_exact_missing_binding_id() {
             .as_ref()
             .and_then(|metadata| metadata["agent_binding_id"].as_str()),
         Some(missing_id)
-    );
-}
-
-#[tokio::test]
-async fn resolve_agent_binding_runtime_rejects_foreign_owner_use() {
-    let (service, _binding_service, record) = service_with_in_memory_binding().await;
-    let foreign_scope = astra_services::AgentBindingOwnerScope::for_internal_user("foreign-user");
-
-    let err = match service
-        .resolve_agent_binding_runtime(
-            &foreign_scope,
-            &runtime_binding_request(record.id, "tools", "skills"),
-        )
-        .await
-    {
-        Ok(_) => panic!("a foreign principal must not resolve another tenant's binding"),
-        Err(error) => error,
-    };
-
-    assert_eq!(err.0, StatusCode::NOT_FOUND);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("agent_binding_not_found")
-    );
-}
-
-#[tokio::test]
-async fn prepare_runtime_capabilities_rejects_missing_authenticated_binding_scope() {
-    let (service, _binding_service, record) = service_with_in_memory_binding().await;
-    let mut request = prepared_test_request("use binding");
-    request.agent_binding = Some(runtime_binding_request(record.id, "tools", "skills"));
-    request.agent_binding_owner_scope = None;
-    let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
-
-    let err = match service
-        .prepare_runtime_capabilities(&request, &constraints)
-        .await
-    {
-        Ok(_) => panic!("binding resolution without authenticated scope must fail closed"),
-        Err(error) => error,
-    };
-
-    assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(
-        err.1.0.error_code.as_deref(),
-        Some("agent_binding_owner_scope_missing")
     );
 }
 
@@ -20394,7 +20340,6 @@ fn extract_edge_tools_from_context() {
         interactive_client: false,
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
     };
     let tools = AgenticRunLifecycleService::extract_edge_tools(&req).expect("edge tools");
     assert_eq!(tools.len(), 1);
@@ -20482,7 +20427,6 @@ fn extract_edge_profile_from_context() {
         interactive_client: false,
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
     };
     let profile = AgenticRunLifecycleService::extract_edge_profile(&req).expect("edge profile");
     assert_eq!(profile["cwd"], "/tmp");

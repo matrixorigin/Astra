@@ -30,6 +30,15 @@ Deployment may provide:
 
 Astra runtime server does not implicitly become a Kubernetes scheduler or a local executor just because it is deployed in cloud.
 
+### Agent binding addressing
+
+Agent Binding APIs and chat requests remain authenticated. Registration
+idempotency is scoped to the authenticated registrant; subsequent read, chat
+resolution and disable operations address the binding by ID and do not re-match
+the caller's user or principal scope. Product authorization remains the
+integrating application's responsibility. Session/run ownership and data/tool
+authorization are unchanged.
+
 ## Web integration
 
 Web integrations should use runtime contracts, not private implementation assumptions:

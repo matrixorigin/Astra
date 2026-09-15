@@ -632,8 +632,19 @@ async fn cancel_run_for_user(
         .execution
         .run_lifecycle_service
         .cancel_run(run_id, user_id)
-        .await?;
+        .await
+        .map_err(normalize_cancel_run_error)?;
     Ok(Json(CancelRunResponse::from(result)))
+}
+
+fn normalize_cancel_run_error(
+    error: (StatusCode, Json<ErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    if error.0 == StatusCode::NOT_FOUND {
+        error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+    } else {
+        error
+    }
 }
 
 pub(crate) async fn list_runs_handler(
@@ -733,6 +744,33 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn cancel_run_not_found_has_a_stable_machine_code() {
+        let normalized = normalize_cancel_run_error(error_response(
+            StatusCode::NOT_FOUND,
+            "private lookup detail",
+        ));
+        assert_eq!(normalized.0, StatusCode::NOT_FOUND);
+        assert_eq!(normalized.1.0.detail, "Run not found");
+        assert_eq!(normalized.1.0.error_code.as_deref(), Some("run_not_found"));
+    }
+
+    #[test]
+    fn cancel_run_non_not_found_error_is_unchanged() {
+        let original = error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage unavailable",
+            "storage_unavailable",
+        );
+        let normalized = normalize_cancel_run_error(original);
+        assert_eq!(normalized.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(normalized.1.0.detail, "storage unavailable");
+        assert_eq!(
+            normalized.1.0.error_code.as_deref(),
+            Some("storage_unavailable")
+        );
+    }
     use async_trait::async_trait;
     use axum::{
         Json,

@@ -895,9 +895,6 @@ pub struct ChatRequestData {
     /// lifecycle so that edge workspace isolation checks work correctly on the
     /// MOI provider-authorized turn path.
     pub provider_workspace_id: Option<String>,
-    /// Trusted tenant/principal scope used to resolve an Agent Binding. This is
-    /// injected after authentication and is never populated from client JSON.
-    pub agent_binding_owner_scope: Option<crate::AgentBindingOwnerScope>,
     pub execution_budget: Option<ExecutionBudget>,
     pub execution_time_budget: Option<ExecutionTimeBudget>,
     /// Internal clock authority, never accepted from a client request.
@@ -34307,7 +34304,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            agent_binding_owner_scope: None,
             conversation_authority: None,
         };
 
@@ -34388,7 +34384,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            agent_binding_owner_scope: None,
             conversation_authority: None,
         };
 
@@ -34503,7 +34498,6 @@ mod tests {
                     interactive_client: false,
                     provider_run_owner: None,
                     provider_workspace_id: None,
-                    agent_binding_owner_scope: None,
                     conversation_authority: None,
                 },
             )

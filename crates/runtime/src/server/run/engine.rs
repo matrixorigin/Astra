@@ -6454,7 +6454,6 @@ mod tests {
             interactive_client: false,
             provider_run_owner: None,
             provider_workspace_id: None,
-            agent_binding_owner_scope: None,
         };
         let context = crate::server::run::binding_resolution::run_start_context_from_request(
             &request, None, None,

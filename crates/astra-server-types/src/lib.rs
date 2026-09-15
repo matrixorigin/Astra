@@ -795,6 +795,7 @@ pub struct SessionCreateRequest {
     pub agent_id: Option<String>,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub client_session_ref: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -1946,7 +1947,6 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
         execution_budget: request.execution_budget,
         execution_time_budget: request.execution_time_budget,
         admitted_execution_deadline: None,

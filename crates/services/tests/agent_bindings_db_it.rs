@@ -90,7 +90,7 @@ async fn database_agent_binding_schema_is_exactly_tenant_scoped() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn database_agent_bindings_isolate_same_name_and_idempotency_across_owners() {
+async fn database_agent_bindings_scope_same_name_and_idempotency_during_registration() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();
     let service = DatabaseAgentBindingService::new(settings).with_pool(shared_pool);
@@ -107,24 +107,7 @@ async fn database_agent_bindings_isolate_same_name_and_idempotency_across_owners
         .expect("owner B independently creates same logical binding");
     assert_ne!(first.id, second.id);
 
-    let foreign_get = service
-        .get_binding(owner_b.clone(), first.id.clone())
-        .await
-        .expect_err("foreign GET must be opaque");
-    assert_eq!(foreign_get.0, StatusCode::NOT_FOUND);
-    let foreign_disable = service
-        .disable_binding(owner_b, first.id.clone())
-        .await
-        .expect_err("foreign disable must be opaque");
-    assert_eq!(foreign_disable.0, StatusCode::NOT_FOUND);
-    assert_eq!(
-        service
-            .get_binding(owner_a, first.id.clone())
-            .await
-            .expect("owner binding remains visible")
-            .status,
-        astra_services::AgentBindingStatus::Active
-    );
+    assert_eq!(service.get_binding(first.id.clone()).await.unwrap(), first);
 
     for id in [first.id, second.id] {
         let _ = sqlx::query("DELETE FROM agent_bindings WHERE id = ?")
@@ -132,6 +115,44 @@ async fn database_agent_bindings_isolate_same_name_and_idempotency_across_owners
             .execute(&pool)
             .await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn database_agent_bindings_read_and_disable_by_id_only() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let service = DatabaseAgentBindingService::new(settings).with_pool(shared_pool);
+    let owner = AgentBindingOwnerScope::for_internal_user("moi-binding-registrar");
+    let suffix = Uuid::new_v4().simple().to_string();
+    let binding = service
+        .create_binding(owner.clone(), binding_request(&suffix))
+        .await
+        .expect("service identity registers binding");
+
+    let visible = service
+        .get_binding(binding.id.clone())
+        .await
+        .expect("authenticated caller reads binding by ID");
+    assert_eq!(visible.id, binding.id);
+    service
+        .disable_binding(binding.id.clone())
+        .await
+        .expect("authenticated caller disables binding by ID");
+    assert_eq!(
+        service
+            .create_binding(owner, binding_request(&suffix))
+            .await
+            .expect("registration retry preserves disabled binding")
+            .status,
+        astra_services::AgentBindingStatus::Disabled
+    );
+    sqlx::query("DELETE FROM agent_bindings WHERE id = ?")
+        .bind(&binding.id)
+        .execute(&pool)
+        .await
+        .expect("remove this test's binding");
 }
 
 #[tokio::test]
@@ -157,7 +178,7 @@ async fn database_agent_binding_invalid_metadata_json_fails_loud() {
         .expect("corrupt metadata_json");
 
     let err = service
-        .get_binding(scope, binding.id.clone())
+        .get_binding(binding.id.clone())
         .await
         .expect_err("invalid persisted metadata_json must fail loudly");
 

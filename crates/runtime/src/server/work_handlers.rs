@@ -3558,7 +3558,6 @@ pub(super) async fn post_work_branch_turn_handler(
         forward_headers: collect_forward_headers(&headers),
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
         execution_budget: None,
         execution_time_budget: None,
         admitted_execution_deadline: None,

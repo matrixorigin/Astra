@@ -166,13 +166,11 @@ pub trait AgentBindingService: Send + Sync {
 
     async fn get_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)>;
 
     async fn disable_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)>;
 }
@@ -196,7 +194,6 @@ impl AgentBindingService for UnconfiguredAgentBindingService {
 
     async fn get_binding(
         &self,
-        _scope: AgentBindingOwnerScope,
         _id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
@@ -208,7 +205,6 @@ impl AgentBindingService for UnconfiguredAgentBindingService {
 
     async fn disable_binding(
         &self,
-        _scope: AgentBindingOwnerScope,
         _id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
@@ -324,38 +320,24 @@ impl AgentBindingService for InMemoryAgentBindingService {
 
     async fn get_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
-        scope.validate()?;
         validate_binding_id_for_lookup(&id)?;
         self.records
             .read()
             .expect("agent binding lock poisoned")
             .get(&id)
-            .filter(|stored| {
-                stored.record.owner_user_id == scope.owner_user_id
-                    && stored.record.principal_scope_id == scope.principal_scope_id
-            })
             .map(|stored| stored.record.clone())
             .ok_or_else(agent_binding_not_found)
     }
 
     async fn disable_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
-        scope.validate()?;
         validate_binding_id_for_lookup(&id)?;
         let mut records = self.records.write().expect("agent binding lock poisoned");
-        let stored = records
-            .get_mut(&id)
-            .filter(|stored| {
-                stored.record.owner_user_id == scope.owner_user_id
-                    && stored.record.principal_scope_id == scope.principal_scope_id
-            })
-            .ok_or_else(agent_binding_not_found)?;
+        let stored = records.get_mut(&id).ok_or_else(agent_binding_not_found)?;
         stored.record.status = AgentBindingStatus::Disabled;
         stored.record.disabled_at = Some(chrono::Utc::now().naive_utc().to_string());
         Ok(stored.record.clone())
@@ -453,7 +435,7 @@ impl AgentBindingService for DatabaseAgentBindingService {
 
             match insert_result {
                 Ok(_) => {
-                    return load_binding_row(&pool, &scope, &id)
+                    return load_binding_row(&pool, &id)
                         .await?
                         .ok_or_else(agent_binding_not_found);
                 }
@@ -504,37 +486,31 @@ impl AgentBindingService for DatabaseAgentBindingService {
 
     async fn get_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
-        scope.validate()?;
         validate_binding_id_for_lookup(&id)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
-        load_binding_row(&pool, &scope, &id)
+        load_binding_row(&pool, &id)
             .await?
             .ok_or_else(agent_binding_not_found)
     }
 
     async fn disable_binding(
         &self,
-        scope: AgentBindingOwnerScope,
         id: String,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
-        scope.validate()?;
         validate_binding_id_for_lookup(&id)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         query(
             "UPDATE agent_bindings \
              SET status = 'disabled', disabled_at = COALESCE(disabled_at, NOW(6)), updated_at = NOW(6) \
-             WHERE id = ? AND owner_user_id = ? AND principal_scope_id = ?",
+             WHERE id = ?",
         )
-        .bind(&id)
-        .bind(&scope.owner_user_id)
-        .bind(&scope.principal_scope_id)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-        load_binding_row(&pool, &scope, &id)
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
+        load_binding_row(&pool, &id)
             .await?
             .ok_or_else(agent_binding_not_found)
     }
@@ -628,17 +604,11 @@ fn optional_json_string(
 
 async fn load_binding_row(
     pool: &sqlx::Pool<MySql>,
-    scope: &AgentBindingOwnerScope,
     id: &str,
 ) -> Result<Option<AgentBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
-    let sql = format!(
-        "SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings \
-         WHERE id = ? AND owner_user_id = ? AND principal_scope_id = ?"
-    );
+    let sql = format!("SELECT {AGENT_BINDING_COLUMNS} FROM agent_bindings WHERE id = ?");
     let row = query(&sql)
         .bind(id)
-        .bind(&scope.owner_user_id)
-        .bind(&scope.principal_scope_id)
         .fetch_optional(pool)
         .await
         .map_err(internal_error)?;
@@ -762,6 +732,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bindings_use_ids_for_read_and_disable_without_changing_registration() {
+        let service = InMemoryAgentBindingService::new();
+        let registered = service
+            .create_binding(owner_scope(), valid_request())
+            .await
+            .unwrap();
+        let read = service.get_binding(registered.id.clone()).await.unwrap();
+        assert_eq!(read, registered);
+        let disabled = service
+            .disable_binding(registered.id.clone())
+            .await
+            .unwrap();
+        assert_eq!(disabled.status, AgentBindingStatus::Disabled);
+        let repeat = service
+            .create_binding(owner_scope(), valid_request())
+            .await
+            .unwrap();
+        assert_eq!(repeat.id, registered.id);
+        assert_eq!(repeat.status, AgentBindingStatus::Disabled);
+        let missing = service
+            .get_binding("ab_missing".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.1.0.error_code.as_deref(),
+            Some("agent_binding_not_found")
+        );
+    }
+
     #[test]
     fn agent_binding_status_parser_fails_closed_on_unknown_status() {
         let err = AgentBindingStatus::from_db_value("paused")
@@ -810,32 +811,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_owner_cannot_get_disable_or_use_binding() {
-        let svc = InMemoryAgentBindingService::new();
-        let owner = AgentBindingOwnerScope::for_internal_user("user-a");
-        let foreign = AgentBindingOwnerScope::for_internal_user("user-b");
-        let created = svc
-            .create_binding(owner.clone(), valid_request())
-            .await
-            .unwrap();
-
-        let get_error = svc
-            .get_binding(foreign.clone(), created.id.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(get_error.0, StatusCode::NOT_FOUND);
-        let disable_error = svc
-            .disable_binding(foreign, created.id.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(disable_error.0, StatusCode::NOT_FOUND);
-        assert_eq!(
-            svc.get_binding(owner, created.id).await.unwrap().status,
-            AgentBindingStatus::Active
-        );
-    }
-
-    #[tokio::test]
     async fn provider_subjects_are_distinct_binding_tenants() {
         fn principal(subject: &str) -> crate::AuthPrincipal {
             crate::AuthPrincipal {
@@ -871,29 +846,6 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(first.id, second.id);
-        assert!(svc.get_binding(second_scope, first.id).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn ownerless_legacy_binding_record_fails_closed() {
-        let svc = InMemoryAgentBindingService::new();
-        let scope = owner_scope();
-        let created = svc
-            .create_binding(scope.clone(), valid_request())
-            .await
-            .unwrap();
-        {
-            let mut records = svc.records.write().unwrap();
-            let stored = records.get_mut(&created.id).unwrap();
-            stored.record.owner_user_id.clear();
-            stored.record.principal_scope_id.clear();
-        }
-
-        let error = svc
-            .get_binding(scope, created.id)
-            .await
-            .expect_err("unscoped persisted records must never be globally visible");
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

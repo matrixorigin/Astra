@@ -786,9 +786,6 @@ async fn handle_chat_message(
         plan_subtask_id,
         is_plan_subtask,
     );
-    request.agent_binding_owner_scope = Some(
-        astra_services::AgentBindingOwnerScope::from_principal(&conn.principal),
-    );
     request.forward_headers = ws_forward_headers(conn);
     let resolved = match resolve_or_create_chat_session(
         state,
@@ -796,6 +793,10 @@ async fn handle_chat_message(
         request.session_id.take(),
         request.agent_id.clone(),
         request_session_id_is_trusted,
+        matches!(
+            &conn.principal.origin,
+            astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+        ),
     )
     .await
     {
@@ -1300,7 +1301,6 @@ fn build_ws_chat_request(
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
         provider_workspace_id: None,
-        agent_binding_owner_scope: None,
         execution_budget,
         execution_time_budget: None,
         admitted_execution_deadline: None,

@@ -113,6 +113,28 @@ pub enum LimitCheck {
 
 // ── Trait ─────────────────────────────────────────────────────────────────
 
+pub fn enforce_session_create_quota(
+    check: &LimitCheck,
+) -> Result<
+    (),
+    (
+        axum::http::StatusCode,
+        axum::Json<astra_core::ErrorResponse>,
+    ),
+> {
+    if let LimitCheck::Denied { limit, reason } = check {
+        return Err(astra_core::error_response_coded(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "Per-user session quota exceeded ({}): {reason}",
+                limit.as_str()
+            ),
+            limit.error_code(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait ResourceGovernor: Send + Sync + 'static {
     /// Get the effective limits for a user (custom or defaults).
