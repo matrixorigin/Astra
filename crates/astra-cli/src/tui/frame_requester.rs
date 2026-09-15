@@ -48,12 +48,35 @@ struct FrameScheduler {
     rate_limiter: FrameRateLimiter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawDelivery {
+    Sent,
+    Pending,
+    Closed,
+}
+
 impl FrameScheduler {
     fn new(receiver: mpsc::Receiver<Instant>, draw_tx: mpsc::Sender<()>) -> Self {
         Self {
             receiver,
             draw_tx,
             rate_limiter: FrameRateLimiter::default(),
+        }
+    }
+
+    /// Try to publish one draw wake and advance the limiter only when the
+    /// wake was actually accepted by the consumer. A scheduler deadline is
+    /// merely a lower bound; it may fire late while the executor is busy, so
+    /// using that old deadline as the last-emitted timestamp would let the
+    /// next request immediately catch up on obsolete frames.
+    fn try_emit_draw_at(&mut self, emitted_at: Instant) -> DrawDelivery {
+        match self.draw_tx.try_send(()) {
+            Ok(()) => {
+                self.rate_limiter.mark_emitted(emitted_at);
+                DrawDelivery::Sent
+            }
+            Err(mpsc::error::TrySendError::Full(())) => DrawDelivery::Pending,
+            Err(mpsc::error::TrySendError::Closed(())) => DrawDelivery::Closed,
         }
     }
 
@@ -77,12 +100,19 @@ impl FrameScheduler {
                 _ = &mut deadline => {
                     if next_deadline.is_some() {
                         next_deadline = None;
-                        self.rate_limiter.mark_emitted(target);
                         // A draw is a wake-up for the latest state, not a
                         // history of every invalidation. Keep the scheduler
                         // independent from the terminal consumer: a stalled
                         // render must never make producers await capacity.
-                        let _ = self.draw_tx.try_send(());
+                        // Anchor rate limiting to the actual delivery time;
+                        // `target` can be arbitrarily stale after scheduler
+                        // starvation. A closed consumer retires the task.
+                        if matches!(
+                            self.try_emit_draw_at(Instant::now()),
+                            DrawDelivery::Closed
+                        ) {
+                            break;
+                        }
                     }
                 }
             }
@@ -92,7 +122,8 @@ impl FrameScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameRequester;
+    use super::{DrawDelivery, FrameRequester, FrameScheduler};
+    use crate::tui::frame_rate_limiter::MIN_FRAME_INTERVAL;
 
     #[tokio::test]
     async fn frame_burst_is_coalesced_without_losing_the_next_draw() {
@@ -158,5 +189,53 @@ mod tests {
             .await
             .expect("a post-consumption request must produce a draw")
             .expect("draw channel remains open");
+    }
+
+    #[test]
+    fn late_draw_delivery_anchors_the_next_deadline_to_delivery_time() {
+        let (draw_tx, _draw_rx) = tokio::sync::mpsc::channel(1);
+        let mut scheduler = FrameScheduler::new(tokio::sync::mpsc::channel(1).1, draw_tx);
+        let requested_at = std::time::Instant::now();
+        let delivered_at = requested_at + MIN_FRAME_INTERVAL * 10;
+
+        assert_eq!(scheduler.try_emit_draw_at(delivered_at), DrawDelivery::Sent);
+        assert_eq!(
+            scheduler.rate_limiter.clamp_deadline(delivered_at),
+            delivered_at + MIN_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn failed_draw_delivery_does_not_move_the_rate_limit_clock() {
+        let (draw_tx, _draw_rx) = tokio::sync::mpsc::channel(1);
+        draw_tx.try_send(()).expect("fill the pending wake slot");
+        let mut scheduler = FrameScheduler::new(tokio::sync::mpsc::channel(1).1, draw_tx);
+        let attempted_at = std::time::Instant::now() + MIN_FRAME_INTERVAL * 10;
+
+        assert_eq!(
+            scheduler.try_emit_draw_at(attempted_at),
+            DrawDelivery::Pending
+        );
+        assert_eq!(
+            scheduler.rate_limiter.clamp_deadline(attempted_at),
+            attempted_at
+        );
+    }
+
+    #[test]
+    fn closed_draw_consumer_retires_the_scheduler_without_updating_state() {
+        let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
+        drop(draw_rx);
+        let mut scheduler = FrameScheduler::new(tokio::sync::mpsc::channel(1).1, draw_tx);
+        let attempted_at = std::time::Instant::now();
+
+        assert_eq!(
+            scheduler.try_emit_draw_at(attempted_at),
+            DrawDelivery::Closed
+        );
+        assert_eq!(
+            scheduler.rate_limiter.clamp_deadline(attempted_at),
+            attempted_at
+        );
     }
 }
