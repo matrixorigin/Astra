@@ -31,6 +31,15 @@ test("opens a durable read attachment after resolving the public delivery branch
     activity: "idle",
     observed_at: "2026-08-01T00:00:00Z",
   } as never;
+  const execution = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    initialized: true,
+    generation: 1,
+    state: "ready",
+    placement: "server",
+  } as never;
   const transcript = { schema_version: 1, items: [] } as never;
   const archivedBranches = { schema_version: 1, branches: [] } as never;
   const patchArtifacts = { schema_version: 1, artifacts: [] } as never;
@@ -39,6 +48,7 @@ test("opens a durable read attachment after resolving the public delivery branch
   const attachWorkBranch = vi.fn().mockResolvedValue(attachment);
   const getWorkBranchTranscript = vi.fn().mockResolvedValue(transcript);
   const getWorkBranchActivity = vi.fn().mockResolvedValue(activity);
+  const getWorkBranchExecution = vi.fn().mockResolvedValue(execution);
   const listArchivedWorkBranches = vi.fn().mockResolvedValue(archivedBranches);
   const listWorkPatchArtifacts = vi.fn().mockResolvedValue(patchArtifacts);
   const patchCommits = { schema_version: 1, operations: [] } as never;
@@ -46,6 +56,7 @@ test("opens a durable read attachment after resolving the public delivery branch
   const sdk = {
     attachWorkBranch,
     getWorkBranchActivity,
+    getWorkBranchExecution,
     getWorkBranchTranscript,
     listArchivedWorkBranches,
     listWorkPatchArtifacts,
@@ -68,6 +79,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     limit: 50,
   });
   expect(getWorkBranchActivity).toHaveBeenCalledWith("work-1", "branch-1");
+  expect(getWorkBranchExecution).toHaveBeenCalledWith("work-1", "branch-1");
   expect(listArchivedWorkBranches).toHaveBeenCalledWith("work-1", { limit: 20 });
   expect(listWorkPatchArtifacts).toHaveBeenCalledWith("work-1", "branch-1", {
     limit: 10,
@@ -79,6 +91,7 @@ test("opens a durable read attachment after resolving the public delivery branch
     initial: snapshot,
     attachment,
     initialActivity: activity,
+    initialExecution: execution,
     transcript,
     archivedBranches,
     patchArtifacts,
@@ -100,6 +113,7 @@ test("restores durable patch application progress for an alternative branch", as
   const sdk = {
     attachWorkBranch: vi.fn().mockResolvedValue(null),
     getWorkBranchActivity: vi.fn().mockResolvedValue({}),
+    getWorkBranchExecution: vi.fn().mockResolvedValue({}),
     getWorkBranchTranscript: vi.fn().mockResolvedValue({}),
     listArchivedWorkBranches: vi.fn().mockResolvedValue({}),
     listWorkPatchArtifacts: vi.fn().mockResolvedValue({}),

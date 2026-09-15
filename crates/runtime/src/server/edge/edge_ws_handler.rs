@@ -167,6 +167,7 @@ async fn handle_edge_connection(
                 match serde_json::from_str::<EdgeClientMessage>(&text) {
                     Ok(EdgeClientMessage::Auth {
                         edge_agent_id,
+                        materialization_id,
                         interaction_api_major,
                         hostname,
                         workspace_dir,
@@ -188,7 +189,13 @@ async fn handle_edge_connection(
                             .await;
                             return None;
                         }
-                        return Some((edge_agent_id, hostname, workspace_dir, capabilities));
+                        return Some((
+                            edge_agent_id,
+                            materialization_id,
+                            hostname,
+                            workspace_dir,
+                            capabilities,
+                        ));
                     }
                     _ => {
                         let _ = send_edge_msg(
@@ -207,34 +214,38 @@ async fn handle_edge_connection(
     })
     .await;
 
-    let (edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
-        Ok(Some(auth)) => auth,
-        _ => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                "edge WebSocket auth timeout or closed before edge_auth"
-            );
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "auth timeout or connection closed".into(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
+    let (edge_agent_id, materialization_id, hostname, workspace_dir, capabilities) =
+        match auth_result {
+            Ok(Some(auth)) => auth,
+            _ => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    "edge WebSocket auth timeout or closed before edge_auth"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "auth timeout or connection closed".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
 
-    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id) {
+    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id)
+        || materialization_id.len() > 128
+        || !astra_runtime_env::is_valid_provider_id(&materialization_id)
+    {
         tracing::warn!(
             target: "astra_runtime::edge_ws",
             edge_agent_id = %edge_agent_id,
-            "edge WebSocket auth failed: invalid edge_agent_id"
+            "edge WebSocket auth failed: invalid edge or materialization identity"
         );
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
-                message: "invalid edge_agent_id".into(),
+                message: "invalid edge or materialization identity".into(),
             },
         )
         .await;
@@ -440,15 +451,18 @@ async fn handle_edge_connection(
     // replaced by this connection. Its DB implementation uses an edge_id CAS,
     // so this predecessor remains correct even when another pod reconnects the
     // same edge concurrently.
-    let mut registration = Box::pin(edge_registry.register_or_update_with_lease(
-        &user_id,
-        &edge_agent_id,
-        &edge_id_for_registry,
-        hostname.as_deref(),
-        workspace_dir.as_deref(),
-        capabilities.clone(),
-        workspace_id.as_deref(),
-    ));
+    let mut registration = Box::pin(
+        edge_registry.register_or_update_with_lease_and_materialization(
+            &user_id,
+            &edge_agent_id,
+            &edge_id_for_registry,
+            hostname.as_deref(),
+            workspace_dir.as_deref(),
+            capabilities.clone(),
+            workspace_id.as_deref(),
+            Some(&materialization_id),
+        ),
+    );
     let mut socket_closed_during_registration = false;
     let registration_result = loop {
         tokio::select! {
@@ -666,16 +680,20 @@ async fn handle_edge_connection(
     // Only after DB success and with the forward loop already running: the new
     // sender becomes selectable inheriting the pending map. Release the reconnect
     // lock immediately afterward so it never spans the connection's lifetime.
-    let pool_generation = state.edge_connection_pool.commit_reconnect(
-        reconnect,
-        &user_id,
-        &edge_agent_id,
-        hostname.clone(),
-        workspace_dir.clone(),
-        capabilities,
-        workspace_id.clone(),
-        pool_tx,
-    );
+    let pool_generation = state
+        .edge_connection_pool
+        .commit_reconnect_with_registry_and_materialization_id(
+            reconnect,
+            &user_id,
+            &edge_agent_id,
+            hostname.clone(),
+            workspace_dir.clone(),
+            capabilities,
+            workspace_id.clone(),
+            Some(registration_lease.current.registry_id.clone()),
+            registration_lease.current.materialization_id.clone(),
+            pool_tx,
+        );
     // Independently poll publication and its deadline even while a message or
     // heartbeat handler awaits database resources. JoinSet aborts on owner drop;
     // normal teardown also joins cancellation before durable unregister.

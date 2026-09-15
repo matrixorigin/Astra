@@ -376,6 +376,7 @@ async fn ws_auth(
     let auth_msg = json!({
         "type": "edge_auth",
         "edge_agent_id": edge_id,
+        "materialization_id": "materialization-test",
         "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
         "hostname": hostname,
         "workspace_dir": "/home/test/project",
@@ -1102,6 +1103,7 @@ async fn edge_auth_result(addr: std::net::SocketAddr, edge_id: &str) -> serde_js
     let auth_msg = json!({
         "type": "edge_auth",
         "edge_agent_id": edge_id,
+        "materialization_id": "materialization-test",
         "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
         "hostname": "host",
         "workspace_dir": "/home/test/project",
@@ -1264,6 +1266,7 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
             worktree_path: worktree_path.map(ToString::to_string),
             capabilities,
             workspace_id: workspace_id.map(ToString::to_string),
+            materialization_id: Some("materialization-test".to_string()),
             registered_at: "2026-07-17 00:00:00.000000".to_string(),
             last_heartbeat_at: "2026-07-17 00:00:00.000000".to_string(),
         };
@@ -1386,6 +1389,7 @@ async fn edge_ws_close_during_registration_rolls_back_without_pool_commit() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-registration-close",
+            "materialization_id": "materialization-test",
             "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
             "workspace_dir": "/workspace",
@@ -1497,6 +1501,7 @@ async fn pending_release_disconnect(wait_for_heartbeat: bool, live_pool: Option<
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-auth-order",
+            "materialization_id": "materialization-test",
             "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
             "workspace_dir": "/workspace",
@@ -1621,6 +1626,7 @@ async fn claim_loss_after_pool_commit_removes_the_unpublished_connection() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-claim-loss",
+            "materialization_id": "materialization-test",
             "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
             "workspace_dir": "/workspace",
@@ -1739,6 +1745,7 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-b2",
+            "materialization_id": "materialization-test",
             "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
             "workspace_dir": "/workspace",
@@ -1790,6 +1797,7 @@ async fn release_outcome_unknown_is_reconciled_while_the_connection_is_alive() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-release-recovery",
+            "materialization_id": "materialization-test",
             "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
             "workspace_dir": "/workspace",
@@ -1880,6 +1888,7 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
             worktree_path: None,
             capabilities: None,
             workspace_id: None,
+            materialization_id: None,
             registered_at: "2024-01-01T00:00:00".to_string(),
             last_heartbeat_at: "2024-01-01T00:00:00".to_string(),
         })

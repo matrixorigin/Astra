@@ -19,6 +19,7 @@ import type {
   WorkPatchArtifactPageV1,
   WorkPatchMaterializationPageV2,
   WorkPatchCommitPageV1,
+  WorkExecutionViewV1,
 } from "@astra/sdk";
 import {
   Archive,
@@ -58,6 +59,7 @@ import { WorkActivityCard } from "@/components/app/work-activity-card";
 import { WorkTranscriptCard } from "@/components/app/work-transcript-card";
 import { WorkPatchReviewCard } from "@/components/app/work-patch-review-card";
 import { WorkTaskGraph } from "@/components/app/work-task-graph";
+import { WorkExecutionCard } from "@/components/app/work-execution-card";
 import type { WorkOverviewSnapshot } from "@/lib/work-overview";
 import type { WorkActionError } from "@/lib/work-action-error";
 import { cn } from "@/lib/utils/cn";
@@ -140,6 +142,7 @@ export function WorkOverviewPage({
   initial,
   attachment,
   initialActivity,
+  initialExecution,
   transcript,
   branchCatalog,
   selectedBranch,
@@ -151,6 +154,7 @@ export function WorkOverviewPage({
   initial: WorkOverviewSnapshot;
   attachment?: WorkBranchAttachmentV1 | null;
   initialActivity?: WorkBranchActivityResponseV1 | null;
+  initialExecution?: WorkExecutionViewV1 | null;
   transcript?: WorkTranscriptPageV1 | null;
   branchCatalog: WorkBranchCatalogV1;
   selectedBranch: WorkBranchCatalogEntryV1;
@@ -930,6 +934,15 @@ export function WorkOverviewPage({
 
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
+            <WorkExecutionCard
+              key={branchId}
+              workId={overview.work_id}
+              branchId={branchId}
+              initialExecution={initialExecution}
+              attachment={attachment}
+              branchRevision={attachment?.branch_revision}
+              controlBasis={attachment?.control_basis}
+            />
             <Card className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>

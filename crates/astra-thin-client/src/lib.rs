@@ -24,7 +24,10 @@ pub use astra_server_types::{
     SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
     SessionRunTreeSnapshot, WorkBranchActivityResponseV1, WorkBranchActivityV1,
     WorkBranchAttachRequestV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
-    WorkCreateCriterionV1, WorkCreateRequestV1, WorkTurnRequestV1,
+    WorkCreateCriterionV1, WorkCreateRequestV1, WorkExecutionPlacementV1, WorkExecutionStateV1,
+    WorkExecutionSwitchOperationV1, WorkExecutionSwitchRequestV1,
+    WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
+    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1, WorkTurnRequestV1,
 };
 pub use client::ThinClient;
 pub use device_proof::{

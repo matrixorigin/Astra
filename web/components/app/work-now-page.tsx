@@ -1,3 +1,5 @@
+"use client";
+
 import type {
   WorkCatalogAttentionV1,
   WorkCatalogEntryV1,

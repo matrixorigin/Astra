@@ -1887,6 +1887,17 @@ async fn validate_execution_binding_generation_in_tx(
             binding.state,
         ));
     }
+    // Claim creation belongs to binding/admission transactions. Dispatch is a
+    // hot path and must not INSERT/DELETE/lock the claim for every tool call;
+    // observe the already-established owner mapping instead.
+    crate::session_context_coordinator::verify_execution_workspace_claim_in_tx(tx, &key, &binding)
+        .await
+        .map_err(|error| match error {
+            crate::SessionContextCoordinatorError::ExecutionBindingBusy => {
+                ToolInvocationLedgerStoreError::ExecutionBindingBusy
+            }
+            other => ToolInvocationLedgerStoreError::ExecutionBindingInvalid(other.to_string()),
+        })?;
     Ok(())
 }
 
@@ -2056,6 +2067,8 @@ pub enum ToolInvocationLedgerStoreError {
     ExecutionBindingNotReady(crate::SessionExecutionBindingStateV1),
     #[error("stored Session execution binding is invalid: {0}")]
     ExecutionBindingInvalid(String),
+    #[error("Session execution binding is busy with another physical workspace claim")]
+    ExecutionBindingBusy,
     #[error(
         "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"
     )]

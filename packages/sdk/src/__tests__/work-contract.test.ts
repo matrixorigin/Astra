@@ -33,6 +33,9 @@ import {
   reconcileWorkEventPageV1,
   decodeWorkTaskGraphPageV2,
   decodeWorkSessionBindingV1,
+  decodeWorkExecutionViewV1,
+  decodeWorkExecutionTargetPageV1,
+  decodeWorkExecutionSwitchOperationV1,
 } from "../index";
 
 const fixture = JSON.parse(
@@ -2673,4 +2676,124 @@ test("Work turn boundary rejects ambiguous input and session-bearing events", ()
   expect(() => decodeWorkTurnStreamEventV1({ type: "future_event" })).toThrow(
     "unsupported",
   );
+});
+
+const executionView = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  initialized: true,
+  generation: 3,
+  state: "ready",
+  placement: "edge",
+  executor_id: "edge-laptop",
+  executor_name: "Laptop",
+  operation_id: null,
+  attempt: null,
+  failure_code: null,
+} as const;
+
+const executionTargets = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  targets: [
+    {
+      executor_id: "edge-laptop",
+      display_name: "Laptop",
+      hostname: "laptop.local",
+      capabilities: ["runtime_process_authorization_v1"],
+      connected: true,
+    },
+    {
+      executor_id: "edge-desktop",
+      display_name: "Desktop",
+      hostname: null,
+      capabilities: [],
+      connected: true,
+    },
+  ],
+} as const;
+
+const executionOperation = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  operation_id: "switch-operation-1",
+  request_id: "switch-request-1",
+  state: "succeeded",
+  expected_generation: 3,
+  switching_generation: 4,
+  completed_generation: 5,
+  attempt: 1,
+  target: { kind: "edge", executor_id: "edge-desktop" },
+  failure_code: null,
+} as const;
+
+test("execution decoders enforce identity, bounded targets, and terminal generations", () => {
+  expect(decodeWorkExecutionViewV1(executionView).generation).toBe(3);
+  expect(decodeWorkExecutionViewV1({ ...executionView, initialized: false }).initialized).toBe(false);
+  expect(decodeWorkExecutionTargetPageV1(executionTargets).targets).toHaveLength(2);
+  expect(decodeWorkExecutionSwitchOperationV1(executionOperation).state).toBe("succeeded");
+
+  const duplicate = structuredClone(executionTargets);
+  duplicate.targets[1].executor_id = duplicate.targets[0].executor_id;
+  // Duplicate target identities make selection ambiguous and are rejected by
+  // the client before a user can submit a move.
+  expect(() => decodeWorkExecutionTargetPageV1(duplicate)).toThrow(
+    "duplicate executor_id",
+  );
+
+  const inconsistent = { ...executionOperation, completed_generation: null };
+  expect(() => decodeWorkExecutionSwitchOperationV1(inconsistent)).toThrow(
+    "terminal state and completed_generation disagree",
+  );
+});
+
+test("execution client methods use no-store reads and sealed mutation bodies", async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce(response(200, executionView))
+    .mockResolvedValueOnce(response(200, executionTargets))
+    .mockResolvedValueOnce(response(201, executionOperation))
+    .mockResolvedValueOnce(response(200, executionOperation))
+    .mockResolvedValueOnce(response(200, executionOperation));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(client.getWorkBranchExecution("work-1", "branch-1")).resolves.toEqual(executionView);
+  await expect(
+    client.listWorkBranchExecutionTargets("work-1", "branch-1"),
+  ).resolves.toEqual(executionTargets);
+  await expect(
+    client.switchWorkBranchExecution("work-1", "branch-1", {
+      requestId: "switch-request-1",
+      attachmentId: "attachment-1",
+      expectedGeneration: 3,
+      target: { kind: "edge", executorId: "edge-desktop" },
+    }),
+  ).resolves.toEqual(executionOperation);
+  await expect(
+    client.getWorkBranchExecutionSwitch("work-1", "branch-1", "switch-operation-1"),
+  ).resolves.toEqual(executionOperation);
+  await expect(
+    client.retryWorkBranchExecutionSwitch(
+      "work-1",
+      "branch-1",
+      "switch-operation-1",
+      "attachment-1",
+    ),
+  ).resolves.toEqual(executionOperation);
+
+  const calls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+  expect(calls[0]?.[1].cache).toBe("no-store");
+  expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({
+    request_id: "switch-request-1",
+    attachment_id: "attachment-1",
+    expected_generation: 3,
+    target: { kind: "edge", executor_id: "edge-desktop" },
+  });
+  expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({
+    attachment_id: "attachment-1",
+  });
 });

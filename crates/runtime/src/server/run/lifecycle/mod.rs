@@ -9131,21 +9131,18 @@ impl AgenticRunLifecycleService {
         }))
     }
 
-    /// Resolve provider selection once per validated Work Session. The public
-    /// request cannot choose this value; the durable owner/session/branch row
-    /// is authoritative, and its generation is carried to both Run admission
-    /// and tool dispatch.
-    async fn bind_work_execution_selection(
+    /// Resolve provider selection once per Session. Work Sessions use their
+    /// canonical Work/branch identity; an ordinary Session gets the same
+    /// durable binding only when it explicitly selects an Edge or Server
+    /// provider. The durable owner/session/branch row is authoritative, and
+    /// its generation is carried to both Run admission and tool dispatch.
+    async fn bind_execution_selection(
         &self,
         user_id: &str,
         session_id: &str,
         request: &mut ChatRequestData,
         work_binding: Option<&ValidatedWorkRuntimeBinding>,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let Some(work_binding) = work_binding else {
-            request.execution_binding_generation = None;
-            return Ok(());
-        };
         let request_is_edge = request.workspace_binding.as_ref().is_some_and(|binding| {
             binding.kind == astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
         }) || request.executor_binding.as_ref().is_some_and(|binding| {
@@ -9175,23 +9172,34 @@ impl AgenticRunLifecycleService {
                 return Ok(());
             }
             #[cfg(not(test))]
-            return Err(error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "durable Work execution selection is unavailable",
-                "execution_binding_unavailable",
-            ));
+            {
+                if work_binding.is_none() && !request_is_edge {
+                    // Ordinary Sessions keep the historical unbound
+                    // execution path when this test/in-memory host has no
+                    // durable coordinator. The downstream server runtime
+                    // still supplies its own sandbox defaults when needed;
+                    // projecting a binding here would make child agents look
+                    // workspace-bound even though no durable provider exists.
+                    request.execution_binding_generation = None;
+                    return Ok(());
+                }
+                return Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "durable Work execution selection is unavailable",
+                    "execution_binding_unavailable",
+                ));
+            }
         };
-        let logical_workspace_id = format!(
-            "work:{}:branch:{}",
-            work_binding.work_id.as_str(),
-            work_binding.branch_id.as_str()
-        );
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
             user_id,
             session_id,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
+        // A Work branch is a durable view over its owning Session branch. Keep
+        // this identity derived from the canonical SessionKey so an ordinary
+        // Session can be promoted to Work without invalidating its binding.
+        let logical_workspace_id = format!("session:{}:branch:{}", key.session_id, key.branch_id);
         let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool);
         // The durable row is the sole provider-selection authority. A Work
         // created from a new Session starts on the Server; an Edge-backed
@@ -9216,7 +9224,8 @@ impl AgenticRunLifecycleService {
             })?;
         let initial = match (existing.as_ref(), request_is_edge) {
             (None, true) => {
-                self.authorize_native_edge_execution(user_id, request)
+                let physical_workspace_id = self
+                    .authorize_native_edge_execution(user_id, request)
                     .await?;
                 let workspace = request.workspace_binding.clone().ok_or_else(|| {
                     error_response_coded(
@@ -9237,6 +9246,7 @@ impl AgenticRunLifecycleService {
                     generation: 1,
                     state: astra_services::SessionExecutionBindingStateV1::Ready,
                     logical_workspace_id: logical_workspace_id.clone(),
+                    physical_workspace_id,
                     workspace,
                     executor,
                 }
@@ -9246,12 +9256,20 @@ impl AgenticRunLifecycleService {
                     logical_workspace_id.clone(),
                 )
             }
-            (None, false) => {
+            (None, false) if work_binding.is_some() => {
                 return Err(error_response_coded(
                     StatusCode::PRECONDITION_REQUIRED,
                     "this existing Work has no durable execution provider; continue from its owning Edge or choose a provider before starting a turn",
                     "execution_binding_provider_required",
                 ));
+            }
+            (None, false) => {
+                // A normal Session with no explicit provider keeps the
+                // historical unbound/server path. Once it selects Edge (or
+                // explicitly selects Server), the row above is created and
+                // all subsequent writes are fenced by its claim.
+                request.execution_binding_generation = None;
+                return Ok(());
             }
             (Some(existing), _) => existing.clone(),
         };
@@ -9328,8 +9346,16 @@ impl AgenticRunLifecycleService {
                     "execution_binding_provider_mismatch",
                 ));
             }
-            self.authorize_native_edge_execution(user_id, request)
+            let authorized_physical_id = self
+                .authorize_native_edge_execution(user_id, request)
                 .await?;
+            if binding.physical_workspace_id != authorized_physical_id {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "the selected Edge materialization changed; refresh the Work and use an explicit handoff",
+                    "execution_binding_provider_mismatch",
+                ));
+            }
         } else if request_is_edge {
             return Err(error_response_coded(
                 StatusCode::CONFLICT,
@@ -9367,9 +9393,9 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         request: &ChatRequestData,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
         if request.provider_runtime_authorized {
-            return Ok(());
+            return Ok(None);
         }
         let workspace = request.workspace_binding.as_ref().ok_or_else(|| {
             error_response_coded(
@@ -9414,16 +9440,21 @@ impl AgenticRunLifecycleService {
         // authorization path, where the authenticated provider scope is
         // available; never widen an unscoped request to match one.
         let workspace_scope: Option<&str> = None;
-        if let Some(pool) = self.edge_connection_pool.as_ref()
-            && pool
-                .find_user_edge_by_agent_and_workspace(user_id, executor_id, workspace_scope)
-                .is_some_and(|edge| path_matches(edge.workspace_dir.as_deref()))
+        let pool_edge = self.edge_connection_pool.as_ref().and_then(|pool| {
+            pool.find_user_edge_by_agent_and_workspace(user_id, executor_id, workspace_scope)
+        });
+        if let Some(edge) = pool_edge.as_ref()
+            && !path_matches(edge.workspace_dir.as_deref())
         {
-            return Ok(());
+            return Err(error_response_coded(
+                StatusCode::PRECONDITION_REQUIRED,
+                "the selected Edge is connected with a different workspace root",
+                "execution_binding_provider_required",
+            ));
         }
 
-        if let Some(registry) = self.edge_registry_service.as_ref() {
-            let agent = registry
+        let registry_edge = if let Some(registry) = self.edge_registry_service.as_ref() {
+            registry
                 .find_by_user_agent_and_workspace(user_id, executor_id, workspace_scope)
                 .await
                 .map_err(|error| {
@@ -9439,15 +9470,81 @@ impl AgenticRunLifecycleService {
                         "the Edge registry is temporarily unavailable",
                         "execution_binding_provider_unavailable",
                     )
-                })?;
-            if agent.is_some_and(|agent| path_matches(agent.worktree_path.as_deref())) {
-                return Ok(());
+                })?
+        } else {
+            None
+        };
+        if let Some(agent) = registry_edge.as_ref()
+            && !path_matches(agent.worktree_path.as_deref())
+        {
+            return Err(error_response_coded(
+                StatusCode::PRECONDITION_REQUIRED,
+                "the selected Edge is registered with a different workspace root",
+                "execution_binding_provider_required",
+            ));
+        }
+
+        // The registry row id is a connection identity, not a checkout
+        // identity. The persisted materialization id is the identity that
+        // survives reconnects and separates independent devices using the
+        // same path. When both views exist, require both authenticated views
+        // to describe the same registration and checkout.
+        let materialization_id = match (pool_edge.as_ref(), registry_edge.as_ref()) {
+            (Some(pool), Some(registry)) => {
+                match (
+                    pool.registry_id.as_deref(),
+                    Some(registry.registry_id.as_str()),
+                ) {
+                    (Some(pool_id), Some(registry_id)) if pool_id == registry_id => {}
+                    (Some(_), Some(_)) => {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "the Edge connection and registry describe different materializations; reconnect the Edge before continuing",
+                            "execution_binding_provider_required",
+                        ));
+                    }
+                    _ => {
+                        return Err(error_response_coded(
+                            StatusCode::PRECONDITION_REQUIRED,
+                            "the Edge connection has no stable registered materialization; reconnect it before continuing",
+                            "execution_binding_provider_required",
+                        ));
+                    }
+                }
+                match (
+                    pool.materialization_id.as_deref(),
+                    registry.materialization_id.as_deref(),
+                ) {
+                    (Some(pool_id), Some(registry_id)) if pool_id == registry_id => Some(pool_id),
+                    (Some(_), Some(_)) => {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "the Edge connection and registry describe different checkout materializations; reconnect the Edge before continuing",
+                            "execution_binding_provider_required",
+                        ));
+                    }
+                    _ => None,
+                }
             }
+            (Some(pool), None) => pool.materialization_id.as_deref(),
+            (None, Some(registry)) => registry.materialization_id.as_deref(),
+            (None, None) => None,
+        };
+        if let Some(materialization_id) = materialization_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return Ok(Some(
+                astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                    materialization_id,
+                    root,
+                ),
+            ));
         }
 
         Err(error_response_coded(
             StatusCode::PRECONDITION_REQUIRED,
-            "the selected Edge is not connected for this user and workspace",
+            "the selected Edge has no stable registered materialization; reconnect it before continuing",
             "execution_binding_provider_required",
         ))
     }
@@ -14836,7 +14933,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
-        self.bind_work_execution_selection(
+        self.bind_execution_selection(
             &user_id,
             &session_id,
             &mut request,
@@ -15712,7 +15809,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
-        self.bind_work_execution_selection(
+        self.bind_execution_selection(
             &user_id,
             &session_id,
             &mut request,

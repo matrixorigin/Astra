@@ -118,12 +118,12 @@ async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
 
     // Exercise the real upgrade gate used by an already-running v72
     // deployment. The new binding table is intentionally removed before the
-    // legacy marker is restored; a v73 bootstrap must execute the DDL again
+    // legacy marker is restored; a v77 bootstrap must execute the DDL again
     // instead of taking the current-contract fast path.
     query("DROP TABLE session_execution_bindings")
         .execute(&db.pool)
         .await
-        .map_err(|error| format!("remove v73-only binding table for migration check: {error}"))?;
+        .map_err(|error| format!("remove v77-only binding table for migration check: {error}"))?;
     query(
         "UPDATE astra_schema_contracts SET contract_version = '2026-09-13-v72'
          WHERE component = 'astra-core'",
@@ -145,7 +145,20 @@ async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
     .try_get("row_count")
     .map_err(|error| format!("decode upgraded execution binding table count: {error}"))?;
     if binding_table_count != 1 {
-        return Err("v72 upgrade did not create session_execution_bindings".to_string());
+        return Err("schema upgrade did not create session_execution_bindings".to_string());
+    }
+    let workspace_claim_table_count: i64 = query(
+        "SELECT COUNT(*) AS row_count FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'session_execution_workspace_claims'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load upgraded execution workspace claim table: {error}"))?
+    .try_get("row_count")
+    .map_err(|error| format!("decode upgraded execution workspace claim table count: {error}"))?;
+    if workspace_claim_table_count != 1 {
+        return Err("schema upgrade did not create session_execution_workspace_claims".to_string());
     }
     ensure_core_schema(&db.settings, "mysql")
         .await

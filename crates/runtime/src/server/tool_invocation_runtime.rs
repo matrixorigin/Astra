@@ -1634,6 +1634,7 @@ impl RuntimeInvocationLedgerError {
                 astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingFenced { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingNotReady(_)
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingInvalid(_)
+                    | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ExecutionBindingBusy
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionSuperseded { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. }
                     | astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAdmissionFailed { .. }

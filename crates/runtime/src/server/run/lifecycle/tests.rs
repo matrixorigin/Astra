@@ -13383,13 +13383,14 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
 async fn native_edge_execution_requires_owned_connection_and_exact_workspace() {
     let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-    edge_pool.register_with_capabilities(
+    edge_pool.register_with_capabilities_and_registry_id(
         "owner-1",
         "edge-owner-1",
         None,
         Some("/workspace/owner".to_string()),
         None,
         None,
+        Some("registry-owner-1".to_string()),
         sender,
     );
     let service = test_service().with_edge_connection_pool(edge_pool);

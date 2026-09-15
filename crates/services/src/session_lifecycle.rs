@@ -295,6 +295,14 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_execution_bindings WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
+        label: "session_execution_switches",
+        sql: "DELETE FROM session_execution_switches WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_execution_workspace_claims",
+        sql: "DELETE FROM session_execution_workspace_claims WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_context_heads",
         sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
     },
@@ -561,6 +569,8 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("agent_session_execution_slots", "user_id"),
     ("session_context_heads", "owner_user_id"),
     ("session_execution_bindings", "owner_user_id"),
+    ("session_execution_switches", "owner_user_id"),
+    ("session_execution_workspace_claims", "owner_user_id"),
     ("session_context_operation_receipts", "owner_user_id"),
     ("session_context_authority_events", "owner_user_id"),
     ("session_handoff_events", "owner_user_id"),
