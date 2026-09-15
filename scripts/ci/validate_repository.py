@@ -66,6 +66,7 @@ def main() -> None:
     contract_scripts = [
         Path("scripts/dev/test_setup_contract.sh"),
         Path("scripts/dev/test-memoria-databases.sh"),
+        Path("scripts/dev/test-memoria-owner-contract.sh"),
         Path("scripts/dev/test-stack-bootstrap-contract.sh"),
         Path("scripts/dev/test_edge_process_contract.sh"),
         Path("scripts/ci/test_interactive_setup_contract.sh"),
@@ -512,6 +513,30 @@ def main() -> None:
                 f"{compose_path}: Memoria healthcheck must probe its HTTP readiness "
                 "boundary instead of only checking that the process exists"
             )
+
+    supported_memoria_image = next(
+        (
+            line.split("=", 1)[1].strip()
+            for line in Path("deployment/all-in-one/.env.example")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.startswith("MEMORIA_IMAGE=")
+        ),
+        "",
+    )
+    dev_env_example = Path(".env.example").read_text(encoding="utf-8")
+    deps_compose = Path("deployment/all-in-one/docker-compose.deps.yml").read_text(
+        encoding="utf-8"
+    )
+    if not supported_memoria_image or supported_memoria_image not in dev_env_example:
+        errors.append(
+            ".env.example: development Memoria must use the pinned all-in-one compatibility image"
+        )
+    if f"${{MEMORIA_IMAGE:-{supported_memoria_image}}}" not in deps_compose:
+        errors.append(
+            "deployment/all-in-one/docker-compose.deps.yml: Memoria fallback must match "
+            "the pinned owner-auth capable image"
+        )
 
     makefile = Path("Makefile").read_text(encoding="utf-8")
     for required in (

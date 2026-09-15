@@ -56,7 +56,12 @@ services:
         max-file: "3"
 
   memoria:
-    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    # Keep the development fallback on the same owner-auth capable release
+    # as deployment/all-in-one/.env.example.  `latest` is not a contract: an
+    # existing .env that omits MEMORIA_IMAGE can otherwise silently pull an
+    # older image whose health endpoint works while Astra's Memoria-Owner
+    # requests all fail with 401.
+    image: ${MEMORIA_IMAGE:-matrixorigin/memoria@sha256:702389efe1d67e3074f024b5c721dc83fc215e9b66cb7b0362dc4e8077c9d061}
     hostname: memoria
     user: "${UID:-1000}:${GID:-1000}"
     ports:

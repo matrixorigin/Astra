@@ -660,6 +660,7 @@ impl<'a> SuiteRunner<'a> {
                     setup_cmd: None,
                     teardown_cmd: None,
                     cleanup_memory_records: false,
+                    requires_memoria: false,
                 };
                 let step_outcome = self.executor.execute(&step_case, model).await;
 
@@ -869,21 +870,23 @@ impl<'a> SuiteRunner<'a> {
         if let Some(scope) = case.required_cache_scope {
             criteria.push(Criterion::PromptCacheReuseScope { scope });
         }
-        if self.runner_cfg.require_session_subsystem_health
-            && !criteria
-                .iter()
-                .any(|criterion| matches!(criterion, Criterion::SessionSubsystemHealthy { .. }))
-        {
+        let health_gate_required = self.runner_cfg.require_session_subsystem_health
+            || (self.runner_cfg.require_memoria_subsystem_health && case.requires_memoria());
+        let health_gate_already_present = if self.runner_cfg.require_session_subsystem_health {
+            crate::criteria::has_unconditional_session_subsystem_health(&criteria)
+        } else {
+            crate::criteria::has_unconditional_memoria_subsystem_health(&criteria)
+        };
+        if health_gate_required && !health_gate_already_present {
             criteria.push(Criterion::SessionSubsystemHealthy {
                 settled_subsystem: Some("post_loop_memory".into()),
             });
         }
-        let settled_subsystem = criteria.iter().find_map(|criterion| match criterion {
-            Criterion::SessionSubsystemHealthy { settled_subsystem } => {
-                settled_subsystem.as_deref()
-            }
-            _ => None,
-        });
+        let settled_subsystem = if self.runner_cfg.require_session_subsystem_health {
+            crate::criteria::unconditional_settled_subsystem(&criteria)
+        } else {
+            crate::criteria::unconditional_memoria_settled_subsystem(&criteria)
+        };
 
         // Load session whenever a criterion needs durable evidence. Keeping
         // this decision beside the effective criteria prevents entry points
@@ -893,7 +896,7 @@ impl<'a> SuiteRunner<'a> {
             || requires_session_capture(&criteria)
         {
             if let Some(session_id) = outcome.session_id.as_deref() {
-                self.load_session_until_settled(session_id, settled_subsystem)
+                self.load_session_until_settled(session_id, settled_subsystem.as_deref())
                     .await
             } else {
                 None
@@ -1475,6 +1478,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         }
     }
 
@@ -1815,6 +1819,22 @@ mod tests {
         }
     }
 
+    struct DelayedSessionLoader {
+        unsettled: SessionCapture,
+        settled: SessionCapture,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionLoader for DelayedSessionLoader {
+        fn load(&self, _id: &str) -> Option<SessionCapture> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Some(self.unsettled.clone())
+            } else {
+                Some(self.settled.clone())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn required_subsystem_health_is_runner_wide_and_forces_capture() {
         let exec = FakeExecutor::new();
@@ -1884,6 +1904,133 @@ mod tests {
         assert!(report.runs[0].criteria.iter().any(|result| {
             matches!(result.criterion, Criterion::SessionSubsystemHealthy { .. }) && result.passed
         }));
+    }
+
+    #[tokio::test]
+    async fn memoria_health_gate_does_not_poison_unrelated_cases() {
+        let exec = FakeExecutor::new();
+        exec.seed("ordinary", "m", outcome_ok("m", "done", &[]));
+        exec.seed("memory", "m", outcome_ok("m", "done", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_memoria_subsystem_health();
+        cfg.session_settle_timeout = Duration::ZERO;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let ordinary = case_with("ordinary", vec![]);
+        let mut memory = case_with("memory", vec![]);
+        memory.requires_memoria = true;
+
+        let report = runner.run_all(&[ordinary, memory]).await;
+        assert_eq!(report.runs.len(), 2);
+        assert!(
+            report
+                .runs
+                .iter()
+                .find(|run| run.case_name == "ordinary")
+                .unwrap()
+                .is_passed()
+        );
+        assert!(
+            !report
+                .runs
+                .iter()
+                .find(|run| run.case_name == "memory")
+                .unwrap()
+                .is_passed()
+        );
+        assert!(!report.runs[0].criteria.iter().any(|result| {
+            matches!(result.criterion, Criterion::SessionSubsystemHealthy { .. })
+        }));
+        assert!(report.runs[1].criteria.iter().any(|result| {
+            matches!(result.criterion, Criterion::SessionSubsystemHealthy { .. }) && !result.passed
+        }));
+    }
+
+    #[tokio::test]
+    async fn nested_memoria_health_waits_for_settlement_before_evaluation() {
+        let exec = FakeExecutor::new();
+        exec.seed("nested-memory", "m", outcome_ok("m", "done", &[]));
+        let turn = crate::session_capture::JournalEvent {
+            event_type: "turn".into(),
+            raw: serde_json::json!({
+                "type": "turn",
+                "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                "turn": 1,
+                "metadata": {"run_id": "run-test"}
+            }),
+        };
+        let settled = crate::session_capture::JournalEvent {
+            event_type: "subsystem_settled".into(),
+            raw: serde_json::json!({
+                "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                "turn": 1,
+                "metadata": {"run_id": "run-test", "subsystem": "post_loop_memory"}
+            }),
+        };
+        let loader = DelayedSessionLoader {
+            unsettled: SessionCapture {
+                session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                journal_path: PathBuf::from("/nested-unsettled"),
+                events: vec![turn.clone()],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            },
+            settled: SessionCapture {
+                session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                journal_path: PathBuf::from("/nested-settled"),
+                events: vec![turn, settled],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            },
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_memoria_subsystem_health();
+        cfg.session_settle_timeout = Duration::from_secs(1);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let case = case_with(
+            "nested-memory",
+            vec![Criterion::AllOf {
+                criteria: vec![Criterion::SessionSubsystemHealthy {
+                    settled_subsystem: Some("post_loop_memory".into()),
+                }],
+            }],
+        );
+
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.passed(), 1);
+        assert!(loader.calls.load(Ordering::Relaxed) >= 2);
     }
 
     #[tokio::test]

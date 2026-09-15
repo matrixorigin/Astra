@@ -14,7 +14,9 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 #   sudo sysctl -w fs.aio-max-nr=1048576
 # then run with `cargo nextest run --test-threads N` to override.
 #
-# `make test-offline` uses the `strict` profile without a global cap.
+# `make test-offline` uses the `strict` profile and the Makefile supplies a
+# conservative per-nextest-process thread cap (`NEXTEST_OFFLINE_THREADS`,
+# default 2). Explicit stress runs may raise that cap.
 # `make test-online` uses the `strict-online` profile, which is capped
 # because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
@@ -35,8 +37,10 @@ test-threads = 2
 fail-fast = false
 failure-output = "immediate"
 slow-timeout = { period = "30s", terminate-after = 1 }
-# When invoked via `make test-offline`, the Makefile overrides this
-# with `--test-threads N` computed from the live inotify headroom.
+# When invoked via `make test-offline`, the Makefile overrides this with
+# `--test-threads NEXTEST_OFFLINE_THREADS` (default 2). This is a per-process
+# cap; running multiple make targets in parallel can still create multiple
+# nextest processes.
 # Direct `cargo nextest run --profile strict` uses num-cpus (fast on
 # tuned hosts; may ENOSPC on default-kernel boxes without the
 # Makefile wrapper — use `make test-offline` instead).

@@ -47,7 +47,7 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case; default 2 nextest threads, override: NEXTEST_OFFLINE_THREADS=<n> / NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
 	@echo "  make test-memoria-databases - Verify Memoria database bootstrap contract"
@@ -166,6 +166,13 @@ STACK_RECREATE_ARGS := $(if $(filter 1 true yes,$(STACK_RECREATE)),--force-recre
 #   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
 NEXTEST_OFFLINE_PROFILE ?= strict
 NEXTEST_ONLINE_PROFILE  ?= strict-online
+# Keep the offline gate deterministic on hosts where the strict profile would
+# otherwise fan out to every CPU. The runtime tests create many independent
+# Tokio runtimes and filesystem-backed session fixtures; unconstrained
+# process-level fan-out turns scheduling and temporary-state contention into
+# false failures. Override for a tuned machine when doing an explicit stress
+# run (for example, NEXTEST_OFFLINE_THREADS=8).
+NEXTEST_OFFLINE_THREADS ?= 2
 CLEANUP_PRESSURE_PROFILE ?= smoke
 CLEANUP_PRESSURE_DATABASE_BASE ?= astra_runtime_test_cleanup_pressure
 CLEANUP_PRESSURE_ARGS ?=
@@ -173,7 +180,7 @@ DURABLE_EVENT_PRESSURE_PROFILE ?= smoke
 DURABLE_EVENT_PRESSURE_DATABASE ?= astra_runtime_test_durable_event_pressure
 DURABLE_EVENT_PRESSURE_ARGS ?=
 
-NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
+NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE) --test-threads $(NEXTEST_OFFLINE_THREADS)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
 # Operational pressure probes have dedicated runners and data-size controls.
 # Keep them out of the generic ignored-test lane, whose per-case timeout is a
@@ -327,6 +334,8 @@ dev-deps-ensure-memoria:
 dev-deps-wait:
 	@$(MAKE) dev-deps-wait-matrixone
 	@$(MAKE) dev-deps-ensure-memoria
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	./scripts/dev/check-memoria-owner.sh
 	@echo "Waiting for Memoria..."
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ -z "$${MEMORIA_MASTER_KEY:-}" ]; then \
@@ -1713,6 +1722,10 @@ test-mysql-client:
 .PHONY: test-memoria-databases
 test-memoria-databases:
 	@bash scripts/dev/test-memoria-databases.sh
+
+.PHONY: test-memoria-owner
+test-memoria-owner:
+	@bash scripts/dev/test-memoria-owner-contract.sh
 
 .PHONY: test-stack-bootstrap
 test-stack-bootstrap:

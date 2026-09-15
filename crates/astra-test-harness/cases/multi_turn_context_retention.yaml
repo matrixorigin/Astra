@@ -14,6 +14,7 @@ prompt: |
   The secret code is ALPHA-7742. Acknowledge with a short sentence.
   Do not use any tools — just reply in text.
 capability: memory
+requires_memoria: true
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240

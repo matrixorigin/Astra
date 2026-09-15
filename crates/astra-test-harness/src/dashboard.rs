@@ -1305,7 +1305,7 @@ async fn execute_run(
     let fallback_models = req.models.clone();
     let mut runner_cfg = RunnerConfig::new(config.astra_bin.clone())
         .with_fallback_models(fallback_models)
-        .with_required_session_subsystem_health();
+        .with_required_memoria_subsystem_health();
     runner_cfg.working_dir = None;
     let runner_identity = resolve_runner_profile_owner(None).map_err(anyhow::Error::msg)?;
     astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());

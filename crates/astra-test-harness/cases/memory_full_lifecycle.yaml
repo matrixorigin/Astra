@@ -18,6 +18,7 @@ prompt: |
   confirm the marker and ID. Do not update or delete an existing record: if the service reports
   a conflict, generate a different marker and retry remember.
 capability: memory
+requires_memoria: true
 difficulty: 3
 weight: 2.5
 timeout_seconds: 240

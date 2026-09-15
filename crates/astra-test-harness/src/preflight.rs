@@ -30,6 +30,9 @@ pub enum PreflightError {
     ModelUnavailable { model: String, detail: String },
 }
 
+const OWNER_READINESS_PROBE_USER: &str = "astra-owner-readiness-probe";
+const OWNER_READINESS_PROBE_QUERY: &str = "__astra_owner_auth_readiness_probe__";
+
 fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
     stderr.contains("Could not validate credentials")
         || stderr.contains("Session expired")
@@ -143,9 +146,17 @@ pub async fn run_preflight(
     astra_bin: &Path,
     models: &[String],
     requested_profile: Option<&str>,
+    require_memoria: bool,
 ) -> Result<Option<String>, PreflightError> {
+    // The server and local dependency scripts both load `.env`; do the same
+    // for the harness so an owner-auth probe cannot be skipped merely because
+    // the caller did not export the local development variables in its shell.
+    dotenvy::dotenv().ok();
     check_binary(astra_bin)?;
-    check_server(astra_bin).await?;
+    let readiness = check_server(astra_bin).await?;
+    if require_memoria {
+        check_memoria_readiness(&readiness).await?;
+    }
     let mut effective_profile = requested_profile.map(str::to_string);
     for model in models {
         effective_profile = check_model(astra_bin, model, effective_profile.as_deref()).await?;
@@ -168,7 +179,7 @@ fn check_binary(astra_bin: &Path) -> Result<(), PreflightError> {
     Ok(())
 }
 
-async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
+async fn check_server(astra_bin: &Path) -> Result<ServerReadiness, PreflightError> {
     let output = Command::new(astra_bin)
         .args(["health"])
         .env("NO_PROXY", "localhost,127.0.0.1")
@@ -196,6 +207,138 @@ async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
             }
         );
     }
+    Ok(readiness)
+}
+
+/// Validate the storage/authentication contract used by self-hosted memory.
+///
+/// The ordinary Memoria health endpoint authenticates as an administrator
+/// (`Bearer`) and therefore cannot detect an older backend that accepts health
+/// checks but rejects Astra's required `Memoria-Owner` requests.  Probe a
+/// nonexistent query through the exact owner-scoped endpoint instead. The
+/// request does not execute an explicit memory write, is bounded, and the
+/// master key is never included in an error string.
+async fn check_memoria_readiness(server_readiness: &ServerReadiness) -> Result<(), PreflightError> {
+    if server_readiness
+        .unavailable_components
+        .iter()
+        .any(|component| component == "memoria")
+    {
+        return Err(PreflightError::ServerUnready {
+            detail: "Memoria is unavailable according to the server health response; \
+                     fix the dependency before running memory-dependent cases"
+                .to_string(),
+        });
+    }
+
+    // Hosted/browser-login deployments use a scoped user credential and must
+    // not be forced through the local master-key fallback. The explicit local
+    // flag is the contract that enables this probe.
+    if std::env::var("MEMORIA_SELF_HOSTED_MASTER_ACCESS").as_deref() != Ok("1")
+        || std::env::var("MEMORIA_WEB_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty())
+    {
+        return Ok(());
+    }
+
+    let master_key = std::env::var("MEMORIA_MASTER_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| PreflightError::ServerUnready {
+            detail: "MEMORIA_MASTER_KEY is required for self-hosted Memoria-Owner readiness"
+                .to_string(),
+        })?;
+    let base_url = std::env::var("MEMORIA_BASE_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "http://127.0.0.1:{}",
+                std::env::var("MEMORIA_PORT").unwrap_or_else(|_| "8100".to_string())
+            )
+        });
+    probe_memoria_owner(&base_url, &master_key)
+        .await
+        .map_err(|detail| PreflightError::ServerUnready { detail })?;
+    eprintln!("[astra-test] preflight: Memoria owner-authenticated storage is ready");
+    Ok(())
+}
+
+fn validate_memoria_retrieve_body(body: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("Memoria owner-auth readiness returned invalid JSON: {error}"))?;
+    let valid = match &value {
+        serde_json::Value::Array(_) => true,
+        serde_json::Value::Object(object) => {
+            !object.contains_key("error")
+                && ["memories", "results"]
+                    .iter()
+                    .any(|key| object.get(*key).is_some_and(serde_json::Value::is_array))
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("Memoria owner-auth readiness returned a non-retrieve response".to_string())
+    }
+}
+
+async fn probe_memoria_owner(base_url: &str, master_key: &str) -> Result<(), String> {
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    let url = format!("{}/v1/memories/retrieve", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("failed to build Memoria readiness client: {error}"))?;
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Memoria-Owner {master_key}"))
+        .header("X-User-Id", OWNER_READINESS_PROBE_USER)
+        .json(&serde_json::json!({
+            "query": OWNER_READINESS_PROBE_QUERY,
+            "top_k": 1,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Memoria owner-auth readiness request failed: {error}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(
+            "Memoria owner authentication returned HTTP 401; use a Memoria 0.5.2+ image with matching MEMORIA_MASTER_KEY"
+                .to_string(),
+        );
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(
+            "Memoria owner authentication returned HTTP 403; check MEMORIA_SELF_HOSTED_MASTER_ACCESS=1"
+                .to_string(),
+        );
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Memoria owner-auth readiness returned HTTP {status}"
+        ));
+    }
+    use futures::StreamExt;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            format!("Memoria owner-auth readiness response could not be read: {error}")
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err("Memoria owner-auth readiness response exceeds 64 KiB".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    validate_memoria_retrieve_body(std::str::from_utf8(&body).map_err(|error| {
+        format!("Memoria owner-auth readiness returned non-UTF-8 JSON: {error}")
+    })?)?;
     Ok(())
 }
 
@@ -490,6 +633,164 @@ mod tests {
     }
 
     use super::*;
+
+    async fn probe_with_response(
+        status: &str,
+        extra_headers: &str,
+        body: &str,
+    ) -> (Result<(), String>, String) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let extra_headers = extra_headers.to_string();
+        let body = body.to_string();
+        let captured_request = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_server = Arc::clone(&captured_request);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    let header_end = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4);
+                    let Some(header_end) = header_end else {
+                        continue;
+                    };
+                    let content_length = request[..header_end]
+                        .split(|byte| *byte == b'\n')
+                        .find_map(|line| {
+                            let line = line.strip_suffix(b"\r").unwrap_or(line);
+                            let colon = line.iter().position(|byte| *byte == b':')?;
+                            let (name, value) = line.split_at(colon);
+                            let value = &value[1..];
+                            name.eq_ignore_ascii_case(b"content-length")
+                                .then(|| {
+                                    std::str::from_utf8(value)
+                                        .ok()?
+                                        .trim()
+                                        .parse::<usize>()
+                                        .ok()
+                                })
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            })
+            .await;
+            *captured_for_server.lock().unwrap() = request;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let result = probe_memoria_owner(&format!("http://{address}"), "probe-key").await;
+        server.await.unwrap();
+        let request = String::from_utf8_lossy(&captured_request.lock().unwrap()).into_owned();
+        (result, request)
+    }
+
+    #[tokio::test]
+    async fn owner_probe_accepts_only_retrieve_shapes() {
+        let (result, request) = probe_with_response("200 OK", "", "[]").await;
+        assert!(result.is_ok());
+        let request_lower = request.to_ascii_lowercase();
+        assert!(
+            request.starts_with("POST /v1/memories/retrieve HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request_lower.contains("authorization: memoria-owner probe-key"),
+            "{request}"
+        );
+        assert!(
+            request_lower.contains("x-user-id: astra-owner-readiness-probe"),
+            "{request}"
+        );
+        assert!(
+            request.contains("__astra_owner_auth_readiness_probe__"),
+            "{request}"
+        );
+        assert!(request.contains("\"top_k\":1"), "{request}");
+
+        let (result, _) = probe_with_response("200 OK", "", r#"{"memories":[]}"#).await;
+        assert!(result.is_ok());
+        let (result, _) = probe_with_response("200 OK", "", r#"{"results":[]}"#).await;
+        assert!(result.is_ok());
+        let (result, _) = probe_with_response("200 OK", "", r#"{"error":"unavailable"}"#).await;
+        assert!(result.is_err());
+        let (result, _) = probe_with_response("200 OK", "", r#"{"status":"healthy"}"#).await;
+        assert!(result.is_err());
+        let (result, _) = probe_with_response("200 OK", "", "not-json").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn owner_probe_rejects_redirects_without_following_them() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::AsyncWriteExt;
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_visited = Arc::new(AtomicBool::new(false));
+        let target_visited_by_server = Arc::clone(&target_visited);
+        let target_server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = target_listener.accept().await {
+                target_visited_by_server.store(true, Ordering::SeqCst);
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let (result, _) = probe_with_response(
+            "302 Found",
+            &format!("Location: http://{target_address}/v1/memories/retrieve\r\n"),
+            "[]",
+        )
+        .await;
+        let error = result.expect_err("redirect must not certify storage readiness");
+        assert!(error.contains("HTTP 302"), "{error}");
+        assert!(!target_visited.load(Ordering::SeqCst));
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn owner_probe_explains_auth_failures_without_exposing_key() {
+        let (result, _) =
+            probe_with_response("401 Unauthorized", "", "secret backend detail").await;
+        let error = result.expect_err("401 must fail readiness");
+        assert!(error.contains("HTTP 401"), "{error}");
+        assert!(!error.contains("probe-key"), "{error}");
+        let (result, _) = probe_with_response("403 Forbidden", "", "secret backend detail").await;
+        let error = result.expect_err("403 must fail readiness");
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(!error.contains("probe-key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn owner_probe_rejects_oversized_response() {
+        let body = format!("[{}]", " ".repeat(64 * 1024));
+        let (result, _) = probe_with_response("200 OK", "", &body).await;
+        let error = result.expect_err("oversized response must fail readiness");
+        assert!(error.contains("exceeds 64 KiB"), "{error}");
+    }
 
     #[test]
     fn binary_not_found() {

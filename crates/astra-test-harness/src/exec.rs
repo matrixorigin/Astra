@@ -1164,6 +1164,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
@@ -1423,6 +1424,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let start = std::time::Instant::now();
         let outcome = exec.execute(&case, "ignored").await;
@@ -1515,6 +1517,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let out = fe.execute(&case, "qwen-flash").await;
         assert_eq!(out.text, "hello");
@@ -1548,6 +1551,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         }
     }
 

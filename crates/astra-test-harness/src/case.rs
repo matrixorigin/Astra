@@ -123,6 +123,12 @@ pub struct Case {
     /// purges and avoids a separate privileged Memoria credential.
     #[serde(default)]
     pub cleanup_memory_records: bool,
+
+    /// Explicitly require the live Memoria contract even when this case does
+    /// not create a record (for example, a read-only memory probe). Negative
+    /// tests that intentionally ban memory actions leave this false.
+    #[serde(default)]
+    pub requires_memoria: bool,
 }
 
 /// A follow-up turn in a multi-turn case.
@@ -453,6 +459,16 @@ pub fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 impl Case {
+    /// Whether this case needs the live Memoria contract and its durable
+    /// post-loop settlement marker. Explicit opt-in, exact-record cleanup, or
+    /// a post-loop memory health criterion enables it; a capability label
+    /// alone does not, because negative memory cases may ban the tool.
+    pub fn requires_memoria(&self) -> bool {
+        self.requires_memoria
+            || self.cleanup_memory_records
+            || super::criteria::requires_memoria_subsystem_health(&self.criteria)
+    }
+
     /// Load a case from a YAML file on disk.
     pub fn from_path(path: &Path) -> Result<Self, anyhow::Error> {
         // Cheap size guard so a pathological YAML (or a wrong file

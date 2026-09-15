@@ -466,7 +466,15 @@ async fn main() -> Result<()> {
         }
         preflight_models.sort();
         preflight_models.dedup();
-        match run_preflight(&astra_bin, &preflight_models, args.profile.as_deref()).await {
+        let require_memoria = cases.iter().any(Case::requires_memoria);
+        match run_preflight(
+            &astra_bin,
+            &preflight_models,
+            args.profile.as_deref(),
+            require_memoria,
+        )
+        .await
+        {
             Ok(effective_profile) => {
                 if effective_profile.is_some() {
                     runner_profile = effective_profile;
@@ -485,7 +493,7 @@ async fn main() -> Result<()> {
 
     let mut runner_cfg = RunnerConfig::new(astra_bin.clone())
         .with_fallback_models(fallback_models.clone())
-        .with_required_session_subsystem_health();
+        .with_required_memoria_subsystem_health();
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();

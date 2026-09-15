@@ -10,6 +10,7 @@ description: |
 prompt: |
   我关注oceanbase这个项目，帮我记住。
 capability: memory
+requires_memoria: true
 difficulty: 3
 weight: 2.0
 timeout_seconds: 120

@@ -336,7 +336,12 @@ the matrix, and duplicate IDs are an error. `weight × difficulty` is the
 single scoring weight shared by text and structured evaluation. Unknown model
 metadata does not skip a case: the harness runs it so criteria can provide
 actual evidence, including the injected hard gate for the declared cache
-scope.
+scope. The asynchronous post-loop health gate is injected only for cases that
+explicitly set `requires_memoria: true`, clean up memory records, or declare
+`session_subsystem_healthy`; an optional memory outage must not turn unrelated
+tool or reasoning cases into identical failures. A negative case can still use
+`capability: memory` while leaving `requires_memoria` false when its contract
+is specifically to verify behavior without invoking the memory backend.
 
 ## FAIL report artifacts
 
@@ -441,6 +446,16 @@ Before running cases, the harness validates:
    the matrix to catch misconfigured keys early.
 3. **Binary resolution**: confirms the astra binary exists and is
    executable.
+4. **Self-hosted Memoria owner contract**: when the selected cases need
+   Memoria and `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, performs a bounded,
+   read-only `Memoria-Owner` retrieval probe. This catches an old or
+   incompatible Memoria image even when the administrator bearer health
+   endpoint is green.
+
+The local development stack pins the owner-auth capable Memoria image and
+`make dev-deps-wait` performs the same probe before declaring dependencies
+ready. A failed probe reports the dependency/authentication action instead of
+spending model calls on doomed cases.
 
 Skip with `--skip-preflight` for faster iteration when you know the
 environment is healthy.

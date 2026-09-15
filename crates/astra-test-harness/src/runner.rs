@@ -193,6 +193,10 @@ pub struct RunnerConfig {
     /// Require every run to prove that typed asynchronous subsystem work
     /// remained healthy using its durable session journal.
     pub require_session_subsystem_health: bool,
+    /// Require the same proof for cases that explicitly exercise Memoria.
+    /// Unrelated cases keep running and report their own criteria when an
+    /// optional memory backend is degraded.
+    pub require_memoria_subsystem_health: bool,
     /// Maximum time to wait for the server's durable asynchronous settlement
     /// marker after the visible chat process exits.
     pub session_settle_timeout: std::time::Duration,
@@ -207,6 +211,7 @@ impl RunnerConfig {
             profile: None,
             artifact_owner_scopes: Vec::new(),
             require_session_subsystem_health: false,
+            require_memoria_subsystem_health: false,
             session_settle_timeout: std::time::Duration::ZERO,
         }
     }
@@ -222,6 +227,15 @@ impl RunnerConfig {
         // runtime resets its drain window only after observable handoff to the
         // queued refresh. The harness watches the complete bounded contract;
         // it must not label healthy sequential progress as data loss.
+        self.session_settle_timeout = std::time::Duration::from_secs(75);
+        self
+    }
+
+    pub fn with_required_memoria_subsystem_health(mut self) -> Self {
+        self.require_memoria_subsystem_health = true;
+        // Memory extraction has the same bounded provider and refresh
+        // contract as the global health gate. Keep the wait long enough for
+        // the asynchronous worker to publish its durable settlement marker.
         self.session_settle_timeout = std::time::Duration::from_secs(75);
         self
     }
@@ -890,6 +904,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let cfg = RunnerConfig::new("astra").with_fallback_models(vec!["sonnet".into()]);
         assert_eq!(resolve_models(&case, &cfg).unwrap(), vec!["opus"]);
@@ -916,6 +931,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let cfg = RunnerConfig::new("astra")
             .with_fallback_models(vec!["sonnet".into(), "minimax".into()]);
@@ -944,6 +960,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         let cfg = RunnerConfig::new("astra");
         assert!(resolve_models(&case, &cfg).is_err());
@@ -970,6 +987,7 @@ mod tests {
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
+            requires_memoria: false,
         };
         case.models = Some(vec!["m".into(), "m".into()]);
         let cfg = RunnerConfig::new("astra");
