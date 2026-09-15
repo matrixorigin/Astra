@@ -83,6 +83,7 @@ mod tests {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
