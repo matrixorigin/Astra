@@ -2190,7 +2190,7 @@ mod sustained_presentation_pressure_tests {
             }
 
             if (round + 1) % RENDER_EVERY == 0 {
-                let (width, height) = if (round / RENDER_EVERY) % 2 == 0 {
+                let (width, height) = if (round / RENDER_EVERY).is_multiple_of(2) {
                     (120, 24)
                 } else {
                     (40, 12)
