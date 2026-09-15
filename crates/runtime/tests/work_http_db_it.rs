@@ -5761,3 +5761,263 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
     cleanup_owner(&pool, &owner_id).await;
     cleanup_owner(&pool, &other_owner_id).await;
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn durable_work_mixed_read_write_keeps_owner_session_boundaries_under_concurrency() {
+    let Some((app, pool)) = setup().await else {
+        return;
+    };
+    let owner_id = id("mixed-owner");
+    let other_owner_id = id("mixed-other-owner");
+    cleanup_owner(&pool, &owner_id).await;
+    cleanup_owner(&pool, &other_owner_id).await;
+
+    let (owner_first, owner_second, other_first, other_second) = tokio::join!(
+        post_work(
+            app.clone(),
+            &owner_id,
+            serde_json::json!({
+                "request_id": "mixed-owner-first",
+                "goal": "Keep one durable Work readable during concurrent cursor writes.",
+                "criteria": []
+            })
+        ),
+        post_work(
+            app.clone(),
+            &owner_id,
+            serde_json::json!({
+                "request_id": "mixed-owner-second",
+                "goal": "Keep a second canonical session independent from the first.",
+                "criteria": []
+            })
+        ),
+        post_work(
+            app.clone(),
+            &other_owner_id,
+            serde_json::json!({
+                "request_id": "mixed-other-first",
+                "goal": "Keep a foreign owner's Work isolated.",
+                "criteria": []
+            })
+        ),
+        post_work(
+            app.clone(),
+            &other_owner_id,
+            serde_json::json!({
+                "request_id": "mixed-other-second",
+                "goal": "Keep another foreign session independently readable.",
+                "criteria": []
+            })
+        )
+    );
+    for (status, body) in [&owner_first, &owner_second, &other_first, &other_second] {
+        assert_eq!(*status, StatusCode::CREATED, "create Work: {body}");
+    }
+
+    let target = |body: &Value| {
+        (
+            body["overview"]["work_id"]
+                .as_str()
+                .expect("public Work id")
+                .to_owned(),
+            body["overview"]["delivery_branch"]["branch_id"]
+                .as_str()
+                .expect("delivery branch id")
+                .to_owned(),
+        )
+    };
+    let (owner_work, owner_branch) = target(&owner_first.1);
+    let (owner_second_work, owner_second_branch) = target(&owner_second.1);
+    let (other_work, other_branch) = target(&other_first.1);
+    let (other_second_work, _) = target(&other_second.1);
+
+    let owner_session: String = sqlx::query_scalar(
+        "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&owner_work)
+    .bind(&owner_branch)
+    .fetch_one(pool.get())
+    .await
+    .expect("owner session binding");
+    let owner_second_session: String = sqlx::query_scalar(
+        "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&owner_second_work)
+    .bind(&owner_second_branch)
+    .fetch_one(pool.get())
+    .await
+    .expect("second owner session binding");
+    assert_ne!(owner_session, owner_second_session);
+
+    let (owner_attach_left, owner_attach_right) = tokio::join!(
+        attach_work_branch(
+            app.clone(),
+            &owner_id,
+            &owner_work,
+            &owner_branch,
+            "mixed-owner-attachment-left"
+        ),
+        attach_work_branch(
+            app.clone(),
+            &owner_id,
+            &owner_work,
+            &owner_branch,
+            "mixed-owner-attachment-right"
+        )
+    );
+    for (status, attachment) in [&owner_attach_left, &owner_attach_right] {
+        assert_eq!(*status, StatusCode::OK, "read attachment: {attachment}");
+        assert_eq!(attachment["mode"], "read_only");
+        assert_field_absent(attachment, "session_id");
+    }
+    assert_ne!(
+        owner_attach_left.1["attachment_id"], owner_attach_right.1["attachment_id"],
+        "independent clients must receive independent read attachments"
+    );
+
+    // Reader pages and cursor writes run at the same time across two owners
+    // and two canonical sessions.  The read path is allowed to observe the
+    // genesis head, but it must never cross the Work identity boundary.
+    let (
+        owner_work_read,
+        owner_events_read,
+        owner_graph_read,
+        owner_cursor_left,
+        owner_cursor_right,
+        other_work_read,
+        other_events_read,
+        other_graph_read,
+    ) = tokio::join!(
+        get_work(app.clone(), &owner_id, &owner_work),
+        get_work_events(app.clone(), &owner_id, &owner_work, "?limit=1"),
+        get_work_task_graph(
+            app.clone(),
+            &owner_id,
+            &owner_work,
+            &owner_branch,
+            "?item_limit=1&dependency_limit=1"
+        ),
+        put_read_cursor(
+            app.clone(),
+            &owner_id,
+            &owner_work,
+            serde_json::json!({"through_event_seq": 1})
+        ),
+        put_read_cursor(
+            app.clone(),
+            &owner_id,
+            &owner_work,
+            serde_json::json!({"through_event_seq": 1})
+        ),
+        get_work(app.clone(), &other_owner_id, &other_work),
+        get_work_events(app.clone(), &other_owner_id, &other_work, "?limit=1"),
+        get_work_task_graph(
+            app.clone(),
+            &other_owner_id,
+            &other_work,
+            &other_branch,
+            "?item_limit=1&dependency_limit=1"
+        )
+    );
+    assert_eq!(
+        owner_work_read.0,
+        StatusCode::OK,
+        "Work read: {}",
+        owner_work_read.1
+    );
+    assert_eq!(owner_work_read.1["overview"]["work_id"], owner_work);
+    assert_eq!(
+        owner_events_read.0,
+        StatusCode::OK,
+        "events read: {}",
+        owner_events_read.1
+    );
+    assert_eq!(owner_events_read.1["work_id"], owner_work);
+    assert_eq!(
+        owner_graph_read.0,
+        StatusCode::OK,
+        "graph read: {}",
+        owner_graph_read.1
+    );
+    assert_eq!(owner_graph_read.1["basis"]["work_id"], owner_work);
+    assert_eq!(
+        owner_cursor_left.0,
+        StatusCode::OK,
+        "cursor write: {}",
+        owner_cursor_left.1
+    );
+    assert_eq!(
+        owner_cursor_right.0,
+        StatusCode::OK,
+        "cursor retry: {}",
+        owner_cursor_right.1
+    );
+    assert_eq!(owner_cursor_left.1, owner_cursor_right.1);
+    assert_eq!(
+        other_work_read.0,
+        StatusCode::OK,
+        "other Work read: {}",
+        other_work_read.1
+    );
+    assert_eq!(other_work_read.1["overview"]["work_id"], other_work);
+    assert_eq!(
+        other_events_read.0,
+        StatusCode::OK,
+        "other events: {}",
+        other_events_read.1
+    );
+    assert_eq!(other_events_read.1["work_id"], other_work);
+    assert_eq!(
+        other_graph_read.0,
+        StatusCode::OK,
+        "other graph: {}",
+        other_graph_read.1
+    );
+    assert_eq!(other_graph_read.1["basis"]["work_id"], other_work);
+
+    let receipt_revision: i64 = sqlx::query_scalar(
+        "SELECT receipt_revision FROM work_attention_receipts WHERE owner_id = ? AND work_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&owner_work)
+    .fetch_one(pool.get())
+    .await
+    .expect("read receipt revision");
+    assert_eq!(
+        receipt_revision, 2,
+        "concurrent exact cursor PUTs advance once"
+    );
+
+    let (foreign_work_status, foreign_work_body, _) =
+        get_work(app.clone(), &owner_id, &other_work).await;
+    assert_eq!(foreign_work_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_work_body["code"], "work_not_found");
+    let (foreign_events_status, foreign_events_body, _) =
+        get_work_events(app.clone(), &owner_id, &other_work, "?limit=1").await;
+    assert_eq!(foreign_events_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_events_body["code"], "work_not_found");
+    let (foreign_graph_status, foreign_graph_body, _) = get_work_task_graph(
+        app.clone(),
+        &owner_id,
+        &other_work,
+        &other_branch,
+        "?item_limit=1&dependency_limit=1",
+    )
+    .await;
+    assert_eq!(foreign_graph_status, StatusCode::NOT_FOUND);
+    assert_eq!(foreign_graph_body["code"], "branch_not_found");
+    assert!(!foreign_work_body.to_string().contains(&other_work));
+    assert!(!foreign_events_body.to_string().contains(&other_work));
+    assert!(!foreign_graph_body.to_string().contains(&other_work));
+
+    let (other_read_status, other_read, _) =
+        get_work(app.clone(), &other_owner_id, &other_second_work).await;
+    assert_eq!(other_read_status, StatusCode::OK);
+    assert_eq!(other_read["overview"]["work_id"], other_second_work);
+
+    cleanup_owner(&pool, &owner_id).await;
+    cleanup_owner(&pool, &other_owner_id).await;
+}
