@@ -467,11 +467,17 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     ));
                 }
                 s.push_str(&format!(
-                    "    execution: tools={} success={} failed={} unknown={}\n",
+                    "    execution: tools={} executed={} success={} failed={} rejected={} reused={} suppressed={} deferred={} unknown={} unknown_disposition={}\n",
                     execution.total_tool_calls,
+                    execution.executed_tool_calls,
                     execution.successful_tool_calls,
                     execution.failed_tool_calls,
+                    execution.rejected_tool_calls,
+                    execution.reused_tool_calls,
+                    execution.suppressed_tool_calls,
+                    execution.deferred_tool_calls,
                     execution.unknown_outcome_tool_calls,
+                    execution.unknown_disposition_tool_calls,
                 ));
                 if execution.settlement_attempts > 0 {
                     s.push_str(&format!(
@@ -981,9 +987,12 @@ mod tests {
     fn json_report_includes_execution_attribution_when_captured() {
         let mut report = mk_report_passed();
         report.runs[0].execution = Some(crate::pipeline_analysis::ExecutionTraceReport {
-            total_tool_calls: 3,
+            total_tool_calls: 5,
+            executed_tool_calls: 3,
             successful_tool_calls: 2,
             failed_tool_calls: 1,
+            rejected_tool_calls: 1,
+            suppressed_tool_calls: 1,
             settlement_attempts: 2,
             successful_settlements: 1,
             rejected_settlements: 1,
@@ -995,7 +1004,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&render(&report, Format::Json, false)).unwrap();
-        assert_eq!(json["runs"][0]["execution"]["total_tool_calls"], 3);
+        assert_eq!(json["runs"][0]["execution"]["total_tool_calls"], 5);
+        assert_eq!(json["runs"][0]["execution"]["executed_tool_calls"], 3);
+        assert_eq!(json["runs"][0]["execution"]["rejected_tool_calls"], 1);
+        assert_eq!(json["runs"][0]["execution"]["suppressed_tool_calls"], 1);
         assert_eq!(
             json["runs"][0]["execution"]["runtime_rejection_reasons"]["work_settlement_evidence_required"],
             1

@@ -647,6 +647,14 @@ impl SessionCapture {
                         "error_kind": record.get("error_kind"),
                         "disposition": record.get("disposition"),
                         "pre_dispatch_rejection": record.get("pre_dispatch_rejection"),
+                        // Keep the legacy fields needed to reproduce the
+                        // canonical ToolCallRecord::effective_disposition
+                        // when older journals omitted an explicit
+                        // `disposition` value.
+                        "surgically_removed": record.get("surgically_removed"),
+                        "skill_reentry_count": record.get("skill_reentry_count"),
+                        "skill_locked_out": record.get("skill_locked_out"),
+                        "result_class": record.get("result_class"),
                     }),
                     call_id,
                     name: name.to_string(),
