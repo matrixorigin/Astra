@@ -60,7 +60,9 @@ use crate::{
     edge_tools::ToolExecutor,
 };
 
-use crate::cli::chat_stream::edge_executor::edge_executor_instance_id;
+use crate::cli::chat_stream::edge_executor::{
+    edge_executor_instance_id, try_edge_executor_instance_id,
+};
 
 /// Plan-mode escape hatches must remain callable while that policy overlay is
 /// active. Outside plan mode they remain deferred behind `tool_search`: making
@@ -706,6 +708,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         astra_core::history_work::HistoryWorkSite::CliPromptPayloadClone,
         &prompt_messages,
     );
+    let edge_executor_id = edge_executor_instance_id();
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: &prompt_messages,
         user_intent: Some(ctx.user_intent),
@@ -717,7 +720,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
-        edge_executor_id: edge_executor_instance_id(),
+        edge_executor_id,
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
@@ -1593,6 +1596,10 @@ async fn chat_turn_post_payload_after_prepare(
         prepare,
     } = request;
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
+    // Resolve the executor identity before building or sending the admission
+    // request. A missing persisted materialization is an actionable local
+    // setup error; never silently replace it with a process-scoped identity.
+    try_edge_executor_instance_id()?;
     let (current_session_id, session_turn, round_index) = (
         prepare.current_session_id,
         prepare.session_turn,
@@ -1839,7 +1846,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     let edge_ctx = EdgeSseContext {
         api,
         token,
-        executor_id: edge_executor_instance_id(),
+        executor_id: try_edge_executor_instance_id()?,
         executor,
         render_policy,
         perm_manager: Some(perm_manager),

@@ -1,6 +1,7 @@
 //! Suite orchestration with parallel execution, circuit breaker,
 //! failure classification, and retry on rate-limit.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use crate::model_profiles::{ModelReuseSupport, load_profiles};
 use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
+use crate::session_identity::delete_server_session;
 use crate::session_identity::is_valid_server_session_id;
 
 fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCapture) {
@@ -34,6 +36,62 @@ fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCap
         .saturating_sub(stderr.chars().count() + LABEL.chars().count());
     let evidence = session.render_tool_evidence(available);
     outcome.stderr = format!("{stderr}{LABEL}{evidence}");
+}
+
+/// Return only identities observed from root executions owned by this case.
+/// Follow-up outcomes are resumptions of the root session, not new ownership
+/// grants. A divergent follow-up identity is retained as a lifecycle error and
+/// must never become an implicit deletion target.
+fn created_session_ids_for_cleanup(attempts: &[AttemptRecord]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for id in attempts.iter().filter_map(|attempt| {
+        attempt
+            .outcome
+            .session_id
+            .as_deref()
+            .filter(|id| is_valid_server_session_id(id))
+    }) {
+        ids.insert(id.to_string());
+    }
+    ids.into_iter().collect()
+}
+
+/// Destructive cleanup requires a complete capture for each owned session.
+/// Captures are loaded into the per-run archive map before this function is
+/// called; missing or conflicting evidence leaves the session in place and
+/// makes the harness surface an explicit cleanup failure.
+fn cleanup_ready_session_ids(
+    owned_ids: &[String],
+    captures: &BTreeMap<String, SessionCapture>,
+) -> (Vec<String>, Vec<String>) {
+    let mut ready = Vec::new();
+    let mut errors = Vec::new();
+    for id in owned_ids {
+        let Some(capture) = captures.get(id) else {
+            errors.push(format!(
+                "created session {id} was not deleted because its journal capture was unavailable"
+            ));
+            continue;
+        };
+        if capture.session_id != *id {
+            errors.push(format!(
+                "created session {id} was not deleted because the archived capture belongs to {}",
+                capture.session_id
+            ));
+            continue;
+        }
+        if capture.skipped_lines != 0
+            || capture.dropped_lines != 0
+            || capture.has_integrity_errors()
+        {
+            errors.push(format!(
+                "created session {id} was not deleted because its journal capture is incomplete"
+            ));
+            continue;
+        }
+        ready.push(id.clone());
+    }
+    (ready, errors)
 }
 
 /// Render the assistant responses in the order in which they were produced.
@@ -888,22 +946,54 @@ impl<'a> SuiteRunner<'a> {
             crate::criteria::unconditional_memoria_settled_subsystem(&criteria)
         };
 
+        let cleanup_enabled = self.runner_cfg.cleanup_created_sessions
+            && case
+                .extra_cli_args
+                .iter()
+                .all(|arg| arg != "--session-id" && !arg.starts_with("--session-id="));
+        let owned_session_ids = if cleanup_enabled {
+            created_session_ids_for_cleanup(&attempts)
+        } else {
+            Vec::new()
+        };
+        // Every root attempt owns an independent server session. Load each
+        // journal before deletion so retries are archived independently and a
+        // missing/corrupt capture leaves that exact session in place.
+        let mut cleanup_captures = BTreeMap::new();
+        if cleanup_enabled {
+            for session_id in &owned_session_ids {
+                if let Some(capture) = self
+                    .load_session_until_settled(session_id, settled_subsystem.as_deref())
+                    .await
+                {
+                    cleanup_captures.insert(session_id.clone(), capture);
+                }
+            }
+        }
+
         // Load session whenever a criterion needs durable evidence. Keeping
         // this decision beside the effective criteria prevents entry points
         // from accidentally running the health gate without its evidence.
-        let mut session = if self.session_mode.should_load(case)
-            || case.cleanup_memory_records
-            || requires_session_capture(&criteria)
+        let mut session = if cleanup_enabled {
+            outcome
+                .session_id
+                .as_deref()
+                .and_then(|session_id| cleanup_captures.get(session_id).cloned())
+        } else {
+            None
+        };
+        if session.is_none()
+            && (self.session_mode.should_load(case)
+                || case.cleanup_memory_records
+                || requires_session_capture(&criteria))
         {
-            if let Some(session_id) = outcome.session_id.as_deref() {
+            session = if let Some(session_id) = outcome.session_id.as_deref() {
                 self.load_session_until_settled(session_id, settled_subsystem.as_deref())
                     .await
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
+        }
         // Every executed invocation must identify itself. Never use
         // filter_map here: a missing root/step identity must not disappear
         // merely because another step returned a valid run_id.
@@ -1086,6 +1176,28 @@ impl<'a> SuiteRunner<'a> {
             self.cleanup_session_owned_memories(case, session.as_ref())
                 .await,
         );
+        if cleanup_enabled {
+            // Archive/capture evaluation has completed and `CaseRunReport`
+            // owns the parsed evidence before any exact root session is
+            // deleted. Follow-up identities are validated above but are never
+            // treated as independent ownership grants.
+            let (ready_ids, capture_errors) =
+                cleanup_ready_session_ids(&owned_session_ids, &cleanup_captures);
+            cleanup_errors.extend(capture_errors);
+            for session_id in ready_ids {
+                if let Err(error) = delete_server_session(
+                    &self.runner_cfg.astra_bin,
+                    self.runner_cfg.profile.as_deref(),
+                    &session_id,
+                )
+                .await
+                {
+                    cleanup_errors.push(format!(
+                        "[astra-test] created session cleanup failed for {session_id}: {error}"
+                    ));
+                }
+            }
+        }
         for error in &cleanup_errors {
             if !outcome.stderr.is_empty() {
                 outcome.stderr.push('\n');
@@ -1133,6 +1245,7 @@ impl<'a> SuiteRunner<'a> {
             steps: step_results,
             attempts,
             session,
+            session_captures: cleanup_captures.into_values().collect(),
             reproducer,
             digest,
             digest_error,
@@ -1317,6 +1430,7 @@ impl<'a> SuiteRunner<'a> {
             steps: Vec::new(),
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1361,6 +1475,7 @@ impl<'a> SuiteRunner<'a> {
             steps: Vec::new(),
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1415,6 +1530,7 @@ impl<'a> SuiteRunner<'a> {
             steps: Vec::new(),
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1529,6 +1645,87 @@ mod tests {
             render_ordered_judger_transcript(&outcome, &[first, second], &[]),
             "### Root attempt 0 assistant response\nabandoned attempt\n\n### Root attempt 1 assistant response\nfinal attempt"
         );
+    }
+
+    #[test]
+    fn cleanup_collects_every_harness_created_session_once() {
+        let first_id = "550e8400-e29b-41d4-a716-446655440000";
+        let second_id = "550e8400-e29b-41d4-a716-446655440001";
+        let third_id = "550e8400-e29b-41d4-a716-446655440002";
+        let attempts = vec![
+            AttemptRecord {
+                attempt_index: 0,
+                outcome: RunOutcome::new("m").with_session_id(second_id),
+            },
+            AttemptRecord {
+                attempt_index: 1,
+                outcome: RunOutcome::new("m").with_session_id(first_id),
+            },
+        ];
+        let steps = [StepResult {
+            step_index: 0,
+            prompt: "follow up".into(),
+            outcome: RunOutcome::new("m").with_session_id(third_id),
+            duration_ms: 0,
+            criteria: vec![],
+            passed: true,
+        }];
+
+        assert_eq!(
+            created_session_ids_for_cleanup(&attempts),
+            vec![first_id, second_id]
+        );
+        assert_eq!(steps[0].outcome.session_id.as_deref(), Some(third_id));
+
+        let captures = BTreeMap::from([
+            (
+                first_id.to_string(),
+                SessionCapture {
+                    session_id: first_id.into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                second_id.to_string(),
+                SessionCapture {
+                    session_id: second_id.into(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (ready, errors) =
+            cleanup_ready_session_ids(&[first_id.into(), second_id.into()], &captures);
+        assert_eq!(ready, vec![first_id, second_id]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn cleanup_requires_complete_capture_before_deletion() {
+        let session_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        let owned = vec![session_id.clone()];
+        let captures = BTreeMap::new();
+        let (ready, errors) = cleanup_ready_session_ids(&owned, &captures);
+        assert!(ready.is_empty());
+        assert_eq!(errors.len(), 1);
+
+        let mut incomplete = SessionCapture {
+            session_id: session_id.clone(),
+            ..Default::default()
+        };
+        incomplete.skipped_lines = 1;
+        let captures = BTreeMap::from([(session_id.clone(), incomplete)]);
+        let (ready, errors) = cleanup_ready_session_ids(&owned, &captures);
+        assert!(ready.is_empty());
+        assert_eq!(errors.len(), 1);
+
+        let complete = SessionCapture {
+            session_id: session_id.clone(),
+            ..Default::default()
+        };
+        let captures = BTreeMap::from([(session_id.clone(), complete)]);
+        let (ready, errors) = cleanup_ready_session_ids(&owned, &captures);
+        assert_eq!(ready, owned);
+        assert!(errors.is_empty());
     }
 
     #[test]

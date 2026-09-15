@@ -1606,20 +1606,67 @@ pub(crate) async fn post_agents_edge_register_handler(
         ));
     }
     let edge_id = edge_id_from_headers(&headers);
-    let rec = state
-        .execution
-        .edge_registry_service
-        .register_or_update(
-            &user.user_id,
-            &body.edge_agent_id,
-            &edge_id,
-            body.hostname.as_deref(),
-            body.worktree_path.as_deref(),
-            body.capabilities,
-            None, // workspace_id not available via REST callback path
-        )
-        .await
-        .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let rec = if body.materialization_id.is_some() {
+        let lease = state
+            .execution
+            .edge_registry_service
+            .register_or_update_with_lease_and_materialization(
+                &user.user_id,
+                &body.edge_agent_id,
+                &edge_id,
+                body.hostname.as_deref(),
+                body.worktree_path.as_deref(),
+                body.capabilities,
+                None, // workspace_id not available via REST callback path
+                body.materialization_id.as_deref(),
+            )
+            .await
+            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        let finalized = state
+            .execution
+            .edge_registry_service
+            .finalize_registration(&lease)
+            .await
+            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        if !finalized {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "edge registration was superseded before publication",
+            ));
+        }
+        // REST registration has no long-lived socket publication phase. Move
+        // the finalized generation into the published state before returning,
+        // otherwise native execution lookup correctly excludes the setup-only
+        // state even though the request supplied a valid materialization.
+        let released = state
+            .execution
+            .edge_registry_service
+            .release_registration(&lease)
+            .await
+            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        if lease.claim_id.is_some() && !released {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "edge registration was superseded before publication was released",
+            ));
+        }
+        lease.current
+    } else {
+        state
+            .execution
+            .edge_registry_service
+            .register_or_update(
+                &user.user_id,
+                &body.edge_agent_id,
+                &edge_id,
+                body.hostname.as_deref(),
+                body.worktree_path.as_deref(),
+                body.capabilities,
+                None, // workspace_id not available via REST callback path
+            )
+            .await
+            .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?
+    };
     Ok(Json(serde_json::json!({
         "ok": true,
         "registered": true,

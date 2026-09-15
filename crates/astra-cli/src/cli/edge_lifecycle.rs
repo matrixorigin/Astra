@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::cli::chat_stream::edge_executor_instance_id;
+use crate::cli::chat_stream::try_edge_executor_instance_id;
 use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::edge::edge_runtime_environment_capabilities;
 use astra_thin_client::{
@@ -257,9 +257,15 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
     if !edge_cloud_registry_enabled() {
         return Ok(());
     }
-    let transport_id = edge_executor_instance_id();
+    let transport_id = try_edge_executor_instance_id().map_err(ThinClientError::InvalidInput)?;
     let mut body = EdgeRegisterRequest::new(transport_id);
     enrich_register_body(&mut body);
+    if let Some(worktree_path) = body.worktree_path.as_deref() {
+        body.materialization_id = Some(
+            astra_runtime_env::load_or_create_materialization_id(Path::new(worktree_path))
+                .map_err(ThinClientError::InvalidInput)?,
+        );
+    }
     attach_runtime_environment_capabilities(&mut body);
     api.post_agents_edge_register(Some(token), Some(transport_id), &body)
         .await?;
@@ -273,7 +279,8 @@ async fn send_heartbeat(
     if !edge_cloud_registry_enabled() {
         return Ok(None);
     }
-    let id = edge_executor_instance_id();
+    let id = try_edge_executor_instance_id()
+        .map_err(|error| ThinClientError::InvalidInput(error.to_string()))?;
     let hb = EdgeHeartbeatRequest {
         edge_agent_id: id.to_string(),
         pending_request_count: edge_lifecycle().pending_tool_request_count(),

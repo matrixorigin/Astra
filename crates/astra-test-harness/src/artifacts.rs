@@ -82,6 +82,7 @@ mod tests {
             steps: vec![],
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,

@@ -3700,6 +3700,7 @@ mod tests {
             edge_agent_id: "agent-logical".into(),
             hostname: Some("host-a".into()),
             worktree_path: Some("/workspace/app".into()),
+            materialization_id: None,
             capabilities: Some(crate::edge::edge_runtime_environment_capabilities(
                 "agent-logical",
                 "/workspace/app",

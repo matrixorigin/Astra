@@ -91,6 +91,11 @@ pub struct CaseRunReport {
     /// `debug_log: true` on the case or `--capture-session` on the CLI.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session: Option<SessionCapture>,
+    /// Complete journal captures for every root attempt owned by this run.
+    /// This archive survives destructive session cleanup, including retries
+    /// that received a different server session identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_captures: Vec<SessionCapture>,
     /// Shell command a developer can paste to re-run the case in a
     /// terminal. Surfaced in text reports after FAIL so debugging is
     /// a copy-paste away. `None` in unit tests with fake executors.
@@ -885,6 +890,7 @@ mod tests {
                 steps: vec![],
                 attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -932,11 +938,31 @@ mod tests {
 
     #[test]
     fn json_report_roundtrips() {
-        let r = mk_report_passed();
+        let mut r = mk_report_passed();
+        r.runs[0].session_captures = vec![
+            SessionCapture {
+                session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                ..Default::default()
+            },
+            SessionCapture {
+                session_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+                ..Default::default()
+            },
+        ];
         let out = render(&r, Format::Json, false);
         let parsed: SuiteReport = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed.total(), 1);
         assert_eq!(parsed.passed(), 1);
+        let captures = &parsed.runs[0].session_captures;
+        assert_eq!(captures.len(), 2);
+        assert_eq!(
+            captures[0].session_id,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            captures[1].session_id,
+            "550e8400-e29b-41d4-a716-446655440001"
+        );
     }
 
     #[test]
@@ -1196,6 +1222,7 @@ mod tests {
             steps: vec![],
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1318,6 +1345,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1357,6 +1385,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1402,6 +1431,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1444,6 +1474,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1479,6 +1510,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1513,6 +1545,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1552,6 +1585,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1629,6 +1663,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            session_captures: Vec::new(),
             reproducer: None,
             digest: None,
             digest_error: None,

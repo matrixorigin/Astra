@@ -468,6 +468,11 @@ pub struct EdgeRegisterRequest {
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// Stable identity of the physical checkout advertised by this executor.
+    /// REST registrations carry the same identity as the Edge WebSocket path
+    /// so durable execution selection can never rely on an ephemeral process id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Value>,
 }
@@ -478,6 +483,7 @@ impl EdgeRegisterRequest {
             edge_agent_id: edge_agent_id.into(),
             hostname: None,
             worktree_path: None,
+            materialization_id: None,
             capabilities: None,
         }
     }
