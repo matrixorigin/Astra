@@ -39,6 +39,7 @@
 //! without building from the `astra-test` binary.
 
 pub mod artifacts;
+pub mod benchmark;
 pub mod capability_coverage;
 pub mod case;
 pub mod classify;
