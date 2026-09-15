@@ -1372,10 +1372,10 @@ fn recommendation_text(
             "Validation retry churn persisted. Do not rerun equivalent checks; use authoritative CI/artifacts or fix the prerequisite, and state the resulting confidence boundary."
         }
         (RuntimePolicyRecommendation::SynthesizeAndDecide, RuntimePolicyStage::Observe) => {
-            "Low-yield rounds detected. Name the leading hypothesis and one falsifier internally, reuse the evidence already collected, then take a decisive action that closes a still-unmet user predicate. For an authorized change, make the needed mutation before running the complete unmodified project acceptance harness from a fresh process. Do not repeat equivalent probes or narrate the plan back to the user."
+            "Low-yield rounds detected. Summarize the evidence already collected, name the remaining uncertainty, and choose the next action that will resolve it. Reuse known observations and batch independent checks; continue exploring when the evidence is still insufficient. Do not repeat equivalent probes or narrate the plan."
         }
         (RuntimePolicyRecommendation::SynthesizeAndDecide, RuntimePolicyStage::Converge) => {
-            "Low-yield work persisted after prior feedback. Stop new exploration and stop restating the plan. Use the evidence now: complete the remaining authorized mutation, run the complete unmodified acceptance harness after the final mutation, or answer with the exact unresolved boundary. Any further tool call must directly close a named user predicate and must not repeat an existing probe."
+            "Low-yield work persisted after prior feedback. Reassess the remaining uncertainty from the evidence already collected, then choose one decisive check, authorized action, or honest unresolved result. Continue only when the next step can resolve uncertainty or advance the requested result; avoid repeating equivalent probes or restating the plan."
         }
     }
 }
@@ -3428,26 +3428,40 @@ mod tests {
             RuntimePolicyRecommendation::SynthesizeAndDecide,
             RuntimePolicyStage::Observe,
         );
-        assert!(synthesis.contains("leading hypothesis"));
-        assert!(synthesis.contains("one falsifier"));
-        assert!(synthesis.contains("still-unmet user predicate"));
-        assert!(synthesis.contains("complete unmodified project acceptance harness"));
-        assert!(synthesis.contains("authorized change"));
+        assert!(synthesis.contains("evidence already collected"));
+        assert!(synthesis.contains("remaining uncertainty"));
+        assert!(synthesis.contains("continue exploring"));
+        assert!(synthesis.contains("batch independent checks"));
         assert!(synthesis.contains("Do not repeat equivalent probes"));
         assert!(synthesis.contains("narrate the plan"));
+        for scene_specific in ["acceptance harness", "user predicate", "authorized change"] {
+            assert!(
+                !synthesis.to_ascii_lowercase().contains(scene_specific),
+                "advisory must remain task-agnostic: {synthesis}"
+            );
+        }
         assert!(synthesis.len() <= 500, "dynamic advisory must stay compact");
 
         let converge = recommendation_text(
             RuntimePolicyRecommendation::SynthesizeAndDecide,
             RuntimePolicyStage::Converge,
         );
-        assert!(converge.contains("Stop new exploration"));
-        assert!(converge.contains("stop restating the plan"));
-        assert!(converge.contains("remaining authorized mutation"));
-        assert!(converge.contains("after the final mutation"));
-        assert!(converge.contains("complete unmodified acceptance harness"));
-        assert!(converge.contains("exact unresolved boundary"));
-        assert!(converge.contains("directly close a named user predicate"));
+        assert!(converge.contains("remaining uncertainty"));
+        assert!(converge.contains("decisive check"));
+        assert!(converge.contains("authorized action"));
+        assert!(converge.contains("honest unresolved result"));
+        assert!(converge.contains("resolve uncertainty or advance the requested result"));
+        assert!(converge.contains("avoid repeating equivalent probes"));
+        for scene_specific in [
+            "acceptance harness",
+            "user predicate",
+            "remaining authorized mutation",
+        ] {
+            assert!(
+                !converge.to_ascii_lowercase().contains(scene_specific),
+                "advisory must remain task-agnostic: {converge}"
+            );
+        }
         assert!(converge.len() <= 500, "dynamic advisory must stay compact");
 
         let outcomes = recommendation_text(

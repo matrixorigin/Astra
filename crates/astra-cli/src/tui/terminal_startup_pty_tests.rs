@@ -170,7 +170,7 @@ fn probe_child() {
     }
     let events = runtime.block_on(async {
         use tokio_stream::StreamExt;
-        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut stream = crate::tui::event::TuiEventStream::new(rx);
         let mut events = Vec::new();
         while events.len() < expected_events(&case).len() {
