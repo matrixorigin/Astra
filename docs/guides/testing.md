@@ -188,6 +188,50 @@ EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 
+### Durable Work mixed pressure
+
+The public Work pressure probe validates the durable read/write boundary with
+multiple authenticated owners and multiple Work-shaped sessions per owner. It
+creates one bounded Work per session, opens two independent read attachments,
+then mixes catalog, Work, branch, event, transcript and Task Graph reads with
+owner-scoped attachment open/close and `read-cursor` writes. Each active writer
+must advance its attachment epoch and close the temporary attachment while
+the same Work is being read. A repeated Work creation request is used as a
+lost-response/idempotency check, and a foreign owner must receive typed 404
+responses without the source Work identity being echoed.
+
+The probe uses no model or provider calls. It therefore measures public HTTP
+protocol behavior and database-backed durability, not agent quality, provider
+admission, TUI/Web rendering, automatic Edge takeover, or Run-owner recovery.
+Rows examined are deployment-specific; the report says when that
+instrumentation is unavailable instead of inferring a database bound from page
+size alone.
+
+Use a disposable MatrixOne database and either one token per owner or the
+explicit registration path. The registration path writes only its summary and
+does not persist tokens:
+
+```bash
+python3 scripts/load/durable_work_pressure_probe.py \
+  --profile smoke --register-users \
+  --output-dir tmp/durable-work-pressure/smoke
+
+python3 scripts/load/durable_work_pressure_probe.py \
+  --profile pressure --token-file /absolute/path/to/owner-tokens.json \
+  --output-dir tmp/durable-work-pressure/pressure
+```
+
+If `/metrics` is protected, provide its separate credential through
+`ASTRA_METRICS_AUTH_TOKEN`; owner tokens are never reused for metrics.
+
+`smoke` defaults to 3 owners × 2 sessions for 10 seconds. `pressure` defaults
+to 25 owners × 4 sessions for 60 seconds. Override duration and rates only when
+the deployment has an explicit capacity budget. A nonzero exit status means a
+contract invariant failed; inspect `summary.json` for per-operation p50/p95/p99,
+sample and failure counts, response sizes, foreign-access results, and
+available Prometheus counter deltas. The fixed slow session is a scheduling
+pressure signal, not a claim that a provider was deliberately stalled.
+
 ### Optional thinking-protocol compatibility checks
 
 Offline checks require no credentials:
