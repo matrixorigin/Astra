@@ -91,6 +91,11 @@ pub struct CaseRunReport {
     /// `debug_log: true` on the case or `--capture-session` on the CLI.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session: Option<SessionCapture>,
+    /// Typed execution attribution derived from the captured journal. This
+    /// stays optional because cases without durable capture cannot certify
+    /// these counters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub execution: Option<crate::pipeline_analysis::ExecutionTraceReport>,
     /// Shell command a developer can paste to re-run the case in a
     /// terminal. Surfaced in text reports after FAIL so debugging is
     /// a copy-paste away. `None` in unit tests with fake executors.
@@ -424,6 +429,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 cap.tools_invoked()
             ));
             let health = crate::pipeline_analysis::analyze_pipeline_health(cap);
+            let execution = run.execution.as_ref().unwrap_or(&health.execution);
             if health.turns_with_feedback > 0 {
                 if let Some(stable_prefix_coverage) = health.stable_prefix_cache_coverage {
                     s.push_str(&format!(
@@ -451,31 +457,31 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     ));
                 }
             }
-            if health.execution.total_tool_calls > 0 || !health.execution.evidence_complete {
-                if !health.execution.evidence_complete {
+            if execution.total_tool_calls > 0 || !execution.evidence_complete {
+                if !execution.evidence_complete {
                     s.push_str(&format!(
                         "    execution: evidence=incomplete lower_bound=true skipped_lines={} dropped_lines={} integrity_errors={}\n",
-                        health.execution.skipped_lines,
-                        health.execution.dropped_lines,
-                        health.execution.integrity_errors,
+                        execution.skipped_lines,
+                        execution.dropped_lines,
+                        execution.integrity_errors,
                     ));
                 }
                 s.push_str(&format!(
                     "    execution: tools={} success={} failed={} unknown={}\n",
-                    health.execution.total_tool_calls,
-                    health.execution.successful_tool_calls,
-                    health.execution.failed_tool_calls,
-                    health.execution.unknown_outcome_tool_calls,
+                    execution.total_tool_calls,
+                    execution.successful_tool_calls,
+                    execution.failed_tool_calls,
+                    execution.unknown_outcome_tool_calls,
                 ));
-                if health.execution.settlement_attempts > 0 {
+                if execution.settlement_attempts > 0 {
                     s.push_str(&format!(
                         "    execution: settlements={} success={} rejected={}\n",
-                        health.execution.settlement_attempts,
-                        health.execution.successful_settlements,
-                        health.execution.rejected_settlements,
+                        execution.settlement_attempts,
+                        execution.successful_settlements,
+                        execution.rejected_settlements,
                     ));
                 }
-                for (reason, count) in &health.execution.runtime_rejection_reasons {
+                for (reason, count) in &execution.runtime_rejection_reasons {
                     s.push_str(&format!(
                         "    execution: runtime_rejections={} × {}\n",
                         count, reason
@@ -916,6 +922,7 @@ mod tests {
                 steps: vec![],
                 attempts: Vec::new(),
                 session: None,
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -968,6 +975,31 @@ mod tests {
         let parsed: SuiteReport = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed.total(), 1);
         assert_eq!(parsed.passed(), 1);
+    }
+
+    #[test]
+    fn json_report_includes_execution_attribution_when_captured() {
+        let mut report = mk_report_passed();
+        report.runs[0].execution = Some(crate::pipeline_analysis::ExecutionTraceReport {
+            total_tool_calls: 3,
+            successful_tool_calls: 2,
+            failed_tool_calls: 1,
+            settlement_attempts: 2,
+            successful_settlements: 1,
+            rejected_settlements: 1,
+            runtime_rejection_reasons: [("work_settlement_evidence_required".into(), 1)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&report, Format::Json, false)).unwrap();
+        assert_eq!(json["runs"][0]["execution"]["total_tool_calls"], 3);
+        assert_eq!(
+            json["runs"][0]["execution"]["runtime_rejection_reasons"]["work_settlement_evidence_required"],
+            1
+        );
     }
 
     #[test]
@@ -1227,6 +1259,7 @@ mod tests {
             steps: vec![],
             attempts: Vec::new(),
             session: None,
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1349,6 +1382,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1388,6 +1422,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1433,6 +1468,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1475,6 +1511,7 @@ mod tests {
                 has_warnings: false,
                 attempts: Vec::new(),
                 session: None,
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -1510,6 +1547,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1544,6 +1582,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1583,6 +1622,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1660,6 +1700,7 @@ mod tests {
             has_warnings: false,
             attempts: Vec::new(),
             session: None,
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
