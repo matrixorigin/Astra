@@ -1896,6 +1896,11 @@ async fn validate_execution_binding_generation_in_tx(
             crate::SessionContextCoordinatorError::ExecutionBindingBusy => {
                 ToolInvocationLedgerStoreError::ExecutionBindingBusy
             }
+            crate::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. } => {
+                ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
+                    "execution workspace claim changed owner during tool dispatch".to_string(),
+                )
+            }
             other => ToolInvocationLedgerStoreError::ExecutionBindingInvalid(other.to_string()),
         })?;
     Ok(())

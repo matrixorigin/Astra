@@ -155,6 +155,27 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
+/// Return identities carried by a host response only when both values are
+/// non-empty.  Remote-admission clients use this as their sole durable
+/// identity source; their local `AgenticLoopState.current_run_id` is only a
+/// correlation label until this response arrives.
+pub(crate) fn context_manifest_identity_from_result(
+    result: Option<&HostTurnResult>,
+) -> Option<(String, String)> {
+    let result = result?;
+    let session_id = result
+        .accum
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())?;
+    let run_id = result
+        .accum
+        .run_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())?;
+    Some((session_id.to_string(), run_id.to_string()))
+}
+
 /// Provenance of a host-owned control-plane result crossing the shared loop.
 ///
 /// Result shape is not evidence that a provider call did or did not happen:
@@ -709,6 +730,24 @@ pub trait AgenticLoopHost: Send {
         _state: &AgenticLoopState,
         _outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
+    }
+
+    /// Whether the host rejected the request before a durable Run was
+    /// admitted.  Pre-admission failures must discard in-memory turn-event
+    /// buffers instead of persisting a synthetic interrupted turn.
+    fn is_pre_admission_rejection(&self) -> bool {
+        false
+    }
+
+    /// Resolve the identity that may own a context manifest for this host's
+    /// attempt. Remote clients must wait for the response pair above; a
+    /// server host may override this with its already-admitted state identity.
+    fn context_manifest_identity(
+        &self,
+        _state: &AgenticLoopState,
+        result: Option<&HostTurnResult>,
+    ) -> Option<(String, String)> {
+        context_manifest_identity_from_result(result)
     }
 
     /// Whether the host measures the provider boundary more precisely than

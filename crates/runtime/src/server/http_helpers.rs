@@ -56,6 +56,19 @@ pub(crate) fn sse_stream_response(status: StatusCode, body: Body) -> Response {
         .expect("static SSE response headers are valid")
 }
 
+fn sse_error_kind(status: StatusCode, _domain_code: Option<&str>) -> astra_core::ErrorKind {
+    // The HTTP status is the only stable classifier at this boundary.  Domain
+    // codes are descriptive and may contain words such as "authority" or
+    // "token" that do not mean authentication or rate limiting.
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => astra_core::ErrorKind::Auth,
+        StatusCode::TOO_MANY_REQUESTS => astra_core::ErrorKind::RateLimit,
+        status if status.is_client_error() => astra_core::ErrorKind::InvalidRequest,
+        status if status.is_server_error() => astra_core::ErrorKind::ServerError,
+        _ => astra_core::ErrorKind::Unknown,
+    }
+}
+
 fn with_interaction_protocol(mut response: Response) -> Response {
     response.headers_mut().insert(
         axum::http::HeaderName::from_static(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER),
@@ -106,6 +119,7 @@ pub(super) fn sse_error_response_with_retryable_and_context(
         "message": message,
         "code": status_to_chat_sse_error_code(status),
         "retryable": retryable,
+        "error_kind": sse_error_kind(status, None).as_str(),
     });
     if let Some(object) = event.as_object_mut() {
         for (field, value) in [
@@ -162,6 +176,17 @@ pub(super) fn sse_error_response_from_error_with_context(
         "code": status_to_chat_sse_error_code(status),
         "retryable": status_to_sse_retryable(status),
     });
+    // Every structured HTTP failure crossing the SSE boundary carries the
+    // same stable classifier as the JSON API. In particular, a 409 admission
+    // rejection is a user-actionable request conflict, never an "unknown"
+    // provider failure in the CLI.
+    if let Some(obj) = event.as_object_mut() {
+        let kind = sse_error_kind(status, error.error_code.as_deref());
+        obj.insert(
+            "error_kind".to_string(),
+            serde_json::Value::String(kind.as_str().to_string()),
+        );
+    }
     if let Some(error_code) = error.error_code
         && let Some(obj) = event.as_object_mut()
     {
@@ -694,6 +719,40 @@ mod tests {
         assert!(!status_to_sse_retryable(StatusCode::UNPROCESSABLE_ENTITY));
     }
 
+    #[test]
+    fn sse_error_kind_uses_http_status_not_domain_code_substrings() {
+        assert_eq!(
+            sse_error_kind(
+                StatusCode::UNAUTHORIZED,
+                Some("conversation_authority_fenced")
+            ),
+            astra_core::ErrorKind::Auth
+        );
+        assert_eq!(
+            sse_error_kind(StatusCode::FORBIDDEN, Some("token_budget_exceeded")),
+            astra_core::ErrorKind::Auth
+        );
+        assert_eq!(
+            sse_error_kind(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("session_authority_unavailable")
+            ),
+            astra_core::ErrorKind::RateLimit
+        );
+        for code in [
+            "conversation_authority_fenced",
+            "conversation_authority_run_conflict",
+            "session_authority_unavailable",
+            "token_budget_exceeded",
+        ] {
+            assert_eq!(
+                sse_error_kind(StatusCode::CONFLICT, Some(code)),
+                astra_core::ErrorKind::InvalidRequest,
+                "domain code {code} must not be mistaken for authentication"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sse_error_response_from_error_preserves_machine_fields() {
         let error = ErrorResponse::new("stale")
@@ -717,6 +776,7 @@ mod tests {
         assert_eq!(event["type"], "error");
         assert_eq!(event["message"], "stale");
         assert_eq!(event["error_code"], "session_turn_mismatch");
+        assert_eq!(event["error_kind"], "invalid_request");
         assert_eq!(event["request_id"], "req-1");
         assert_eq!(event["metadata"]["expected_session_turn"], 2);
     }

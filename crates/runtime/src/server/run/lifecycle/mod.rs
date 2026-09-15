@@ -5578,10 +5578,33 @@ impl AgenticRunLifecycleService {
                                 | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_)
                                 | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
                         ) {
-                            return Err(error_response_coded(
+                            return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
                                 "Work execution selection changed before this turn was admitted; refresh and retry",
                                 "session_execution_binding_fenced",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "retry_session",
+                                }),
+                            ));
+                        }
+                        if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                            owner_session_id,
+                            owner_branch_id,
+                        } = error
+                        {
+                            return Err(error_response_coded_with_metadata(
+                                StatusCode::CONFLICT,
+                                format!(
+                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
+                                ),
+                                "execution_workspace_claimed",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "resume_session",
+                                    "owner_session_id": owner_session_id,
+                                    "owner_branch_id": owner_branch_id,
+                                }),
                             ));
                         }
                         return Err(error_response_coded(
@@ -5662,10 +5685,33 @@ impl AgenticRunLifecycleService {
                                 | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_)
                                 | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
                         ) {
-                            return Err(error_response_coded(
+                            return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
                                 "Work execution selection changed before this turn was admitted; refresh and retry",
                                 "session_execution_binding_fenced",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "retry_session",
+                                }),
+                            ));
+                        }
+                        if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                            owner_session_id,
+                            owner_branch_id,
+                        } = error
+                        {
+                            return Err(error_response_coded_with_metadata(
+                                StatusCode::CONFLICT,
+                                format!(
+                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
+                                ),
+                                "execution_workspace_claimed",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "resume_session",
+                                    "owner_session_id": owner_session_id,
+                                    "owner_branch_id": owner_branch_id,
+                                }),
                             ));
                         }
                         return Err(error_response_coded(
@@ -9353,6 +9399,13 @@ impl AgenticRunLifecycleService {
                 .await
                 .map_err(|error| {
                     let (status, code, detail) = match &error {
+                    astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                        ..
+                    } => (
+                        StatusCode::CONFLICT,
+                        "execution_workspace_claimed",
+                        "This checkout is already attached to another Session; resume that Session or use a separate worktree",
+                    ),
                     astra_services::SessionContextCoordinatorError::ExecutionBindingBusy => (
                         StatusCode::CONFLICT,
                         "execution_binding_busy",
@@ -9383,6 +9436,36 @@ impl AgenticRunLifecycleService {
                         error = %error,
                         "failed to resolve durable Work execution selection"
                     );
+                    if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                        owner_session_id,
+                        owner_branch_id,
+                    } = error
+                    {
+                        return error_response_coded_with_metadata(
+                            status,
+                            format!(
+                                "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
+                            ),
+                            code,
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "resume_session",
+                                "owner_session_id": owner_session_id,
+                                "owner_branch_id": owner_branch_id,
+                            }),
+                        );
+                    }
+                    if code == "execution_binding_busy" {
+                        return error_response_coded_with_metadata(
+                            status,
+                            detail,
+                            code,
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "retry_session",
+                            }),
+                        );
+                    }
                     error_response_coded(status, detail, code)
                 })?
         };

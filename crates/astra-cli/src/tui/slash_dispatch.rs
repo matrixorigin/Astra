@@ -2859,6 +2859,7 @@ fn fmt_tokens(n: u64) -> String {
 #[derive(Clone)]
 pub(crate) struct SessionHubSnapshot {
     pub(crate) session_id: String,
+    pending_recovery: Option<String>,
     turn: u32,
     model: String,
     total_cost: f64,
@@ -2888,6 +2889,7 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         .unwrap_or_else(|_| "?".into());
     SessionHubSnapshot {
         session_id: state.session_id.clone().unwrap_or_default(),
+        pending_recovery: state.pending_recovery.clone(),
         turn: state.turn,
         model: state.model.clone().unwrap_or_else(|| "—".into()),
         total_cost: state.total_session_cost,
@@ -2983,6 +2985,21 @@ pub(crate) fn session_hub_view(
         ));
     } else {
         pairs.push(("cwd", snapshot.cwd_fallback.clone()));
+    }
+    if let Some(owner) = snapshot
+        .pending_recovery
+        .as_deref()
+        .filter(|owner| !owner.is_empty() && Some(*owner) != Some(snapshot.session_id.as_str()))
+    {
+        if snapshot.session_id.is_empty() {
+            pairs.push(("recovery", format!("available via /resume {owner}")));
+        } else {
+            pairs.push((
+                "execution",
+                format!("not admitted · checkout belongs to Session {owner}"),
+            ));
+            pairs.push(("next", format!("/resume {owner}")));
+        }
     }
     if let Some(error) =
         session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())

@@ -1,8 +1,6 @@
 use crate::cli::{
     chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
-    cli_config::cli_utils::{
-        map_thin_err, persist_profile_last_session_or_warn, prefix_chars, urlencoding,
-    },
+    cli_config::cli_utils::{map_thin_err, prefix_chars, urlencoding},
     permission_manager::PermissionManager,
     session::session_state::{ContinuationAnchor, ExplainMode, SessionState},
     theme,
@@ -413,12 +411,12 @@ fn append_history_edit_rollback_error(
     }
 }
 
-/// Create and bind a fresh server session without owning any presentation.
-/// Both the text CLI and TUI call this transaction; each surface renders its
-/// own acknowledgement after the authoritative `SessionState` rebind lands.
+/// Create a fresh server session without publishing it as the profile's
+/// resumable session yet. The identity is provisional until its first turn is
+/// durably admitted; this prevents an admission failure from making an empty
+/// draft the next process's implicit recovery target.
 async fn create_server_session_identity(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
     token: &str,
 ) -> Result<String, String> {
     let body = api
@@ -434,11 +432,6 @@ async fn create_server_session_identity(
         .ok_or_else(|| "session service returned no session identity".to_string())?
         .to_string();
 
-    persist_profile_last_session_or_warn(
-        profile,
-        &session_id,
-        "slash_state:clear_starts_fresh_session",
-    );
     Ok(session_id)
 }
 
@@ -451,7 +444,7 @@ async fn create_server_session_identity(
 /// transitions continue to go through [`start_fresh_session`].
 pub(crate) async fn bind_initial_session(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    _profile: Option<&str>,
     token: &str,
     state: &mut SessionState,
 ) -> Result<String, String> {
@@ -462,7 +455,7 @@ pub(crate) async fn bind_initial_session(
     {
         return Err("initial session identity requires a pristine sessionless runtime".to_string());
     }
-    let session_id = create_server_session_identity(api, profile, token).await?;
+    let session_id = create_server_session_identity(api, token).await?;
     state.set_session_id(session_id.clone());
     crate::cli::session::session_startup::initialize_journal_pub(state, &session_id);
     Ok(session_id)
@@ -470,11 +463,11 @@ pub(crate) async fn bind_initial_session(
 
 pub(crate) async fn start_fresh_session(
     api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    _profile: Option<&str>,
     token: &str,
     state: &mut SessionState,
 ) -> Result<String, String> {
-    let session_id = create_server_session_identity(api, profile, token).await?;
+    let session_id = create_server_session_identity(api, token).await?;
     state.prepare_for_session_rebind().await;
     state.reset_for_new_session();
     state.set_session_id(session_id.clone());

@@ -570,7 +570,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Registry cleanup is handled by HarnessSlot::Drop (single ownership).
 
     // On error, best-effort flush turn observability events.
-    if result.is_err() {
+    if result.is_err() && !host.is_pre_admission_rejection() {
         if let Some(sid) = state.current_session_id.as_deref() {
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
@@ -588,10 +588,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
         }
+    } else if host.is_pre_admission_rejection() {
+        // The runtime may have opened a local turn-event buffer before the
+        // Server rejected admission.  Those lifecycle observations are not a
+        // durable turn and must not become an interrupted StepStarted record.
+        let _ = state.turn_event_buffer.take();
+        state.step_recorder.discard_uncommitted();
+        state.interruption = None;
     }
 
     // Emit structured interruption to journal if one was recorded.
-    if let Some(ref interruption) = state.interruption {
+    if !host.is_pre_admission_rejection()
+        && let Some(ref interruption) = state.interruption
+    {
         if let Some(ref sid) = state.current_session_id {
             // `JournalWriter::append` auto-prepends `SessionStart` under
             // the same file lock; the eager `ensure_session_start_event`

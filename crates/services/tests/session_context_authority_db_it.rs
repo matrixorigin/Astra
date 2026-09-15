@@ -730,7 +730,10 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         coordinator
             .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
             .await,
-        Err(SessionContextCoordinatorError::ExecutionBindingBusy)
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            ref owner_session_id,
+            ref owner_branch_id,
+        }) if owner_session_id == &key.session_id && owner_branch_id == &key.branch_id
     ));
 
     for table in [
@@ -854,7 +857,10 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .expect_err("a second Session must not share one physical checkout");
     assert!(matches!(
         error,
-        SessionContextCoordinatorError::ExecutionBindingBusy
+        SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            ref owner_session_id,
+            ref owner_branch_id,
+        } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
     ));
     let ordinary_after = coordinator
         .load_execution_binding(&ordinary_key)

@@ -48,7 +48,7 @@ use agentic_sse_loop::{
     resolved_tool_metrics,
 };
 use serde_json::{Value, json};
-use server_admission_host::CliServerAdmissionHost;
+use server_admission_host::{CliServerAdmissionHost, is_pre_admission_rejection};
 
 fn non_tty_output_failure(
     is_terminal: bool,
@@ -178,11 +178,7 @@ fn step_recorder_for_cli_turn(
     session_id: Option<&str>,
     run_id: &str,
 ) -> StepRecorder {
-    if let Some(session_id) = session_id {
-        StepRecorder::with_persistence_for_run(user_id, session_id, run_id, run_id)
-    } else {
-        StepRecorder::with_deferred_persistence_for_run(user_id, "ephemeral", run_id, run_id)
-    }
+    StepRecorder::with_deferred_persistence(user_id, session_id.unwrap_or("ephemeral"), run_id)
 }
 
 async fn refresh_root_permission_context(
@@ -751,6 +747,8 @@ pub(crate) async fn stream_chat_sse(
         remote_cancel_required: false,
         remote_cancel_run_id: None,
         last_physical_run_id: None,
+        last_error_code: None,
+        last_error_metadata: None,
         output_transport_failure: None,
     };
 
@@ -1216,7 +1214,19 @@ pub(crate) async fn stream_chat_sse(
                     )
                     .collect(),
                 session_id: state.current_session_id.clone(),
-                run_id: state.current_run_id.clone(),
+                // `AgenticLoopState.current_run_id` is a local turn-chain
+                // correlation id created before the HTTP request. It is not
+                // evidence that the server admitted a durable Run. Only the
+                // immutable physical owner observed in the SSE bootstrap may
+                // cross the settlement boundary.
+                run_id: host.last_physical_run_id.clone(),
+                error_code: host.last_error_code.clone(),
+                error_metadata: host.last_error_metadata.clone(),
+                admission_rejected: is_pre_admission_rejection(
+                    host.last_error_code.as_deref(),
+                    host.last_error_metadata.as_ref(),
+                    host.last_physical_run_id.as_deref(),
+                ),
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
                 run_transcript_messages: state.take_run_transcript_capture(),

@@ -61,6 +61,14 @@ pub(crate) struct PartialTurnData {
     pub applied_user_intents: Vec<AppliedStreamUserIntent>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Stable server classification for a stream failure.  A rejected
+    /// admission may carry this without having created a durable Run.
+    pub error_code: Option<String>,
+    pub error_metadata: Option<serde_json::Value>,
+    /// The server rejected the request before durable Run admission. Such a
+    /// request is not a failed turn and must not be reconciled or journaled as
+    /// one.
+    pub admission_rejected: bool,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.

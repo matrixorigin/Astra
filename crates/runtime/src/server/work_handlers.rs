@@ -4020,6 +4020,7 @@ fn map_execution_switch_error(
         ),
         astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
+        | astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_) => {
             work_error(
                 StatusCode::CONFLICT,

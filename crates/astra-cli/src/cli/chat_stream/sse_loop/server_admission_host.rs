@@ -398,10 +398,28 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Latest immutable physical SSE owner, retained through the runtime's
     /// later final-output hook where the full AgenticLoopState is unavailable.
     pub last_physical_run_id: Option<String>,
+    /// Structured admission failure metadata retained after the accumulator is
+    /// moved into the shared loop.  These facts drive user-facing recovery and
+    /// must not be reconstructed from the rendered error string.
+    pub last_error_code: Option<String>,
+    pub last_error_metadata: Option<Value>,
     /// Public stdout transport failure that stopped this host. Kept typed so
     /// the outer CLI can settle the durable run before choosing exit 141.
     pub output_transport_failure:
         Option<crate::cli::stream::streaming_types::OutputTransportFailure>,
+}
+
+pub(crate) fn is_pre_admission_rejection(
+    error_code: Option<&str>,
+    error_metadata: Option<&Value>,
+    physical_run_id: Option<&str>,
+) -> bool {
+    error_code.is_some()
+        && physical_run_id.is_none_or(|run_id| run_id.trim().is_empty())
+        && error_metadata
+            .and_then(|metadata| metadata.get("admission_state"))
+            .and_then(Value::as_str)
+            == Some("rejected")
 }
 
 impl CliServerAdmissionHost<'_> {
@@ -971,6 +989,14 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliServerAdmissionHost<'_> {
+    fn is_pre_admission_rejection(&self) -> bool {
+        is_pre_admission_rejection(
+            self.last_error_code.as_deref(),
+            self.last_error_metadata.as_ref(),
+            self.last_physical_run_id.as_deref(),
+        )
+    }
+
     fn continuation_authority(&self, result: &HostTurnResult) -> ContinuationAuthority {
         if result.accum.server_loop_terminal {
             ContinuationAuthority::RemoteServer
@@ -1286,6 +1312,23 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
 
         let turn_result = turn_result?;
 
+        // Step events are collected before the HTTP admission response so the
+        // live projection can render preparation phases.  Persist them only
+        // after both identities come from the server; the locally generated
+        // parent turn id is a correlation label, never durable run identity.
+        if let (Some(session_id), Some(run_id)) = (
+            turn_result
+                .core
+                .session_id
+                .as_deref()
+                .or(state.current_session_id.as_deref()),
+            turn_result.core.run_id.as_deref(),
+        ) {
+            state
+                .step_recorder
+                .bind_authoritative_run(session_id, run_id);
+        }
+
         // A saturated interactive projection may have retained terminal
         // Explain Analyze facts, a publication, and the answer suffix outside
         // the normal stream queue. Reattach them to the outer host before
@@ -1462,6 +1505,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
 
         self.last_physical_run_id = turn_result.core.run_id.clone();
+        self.last_error_code = turn_result.core.error_code.clone();
+        self.last_error_metadata = turn_result.core.error_metadata.clone();
         if self.output_transport_failure.is_none()
             && !turn_result.callback_delivery_failed
             && let Some(output_failure) = turn_result.output_transport_failure
@@ -2237,11 +2282,11 @@ mod tests {
         SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, accumulated_control_duration_ms,
         authoritative_provider_surface_report, derive_turn_interaction_mode,
         emit_final_output_ready, emit_ordered_control_event_with_backpressure,
-        permission_mode_change_audit_event, plan_mode_restriction_names,
-        reconcile_terminal_stream_projection, record_remote_applied_user_intents,
-        recovered_agent_fanout_completion_event, request_allowlist_restriction_names,
-        retain_ordered_stream_event_in_queue, stream_event_requires_ordered_delivery,
-        user_intent_stream_event,
+        is_pre_admission_rejection, permission_mode_change_audit_event,
+        plan_mode_restriction_names, reconcile_terminal_stream_projection,
+        record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
+        request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
+        stream_event_requires_ordered_delivery, user_intent_stream_event,
     };
 
     #[test]
@@ -2269,6 +2314,74 @@ mod tests {
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn mixed_workspace_claim_frame_with_physical_run_is_not_pre_admission() {
+        let metadata = json!({"admission_state": "rejected"});
+        assert!(is_pre_admission_rejection(
+            Some("execution_workspace_claimed"),
+            Some(&metadata),
+            None,
+        ));
+        assert!(!is_pre_admission_rejection(
+            Some("execution_workspace_claimed"),
+            Some(&metadata),
+            Some("run-admitted"),
+        ));
+        assert!(is_pre_admission_rejection(
+            Some("conversation_authority_fenced"),
+            Some(&metadata),
+            None,
+        ));
+    }
+
+    #[test]
+    fn typed_binding_busy_frame_is_pre_admission_without_a_physical_run() {
+        let metadata = json!({
+            "admission_state": "rejected",
+            "recovery_action": "retry_session",
+        });
+        assert!(is_pre_admission_rejection(
+            Some("execution_binding_busy"),
+            Some(&metadata),
+            None,
+        ));
+        assert!(!is_pre_admission_rejection(
+            Some("execution_binding_busy"),
+            Some(&metadata),
+            Some("run-admitted"),
+        ));
+        assert!(!is_pre_admission_rejection(
+            Some("execution_binding_busy"),
+            Some(&json!({"admission_state": "accepted"})),
+            None,
+        ));
+    }
+
+    #[test]
+    fn sse_admission_error_reaches_typed_settlement_boundary() {
+        use astra_turn_core::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+        };
+
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            concat!(
+                "data: {\"type\":\"error\",\"message\":\"Work execution selection cannot change while this Session is active\",",
+                "\"error_code\":\"execution_binding_busy\",",
+                "\"metadata\":{\"admission_state\":\"rejected\",\"recovery_action\":\"retry_session\"}}\n\n",
+            ),
+            &mut accum,
+            &mut vec![],
+        );
+
+        assert!(is_pre_admission_rejection(
+            accum.error_code.as_deref(),
+            accum.error_metadata.as_ref(),
+            accum.run_id.as_deref(),
+        ));
+        assert!(accum.run_id.is_none());
+    }
 
     #[test]
     fn fatal_stream_failure_retains_root_for_durable_cleanup() {

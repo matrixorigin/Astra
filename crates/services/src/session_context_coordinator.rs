@@ -69,6 +69,13 @@ pub enum SessionContextCoordinatorError {
     ExecutionBindingPresent { generation: u64 },
     #[error("session execution binding is busy with an active Run or unresolved invocation")]
     ExecutionBindingBusy,
+    #[error(
+        "execution workspace is already claimed by session {owner_session_id} on branch {owner_branch_id}"
+    )]
+    ExecutionWorkspaceClaimed {
+        owner_session_id: String,
+        owner_branch_id: String,
+    },
     #[error("session execution binding is not ready: {0:?}")]
     ExecutionBindingNotReady(SessionExecutionBindingStateV1),
     #[error("coordinator database operation {operation} failed: {source}")]
@@ -5124,7 +5131,10 @@ pub(crate) async fn ensure_execution_workspace_claim_in_tx(
         || existing_session != key.session_id
         || existing_branch != key.branch_id
     {
-        return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
+        return Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            owner_session_id: existing_session,
+            owner_branch_id: existing_branch,
+        });
     }
     Ok(())
 }
@@ -5171,7 +5181,10 @@ pub(crate) async fn verify_execution_workspace_claim_in_tx(
         || existing_session != key.session_id
         || existing_branch != key.branch_id
     {
-        return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
+        return Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+            owner_session_id: existing_session,
+            owner_branch_id: existing_branch,
+        });
     }
     Ok(())
 }
