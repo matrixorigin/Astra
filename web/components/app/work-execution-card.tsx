@@ -202,6 +202,8 @@ export function WorkExecutionCard({
       // A refresh supersedes any in-flight target read. Its stale response
       // must not leave the picker stuck in a loading state.
       setTargetsLoading(false);
+      setTargets(null);
+      setTargetsOpen(false);
     }
     setRefreshing(true);
     try {
@@ -267,21 +269,16 @@ export function WorkExecutionCard({
       return false;
     }
     if (result.operation.state === "pending") {
-      setBusy(true);
-      try {
-        const operation = await waitForControl(
-          workId,
-          branchId,
-          result.operation.operation_id,
-          isCurrent,
-        );
-        if (!operation || operation.state !== "succeeded") {
-          if (!isCurrent()) return false;
-          setError("Control was not confirmed. The Work remains safe to view on the other device.");
-          return false;
-        }
-      } finally {
-        if (isCurrent()) setBusy(false);
+      const operation = await waitForControl(
+        workId,
+        branchId,
+        result.operation.operation_id,
+        isCurrent,
+      );
+      if (!operation || operation.state !== "succeeded") {
+        if (!isCurrent()) return false;
+        setError("Control was not confirmed. The Work remains safe to view on the other device.");
+        return false;
       }
     } else if (result.operation.state !== "succeeded") {
       if (!isCurrent()) return false;
@@ -399,6 +396,8 @@ export function WorkExecutionCard({
     setBusy(true);
     setError(null);
     try {
+      if (!(await ensureController(generation))) return;
+      if (!mounted.current || operationGeneration.current !== generation) return;
       const result = await retryWorkExecutionSwitchAction({
         workId,
         branchId,
@@ -430,6 +429,7 @@ export function WorkExecutionCard({
       }
       if (!mounted.current || operationGeneration.current !== generation) return;
       setOperation(null);
+      setTargetsOpen(false);
       await refreshExecution(generation);
       if (mounted.current) router.refresh();
     } catch {

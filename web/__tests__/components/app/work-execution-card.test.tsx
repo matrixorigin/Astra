@@ -17,6 +17,7 @@ import {
   acquireWorkBranchControlAction,
   loadWorkExecutionAction,
   loadWorkExecutionTargetsAction,
+  observeWorkBranchControlAction,
   observeWorkExecutionSwitchAction,
   retryWorkExecutionSwitchAction,
   switchWorkExecutionAction,
@@ -27,6 +28,7 @@ const refreshMock = vi.fn();
 const acquireControl = vi.mocked(acquireWorkBranchControlAction);
 const loadExecution = vi.mocked(loadWorkExecutionAction);
 const loadTargets = vi.mocked(loadWorkExecutionTargetsAction);
+const observeControl = vi.mocked(observeWorkBranchControlAction);
 const observeExecution = vi.mocked(observeWorkExecutionSwitchAction);
 const switchExecution = vi.mocked(switchWorkExecutionAction);
 const retryExecution = vi.mocked(retryWorkExecutionSwitchAction);
@@ -98,28 +100,40 @@ const succeeded = {
   failure_code: null,
 };
 
+const controlSucceeded = {
+  schema_version: 2 as const,
+  operation_id: "control-1",
+  work_id: "work-1",
+  branch_id: "branch-1",
+  attachment_id: "attachment-1",
+  kind: "acquire_branch_control" as const,
+  state: "succeeded" as const,
+  outcome: "acquired" as const,
+  branch_revision: 4,
+  control_basis: { writer_epoch: 3, canonical_root_hash: null },
+  created_at: "2026-08-01T00:00:00Z",
+  completed_at: "2026-08-01T00:00:01Z",
+};
+
+const controlPending = {
+  ...controlSucceeded,
+  operation_id: "control-pending",
+  state: "pending" as const,
+  outcome: "pending" as const,
+  control_basis: null,
+  completed_at: null,
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   loadExecution.mockReset();
   loadExecution.mockResolvedValue({ ok: true, execution });
+  observeControl.mockReset();
   observeExecution.mockReset();
   loadTargets.mockResolvedValue({ ok: true, page: targets });
   acquireControl.mockResolvedValue({
     ok: true,
-    operation: {
-      schema_version: 2,
-      operation_id: "control-1",
-      work_id: "work-1",
-      branch_id: "branch-1",
-      attachment_id: "attachment-1",
-      kind: "acquire_branch_control",
-      state: "succeeded",
-      outcome: "acquired",
-      branch_revision: 4,
-      control_basis: { writer_epoch: 3, canonical_root_hash: null },
-      created_at: "2026-08-01T00:00:00Z",
-      completed_at: "2026-08-01T00:00:01Z",
-    },
+    operation: controlSucceeded,
   });
   switchExecution.mockResolvedValue({ ok: true, operation: succeeded });
   retryExecution.mockResolvedValue({ ok: true, operation: succeeded });
@@ -170,6 +184,90 @@ test("keeps an interrupted switching move recoverable after reload", async () =>
   expect(await screen.findByRole("button", { name: "Resume move" })).toBeInTheDocument();
   await waitFor(() => expect(observeExecution).toHaveBeenCalledTimes(2));
   expect(screen.queryByRole("button", { name: "Resume move" })).not.toBeInTheDocument();
+});
+
+test("acquires controller before retrying a persisted failed move from read-only attachment", async () => {
+  const failed = {
+    ...succeeded,
+    state: "failed" as const,
+    failure_code: "edge_attestation_command_failed",
+  };
+  observeExecution.mockResolvedValue({ ok: true, operation: failed });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: failed.operation_id, state: "needs_attention" }}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "Retry move" }));
+  await waitFor(() => expect(acquireControl).toHaveBeenCalledTimes(1));
+  await waitFor(() =>
+    expect(retryExecution).toHaveBeenCalledWith({
+      workId: "work-1",
+      branchId: "branch-1",
+      operationId: "switch-1",
+      attachmentId: "attachment-1",
+    }),
+  );
+});
+
+test("waits for controller acquisition before resuming a switching move", async () => {
+  const switching = { ...succeeded, state: "switching" as const };
+  observeExecution.mockResolvedValue({ ok: true, operation: switching });
+  acquireControl.mockResolvedValueOnce({ ok: true, operation: controlPending });
+  observeControl.mockResolvedValueOnce({ ok: true, operation: controlSucceeded });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: switching.operation_id, state: "switching" }}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "Resume move" }));
+  await waitFor(() => expect(observeControl).toHaveBeenCalledWith({
+    workId: "work-1",
+    branchId: "branch-1",
+    operationId: "control-pending",
+  }));
+  await waitFor(() => expect(retryExecution).toHaveBeenCalledTimes(1));
+});
+
+test("does not retry a recovered move when controller acquisition is denied", async () => {
+  const failed = {
+    ...succeeded,
+    state: "failed" as const,
+    failure_code: "edge_attestation_command_failed",
+  };
+  observeExecution.mockResolvedValue({ ok: true, operation: failed });
+  acquireControl.mockResolvedValueOnce({
+    ok: false,
+    status: 409,
+    code: "writer_conflict",
+    retryable: false,
+  });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{ ...execution, operation_id: failed.operation_id, state: "needs_attention" }}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "Retry move" }));
+  await waitFor(() => expect(acquireControl).toHaveBeenCalledTimes(1));
+  expect(retryExecution).not.toHaveBeenCalled();
 });
 
 test("refreshes placement and generation after a switching move settles", async () => {
@@ -317,7 +415,7 @@ test("keeps a failed durable move retryable without submitting a new target", as
     attachmentId: "attachment-1",
   })));
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: /Desktop/i })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
   );
 });
 
@@ -344,12 +442,35 @@ test("does not leave target loading stuck after a refresh supersedes its request
   await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Hide Edges" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
   );
 
   resolveTargets?.({ ok: true, page: targets });
-  fireEvent.click(screen.getByRole("button", { name: "Hide Edges" }));
   fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
   await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(2));
   expect(await screen.findByText("Desktop")).toBeInTheDocument();
+});
+
+test("refreshes an empty target directory before reopening the picker", async () => {
+  loadTargets
+    .mockResolvedValueOnce({ ok: true, page: { ...targets, targets: [] } })
+    .mockResolvedValueOnce({ ok: true, page: targets });
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={execution}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  expect(await screen.findByText(/No other connected Edge is available/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(loadExecution).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  expect(await screen.findByText("Desktop")).toBeInTheDocument();
+  expect(loadTargets).toHaveBeenCalledTimes(2);
 });
