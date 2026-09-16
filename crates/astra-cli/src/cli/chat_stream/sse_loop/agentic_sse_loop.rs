@@ -89,9 +89,6 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         );
         if let Some(publication) = explain_artifact.as_ref() {
             eprintln!("{}", publication.user_notice());
-            if let Some(error) = publication.render_error.as_deref() {
-                eprintln!("Explain Analyze report warning · {error}");
-            }
         }
         if let Some(error) = explain_artifact_error.as_deref() {
             eprintln!("Explain Analyze artifact unavailable · {error}");

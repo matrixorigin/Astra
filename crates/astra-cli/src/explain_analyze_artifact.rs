@@ -162,20 +162,24 @@ pub(crate) struct PublishedArtifact {
 
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
-        match &self.rendered_path {
-            Some(path) => format!(
-                "Explain Analyze report saved locally · Markdown\n  Path: {}",
-                compact_local_path(path)
-            ),
-            None if self.render_error.is_some() => format!(
-                "Explain Analyze data saved locally · Markdown unavailable\n  Artifact: {}\n  Reason: {}",
+        match (&self.rendered_path, self.render_error.as_deref()) {
+            (Some(path), None) => format!(
+                "Explain Analyze report saved\n  Markdown on this device: {}\n  Session artifact reference: {}",
+                compact_local_path(path),
                 self.handle,
-                self.render_error
-                    .as_deref()
-                    .unwrap_or("unknown rendering error")
             ),
-            None => format!(
-                "Explain Analyze data saved locally · canonical JSON\n  Artifact: {}",
+            (Some(path), Some(error)) => format!(
+                "Explain Analyze report saved\n  Markdown on this device: {}\n  Session artifact reference: {}\n  Rendering warning: {}",
+                compact_local_path(path),
+                self.handle,
+                error,
+            ),
+            (None, Some(error)) => format!(
+                "Explain Analyze data saved; Markdown unavailable\n  Session artifact reference: {}\n  Reason: {}",
+                self.handle, error
+            ),
+            (None, None) => format!(
+                "Explain Analyze artifact reference\n  Session artifact reference: {}\n  No Markdown file is available on this device.",
                 self.handle
             ),
         }
@@ -866,20 +870,21 @@ mod tests {
     fn published_artifact_notice_labels_the_local_copy_and_model_handle() {
         let local = PublishedArtifact {
             handle: artifact_handle("run-1", "turn-1"),
-            rendered_path: Some(PathBuf::from("/tmp/explain-analyze.md")),
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.md")),
             render_error: None,
         };
         let notice = local.user_notice();
-        assert!(notice.starts_with("Explain Analyze report saved locally · Markdown"));
-        assert!(notice.contains("Path: /tmp/explain-analyze.md"));
-        assert!(!notice.contains("Local Explain report\n/tmp"));
+        assert!(notice.starts_with("Explain Analyze report saved"));
+        assert!(notice.contains("Markdown on this device: /tmp/report with spaces.md"));
+        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
 
         let server = PublishedArtifact {
             rendered_path: None,
             ..local
         };
         let notice = server.user_notice();
-        assert!(notice.contains("Artifact: artifact://session/explain-analyze/"));
+        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
+        assert!(!notice.contains("saved locally"));
 
         let failed_render = PublishedArtifact {
             render_error: Some("rendered report exceeds the bound".into()),
@@ -887,7 +892,32 @@ mod tests {
         };
         let notice = failed_render.user_notice();
         assert!(notice.contains("Markdown unavailable"));
-        assert!(notice.contains("Reason: rendered report exceeds the bound"));
+        assert_eq!(
+            notice.matches("rendered report exceeds the bound").count(),
+            1
+        );
+
+        let rendered_with_warning = PublishedArtifact {
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.md")),
+            ..failed_render.clone()
+        };
+        let notice = rendered_with_warning.user_notice();
+        assert!(notice.contains("Markdown on this device: /tmp/report with spaces.md"));
+        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
+        assert_eq!(
+            notice.matches("rendered report exceeds the bound").count(),
+            1
+        );
+
+        let no_local_copy = PublishedArtifact {
+            rendered_path: None,
+            render_error: None,
+            ..failed_render
+        };
+        let notice = no_local_copy.user_notice();
+        assert!(notice.contains("Explain Analyze artifact reference"));
+        assert!(notice.contains("No Markdown file is available on this device."));
+        assert!(!notice.contains("saved locally"));
     }
 
     #[test]

@@ -2619,12 +2619,13 @@ impl ChatWidget {
             )));
         }
         if let Some(publication) = publication {
-            self.commit_concurrent_system(SystemCell::info(publication.user_notice()));
-            if let Some(error) = publication.render_error {
-                self.commit_concurrent_system(SystemCell::warning(format!(
-                    "Explain Analyze report was not rendered: {error}"
-                )));
-            }
+            let notice = publication.user_notice();
+            let cell = if publication.render_error.is_some() {
+                SystemCell::warning(notice)
+            } else {
+                SystemCell::info(notice)
+            };
+            self.commit_concurrent_system(cell);
         }
         if let Some(error) = publication_error {
             self.commit_concurrent_system(SystemCell::warning(format!(
