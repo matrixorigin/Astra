@@ -16,11 +16,12 @@ pub(crate) fn render_detail(
     row: Option<&BackgroundTaskRow>,
     area: Rect,
     buf: &mut Buffer,
+    requested_scroll: usize,
     fallback: impl FnOnce(Rect, &mut Buffer),
-) {
+) -> usize {
     let Some(row) = row else {
         fallback(area, buf);
-        return;
+        return 0;
     };
     let dim = Style::default().fg(crate::tui::theme::current().dim);
     let title_style = Style::default()
@@ -42,11 +43,11 @@ pub(crate) fn render_detail(
         | BackgroundTaskKind::MainSession
         | BackgroundTaskKind::Monitor => "  title ",
     };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("  {} · {}", row.id, row.status.label()),
-            title_style,
-        )),
+    let title_line = Line::from(Span::styled(
+        format!("  {} · {}", row.id, row.status.label()),
+        title_style,
+    ));
+    let context_lines = vec![
         Line::from(vec![
             Span::styled("  kind ", dim),
             Span::raw(row.kind.as_str()),
@@ -58,6 +59,7 @@ pub(crate) fn render_detail(
             Span::raw(row.title.clone()),
         ]),
     ];
+    let mut secondary_lines = Vec::new();
     if let Some(total_bytes) = row.total_bytes {
         let mut output_parts = Vec::new();
         if let Some(offset) = row.output_offset {
@@ -67,31 +69,32 @@ pub(crate) fn render_detail(
         if let Some(total_lines) = row.total_lines {
             output_parts.push(pluralize_with_count(total_lines as usize, "line", "lines"));
         }
-        lines.push(Line::from(vec![
+        secondary_lines.push(Line::from(vec![
             Span::styled("  output ", dim),
             Span::raw(output_parts.join(" · ")),
         ]));
     }
     if let Some(exit_code) = row.exit_code {
-        lines.push(Line::from(vec![
+        secondary_lines.push(Line::from(vec![
             Span::styled("  exit ", dim),
             Span::raw(exit_code.to_string()),
         ]));
     }
+    let mut actionable_lines = Vec::new();
     if let Some(reason) = row.terminal_reason.as_deref() {
-        lines.push(Line::from(vec![
+        actionable_lines.push(Line::from(vec![
             Span::styled("  reason ", dim),
             Span::raw(reason.to_string()),
         ]));
     }
     if let Some(label) = row.live_control.label() {
-        lines.push(Line::from(vec![
+        actionable_lines.push(Line::from(vec![
             Span::styled("  control ", dim),
             Span::raw(label.to_string()),
         ]));
     }
     if let Some(inactive_ms) = row.no_recent_output_ms {
-        lines.push(Line::from(vec![
+        actionable_lines.push(Line::from(vec![
             Span::styled("  activity ", dim),
             Span::raw(format!(
                 "no output observed for {} · advisory only",
@@ -100,11 +103,23 @@ pub(crate) fn render_detail(
         ]));
     }
     if let Some(output_ref) = row.output_ref.as_deref() {
-        lines.push(Line::from(vec![
+        actionable_lines.push(Line::from(vec![
             Span::styled("  ref ", dim),
             Span::raw(output_ref.to_string()),
         ]));
     }
+
+    // Keep diagnostics and the next useful action ahead of low-signal
+    // counters. The detail viewport is intentionally short, so silently
+    // keeping insertion order could hide the reason a task needs attention.
+    let mut metadata_lines = Vec::with_capacity(
+        1 + actionable_lines.len() + context_lines.len() + secondary_lines.len(),
+    );
+    metadata_lines.push(title_line);
+    metadata_lines.extend(actionable_lines);
+    metadata_lines.extend(context_lines);
+    metadata_lines.extend(secondary_lines);
+
     let tail = row
         .output_tail
         .as_deref()
@@ -113,13 +128,26 @@ pub(crate) fn render_detail(
         .unwrap_or_else(|| row.status.empty_output_state());
     let tail_lines = tail.lines().collect::<Vec<_>>();
     let body_height = area.height.saturating_sub(2) as usize;
-    let minimum_tail_lines = tail_lines.len().min(3);
-    let metadata_capacity = body_height.saturating_sub(2 + minimum_tail_lines).max(1);
-    lines.truncate(metadata_capacity);
     let tail_capacity = body_height
-        .saturating_sub(lines.len() + 2)
+        .saturating_sub(3)
         .min(DETAIL_TAIL_LINES)
         .min(tail_lines.len());
+    let tail_budget = if tail_capacity > 0 {
+        tail_capacity + 2
+    } else {
+        0
+    };
+    let metadata_capacity = body_height
+        .saturating_sub(tail_budget)
+        .max(1)
+        .min(body_height.max(1));
+    let max_scroll = metadata_lines.len().saturating_sub(metadata_capacity);
+    let scroll = requested_scroll.min(max_scroll);
+    let mut lines = metadata_lines
+        .into_iter()
+        .skip(scroll)
+        .take(metadata_capacity)
+        .collect::<Vec<_>>();
     if tail_capacity > 0 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  Latest output", dim)));
@@ -139,4 +167,5 @@ pub(crate) fn render_detail(
         &Line::from(Span::styled(action, dim)),
         area.width,
     );
+    scroll
 }

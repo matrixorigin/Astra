@@ -1231,12 +1231,20 @@ fn agent_fanout_membership(
 
 fn agent_run_state_from_fanout_receipt(status: &str) -> Option<AgentRunStatus> {
     match status {
+        // These are the canonical fanout slot states. Keep the older
+        // wire labels as aliases because a receipt may be replayed after a
+        // client restart, but always project them into the same lifecycle
+        // enum used by live events and the durable run reconciler.
+        "planned" | "spawn_accepted" => Some(AgentRunStatus::Starting),
         "launched" | "running" => Some(AgentRunStatus::Running),
-        "waiting" => Some(AgentRunStatus::Waiting),
+        "waiting" | "waiting_for_input" => Some(AgentRunStatus::Waiting),
         "completed" => Some(AgentRunStatus::Completed),
         "interrupted" => Some(AgentRunStatus::Interrupted),
-        "cancelled" => Some(AgentRunStatus::Cancelled),
-        "failed" => Some(AgentRunStatus::Failed),
+        "spawn_rejected" | "failed" => Some(AgentRunStatus::Failed),
+        "cancelled" | "cancelled_by_user" | "cancelled_by_runtime" => {
+            Some(AgentRunStatus::Cancelled)
+        }
+        "timed_out" => Some(AgentRunStatus::Failed),
         _ => None,
     }
 }
@@ -3516,7 +3524,7 @@ impl ChatWidget {
                     slot_index,
                     slot_label: slot_label.to_string(),
                 };
-            self.agent_runs.ensure(
+            let state_accepted = self.agent_runs.ensure(
                 agent_id.clone(),
                 slot_label.to_string(),
                 AgentRunState::observed(state),
@@ -3536,6 +3544,39 @@ impl ChatWidget {
             if let Some(transcript_target) = transcript_target {
                 projection
                     .set_transcript_target(AgentProjectionSource::LiveStream, transcript_target);
+            }
+            if state_accepted
+                && let Some(reason) = [
+                    agent.get("terminal_reason"),
+                    agent.get("finish_reason"),
+                    agent.get("reason"),
+                    agent.get("error"),
+                    agent
+                        .get("result")
+                        .and_then(|result| result.get("finish_reason")),
+                    agent.get("result").and_then(|result| result.get("reason")),
+                    agent.get("result").and_then(|result| result.get("error")),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .find(|reason| !reason.is_empty())
+            {
+                match state {
+                    AgentRunStatus::Waiting => {
+                        let attention = format!("Waiting for {reason}");
+                        projection.detail.output_summary = Some(attention.clone());
+                        projection.set_attention_summary(Some(attention));
+                    }
+                    AgentRunStatus::Failed | AgentRunStatus::Interrupted => {
+                        projection.detail.error = Some(reason.to_string());
+                    }
+                    AgentRunStatus::Cancelled => {
+                        projection.detail.output_summary = Some(reason.to_string());
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -4756,7 +4797,7 @@ fn box_into_arc(b: Box<dyn HistoryCell>) -> Arc<dyn HistoryCell> {
 mod tests {
     use super::*;
     use crate::tui::agent_run_projection::{
-        AgentProjectionConfidence, AgentProjectionSource, AgentRunStatus,
+        AgentProjectionConfidence, AgentProjectionSource, AgentRunState, AgentRunStatus,
     };
     use crate::tui::history_cell::tool::ToolStatus;
     use astra_services::SessionArtifactStore;
@@ -7714,6 +7755,156 @@ mod tests {
                 .map(|cell| cell.description.as_str()),
             Some("Correctness boundary review")
         );
+    }
+
+    #[test]
+    fn canonical_fanout_slot_statuses_remain_visible_after_receipt_replay() {
+        let cases = [
+            ("planned", AgentRunStatus::Starting),
+            ("spawn_accepted", AgentRunStatus::Starting),
+            ("running", AgentRunStatus::Running),
+            ("waiting_for_input", AgentRunStatus::Waiting),
+            ("completed", AgentRunStatus::Completed),
+            ("interrupted", AgentRunStatus::Interrupted),
+            ("failed", AgentRunStatus::Failed),
+            ("cancelled_by_user", AgentRunStatus::Cancelled),
+            ("cancelled_by_runtime", AgentRunStatus::Cancelled),
+            ("timed_out", AgentRunStatus::Failed),
+            ("spawn_rejected", AgentRunStatus::Failed),
+        ];
+
+        for (wire_status, expected) in cases {
+            assert_eq!(
+                agent_run_state_from_fanout_receipt(wire_status),
+                Some(expected),
+                "canonical receipt status {wire_status} must project to a visible lifecycle"
+            );
+        }
+        assert_eq!(agent_run_state_from_fanout_receipt("future_status"), None);
+    }
+
+    #[test]
+    fn canonical_fanout_receipt_replay_keeps_terminal_reason_and_lifecycle() {
+        let cases = [
+            ("spawn_accepted", AgentRunStatus::Starting, None),
+            (
+                "waiting_for_input",
+                AgentRunStatus::Waiting,
+                Some("approval"),
+            ),
+            (
+                "cancelled_by_runtime",
+                AgentRunStatus::Cancelled,
+                Some("owner released"),
+            ),
+            (
+                "timed_out",
+                AgentRunStatus::Failed,
+                Some("deadline exceeded"),
+            ),
+        ];
+        let slots = cases
+            .iter()
+            .enumerate()
+            .map(|(slot_index, (status, _, reason))| {
+                let mut slot = serde_json::json!({
+                    "slot_index": slot_index,
+                    "id": format!("slot-{slot_index}"),
+                    "agent_id": format!("reviewer@{slot_index}"),
+                    "run_id": format!("run-{slot_index}"),
+                    "status": status,
+                });
+                if let Some(reason) = reason {
+                    if *status == "timed_out" {
+                        slot["terminal_reason"] = serde_json::Value::Null;
+                        slot["finish_reason"] = serde_json::json!("");
+                        slot["result"] = serde_json::json!({
+                            "status": status,
+                            "finish_reason": reason
+                        });
+                    } else {
+                        slot["terminal_reason"] = serde_json::json!(reason);
+                    }
+                }
+                slot
+            })
+            .collect::<Vec<_>>();
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "incomplete",
+                "group_id": "canonical-statuses",
+                "target_count": cases.len(),
+                "fanout": {"slots": slots}
+            })
+            .to_string(),
+        );
+
+        let rows = widget.agent_monitor_snapshot(10);
+        assert_eq!(rows.len(), cases.len());
+        for (slot_index, (_, expected, reason)) in cases.iter().enumerate() {
+            let agent_id = format!("reviewer@{slot_index}");
+            let row = rows
+                .iter()
+                .find(|row| row.agent_id == agent_id)
+                .expect("receipt slot should remain visible");
+            assert_eq!(row.state.status, *expected);
+            if let Some(reason) = reason {
+                let detail = widget
+                    .agent_run_cell(&agent_id)
+                    .expect("receipt slot has a detail cell");
+                let rendered_reason = detail
+                    .error
+                    .as_deref()
+                    .or(detail.output_summary.as_deref())
+                    .unwrap_or_default();
+                assert!(rendered_reason.contains(reason), "{rendered_reason}");
+            }
+        }
+
+        // A durable terminal projection must win over a delayed receipt from
+        // an earlier lifecycle state. The stale receipt may still refresh
+        // membership, but it must not rewrite the user's terminal reason or
+        // make the run look actionable again.
+        {
+            let projection = widget
+                .agent_runs
+                .get_mut("reviewer@3")
+                .expect("timeout slot exists");
+            assert!(
+                projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Completed,))
+            );
+            projection.detail.output_summary = Some("authoritative result".into());
+            projection.detail.error = None;
+        }
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "incomplete",
+                "group_id": "canonical-statuses",
+                "target_count": cases.len(),
+                "fanout": {"slots": [{
+                    "slot_index": 3,
+                    "id": "slot-3",
+                    "agent_id": "reviewer@3",
+                    "run_id": "run-3",
+                    "status": "waiting_for_input",
+                    "terminal_reason": "late approval request"
+                }]}
+            })
+            .to_string(),
+        );
+        let terminal = widget
+            .agent_runs
+            .get("reviewer@3")
+            .expect("terminal projection remains present");
+        assert_eq!(terminal.state.status, AgentRunStatus::Completed);
+        assert_eq!(
+            terminal.detail.output_summary.as_deref(),
+            Some("authoritative result")
+        );
+        assert_eq!(terminal.detail.error, None);
+        assert_eq!(terminal.attention_summary, None);
     }
 
     #[test]

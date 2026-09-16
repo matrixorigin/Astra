@@ -432,6 +432,25 @@ fn work_item_presentation(
                     });
             if current_passed {
                 ("✓", "Checked")
+            } else if item
+                .verification
+                .latest_check
+                .as_ref()
+                .is_some_and(|check| {
+                    check.freshness == WorkTaskCheckFreshnessV2::Current
+                        && matches!(
+                            check.outcome,
+                            WorkTaskCheckOutcomeV2::Failed
+                                | WorkTaskCheckOutcomeV2::Error
+                                | WorkTaskCheckOutcomeV2::Cancelled
+                        )
+                })
+            {
+                // A current check failure is an actionable verification
+                // result. Keep it visible in the CLI snapshot just as the
+                // TUI task board does; execution completed, but the declared
+                // completion evidence did not.
+                ("!", "Check failed")
             } else if item.verification.status == WorkItemVerificationStatusV2::StaleEvidence {
                 ("!", "Needs recheck")
             } else {
@@ -566,6 +585,28 @@ mod tests {
         let rendered = render_work_snapshot(&observation, &graph).expect("snapshot");
         assert!(rendered.contains("✓ Implement task-a  [task-a · Checked]"));
         assert!(rendered.contains("task-a → task-b"));
+
+        for outcome in [
+            WorkTaskCheckOutcomeV2::Failed,
+            WorkTaskCheckOutcomeV2::Error,
+            WorkTaskCheckOutcomeV2::Cancelled,
+        ] {
+            let mut check_failed = graph.clone();
+            check_failed.items.entries[0]
+                .verification
+                .latest_check
+                .as_mut()
+                .expect("fixture has a current check")
+                .outcome = outcome;
+            check_failed
+                .validate()
+                .expect("valid failed check projection");
+            let rendered = render_work_snapshot(&observation, &check_failed).expect("snapshot");
+            assert!(
+                rendered.contains("! Implement task-a  [task-a · Check failed]"),
+                "{rendered}"
+            );
+        }
 
         // Delivery is the terminal execution fact for a Work item when no
         // durable verification evidence exists. The CLI must agree with the

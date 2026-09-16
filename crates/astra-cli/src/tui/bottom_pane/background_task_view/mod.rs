@@ -6,6 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect};
+use std::cell::Cell;
 
 pub(crate) mod detail_render;
 pub(crate) mod fanout_header;
@@ -30,6 +31,7 @@ pub(crate) struct BackgroundTaskView {
     selected: usize,
     completed: bool,
     mode: Mode,
+    detail_scroll: Cell<usize>,
     pending_action: Option<ViewActionRequest>,
 }
 
@@ -40,6 +42,7 @@ impl BackgroundTaskView {
             selected: 0,
             completed: false,
             mode: Mode::List,
+            detail_scroll: Cell::new(0),
             pending_action: None,
         };
         view.clamp_selection();
@@ -72,12 +75,17 @@ impl BackgroundTaskView {
         let rows = sort_rows_preserving_work_unit_order(rows, &self.rows);
         let selected_idx = selected_id.and_then(|id| rows.iter().position(|row| row.id == id));
         let fallback_idx = current_selected_id
-            .and_then(|id| rows.iter().position(|row| row.id == id))
+            .as_ref()
+            .and_then(|id| rows.iter().position(|row| row.id.as_str() == id))
             .or_else(|| rows.first().map(|_| 0));
         self.selected = selected_idx
             .or(fallback_idx)
             .unwrap_or(0)
             .min(rows.len().saturating_sub(1));
+        let next_selected_id = rows.get(self.selected).map(|row| row.id.as_str());
+        if current_selected_id.as_deref() != next_selected_id {
+            self.detail_scroll.set(0);
+        }
         self.rows = rows;
         self.clamp_selection();
     }
@@ -228,19 +236,23 @@ impl BottomPaneView for BackgroundTaskView {
         }
         match self.mode {
             Mode::List => list_render::render_list(&self.rows, self.selected, area, buf),
-            Mode::Detail => detail_render::render_detail(
-                self.selected_row(),
-                area,
-                buf,
-                |fallback_area, fallback_buf| {
-                    list_render::render_list(
-                        &self.rows,
-                        self.selected,
-                        fallback_area,
-                        fallback_buf,
-                    );
-                },
-            ),
+            Mode::Detail => {
+                let scroll = detail_render::render_detail(
+                    self.selected_row(),
+                    area,
+                    buf,
+                    self.detail_scroll.get(),
+                    |fallback_area, fallback_buf| {
+                        list_render::render_list(
+                            &self.rows,
+                            self.selected,
+                            fallback_area,
+                            fallback_buf,
+                        );
+                    },
+                );
+                self.detail_scroll.set(scroll);
+            }
         }
     }
 
@@ -269,6 +281,7 @@ impl BottomPaneView for BackgroundTaskView {
                     if !self.rows.is_empty() =>
                 {
                     self.mode = Mode::Detail;
+                    self.detail_scroll.set(0);
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('x') | KeyCode::Delete => {
                     self.request_stop();
@@ -277,6 +290,24 @@ impl BottomPaneView for BackgroundTaskView {
                 _ => {}
             },
             Mode::Detail => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll
+                        .set(self.detail_scroll.get().saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll
+                        .set(self.detail_scroll.get().saturating_add(1));
+                }
+                KeyCode::PageUp => {
+                    self.detail_scroll
+                        .set(self.detail_scroll.get().saturating_sub(PAGE_STEP));
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll
+                        .set(self.detail_scroll.get().saturating_add(PAGE_STEP));
+                }
+                KeyCode::Home => self.detail_scroll.set(0),
+                KeyCode::End => self.detail_scroll.set(usize::MAX),
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('x') | KeyCode::Delete => {
                     self.request_stop();
                 }
@@ -325,7 +356,7 @@ impl BottomPaneView for BackgroundTaskView {
     fn hint_keys(&self) -> Option<String> {
         match self.mode {
             Mode::List => Some("↑↓ move · Enter details · S stop · Esc close".into()),
-            Mode::Detail => Some("S stop · Esc list · Q close".into()),
+            Mode::Detail => Some("↑↓ scroll · PgUp/PgDn page · S stop · Esc list · Q close".into()),
         }
     }
 
@@ -718,6 +749,73 @@ mod tests {
         assert!(text.contains("312 lines"), "{text}");
         assert!(text.contains("exit 1"), "{text}");
         assert!(text.contains("reason exit code 1"), "{text}");
+    }
+
+    #[test]
+    fn detail_keeps_actionable_diagnostics_visible_and_scrolls_secondary_metadata() {
+        let mut view = BackgroundTaskView::new(vec![
+            BackgroundTaskRow::shell(
+                "diagnostic",
+                "failed",
+                41_200,
+                "cargo test --workspace",
+                Some("/tmp/diagnostic.stdout".to_string()),
+                Some("line one\nline two\nline three".to_string()),
+                Some(13_244),
+            )
+            .with_output_stats(Some(8192), Some(312))
+            .with_terminal(Some(1), Some("exit code 1".to_string()))
+            .with_live_control(LiveControlState::StaleHandle)
+            .with_no_recent_output(Some(47_000)),
+        ]);
+
+        view.handle_key(key(KeyCode::Enter));
+        let top = render(&view, 120, 14);
+        assert!(top.contains("reason exit code 1"), "{top}");
+        assert!(
+            top.contains("control restored snapshot · no live control"),
+            "{top}"
+        );
+        assert!(
+            top.contains("activity no output observed for 47.0s · advisory only"),
+            "{top}"
+        );
+        assert!(top.contains("ref /tmp/diagnostic.stdout"), "{top}");
+
+        // The low-priority counters may be below the initial viewport, but
+        // detail navigation must make them reachable without losing the same
+        // selected task or replacing the live output surface.
+        view.handle_key(key(KeyCode::End));
+        let bottom = render(&view, 120, 14);
+        assert!(bottom.contains("output offset 8192 -> 13244"), "{bottom}");
+        assert!(bottom.contains("exit 1"), "{bottom}");
+
+        // Refreshing the same work unit must keep the reading position. A
+        // resize still clamps that position to the new viewport instead of
+        // exposing stale blank rows.
+        let mut refreshed = view.rows[0].clone();
+        refreshed.elapsed_ms = 42_000;
+        view.replace_rows(vec![refreshed]);
+        let refreshed_bottom = render(&view, 120, 14);
+        assert!(
+            refreshed_bottom.contains("output offset 8192 -> 13244"),
+            "{refreshed_bottom}"
+        );
+        view.handle_key(key(KeyCode::End));
+        let _narrow = render(&view, 120, 8);
+        let resized = render(&view, 120, 20);
+        assert!(resized.contains("reason exit code 1"), "{resized}");
+
+        // Removing the selected task resets the detail offset for the new
+        // selection rather than showing the replacement from its tail.
+        view.replace_rows(vec![row("replacement", "running", "replacement task")]);
+        let replacement = render(&view, 120, 14);
+        assert!(
+            replacement.contains("replacement · running"),
+            "{replacement}"
+        );
+        view.handle_key(key(KeyCode::Home));
+        assert!(render(&view, 120, 14).contains("replacement · running"));
     }
 
     #[test]
