@@ -488,6 +488,16 @@ pub(crate) async fn handle_slash_command(
             }
         },
 
+        "/tasks" => {
+            if arg.is_empty() {
+                eprintln!(
+                    "  `/tasks` is available in the interactive TUI. Start `astra` and use it to open the live background task panel."
+                );
+            } else {
+                eprintln!("  Usage: /tasks");
+            }
+        }
+
         "/clear" | "/explain" | "/compact" | "/reflect" | "/undo" | "/redo" => {
             handle_state_command(
                 cmd,

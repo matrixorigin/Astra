@@ -26,6 +26,10 @@ pub(crate) enum SlashResult {
         session_id: Option<String>,
     },
     OpenWorkTasks,
+    /// Open the same live background-task panel used by Shift+Down/Ctrl+B.
+    /// The event loop owns the registry so this route cannot accidentally
+    /// create a second task model or lose session-bound local projections.
+    OpenBackgroundTasks,
     StartWork(Box<WorkStartRequest>),
     BackgroundRead(Box<SlashBackgroundRead>),
     Exit,
@@ -123,6 +127,20 @@ pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
         "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
         "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
         _ => WorkCommandRoute::Unsupported,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTasksCommandRoute {
+    Open,
+    Unsupported,
+}
+
+fn background_tasks_command_route(args: &str) -> BackgroundTasksCommandRoute {
+    if args.trim().is_empty() {
+        BackgroundTasksCommandRoute::Open
+    } else {
+        BackgroundTasksCommandRoute::Unsupported
     }
 }
 
@@ -397,6 +415,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             WorkCommandRoute::Unsupported => {
                 ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                SlashResult::Handled
+            }
+        },
+
+        "/tasks" => match background_tasks_command_route(args) {
+            BackgroundTasksCommandRoute::Open => {
+                ctx.show_response("Opened background tasks".to_string());
+                SlashResult::OpenBackgroundTasks
+            }
+            BackgroundTasksCommandRoute::Unsupported => {
+                ctx.show_error("Usage: /tasks".to_string());
                 SlashResult::Handled
             }
         },
@@ -2939,6 +2968,13 @@ pub(crate) fn active_run_concurrent_read(
     })
 }
 
+/// `/tasks` is a local navigation action and remains safe while a model turn
+/// is active. The event loop opens the already-owned registry directly so a
+/// user never has to send a control command as model guidance.
+pub(crate) fn active_run_opens_background_tasks(text: &str) -> bool {
+    text.trim() == "/tasks"
+}
+
 /// Build the session hub after its workspace read finishes. All live state was
 /// captured in [`SessionHubSnapshot`] at submit time, keeping a late result
 /// attributable to the session the user actually asked to inspect.
@@ -3405,10 +3441,11 @@ fn handle_reflect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashRe
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
-        MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
-        SkillCommandRoute, WorkCommandRoute, config_command_route, context_breakdown_for_panel,
-        context_dump_argument, explain_mode_for_command, help_command_route, history_command_route,
+        BackgroundTasksCommandRoute, CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute,
+        HistoryCommandRoute, MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT,
+        MemoryCommandRoute, SkillCommandRoute, WorkCommandRoute, background_tasks_command_route,
+        config_command_route, context_breakdown_for_panel, context_dump_argument,
+        explain_mode_for_command, help_command_route, history_command_route,
         is_model_picker_request, keyboard_shortcut_pairs, memory_command_route,
         skill_command_route, work_command_route,
     };
@@ -3567,6 +3604,22 @@ mod routing_tests {
         );
         assert_eq!(explain_mode_for_command("off"), Ok(ExplainMode::Off));
         assert!(explain_mode_for_command("typo").is_err());
+    }
+
+    #[test]
+    fn tasks_route_only_accepts_the_root_form() {
+        assert_eq!(
+            background_tasks_command_route(""),
+            BackgroundTasksCommandRoute::Open
+        );
+        assert_eq!(
+            background_tasks_command_route("   "),
+            BackgroundTasksCommandRoute::Open
+        );
+        assert_eq!(
+            background_tasks_command_route("list"),
+            BackgroundTasksCommandRoute::Unsupported
+        );
     }
 
     #[test]
@@ -4361,7 +4414,10 @@ mod fmt_tokens_tests {
 
 #[cfg(test)]
 mod session_hub_tests {
-    use super::{SlashBackgroundRead, active_run_concurrent_read, session_hub_persistence_error};
+    use super::{
+        SlashBackgroundRead, active_run_concurrent_read, active_run_opens_background_tasks,
+        session_hub_persistence_error,
+    };
     use crate::cli::session::session_state::SessionState;
     use astra_services::session_workspace::WorkspaceMetadata;
 
@@ -4411,5 +4467,12 @@ mod session_hub_tests {
                 "stateful or unknown commands must wait for idle dispatch: {command}"
             );
         }
+    }
+
+    #[test]
+    fn active_run_opens_background_tasks_without_sending_guidance() {
+        assert!(active_run_opens_background_tasks(" /tasks "));
+        assert!(!active_run_opens_background_tasks("/tasks list"));
+        assert!(!active_run_opens_background_tasks("show my tasks"));
     }
 }

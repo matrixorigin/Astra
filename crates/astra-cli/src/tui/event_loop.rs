@@ -6061,6 +6061,16 @@ pub(crate) async fn run_tui_session(
                                                 &frame_requester,
                                             );
                                         }
+                                        slash_dispatch::SlashResult::OpenBackgroundTasks => {
+                                            let _ = force_open_background_task_view(
+                                                &mut background_registry,
+                                                state.agent_spawner.as_ref(),
+                                                &restored_local_agent_task_projections,
+                                                &mut bottom_pane,
+                                                &frame_requester,
+                                            )
+                                            .await;
+                                        }
                                         slash_dispatch::SlashResult::StartWork(request) => {
                                             if work_start_in_flight {
                                                 chat_widget.commit_system(
@@ -6845,6 +6855,34 @@ pub(crate) async fn run_tui_session(
                                                                                 slash_background_read_tx.clone(),
                                                                                 &mut slash_background_read_tasks,
                                                                             );
+                                                                            flush_chat_widget(
+                                                                                &mut guard,
+                                                                                &mut chat_widget,
+                                                                                w,
+                                                                            );
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if slash_dispatch::active_run_opens_background_tasks(
+                                                                            &queued_text,
+                                                                        ) {
+                                                                            commit_submission_projection(
+                                                                                &mut chat_widget,
+                                                                                &queued_text,
+                                                                            );
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::response(
+                                                                                    "Opened background tasks",
+                                                                                ),
+                                                                            );
+                                                                            let _ = force_open_background_task_view(
+                                                                                &mut background_registry,
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                                &restored_local_agent_task_projections,
+                                                                                &mut bottom_pane,
+                                                                                &frame_requester,
+                                                                            )
+                                                                            .await;
                                                                             flush_chat_widget(
                                                                                 &mut guard,
                                                                                 &mut chat_widget,

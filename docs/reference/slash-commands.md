@@ -55,11 +55,14 @@ TUI.
 | `/stop` | Stop the active run. |
 | `/plan` | Enter or exit plan mode, then describe the plan in the composer. |
 | `/work` | Open the Work board or start durable work. |
+| `/tasks` | Open the live background task panel. |
 | `/agent` | Open the agent monitor for active and recent runs. |
 
-`/work` opens the canonical task board. Use `/work start <goal>` to track the
-current conversation as durable Work; the conversation must have a saved
-session first. `/work status` remains accepted as an alias for the board.
+`/work` opens the canonical durable Work board. Use `/work start <goal>` to
+track the current conversation as durable Work; the conversation must have a
+saved session first. `/work status` remains accepted as an alias for the
+board. `/tasks` opens the live shell and local-agent task panel used by
+Shift+Down/Ctrl+B; it reuses the same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains

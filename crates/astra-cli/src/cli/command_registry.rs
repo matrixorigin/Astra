@@ -595,6 +595,13 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_arg_hint("[start <goal>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
+    CommandMeta::new(
+        "/tasks",
+        "Open the live background task panel",
+        CommandGroup::Work,
+    )
+    .with_usage_examples(&["tasks"])
+    .with_tui_route(TuiCommandRoute::Native),
     // ── Inspect and settings ───────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
@@ -1150,6 +1157,11 @@ mod tests {
             ]
         );
 
+        let tasks = resolve_command_meta("/tasks").expect("tasks command registered");
+        assert_eq!(tasks.tui_route, TuiCommandRoute::Native);
+        assert!(tasks.visible_tui_subcommands().is_empty());
+        assert_eq!(tasks.arg_hint, None);
+
         let config = resolve_command_meta("/config").expect("config command registered");
         assert!(config.visible_tui_subcommands().is_empty());
     }
@@ -1336,6 +1348,7 @@ mod tests {
                 "/plan",
                 "/memory",
                 "/work",
+                "/tasks",
                 "/explain",
                 "/reflect",
                 "/inspect",
