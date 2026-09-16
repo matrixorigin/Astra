@@ -5543,6 +5543,10 @@ impl AgenticRunLifecycleService {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "distributed_session_admission_configuration_mismatch",
                 ),
+                astra_services::DistributedAdmissionError::AdmissionTimeout { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "distributed_session_admission_timeout",
+                ),
                 _ => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "distributed_session_admission_rejected",
@@ -6008,7 +6012,16 @@ impl AgenticRunLifecycleService {
         if admission.release_writer_on_finish {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
         }
-        let _ = admission.distributed_permit.release().await;
+        if let Err(error) = admission.distributed_permit.release().await {
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "distributed admission release is pending; the permit will retry on drop"
+            );
+        }
         admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
             astra_core::ClassifiedError::new(
@@ -6053,13 +6066,17 @@ impl AgenticRunLifecycleService {
                 ));
             }
         }
-        self.distributed_weighted_admission = Some(
+        let mut distributed_weighted_admission =
             astra_services::DatabaseWeightedAdmissionController::new(
                 pool.clone(),
                 self.admission_limits,
             )
-            .expect("per-owner distributed admission limits fit global limits"),
-        );
+            .expect("per-owner distributed admission limits fit global limits");
+        // Use the existing run admission budget for both the local durable
+        // gate queue and the database-pool acquire. This keeps a burst from
+        // waiting forever before the run-level admission timeout can act.
+        distributed_weighted_admission.with_admission_wait_timeout(run_admission_timeout());
+        self.distributed_weighted_admission = Some(distributed_weighted_admission);
         self.shared_pool = Some(pool);
         self
     }

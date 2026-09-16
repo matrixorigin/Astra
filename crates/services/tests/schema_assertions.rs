@@ -1586,12 +1586,33 @@ async fn phase1_run_durability_schema_contract() {
         ["scope_name", "reservation_id"],
         "distributed admission reservations need one cross-pod physical identity"
     );
+    let admission_gate_columns =
+        column_names(&pool, &schema, "session_weighted_admission_gates").await;
     assert!(
-        column_names(&pool, &schema, "session_weighted_admission_gates")
-            .await
+        admission_gate_columns
             .iter()
             .any(|column| column == "capacity_hash"),
         "distributed admission gate must persist the deployment capacity snapshot"
+    );
+    for expected in [
+        "usage_initialized",
+        "global_resident_bytes",
+        "global_context_tokens",
+        "global_provider_slots",
+        "global_cpu_units",
+        "global_io_bytes",
+    ] {
+        assert!(
+            admission_gate_columns
+                .iter()
+                .any(|column| column == expected),
+            "distributed admission gate must persist materialized usage column {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_weighted_admission_owner_usage").await,
+        ["scope_name", "isolation_domain", "owner_user_id"],
+        "per-owner materialized admission usage must be isolated by scope, domain, and owner"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_authority_events").await,
