@@ -858,10 +858,7 @@ impl DatabaseWorkAttemptSettlementService {
                 &mut tx,
                 &owner,
                 &session_id,
-                &WorkId::parse(work_id.clone())
-                    .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
-                &WorkBranchId::parse(branch_id.clone())
-                    .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
+                &snapshot,
                 &due_groups,
                 &WorkItemAttemptId::parse(attempt_id.to_string())
                     .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,

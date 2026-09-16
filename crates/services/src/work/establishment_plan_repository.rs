@@ -274,8 +274,7 @@ pub(super) async fn record_graph_mutation_trigger_attempts(
     tx: &mut Transaction<'_, MySql>,
     owner: &WorkOwnerId,
     session: &InternalSessionId,
-    work_id: &super::WorkId,
-    branch_id: &super::WorkBranchId,
+    snapshot: &WorkTaskExecutionSnapshot,
     groups: &[WorkEstablishmentMutationGroup],
     trigger_attempt_id: &WorkItemAttemptId,
     trigger_item: &WorkItemRevisionRef,
@@ -303,8 +302,8 @@ pub(super) async fn record_graph_mutation_trigger_attempts(
                 .proposal_id(
                     owner.as_str(),
                     session.as_str(),
-                    work_id.as_str(),
-                    branch_id.as_str(),
+                    snapshot.basis().work_id.as_str(),
+                    snapshot.basis().branch_id.as_str(),
                 )
                 .map_err(|error| {
                     WorkRepositoryError::corrupt(
@@ -323,8 +322,8 @@ pub(super) async fn record_graph_mutation_trigger_attempts(
     query.push_values(rows, |mut values, proposal_id| {
         values
             .push_bind(owner.as_str().to_string())
-            .push_bind(work_id.as_str().to_string())
-            .push_bind(branch_id.as_str().to_string())
+            .push_bind(snapshot.basis().work_id.as_str().to_string())
+            .push_bind(snapshot.basis().branch_id.as_str().to_string())
             .push_bind(proposal_id.as_str().to_string())
             .push_bind(trigger_attempt_id.as_str().to_string())
             .push_bind(trigger_item.item_id.as_str().to_string())
