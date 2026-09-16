@@ -438,12 +438,13 @@ dev-sdk-deps:
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
-# The Web app consumes the package's dist entrypoint. Rebuild when source
-# changed so a restarted Web server cannot silently load an older decoder.
+<<<<<<< HEAD
+# The Web app consumes the package's dist entrypoint. Rebuild when source or
+# package configuration changed so a restarted Web server cannot silently load
+# an older decoder.
 	@if [ ! -f packages/sdk/dist/index.js ] || [ ! -f packages/sdk/dist/index.d.ts ] || \
-		[ -n "$$(find packages/sdk/src -type f -newer packages/sdk/dist/index.js -print -quit 2>/dev/null)" ] || \
-		[ packages/sdk/package.json -nt packages/sdk/dist/index.js ] || \
-		[ packages/sdk/tsup.config.ts -nt packages/sdk/dist/index.js ]; then \
+		[ -n "$$(find packages/sdk/src packages/sdk/package.json packages/sdk/tsconfig.json packages/sdk/tsup.config.ts \
+			-type f -newer packages/sdk/dist/index.js -print -quit 2>/dev/null)" ]; then \
 		echo "Building local @astra/sdk package..."; \
 		cd packages/sdk && npm run build; \
 	else \

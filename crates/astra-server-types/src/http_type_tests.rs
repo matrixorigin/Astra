@@ -53,6 +53,38 @@ fn default_functions_return_expected_values() {
     }
 }
 
+#[test]
+fn interaction_protocol_contract_matches_web_sdk() {
+    // The Web package is the other compiled consumer of this cross-language
+    // contract. Keep the assertion independent from the Web fixture values so
+    // changing both sides to the same stale major cannot make tests green.
+    let sdk_paths = include_str!("../../../packages/sdk/src/paths.ts")
+        .split_whitespace()
+        .collect::<String>();
+    let sdk_index = include_str!("../../../packages/sdk/src/index.ts")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(
+        sdk_paths.contains(&format!(
+            "exportconstASTRA_AGENT_INTERACTION_API_MAJOR_HEADER=\"{}\";",
+            AGENT_INTERACTION_API_MAJOR_HEADER
+        )),
+        "Web SDK header must match the Rust interaction contract"
+    );
+    assert!(
+        sdk_paths.contains(&format!(
+            "exportconstASTRA_AGENT_INTERACTION_API_MAJOR=\"{}\";",
+            AGENT_INTERACTION_API_MAJOR
+        )),
+        "Web SDK major must match the Rust interaction contract"
+    );
+    assert!(
+        sdk_index.contains("ASTRA_AGENT_INTERACTION_API_MAJOR,")
+            && sdk_index.contains("ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER,"),
+        "Web SDK must export the interaction contract"
+    );
+}
+
 // ── deserialization with defaults ───────────────────────────────
 
 #[test]

@@ -1,6 +1,8 @@
 import { parseChatSseFrame, isReplayConnectionError } from "@/lib/api/chat-sse-frame";
 import { NextRequest, NextResponse } from "next/server";
 import {
+  ASTRA_AGENT_INTERACTION_API_MAJOR,
+  ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER,
   PATH_CHAT_STREAM,
   buildQueryString,
   chatRunStreamPath,
@@ -178,8 +180,8 @@ function proxyRunStream(params: {
     assistantMessage: unknown;
   };
 }) {
-  const interactionProtocolHeader = "x-astra-agent-interaction-api-major";
-  const expectedInteractionProtocol = "1";
+  const interactionProtocolHeader = ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER;
+  const expectedInteractionProtocol = ASTRA_AGENT_INTERACTION_API_MAJOR;
   const {
     backendResponse,
     backendAbortController,
