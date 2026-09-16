@@ -30,14 +30,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<String, String> {
 fn parse_explain_mode_arg(
     value: &str,
 ) -> Result<crate::cli::session::session_state::ExplainMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" => Ok(crate::cli::session::session_state::ExplainMode::On),
-        "off" | "false" => Ok(crate::cli::session::session_state::ExplainMode::Off),
-        "verbose" => Ok(crate::cli::session::session_state::ExplainMode::Verbose),
-        other => Err(format!(
-            "invalid explain mode `{other}` (expected on, off, or verbose)"
-        )),
-    }
+    crate::cli::session::session_state::ExplainMode::parse_cli_arg(value)
 }
 
 #[cfg(feature = "harness")]

@@ -5101,6 +5101,7 @@ pub(crate) async fn run_tui_session(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
+    initial_explain: Option<crate::ExplainMode>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
@@ -5154,6 +5155,13 @@ pub(crate) async fn run_tui_session(
         shutdown_signal_rx,
         ..
     } = startup;
+    // An explicit launch flag is a session-local intent and wins over a
+    // previously synced preference. Apply it after startup preference pull
+    // but before transcript replay and the first turn so every surface sees
+    // one consistent mode without mutating prompt or tool schemas.
+    if let Some(explain_mode) = initial_explain {
+        state.explain = explain_mode;
+    }
     tracer.finish(state.session_id.as_deref());
 
     // Take terminal ownership before spawning any TUI-owned worker. If the

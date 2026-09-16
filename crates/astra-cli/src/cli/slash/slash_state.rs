@@ -828,11 +828,14 @@ pub(crate) async fn handle_state_command(
         }
 
         "/explain" => {
-            state.explain = match state.explain {
-                ExplainMode::Off => ExplainMode::On,
-                ExplainMode::On => ExplainMode::Verbose,
-                ExplainMode::Verbose => ExplainMode::Off,
+            let mode = match ExplainMode::parse_slash_arg(arg) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    eprintln!("  {}", error.yellow());
+                    return Ok(());
+                }
             };
+            state.explain = mode;
             let s = match state.explain {
                 ExplainMode::Off => "off".yellow().to_string(),
                 ExplainMode::On => "on".green().to_string(),

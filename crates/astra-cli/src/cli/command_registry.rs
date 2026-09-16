@@ -202,6 +202,18 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("tools", "Tool performance: calls, timing, success rate"),
 ];
 
+const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("on", "Show concise measured execution facts"),
+    (
+        "verbose",
+        "Include context, dependency, and coverage details",
+    ),
+    (
+        "off",
+        "Hide explain output while retaining durable evidence",
+    ),
+];
+
 const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[("log", "Server-owned sync log hint")];
 
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -586,9 +598,12 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Inspect and settings ───────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
-        "Cycle execution detail: off, on, or verbose",
+        "Show measured execution facts (on, verbose, or off)",
         CommandGroup::Inspect,
     )
+    .with_subcommands(EXPLAIN_SUBCOMMANDS)
+    .with_arg_hint("[on|verbose|off]")
+    .with_usage_examples(&["explain", "explain verbose", "explain off"])
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/compact",

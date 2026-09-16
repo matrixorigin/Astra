@@ -30,6 +30,45 @@ impl std::fmt::Display for ExplainMode {
     }
 }
 
+impl ExplainMode {
+    /// The slash command is an explicit setting, rather than a cycling
+    /// toggle.  A bare command is the shortest spelling for the useful
+    /// concise mode; repeating it is therefore idempotent and safe when an
+    /// input is retried after a reconnect or session handoff.
+    pub(crate) const SLASH_USAGE: &'static str = "Usage: /explain [on|verbose|off]";
+
+    /// Parse the user-facing `/explain` argument contract shared by the TUI
+    /// and line-mode command paths.  This deliberately does not accept the
+    /// `true`/`false` aliases used by the process CLI flag: slash commands are
+    /// documented with the three explain modes and should fail clearly on a
+    /// typo without changing the current state.
+    pub(crate) fn parse_slash_arg(arg: &str) -> Result<Self, String> {
+        match arg.trim().to_ascii_lowercase().as_str() {
+            "" | "on" => Ok(Self::On),
+            "verbose" => Ok(Self::Verbose),
+            "off" => Ok(Self::Off),
+            other => Err(format!(
+                "Invalid explain mode `{other}`. {}",
+                Self::SLASH_USAGE
+            )),
+        }
+    }
+
+    /// Parse the clap `--explain [mode]` value.  Boolean aliases remain
+    /// accepted here because they are already part of the non-interactive
+    /// CLI contract; both parsers still produce the same canonical enum.
+    pub(crate) fn parse_cli_arg(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" => Ok(Self::On),
+            "off" | "false" => Ok(Self::Off),
+            "verbose" => Ok(Self::Verbose),
+            other => Err(format!(
+                "invalid explain mode `{other}` (expected on, off, or verbose)"
+            )),
+        }
+    }
+}
+
 /// Active `/skill dev` session — name and directory are always set together.
 #[derive(Clone, Debug)]
 pub(crate) struct SkillDevState {
@@ -771,6 +810,29 @@ impl SessionState {
 mod default_tests {
     use super::{ContinuationAnchor, ExplainMode, SessionState};
     use crate::cli::permission_manager::PermissionManager;
+
+    #[test]
+    fn explain_slash_parser_is_explicit_and_idempotent() {
+        assert_eq!(ExplainMode::parse_slash_arg(""), Ok(ExplainMode::On));
+        assert_eq!(ExplainMode::parse_slash_arg(" on "), Ok(ExplainMode::On));
+        assert_eq!(
+            ExplainMode::parse_slash_arg("VERBOSE"),
+            Ok(ExplainMode::Verbose)
+        );
+        assert_eq!(ExplainMode::parse_slash_arg("off"), Ok(ExplainMode::Off));
+        assert!(ExplainMode::parse_slash_arg("true").is_err());
+        assert!(ExplainMode::parse_slash_arg("on extra").is_err());
+    }
+
+    #[test]
+    fn explain_cli_parser_keeps_boolean_aliases() {
+        assert_eq!(ExplainMode::parse_cli_arg("true"), Ok(ExplainMode::On));
+        assert_eq!(ExplainMode::parse_cli_arg("false"), Ok(ExplainMode::Off));
+        assert_eq!(
+            ExplainMode::parse_cli_arg("verbose"),
+            Ok(ExplainMode::Verbose)
+        );
+    }
 
     #[test]
     fn default_auto_approve_reads_env_flag() {

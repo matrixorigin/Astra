@@ -173,7 +173,7 @@ fn resolve_journal_target_session_uses_active_session_without_argument() {
 }
 
 #[tokio::test]
-async fn slash_explain_toggles_state() {
+async fn slash_explain_sets_an_explicit_mode_and_retries_are_idempotent() {
     let api =
         astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
     let mut state = SessionState::default();
@@ -189,13 +189,35 @@ async fn slash_explain_toggles_state() {
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
+    assert_eq!(state.explain, ExplainMode::On);
+
+    let should_exit = handle_slash_command("/explain verbose", &api, None, &mut state, None)
+        .await
+        .expect("slash command should succeed");
+    assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::Verbose);
 
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
+    let should_exit = handle_slash_command("/explain off", &api, None, &mut state, None)
         .await
         .expect("slash command should succeed");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::Off);
+}
+
+#[tokio::test]
+async fn slash_explain_rejects_invalid_mode_without_mutating_state() {
+    let api =
+        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
+    let mut state = SessionState {
+        explain: ExplainMode::Verbose,
+        ..Default::default()
+    };
+
+    let should_exit = handle_slash_command("/explain maybe", &api, None, &mut state, None)
+        .await
+        .expect("slash command should report usage without failing the REPL");
+    assert!(!should_exit);
+    assert_eq!(state.explain, ExplainMode::Verbose);
 }
 
 #[test]

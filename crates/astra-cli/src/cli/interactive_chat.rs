@@ -6,11 +6,13 @@
 use crossterm::style::Stylize;
 
 use crate::cli::cli_config::cli_context::CliContext;
+use crate::cli::session::session_state::ExplainMode;
 
 pub(crate) async fn run_interactive_chat(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     initial_model: Option<&str>,
+    initial_explain: Option<ExplainMode>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
     cli_context: &CliContext,
@@ -32,6 +34,7 @@ pub(crate) async fn run_interactive_chat(
         api,
         profile,
         initial_model,
+        initial_explain,
         resume_session_id,
         no_instructions,
         cli_context,

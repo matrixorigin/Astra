@@ -126,6 +126,10 @@ pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
     }
 }
 
+fn explain_mode_for_command(args: &str) -> Result<ExplainMode, String> {
+    ExplainMode::parse_slash_arg(args)
+}
+
 /// Immutable request captured when a read-only memory surface is submitted.
 /// Authentication, local artifact reads and remote retrieval happen in the
 /// background worker; the event loop only projects a typed completion.
@@ -648,11 +652,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Explain ─────────────────────────────────────────────────
         "/explain" => {
-            ctx.state.explain = match ctx.state.explain {
-                ExplainMode::Off => ExplainMode::On,
-                ExplainMode::On => ExplainMode::Verbose,
-                ExplainMode::Verbose => ExplainMode::Off,
+            let mode = match explain_mode_for_command(args) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    ctx.show_error(error);
+                    return SlashResult::Handled;
+                }
             };
+            ctx.state.explain = mode;
             let label = match ctx.state.explain {
                 ExplainMode::Off => "off",
                 ExplainMode::On => "on",
@@ -3401,11 +3408,12 @@ mod routing_tests {
         CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
         MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
         SkillCommandRoute, WorkCommandRoute, config_command_route, context_breakdown_for_panel,
-        context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
-        keyboard_shortcut_pairs, memory_command_route, skill_command_route, work_command_route,
+        context_dump_argument, explain_mode_for_command, help_command_route, history_command_route,
+        is_model_picker_request, keyboard_shortcut_pairs, memory_command_route,
+        skill_command_route, work_command_route,
     };
     use crate::cli::command_registry;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ExplainMode, SessionState};
     use crate::tui::context_panel::{
         ContextSnapshot,
         model::{SessionSummary, VisibleConversationItem},
@@ -3547,6 +3555,18 @@ mod routing_tests {
             WorkCommandRoute::Unsupported,
             "the old list alias adds no distinct TUI behavior"
         );
+    }
+
+    #[test]
+    fn explain_route_matches_the_shared_slash_contract() {
+        assert_eq!(explain_mode_for_command(""), Ok(ExplainMode::On));
+        assert_eq!(explain_mode_for_command("on"), Ok(ExplainMode::On));
+        assert_eq!(
+            explain_mode_for_command("verbose"),
+            Ok(ExplainMode::Verbose)
+        );
+        assert_eq!(explain_mode_for_command("off"), Ok(ExplainMode::Off));
+        assert!(explain_mode_for_command("typo").is_err());
     }
 
     #[test]

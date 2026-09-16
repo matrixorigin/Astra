@@ -433,6 +433,7 @@ async fn run_async() -> i32 {
                     &api,
                     profile.as_deref(),
                     resolved_model.as_deref(),
+                    None,
                     Some(&sid),
                     no_instructions,
                     &cli_context,
