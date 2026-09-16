@@ -378,6 +378,7 @@ pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResp
 pub(super) async fn current_health(state: &AppState) -> HealthResponse {
     let database_health = state.health_checker.database_health().await;
     let memoria_health = state.cached_memoria_health();
+    let build_info = astra_core::build_info::current();
 
     let status = if !database_health.is_healthy() {
         "unhealthy"
@@ -392,7 +393,10 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
         database: database_health.database_label().to_string(),
         memoria: memoria_health.label().to_string(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
-        build_git_sha: astra_core::history_work_baseline::BUILD_GIT_SHA.to_string(),
+        build_git_sha: build_info.git_sha.to_string(),
+        build_git_dirty: build_info.git_dirty,
+        build_target: build_info.target.to_string(),
+        build_profile: build_info.profile.to_string(),
     }
 }
 

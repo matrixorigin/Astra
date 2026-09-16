@@ -583,6 +583,9 @@ fn health_response_serializes() {
         memoria: "connected".into(),
         interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: "a".repeat(40),
+        build_git_dirty: false,
+        build_target: "x86_64-unknown-linux-gnu".into(),
+        build_profile: "release".into(),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
@@ -591,6 +594,9 @@ fn health_response_serializes() {
     assert!(v.get("persist_ok").is_none());
     assert!(v.get("persist_fail").is_none());
     assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
+    assert!(!v["build_git_dirty"].as_bool().unwrap());
+    assert_eq!(v["build_target"], "x86_64-unknown-linux-gnu");
+    assert_eq!(v["build_profile"], "release");
 }
 
 #[test]

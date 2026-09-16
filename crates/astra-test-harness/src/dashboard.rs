@@ -1278,6 +1278,7 @@ async fn execute_run(
     use crate::digest::AstraCliDigestCollector;
     use crate::exec::AstraCliExecutor;
     use crate::judger::{AstraCliJudger, JudgerConfig};
+    use crate::preflight::probe_server_identity;
     use crate::runner::{RunnerConfig, resolve_runner_profile_owner};
     use crate::suite::{ScopedDiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
 
@@ -1340,7 +1341,7 @@ async fn execute_run(
     }
     let executor_identity = Some(tested_binary.clone());
     let effective_models = effective_model_ids(&cases, &runner_cfg);
-    let benchmark_manifest = BenchmarkManifest::new(
+    let mut benchmark_manifest = BenchmarkManifest::new(
         &cases,
         &effective_models,
         BenchmarkConfig {
@@ -1371,6 +1372,18 @@ async fn execute_run(
         executor_identity,
         chrono::Utc::now().to_rfc3339(),
     );
+    benchmark_manifest.serving_runtime = probe_server_identity(
+        &config.astra_bin,
+        runner_cfg.profile.as_deref(),
+        runner_cfg.working_dir.as_deref(),
+        &cases,
+    )
+    .await;
+    if benchmark_manifest.serving_runtime.is_none() {
+        eprintln!(
+            "[astra-test] WARNING: serving Server build identity is unavailable; runtime-performance attribution will be disabled"
+        );
+    }
 
     // SuiteStarted is emitted by runner.run_all() — don't duplicate here.
     let runner = SuiteRunner {

@@ -65,9 +65,10 @@ A change should not activate if it causes material regression in:
 The `astra-test` harness persists a typed manifest with each JSON suite
 report. It records the case digest, effective model matrix, effective working
 directory, profile and repeat/concurrency settings, full capture and judger
-configuration, executor kind, and the embedded build identity of the process
-that actually ran the cases. External command text is represented only by a
-digest; the manifest does not contain credentials or command stderr.
+configuration, executor kind, the local CLI build identity, and the
+independently observed build identity of the serving Server that owns the
+agent loop. External command text is represented only by a digest; the
+manifest does not contain credentials or command stderr.
 
 The report also contains one canonical aggregate keyed by `(case, model)`.
 Planned, executed, passed, failed, cancelled, unavailable, and incomplete
@@ -83,9 +84,13 @@ quality or efficiency deltas. A case/model/configuration mismatch is
 `incomparable`. Efficiency is considered only with at least three successful,
 complete observations in each report and only when the quality rate has not
 decreased; an earlier failure, cancellation, or unavailable row therefore
-cannot masquerade as a cheaper run. Missing case-executor identity makes
-performance comparison unavailable while keeping the current product result
-visible.
+cannot masquerade as a cheaper run. Missing or untrusted case-executor or
+serving-Server identity (including a dirty build without an artifact digest)
+makes performance comparison unavailable while keeping the current product
+result visible. Known revision changes remain valid before/after comparisons
+and are surfaced as `binary_changed: true`; they are not treated as an
+identity gap. If an identity is missing, dirty, or otherwise unresolved,
+`binary_changed` is `null`, never an assertion that the binary is unchanged.
 
 ## Relationship to learning
 

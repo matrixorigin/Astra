@@ -19,7 +19,7 @@ use crate::case::Case;
 use crate::report::{CaseRunReport, CaseRunStatus, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 
-pub const BENCHMARK_MANIFEST_SCHEMA: &str = "astra.benchmark.manifest.v1";
+pub const BENCHMARK_MANIFEST_SCHEMA: &str = "astra.benchmark.manifest.v2";
 pub const BENCHMARK_AGGREGATE_SCHEMA: &str = "astra.benchmark.aggregate.v1";
 pub const BENCHMARK_COMPARISON_SCHEMA: &str = "astra.benchmark.comparison.v1";
 
@@ -46,6 +46,15 @@ pub struct BinaryBuildInfo {
     pub git_dirty: bool,
     pub target: String,
     pub profile: String,
+}
+
+/// Trusted identity observed from the serving Astra Server that owns the
+/// agent loop. The local CLI starts the request, but it is not the runtime
+/// whose scheduling, policy, and prompt assembly are being measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerIdentity {
+    pub build_info: BinaryBuildInfo,
+    pub interaction_api_major: String,
 }
 
 /// Effective harness settings that affect whether two runs are comparable.
@@ -108,6 +117,11 @@ pub struct BenchmarkManifest {
     /// absent because a command string is not a trustworthy build identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_identity: Option<BinaryIdentity>,
+    /// Identity observed from the serving Server. Missing identity makes
+    /// runtime-performance attribution unavailable instead of silently
+    /// attributing Server behavior to the local CLI binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_runtime: Option<ServerIdentity>,
 }
 
 impl BenchmarkManifest {
@@ -138,6 +152,7 @@ impl BenchmarkManifest {
             config,
             tested_binary,
             executor_identity,
+            serving_runtime: None,
         }
     }
 }
@@ -230,13 +245,24 @@ fn parse_binary_build_info(bytes: &[u8]) -> Result<BinaryBuildInfo, String> {
         .get("git_dirty")
         .and_then(Value::as_bool)
         .ok_or_else(|| "build-info field \"git_dirty\" must be boolean".to_string())?;
+    let git_sha = string_field("git_sha")?;
+    if !is_known_git_sha(&git_sha) {
+        return Err(
+            "build-info field \"git_sha\" must be a 40/64-character hexadecimal revision"
+                .to_string(),
+        );
+    }
     Ok(BinaryBuildInfo {
         schema,
-        git_sha: string_field("git_sha")?,
+        git_sha,
         git_dirty,
         target: string_field("target")?,
         profile: string_field("profile")?,
     })
+}
+
+fn is_known_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Resolve the directory actually inherited by subprocesses.  Recording the
@@ -683,7 +709,11 @@ pub struct BenchmarkComparison {
     pub performance_comparable: bool,
     pub reasons: Vec<String>,
     pub performance_reasons: Vec<String>,
-    pub binary_changed: bool,
+    /// `Some(true/false)` only when every runtime identity involved in the
+    /// comparison is known and clean. `None` means the reports cannot prove
+    /// whether the executable changed (for example a missing or dirty
+    /// identity); it must never be rendered as "unchanged".
+    pub binary_changed: Option<bool>,
     pub summary: ComparisonSummary,
     pub groups: Vec<BenchmarkGroupComparison>,
 }
@@ -753,13 +783,13 @@ impl BenchmarkComparison {
 fn compare_manifests(
     current: Option<&BenchmarkManifest>,
     baseline: Option<&BenchmarkManifest>,
-) -> (bool, Vec<String>, bool, Vec<String>, bool) {
+) -> (bool, Vec<String>, bool, Vec<String>, Option<bool>) {
     let mut reasons = Vec::new();
     let mut performance_reasons = Vec::new();
     let (Some(current), Some(baseline)) = (current, baseline) else {
         reasons.push("both reports must contain a benchmark manifest".to_string());
         performance_reasons.push("binary/platform identity is missing".to_string());
-        return (false, reasons, false, performance_reasons, false);
+        return (false, reasons, false, performance_reasons, None);
     };
     if current.schema != baseline.schema {
         reasons.push(format!(
@@ -784,25 +814,21 @@ fn compare_manifests(
             baseline.platform, current.platform
         ));
     }
-    if baseline.tested_binary.build_info.is_none() || current.tested_binary.build_info.is_none() {
-        performance_reasons.push("one or both tested binary build identities are unknown".into());
-    }
+    append_binary_identity_reasons(
+        &mut performance_reasons,
+        "one or both tested binary",
+        Some(&baseline.tested_binary),
+    );
+    append_binary_identity_reasons(
+        &mut performance_reasons,
+        "one or both tested binary",
+        Some(&current.tested_binary),
+    );
     if baseline.executor_identity.is_none() || current.executor_identity.is_none() {
         performance_reasons.push(
             "one or both case executor identities are unknown; external executors must provide a trusted identity"
                 .into(),
         );
-    }
-    if baseline
-        .executor_identity
-        .as_ref()
-        .is_some_and(|identity| identity.build_info.is_none())
-        || current
-            .executor_identity
-            .as_ref()
-            .is_some_and(|identity| identity.build_info.is_none())
-    {
-        performance_reasons.push("one or both case executor build identities are unknown".into());
     }
     if baseline
         .executor_identity
@@ -815,17 +841,70 @@ fn compare_manifests(
     {
         performance_reasons.push("one or both case executor identity probes failed".into());
     }
+    if baseline.executor_identity.is_some() {
+        append_binary_identity_reasons(
+            &mut performance_reasons,
+            "one or both case executor",
+            baseline.executor_identity.as_ref(),
+        );
+    }
+    if current.executor_identity.is_some() {
+        append_binary_identity_reasons(
+            &mut performance_reasons,
+            "one or both case executor",
+            current.executor_identity.as_ref(),
+        );
+    }
+
+    match (
+        baseline.serving_runtime.as_ref(),
+        current.serving_runtime.as_ref(),
+    ) {
+        (Some(baseline), Some(current)) => {
+            if baseline.interaction_api_major.trim().is_empty()
+                || current.interaction_api_major.trim().is_empty()
+            {
+                performance_reasons.push(
+                    "one or both serving Server identities omit interaction API metadata".into(),
+                );
+            }
+            if baseline.interaction_api_major != current.interaction_api_major {
+                reasons.push(format!(
+                    "serving Server interaction API differs (baseline={}, current={})",
+                    baseline.interaction_api_major, current.interaction_api_major
+                ));
+            }
+            if !is_resolved_build_info(&baseline.build_info)
+                || !is_resolved_build_info(&current.build_info)
+            {
+                performance_reasons.push(
+                    "one or both serving Server identities have unknown or incomplete build metadata"
+                        .into(),
+                );
+            }
+            if baseline.build_info.git_dirty || current.build_info.git_dirty {
+                performance_reasons.push(
+                    "one or both serving Server builds are dirty and have no trusted artifact identity"
+                        .into(),
+                );
+            }
+        }
+        _ => performance_reasons.push(
+            "one or both serving Server build identities are unknown; runtime-performance attribution is unavailable"
+                .into(),
+        ),
+    }
+
     // Paths are machine-local provenance and may differ between CI workers;
-    // only the typed identity of the process that executed cases denotes a
-    // binary change.  Auxiliary Astra CLI provenance is never used here.
-    let binary_changed = current
-        .executor_identity
-        .as_ref()
-        .and_then(|identity| identity.build_info.as_ref())
-        != baseline
-            .executor_identity
-            .as_ref()
-            .and_then(|identity| identity.build_info.as_ref());
+    // only typed identities denote a binary/runtime change. Version changes
+    // remain comparable, but are surfaced through this flag. An unresolved
+    // identity produces `None`, so the report cannot claim "unchanged".
+    let binary_changed = binary_change_status(
+        baseline.executor_identity.as_ref(),
+        current.executor_identity.as_ref(),
+        baseline.serving_runtime.as_ref(),
+        current.serving_runtime.as_ref(),
+    );
     let comparable = reasons.is_empty();
     let performance_comparable = comparable && performance_reasons.is_empty();
     (
@@ -835,6 +914,97 @@ fn compare_manifests(
         performance_reasons,
         binary_changed,
     )
+}
+
+fn binary_change_status(
+    baseline_executor: Option<&BinaryIdentity>,
+    current_executor: Option<&BinaryIdentity>,
+    baseline_server: Option<&ServerIdentity>,
+    current_server: Option<&ServerIdentity>,
+) -> Option<bool> {
+    let mut changed = false;
+    let mut compare_binary = |baseline: Option<&BinaryBuildInfo>,
+                              current: Option<&BinaryBuildInfo>| {
+        let (Some(baseline), Some(current)) = (baseline, current) else {
+            return false;
+        };
+        if !is_resolved_build_info(baseline) || !is_resolved_build_info(current) {
+            return false;
+        }
+        changed |= baseline != current;
+        true
+    };
+
+    if !compare_binary(
+        baseline_executor.and_then(|identity| identity.build_info.as_ref()),
+        current_executor.and_then(|identity| identity.build_info.as_ref()),
+    ) {
+        return None;
+    }
+    if baseline_executor.is_some_and(|identity| identity.probe_error.is_some())
+        || current_executor.is_some_and(|identity| identity.probe_error.is_some())
+    {
+        return None;
+    }
+
+    let (Some(baseline_server), Some(current_server)) = (baseline_server, current_server) else {
+        return None;
+    };
+    if baseline_server.interaction_api_major.trim().is_empty()
+        || current_server.interaction_api_major.trim().is_empty()
+    {
+        return None;
+    }
+    if !is_resolved_build_info(&baseline_server.build_info)
+        || !is_resolved_build_info(&current_server.build_info)
+    {
+        return None;
+    }
+    changed |= baseline_server.interaction_api_major != current_server.interaction_api_major;
+    changed |= baseline_server.build_info != current_server.build_info;
+    Some(changed)
+}
+
+fn is_resolved_build_info(build_info: &BinaryBuildInfo) -> bool {
+    build_info.schema == "astra.build_info.v1"
+        && is_known_git_sha(&build_info.git_sha)
+        && !build_info.git_dirty
+        && !build_info.target.trim().is_empty()
+        && !build_info.profile.trim().is_empty()
+}
+
+fn append_binary_identity_reasons(
+    performance_reasons: &mut Vec<String>,
+    label: &str,
+    identity: Option<&BinaryIdentity>,
+) {
+    let Some(identity) = identity else {
+        performance_reasons.push(format!("{label} build identity is unknown"));
+        return;
+    };
+    let Some(build_info) = identity.build_info.as_ref() else {
+        performance_reasons.push(format!("{label} build identity is unknown"));
+        return;
+    };
+    if identity.probe_error.is_some() {
+        performance_reasons.push(format!("{label} identity probe failed"));
+    }
+    if !is_known_git_sha(&build_info.git_sha) {
+        performance_reasons.push(format!(
+            "{label} build identity has an unknown source revision"
+        ));
+    }
+    if build_info.schema != "astra.build_info.v1"
+        || build_info.target.trim().is_empty()
+        || build_info.profile.trim().is_empty()
+    {
+        performance_reasons.push(format!("{label} build identity has incomplete metadata"));
+    }
+    if build_info.git_dirty {
+        performance_reasons.push(format!(
+            "{label} build is dirty and has no trusted artifact identity"
+        ));
+    }
 }
 
 fn append_config_differences(
@@ -1137,7 +1307,17 @@ mod tests {
     }
 
     fn manifest(cases: &[Case], binary_sha: &str) -> BenchmarkManifest {
-        BenchmarkManifest::new(
+        let binary_sha = match binary_sha {
+            "same" => "a".repeat(40),
+            "old" => "b".repeat(40),
+            "new" => "c".repeat(40),
+            other if is_known_git_sha(other) => other.to_string(),
+            other => format!(
+                "{:0<40}",
+                other.replace(|character: char| !character.is_ascii_hexdigit(), "0")
+            ),
+        };
+        let mut manifest = BenchmarkManifest::new(
             cases,
             &["model".into()],
             BenchmarkConfig {
@@ -1164,7 +1344,7 @@ mod tests {
                 path: "/bin/astra".into(),
                 build_info: Some(BinaryBuildInfo {
                     schema: "astra.build_info.v1".into(),
-                    git_sha: binary_sha.into(),
+                    git_sha: binary_sha.clone(),
                     git_dirty: false,
                     target: "x86_64".into(),
                     profile: "release".into(),
@@ -1175,7 +1355,7 @@ mod tests {
                 path: "/bin/astra".into(),
                 build_info: Some(BinaryBuildInfo {
                     schema: "astra.build_info.v1".into(),
-                    git_sha: binary_sha.into(),
+                    git_sha: binary_sha.clone(),
                     git_dirty: false,
                     target: "x86_64".into(),
                     profile: "release".into(),
@@ -1183,7 +1363,18 @@ mod tests {
                 probe_error: None,
             }),
             "2026-09-16T00:00:00Z",
-        )
+        );
+        manifest.serving_runtime = Some(ServerIdentity {
+            build_info: BinaryBuildInfo {
+                schema: "astra.build_info.v1".into(),
+                git_sha: binary_sha,
+                git_dirty: false,
+                target: "x86_64".into(),
+                profile: "release".into(),
+            },
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+        });
+        manifest
     }
 
     fn case(name: &str, prompt: &str) -> Case {
@@ -1277,7 +1468,7 @@ mod tests {
             comparison.groups[0].efficiency_status,
             ComparisonStatus::InsufficientEvidence
         );
-        assert!(comparison.binary_changed);
+        assert_eq!(comparison.binary_changed, Some(true));
 
         let without_manifest = SuiteReport {
             runs: current.runs.clone(),
@@ -1402,6 +1593,107 @@ mod tests {
             comparison.groups[0].efficiency_status,
             ComparisonStatus::Incomparable
         );
+    }
+
+    #[test]
+    fn serving_runtime_identity_is_required_and_changes_are_reported() {
+        let cases = vec![case("c", "prompt")];
+        let baseline = SuiteReport {
+            runs: vec![run("c", "model", 0, CaseRunStatus::Passed, 10)],
+            manifest: Some(manifest(&cases, "same")),
+            ..Default::default()
+        };
+
+        let mut changed_manifest = manifest(&cases, "same");
+        changed_manifest
+            .serving_runtime
+            .as_mut()
+            .unwrap()
+            .build_info
+            .git_sha = "b".repeat(40);
+        let changed = SuiteReport {
+            runs: vec![run("c", "model", 0, CaseRunStatus::Passed, 1)],
+            manifest: Some(changed_manifest),
+            ..Default::default()
+        };
+        let comparison = BenchmarkComparison::compare(&changed, &baseline);
+        assert!(comparison.performance_comparable);
+        assert_eq!(comparison.binary_changed, Some(true));
+
+        let mut missing_manifest = manifest(&cases, "same");
+        missing_manifest.serving_runtime = None;
+        let missing = SuiteReport {
+            runs: vec![run("c", "model", 0, CaseRunStatus::Passed, 1)],
+            manifest: Some(missing_manifest),
+            ..Default::default()
+        };
+        let comparison = BenchmarkComparison::compare(&missing, &baseline);
+        assert!(!comparison.performance_comparable);
+        assert_eq!(comparison.binary_changed, None);
+        assert!(
+            comparison
+                .performance_reasons
+                .iter()
+                .any(|reason| reason.contains("serving Server build identities"))
+        );
+    }
+
+    #[test]
+    fn dirty_or_unknown_build_identity_cannot_claim_performance_comparability() {
+        let cases = vec![case("c", "prompt")];
+        let mut baseline_manifest = manifest(&cases, "same");
+        baseline_manifest
+            .tested_binary
+            .build_info
+            .as_mut()
+            .unwrap()
+            .git_dirty = true;
+        baseline_manifest
+            .executor_identity
+            .as_mut()
+            .unwrap()
+            .build_info
+            .as_mut()
+            .unwrap()
+            .git_dirty = true;
+        baseline_manifest
+            .serving_runtime
+            .as_mut()
+            .unwrap()
+            .build_info
+            .git_dirty = true;
+        let mut current_manifest = baseline_manifest.clone();
+        current_manifest
+            .serving_runtime
+            .as_mut()
+            .unwrap()
+            .build_info
+            .target = "different-target".into();
+        let baseline = SuiteReport {
+            runs: vec![run("c", "model", 0, CaseRunStatus::Passed, 10)],
+            manifest: Some(baseline_manifest.clone()),
+            ..Default::default()
+        };
+        let current = SuiteReport {
+            runs: vec![run("c", "model", 0, CaseRunStatus::Passed, 1)],
+            manifest: Some(current_manifest),
+            ..Default::default()
+        };
+        let comparison = BenchmarkComparison::compare(&current, &baseline);
+        assert!(!comparison.performance_comparable);
+        assert_eq!(comparison.binary_changed, None);
+        assert!(
+            comparison
+                .performance_reasons
+                .iter()
+                .any(|reason| reason.contains("dirty"))
+        );
+
+        let error = parse_binary_build_info(
+            br#"{"schema":"astra.build_info.v1","git_sha":"unknown","git_dirty":false,"target":"x86_64","profile":"release"}"#,
+        )
+        .expect_err("unknown source identity must fail closed");
+        assert!(error.contains("git_sha"));
     }
 
     #[test]

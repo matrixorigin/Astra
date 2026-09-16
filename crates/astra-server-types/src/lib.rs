@@ -1276,6 +1276,9 @@ pub struct HealthResponse {
     pub memoria: String,
     pub interaction_api_major: String,
     pub build_git_sha: String,
+    pub build_git_dirty: bool,
+    pub build_target: String,
+    pub build_profile: String,
 }
 
 #[cfg(feature = "server")]

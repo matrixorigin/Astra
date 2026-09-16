@@ -303,7 +303,10 @@ orchestrator probes.
   "database": "connected",
   "memoria": "available",
   "interaction_api_major": "3",
-  "build_git_sha": "0123456789abcdef0123456789abcdef01234567"
+  "build_git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "build_git_dirty": false,
+  "build_target": "aarch64-apple-darwin",
+  "build_profile": "release"
 }
 ```
 

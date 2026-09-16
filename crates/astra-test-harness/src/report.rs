@@ -847,11 +847,14 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     }
 
     if let Some(comparison) = &report.baseline_comparison {
+        let binary_changed = comparison
+            .binary_changed
+            .map_or("unknown", |changed| if changed { "true" } else { "false" });
         s.push_str(&format!(
             "=== baseline comparison ===\n  comparable={} performance_comparable={} binary_changed={} quality_improved={} quality_regressed={} efficiency_improved={} efficiency_regressed={} insufficient={} incomparable={}\n",
             comparison.comparable,
             comparison.performance_comparable,
-            comparison.binary_changed,
+            binary_changed,
             comparison.summary.quality_improved,
             comparison.summary.quality_regressed,
             comparison.summary.efficiency_improved,

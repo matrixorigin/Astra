@@ -98,8 +98,9 @@ therefore does not manufacture compaction pressure; compaction mechanics and
     --baseline target/benchmark-baseline.json
 ```
 
-Every CLI report carries an `astra.benchmark.manifest.v1` identity and a canonical
+Every CLI report carries an `astra.benchmark.manifest.v2` identity and a canonical
 row aggregate. The manifest records the tested binary's typed build identity,
+the independently observed serving Server build identity,
 case digest, effective model matrix, effective working directory, profile,
 repeat/concurrency settings, judger kind/model/timeout/quorum, capture mode,
 and executor kind (external command contents are stored only as SHA-256
@@ -115,8 +116,14 @@ current report. Case/model/configuration mismatches are marked
 `incomparable`. Efficiency is evaluated only with at least three successful,
 complete observations in both reports and only when quality has not regressed;
 cancelled rows and early failures therefore cannot manufacture a cost win.
-Unknown or missing binary identity makes performance comparison unavailable,
-while still leaving the current run's product result visible.
+Unknown or missing CLI/Server identity, including dirty builds without an
+artifact digest, makes performance comparison unavailable while still leaving
+the current run's product result visible. A known Server or CLI revision may
+change between reports; that change is surfaced as `binary_changed: true` while
+the comparison remains eligible for before/after analysis. When any executor or
+serving identity is missing, dirty, or otherwise unresolved, `binary_changed` is
+`null` and performance attribution is unavailable; it is never reported as
+unchanged.
 
 ### `--astra-bin` resolution
 

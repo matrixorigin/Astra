@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use astra_test_harness::benchmark::{
-    BenchmarkComparison, BenchmarkConfig, BenchmarkManifest, ExecutorKind, JudgerKind,
-    digest_command, effective_model_ids, effective_working_dir, probe_binary_identity,
+    BENCHMARK_MANIFEST_SCHEMA, BenchmarkComparison, BenchmarkConfig, BenchmarkManifest,
+    ExecutorKind, JudgerKind, digest_command, effective_model_ids, effective_working_dir,
+    probe_binary_identity,
 };
 use astra_test_harness::case::{Case, expand_prompt_variants, matches_filter};
 use astra_test_harness::criteria::{Criterion, requires_session_capture};
@@ -247,6 +248,28 @@ fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) ->
     PathBuf::from("crates/astra-test-harness/cases")
 }
 
+fn load_baseline_report(path: &std::path::Path) -> Result<astra_test_harness::report::SuiteReport> {
+    let baseline_text = std::fs::read_to_string(path)
+        .with_context(|| format!("read baseline report {}", path.display()))?;
+    let report: astra_test_harness::report::SuiteReport = serde_json::from_str(&baseline_text)
+        .with_context(|| format!("parse baseline report {} as SuiteReport", path.display()))?;
+    let manifest = report.manifest.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "baseline report {} has no benchmark manifest",
+            path.display()
+        )
+    })?;
+    if manifest.schema != BENCHMARK_MANIFEST_SCHEMA {
+        anyhow::bail!(
+            "baseline report {} uses unsupported manifest schema {}; expected {}",
+            path.display(),
+            manifest.schema,
+            BENCHMARK_MANIFEST_SCHEMA
+        );
+    }
+    Ok(report)
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -398,6 +421,16 @@ async fn main() -> Result<()> {
         anyhow::bail!("no cases found in {}", suite_path.display());
     }
 
+    // Read and parse the baseline before preflight or any paid provider call.
+    // The parsed snapshot is held in memory so a file changed during the run
+    // cannot silently alter the comparison or make a completed report
+    // disappear behind a late parse error.
+    let baseline = args
+        .baseline
+        .as_deref()
+        .map(load_baseline_report)
+        .transpose()?;
+
     if args.capability_probes {
         let coverage =
             astra_test_harness::capability_coverage::retain_model_probe_cases(&mut cases)
@@ -441,6 +474,7 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
     let mut runner_profile = args.profile.clone();
+    let mut serving_runtime = None;
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
@@ -482,18 +516,26 @@ async fn main() -> Result<()> {
             &preflight_models,
             args.profile.as_deref(),
             require_memoria,
+            args.working_dir.as_deref(),
+            &cases,
         )
         .await
         {
-            Ok(effective_profile) => {
-                if effective_profile.is_some() {
-                    runner_profile = effective_profile;
+            Ok(preflight) => {
+                if preflight.effective_profile.is_some() {
+                    runner_profile = preflight.effective_profile;
                 }
+                serving_runtime = preflight.server_identity;
             }
             Err(e) => {
                 anyhow::bail!("pre-flight check failed: {e}\n  (use --skip-preflight to bypass)");
             }
         }
+    }
+    if serving_runtime.is_none() {
+        eprintln!(
+            "[astra-test] WARNING: serving Server build identity is unavailable; runtime-performance attribution will be disabled"
+        );
     }
 
     let runner_identity =
@@ -629,7 +671,7 @@ async fn main() -> Result<()> {
         SessionCaptureMode::OnDebugLog => "on_debug_log",
         SessionCaptureMode::Always => "always",
     };
-    let benchmark_manifest = BenchmarkManifest::new(
+    let mut benchmark_manifest = BenchmarkManifest::new(
         &cases,
         &effective_models,
         BenchmarkConfig {
@@ -656,6 +698,7 @@ async fn main() -> Result<()> {
         executor_identity,
         chrono::Utc::now().to_rfc3339(),
     );
+    benchmark_manifest.serving_runtime = serving_runtime;
 
     let runner = SuiteRunner {
         executor: executor.as_ref(),
@@ -675,17 +718,8 @@ async fn main() -> Result<()> {
     suite.manifest = Some(benchmark_manifest);
     suite.aggregate = Some(suite.benchmark_aggregate());
 
-    if let Some(ref baseline_path) = args.baseline {
-        let baseline_text = std::fs::read_to_string(baseline_path)
-            .with_context(|| format!("read baseline report {}", baseline_path.display()))?;
-        let baseline: astra_test_harness::report::SuiteReport =
-            serde_json::from_str(&baseline_text).with_context(|| {
-                format!(
-                    "parse baseline report {} as SuiteReport",
-                    baseline_path.display()
-                )
-            })?;
-        suite.baseline_comparison = Some(BenchmarkComparison::compare(&suite, &baseline));
+    if let Some(baseline) = baseline.as_ref() {
+        suite.baseline_comparison = Some(BenchmarkComparison::compare(&suite, baseline));
     }
 
     // Persist artifacts if requested.
@@ -779,9 +813,17 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_astra_bin;
+    use super::{
+        BenchmarkConfig, BenchmarkManifest, load_baseline_report, resolve_workspace_astra_bin,
+    };
+    use astra_test_harness::benchmark::{
+        BinaryBuildInfo, BinaryIdentity, ExecutorKind, JudgerKind, ServerIdentity,
+    };
+    use astra_test_harness::case::Case;
+    use astra_test_harness::report::SuiteReport;
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
+    use std::path::Path;
     use std::time::Duration;
 
     #[test]
@@ -816,6 +858,82 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&release_bin, b"release-newer").unwrap();
         assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
+
+    #[test]
+    fn baseline_is_loaded_once_and_invalid_input_fails_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+
+        assert!(load_baseline_report(Path::new("/definitely/missing/baseline.json")).is_err());
+
+        fs::write(&path, b"not-json").unwrap();
+        assert!(load_baseline_report(&path).is_err());
+
+        let case: Case = serde_yaml_ng::from_str("name: baseline\nprompt: ping\n").unwrap();
+        let build_info = BinaryBuildInfo {
+            schema: "astra.build_info.v1".into(),
+            git_sha: "a".repeat(40),
+            git_dirty: false,
+            target: "x86_64".into(),
+            profile: "release".into(),
+        };
+        let binary = BinaryIdentity {
+            path: "/bin/astra".into(),
+            build_info: Some(build_info.clone()),
+            probe_error: None,
+        };
+        let mut manifest = BenchmarkManifest::new(
+            &[case],
+            &["model".into()],
+            BenchmarkConfig {
+                profile: Some("p".into()),
+                working_dir: None,
+                runs: 1,
+                parallel: 1,
+                circuit_breaker_threshold: 1,
+                retry_on_429: false,
+                session_capture_mode: "never".into(),
+                no_judger: true,
+                judger_kind: JudgerKind::Disabled,
+                judger_command_digest: None,
+                judger_model: "judge".into(),
+                judger_n: 1,
+                judger_agg: "median".into(),
+                judger_timeout_seconds: 120,
+                capability_probes: false,
+                prompt_variants: false,
+                executor_kind: ExecutorKind::Builtin,
+                executor_command_digest: None,
+            },
+            binary.clone(),
+            Some(binary),
+            "2026-09-16T00:00:00Z",
+        );
+        manifest.serving_runtime = Some(ServerIdentity {
+            build_info,
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&SuiteReport {
+                manifest: Some(manifest),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = load_baseline_report(&path).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&astra_test_harness::report::SuiteReport {
+                wall_time_ms: 99,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.wall_time_ms, 0);
     }
 
     #[test]
