@@ -23020,7 +23020,9 @@ async fn explain_publication_failure_is_returned_when_no_outcome_can_be_recorded
         outcome.result,
         astra_turn_types::ArtifactPublicationResult::Unavailable { .. }
     ));
-    assert!(outcome.user_notice().contains("could not be saved"));
+    let notice = outcome.user_notice();
+    assert!(notice.contains("server recording unconfirmed"));
+    assert!(notice.contains("No readable execution facts were saved."));
     assert!(
         wire.get("handle").is_none(),
         "failed publication must never advertise a readable artifact"
