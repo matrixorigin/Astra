@@ -1859,7 +1859,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         product_owner="transcript materialization, compaction, and projection recovery",
     ),
     "session_weighted_admission_gates": TableMetadata(
-        semantic_owner="astra_services::context::weighted_admission",
+        semantic_owner="astra_services::weighted_admission",
         state_class="durable hot admission coordination gate",
         primary_query="scope-level admission gate by scope_name and updated_at",
         retention_policy="retain one gate per configured scope while admission coordination is enabled; recreate or remove with scope configuration",
@@ -1868,8 +1868,18 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / context",
         product_owner="weighted context admission hot coordination",
     ),
+    "session_weighted_admission_owner_usage": TableMetadata(
+        semantic_owner="astra_services::weighted_admission",
+        state_class="durable per-owner materialized admission usage projection",
+        primary_query="owner usage by scope_name, isolation_domain, owner_user_id, and resident/context/provider/cpu/io totals",
+        retention_policy="retain one row while the owner has active reservations; rows are maintained transactionally under the durable gate, zero-usage rows are removed on release, and all rows rebuild from live reservations after bootstrap or cleanup",
+        rebuildability="fully rebuildable from active weighted reservations in the same transaction as the global gate because this row is a materialized projection, not capacity authority",
+        merge_guidance="keep separate from weighted gates and reservations; the owner row accelerates per-owner limits while the gate coordinates the scope and reservations remain the fencing and expiry authority",
+        migration_owner="astra_services::storage / context",
+        product_owner="per-owner weighted admission usage and multi-session fairness",
+    ),
     "session_weighted_admission_reservations": TableMetadata(
-        semantic_owner="astra_services::context::weighted_admission",
+        semantic_owner="astra_services::weighted_admission",
         state_class="durable capacity reservation and fencing fact",
         primary_query="active reservation by scope_name, reservation_id, owner session/branch, idempotency_hash, and expires_at",
         retention_policy="retain reservations until expiry or release, then prune expired capacity claims in bounded batches",
