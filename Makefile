@@ -452,7 +452,8 @@ dev-sdk-deps:
 
 .PHONY: dev-web-deps
 dev-web-deps: dev-sdk-deps
-	@if [ ! -f web/node_modules/next/dist/bin/next ]; then \
+	@if [ ! -f web/node_modules/next/dist/bin/next ] || \
+		[ ! -f web/node_modules/@astra/sdk/package.json ]; then \
 		echo "Installing web UI dependencies..."; \
 		cd web && npm ci --no-audit --no-fund; \
 	else \
