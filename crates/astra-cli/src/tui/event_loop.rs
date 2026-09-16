@@ -21,7 +21,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use crate::lock_recovery::LockRecovery;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use crossterm::style::Stylize;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use super::app_event::TuiAppEvent;
@@ -5248,7 +5248,7 @@ pub(crate) async fn run_tui_session(
     let mut bottom_pane = BottomPane::new();
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
-    let (draw_tx, draw_rx) = broadcast::channel(16);
+    let (draw_tx, draw_rx) = mpsc::channel(1);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
     let mut event_stream = TuiEventStream::new(draw_rx);

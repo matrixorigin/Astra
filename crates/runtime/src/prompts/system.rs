@@ -858,12 +858,12 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
 /// Work section above carries the stable invariant; this short copy keeps an
 /// assignment understandable after a provider switch or partial restore
 /// without repeating policy prose on every tool round.
-pub(crate) const DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION: &str = "Execute only this assignment; satisfy every explicit expected_result condition with direct evidence, then settle immediately. Stop investigating once each condition is proved. Do not broaden, delegate, or claim delivery without evidence.";
+pub(crate) const DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION: &str = "Execute this assignment; prove expected_result directly. Delivery requires a successful non-lifecycle tool result after assignment; if unobtainable, settle blocked/failed. Stop and settle immediately when proved; do not broaden.";
 
 /// Continuation marker for an already-established assignment. Assignment
 /// facts remain in the frame; this text only tells the model which stable
 /// contract applies.
-pub(crate) const DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION: &str = "Continue this WorkItem under the assigned contract; use direct evidence, stop investigating and settle immediately when expected_result is satisfied, and do not broaden or claim delivery without evidence.";
+pub(crate) const DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION: &str = "Continue this WorkItem; prove expected_result directly. Delivery requires a successful non-lifecycle tool result after assignment; if unobtainable, settle blocked/failed. Stop and settle immediately when proved; do not broaden.";
 
 fn tool_precedence_section(tool_names: &[&str]) -> String {
     if tool_names.is_empty() {
@@ -1680,11 +1680,27 @@ mod tests {
         assert!(executable.contains("report blocked/failed"));
         assert!(
             DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION
-                .contains("Stop investigating once each condition is proved")
+                .contains("a successful non-lifecycle tool result after assignment")
+        );
+        assert!(
+            DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION
+                .contains("if unobtainable, settle blocked/failed")
+        );
+        assert!(
+            DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION
+                .contains("Stop and settle immediately when proved")
         );
         assert!(
             DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION
-                .contains("stop investigating and settle immediately")
+                .contains("a successful non-lifecycle tool result after assignment")
+        );
+        assert!(
+            DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION
+                .contains("if unobtainable, settle blocked/failed")
+        );
+        assert!(
+            DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION
+                .contains("Stop and settle immediately when proved")
         );
         assert!(!executable.contains("one focused evidence path and stay inside the objective"));
         assert!(

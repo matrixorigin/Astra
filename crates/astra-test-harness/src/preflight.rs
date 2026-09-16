@@ -4,12 +4,15 @@
 //! and auth + model connectivity works. Fails fast with actionable
 //! error messages so users don't waste time on doomed runs.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::process::Command;
 
+use crate::benchmark::{BinaryBuildInfo, ServerIdentity};
+use crate::case::Case;
 use crate::runner::parse_strict_cli_outcome;
 use crate::session_identity::delete_server_session;
 
@@ -52,6 +55,13 @@ struct ServerReadiness {
     unavailable_components: Vec<String>,
     interaction_api_major: String,
     build_git_sha: String,
+    server_identity: Option<ServerIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightReport {
+    pub effective_profile: Option<String>,
+    pub server_identity: Option<ServerIdentity>,
 }
 
 fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
@@ -84,8 +94,37 @@ fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
     let build_git_sha = value
         .get("build_git_sha")
         .and_then(serde_json::Value::as_str)
-        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .filter(|sha| {
+            matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
         .ok_or_else(|| format!("health response omitted a valid build_git_sha: {value}"))?;
+    let server_identity = match (
+        value
+            .get("build_git_dirty")
+            .and_then(serde_json::Value::as_bool),
+        value
+            .get("build_target")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("build_profile")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        (Some(git_dirty), Some(target), Some(profile))
+            if !target.trim().is_empty() && !profile.trim().is_empty() =>
+        {
+            Some(ServerIdentity {
+                build_info: BinaryBuildInfo {
+                    schema: "astra.build_info.v1".to_string(),
+                    git_sha: build_git_sha.to_string(),
+                    git_dirty,
+                    target: target.to_string(),
+                    profile: profile.to_string(),
+                },
+                interaction_api_major: interaction_api_major.to_string(),
+            })
+        }
+        _ => None,
+    };
     let unavailable_components = value
         .as_object()
         .into_iter()
@@ -97,6 +136,7 @@ fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
         unavailable_components,
         interaction_api_major: interaction_api_major.to_string(),
         build_git_sha: build_git_sha.to_string(),
+        server_identity,
     })
 }
 
@@ -147,21 +187,113 @@ pub async fn run_preflight(
     models: &[String],
     requested_profile: Option<&str>,
     require_memoria: bool,
-) -> Result<Option<String>, PreflightError> {
+    working_dir: Option<&Path>,
+    cases: &[Case],
+) -> Result<PreflightReport, PreflightError> {
     // The server and local dependency scripts both load `.env`; do the same
     // for the harness so an owner-auth probe cannot be skipped merely because
     // the caller did not export the local development variables in its shell.
     dotenvy::dotenv().ok();
     check_binary(astra_bin)?;
-    let readiness = check_server(astra_bin).await?;
+    let (readinesses, server_identity) =
+        check_servers_for_cases(astra_bin, requested_profile, working_dir, cases).await?;
     if require_memoria {
-        check_memoria_readiness(&readiness).await?;
+        for readiness in &readinesses {
+            check_memoria_readiness(readiness).await?;
+        }
     }
     let mut effective_profile = requested_profile.map(str::to_string);
     for model in models {
         effective_profile = check_model(astra_bin, model, effective_profile.as_deref()).await?;
     }
-    Ok(effective_profile)
+    // Authentication may have selected the isolated harness profile above.
+    // Re-probe after that transition so the recorded Server identity matches
+    // the profile and endpoint used by the paid case subprocesses, rather
+    // than the pre-auth default profile used for the initial fast check.
+    let server_identity = if effective_profile.as_deref() != requested_profile {
+        let (readinesses, identity) =
+            check_servers_for_cases(astra_bin, effective_profile.as_deref(), working_dir, cases)
+                .await?;
+        if require_memoria {
+            for readiness in &readinesses {
+                check_memoria_readiness(readiness).await?;
+            }
+        }
+        identity
+    } else {
+        server_identity
+    };
+    Ok(PreflightReport {
+        effective_profile,
+        server_identity,
+    })
+}
+
+/// Best-effort serving-runtime provenance for callers that intentionally skip
+/// model/auth preflight (the dashboard uses this without turning an identity
+/// gap into a failed run). A missing identity remains explicit in the report.
+pub async fn probe_server_identity(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    working_dir: Option<&Path>,
+    cases: &[Case],
+) -> Option<ServerIdentity> {
+    check_servers_for_cases(astra_bin, profile, working_dir, cases)
+        .await
+        .ok()
+        .and_then(|(_, identity)| identity)
+}
+
+/// Probe every distinct case execution environment once. A single suite may
+/// intentionally route different cases to different Servers through
+/// `cli_env`; one identity cannot safely describe that run unless all probes
+/// agree. Environment values are used only for the child health process and
+/// are never persisted in the benchmark manifest.
+async fn check_servers_for_cases(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    working_dir: Option<&Path>,
+    cases: &[Case],
+) -> Result<(Vec<ServerReadiness>, Option<ServerIdentity>), PreflightError> {
+    let contexts = unique_case_envs(cases);
+    let mut readinesses = Vec::with_capacity(contexts.len());
+    let mut identity: Option<ServerIdentity> = None;
+    let mut identity_missing = false;
+    let mut identity_mismatch = false;
+
+    for env in contexts {
+        let readiness = check_server_with_context(astra_bin, profile, working_dir, &env).await?;
+        match readiness.server_identity.as_ref() {
+            Some(observed) if identity.as_ref().is_none_or(|first| first == observed) => {
+                identity = Some(observed.clone());
+            }
+            Some(_) => identity_mismatch = true,
+            None => identity_missing = true,
+        }
+        readinesses.push(readiness);
+    }
+
+    if identity_missing || identity_mismatch {
+        identity = None;
+    }
+    Ok((readinesses, identity))
+}
+
+fn unique_case_envs(cases: &[Case]) -> Vec<Vec<(String, String)>> {
+    let mut contexts = BTreeSet::new();
+    for case in cases {
+        let mut env: Vec<_> = case
+            .cli_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        env.sort();
+        contexts.insert(env);
+    }
+    if contexts.is_empty() {
+        contexts.insert(Vec::new());
+    }
+    contexts.into_iter().collect()
 }
 
 fn check_binary(astra_bin: &Path) -> Result<(), PreflightError> {
@@ -179,16 +311,36 @@ fn check_binary(astra_bin: &Path) -> Result<(), PreflightError> {
     Ok(())
 }
 
-async fn check_server(astra_bin: &Path) -> Result<ServerReadiness, PreflightError> {
-    let output = Command::new(astra_bin)
-        .args(["health"])
-        .env("NO_PROXY", "localhost,127.0.0.1")
-        .env("no_proxy", "localhost,127.0.0.1")
-        .output()
-        .await
-        .map_err(|e| PreflightError::ServerUnreachable {
-            detail: format!("failed to spawn: {e}"),
-        })?;
+async fn check_server_with_context(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    working_dir: Option<&Path>,
+    cli_env: &[(String, String)],
+) -> Result<ServerReadiness, PreflightError> {
+    let mut command = Command::new(astra_bin);
+    if let Some(profile) = profile {
+        command.arg("--profile").arg(profile);
+    }
+    command.arg("health");
+    if let Some(working_dir) = working_dir {
+        command.current_dir(working_dir);
+    }
+    command.envs(cli_env.iter().map(|(key, value)| (key, value)));
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        command
+            .env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1")
+            .output(),
+    )
+    .await
+    .map_err(|_| PreflightError::ServerUnreachable {
+        detail: "health probe timed out after 10 seconds".to_string(),
+    })?
+    .map_err(|e| PreflightError::ServerUnreachable {
+        detail: format!("failed to spawn: {e}"),
+    })?;
 
     let readiness = validate_health_probe(&output.stdout, output.status.code())
         .map_err(|detail| PreflightError::ServerUnready { detail })?;
@@ -622,12 +774,19 @@ mod tests {
         for case in cases.as_array().unwrap() {
             let body = serde_json::to_vec(&case["body"]).unwrap();
             let code = case["exit_code"].as_i64().unwrap() as i32;
+            let result = super::validate_health_probe(&body, Some(code));
             assert_eq!(
-                super::validate_health_probe(&body, Some(code)).is_ok(),
+                result.is_ok(),
                 case["ready"].as_bool().unwrap(),
                 "{}",
                 case["name"]
             );
+            if case["name"] == "healthy" {
+                assert!(result.as_ref().unwrap().server_identity.is_some());
+            }
+            if case["name"] == "missing_runtime_identity" {
+                assert!(result.as_ref().unwrap().server_identity.is_none());
+            }
         }
         assert!(super::validate_health_probe(&vec![b' '; 65537], Some(0)).is_err());
     }
@@ -800,11 +959,49 @@ mod tests {
 
     #[tokio::test]
     async fn server_unreachable_on_bad_binary() {
-        let result = check_server(Path::new("/nonexistent/astra")).await;
+        let result =
+            check_server_with_context(Path::new("/nonexistent/astra"), None, None, &[]).await;
         assert!(matches!(
             result,
             Err(PreflightError::ServerUnreachable { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serving_identity_is_unavailable_when_cases_route_to_different_servers() {
+        use crate::case::Case;
+        use crate::test_support::write_executable_shim;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("astra-shim");
+        write_executable_shim(
+            &bin,
+            r#"#!/bin/sh
+if [ "$ASTRA_API_URL" = "http://server-a" ]; then
+  sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+else
+  sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+fi
+printf '{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"%s","build_git_dirty":false,"build_target":"x86_64","build_profile":"release"}\n' "$sha"
+"#,
+        )
+        .unwrap();
+
+        let mut first: Case = serde_yaml_ng::from_str("name: first\nprompt: ping\n").unwrap();
+        first
+            .cli_env
+            .insert("ASTRA_API_URL".into(), "http://server-a".into());
+        let mut second: Case = serde_yaml_ng::from_str("name: second\nprompt: ping\n").unwrap();
+        second
+            .cli_env
+            .insert("ASTRA_API_URL".into(), "http://server-b".into());
+
+        let identity = probe_server_identity(&bin, None, None, &[first, second]).await;
+        assert!(
+            identity.is_none(),
+            "a single manifest identity must not hide a mixed-server suite"
+        );
     }
 
     #[tokio::test]

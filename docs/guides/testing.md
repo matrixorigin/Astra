@@ -188,6 +188,103 @@ EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 
+### Sustained TUI presentation pressure
+
+The deterministic `astra-cli` pressure harness drives the real `ChatWidget`
+event router and `active_viewport` projection with eight interleaved logical
+agent runs. It applies 32 state and output update rounds, skips rendering
+between batches, checks the latest output through rendering components at
+alternating sizes, interleaves composer input, and then exercises a dropped
+event gap and a failed run. The assertions cover the canonical projection,
+aggregate agent discovery, gap attention, retained failure state, and input
+preservation.
+
+The event-stream test separately proves that an input already queued for the
+TUI is delivered before a pending redraw wake. Both tests are deterministic
+and provider-free. The pressure harness uses a test layout and does not
+exercise the production draw loop, terminal backpressure, or input scheduling
+latency; PTY throughput and deployment-level multi-user capacity still require
+the opt-in load or system lanes described below.
+
+Run only the focused checks while iterating:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p astra-cli \
+  sustained_multi_agent_updates_preserve_projection_and_composer_input --lib
+CARGO_INCREMENTAL=0 cargo test -p astra-cli \
+  queued_input_is_processed_before_pending_draw --lib
+```
+
+### Durable Work mixed pressure
+
+The public Work pressure probe validates the durable read/write boundary with
+multiple authenticated owners and multiple Work-shaped sessions per owner. It
+creates one bounded Work per session, opens two independent read attachments,
+then mixes catalog, Work, branch, event, transcript and Task Graph reads with
+owner-scoped attachment open/close and `read-cursor` writes. Each active writer
+must advance its attachment epoch and close the temporary attachment while
+the same Work is being read. A repeated Work creation request is used as a
+lost-response/idempotency check, and a foreign owner must receive typed 404
+responses without the source Work identity being echoed.
+
+The probe uses no model or provider calls. It therefore measures public HTTP
+protocol behavior and database-backed durability, not agent quality, provider
+admission, TUI/Web rendering, automatic Edge takeover, or Run-owner recovery.
+Rows examined are deployment-specific; the report says when that
+instrumentation is unavailable instead of inferring a database bound from page
+size alone.
+
+Use a disposable MatrixOne database and either one token per owner or the
+explicit registration path. The registration path writes only its summary and
+does not persist tokens:
+
+```bash
+python3 scripts/load/durable_work_pressure_probe.py \
+  --profile smoke --register-users \
+  --output-dir tmp/durable-work-pressure/smoke
+
+python3 scripts/load/durable_work_pressure_probe.py \
+  --profile pressure --token-file /absolute/path/to/owner-tokens.json \
+  --output-dir tmp/durable-work-pressure/pressure
+```
+
+If `/metrics` is protected, provide its separate credential through
+`ASTRA_METRICS_AUTH_TOKEN`; owner tokens are never reused for metrics.
+
+`smoke` defaults to 3 owners × 2 sessions for 10 seconds. `pressure` defaults
+to 25 owners × 4 sessions for 60 seconds. Override duration and rates only when
+the deployment has an explicit capacity budget. A nonzero exit status means a
+contract invariant failed; inspect `summary.json` for per-operation p50/p95/p99,
+sample and failure counts, response sizes, foreign-access results, and
+available Prometheus counter deltas. The fixed slow session is a scheduling
+pressure signal, not a claim that a provider was deliberately stalled.
+
+### Durable provider concurrency and cancellation
+
+The ignored runtime test
+`db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable` runs the
+actual durable lifecycle against a loopback HTTP/SSE model gateway. It holds
+one provider run open, then requires another session owned by the same user and
+a session owned by a second user to complete within a bounded window. It also
+reconnects a reader to the completed run, verifies the cancelled terminal
+record, checks that the cancelled run's durable admission reservation is gone,
+and starts a new session to prove that cancellation releases the provider
+slot. The test requires the configured admission budget to expose at least
+three global provider slots and two slots per owner.
+
+Run this focused check only with a disposable MatrixOne database:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --lib \
+  db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable -- \
+  --ignored --nocapture
+```
+
+This is an execution-isolation and slot-reuse contract, not a deployment-scale
+throughput benchmark. Use the Work pressure probe or a separately budgeted
+load lane for multi-pod throughput, thousands of sessions, provider quotas,
+and PTY latency.
+
 ### Optional thinking-protocol compatibility checks
 
 Offline checks require no credentials:

@@ -121,24 +121,56 @@ fn assert_health_contract_json(
     expected: &serde_json::Value,
     label: &str,
 ) {
-    let expected_sha = expected
-        .as_object()
-        .and_then(|object| object.get("build_git_sha"))
+    let mut resolved_expected = expected.clone();
+    let object = resolved_expected
+        .as_object_mut()
+        .expect("health contract should be a JSON object");
+    let expected_sha = object
+        .get("build_git_sha")
         .and_then(serde_json::Value::as_str);
     assert_eq!(
         expected_sha,
         Some("<dynamic-build-git-sha>"),
         "{label}: health contract must use the dynamic build SHA sentinel"
     );
-
-    let mut resolved_expected = expected.clone();
-    resolved_expected
-        .as_object_mut()
-        .expect("health contract should be a JSON object")
-        .insert(
-            "build_git_sha".to_string(),
-            serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
+    object.insert(
+        "build_git_sha".to_string(),
+        serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
+    );
+    let dynamic_dirty = object
+        .get("build_git_dirty")
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        dynamic_dirty,
+        Some("<dynamic-build-git-dirty>"),
+        "{label}: health contract must use the dynamic dirty sentinel"
+    );
+    object.insert(
+        "build_git_dirty".to_string(),
+        serde_json::Value::Bool(astra_core::build_info::current().git_dirty),
+    );
+    for (field, sentinel, value) in [
+        (
+            "build_target",
+            "<dynamic-build-target>",
+            astra_core::build_info::BUILD_TARGET,
+        ),
+        (
+            "build_profile",
+            "<dynamic-build-profile>",
+            astra_core::build_info::BUILD_PROFILE,
+        ),
+    ] {
+        assert_eq!(
+            object.get(field).and_then(serde_json::Value::as_str),
+            Some(sentinel),
+            "{label}: health contract must use the {field} sentinel"
         );
+        object.insert(
+            field.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
     assert_contract_json(actual, &resolved_expected, label);
 }
 

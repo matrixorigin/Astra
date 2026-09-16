@@ -1777,6 +1777,14 @@ const S = {
 const $ = id => document.getElementById(id);
 const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/"/g, '&quot;'); };
 const trunc = (s, n) => s && s.length > n ? s.slice(0, n) + '...' : (s || '');
+// RunOutcome keeps prompt-cache buckets disjoint.  Every dashboard view uses
+// this billable total so a cached turn cannot look cheaper merely because the
+// UI forgot cache reads or writes.
+const runTokens = run => {
+  const o = (run && run.outcome) || {};
+  return (o.prompt_tokens || 0) + (o.cached_input_tokens || 0)
+    + (o.cache_creation_tokens || 0) + (o.completion_tokens || 0);
+};
 
 // CaseRunStatus is the authoritative report contract. The dashboard never
 // infers a green result from criteria or a stale boolean projection.
@@ -2182,7 +2190,7 @@ function addRailDot(type, label, targetEl, report) {
   if (report && report.case_name) {
     const status = runVisualStatus(report);
     const badgeLabel = runVisualLabel(report);
-    const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+    const tok = runTokens(report);
     dot.innerHTML = `<div class="tl-dot-preview">
       <div class="dp-header">
         <span class="dp-badge ${status}">${badgeLabel}</span>
@@ -2266,7 +2274,7 @@ function addTimelineRow(report) {
   if (!rows) return;
 
   const status = runVisualStatus(report);
-  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+  const tok = runTokens(report);
   const key = 'tlr_' + report.case_name + '_' + report.model + '_' + (report.run_index || 0);
 
   // Remove the running placeholder if it exists
@@ -2419,7 +2427,7 @@ if (document.readyState === 'loading') {
 
 function buildCaseDetailHTML(report) {
   const status = runVisualStatus(report);
-  const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
+  const tok = runTokens(report);
 
   let html = '';
 
@@ -2558,7 +2566,7 @@ function availableResultsLabel() {
 function addReportCard() {
   const stats = modelStats();
   const entries = Object.entries(stats).sort((a, b) =>
-    (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1))
+    (b[1].pass / Math.max(b[1].scoreable, 1)) - (a[1].pass / Math.max(a[1].scoreable, 1))
   );
 
   const planned = S.completed - S.unavailable;
@@ -2595,13 +2603,13 @@ function addReportCard() {
     html += '<th>Model</th><th>Pass</th><th>Tok/Pass</th><th>Dur/Pass</th>';
     html += '</tr></thead><tbody>';
     for (const [name, s] of entries) {
-      const r = Math.round(s.pass / Math.max(s.total, 1) * 100);
-      const p = Math.max(s.pass, 1);
+      const r = Math.round(s.pass / Math.max(s.scoreable, 1) * 100);
+      const p = s.successfulSamples;
       html += '<tr>';
       html += '<td style="font-weight:600">' + esc(name) + '</td>';
-      html += '<td><span class="rate-pill" style="background:' + rateColor(r) + '">' + r + '%</span> <span style="color:var(--muted);font-size:11px">' + s.pass + '/' + s.total + '</span></td>';
-      html += '<td>' + formatTok(Math.round(s.passTok / p)) + '</td>';
-      html += '<td>' + formatDur(Math.round(s.passDur / p)) + '</td>';
+      html += '<td><span class="rate-pill" style="background:' + rateColor(r) + '">' + r + '%</span> <span style="color:var(--muted);font-size:11px">' + s.pass + '/' + s.scoreable + '</span></td>';
+      html += '<td>' + (p > 0 ? formatTok(Math.round(s.passTok / p)) : 'n/a') + '</td>';
+      html += '<td>' + (p > 0 ? formatDur(Math.round(s.passDur / p)) : 'n/a') + '</td>';
       html += '</tr>';
     }
     html += '</tbody></table>';
@@ -2688,19 +2696,47 @@ function addReportCard() {
 }
 
 function modelStats() {
+  // Prefer the server's canonical aggregate. It includes cancelled rows in
+  // the denominator and only complete successful samples in cost metrics.
+  const aggregate = S.suiteReport && S.suiteReport.aggregate;
+  if (aggregate && Array.isArray(aggregate.groups)) {
+    const out = {};
+    for (const group of aggregate.groups) {
+      const c = group.counts || {};
+      const scoreable = Math.max((c.planned || 0) - (c.unavailable || 0), 0);
+      if (scoreable <= 0) continue;
+      const m = group.model;
+      if (!out[m]) out[m] = { pass: 0, total: 0, scoreable: 0, passTok: 0, passDur: 0, passTurns: 0, successfulSamples: 0 };
+      const s = out[m];
+      s.total += c.planned || 0;
+      s.scoreable += scoreable;
+      s.pass += c.passed || 0;
+      const cost = group.successful_cost || {};
+      s.passTok += cost.total_tokens || 0;
+      s.passDur += cost.total_duration_ms || 0;
+      s.passTurns += cost.total_turns || 0;
+      s.successfulSamples += cost.sample_count || 0;
+    }
+    return out;
+  }
+
   const out = {};
   for (const r of S.runs) {
-    if (!runEvidence(r)) continue;
+    if (runUnavailable(r)) continue;
     const m = r.model;
-    if (!out[m]) out[m] = { pass: 0, total: 0, passTok: 0, passDur: 0, passTurns: 0 };
+    if (!out[m]) out[m] = { pass: 0, total: 0, scoreable: 0, passTok: 0, passDur: 0, passTurns: 0, successfulSamples: 0 };
     const s = out[m];
     s.total++;
-    const tok = (r.outcome.prompt_tokens || 0) + (r.outcome.completion_tokens || 0);
+    s.scoreable++;
+    const tok = runTokens(r);
     if (runPassed(r)) {
       s.pass++;
-      s.passTok += tok;
-      s.passDur += r.outcome.duration_ms || 0;
-      s.passTurns += r.outcome.turn_rounds || 0;
+      if (!r.execution || r.execution.evidence_complete !== false) {
+        s.passTok += tok;
+        s.passDur += r.outcome.duration_ms || 0;
+        s.passTurns += r.outcome.turn_rounds || 0;
+        s.successfulSamples++;
+      }
     }
   }
   return out;

@@ -1216,6 +1216,9 @@ impl<'a> SuiteRunner<'a> {
         } else {
             Some(FailureClass::HarnessCleanupFailed)
         };
+        let execution = session
+            .as_ref()
+            .map(crate::pipeline_analysis::analyze_execution_trace);
 
         // Progress: emit per-case result to stderr so long runs show
         // streaming progress even when stdout is buffered.
@@ -1246,6 +1249,7 @@ impl<'a> SuiteRunner<'a> {
             attempts,
             session,
             session_captures: cleanup_captures.into_values().collect(),
+            execution,
             reproducer,
             digest,
             digest_error,
@@ -1431,6 +1435,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1476,6 +1481,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1531,6 +1537,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,

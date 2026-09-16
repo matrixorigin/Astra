@@ -1065,7 +1065,7 @@ async fn chat_handler(
                             crate::report::CaseRunStatus::Unavailable => "UNAVAILABLE",
                         },
                         run.outcome.exit_code,
-                        run.outcome.prompt_tokens + run.outcome.completion_tokens,
+                        crate::benchmark::total_tokens(&run.outcome),
                         run.outcome.duration_ms,
                         run.outcome.turn_rounds,
                         run.failure_class
@@ -1270,10 +1270,15 @@ async fn execute_run(
     cancel_flag: Arc<AtomicBool>,
     run_id: &str,
 ) -> anyhow::Result<SuiteReport> {
+    use crate::benchmark::{
+        BenchmarkConfig, BenchmarkManifest, ExecutorKind, JudgerKind, effective_model_ids,
+        effective_working_dir, probe_binary_identity,
+    };
     use crate::case::Case;
     use crate::digest::AstraCliDigestCollector;
     use crate::exec::AstraCliExecutor;
     use crate::judger::{AstraCliJudger, JudgerConfig};
+    use crate::preflight::probe_server_identity;
     use crate::runner::{RunnerConfig, resolve_runner_profile_owner};
     use crate::suite::{ScopedDiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
 
@@ -1327,6 +1332,59 @@ async fn execute_run(
         runs: 1,
     };
 
+    let tested_binary = probe_binary_identity(&config.astra_bin).await;
+    if let Some(error) = &tested_binary.probe_error {
+        eprintln!(
+            "[astra-test] WARNING: could not identify tested binary {}: {}",
+            tested_binary.path, error
+        );
+    }
+    let executor_identity = Some(tested_binary.clone());
+    let effective_models = effective_model_ids(&cases, &runner_cfg);
+    let mut benchmark_manifest = BenchmarkManifest::new(
+        &cases,
+        &effective_models,
+        BenchmarkConfig {
+            profile: runner_cfg.profile.clone(),
+            working_dir: effective_working_dir(runner_cfg.working_dir.as_deref()),
+            runs: suite_cfg.runs,
+            parallel: suite_cfg.parallel,
+            circuit_breaker_threshold: suite_cfg.circuit_breaker_threshold,
+            retry_on_429: suite_cfg.retry_on_429,
+            session_capture_mode: "on_debug_log".to_string(),
+            no_judger: req.no_judger,
+            judger_kind: if req.no_judger {
+                JudgerKind::Disabled
+            } else {
+                JudgerKind::Builtin
+            },
+            judger_command_digest: None,
+            judger_model: judger_model.to_string(),
+            judger_n: 1,
+            judger_agg: "median".to_string(),
+            judger_timeout_seconds: 120,
+            capability_probes: false,
+            prompt_variants: false,
+            executor_kind: ExecutorKind::Builtin,
+            executor_command_digest: None,
+        },
+        tested_binary,
+        executor_identity,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    benchmark_manifest.serving_runtime = probe_server_identity(
+        &config.astra_bin,
+        runner_cfg.profile.as_deref(),
+        runner_cfg.working_dir.as_deref(),
+        &cases,
+    )
+    .await;
+    if benchmark_manifest.serving_runtime.is_none() {
+        eprintln!(
+            "[astra-test] WARNING: serving Server build identity is unavailable; runtime-performance attribution will be disabled"
+        );
+    }
+
     // SuiteStarted is emitted by runner.run_all() — don't duplicate here.
     let runner = SuiteRunner {
         executor: &executor,
@@ -1342,7 +1400,9 @@ async fn execute_run(
         cancel_flag: Some(cancel_flag),
     };
 
-    let report = runner.run_all(&cases).await;
+    let mut report = runner.run_all(&cases).await;
+    report.manifest = Some(benchmark_manifest);
+    report.aggregate = Some(report.benchmark_aggregate());
     Ok(report)
 }
 

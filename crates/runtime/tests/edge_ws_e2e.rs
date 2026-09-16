@@ -1165,6 +1165,7 @@ struct BlockingLeaseEdgeRegistry {
     registration_started: Notify,
     release_registration: Notify,
     claim_release_started: Notify,
+    release_deadline_armed: Notify,
     claim_release_gate: Notify,
     rollback_count: AtomicUsize,
     release_attempts: AtomicUsize,
@@ -1214,6 +1215,7 @@ impl BlockingLeaseEdgeRegistry {
             registration_started: Notify::new(),
             release_registration: Notify::new(),
             claim_release_started: Notify::new(),
+            release_deadline_armed: Notify::new(),
             claim_release_gate: Notify::new(),
             rollback_count: AtomicUsize::new(0),
             release_attempts: AtomicUsize::new(0),
@@ -1298,6 +1300,11 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         self.active_releases.fetch_add(1, Ordering::SeqCst);
         let _sentinel = ReleaseDropSentinel(&self.active_releases);
         self.claim_release_started.notify_one();
+        // The first yield lets the timeout wrapper poll its own deadline. The
+        // readiness notification is therefore a reliable barrier for tests
+        // before they switch to virtual time.
+        tokio::task::yield_now().await;
+        self.release_deadline_armed.notify_one();
         if self.block_every_release || (self.block_first_release && attempt == 0) {
             self.claim_release_gate.notified().await;
         }
@@ -1555,16 +1562,20 @@ async fn pending_release_disconnect(wait_for_heartbeat: bool, live_pool: Option<
     if wait_for_heartbeat {
         // Establish the socket with real time, then deterministically start a
         // fresh pending publication attempt just before heartbeat is due.
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(24)).await;
         tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            registry.claim_release_started.notified(),
+            std::time::Duration::from_secs(2),
+            registry.release_deadline_armed.notified(),
         )
         .await
-        .expect("retry acquired the connection before heartbeat");
+        .expect("release timeout armed before pausing the clock");
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_millis(5001)).await;
+        tokio::task::yield_now().await;
+        let retry_started = registry.claim_release_started.notified();
+        tokio::time::advance(std::time::Duration::from_secs(24)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(100), retry_started)
+            .await
+            .expect("retry acquired the connection before heartbeat");
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
