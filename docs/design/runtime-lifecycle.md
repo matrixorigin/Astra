@@ -222,9 +222,11 @@ conflicting retirement/prerequisite lifetimes are rejected before establishment.
 The canonical schema now includes the durable trigger-association table and a
 composite `work_graph_revisions(owner_id, work_id, patch_ref, revision)` index.
 Fresh installations receive both from the schema manifest. Existing databases
-must add the table and index through the repository's schema migration process
-before deploying a binary that verifies this contract; `CREATE TABLE IF NOT
-EXISTS` and `CREATE INDEX` declarations are not an in-place upgrade mechanism.
+must provision both through the repository's schema migration process (or use a
+fresh-schema cutover) before deploying a binary that verifies this contract.
+Bootstrap fails closed with an explicit cutover error when either structure is
+missing; `CREATE TABLE IF NOT EXISTS` and the manifest's index declaration are
+not an in-place upgrade mechanism for an existing Work table.
 
 Tasks are durable work items projected into UI boards.
 

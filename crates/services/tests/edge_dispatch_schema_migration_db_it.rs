@@ -11,6 +11,8 @@ use astra_services::storage::{CORE_SCHEMA_CONTRACT_VERSION, ensure_core_schema};
 use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query};
 use uuid::Uuid;
 
+const PREVIOUS_CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-15-v77";
+
 const LEGACY_EDGE_PENDING_DISPATCH_DDL: &str = "CREATE TABLE edge_pending_dispatch (
     user_id VARCHAR(64) NOT NULL,
     edge_agent_id VARCHAR(255) NOT NULL,
@@ -118,12 +120,12 @@ async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
 
     // Exercise the real upgrade gate used by an already-running v72
     // deployment. The new binding table is intentionally removed before the
-    // legacy marker is restored; a v77 bootstrap must execute the DDL again
+    // legacy marker is restored; a v78 bootstrap must execute the DDL again
     // instead of taking the current-contract fast path.
     query("DROP TABLE session_execution_bindings")
         .execute(&db.pool)
         .await
-        .map_err(|error| format!("remove v77-only binding table for migration check: {error}"))?;
+        .map_err(|error| format!("remove v78-only binding table for migration check: {error}"))?;
     query(
         "UPDATE astra_schema_contracts SET contract_version = '2026-09-13-v72'
          WHERE component = 'astra-core'",
@@ -228,6 +230,90 @@ async fn assert_terminal_legacy_schema_is_archived_and_current_schema_created(
     {
         return Err(format!(
             "upgraded edge dispatch primary key = {primary_key:?}"
+        ));
+    }
+    assert_v77_marker_cannot_fast_path_incomplete_work_schema(db).await?;
+    Ok(())
+}
+
+async fn assert_v77_marker_cannot_fast_path_incomplete_work_schema(
+    db: &IsolatedDatabase,
+) -> Result<(), String> {
+    // Simulate a database created by the base commit: the completion marker
+    // and table authority still describe v77, while the new mandatory Work
+    // table and graph lookup index are absent.
+    query("ALTER TABLE work_graph_revisions DROP INDEX idx_work_graph_revision_patch_ref")
+        .execute(&db.pool)
+        .await
+        .map_err(|error| format!("remove v78 Work graph index: {error}"))?;
+    query("DROP TABLE work_proposal_trigger_attempts")
+        .execute(&db.pool)
+        .await
+        .map_err(|error| format!("remove v78 Work trigger table: {error}"))?;
+    query(
+        "DELETE FROM astra_schema_table_contracts
+         WHERE table_name = 'work_proposal_trigger_attempts'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("remove v78 Work table claim: {error}"))?;
+    query(
+        "UPDATE astra_schema_table_contracts SET contract_version = ?
+         WHERE component = 'astra-core'",
+    )
+    .bind(PREVIOUS_CORE_SCHEMA_CONTRACT_VERSION)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("restore v77 Work table claims: {error}"))?;
+    query(
+        "UPDATE astra_schema_contracts SET contract_version = ?
+         WHERE component = 'astra-core'",
+    )
+    .bind(PREVIOUS_CORE_SCHEMA_CONTRACT_VERSION)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("restore v77 schema marker: {error}"))?;
+
+    let error = ensure_core_schema(&db.settings, "mysql")
+        .await
+        .expect_err("an incomplete v77 Work schema must not report readiness");
+    let detail = error.to_string();
+    if !detail.contains("fresh-schema cutover")
+        || !detail.contains("idx_work_graph_revision_patch_ref")
+    {
+        return Err(format!("incomplete v77 Work schema error = {detail}"));
+    }
+
+    let marker = query(
+        "SELECT contract_version FROM astra_schema_contracts
+         WHERE component = 'astra-core'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|error| format!("load failed-bootstrap schema marker: {error}"))?
+    .map(|row| row.try_get::<String, _>("contract_version"))
+    .transpose()
+    .map_err(|error| format!("decode failed-bootstrap schema marker: {error}"))?;
+    if marker.as_deref() != Some(PREVIOUS_CORE_SCHEMA_CONTRACT_VERSION) {
+        return Err(format!(
+            "failed bootstrap published schema marker {marker:?}"
+        ));
+    }
+
+    let index_count: i64 = query(
+        "SELECT COUNT(*) AS row_count FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'work_graph_revisions'
+           AND INDEX_NAME = 'idx_work_graph_revision_patch_ref'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load v78 Work graph index state: {error}"))?
+    .try_get("row_count")
+    .map_err(|error| format!("decode v78 Work graph index state: {error}"))?;
+    if index_count != 0 {
+        return Err(format!(
+            "failed bootstrap silently migrated v78 Work graph index ({index_count} rows)"
         ));
     }
     Ok(())
