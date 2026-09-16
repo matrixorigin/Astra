@@ -1498,6 +1498,37 @@ fn active_submission_belongs_to_next_turn(
         || submission_belongs_to_next_turn(output_has_settled, foreground_lifecycle_transferred)
 }
 
+/// Handle the one active-run slash command that is a pure navigation action.
+/// Keeping this branch shared by the event loop and its regression test is
+/// deliberate: opening `/tasks` must never fall through to guidance delivery
+/// or mutate the active run's control state.
+async fn handle_active_run_background_tasks_command(
+    queued_text: &str,
+    chat_widget: &mut chat_widget::ChatWidget,
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    if !slash_dispatch::active_run_opens_background_tasks(queued_text) {
+        return false;
+    }
+    commit_submission_projection(chat_widget, queued_text);
+    chat_widget.commit_system(history_cell::system::SystemCell::response(
+        "Opened background tasks",
+    ));
+    let _ = force_open_background_task_view(
+        background_registry,
+        agent_spawner,
+        restored_local_agents,
+        bottom_pane,
+        frame_requester,
+    )
+    .await;
+    true
+}
+
 fn should_start_queued_followups(
     turn_ok: bool,
     turn_interrupted: bool,
@@ -5159,9 +5190,7 @@ pub(crate) async fn run_tui_session(
     // previously synced preference. Apply it after startup preference pull
     // but before transcript replay and the first turn so every surface sees
     // one consistent mode without mutating prompt or tool schemas.
-    if let Some(explain_mode) = initial_explain {
-        state.explain = explain_mode;
-    }
+    crate::cli::session::session_state::apply_initial_explain_mode(&mut state, initial_explain);
     tracer.finish(state.session_id.as_deref());
 
     // Take terminal ownership before spawning any TUI-owned worker. If the
@@ -6863,26 +6892,17 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        if slash_dispatch::active_run_opens_background_tasks(
+                                                                        if handle_active_run_background_tasks_command(
                                                                             &queued_text,
-                                                                        ) {
-                                                                            commit_submission_projection(
-                                                                                &mut chat_widget,
-                                                                                &queued_text,
-                                                                            );
-                                                                            chat_widget.commit_system(
-                                                                                history_cell::system::SystemCell::response(
-                                                                                    "Opened background tasks",
-                                                                                ),
-                                                                            );
-                                                                            let _ = force_open_background_task_view(
-                                                                                &mut background_registry,
-                                                                                agent_spawner_for_cancel.as_ref(),
-                                                                                &restored_local_agent_task_projections,
-                                                                                &mut bottom_pane,
-                                                                                &frame_requester,
-                                                                            )
-                                                                            .await;
+                                                                            &mut chat_widget,
+                                                                            &mut background_registry,
+                                                                            agent_spawner_for_cancel.as_ref(),
+                                                                            &restored_local_agent_task_projections,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        )
+                                                                        .await
+                                                                        {
                                                                             flush_chat_widget(
                                                                                 &mut guard,
                                                                                 &mut chat_widget,
@@ -12855,6 +12875,118 @@ mod tests {
             bottom_pane.has_active_view(),
             "background task shortcut must open a panel for an empty registry"
         );
+    }
+
+    #[tokio::test]
+    async fn active_run_tasks_panel_is_read_only_and_preserves_queue_and_selection() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("active"));
+        let first_id = registry.spawn_shell("sleep 60", "first active task");
+        let second_id = registry.spawn_shell("sleep 60", "second active task");
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.set_task_status(TaskStatus::TurnRunning {
+            started_at: std::time::Instant::now(),
+        });
+        bottom_pane.queue_next_turn_submission("queued follow-up".to_string());
+        assert!(bottom_pane.accept_user_intent(
+            "existing-guidance",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedLocal,
+            "guidance already waiting",
+        ));
+        let pending_intents_before = bottom_pane.pending_user_intent_count();
+        let run_control = LocalRunControl::shared();
+        run_control.request_pause();
+        let status_before = run_control
+            .control_status("", "")
+            .await
+            .expect("local run status");
+
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        assert!(
+            handle_active_run_background_tasks_command(
+                " /tasks ",
+                &mut chat_widget,
+                &mut registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await
+        );
+        assert!(bottom_pane.accepts_background_task_rows());
+
+        // Move to a known row identity before the active-run refresh. The
+        // view refresh must retain that identity rather than resetting to the
+        // first task whenever `/tasks` is opened again.
+        bottom_pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let selected_before = render_bottom_pane_text(&bottom_pane, 120, 12);
+        let selected_line_before = selected_before
+            .lines()
+            .find(|line| line.contains("› "))
+            .expect("task panel should render a selected row");
+        assert!(
+            selected_line_before.contains("second active task"),
+            "End should select the last active task: {selected_before}"
+        );
+
+        // These are the observable active-run invariants: opening a
+        // navigation surface cannot cancel/pause ownership, submit guidance,
+        // or consume an already queued next-turn message.
+        assert_eq!(
+            run_control
+                .control_status("", "")
+                .await
+                .expect("local run status after tasks"),
+            status_before
+        );
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+        assert!(run_control.pending_remote_disposition_ids().is_empty());
+        assert_eq!(
+            bottom_pane.pending_user_intent_count(),
+            pending_intents_before,
+            "opening `/tasks` must not enqueue or consume guidance"
+        );
+        assert_eq!(
+            bottom_pane
+                .take_queued_next_turn_submissions()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["queued follow-up".to_string()],
+            "opening `/tasks` must leave the next-turn FIFO untouched"
+        );
+
+        // Re-open through the same active-run navigation path. The selected
+        // task identity must survive the live registry projection refresh.
+        assert!(
+            handle_active_run_background_tasks_command(
+                "/tasks",
+                &mut chat_widget,
+                &mut registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await
+        );
+        let selected_after = render_bottom_pane_text(&bottom_pane, 120, 12);
+        let selected_line_after = selected_after
+            .lines()
+            .find(|line| line.contains("› "))
+            .expect("task panel should keep a selected row after refresh");
+        assert!(
+            selected_line_after.contains("second active task"),
+            "refreshing `/tasks` must preserve the selected identity: {selected_after}"
+        );
+
+        let _ = registry.kill(&first_id);
+        let _ = registry.kill(&second_id);
     }
 
     #[tokio::test]

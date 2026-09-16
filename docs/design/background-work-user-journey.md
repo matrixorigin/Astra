@@ -131,6 +131,10 @@ continuation, not automatic replay of an interrupted execution.
   independently of the largest domain-valid object.
 - Validate the complete fanout before spawning any slot. A partial launch has
   a fixed target count, explicit rejected slots, and no automatic replacements.
+- Fanout admission is bounded to 50 slots. The bound is enforced before any
+  child is admitted and is repeated when projecting a slot identity, so an
+  oversized request cannot allocate an unbounded group or bypass the runtime
+  contract through recovery.
 - Fast children may finish before the UI draws the launch receipt; monotonic
   projection must skip directly to terminal without showing a later running
   regression.

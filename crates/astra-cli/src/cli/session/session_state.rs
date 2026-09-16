@@ -806,9 +806,21 @@ impl SessionState {
     }
 }
 
+/// Apply an explicit process launch choice after session preferences have
+/// been restored and before the first turn is assembled. A missing choice
+/// deliberately leaves the synced preference untouched.
+pub(crate) fn apply_initial_explain_mode(
+    state: &mut SessionState,
+    initial_explain: Option<ExplainMode>,
+) {
+    if let Some(mode) = initial_explain {
+        state.explain = mode;
+    }
+}
+
 #[cfg(test)]
 mod default_tests {
-    use super::{ContinuationAnchor, ExplainMode, SessionState};
+    use super::{ContinuationAnchor, ExplainMode, SessionState, apply_initial_explain_mode};
     use crate::cli::permission_manager::PermissionManager;
 
     #[test]
@@ -832,6 +844,31 @@ mod default_tests {
             ExplainMode::parse_cli_arg("verbose"),
             Ok(ExplainMode::Verbose)
         );
+    }
+
+    #[test]
+    fn explicit_launch_explain_mode_overrides_synced_preference_before_first_turn() {
+        let mut state = SessionState {
+            explain: ExplainMode::Verbose,
+            ..SessionState::default()
+        };
+
+        apply_initial_explain_mode(&mut state, Some(ExplainMode::Off));
+        assert_eq!(state.explain, ExplainMode::Off);
+
+        apply_initial_explain_mode(&mut state, Some(ExplainMode::Verbose));
+        assert_eq!(state.explain, ExplainMode::Verbose);
+    }
+
+    #[test]
+    fn missing_launch_explain_mode_preserves_synced_preference() {
+        let mut state = SessionState {
+            explain: ExplainMode::On,
+            ..SessionState::default()
+        };
+
+        apply_initial_explain_mode(&mut state, None);
+        assert_eq!(state.explain, ExplainMode::On);
     }
 
     #[test]

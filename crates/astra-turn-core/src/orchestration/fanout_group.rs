@@ -38,6 +38,12 @@ impl AgentFanoutSlotIdentity {
                 "fanout group '{group_id}' requires fanout_target_count >= 1"
             ));
         }
+        if target_count > astra_tools::agent_tool_contract::AGENT_FANOUT_MAX_TARGET_COUNT as usize {
+            return Err(format!(
+                "fanout group '{group_id}' target_count {target_count} exceeds maximum of {}",
+                astra_tools::agent_tool_contract::AGENT_FANOUT_MAX_TARGET_COUNT
+            ));
+        }
         if slot_index >= target_count {
             return Err(format!(
                 "fanout slot_index {slot_index} is outside target_count {target_count}"
@@ -704,6 +710,27 @@ mod tests {
         assert_eq!(group.target_count, 3);
         assert_eq!(group.slots.len(), 3);
         assert_eq!(group.slots[2].slot_index, 2);
+    }
+
+    #[test]
+    fn slot_identity_rejects_target_count_above_tool_contract_cap() {
+        let target_count =
+            astra_tools::agent_tool_contract::AGENT_FANOUT_MAX_TARGET_COUNT as usize + 1;
+        let error = AgentFanoutSlotIdentity::new("review-1", target_count, 0, None)
+            .expect_err("fanout identities must share the bounded tool contract");
+
+        assert!(error.contains("exceeds maximum of 50"), "{error}");
+    }
+
+    #[test]
+    fn slot_identity_accepts_the_contract_boundary() {
+        let target_count = astra_tools::agent_tool_contract::AGENT_FANOUT_MAX_TARGET_COUNT as usize;
+        let identity =
+            AgentFanoutSlotIdentity::new("review-1", target_count, target_count - 1, None)
+                .expect("the documented fanout boundary must remain usable");
+
+        assert_eq!(identity.target_count, target_count);
+        assert_eq!(identity.slot_index, target_count - 1);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use astra_core::work_unit::{
     WorkUnitWakePolicy,
 };
 use astra_tools::agent_tool_contract::{
-    AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
-    has_malformed_tool_args,
+    AGENT_FANOUT_MAX_TARGET_COUNT, AgentAction, AgentFanoutAction, agent_action_from_args,
+    agent_fanout_action_from_args, has_malformed_tool_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
     AGENT_RESULT_CLASS_SUCCESS, agent_tool_result_needs_recovery,
@@ -59,7 +59,7 @@ const AGENT_RESULT_OBSERVE_GRACE: Duration = Duration::from_secs(1);
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
-pub(crate) const MAX_FANOUT_TARGET_COUNT: usize = 50;
+pub(crate) const MAX_FANOUT_TARGET_COUNT: usize = AGENT_FANOUT_MAX_TARGET_COUNT as usize;
 /// A failed child admission must not turn one fanout slot into an unbounded
 /// aggregate result. The full error remains in runtime logs/transcript; the
 /// parent receives a bounded, UTF-8-safe explanation plus exact byte count.
@@ -1139,16 +1139,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
     if let Err(e) = validate_agent_fanout_start_shape(args) {
         return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
-    let ctx = match ctx {
-        Some(c) => c,
-        None => {
-            return render_agent_runtime_binding_error("agent_fanout", "start");
-        }
-    };
-    if !ctx.spawner.has_executor() {
-        return render_agent_runtime_binding_error("agent_fanout", "start");
-    }
-    let mut input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
+    let input: AgentFanoutStartInput = match serde_json::from_value(args.clone()) {
         Ok(input) => input,
         Err(e) => {
             return render_agent_tool_error(
@@ -1180,6 +1171,16 @@ async fn handle_agent_fanout_start_action_with_deadline(
             ),
         );
     }
+    let ctx = match ctx {
+        Some(c) => c,
+        None => {
+            return render_agent_runtime_binding_error("agent_fanout", "start");
+        }
+    };
+    if !ctx.spawner.has_executor() {
+        return render_agent_runtime_binding_error("agent_fanout", "start");
+    }
+    let mut input = input;
     for (slot_index, slot) in input.slots.iter().enumerate() {
         let description_chars = slot.description.chars().count() as u64;
         if description_chars
@@ -3822,6 +3823,34 @@ mod tests {
         assert_eq!(groups[0].parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(groups[0].slots[0].slot_id.as_deref(), Some("storage"));
         assert_eq!(groups[0].slots[1].slot_id.as_deref(), Some("ui"));
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_rejects_target_count_above_contract_cap_before_binding() {
+        let target_count = MAX_FANOUT_TARGET_COUNT + 1;
+        let slots = (0..target_count)
+            .map(|index| {
+                json!({
+                    "description": format!("Review slot {index}"),
+                    "prompt": "Review the assigned surface and report evidence."
+                })
+            })
+            .collect::<Vec<_>>();
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": target_count,
+                "slots": slots
+            }),
+            None,
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(
+            result.contains("exceeds maximum of 50"),
+            "the bounded contract must be enforced before runtime binding: {result}"
+        );
     }
 
     #[tokio::test]

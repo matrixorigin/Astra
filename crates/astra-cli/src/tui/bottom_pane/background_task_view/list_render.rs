@@ -38,15 +38,24 @@ pub(crate) fn background_task_list_entries(
     rows: &[BackgroundTaskRow],
 ) -> Vec<BackgroundTaskListEntry<'_>> {
     let mut entries = Vec::with_capacity(rows.len());
-    let mut rendered = vec![false; rows.len()];
+    // Build the fanout membership index once per projection. The old path
+    // scanned every row again for each first-seen group, which made a list
+    // with many groups approach O(N×G) work on every repaint and navigation
+    // key. Borrowed group ids keep this temporary index allocation small and
+    // do not create another source of lifecycle state.
+    let mut fanout_members = std::collections::HashMap::<&str, Vec<usize>>::new();
+    for (idx, row) in rows.iter().enumerate() {
+        if let Some(fanout) = row.fanout.as_ref() {
+            fanout_members
+                .entry(fanout.group_id.as_str())
+                .or_default()
+                .push(idx);
+        }
+    }
+    let mut rendered_groups = std::collections::HashSet::<&str>::new();
 
     for idx in 0..rows.len() {
-        if rendered[idx] {
-            continue;
-        }
-
         let Some(fanout) = rows[idx].fanout.as_ref() else {
-            rendered[idx] = true;
             entries.push(BackgroundTaskListEntry::Row {
                 row_idx: idx,
                 row: &rows[idx],
@@ -55,21 +64,15 @@ pub(crate) fn background_task_list_entries(
             continue;
         };
 
-        let member_indices = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(member_idx, row)| {
-                row.fanout
-                    .as_ref()
-                    .is_some_and(|member| member.group_id == fanout.group_id)
-                    .then_some(member_idx)
-            })
-            .collect::<Vec<_>>();
+        let group_id = fanout.group_id.as_str();
+        if !rendered_groups.insert(group_id) {
+            continue;
+        }
+        let member_indices = fanout_members.get(group_id).cloned().unwrap_or_default();
         entries.push(BackgroundTaskListEntry::FanoutHeader(
             compute_fanout_header(fanout, &member_indices, rows),
         ));
         for member_idx in member_indices {
-            rendered[member_idx] = true;
             entries.push(BackgroundTaskListEntry::Row {
                 row_idx: member_idx,
                 row: &rows[member_idx],
@@ -174,7 +177,9 @@ pub(crate) fn render_list(
         .count();
     for (i, entry) in entries.iter().skip(window_start).take(body_h).enumerate() {
         let line = match entry {
-            BackgroundTaskListEntry::FanoutHeader(header) => fanout_header_line(header, dim),
+            BackgroundTaskListEntry::FanoutHeader(header) => {
+                fanout_header_line(header, dim, usize::from(area.width))
+            }
             BackgroundTaskListEntry::Row {
                 row_idx,
                 row,

@@ -664,6 +664,11 @@ impl BottomPane {
         std::mem::take(&mut self.queued_next_turn_submissions)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_user_intent_count(&self) -> usize {
+        self.pending_user_intents.len()
+    }
+
     fn has_pending_user_intents(&self) -> bool {
         !self.pending_user_intents.is_empty()
     }

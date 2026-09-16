@@ -6,6 +6,14 @@ pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, get_result, run_chain, send_mess
 
 pub const AGENT_FANOUT_ACTIONS: &[&str] = &["start", "get_results", "stop_slot", "stop_group"];
 pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot, stop_group";
+/// Maximum number of fixed fanout slots admitted by the runtime.
+///
+/// This is part of the runtime contract rather than a UI-only limit: runtime
+/// admission and recovered slot identity validation use the same bound so a
+/// caller cannot request an unbounded group through another surface. The
+/// serialized tool schema remains structurally stable so this safety fix does
+/// not churn the prompt-cache prefix.
+pub const AGENT_FANOUT_MAX_TARGET_COUNT: u64 = 50;
 pub const AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS: u64 = 256;
 pub const AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS: u64 = 4096;
 
