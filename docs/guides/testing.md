@@ -259,6 +259,32 @@ sample and failure counts, response sizes, foreign-access results, and
 available Prometheus counter deltas. The fixed slow session is a scheduling
 pressure signal, not a claim that a provider was deliberately stalled.
 
+### Durable provider concurrency and cancellation
+
+The ignored runtime test
+`db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable` runs the
+actual durable lifecycle against a loopback HTTP/SSE model gateway. It holds
+one provider run open, then requires another session owned by the same user and
+a session owned by a second user to complete within a bounded window. It also
+reconnects a reader to the completed run, verifies the cancelled terminal
+record, checks that the cancelled run's durable admission reservation is gone,
+and starts a new session to prove that cancellation releases the provider
+slot. The test requires the configured admission budget to expose at least
+three global provider slots and two slots per owner.
+
+Run this focused check only with a disposable MatrixOne database:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --lib \
+  db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable -- \
+  --ignored --nocapture
+```
+
+This is an execution-isolation and slot-reuse contract, not a deployment-scale
+throughput benchmark. Use the Work pressure probe or a separately budgeted
+load lane for multi-pod throughput, thousands of sessions, provider quotas,
+and PTY latency.
+
 ### Optional thinking-protocol compatibility checks
 
 Offline checks require no credentials:

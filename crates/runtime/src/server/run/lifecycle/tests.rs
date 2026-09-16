@@ -8564,6 +8564,128 @@ async fn spawn_incremental_terminal_test_llm(terminal_delay: Duration) -> Termin
     }
 }
 
+struct GatedTerminalTestLlm {
+    base_url: String,
+    blocked_entered: Arc<tokio::sync::Notify>,
+    release_blocked: Arc<tokio::sync::Notify>,
+    fast_requests: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GatedTerminalTestLlm {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// A provider fixture that keeps exactly one request open until the test
+/// releases it. The provider entrypoint is real HTTP/SSE, so this exercises
+/// the lifecycle's execution and cancellation boundaries instead of only
+/// testing an in-memory semaphore.
+async fn spawn_gated_terminal_test_llm() -> GatedTerminalTestLlm {
+    use axum::{
+        Router,
+        body::{Body, Bytes},
+        extract::State,
+        http::header,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use std::convert::Infallible;
+
+    type ProviderState = (
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+    );
+
+    async fn chat_completions(
+        State((blocked_entered, release_blocked, fast_requests)): State<ProviderState>,
+        Json(request): Json<Value>,
+    ) -> Response {
+        let blocked = request.to_string().contains("blocked-provider-run");
+        if blocked {
+            // Signal at handler admission, before the response body can be
+            // buffered by the HTTP client.
+            blocked_entered.notify_one();
+        } else {
+            fast_requests.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if request.get("stream").and_then(Value::as_bool) != Some(true) {
+            return Json(json!({
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+            }))
+            .into_response();
+        }
+
+        let stream = async_stream::stream! {
+            let delta = json!({"choices":[{"delta":{"content":"done"}}]});
+            yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {delta}\n\n")));
+            if blocked {
+                release_blocked.notified().await;
+            }
+            let terminal = json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":1}
+            });
+            yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {terminal}\n\n")));
+            yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+        };
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("gated terminal test response")
+    }
+
+    let blocked_entered = Arc::new(tokio::sync::Notify::new());
+    let release_blocked = Arc::new(tokio::sync::Notify::new());
+    let fast_requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state((
+            blocked_entered.clone(),
+            release_blocked.clone(),
+            fast_requests.clone(),
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gated terminal test LLM");
+    let addr = listener
+        .local_addr()
+        .expect("gated terminal test LLM address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve gated terminal test LLM");
+    });
+    GatedTerminalTestLlm {
+        base_url: format!("http://{addr}/v1"),
+        blocked_entered,
+        release_blocked,
+        fast_requests,
+        server,
+    }
+}
+
+async fn collect_chat_stream(mut stream: ChatStreamRecord) -> Vec<Value> {
+    let mut events = stream.events;
+    if let Some(mut event_rx) = stream.event_rx.take() {
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+    }
+    events
+}
+
+fn chat_stream_event_status(event: &Value) -> Option<&str> {
+    event
+        .pointer("/data/status")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("status").and_then(Value::as_str))
+}
+
 async fn terminal_test_service() -> (AgenticRunLifecycleService, TerminalTestLlm) {
     let llm = spawn_terminal_test_llm().await;
     let service = AgenticRunLifecycleService::new(
@@ -9802,6 +9924,261 @@ fn db_backed_test_service(
     )
     .with_pool(shared_pool.clone())
     .with_model_service(Arc::new(ActiveTestModelService::default()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner_a = format!("cap-owner-a-{}", Uuid::new_v4());
+    let owner_b = format!("cap-owner-b-{}", Uuid::new_v4());
+    let blocked_session = format!("cap-blocked-{}", Uuid::new_v4());
+    let fast_a_session = format!("cap-fast-a-{}", Uuid::new_v4());
+    let fast_b_session = format!("cap-fast-b-{}", Uuid::new_v4());
+    let after_cancel_session = format!("cap-after-cancel-{}", Uuid::new_v4());
+    for (user_id, session_id) in [
+        (&owner_a, &blocked_session),
+        (&owner_a, &fast_a_session),
+        (&owner_a, &after_cancel_session),
+        (&owner_b, &fast_b_session),
+    ] {
+        crate::server::run::insert_active_run_session_fixture(&pool, user_id, session_id).await;
+    }
+
+    let service =
+        db_backed_test_service(&pool, &format!("capacity-it-owner-pod-{}", Uuid::new_v4()));
+    assert!(
+        service.admission_limits.global.provider_slots >= 3
+            && service.admission_limits.per_owner.provider_slots >= 2,
+        "the configured deployment capacity must allow one owner to run two sessions while another owner runs one"
+    );
+    let llm = spawn_gated_terminal_test_llm().await;
+
+    let authorized_request = |message: &str, session_id: &str| {
+        let mut request = prepared_test_request(message);
+        request.session_id = Some(session_id.to_string());
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer gated-test-provider".to_string(),
+        });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "gated-test-gateway",
+                    "model_gateway",
+                    &format!("{}/chat/completions", llm.base_url),
+                )),
+                ..Default::default()
+            });
+        request.execution_policy.skill_auto_route =
+            astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+        request
+    };
+
+    let blocked_stream = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.stream_chat(
+            owner_a.clone(),
+            authorized_request("blocked-provider-run", &blocked_session),
+        ),
+    )
+    .await
+    .expect("blocked run admission should be bounded"));
+    let blocked_run_id = blocked_stream.run_id.clone();
+    let blocked_events_task = tokio::spawn(collect_chat_stream(blocked_stream));
+    tokio::time::timeout(Duration::from_secs(5), llm.blocked_entered.notified())
+        .await
+        .expect("blocked provider request should reach the real HTTP gateway");
+
+    let fast_a_stream = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.stream_chat(
+            owner_a.clone(),
+            authorized_request("fast-owner-a", &fast_a_session),
+        ),
+    )
+    .await
+    .expect("same-owner session admission should be bounded"));
+    let fast_a_run_id = fast_a_stream.run_id.clone();
+    let fast_b_stream = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.stream_chat(
+            owner_b.clone(),
+            authorized_request("fast-owner-b", &fast_b_session),
+        ),
+    )
+    .await
+    .expect("cross-owner session admission should be bounded"));
+    let fast_b_run_id = fast_b_stream.run_id.clone();
+    let (fast_a_events, fast_b_events) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            collect_chat_stream(fast_a_stream),
+            collect_chat_stream(fast_b_stream),
+        )
+    })
+    .await
+    .expect("independent users and sessions must finish while one provider run is blocked");
+    assert!(
+        llm.fast_requests.load(Ordering::SeqCst) >= 2,
+        "both independent runs must reach the provider while the blocked request is open"
+    );
+    for events in [&fast_a_events, &fast_b_events] {
+        assert!(
+            events
+                .iter()
+                .any(|event| replay_event_type(event) == Some("run_finished")),
+            "independent run stream must include its terminal lifecycle event: {events:?}"
+        );
+    }
+
+    let fast_a_status = ok(service
+        .get_run_status(fast_a_run_id.clone(), owner_a.clone())
+        .await);
+    let fast_b_status = ok(service
+        .get_run_status(fast_b_run_id.clone(), owner_b.clone())
+        .await);
+    assert_eq!(fast_a_status.status, STATUS_COMPLETED);
+    assert_eq!(fast_b_status.status, STATUS_COMPLETED);
+
+    let attached = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.stream_run_live(fast_a_run_id.clone(), owner_a.clone(), 0),
+    )
+    .await
+    .expect("durable reader reconnect should be bounded"));
+    let attached_events =
+        tokio::time::timeout(Duration::from_secs(5), collect_chat_stream(attached))
+            .await
+            .expect("durable reader reconnect should close after the terminal event");
+    assert!(
+        attached_events
+            .iter()
+            .any(|event| replay_event_type(event) == Some("run_finished")),
+        "a reconnecting reader must observe the durable terminal event"
+    );
+
+    let blocked_status = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.get_run_status(blocked_run_id.clone(), owner_a.clone()),
+    )
+    .await
+    .expect("blocked run status read should be bounded"));
+    assert_eq!(
+        blocked_status.status, STATUS_RUNNING,
+        "the blocked provider run must remain active until cancellation"
+    );
+    let active_reservation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM session_weighted_admission_reservations
+         WHERE owner_user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_a)
+    .bind(&blocked_session)
+    .fetch_one(pool.get())
+    .await
+    .expect("read active blocked run admission reservation");
+    assert_eq!(
+        active_reservation_count, 1,
+        "the blocked run must hold exactly one durable provider reservation before cancellation"
+    );
+    let cancellation = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.cancel_run(blocked_run_id.clone(), owner_a.clone()),
+    )
+    .await
+    .expect("cancellation request should be bounded"));
+    assert_eq!(cancellation.status, "cancellation_requested");
+    let blocked_events = tokio::time::timeout(Duration::from_secs(5), blocked_events_task)
+        .await
+        .expect("cancelled provider stream should settle")
+        .expect("blocked stream task should not panic");
+    assert!(
+        blocked_events.iter().any(|event| {
+            replay_event_type(event) == Some("run_finished")
+                && chat_stream_event_status(event) == Some(STATUS_CANCELLED)
+        }),
+        "cancellation must produce the canonical cancelled terminal event: {blocked_events:?}"
+    );
+
+    let reservation_released = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                 FROM session_weighted_admission_reservations
+                 WHERE owner_user_id = ? AND session_id = ?",
+            )
+            .bind(&owner_a)
+            .bind(&blocked_session)
+            .fetch_one(pool.get())
+            .await
+            .expect("read blocked run admission reservation");
+            if count == 0 {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("cancelled run admission reservation should be released");
+    assert!(reservation_released);
+    // The gate is already closed from the cancellation assertion above. This
+    // notification is cleanup only, after the lifecycle has converged, in
+    // case the loopback server still owns a response-body future.
+    llm.release_blocked.notify_one();
+
+    let cancelled_status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = ok(service
+                .get_run_status(blocked_run_id.clone(), owner_a.clone())
+                .await);
+            if status.status == STATUS_CANCELLED {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("durable cancellation should converge");
+    assert_eq!(cancelled_status.status, STATUS_CANCELLED);
+
+    let after_cancel_stream = ok(tokio::time::timeout(
+        Duration::from_secs(5),
+        service.stream_chat(
+            owner_a.clone(),
+            authorized_request("after-cancel-slot-reuse", &after_cancel_session),
+        ),
+    )
+    .await
+    .expect("post-cancellation session admission should be bounded"));
+    let after_cancel_run_id = after_cancel_stream.run_id.clone();
+    let after_cancel_events = tokio::time::timeout(
+        Duration::from_secs(5),
+        collect_chat_stream(after_cancel_stream),
+    )
+    .await
+    .expect("a cancelled run must release its provider slot for the next session");
+    assert!(after_cancel_events.iter().any(|event| {
+        replay_event_type(event) == Some("run_finished")
+            && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
+    }));
+
+    for (user_id, run_id) in [
+        (&owner_a, &blocked_run_id),
+        (&owner_a, &fast_a_run_id),
+        (&owner_b, &fast_b_run_id),
+        (&owner_a, &after_cancel_run_id),
+    ] {
+        cleanup_lifecycle_run_fixture(&pool, user_id, run_id).await;
+    }
+    for (user_id, session_id) in [
+        (&owner_a, &blocked_session),
+        (&owner_a, &fast_a_session),
+        (&owner_a, &after_cancel_session),
+        (&owner_b, &fast_b_session),
+    ] {
+        crate::server::run::cleanup_run_session_fixture(&pool, user_id, session_id).await;
+    }
 }
 
 async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
