@@ -59,6 +59,7 @@ import {
 } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { PATH_EDGES_STATUS } from "@astra/sdk";
+import workspaceBindingContract from "../../../fixtures/contracts/workspace_binding_request.json";
 
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
@@ -966,12 +967,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "none",
-          display_name: "Web",
-          authority: "none",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.none,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-control-plane",
@@ -1047,12 +1043,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "server_sandbox",
-          display_name: "Server sandbox",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.server_sandbox,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-local",
@@ -1155,13 +1146,7 @@ describe("chat stream route proxy cancellation", () => {
         attachments: [],
         model_selection: { offering_id: "model-backend" },
         enabled_tools: ["github", "web_fetch", "web_search"],
-        workspace_binding: {
-          kind: "edge_workspace",
-          display_name: "MacBook Pro",
-          cwd: "/Users/test/astra",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: {
           kind: "edge_agent",
           executor_id: "edge-1",
@@ -1453,10 +1438,7 @@ describe("chat stream route proxy cancellation", () => {
         parts: [],
         attachments: [],
         model_selection: { offering_id: "model-backend" },
-        workspace_binding: expect.objectContaining({
-          kind: "edge_workspace",
-          cwd: "/Users/test/astra",
-        }),
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: expect.objectContaining({
           kind: "edge_agent",
           executor_id: "edge-1",

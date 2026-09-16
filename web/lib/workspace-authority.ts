@@ -1,4 +1,7 @@
-import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
+import type {
+  ExecutorBinding,
+  WorkspaceBindingRequest,
+} from "@astra/sdk";
 import type { WorkspaceAuthority, WorkspaceSelection } from "@/lib/api/types";
 
 type WorkspaceAuthorityError = {
@@ -36,12 +39,11 @@ function selectedWorkspaceAuthority(selection: WorkspaceSelection) {
   return selection.authority ?? DEFAULT_SELECTED_WORKSPACE_AUTHORITY;
 }
 
-export function defaultWorkspaceBinding(): WorkspaceBinding {
+export function defaultWorkspaceBinding(): WorkspaceBindingRequest {
   return {
     kind: "none",
     display_name: "Web",
     authority: "none",
-    fallback_policy: "disabled",
   };
 }
 
@@ -57,13 +59,13 @@ export function defaultExecutorBinding(): ExecutorBinding {
 
 export function edgeWorkspaceBinding(
   selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
-): WorkspaceBinding {
+): WorkspaceBindingRequest {
   return {
     kind: "edge_workspace",
     display_name: selection.displayName ?? selection.edgeAgentId,
-    cwd: selection.cwd,
+    root: selection.cwd,
+    source: { kind: "edge_path", path: selection.cwd },
     authority: selectedWorkspaceAuthority(selection),
-    fallback_policy: "disabled",
   };
 }
 
@@ -81,12 +83,11 @@ export function edgeExecutorBinding(
 
 export function serverSandboxWorkspaceBinding(
   selection?: Extract<WorkspaceSelection, { kind: "server_sandbox" }>,
-): WorkspaceBinding {
+): WorkspaceBindingRequest {
   return {
     kind: "server_sandbox",
     display_name: "Server sandbox",
     authority: selection ? selectedWorkspaceAuthority(selection) : "read_write",
-    fallback_policy: "disabled",
   };
 }
 

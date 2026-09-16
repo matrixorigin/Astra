@@ -1485,9 +1485,9 @@ describe("chatRequestToWire", () => {
       workspaceBinding: {
         kind: "edge_workspace",
         display_name: "Edge workspace",
-        cwd: "/tmp",
+        root: "/tmp",
+        source: { kind: "edge_path", path: "/tmp" },
         authority: "read_write",
-        fallback_policy: "disabled",
       },
       executorBinding: {
         kind: "edge_agent",
@@ -1529,9 +1529,9 @@ describe("chatRequestToWire", () => {
       workspace_binding: {
         kind: "edge_workspace",
         display_name: "Edge workspace",
-        cwd: "/tmp",
+        root: "/tmp",
+        source: { kind: "edge_path", path: "/tmp" },
         authority: "read_write",
-        fallback_policy: "disabled",
       },
       executor_binding: {
         kind: "edge_agent",

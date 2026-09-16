@@ -23,6 +23,8 @@ export type {
   ThinkingDeltaEvent,
   ThinkingDoneEvent,
   WorkspaceBinding,
+  WorkspaceBindingRequest,
+  WorkspaceSourceRequest,
   ExecutorBinding,
   ExecutionBindingFields,
   ToolCallEvent,

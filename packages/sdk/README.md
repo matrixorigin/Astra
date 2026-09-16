@@ -206,7 +206,9 @@ audit or visualization needs. Integration boundaries such as
 `agentBinding`, `runtimeProfile`, `executionBudget`, `capabilities`, `explain`,
 `context`, `allowSkills`, `allowTools`, `workspaceBinding`, and
 `executorBinding` are passed through the same typed chat request rather than
-being flattened into prompt text.
+being flattened into prompt text. `workspaceBinding` uses the canonical request
+shape (`kind` plus optional `display_name`, `root`, `source`, and `authority`);
+the workspace object observed in runtime events is a separate response shape.
 
 ## §5.5 Edge protocol (from TypeScript)
 
