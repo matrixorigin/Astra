@@ -224,14 +224,14 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
     async fn renew_invocation_owner(
         &self,
         plan: &astra_services::InferenceInvocationPlan,
-    ) -> astra_services::ServiceResult<()>;
+    ) -> astra_services::ServiceResult<astra_services::InferenceOwnerLeaseRenewal>;
 
     #[cfg(test)]
     async fn renew_invocation_owner(
         &self,
         _plan: &astra_services::InferenceInvocationPlan,
-    ) -> astra_services::ServiceResult<()> {
-        Ok(())
+    ) -> astra_services::ServiceResult<astra_services::InferenceOwnerLeaseRenewal> {
+        Ok(astra_services::InferenceOwnerLeaseRenewal::Renewed)
     }
 
     async fn settle_uncertain_admission(
@@ -315,7 +315,7 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
     async fn renew_invocation_owner(
         &self,
         plan: &astra_services::InferenceInvocationPlan,
-    ) -> astra_services::ServiceResult<()> {
+    ) -> astra_services::ServiceResult<astra_services::InferenceOwnerLeaseRenewal> {
         astra_services::renew_inference_invocation_owner(&self.shared_pool, plan).await
     }
 
@@ -465,7 +465,13 @@ impl InferenceOwnerLease {
                     _ = interval.tick() => {}
                 }
                 match persistence.renew_invocation_owner(&plan).await {
-                    Ok(()) => last_success = std::time::Instant::now(),
+                    Ok(astra_services::InferenceOwnerLeaseRenewal::Renewed) => {
+                        last_success = std::time::Instant::now();
+                    }
+                    Ok(astra_services::InferenceOwnerLeaseRenewal::AlreadyTerminal) => {
+                        lease.stop();
+                        break;
+                    }
                     Err(error)
                         if matches!(
                             error.kind,
@@ -2239,16 +2245,22 @@ impl TestInferenceLedgerPersistence {
 impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
     async fn renew_invocation_owner(
         &self,
-        _plan: &astra_services::InferenceInvocationPlan,
-    ) -> astra_services::ServiceResult<()> {
+        plan: &astra_services::InferenceInvocationPlan,
+    ) -> astra_services::ServiceResult<astra_services::InferenceOwnerLeaseRenewal> {
         let mut state = self.lock();
         state.owner_renewals = state.owner_renewals.saturating_add(1);
         if state.owner_lease_lost {
             Err(astra_services::ServiceError::conflict(
                 "test inference owner generation was transferred",
             ))
+        } else if state
+            .invocations
+            .get(plan.invocation_id())
+            .is_some_and(|invocation| invocation.terminal.is_some())
+        {
+            Ok(astra_services::InferenceOwnerLeaseRenewal::AlreadyTerminal)
         } else {
-            Ok(())
+            Ok(astra_services::InferenceOwnerLeaseRenewal::Renewed)
         }
     }
 
@@ -5849,6 +5861,51 @@ mod tests {
                 .ensure_live("provider delivery authorization")
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_owner_heartbeat_stops_without_fencing_local_authority() {
+        let persistence = Arc::new(TestInferenceLedgerPersistence::default());
+        let plan = test_invocation_plan();
+        persistence
+            .admit_invocation(&plan)
+            .await
+            .expect("admit terminal heartbeat test invocation");
+        let attempt = test_provider_attempt(&plan, 0);
+        persistence
+            .begin_provider_attempt(&attempt)
+            .await
+            .expect("begin terminal heartbeat provider attempt");
+        let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+            astra_services::InferenceUsage::default(),
+            Some("terminal-heartbeat-response".to_string()),
+        );
+        persistence
+            .finish_successful_provider_attempt_and_invocation(&plan, &attempt, &terminal)
+            .await
+            .expect("terminalize heartbeat test invocation");
+
+        let owner_lease = InferenceOwnerLease::start(persistence.clone(), plan.clone(), None);
+        InferenceOwnerLease::spawn_heartbeat_with_timing(
+            owner_lease.clone(),
+            persistence.clone(),
+            plan,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(20),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            owner_lease.stop.cancelled(),
+        )
+        .await
+        .expect("terminal owner heartbeat must stop itself");
+
+        assert!(!owner_lease.is_lost());
+        assert!(!owner_lease.cancel.is_cancelled());
+        assert_eq!(persistence.lock().owner_renewals, 1);
+        owner_lease
+            .ensure_live("logical terminal")
+            .expect("terminal completion must not look like owner loss");
     }
 
     #[tokio::test]

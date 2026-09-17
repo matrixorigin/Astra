@@ -342,6 +342,19 @@ impl InferenceTerminalStatus {
     }
 }
 
+/// Authoritative result of renewing one durable inference owner lease.
+///
+/// A terminal invocation still belongs to the owner that committed its final
+/// fact, but no longer has a renewable lease. Callers must stop heartbeating it
+/// without treating that terminal transition as an ownership transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceOwnerLeaseRenewal {
+    /// The admitted invocation lease was extended.
+    Renewed,
+    /// The same owner already committed an authoritative terminal fact.
+    AlreadyTerminal,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferenceUsage {
     /// Provider-normalized input buckets. Fresh input, cache reads, and cache
@@ -2934,6 +2947,55 @@ fn classify_persisted_provider_terminal(
     )))
 }
 
+/// Owner state read under the immutable invocation identity lock.
+struct LockedInferenceOwnerFact {
+    status: String,
+    owner_token: String,
+    owner_generation: i64,
+    lease_live: bool,
+}
+
+async fn lock_inference_owner_fact(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+) -> ServiceResult<Option<LockedInferenceOwnerFact>> {
+    let row = sqlx::query(
+        "SELECT status, owner_token, owner_generation,
+                IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "lock inference invocation owner fact",
+            error,
+        )
+    })?;
+    row.map(|row| -> Result<LockedInferenceOwnerFact, sqlx::Error> {
+        Ok(LockedInferenceOwnerFact {
+            status: row.try_get("status")?,
+            owner_token: row.try_get("owner_token")?,
+            owner_generation: row.try_get("owner_generation")?,
+            lease_live: row.try_get::<i64, _>("lease_live")? == 1,
+        })
+    })
+    .transpose()
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode locked inference invocation owner fact",
+            error,
+        )
+    })
+}
+
 /// Serialize the two mutually exclusive lifecycle decisions for one logical
 /// invocation: opening another physical attempt, or publishing its final
 /// settlement. The lock is deliberately on the immutable invocation identity,
@@ -2949,67 +3011,18 @@ async fn lock_admitted_inference_invocation(
     let owner_generation = i64::try_from(owner_generation).map_err(|_| {
         ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
     })?;
-    // Keep recovery byte-exact. MatrixOne CAST(... AS CHAR) truncates large
-    // LONGTEXT values, so the SQL predicate bounds the raw transfer and Rust
-    // owns the complete-payload digest and JSON validation.
-    let row = sqlx::query(
-        "SELECT status, owner_token, owner_generation,
-                IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
-         FROM inference_invocations
-         WHERE user_id = ? AND invocation_id = ?
-         FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(invocation_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "lock inference invocation lifecycle",
-            error,
-        )
-    })?;
-    let Some(row) = row else {
+    let Some(persisted) = lock_inference_owner_fact(tx, user_id, invocation_id).await? else {
         return Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} is unavailable; cannot {action}"
         )));
     };
-    let status = row.try_get::<String, _>("status").map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode locked inference invocation status",
-            error,
-        )
-    })?;
-    let durable_owner_token = row.try_get::<String, _>("owner_token").map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode locked inference owner token",
-            error,
-        )
-    })?;
-    let durable_owner_generation = row.try_get::<i64, _>("owner_generation").map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode locked inference owner generation",
-            error,
-        )
-    })?;
-    let lease_live = row.try_get::<i64, _>("lease_live").map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode locked inference owner lease",
-            error,
-        )
-    })? == 1;
-    if durable_owner_token != owner_token || durable_owner_generation != owner_generation {
+    if persisted.owner_token != owner_token || persisted.owner_generation != owner_generation {
         return Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} belongs to a different owner generation; cannot {action}"
         )));
     }
-    match status.as_str() {
-        "admitted" if lease_live => Ok(()),
+    match persisted.status.as_str() {
+        "admitted" if persisted.lease_live => Ok(()),
         "admitted" => Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} owner lease expired; cannot {action}"
         ))),
@@ -3025,7 +3038,7 @@ async fn lock_admitted_inference_invocation(
 pub async fn renew_inference_invocation_owner(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
-) -> ServiceResult<()> {
+) -> ServiceResult<InferenceOwnerLeaseRenewal> {
     let owner_generation = i64::try_from(plan.owner_generation).map_err(|_| {
         ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
     })?;
@@ -3050,12 +3063,74 @@ pub async fn renew_inference_invocation_owner(
         )
     })?;
     if updated.rows_affected() == 1 {
-        Ok(())
-    } else {
+        return Ok(InferenceOwnerLeaseRenewal::Renewed);
+    }
+
+    // A successful physical terminal atomically terminalizes the logical
+    // invocation before the runtime finishes its in-memory settlement. A
+    // heartbeat already in flight can therefore observe zero updated rows even
+    // though no owner transfer occurred. Re-read the row under a write lock so
+    // terminal completion is distinguished from lease expiry or a newer owner.
+    let mut tx = pool.get().begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin inference owner renewal resolution",
+            error,
+        )
+    })?;
+    let resolution: ServiceResult<InferenceOwnerLeaseRenewal> = async {
+        let Some(persisted) = lock_inference_owner_fact(
+            &mut tx,
+            plan.input.user_id.as_str(),
+            plan.invocation_id.as_str(),
+        )
+        .await?
+        else {
+            return Err(ServiceError::conflict(format!(
+                "inference invocation {} is unavailable; owner lease is no longer renewable",
+                plan.invocation_id
+            )));
+        };
+        if persisted.owner_token != plan.owner_token
+            || persisted.owner_generation != owner_generation
+        {
+            return Err(ServiceError::conflict(format!(
+                "inference invocation {} belongs to a different owner generation; owner lease is no longer renewable",
+                plan.invocation_id
+            )));
+        }
+        if matches!(
+            persisted.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "delivery_unknown"
+        ) {
+            return Ok(InferenceOwnerLeaseRenewal::AlreadyTerminal);
+        }
+        let reason = if persisted.status == "admitted" && !persisted.lease_live {
+            "owner lease expired"
+        } else {
+            "owner lease is no longer renewable"
+        };
         Err(ServiceError::conflict(format!(
-            "inference invocation {} owner lease is no longer renewable",
+            "inference invocation {} {reason}",
             plan.invocation_id
         )))
+    }
+    .await;
+    match resolution {
+        Ok(outcome) => {
+            tx.commit().await.map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "commit inference owner renewal resolution",
+                    error,
+                )
+            })?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            rollback_inference_tx(tx, "resolve inference owner renewal").await;
+            Err(error)
+        }
     }
 }
 

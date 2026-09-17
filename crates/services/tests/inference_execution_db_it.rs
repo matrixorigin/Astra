@@ -9,13 +9,14 @@ mod common;
 use astra_services::runtime_maintenance::{RuntimeMaintenancePolicy, maintain_runtime_storage};
 use astra_services::{
     InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
-    InferenceInvocationTerminal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
-    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority, InferenceTerminalStatus,
-    InferenceUsage, InferenceUsageStatus, ModelAccessKind, ModelExecutionPlacement,
-    ServiceErrorKind, admit_inference_invocation,
+    InferenceInvocationTerminal, InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan,
+    InferenceProviderDeliveryState, InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
+    InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus, ModelAccessKind,
+    ModelExecutionPlacement, ServiceErrorKind, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
+    finish_successful_inference_provider_attempt_and_invocation,
     load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
     renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
@@ -5450,6 +5451,75 @@ async fn heartbeat_and_expiry_finish_race_have_one_durable_owner() {
     assert_eq!(
         raced_fact.get::<String, _>("provider_delivery_state"),
         "delivery_authorized"
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn heartbeat_recognizes_terminal_committed_by_the_same_owner() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("terminal-heartbeat-user-{suffix}");
+    let session_id = format!("terminal-heartbeat-session-{suffix}");
+    let run_id = format!("terminal-heartbeat-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        22,
+        "terminal_heartbeat",
+    ))
+    .expect("plan terminal-heartbeat invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit terminal-heartbeat invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin terminal-heartbeat provider attempt");
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage::default(),
+        Some("terminal-heartbeat-response".to_string()),
+    );
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+    )
+    .await
+    .expect("commit terminal-heartbeat success");
+
+    assert_eq!(
+        renew_inference_invocation_owner(&shared_pool, &plan)
+            .await
+            .expect("resolve heartbeat after terminal success"),
+        InferenceOwnerLeaseRenewal::AlreadyTerminal
+    );
+    let persisted = sqlx::query(
+        "SELECT status, owner_token, owner_generation
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load terminal-heartbeat invocation");
+    assert_eq!(persisted.get::<String, _>("status"), "succeeded");
+    assert_eq!(
+        persisted.get::<String, _>("owner_token"),
+        plan.owner_token()
+    );
+    assert_eq!(
+        persisted.get::<i64, _>("owner_generation"),
+        i64::try_from(plan.owner_generation()).expect("owner generation fits i64")
     );
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
