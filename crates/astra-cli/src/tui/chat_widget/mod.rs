@@ -299,7 +299,17 @@ impl AgentRunProjection {
         if !should_accept_agent_state(self.state, state) {
             return false;
         }
+        let lifecycle_changed = self.state.status != state.status;
         self.state = state;
+        if lifecycle_changed {
+            // Receipt projections may arrive more than once and can carry
+            // different amounts of detail. Status-scoped text must never
+            // survive a lifecycle transition: a later completed receipt
+            // without a reason must not display an earlier failure or wait
+            // message as if it were still current.
+            self.detail.output_summary = None;
+            self.detail.error = None;
+        }
         if !matches!(
             state.status,
             AgentRunStatus::Waiting | AgentRunStatus::Paused
@@ -7786,6 +7796,83 @@ mod tests {
             );
         }
         assert_eq!(agent_run_state_from_fanout_receipt("future_status"), None);
+    }
+
+    #[test]
+    fn accepted_fanout_completion_clears_an_earlier_failure() {
+        let receipt = |status: &str, reason: Option<&str>| {
+            let mut agent = serde_json::json!({
+                "slot_index": 0,
+                "agent_id": "reviewer@failure-replay",
+                "run_id": "run-failure-replay",
+                "status": status,
+            });
+            if let Some(reason) = reason {
+                agent["terminal_reason"] = serde_json::json!(reason);
+            }
+            serde_json::json!({
+                "group_id": "failure-replay",
+                "target_count": 1,
+                "agents": [agent],
+            })
+            .to_string()
+        };
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(&receipt("failed", Some("boom")));
+        let failed = widget
+            .agent_run_cell("reviewer@failure-replay")
+            .expect("failed receipt creates a projection");
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+
+        widget.on_agent_fanout_launch_receipt(&receipt("completed", None));
+        let completed = widget
+            .agent_run_cell("reviewer@failure-replay")
+            .expect("completed receipt keeps the projection");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.error, None);
+        assert_eq!(completed.output_summary, None);
+    }
+
+    #[test]
+    fn accepted_fanout_completion_clears_an_earlier_waiting_message() {
+        let receipt = |status: &str, reason: Option<&str>| {
+            let mut agent = serde_json::json!({
+                "slot_index": 0,
+                "agent_id": "reviewer@waiting-replay",
+                "run_id": "run-waiting-replay",
+                "status": status,
+            });
+            if let Some(reason) = reason {
+                agent["terminal_reason"] = serde_json::json!(reason);
+            }
+            serde_json::json!({
+                "group_id": "waiting-replay",
+                "target_count": 1,
+                "agents": [agent],
+            })
+            .to_string()
+        };
+
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(&receipt("waiting_for_input", Some("approval")));
+        let waiting = widget
+            .agent_run_cell("reviewer@waiting-replay")
+            .expect("waiting receipt creates a projection");
+        assert_eq!(waiting.status, TaskStatus::Waiting);
+        assert_eq!(
+            waiting.output_summary.as_deref(),
+            Some("Waiting for approval")
+        );
+
+        widget.on_agent_fanout_launch_receipt(&receipt("completed", None));
+        let completed = widget
+            .agent_run_cell("reviewer@waiting-replay")
+            .expect("completed receipt keeps the projection");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.output_summary, None);
+        assert_eq!(completed.error, None);
     }
 
     #[test]

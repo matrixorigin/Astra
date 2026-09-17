@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{IsTerminal, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -190,11 +190,16 @@ impl PublishedArtifact {
 
     /// Compact one-line output for non-TUI callers such as the streaming CLI.
     pub(crate) fn terminal_notice(&self) -> String {
+        self.terminal_notice_with_links(std::io::stderr().is_terminal())
+    }
+
+    fn terminal_notice_with_links(&self, allow_osc8: bool) -> String {
         let notice = self.user_notice();
         let Some(link) = self.user_link() else {
             return notice;
         };
-        let target = if crate::cli::terminal_hyperlinks::terminal_hyperlinks_enabled() {
+        let target = if allow_osc8 && crate::cli::terminal_hyperlinks::terminal_hyperlinks_enabled()
+        {
             crate::cli::terminal_hyperlinks::osc8_link(&link.uri, &link.label)
         } else {
             link.fallback
@@ -949,6 +954,19 @@ mod tests {
             "Explain Analyze data saved · no local report is available"
         );
         assert!(no_local_copy.user_link().is_none());
+    }
+
+    #[test]
+    fn redirected_artifact_notice_uses_plain_path_without_osc8() {
+        let publication = PublishedArtifact {
+            handle: artifact_handle("run-redirected", "turn-1"),
+            rendered_path: Some(PathBuf::from("/tmp/report.md")),
+            render_error: None,
+        };
+
+        let notice = publication.terminal_notice_with_links(false);
+        assert_eq!(notice, "Explain Analyze report ready · /tmp/report.md");
+        assert!(!notice.contains('\x1b'));
     }
 
     #[test]
