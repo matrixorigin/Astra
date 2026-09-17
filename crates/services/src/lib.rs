@@ -202,9 +202,10 @@ pub use harness::{
 pub use inference_execution::{
     InferenceCanonicalTransitionReceipt, InferenceInvocationAdmissionResolution,
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
-    InferenceProviderAttemptPlan, InferenceProviderDeliveryState, InferenceProviderWireIdentity,
-    InferenceRunAdmissionAuthority, InferenceScopeRejection, InferenceSettlementReconcileOutcome,
-    InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus, admit_inference_invocation,
+    InferenceOwnerLeaseRenewal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
+    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority, InferenceScopeRejection,
+    InferenceSettlementReconcileOutcome, InferenceTerminalStatus, InferenceUsage,
+    InferenceUsageStatus, admit_inference_invocation,
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
