@@ -5528,6 +5528,177 @@ async fn heartbeat_recognizes_terminal_committed_by_the_same_owner() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn combined_successful_settlement_commits_exact_terminal() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("combined-success-user-{suffix}");
+    let session_id = format!("combined-success-session-{suffix}");
+    let run_id = format!("combined-success-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        23,
+        "combined_success",
+    ))
+    .expect("plan combined-success invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit combined-success invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin combined-success provider attempt");
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("combined-success-response".to_string()),
+    );
+
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+    )
+    .await
+    .expect("commit combined physical and logical success");
+
+    let persisted = sqlx::query(
+        "SELECT invocation.status AS invocation_status,
+                invocation.terminal_fingerprint AS invocation_fingerprint,
+                attempt.status AS attempt_status,
+                attempt.terminal_fingerprint AS attempt_fingerprint
+         FROM inference_invocations AS invocation
+         JOIN inference_provider_attempts AS attempt
+           ON attempt.user_id = invocation.user_id
+          AND attempt.invocation_id = invocation.invocation_id
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load combined-success terminal facts");
+    assert_eq!(persisted.get::<String, _>("invocation_status"), "succeeded");
+    assert_eq!(persisted.get::<String, _>("attempt_status"), "succeeded");
+    assert_eq!(
+        persisted.get::<String, _>("invocation_fingerprint"),
+        persisted.get::<String, _>("attempt_fingerprint")
+    );
+    let settlement_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load combined-success settlement debt count");
+    assert_eq!(settlement_debts, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn combined_successful_settlement_fails_closed_with_multiple_open_attempts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("combined-ambiguous-user-{suffix}");
+    let session_id = format!("combined-ambiguous-session-{suffix}");
+    let run_id = format!("combined-ambiguous-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        24,
+        "combined_ambiguous",
+    ))
+    .expect("plan combined-ambiguous invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit combined-ambiguous invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin combined-ambiguous provider attempt");
+
+    let shadow_attempt_id = format!("shadow-{suffix}");
+    sqlx::query(
+        "INSERT INTO inference_provider_attempts
+         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id,
+          attempt_index, provider, admission_token, provider_protocol,
+          provider_wire_hash, provider_wire_bytes, status, usage_status,
+          started_at, terminal_at)
+         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+                attempt_index + 1, provider, ?, provider_protocol,
+                provider_wire_hash, provider_wire_bytes, 'started', 'unavailable',
+                NOW(6), NULL
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&shadow_attempt_id)
+    .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("inject a second open attempt to verify the settlement fence");
+
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(5, 3, 0),
+            output_tokens: 2,
+        },
+        Some("combined-ambiguous-response".to_string()),
+    );
+    let error = finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+    )
+    .await
+    .expect_err("ambiguous open attempts must fail closed before terminal writes");
+    assert_eq!(error.kind, ServiceErrorKind::Conflict);
+
+    let invocation_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load fenced invocation status");
+    assert_eq!(invocation_status, "admitted");
+    let open_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ? AND status = 'started'",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load fenced provider attempts");
+    assert_eq!(open_attempts, 2);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
     let started = std::time::Instant::now();
     let (shared_pool, _) = common::setup_pool_and_settings().await;
