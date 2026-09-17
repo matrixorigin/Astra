@@ -1141,11 +1141,11 @@ struct EditedDiffPreview<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::render::line_utils::sanitize_lines_for_terminal;
+    use crate::tui::render::line_utils::sanitize_lines_for_buffer;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
     fn render(cell: &ToolCell, width: u16, height: u16) -> String {
-        let lines = sanitize_lines_for_terminal(cell.display_lines(width));
+        let lines = sanitize_lines_for_buffer(cell.display_lines(width));
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
@@ -1832,7 +1832,7 @@ mod tests {
         t.output_summary = Some("@@ -1,1 +1,1 @@\n-fn old_name() {}\n+fn new_name() {}".into());
 
         let width = 80;
-        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let lines = sanitize_lines_for_buffer(t.display_lines(width));
         let paragraph = crate::tui::render::line_utils::FullRowParagraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 12);
@@ -1861,7 +1861,7 @@ mod tests {
         t.output = Some("@@ -40,0 +40,2 @@\n+func sealAndRunWhenDrained() {}\n+\n".into());
 
         let width = 96;
-        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let lines = sanitize_lines_for_buffer(t.display_lines(width));
         let paragraph = crate::tui::render::line_utils::FullRowParagraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 10);
@@ -1890,7 +1890,7 @@ mod tests {
             Some("@@ -10,0 +10,3 @@\n+fn before_blank() {}\n+\n+fn after_blank() {}\n".into());
 
         let width = 72;
-        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let lines = sanitize_lines_for_buffer(t.display_lines(width));
         let rendered_line = |line: &ratatui::text::Line<'_>| {
             line.spans
                 .iter()

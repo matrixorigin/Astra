@@ -241,6 +241,7 @@ mod tests {
             ts: None,
             level: crate::tui::turn_event::SystemLevel::Info,
             text: "not a user".into(),
+            link: None,
         };
         assert!(UserCell::from_persist(wrong).is_none());
     }

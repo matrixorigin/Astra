@@ -7117,15 +7117,23 @@ impl ServerAgenticLoopHost {
 
         if is_turn_pipeline_tool(name) {
             // A pipeline tool has exactly one execution owner. Server skills
-            // resolve inline; CLI-local skills are executed through the
-            // existing typed client-result lane only when that client
-            // explicitly advertised the schema. Never expose a virtual tool
-            // that neither side can execute.
-            return Some(
-                state.skills.resolver.is_some()
-                    || (self.runtime_declared_tool_names.contains(name)
-                        && self.has_client_tool_delivery_lane()),
-            );
+            // resolve inline only after a non-empty server catalog is ready;
+            // CLI-local skills are executed through the existing typed
+            // client-result lane only when that client explicitly advertised
+            // skill identities. A bound resolver is not itself proof that a
+            // skill exists: CLI startup installs it before background
+            // discovery converges. Never expose a virtual tool that neither
+            // side can execute.
+            let server_catalog_ready = state
+                .skills
+                .resolver
+                .as_ref()
+                .is_some_and(|resolver| !resolver.available_skills().is_empty());
+            let client_catalog_ready = self.runtime_declared_tool_names.contains(name)
+                && self.has_client_tool_delivery_lane()
+                && (state.skills.resolver.is_none()
+                    || !state.skills.client_pipeline_skill_names.is_empty());
+            return Some(server_catalog_ready || client_catalog_ready);
         }
 
         let requires = astra_turn_core::tool::registry::meta::tool_meta(name)?.requires;
@@ -25125,6 +25133,27 @@ mod tests {
         }
     }
 
+    struct ListedSkillResolver;
+
+    impl crate::turn::skill_tool::SkillResolver for ListedSkillResolver {
+        fn resolve(
+            &self,
+            name: &str,
+        ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
+            Err(crate::skills::SkillError::NotFound(format!(
+                "unknown test skill: {name}"
+            )))
+        }
+
+        fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
+            vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".to_string(),
+                description: "Review local changes".to_string(),
+                ..Default::default()
+            }]
+        }
+    }
+
     fn server_public_network_capabilities() -> Arc<HashMap<String, HashSet<String>>> {
         Arc::new(HashMap::from([(
             "server-builtin".to_string(),
@@ -39979,6 +40008,35 @@ mod tests {
         assert!(
             !names.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
             "a schema without a server resolver or client delivery lane is not an executable promise: {names:?}"
+        );
+    }
+
+    #[test]
+    fn visible_turn_tools_hide_skill_until_server_catalog_is_ready() {
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_server_sandbox_workspace(dir.path())
+        .build();
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+
+        let mut state = create_test_state();
+        state.skills.resolver = Some(Arc::new(ServerSkillResolver));
+        let before_discovery = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(
+            !before_discovery.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            "installing a resolver before discovery must not expose an empty skill promise: {before_discovery:?}"
+        );
+
+        state.skills.resolver = Some(Arc::new(ListedSkillResolver));
+        let after_discovery = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(
+            after_discovery.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            "a non-empty server catalog makes the shared skill tool executable: {after_discovery:?}"
         );
     }
 

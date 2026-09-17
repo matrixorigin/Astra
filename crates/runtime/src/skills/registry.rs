@@ -650,6 +650,25 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
         out
     }
 
+    fn catalog_is_authoritative(&self) -> bool {
+        true
+    }
+
+    fn execution_catalog_contains(&self, name: &str) -> bool {
+        let lookup = name.trim();
+        !lookup.is_empty()
+            && self.registry.all_manifests().into_iter().any(|manifest| {
+                let active =
+                    !manifest.is_conditional() || self.registry.is_skill_activated(&manifest.name);
+                active
+                    && (manifest.name.trim().eq_ignore_ascii_case(lookup)
+                        || manifest
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.trim().eq_ignore_ascii_case(lookup)))
+            })
+    }
+
     fn execution_topology(
         &self,
         name: &str,
@@ -673,6 +692,7 @@ pub type SharedSkillRegistry = Arc<UnifiedSkillRegistry>;
 mod tests {
     use super::*;
     use crate::skills::traits::SkillResolver as _;
+    use astra_skills::manifest::SkillComposition;
     use async_trait::async_trait;
 
     struct StubProvider {
@@ -820,6 +840,37 @@ mod tests {
 
         let resolved = resolver.resolve("test").unwrap();
         assert_eq!(resolved.instructions, "Instructions here.");
+    }
+
+    #[tokio::test]
+    async fn resolver_execution_catalog_includes_hidden_composable_steps() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![(
+                SkillManifest {
+                    name: "internal-review-step".into(),
+                    description: "Pipeline-only review step".into(),
+                    source: SkillSourceKind::Bundled,
+                    user_invocable: false,
+                    composition: Some(SkillComposition {
+                        composable: true,
+                        idempotent: true,
+                        side_effects: Vec::new(),
+                        max_duration_sec: None,
+                        max_depth: None,
+                        steps: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+                "Review the pipeline input.".into(),
+            )],
+        }));
+        registry.discover_all().await.unwrap();
+
+        let resolver = UnifiedSkillResolver::new(Arc::new(registry));
+        assert!(resolver.available_skills().is_empty());
+        assert!(resolver.execution_catalog_contains("internal-review-step"));
+        assert!(!resolver.execution_catalog_contains("invented-step"));
     }
 
     #[tokio::test]

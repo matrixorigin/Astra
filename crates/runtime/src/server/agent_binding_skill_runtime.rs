@@ -252,6 +252,14 @@ impl SkillResolver for AgentBindingSkillResolver {
         skills.sort_by(|left, right| left.name.cmp(&right.name));
         skills
     }
+
+    fn catalog_is_authoritative(&self) -> bool {
+        true
+    }
+
+    fn execution_catalog_contains(&self, name: &str) -> bool {
+        self.entry(name).is_ok()
+    }
 }
 
 fn skill_gateway_http_client() -> &'static reqwest::Client {

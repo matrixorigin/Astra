@@ -18,7 +18,7 @@ use ratatui::widgets::{Clear, Paragraph, Widget};
 use super::agent_run_projection::{AgentProjectionConfidence, AgentRunState, AgentRunStatus};
 use super::bottom_pane::{BottomPane, ConversationTab, footer::Footer};
 use super::history_cell::assistant::AssistantCell;
-use super::render::line_utils::sanitize_lines_for_terminal;
+use super::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
 use super::task_board_observer::{TaskBoardObserver, TaskBoardProjection, TaskBoardTruthState};
 use super::terminal::TerminalGuard;
@@ -480,11 +480,10 @@ pub(crate) fn active_viewport(
         let lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
             && cell.is_live()
         {
-            assistant.live_viewport_lines(inner_w, live_assistant_rows)
+            sanitize_lines_for_buffer(assistant.live_viewport_lines(inner_w, live_assistant_rows))
         } else {
-            cell.display_lines(inner_w)
+            history_cell_lines_for_buffer(cell, inner_w)
         };
-        let lines = sanitize_lines_for_terminal(lines);
         if lines.is_empty() {
             None
         } else {

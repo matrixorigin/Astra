@@ -15,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
-use crate::tui::turn_event::{SystemLevel, TurnEvent};
+use crate::tui::turn_event::{SystemLevel, SystemLink, TurnEvent};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SystemCell {
@@ -24,6 +24,8 @@ pub(crate) struct SystemCell {
     presentation: SystemPresentation,
     ts: Option<String>,
     durable: bool,
+    link: Option<SystemLink>,
+    link_lease: Option<crate::cli::terminal_hyperlinks::LinkLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -55,6 +59,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -65,6 +71,8 @@ impl SystemCell {
             presentation: SystemPresentation::BackgroundTask,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -78,6 +86,8 @@ impl SystemCell {
             presentation: SystemPresentation::RuntimeWork,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -92,6 +102,8 @@ impl SystemCell {
             presentation: SystemPresentation::RuntimeControl,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -109,6 +121,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -119,6 +133,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -129,6 +145,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: false,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -145,6 +163,8 @@ impl SystemCell {
             presentation: SystemPresentation::Standard,
             ts: None,
             durable: true,
+            link: None,
+            link_lease: None,
         }
     }
 
@@ -153,16 +173,39 @@ impl SystemCell {
         self
     }
 
+    /// Attach one user-facing action to a notice. The target is stored as
+    /// structured data so OSC 8 escape sequences are produced only while
+    /// rendering and never enter the durable message text.
+    pub fn with_link(mut self, link: SystemLink) -> Self {
+        let lease = crate::cli::terminal_hyperlinks::register_link(&link.uri);
+        self.link = Some(link);
+        self.link_lease = lease;
+        self
+    }
+
     /// Resume constructor.
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
-            TurnEvent::System { ts, level, text } => Some(Self {
-                message: text,
-                level,
-                presentation: SystemPresentation::Standard,
+            TurnEvent::System {
                 ts,
-                durable: true,
-            }),
+                level,
+                text,
+                link,
+            } => {
+                let mut cell = Self {
+                    message: text,
+                    level,
+                    presentation: SystemPresentation::Standard,
+                    ts,
+                    durable: true,
+                    link: None,
+                    link_lease: None,
+                };
+                if let Some(link) = link {
+                    cell = cell.with_link(link);
+                }
+                Some(cell)
+            }
             _ => None,
         }
     }
@@ -176,8 +219,8 @@ impl SystemCell {
     }
 }
 
-impl HistoryCell for SystemCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+impl SystemCell {
+    fn display_lines_impl(&self, _width: u16, include_structured_link: bool) -> Vec<Line<'static>> {
         let theme = crate::tui::theme::current();
         let (prefix, label_style, body_style) = match self.presentation {
             SystemPresentation::BackgroundTask => (
@@ -231,20 +274,59 @@ impl HistoryCell for SystemCell {
         self.message
             .lines()
             .enumerate()
-            .map(|(i, line)| {
+            .map(|(i, raw_line)| {
+                // A normal message is untrusted text. Strip terminal controls
+                // and private link markers before a structured marker is
+                // optionally appended below.
+                let line =
+                    crate::tui::render::line_utils::sanitize_terminal_text_for_buffer(raw_line)
+                        .into_owned();
+                let body = if i == 0 {
+                    self.link.as_ref().map_or(line.clone(), |link| {
+                        let label = if include_structured_link
+                            && crate::cli::terminal_hyperlinks::terminal_hyperlinks_enabled()
+                        {
+                            self.link_lease
+                                .as_ref()
+                                .map(|lease| {
+                                    crate::cli::terminal_hyperlinks::mark_link_label(
+                                        lease.token(),
+                                        &link.label,
+                                    )
+                                })
+                                .filter(|marked| !marked.is_empty())
+                                .unwrap_or_else(|| link.fallback.clone())
+                        } else {
+                            link.fallback.clone()
+                        };
+                        format!("{line} · {label}")
+                    })
+                } else {
+                    line
+                };
                 if i == 0 {
                     Line::from(vec![
                         Span::styled(prefix.to_string(), label_style),
-                        Span::styled(line.to_string(), body_style),
+                        Span::styled(body, body_style),
                     ])
                 } else {
                     Line::from(vec![
                         Span::styled(continuation.clone(), label_style),
-                        Span::styled(line.to_string(), body_style),
+                        Span::styled(body, body_style),
                     ])
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn display_lines_with_links(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines_impl(width, true)
+    }
+}
+
+impl HistoryCell for SystemCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines_impl(width, false)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -262,6 +344,7 @@ impl HistoryCell for SystemCell {
             ts: self.ts.clone(),
             level: self.level,
             text: self.message.clone(),
+            link: self.link.clone(),
         })
     }
 }
@@ -314,7 +397,9 @@ mod tests {
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
 
     fn render(cell: &SystemCell, width: u16, height: u16) -> String {
-        let lines = cell.display_lines(width);
+        let lines = crate::tui::render::line_utils::sanitize_lines_for_buffer_with_links(
+            cell.display_lines_with_links(width),
+        );
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         buffer_to_string(&draw_widget(p, width, height))
@@ -328,6 +413,38 @@ mod tests {
         let out = render(&cell, 40, 1);
         assert!(out.contains("session resumed"));
         assert!(out.starts_with("ℹ Note · "), "label missing: {out:?}");
+    }
+
+    #[test]
+    fn structured_link_renders_as_one_short_action_and_survives_resume() {
+        let cell = SystemCell::info("Explain Analyze report ready").with_link(SystemLink {
+            uri: "file:///tmp/report.md".into(),
+            label: "Open report".into(),
+            fallback: "/tmp/report.md".into(),
+        });
+        let raw = cell.display_lines_with_links(80);
+        let raw_text = raw[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            raw_text.contains('\u{034f}'),
+            "history line should carry a structured link marker: {raw_text:?}"
+        );
+        let out = render(&cell, 80, 1);
+        assert!(out.contains("Explain Analyze report ready"), "{out:?}");
+        assert!(out.contains("Open report"), "{out:?}");
+        assert!(
+            !out.contains("]8;;"),
+            "buffer must not expose OSC8 syntax: {out:?}"
+        );
+        assert!(!out.contains("Session artifact reference"), "{out:?}");
+
+        let restored = SystemCell::from_persist(cell.to_persist().expect("durable link"))
+            .expect("link notice should restore");
+        assert!(restored.message().contains("Explain Analyze report ready"));
+        assert!(render(&restored, 80, 1).contains("Open report"));
     }
 
     #[test]

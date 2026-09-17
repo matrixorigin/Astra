@@ -72,7 +72,9 @@ pub(crate) mod render {
             let mut row = String::with_capacity(area.width as usize);
             for x in 0..area.width {
                 if let Some(cell) = buf.cell((x, y)) {
-                    row.push_str(cell.symbol());
+                    row.push_str(&crate::cli::terminal_hyperlinks::strip_link_markers(
+                        cell.symbol(),
+                    ));
                 }
             }
             // Trim only trailing whitespace — preserve leading indentation.

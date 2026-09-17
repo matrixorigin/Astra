@@ -3795,6 +3795,7 @@ mod context_history_tests {
                 ts: None,
                 level: SystemLevel::Info,
                 text: "system note should not appear in context history".into(),
+                link: None,
             },
             TurnEvent::Assistant {
                 ts: None,

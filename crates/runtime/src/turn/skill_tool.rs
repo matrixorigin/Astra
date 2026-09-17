@@ -371,6 +371,14 @@ impl SkillResolver for PolicyScopedSkillResolver {
         self.visible_skills.clone()
     }
 
+    fn catalog_is_authoritative(&self) -> bool {
+        self.inner.catalog_is_authoritative()
+    }
+
+    fn execution_catalog_contains(&self, name: &str) -> bool {
+        self.inner.execution_catalog_contains(name)
+    }
+
     fn execution_topology(
         &self,
         name: &str,
@@ -1213,13 +1221,14 @@ async fn execute_pipeline(
                 format!("{parent_invocation_id}:step:{i}"),
             );
         }
-        let r = execute_skill(
+        let r = execute_skill_with_origin(
             resolver,
             executor,
             &step.skill,
             &threaded_task,
             ctx_ref,
             &step_skill_ctx,
+            SkillInvocationOrigin::TrustedPipelineStep,
         )
         .await;
         let SkillCallResult {
@@ -1745,6 +1754,17 @@ async fn execute_remote_skill(
 /// the skill is run in an isolated sub-agent loop. On failure, execution falls
 /// back to inline mode. MCP skills are sandboxed: inline shell commands and
 /// hooks are blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillInvocationOrigin {
+    /// A model or public edge requested this name. Only the model-facing
+    /// available-skills catalog may authorize it.
+    Public,
+    /// A step came from a previously resolved, trusted pipeline manifest.
+    /// Hidden non-user-invocable steps are allowed, then still pass the
+    /// composability and policy checks below.
+    TrustedPipelineStep,
+}
+
 fn execute_skill<'a>(
     resolver: &'a dyn SkillResolver,
     executor: Option<&'a Arc<dyn SkillExecutor>>,
@@ -1752,6 +1772,26 @@ fn execute_skill<'a>(
     task_hint: &'a str,
     composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
     skill_ctx: &'a SkillContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillCallResult> + Send + 'a>> {
+    execute_skill_with_origin(
+        resolver,
+        executor,
+        skill_name,
+        task_hint,
+        composition_ctx,
+        skill_ctx,
+        SkillInvocationOrigin::Public,
+    )
+}
+
+fn execute_skill_with_origin<'a>(
+    resolver: &'a dyn SkillResolver,
+    executor: Option<&'a Arc<dyn SkillExecutor>>,
+    skill_name: &'a str,
+    task_hint: &'a str,
+    composition_ctx: Option<&'a crate::skills::composition::CompositionContext>,
+    skill_ctx: &'a SkillContext,
+    origin: SkillInvocationOrigin,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillCallResult> + Send + 'a>> {
     Box::pin(async move {
         // The public skill schema permits omitting `task` so a skill can act
@@ -1762,6 +1802,32 @@ fn execute_skill<'a>(
         } else {
             task_hint
         };
+        let catalog = resolver.available_skills();
+        let public_name = skill_name_matches_catalog(skill_name, &catalog);
+        let trusted_pipeline_name = matches!(origin, SkillInvocationOrigin::TrustedPipelineStep)
+            && resolver.execution_catalog_contains(skill_name);
+        if resolver.catalog_is_authoritative() && !public_name && !trusted_pipeline_name {
+            return SkillCallResult {
+                output: format!(
+                    "`{skill_name}` is not listed in <available_skills>; choose an advertised skill name."
+                ),
+                success: false,
+                activation: None,
+                verification: None,
+            };
+        }
+        if !trusted_pipeline_name
+            && is_unregistered_native_tool_name(skill_name, &catalog, &skill_ctx.available_tools)
+        {
+            return SkillCallResult {
+                output: format!(
+                    "`{skill_name}` is a native tool, not an available skill. Use the tool's current visible or deferred selection contract."
+                ),
+                success: false,
+                activation: None,
+                verification: None,
+            };
+        }
         if let Some(ctx) = composition_ctx {
             // Depth check
             if let Err(e) = ctx.check_depth() {
@@ -2155,6 +2221,42 @@ fn build_activation(skill: &ResolvedSkill) -> SkillActivation {
         agent_type: skill.agent_type.clone(),
         sandbox_policy,
     }
+}
+
+/// Return whether a requested skill name is actually a native tool name with
+/// no matching skill/alias in the resolver catalog. Skill and tool namespaces
+/// are independent; keeping this check at the shared execution boundary
+/// prevents a model routing mistake from becoming a remote network request.
+fn skill_name_matches_catalog(name: &str, catalog: &[SkillToolInfo]) -> bool {
+    let requested = name.trim();
+    !requested.is_empty()
+        && catalog.iter().any(|skill| {
+            skill.name.trim().eq_ignore_ascii_case(requested)
+                || skill
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.trim().eq_ignore_ascii_case(requested))
+        })
+}
+
+fn is_unregistered_native_tool_name(
+    name: &str,
+    catalog: &[SkillToolInfo],
+    available_tools: &[String],
+) -> bool {
+    static BUILTIN_TOOL_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    let builtin_names = BUILTIN_TOOL_NAMES.get_or_init(|| {
+        astra_runtime_env::ToolRegistry::builtins()
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect()
+    });
+    let requested = name.trim().to_ascii_lowercase();
+    let is_native_tool = builtin_names.contains(&requested)
+        || available_tools
+            .iter()
+            .any(|tool| tool.trim().eq_ignore_ascii_case(&requested));
+    is_native_tool && !skill_name_matches_catalog(&requested, catalog)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -2971,6 +3073,113 @@ mod tests {
         .await;
         assert!(r.output.contains("Failed to load skill 'nonexistent'"));
         assert!(r.activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_skill_does_not_send_native_tool_names_to_skill_providers() {
+        struct MustNotResolve;
+
+        impl SkillResolver for MustNotResolve {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                panic!("native tool name must be rejected before provider resolution")
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                Vec::new()
+            }
+        }
+
+        let result = execute_skill(
+            &MustNotResolve,
+            None,
+            "agent_fanout",
+            "parallel review",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.output.contains("native tool"));
+        assert!(result.activation.is_none());
+
+        let result = execute_skill(
+            &MustNotResolve,
+            None,
+            "mcp__reports__query",
+            "parallel review",
+            None,
+            &SkillContext {
+                available_tools: vec!["mcp__reports__query".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.output.contains("native tool"));
+        assert!(result.activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn authoritative_catalog_rejects_unknown_skill_before_resolution() {
+        struct AuthoritativeResolver;
+
+        impl SkillResolver for AuthoritativeResolver {
+            fn resolve(&self, _name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                panic!("an unadvertised skill must not reach resolution")
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                Vec::new()
+            }
+
+            fn catalog_is_authoritative(&self) -> bool {
+                true
+            }
+        }
+
+        let result = execute_skill(
+            &AuthoritativeResolver,
+            None,
+            "invented-skill",
+            "should fail closed",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.output.contains("<available_skills>"));
+        assert!(result.activation.is_none());
+    }
+
+    #[test]
+    fn native_name_guard_allows_an_explicitly_registered_skill_or_alias() {
+        let skill = SkillToolInfo {
+            name: "agent_fanout".into(),
+            ..Default::default()
+        };
+        assert!(!is_unregistered_native_tool_name(
+            "agent_fanout",
+            &[skill],
+            &[]
+        ));
+
+        let aliased = SkillToolInfo {
+            name: "parallel-review".into(),
+            aliases: vec!["agent".into()],
+            ..Default::default()
+        };
+        assert!(!is_unregistered_native_tool_name("agent", &[aliased], &[]));
+        assert!(is_unregistered_native_tool_name("agent_fanout", &[], &[]));
+        assert!(is_unregistered_native_tool_name(
+            "mcp__reports__query",
+            &[],
+            &["mcp__reports__query".into()]
+        ));
+        assert!(!is_unregistered_native_tool_name(
+            "ordinary-skill",
+            &[],
+            &[]
+        ));
     }
 
     #[tokio::test]

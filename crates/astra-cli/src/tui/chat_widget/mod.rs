@@ -2633,6 +2633,11 @@ impl ChatWidget {
             } else {
                 SystemCell::info(notice)
             };
+            let cell = if let Some(link) = publication.user_link() {
+                cell.with_link(link)
+            } else {
+                cell
+            };
             self.commit_concurrent_system(cell);
         }
         if let Some(error) = publication_error {

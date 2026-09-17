@@ -2957,7 +2957,7 @@ mod tests {
                         snapshot_seen = true;
                     }
                     TuiAppEvent::SystemInfo(text)
-                        if text.contains("artifact://session/explain-analyze/bridge") =>
+                        if text == "Explain Analyze report saved on server" =>
                     {
                         publication_seen = true;
                     }

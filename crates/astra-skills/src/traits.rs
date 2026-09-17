@@ -146,6 +146,26 @@ pub trait SkillResolver: Send + Sync {
     /// List available skills for schema generation.
     fn available_skills(&self) -> Vec<SkillToolInfo>;
 
+    /// Whether [`available_skills`] is the complete model-facing admission
+    /// catalog for this resolver. Authoritative catalogs reject public names
+    /// that are not advertised before attempting a lazy or remote load.
+    /// Trusted composition steps use [`execution_catalog_contains`] as their
+    /// separate execution admission check. Resolvers that intentionally
+    /// support opaque dynamic names may keep the default and enforce their own
+    /// public admission contract.
+    fn catalog_is_authoritative(&self) -> bool {
+        false
+    }
+
+    /// Whether a name belongs to the trusted execution catalog, including
+    /// non-user-invocable skills that a declared composition may call.
+    ///
+    /// This is intentionally separate from available_skills: the latter is
+    /// the model-facing surface and may omit internal composable steps.
+    fn execution_catalog_contains(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Closed workflow topology declared by trusted manifest metadata.
     /// Instruction prose is intentionally not parsed for execution authority.
     fn execution_topology(&self, _name: &str) -> Option<super::manifest::SkillExecutionTopology> {

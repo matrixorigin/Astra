@@ -163,26 +163,43 @@ pub(crate) struct PublishedArtifact {
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
         match (&self.rendered_path, self.render_error.as_deref()) {
-            (Some(path), None) => format!(
-                "Explain Analyze report saved\n  Markdown on this device: {}\n  Session artifact reference: {}",
-                compact_local_path(path),
-                self.handle,
-            ),
-            (Some(path), Some(error)) => format!(
-                "Explain Analyze report saved\n  Markdown on this device: {}\n  Session artifact reference: {}\n  Rendering warning: {}",
-                compact_local_path(path),
-                self.handle,
-                error,
-            ),
-            (None, Some(error)) => format!(
-                "Explain Analyze data saved; Markdown unavailable\n  Session artifact reference: {}\n  Reason: {}",
-                self.handle, error
-            ),
-            (None, None) => format!(
-                "Explain Analyze artifact reference\n  Session artifact reference: {}\n  No Markdown file is available on this device.",
-                self.handle
-            ),
+            (Some(_), None) => "Explain Analyze report ready".to_string(),
+            (Some(_), Some(error)) => {
+                format!("Explain Analyze report ready · rendering warning: {error}")
+            }
+            (None, Some(error)) => {
+                format!("Explain Analyze data saved · Markdown unavailable: {error}")
+            }
+            (None, None) => "Explain Analyze data saved · no local report is available".to_string(),
         }
+    }
+
+    /// Return the one actionable local link for a human-facing notice. The
+    /// opaque session handle remains an internal/model-facing identity and is
+    /// deliberately absent from this presentation path.
+    pub(crate) fn user_link(&self) -> Option<crate::tui::turn_event::SystemLink> {
+        let path = self.rendered_path.as_deref()?;
+        let uri =
+            crate::cli::terminal_hyperlinks::file_uri_for_path(&path.display().to_string(), None)?;
+        Some(crate::tui::turn_event::SystemLink {
+            uri,
+            label: "Open report".to_string(),
+            fallback: compact_local_path(path),
+        })
+    }
+
+    /// Compact one-line output for non-TUI callers such as the streaming CLI.
+    pub(crate) fn terminal_notice(&self) -> String {
+        let notice = self.user_notice();
+        let Some(link) = self.user_link() else {
+            return notice;
+        };
+        let target = if crate::cli::terminal_hyperlinks::terminal_hyperlinks_enabled() {
+            crate::cli::terminal_hyperlinks::osc8_link(&link.uri, &link.label)
+        } else {
+            link.fallback
+        };
+        format!("{notice} · {target}")
     }
 }
 
@@ -867,24 +884,35 @@ mod tests {
     }
 
     #[test]
-    fn published_artifact_notice_labels_the_local_copy_and_model_handle() {
+    fn published_artifact_notice_keeps_human_copy_compact_and_separates_the_link() {
         let local = PublishedArtifact {
             handle: artifact_handle("run-1", "turn-1"),
             rendered_path: Some(PathBuf::from("/tmp/report with spaces.md")),
             render_error: None,
         };
         let notice = local.user_notice();
-        assert!(notice.starts_with("Explain Analyze report saved"));
-        assert!(notice.contains("Markdown on this device: /tmp/report with spaces.md"));
-        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
+        assert_eq!(notice, "Explain Analyze report ready");
+        let link = local
+            .user_link()
+            .expect("local report should be actionable");
+        assert_eq!(link.label, "Open report");
+        assert!(
+            link.uri
+                .starts_with("file:///tmp/report%20with%20spaces.md")
+        );
+        assert_eq!(link.fallback, "/tmp/report with spaces.md");
+        assert!(!notice.contains("artifact://"));
 
         let server = PublishedArtifact {
             rendered_path: None,
             ..local
         };
         let notice = server.user_notice();
-        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
-        assert!(!notice.contains("saved locally"));
+        assert_eq!(
+            notice,
+            "Explain Analyze data saved · no local report is available"
+        );
+        assert!(server.user_link().is_none());
 
         let failed_render = PublishedArtifact {
             render_error: Some("rendered report exceeds the bound".into()),
@@ -892,6 +920,7 @@ mod tests {
         };
         let notice = failed_render.user_notice();
         assert!(notice.contains("Markdown unavailable"));
+        assert!(notice.contains("rendered report exceeds the bound"));
         assert_eq!(
             notice.matches("rendered report exceeds the bound").count(),
             1
@@ -902,8 +931,8 @@ mod tests {
             ..failed_render.clone()
         };
         let notice = rendered_with_warning.user_notice();
-        assert!(notice.contains("Markdown on this device: /tmp/report with spaces.md"));
-        assert!(notice.contains("Session artifact reference: artifact://session/explain-analyze/"));
+        assert!(notice.starts_with("Explain Analyze report ready · rendering warning:"));
+        assert!(rendered_with_warning.user_link().is_some());
         assert_eq!(
             notice.matches("rendered report exceeds the bound").count(),
             1
@@ -915,9 +944,11 @@ mod tests {
             ..failed_render
         };
         let notice = no_local_copy.user_notice();
-        assert!(notice.contains("Explain Analyze artifact reference"));
-        assert!(notice.contains("No Markdown file is available on this device."));
-        assert!(!notice.contains("saved locally"));
+        assert_eq!(
+            notice,
+            "Explain Analyze data saved · no local report is available"
+        );
+        assert!(no_local_copy.user_link().is_none());
     }
 
     #[test]

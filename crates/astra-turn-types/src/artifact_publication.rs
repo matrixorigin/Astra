@@ -52,22 +52,18 @@ impl ArtifactPublicationV1 {
 
     pub fn user_notice(&self) -> String {
         match (self.recorded, &self.result) {
-            (true, ArtifactPublicationResult::Published { handle }) => {
-                format!(
-                    "Explain Analyze report saved on server\n  Session artifact reference: {handle}"
-                )
+            (true, ArtifactPublicationResult::Published { .. }) => {
+                "Explain Analyze report saved on server".to_string()
             }
-            (false, ArtifactPublicationResult::Published { handle }) => {
-                format!(
-                    "Explain Analyze report produced; server recording unconfirmed\n  Session artifact reference: {handle}"
-                )
+            (false, ArtifactPublicationResult::Published { .. }) => {
+                "Explain Analyze report produced · server recording unconfirmed".to_string()
             }
             (true, ArtifactPublicationResult::Unavailable { message, .. }) => {
-                format!("Explain Analyze report unavailable on server\n  Reason: {message}")
+                format!("Explain Analyze report unavailable on server · {message}")
             }
             (false, ArtifactPublicationResult::Unavailable { message, .. }) => {
                 format!(
-                    "Explain Analyze report unavailable; server recording unconfirmed\n  Reason: {message}"
+                    "Explain Analyze report unavailable · server recording unconfirmed · {message}"
                 )
             }
         }
@@ -161,7 +157,7 @@ mod tests {
         );
         let notice = published.user_notice();
         assert!(notice.contains("recording unconfirmed"));
-        assert!(notice.contains(&handle));
+        assert!(!notice.contains(&handle));
         assert!(!notice.contains("saved on server"));
 
         let unavailable = publication(

@@ -19,6 +19,7 @@ use super::custom_terminal;
 pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     terminal: &mut custom_terminal::Terminal<B>,
     lines: &[Line<'_>],
+    trusted_links: bool,
     is_zellij: bool,
 ) -> io::Result<()> {
     if lines.is_empty() {
@@ -37,7 +38,11 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     for line in lines {
         let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
         if line_w == 0 {
-            wrapped.push(super::render::line_utils::line_to_static(line));
+            wrapped.push(if trusted_links {
+                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
+            } else {
+                super::render::line_utils::line_to_static(line)
+            });
             wrapped_rows += 1;
         } else if super::wrapping::line_contains_url_like(line)
             && !super::wrapping::line_has_mixed_url_and_non_url_tokens(line)
@@ -45,7 +50,11 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             // Pure URL line — don't wrap, let terminal handle it (keeps URL clickable)
             let physical = line_w.max(1).div_ceil(wrap_width) as u16;
             wrapped_rows += physical;
-            wrapped.push(super::render::line_utils::line_to_static(line));
+            wrapped.push(if trusted_links {
+                super::render::line_utils::sanitize_line_for_terminal_with_links(line)
+            } else {
+                super::render::line_utils::line_to_static(line)
+            });
         } else {
             let line_wrapped = super::wrapping::adaptive_wrap_line(
                 line,
@@ -54,11 +63,13 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             for wl in &line_wrapped {
                 wrapped_rows += wl.width().max(1).div_ceil(wrap_width) as u16;
             }
-            wrapped.extend(
-                line_wrapped
-                    .into_iter()
-                    .map(|l| crate::tui::render::line_utils::line_to_static(&l)),
-            );
+            wrapped.extend(line_wrapped.into_iter().map(|l| {
+                if trusted_links {
+                    crate::tui::render::line_utils::sanitize_line_for_terminal_with_links(&l)
+                } else {
+                    crate::tui::render::line_utils::line_to_static(&l)
+                }
+            }));
         }
     }
 
@@ -94,7 +105,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
             if i > 0 {
                 queue!(writer, Print("\r\n"))?;
             }
-            write_history_line(writer, line)?;
+            write_history_line(writer, line, trusted_links)?;
         }
 
         // Restore cursor position
@@ -147,7 +158,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 
             for line in &wrapped {
                 queue!(writer, Print("\r\n"))?;
-                write_history_line(writer, line)?;
+                write_history_line(writer, line, trusted_links)?;
             }
 
             queue!(writer, Print("\x1b[r"))?;
@@ -169,8 +180,12 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
     Ok(())
 }
 
-fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
-    write_history_line_content(writer, line)
+fn write_history_line(
+    writer: &mut impl Write,
+    line: &Line<'_>,
+    trusted_links: bool,
+) -> io::Result<()> {
+    write_history_line_content(writer, line, trusted_links)
 }
 
 /// Write one physical scrollback row. Diff surfaces are represented on spans
@@ -179,13 +194,17 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
 /// remainder of a semantic diff row with its background active. Printing
 /// spaces through the last physical column would arm terminal auto-wrap and
 /// can make the following CRLF insert a phantom blank row.
-fn write_history_line_content(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
+fn write_history_line_content(
+    writer: &mut impl Write,
+    line: &Line<'_>,
+    trusted_links: bool,
+) -> io::Result<()> {
     queue!(writer, SetAttribute(Attribute::Reset))?;
     queue!(writer, Clear(ClearType::UntilNewLine))?;
 
     for span in &line.spans {
         let merged = line.style.patch(span.style);
-        write_styled_span(writer, &span.content, &merged)?;
+        write_styled_span(writer, &span.content, &merged, trusted_links)?;
     }
 
     if let Some(bg) = full_row_background(line) {
@@ -228,9 +247,16 @@ fn write_styled_span(
     writer: &mut impl Write,
     content: &str,
     style: &ratatui::style::Style,
+    trusted_links: bool,
 ) -> io::Result<()> {
     apply_style_from_clean_state(writer, style)?;
-    queue!(writer, Print(content))?;
+    let sanitized = if trusted_links {
+        crate::tui::render::line_utils::sanitize_terminal_text_for_terminal_with_links(content)
+    } else {
+        crate::tui::render::line_utils::sanitize_terminal_text(content)
+    };
+    let rendered = crate::cli::terminal_hyperlinks::render_link_markers(sanitized.as_ref());
+    queue!(writer, Print(rendered))?;
     Ok(())
 }
 
@@ -296,7 +322,7 @@ mod tests {
             Span::raw(" normal"),
         ]);
 
-        write_history_line(&mut out, &line).expect("history line should render");
+        write_history_line(&mut out, &line, false).expect("history line should render");
         let rendered = String::from_utf8(out).expect("rendered bytes should be utf8");
 
         assert!(
@@ -328,7 +354,7 @@ mod tests {
         assert_eq!(full_row_background(&line), Some(theme.diff_add_bg));
 
         let mut out = Vec::new();
-        write_history_line_content(&mut out, &line).expect("history row writes");
+        write_history_line_content(&mut out, &line, false).expect("history row writes");
         let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
         let plain = crate::cli::theme::strip_ansi(&rendered);
         assert_eq!(plain, "  └    1 + changed");
@@ -336,6 +362,20 @@ mod tests {
             rendered.matches("\x1b[K").count() >= 2,
             "the semantic row must clear its remaining terminal cells under the diff background: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn trusted_structured_marker_becomes_clickable_only_at_scrollback_boundary() {
+        let lease = crate::cli::terminal_hyperlinks::register_link("file:///tmp/report.md")
+            .expect("test link should fit registry");
+        let line = Line::raw(crate::cli::terminal_hyperlinks::mark_link_label(
+            lease.token(),
+            "Open report",
+        ));
+        let mut out = Vec::new();
+        write_history_line(&mut out, &line, true).expect("trusted history line should render");
+        let rendered = String::from_utf8(out).expect("rendered bytes should be utf8");
+        assert!(rendered.contains("\x1b]8;;file:///tmp/report.md\x1b\\Open report\x1b]8;;\x1b\\"));
     }
 
     #[test]
@@ -347,7 +387,7 @@ mod tests {
         ]);
 
         let mut out = Vec::new();
-        write_history_line_content(&mut out, &line).expect("blank diff row writes");
+        write_history_line_content(&mut out, &line, false).expect("blank diff row writes");
         let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
         let plain = crate::cli::theme::strip_ansi(&rendered);
 

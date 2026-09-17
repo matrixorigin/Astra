@@ -16,7 +16,7 @@ use super::view::{
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
 use crate::tui::history_cell::{HistoryCell, reasoning::ReasoningCell, tool::ToolCell};
-use crate::tui::render::line_utils::sanitize_lines_for_terminal;
+use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
 /// Lines reserved for chrome (title + scroll indicator + hint blank + hint).
 /// Kept in one place so `desired_height` and `visible_line_count` agree.
@@ -62,6 +62,7 @@ impl TranscriptItemId {
 enum TranscriptContent {
     Committed(Arc<dyn HistoryCell>),
     Rendered(Vec<Line<'static>>),
+    RenderedTrusted(Vec<Line<'static>>),
     Reasoning(ReasoningCell),
     Tool(ToolCell),
 }
@@ -181,7 +182,21 @@ impl TranscriptItem {
         lines: Vec<Line<'static>>,
         separator_rows: usize,
     ) -> Self {
-        Self::rendered_kind(id, committed_cell_kind(cell), lines, separator_rows)
+        let kind = committed_cell_kind(cell);
+        let content = if cell
+            .as_any_ref()
+            .is::<crate::tui::history_cell::system::SystemCell>()
+        {
+            TranscriptContent::RenderedTrusted(lines)
+        } else {
+            TranscriptContent::Rendered(lines)
+        };
+        Self {
+            id,
+            kind,
+            content,
+            separator_rows,
+        }
     }
 
     pub(crate) fn reasoning(
@@ -209,7 +224,7 @@ impl TranscriptItem {
     fn is_expandable(&self, width: u16) -> bool {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
-            TranscriptContent::Rendered(_) => false,
+            TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
             TranscriptContent::Reasoning(cell) => cell.has_transcript_details(width),
             TranscriptContent::Tool(cell) => cell.has_transcript_details(),
         }
@@ -218,7 +233,7 @@ impl TranscriptItem {
     fn label(&self) -> &'static str {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_label(cell.as_ref()),
-            TranscriptContent::Rendered(_) => "item",
+            TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => "item",
             TranscriptContent::Reasoning(_) => "reasoning",
             TranscriptContent::Tool(_) => "tool details",
         }
@@ -228,10 +243,22 @@ impl TranscriptItem {
         let lines = match &self.content {
             TranscriptContent::Committed(cell) => cell_lines(cell.as_ref(), width, expanded),
             TranscriptContent::Rendered(lines) => lines.clone(),
+            TranscriptContent::RenderedTrusted(lines) => lines.clone(),
             TranscriptContent::Reasoning(cell) => cell.transcript_lines(width, expanded),
             TranscriptContent::Tool(cell) => cell.transcript_lines(width, expanded),
         };
-        sanitize_lines_for_terminal(lines)
+        if matches!(
+            &self.content,
+            TranscriptContent::Committed(cell)
+                if cell
+                    .as_any_ref()
+                    .is::<crate::tui::history_cell::system::SystemCell>()
+        ) || matches!(&self.content, TranscriptContent::RenderedTrusted(_))
+        {
+            crate::tui::render::line_utils::sanitize_lines_for_buffer_with_links(lines)
+        } else {
+            sanitize_lines_for_buffer(lines)
+        }
     }
 
     fn matches_filter(&self, filter: TranscriptFilter) -> bool {
@@ -301,7 +328,7 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
     } else {
-        cell.display_lines(width)
+        history_cell_lines_for_buffer(cell, width)
     }
 }
 

@@ -45,6 +45,8 @@ use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
+use crate::cli::terminal_hyperlinks;
+
 /// Returns the display width of a cell symbol, ignoring OSC escape sequences.
 ///
 /// OSC sequences (e.g. OSC 8 hyperlinks: `\x1B]8;;URL\x07`) are terminal
@@ -562,7 +564,8 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
         while column < row.len() {
             let cell = &row[column];
             let width = display_width(cell.symbol());
-            if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
+            let visible_symbol = terminal_hyperlinks::strip_link_markers(cell.symbol());
+            if visible_symbol != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
                 last_nonblank_column = column + (width.saturating_sub(1));
             }
             column += width.max(1); // treat zero-width symbols as width 1
@@ -620,11 +623,16 @@ where
     let mut bg = Color::Reset;
     let mut modifier = Modifier::empty();
     let mut last_pos: Option<Position> = None;
+    let mut active_link: Option<u64> = None;
     for command in commands {
         let (x, y) = match command {
             DrawCommand::Put { x, y, .. } => (x, y),
             DrawCommand::ClearToEnd { x, y, .. } => (x, y),
         };
+        if active_link.is_some() && !matches!(last_pos, Some(p) if x == p.x + 1 && y == p.y) {
+            queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
+            active_link = None;
+        }
         // Move the cursor if the previous location was not (x - 1, y)
         if !matches!(last_pos, Some(p) if x == p.x + 1 && y == p.y) {
             queue!(writer, MoveTo(x, y))?;
@@ -652,9 +660,37 @@ where
                 fg = cell.fg;
                 bg = cell.bg;
 
-                queue!(writer, Print(cell.symbol()))?;
+                let (symbol, marker) = terminal_hyperlinks::split_link_marker(cell.symbol());
+                if let Some(marker) = marker {
+                    if active_link != Some(marker.token) {
+                        if active_link.is_some() {
+                            queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
+                        }
+                        if let Some(uri) = terminal_hyperlinks::link_uri(marker.token) {
+                            queue!(writer, Print(terminal_hyperlinks::osc8_open(&uri)))?;
+                            active_link = Some(marker.token);
+                        } else {
+                            active_link = None;
+                        }
+                    }
+                    queue!(writer, Print(symbol.as_ref()))?;
+                    if marker.close && active_link == Some(marker.token) {
+                        queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
+                        active_link = None;
+                    }
+                } else {
+                    if active_link.is_some() {
+                        queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
+                        active_link = None;
+                    }
+                    queue!(writer, Print(symbol.as_ref()))?;
+                }
             }
             DrawCommand::ClearToEnd { bg: clear_bg, .. } => {
+                if active_link.is_some() {
+                    queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
+                    active_link = None;
+                }
                 queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
                 modifier = Modifier::empty();
                 if emit_colors {
@@ -664,6 +700,10 @@ where
                 queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
             }
         }
+    }
+
+    if active_link.is_some() {
+        queue!(writer, Print(terminal_hyperlinks::osc8_close()))?;
     }
 
     if emit_colors {
@@ -823,5 +863,95 @@ mod tests {
         assert!(!output.windows(4).any(|window| window == b"\x1b[;m"));
         assert!(!output.windows(3).any(|window| window == b"\x1b[m"));
         assert!(String::from_utf8_lossy(&output).contains("ok"));
+    }
+
+    #[test]
+    fn registered_link_markers_survive_buffer_diff_as_clickable_osc8() {
+        let area = Rect::new(0, 0, 32, 1);
+        let previous = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        let lease = terminal_hyperlinks::register_link("file:///tmp/report.md")
+            .expect("test link should fit registry");
+        let token = lease.token();
+        let marked = terminal_hyperlinks::mark_link_label(token, "Open report");
+        next.set_string(0, 0, marked, Style::default());
+
+        let mut output = Vec::new();
+        draw_with_colors(
+            &mut output,
+            diff_buffers(&previous, &next).into_iter(),
+            false,
+        )
+        .expect("draw registered link");
+        let output = String::from_utf8(output).expect("terminal output is utf8");
+        assert!(
+            output.contains("\x1b]8;;file:///tmp/report.md\x1b\\Open report\x1b]8;;\x1b\\"),
+            "registered link should be emitted at the terminal boundary: {output:?}"
+        );
+        assert!(!output.contains('\u{034f}'));
+        assert!(!output.contains('\u{fe00}'));
+    }
+
+    #[test]
+    fn untrusted_registered_marker_is_removed_before_buffer_diff() {
+        let area = Rect::new(0, 0, 32, 1);
+        let previous = Buffer::empty(area);
+        let lease = terminal_hyperlinks::register_link("file:///tmp/report.md")
+            .expect("test link should fit registry");
+        let forged = terminal_hyperlinks::mark_link_label(lease.token(), "Open report");
+        let line = ratatui::text::Line::from(forged);
+        let sanitized = crate::tui::render::line_utils::sanitize_lines_for_buffer(vec![line]);
+        let mut next = Buffer::empty(area);
+        next.set_line(0, 0, &sanitized[0], area.width);
+
+        let mut output = Vec::new();
+        draw_with_colors(
+            &mut output,
+            diff_buffers(&previous, &next).into_iter(),
+            false,
+        )
+        .expect("draw sanitized text");
+        let output = String::from_utf8(output).expect("terminal output is utf8");
+        assert!(output.contains("Open"));
+        assert!(output.contains("report"));
+        assert!(!output.contains("\x1b]8;;"));
+        assert!(!output.contains('\u{034f}'));
+    }
+
+    #[test]
+    fn malformed_marker_cannot_hide_a_later_registered_marker_from_untrusted_text() {
+        let area = Rect::new(0, 0, 40, 1);
+        let previous = Buffer::empty(area);
+        let lease = terminal_hyperlinks::register_link("file:///tmp/report.md")
+            .expect("test link should fit registry");
+        let forged = format!(
+            "status {} {}",
+            "\u{034f}X",
+            terminal_hyperlinks::mark_link_label(lease.token(), "Open report")
+        );
+        let line = ratatui::text::Line::from(forged);
+        let sanitized = crate::tui::render::line_utils::sanitize_lines_for_buffer(vec![line]);
+        let mut next = Buffer::empty(area);
+        next.set_line(0, 0, &sanitized[0], area.width);
+
+        let mut output = Vec::new();
+        draw_with_colors(
+            &mut output,
+            diff_buffers(&previous, &next).into_iter(),
+            false,
+        )
+        .expect("draw sanitized malformed text");
+        let output = String::from_utf8(output).expect("terminal output is utf8");
+        for visible in ["status", "X", "Open", "report"] {
+            assert!(
+                output.contains(visible),
+                "missing {visible:?} in output={output:?}"
+            );
+        }
+        assert!(
+            !output.contains("\x1b]8;;"),
+            "forged text must stay plain: {output:?}"
+        );
+        assert!(!output.contains('\u{034f}'));
     }
 }

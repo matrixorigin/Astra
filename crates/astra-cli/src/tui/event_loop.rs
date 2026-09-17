@@ -32,7 +32,7 @@ use super::event::{TuiEvent, TuiEventStream};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
 use super::keymap::{AppAction, AppKeymap};
-use super::render::line_utils::sanitize_lines_for_terminal;
+use super::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 #[cfg(test)]
 use super::status_line;
 use super::task_status::TaskStatus;
@@ -2331,7 +2331,7 @@ fn transcript_item_for_cell(
         return TranscriptItem::rendered_cell(
             id,
             cell,
-            sanitize_lines_for_terminal(assistant.live_viewport_lines(width, 48)),
+            sanitize_lines_for_buffer(assistant.live_viewport_lines(width, 48)),
             separator_rows,
         );
     }
@@ -2351,7 +2351,7 @@ fn transcript_item_for_cell(
     TranscriptItem::rendered_cell(
         id,
         cell,
-        sanitize_lines_for_terminal(cell.display_lines(width)),
+        history_cell_lines_for_buffer(cell, width),
         separator_rows,
     )
 }

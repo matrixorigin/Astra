@@ -18,7 +18,7 @@ use ratatui::text::Line;
 use super::custom_terminal;
 use super::frame_requester::FrameRequester;
 use super::history_cell::{HistoryCell, assistant::AssistantCell};
-use super::render::line_utils::sanitize_lines_for_terminal;
+use super::render::line_utils::{history_cell_lines_for_terminal, sanitize_lines_for_terminal};
 
 pub(crate) type CustomTerminal = custom_terminal::Terminal<CrosstermBackend<Stdout>>;
 
@@ -40,7 +40,10 @@ const MAX_HISTORY_CHARS_PER_DRAW: usize = 4 * 1024;
 const MAX_LAZY_ASSISTANT_LINES_PER_BATCH: usize = 8;
 
 enum PendingHistory {
-    Lines(VecDeque<Line<'static>>),
+    Lines {
+        lines: VecDeque<Line<'static>>,
+        trusted_links: bool,
+    },
     Assistant(QueuedAssistantHistory),
 }
 
@@ -143,8 +146,10 @@ impl TerminalGuard {
     pub fn queue_history_lines(&mut self, lines: Vec<Line<'static>>) {
         let lines = sanitize_lines_for_terminal(lines);
         if !lines.is_empty() {
-            self.pending_history
-                .push_back(PendingHistory::Lines(lines.into()));
+            self.pending_history.push_back(PendingHistory::Lines {
+                lines: lines.into(),
+                trusted_links: false,
+            });
         }
     }
 
@@ -177,11 +182,16 @@ impl TerminalGuard {
                 continue;
             }
 
-            let mut lines = sanitize_lines_for_terminal(cell.display_lines(width));
+            let trusted_links = cell
+                .as_any_ref()
+                .is::<super::history_cell::system::SystemCell>();
+            let mut lines = history_cell_lines_for_terminal(cell.as_ref(), width);
             lines.extend(std::iter::repeat_n(Line::default(), separators));
             if !lines.is_empty() {
-                self.pending_history
-                    .push_back(PendingHistory::Lines(lines.into()));
+                self.pending_history.push_back(PendingHistory::Lines {
+                    lines: lines.into(),
+                    trusted_links,
+                });
             }
         }
     }
@@ -301,8 +311,13 @@ impl TerminalGuard {
             return Ok(false);
         }
 
-        let lines = take_pending_history_batch(pending);
-        super::insert_history::insert_history_lines_with_terminal(terminal, &lines, is_zellij)?;
+        let (lines, trusted_links) = take_pending_history_batch(pending);
+        super::insert_history::insert_history_lines_with_terminal(
+            terminal,
+            &lines,
+            trusted_links,
+            is_zellij,
+        )?;
 
         Ok(is_zellij)
     }
@@ -311,7 +326,7 @@ impl TerminalGuard {
         self.pending_history
             .front()
             .is_some_and(|pending| match pending {
-                PendingHistory::Lines(lines) => !lines.is_empty(),
+                PendingHistory::Lines { lines, .. } => !lines.is_empty(),
                 PendingHistory::Assistant(queued) => {
                     !queued.layout_preparing.load(Ordering::Acquire)
                         && (!queued.ready.is_empty()
@@ -413,7 +428,10 @@ fn pending_line_chars(line: &Line<'static>) -> usize {
 }
 
 enum PendingHistoryLine {
-    Ready(Line<'static>),
+    Ready {
+        line: Line<'static>,
+        trusted_links: bool,
+    },
     Waiting,
     Exhausted,
 }
@@ -424,7 +442,13 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
             return PendingHistoryLine::Exhausted;
         };
         let next = match front {
-            PendingHistory::Lines(lines) => lines.pop_front().map(PendingHistoryLine::Ready),
+            PendingHistory::Lines {
+                lines,
+                trusted_links,
+            } => lines.pop_front().map(|line| PendingHistoryLine::Ready {
+                line,
+                trusted_links: *trusted_links,
+            }),
             PendingHistory::Assistant(queued) => {
                 if queued.layout_preparing.load(Ordering::Acquire) {
                     return PendingHistoryLine::Waiting;
@@ -447,11 +471,17 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
                 queued
                     .ready
                     .pop_front()
-                    .map(PendingHistoryLine::Ready)
+                    .map(|line| PendingHistoryLine::Ready {
+                        line,
+                        trusted_links: false,
+                    })
                     .or_else(|| {
                         if queued.rendered_complete && queued.pending_separators > 0 {
                             queued.pending_separators -= 1;
-                            Some(PendingHistoryLine::Ready(Line::default()))
+                            Some(PendingHistoryLine::Ready {
+                                line: Line::default(),
+                                trusted_links: false,
+                            })
                         } else {
                             None
                         }
@@ -467,18 +497,34 @@ fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> Pen
 
 fn return_pending_history_line(pending: &mut VecDeque<PendingHistory>, line: Line<'static>) {
     match pending.front_mut() {
-        Some(PendingHistory::Lines(lines)) => lines.push_front(line),
+        Some(PendingHistory::Lines { lines, .. }) => lines.push_front(line),
         Some(PendingHistory::Assistant(queued)) => queued.ready.push_front(line),
         None => unreachable!("a consumed pending history line keeps its queue entry"),
     }
 }
 
-fn take_pending_history_batch(pending: &mut VecDeque<PendingHistory>) -> Vec<Line<'static>> {
+fn take_pending_history_batch(
+    pending: &mut VecDeque<PendingHistory>,
+) -> (Vec<Line<'static>>, bool) {
     let mut lines = Vec::new();
     let mut chars = 0usize;
+    let mut trusted_links = None;
     while lines.len() < MAX_HISTORY_LINES_PER_DRAW {
         let next = match take_next_pending_history_line(pending) {
-            PendingHistoryLine::Ready(line) => line,
+            PendingHistoryLine::Ready {
+                line,
+                trusted_links: line_trusted_links,
+            } => {
+                if let Some(expected) = trusted_links
+                    && expected != line_trusted_links
+                    && !lines.is_empty()
+                {
+                    return_pending_history_line(pending, line);
+                    break;
+                }
+                trusted_links.get_or_insert(line_trusted_links);
+                line
+            }
             PendingHistoryLine::Waiting | PendingHistoryLine::Exhausted => break,
         };
         let next_chars = pending_line_chars(&next);
@@ -489,7 +535,7 @@ fn take_pending_history_batch(pending: &mut VecDeque<PendingHistory>) -> Vec<Lin
         chars = chars.saturating_add(next_chars);
         lines.push(next);
     }
-    lines
+    (lines, trusted_links.unwrap_or(false))
 }
 
 impl Drop for TerminalGuard {
@@ -499,10 +545,11 @@ impl Drop for TerminalGuard {
         // scrollback rather than silently discarding a reply tail when the
         // user exits immediately after it starts painting.
         while !self.pending_history.is_empty() {
-            let lines = take_pending_history_batch(&mut self.pending_history);
+            let (lines, trusted_links) = take_pending_history_batch(&mut self.pending_history);
             if super::insert_history::insert_history_lines_with_terminal(
                 &mut self.terminal,
                 &lines,
+                trusted_links,
                 self.is_zellij,
             )
             .is_err()
@@ -601,7 +648,7 @@ mod tests {
             ready: VecDeque::new(),
         })]);
 
-        let first = take_pending_history_batch(&mut pending);
+        let (first, _) = take_pending_history_batch(&mut pending);
         assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
         assert!(!pending.is_empty(), "long reply tail remains queued");
         assert!(first.iter().all(|line| line.spans[0].content == "█ "));

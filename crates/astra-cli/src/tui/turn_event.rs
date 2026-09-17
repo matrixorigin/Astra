@@ -95,6 +95,11 @@ pub(crate) enum TurnEvent {
         ts: Option<String>,
         level: SystemLevel,
         text: String,
+        /// Optional user-facing action link. The link is kept separate from
+        /// `text` so terminal escape sequences never become part of the
+        /// durable message or prompt-facing content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<SystemLink>,
     },
 
     /// End-of-turn metric band (the `⏱ … · ⚡ … · Σ …` line).
@@ -135,6 +140,18 @@ pub(crate) enum TurnEvent {
         #[serde(default)]
         delivery_degraded: bool,
     },
+}
+
+/// A durable, presentation-neutral link attached to a system notice.
+///
+/// `uri` is used only when the terminal supports OSC 8. `fallback` remains
+/// visible in plain terminals and non-hyperlink environments, so the notice
+/// stays actionable without leaking the long target into the normal TUI row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SystemLink {
+    pub(crate) uri: String,
+    pub(crate) label: String,
+    pub(crate) fallback: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +281,7 @@ mod tests {
                 ts: None,
                 level: lv,
                 text: "msg".into(),
+                link: None,
             });
         }
     }

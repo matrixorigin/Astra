@@ -310,6 +310,7 @@ fn canonical_root_turn_events(
                         }
                     },
                     text: outcome.user_notice(),
+                    link: None,
                 });
             }
         }

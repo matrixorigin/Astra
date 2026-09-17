@@ -49,6 +49,17 @@ fn skip_string_escape(chars: &mut Peekable<Chars<'_>>, allow_bel: bool) -> Optio
 }
 
 pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_controls(text);
+    if !crate::cli::terminal_hyperlinks::contains_link_marker(sanitized.as_ref()) {
+        return sanitized;
+    }
+    Cow::Owned(
+        crate::cli::terminal_hyperlinks::strip_untrusted_link_markers(sanitized.as_ref())
+            .into_owned(),
+    )
+}
+
+fn sanitize_terminal_controls(text: &str) -> Cow<'_, str> {
     if !text.chars().any(|ch| {
         is_unsafe_terminal_control(ch)
             || matches!(
@@ -66,6 +77,10 @@ pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
         return Cow::Borrowed(text);
     }
 
+    Cow::Owned(sanitize_terminal_text_inner(text))
+}
+
+fn sanitize_terminal_text_inner(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -108,7 +123,7 @@ pub(crate) fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
             _ => {}
         }
     }
-    Cow::Owned(sanitized)
+    sanitized
 }
 
 pub(crate) fn sanitize_line_for_terminal(line: &Line<'_>) -> Line<'static> {
@@ -132,6 +147,153 @@ pub(crate) fn sanitize_lines_for_terminal(lines: Vec<Line<'static>>) -> Vec<Line
     lines
         .into_iter()
         .map(|line| sanitize_line_for_terminal(&line))
+        .collect()
+}
+
+/// Sanitize text before handing it to a ratatui [`Buffer`]. Buffer cells are
+/// Unicode graphemes, not a byte stream: they discard the ESC bytes from an
+/// OSC8 sequence but keep the printable payload (`]8;;…`), which would leak
+/// terminal control syntax into the panel. Keep the visible label and remove
+/// the control sequence entirely for in-frame rendering. Structured links are
+/// represented by zero-width, process-local markers and are handled by the
+/// custom terminal boundary; arbitrary text never becomes a hyperlink here.
+pub(crate) fn sanitize_terminal_text_for_buffer(text: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_controls(text);
+    if !crate::cli::terminal_hyperlinks::contains_link_marker(sanitized.as_ref()) {
+        return sanitized;
+    }
+    Cow::Owned(
+        crate::cli::terminal_hyperlinks::strip_untrusted_link_markers(sanitized.as_ref())
+            .into_owned(),
+    )
+}
+
+/// Sanitize a line that was produced by a structured UI cell. Raw terminal
+/// controls are still removed, while the cell-owned link markers are retained
+/// until the custom terminal boundary can turn them into OSC 8.
+pub(crate) fn sanitize_terminal_text_for_buffer_with_links(text: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_controls(text);
+    if !crate::cli::terminal_hyperlinks::contains_link_marker(sanitized.as_ref()) {
+        return sanitized;
+    }
+    Cow::Owned(
+        crate::cli::terminal_hyperlinks::strip_unregistered_link_markers(sanitized.as_ref())
+            .into_owned(),
+    )
+}
+
+pub(crate) fn sanitize_terminal_text_for_terminal_with_links(text: &str) -> Cow<'_, str> {
+    let sanitized = sanitize_terminal_controls(text);
+    if !crate::cli::terminal_hyperlinks::contains_link_marker(sanitized.as_ref()) {
+        return sanitized;
+    }
+    Cow::Owned(
+        crate::cli::terminal_hyperlinks::strip_unregistered_link_markers(sanitized.as_ref())
+            .into_owned(),
+    )
+}
+
+pub(crate) fn sanitize_line_for_terminal_with_links(line: &Line<'_>) -> Line<'static> {
+    let mut out = Line::from(
+        line.spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    sanitize_terminal_text_for_terminal_with_links(&span.content).into_owned(),
+                    span.style,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    out.style = line.style;
+    out.alignment = line.alignment;
+    out
+}
+
+pub(crate) fn sanitize_line_for_buffer_with_links(line: &Line<'_>) -> Line<'static> {
+    let mut out = Line::from(
+        line.spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    sanitize_terminal_text_for_buffer_with_links(&span.content).into_owned(),
+                    span.style,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    out.style = line.style;
+    out.alignment = line.alignment;
+    out
+}
+
+pub(crate) fn sanitize_lines_for_terminal_with_links(
+    lines: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| sanitize_line_for_terminal_with_links(&line))
+        .collect()
+}
+
+pub(crate) fn sanitize_lines_for_buffer_with_links(
+    lines: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| sanitize_line_for_buffer_with_links(&line))
+        .collect()
+}
+
+pub(crate) fn history_cell_lines_for_buffer(
+    cell: &dyn crate::tui::history_cell::HistoryCell,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if let Some(system) = cell
+        .as_any_ref()
+        .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
+    {
+        sanitize_lines_for_buffer_with_links(system.display_lines_with_links(width))
+    } else {
+        sanitize_lines_for_buffer(cell.display_lines(width))
+    }
+}
+
+pub(crate) fn history_cell_lines_for_terminal(
+    cell: &dyn crate::tui::history_cell::HistoryCell,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if let Some(system) = cell
+        .as_any_ref()
+        .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
+    {
+        sanitize_lines_for_terminal_with_links(system.display_lines_with_links(width))
+    } else {
+        sanitize_lines_for_terminal(cell.display_lines(width))
+    }
+}
+
+pub(crate) fn sanitize_line_for_buffer(line: &Line<'_>) -> Line<'static> {
+    let mut out = Line::from(
+        line.spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    sanitize_terminal_text_for_buffer(&span.content).into_owned(),
+                    span.style,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    out.style = line.style;
+    out.alignment = line.alignment;
+    out
+}
+
+pub(crate) fn sanitize_lines_for_buffer(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| sanitize_line_for_buffer(&line))
         .collect()
 }
 
@@ -209,7 +371,12 @@ impl Widget for FullRowParagraph<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FullRowParagraph, sanitize_line_for_terminal, sanitize_terminal_text};
+    use super::{
+        FullRowParagraph, sanitize_line_for_terminal, sanitize_terminal_text,
+        sanitize_terminal_text_for_buffer, sanitize_terminal_text_for_buffer_with_links,
+        sanitize_terminal_text_for_terminal_with_links,
+    };
+    use crate::cli::terminal_hyperlinks::{mark_link_label, register_link, render_link_markers};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Alignment;
     use ratatui::layout::Rect;
@@ -253,6 +420,56 @@ mod tests {
     fn sanitize_terminal_text_preserves_newline_after_unterminated_string_escape() {
         let text = "prefix\x1b]0;title\nvisible";
         assert_eq!(sanitize_terminal_text(text), "prefix\nvisible");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_osc8_from_untrusted_text() {
+        let text =
+            "open \x1b]8;;file:///tmp/report%20with%20spaces.md\x1b\\Open report\x1b]8;;\x1b\\ now";
+        assert_eq!(sanitize_terminal_text(text), "open Open report now");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_for_buffer_removes_osc8_control_syntax() {
+        let text =
+            "open \x1b]8;;file:///tmp/report%20with%20spaces.md\x1b\\Open report\x1b]8;;\x1b\\ now";
+        assert_eq!(
+            sanitize_terminal_text_for_buffer(text),
+            "open Open report now"
+        );
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_safe_looking_osc8_from_tool_text() {
+        let text = "before \x1b]8;;https://example.com\x1b\\spoof\x1b]8;;\x1b\\ after";
+        assert_eq!(sanitize_terminal_text(text), "before spoof after");
+    }
+
+    #[test]
+    fn untrusted_sanitization_removes_a_registered_marker_before_rendering() {
+        let lease = register_link("file:///tmp/report.md").expect("test link should fit registry");
+        let text = mark_link_label(lease.token(), "Open report");
+        let sanitized = sanitize_terminal_text(&text);
+        assert_eq!(sanitized, "Open report");
+        assert_eq!(render_link_markers(sanitized.as_ref()), "Open report");
+    }
+
+    #[test]
+    fn trusted_sanitization_drops_markers_after_their_lease_expires() {
+        let text = {
+            let lease =
+                register_link("file:///tmp/report.md").expect("test link should fit registry");
+            mark_link_label(lease.token(), "Open report")
+        };
+
+        assert_eq!(
+            sanitize_terminal_text_for_buffer_with_links(&text),
+            "Open report"
+        );
+        assert_eq!(
+            sanitize_terminal_text_for_terminal_with_links(&text),
+            "Open report"
+        );
     }
 
     #[test]
