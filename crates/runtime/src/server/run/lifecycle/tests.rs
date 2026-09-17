@@ -7477,6 +7477,10 @@ struct FaultInjectedRunStateStore {
     mutate_before_status_call: HashMap<usize, FaultInjectedStatusMutation>,
     mutate_before_generation_append_call: HashMap<usize, FaultInjectedStatusMutation>,
     append_events_before_load_call: HashMap<usize, FaultInjectedEventAppend>,
+    claim_before_interaction_resolution: bool,
+    interaction_resolution_claimed: std::sync::atomic::AtomicBool,
+    interaction_wait_entered: Option<Arc<tokio::sync::Notify>>,
+    interaction_wait_release: Option<Arc<tokio::sync::Notify>>,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
     terminal_transition_delay: Duration,
@@ -7506,6 +7510,10 @@ impl FaultInjectedRunStateStore {
             mutate_before_status_call: HashMap::new(),
             mutate_before_generation_append_call: HashMap::new(),
             append_events_before_load_call: HashMap::new(),
+            claim_before_interaction_resolution: false,
+            interaction_resolution_claimed: std::sync::atomic::AtomicBool::new(false),
+            interaction_wait_entered: None,
+            interaction_wait_release: None,
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
@@ -7531,6 +7539,21 @@ impl FaultInjectedRunStateStore {
 
     fn with_failed_status_run(mut self, run_id: &str) -> Self {
         self.fail_status_run_ids.insert(run_id.to_string());
+        self
+    }
+
+    fn with_recovery_claim_before_interaction_resolution(mut self) -> Self {
+        self.claim_before_interaction_resolution = true;
+        self
+    }
+
+    fn with_paused_interaction_wait(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.interaction_wait_entered = Some(entered);
+        self.interaction_wait_release = Some(release);
         self
     }
 
@@ -7872,6 +7895,12 @@ impl RunStateStore for FaultInjectedRunStateStore {
         &self,
         request: astra_services::runs::AtomicRunInteractionWaitRequest<'_>,
     ) -> Result<astra_services::runs::DurableRunInteractionWaitOutcome, String> {
+        if let Some(entered) = &self.interaction_wait_entered {
+            entered.notify_one();
+        }
+        if let Some(release) = &self.interaction_wait_release {
+            release.notified().await;
+        }
         self.inner.begin_run_interaction_wait(request).await
     }
 
@@ -7884,6 +7913,18 @@ impl RunStateStore for FaultInjectedRunStateStore {
         kind: astra_services::runs::DurableRunInteractionKind,
         response_data: serde_json::Value,
     ) -> Result<astra_services::runs::DurableRunInteractionResolveOutcome, String> {
+        if self.claim_before_interaction_resolution
+            && !self
+                .interaction_resolution_claimed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let claims = self.inner.claim_recoverable_active_runs(1).await?;
+            if claims.len() != 1 || claims[0].run.run_id != run_id {
+                return Err(format!(
+                    "injected recovery claim did not acquire expected run {run_id}"
+                ));
+            }
+        }
         self.inner
             .resolve_run_interaction(
                 user_id,
@@ -19215,6 +19256,421 @@ async fn provider_interaction_requires_an_authenticated_provider_run_owner() {
         }),
         "an unowned interaction must not create an unresolvable durable wait"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_interaction_wait_is_registered_and_resolved_durably() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run(
+            "provider-interaction-durable",
+            "user-1",
+            "server-only-session",
+        )
+        .await
+        .unwrap();
+    let (stream_tx, mut stream_rx) = mpsc::channel(4);
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "provider-interaction-durable".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_timeout(Duration::from_secs(1));
+    let interaction = tokio::spawn(async move {
+        astra_tools::ProviderInteractionGate::request_interaction(
+            &gate,
+            &astra_turn_types::ProviderInteractionRequest {
+                request_id: "provider-interaction-request".into(),
+                payload: json!({"type": "provider.test.select"}),
+                timeout_ms: None,
+            },
+        )
+        .await
+    });
+
+    wait_for_durable_run_status(
+        &svc.run_engine,
+        "user-1",
+        "provider-interaction-durable",
+        STATUS_WAITING,
+    )
+    .await;
+    let waiting = svc
+        .run_engine
+        .load_run("user-1", "provider-interaction-durable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.waiting_for.as_deref(), Some("provider_interaction"));
+    assert_eq!(
+        waiting.events[1]["event_type"],
+        "provider_interaction_required"
+    );
+    assert_eq!(
+        waiting.events[1]["idempotency_key"],
+        "server-provider-interaction-required:provider-interaction-request"
+    );
+    assert_eq!(
+        waiting.events[1]["data"]["provider_run_owner"],
+        json!({
+            "provider_id": "moi",
+            "provider_scope_id": "workspace-a",
+        })
+    );
+    assert_eq!(waiting.events[2]["event_type"], "interaction_wait_started");
+    let required = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("provider interaction required must reach the active stream")
+        .expect("provider interaction required event");
+    assert_eq!(required["type"], "provider_interaction_required");
+    assert_eq!(required["run_id"], "provider-interaction-durable");
+    assert_eq!(
+        required["provider_run_owner"],
+        json!({
+            "provider_id": "moi",
+            "provider_scope_id": "workspace-a",
+        })
+    );
+
+    svc.run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "server-only-session",
+            "provider-interaction-durable",
+            "provider-interaction-request",
+            astra_services::runs::DurableRunInteractionKind::Provider,
+            json!({
+                "request_id": "provider-interaction-request",
+                "outcome": "submitted",
+                "payload": {"selected": "provider-option"},
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = interaction.await.unwrap();
+    assert_eq!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Submitted(json!({
+            "selected": "provider-option"
+        }))
+    );
+    let resolved = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("provider interaction resolution must reach the active stream")
+        .expect("provider interaction resolved event");
+    let resumed = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("provider interaction resume must reach the active stream")
+        .expect("provider interaction resumed event");
+    assert_eq!(resolved["type"], "provider_interaction_resolved");
+    assert_eq!(resolved["run_id"], "provider-interaction-durable");
+    assert_eq!(resumed["type"], "run_resumed");
+    assert_eq!(resumed["interaction_outcome"], "submitted");
+
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "provider-interaction-durable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    assert_eq!(
+        durable.events[3]["event_type"],
+        "provider_interaction_resolved"
+    );
+    assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_submission_before_wait_admission_resumes_the_original_gate() {
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let wait_release = Arc::new(tokio::sync::Notify::new());
+    let store = FaultInjectedRunStateStore::new(&[], &[])
+        .with_paused_interaction_wait(Arc::clone(&wait_entered), Arc::clone(&wait_release));
+    let svc = test_service_with_store(Arc::new(store));
+    svc.run_engine
+        .start_run("provider-pre-wait", "user-1", "provider-session")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "provider-session".into(),
+        "provider-pre-wait".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_timeout(Duration::from_secs(1));
+    let interaction = tokio::spawn(async move {
+        astra_tools::ProviderInteractionGate::request_interaction(
+            &gate,
+            &astra_turn_types::ProviderInteractionRequest {
+                request_id: "provider-pre-wait-request".into(),
+                payload: json!({"type": "provider.test.select"}),
+                timeout_ms: None,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), wait_entered.notified())
+        .await
+        .expect("gate must pause after registration and before wait admission");
+    let required = svc
+        .run_engine
+        .load_run_interaction_event(
+            "user-1",
+            "provider-pre-wait",
+            "provider-pre-wait-request",
+            "provider_interaction_required",
+        )
+        .await
+        .unwrap();
+    assert!(required.is_some(), "durable replay can expose the request");
+    assert!(matches!(
+        svc.run_engine
+            .resolve_run_interaction(
+                "user-1",
+                "provider-session",
+                "provider-pre-wait",
+                "provider-pre-wait-request",
+                astra_services::runs::DurableRunInteractionKind::Provider,
+                json!({
+                    "request_id": "provider-pre-wait-request",
+                    "outcome": "submitted",
+                    "payload": {"selected": "early-option"},
+                }),
+            )
+            .await
+            .unwrap(),
+        astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)
+    ));
+    let queued = svc
+        .run_engine
+        .load_run("user-1", "provider-pre-wait")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.status, STATUS_RUNNING);
+    assert!(queued.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str)
+            == Some("provider_interaction_response_queued")
+    }));
+    assert!(queued.events.iter().all(|event| {
+        event.get("event_type").and_then(Value::as_str) != Some("provider_interaction_resolved")
+    }));
+
+    wait_release.notify_one();
+    let decision = tokio::time::timeout(Duration::from_secs(1), interaction)
+        .await
+        .expect("the original gate must consume the queued response")
+        .expect("provider interaction task must not panic");
+    assert_eq!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Submitted(json!({
+            "selected": "early-option"
+        }))
+    );
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "provider-pre-wait")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    let event_types = durable
+        .events
+        .iter()
+        .map(|event| event.get("event_type").and_then(Value::as_str).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &event_types[1..],
+        &[
+            "provider_interaction_required",
+            "provider_interaction_response_queued",
+            "interaction_wait_started",
+            "provider_interaction_resolved",
+            "run_resumed",
+        ]
+    );
+    assert_eq!(
+        durable.events[4]["data"]["_durable_resolution"]["disposition"],
+        "resumed"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum RejectedProviderResolution {
+    Superseded,
+    OwnerGenerationLost,
+}
+
+async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedProviderResolution) {
+    let suffix = match rejection {
+        RejectedProviderResolution::Superseded => "superseded",
+        RejectedProviderResolution::OwnerGenerationLost => "authority-lost",
+    };
+    let run_id = format!("provider-interaction-{suffix}");
+    let request_id = format!("provider-request-{suffix}");
+    let store = match rejection {
+        RejectedProviderResolution::Superseded => FaultInjectedRunStateStore::new(&[], &[]),
+        RejectedProviderResolution::OwnerGenerationLost => {
+            FaultInjectedRunStateStore::new(&[], &[])
+                .with_recovery_claim_before_interaction_resolution()
+        }
+    };
+    let svc = test_service_with_store(Arc::new(store));
+    svc.run_engine
+        .start_run(&run_id, "user-1", "provider-session")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "provider-session".into(),
+        run_id.clone(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_timeout(Duration::from_secs(1));
+    let interaction_request_id = request_id.clone();
+    let interaction = tokio::spawn(async move {
+        astra_tools::ProviderInteractionGate::request_interaction(
+            &gate,
+            &astra_turn_types::ProviderInteractionRequest {
+                request_id: interaction_request_id,
+                payload: json!({"type": "provider.test.select"}),
+                timeout_ms: None,
+            },
+        )
+        .await
+    });
+
+    wait_for_durable_run_status(&svc.run_engine, "user-1", &run_id, STATUS_WAITING).await;
+    if matches!(rejection, RejectedProviderResolution::Superseded) {
+        svc.run_engine
+            .append_event(
+                "user-1",
+                "provider-session",
+                &run_id,
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": format!("user-intent:{run_id}"),
+                    "data": {"intent_id": "newer-user-intent"},
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let outcome = svc
+        .run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "provider-session",
+            &run_id,
+            &request_id,
+            astra_services::runs::DurableRunInteractionKind::Provider,
+            json!({
+                "request_id": request_id,
+                "outcome": "submitted",
+                "payload": {"selected": "stale-option"},
+            }),
+        )
+        .await
+        .unwrap();
+    match rejection {
+        RejectedProviderResolution::Superseded => assert!(matches!(
+            outcome,
+            astra_services::runs::DurableRunInteractionResolveOutcome::Superseded { .. }
+        )),
+        RejectedProviderResolution::OwnerGenerationLost => assert!(matches!(
+            outcome,
+            astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+                reason:
+                    astra_services::runs::DurableRunInteractionAuthorityLoss::OwnerGenerationMismatch {
+                        actual_owner_generation: 1,
+                    },
+                ..
+            }
+        )),
+    }
+
+    let decision = tokio::time::timeout(Duration::from_secs(1), interaction)
+        .await
+        .expect("provider gate must observe the rejected durable response")
+        .expect("provider interaction task must not panic");
+    assert!(matches!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Error(ref error)
+            if error.contains("without durable resume authority")
+    ));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_WAITING);
+    let resolution = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("provider_interaction_resolved")
+                && event.pointer("/data/request_id").and_then(Value::as_str)
+                    == Some(request_id.as_str())
+        })
+        .expect("rejected provider response must remain in the durable audit log");
+    assert_eq!(resolution["data"]["outcome"], "submitted");
+    assert_eq!(
+        resolution["data"]["_durable_resolution"]["disposition"],
+        match rejection {
+            RejectedProviderResolution::Superseded => "superseded",
+            RejectedProviderResolution::OwnerGenerationLost => "authority_lost",
+        }
+    );
+    assert!(
+        durable
+            .events
+            .iter()
+            .all(|event| event.get("event_type").and_then(Value::as_str) != Some("run_resumed"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_provider_submission_is_audited_without_resuming_execution() {
+    assert_rejected_provider_submission_fails_closed(RejectedProviderResolution::Superseded).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authority_lost_provider_submission_is_audited_without_resuming_execution() {
+    assert_rejected_provider_submission_fails_closed(
+        RejectedProviderResolution::OwnerGenerationLost,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
