@@ -13,6 +13,7 @@ WEB_HOST="$(web_agent_host)"
 API_URL="${ASTRA_API_URL:-http://localhost:${ASTRA_API_PORT:-17001}}"
 NEXT_DIST_DIR="${ASTRA_NEXT_DIST_DIR:-.next-dev}"
 NEXT_BIN="$WEB_DIR/node_modules/next/dist/bin/next"
+SDK_PACKAGE="$WEB_DIR/node_modules/@astra/sdk/package.json"
 
 web_validate_port "$WEB_PORT"
 
@@ -21,8 +22,8 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -f "$NEXT_BIN" ]; then
-    echo "Web dependencies are not installed"
+if [ ! -f "$NEXT_BIN" ] || [ ! -f "$SDK_PACKAGE" ]; then
+    echo "Web dependencies are incomplete (Next.js or @astra/sdk is missing)"
     echo "Run: make dev-web-deps"
     exit 1
 fi

@@ -653,6 +653,31 @@ pub(crate) fn sync_task_footer(
     footer.task_board_expanded = board_expanded;
 }
 
+/// Keep the composer (and an open slash palette) on screen when the inline
+/// Work board has many rows. The board is a secondary projection; it may be
+/// shortened for this frame, while the user input surface must remain usable.
+fn fit_task_board_lines(
+    mut lines: Option<Vec<Line<'static>>>,
+    bottom_pane: &BottomPane,
+    terminal_height: u16,
+    width: u16,
+    other_fixed_rows: u16,
+) -> Option<Vec<Line<'static>>> {
+    let board_lines = lines.as_mut()?;
+    let bottom_rows = bottom_pane.desired_height(width);
+    let max_board_rows = terminal_height
+        .saturating_sub(bottom_rows)
+        .saturating_sub(other_fixed_rows)
+        .saturating_sub(1); // spacer between the board and composer
+    if max_board_rows == 0 {
+        return None;
+    }
+    if board_lines.len() > usize::from(max_board_rows) {
+        board_lines.truncate(usize::from(max_board_rows));
+    }
+    lines
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // Frame composition
 // ───────────────────────────────────────────────────────────────────────
@@ -753,6 +778,29 @@ pub(crate) fn do_draw(
         };
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
+
+    // The task board is useful context, but the composer and its active
+    // palette are the interaction surface. Keep enough physical rows for
+    // those controls before handing the frame to FlexRenderable; otherwise
+    // a full Work board can consume the terminal and make a newly typed
+    // `/m` appear to have no completions even though the menu state is open.
+    let other_fixed_rows = multi_agent_renderable
+        .as_ref()
+        .map(|item| item.desired_height(width))
+        .unwrap_or(0)
+        .saturating_add(
+            explain_analyze
+                .as_ref()
+                .map(|lines| lines.len().min(usize::from(u16::MAX)) as u16)
+                .unwrap_or(0),
+        );
+    let task_board_lines = fit_task_board_lines(
+        task_board_lines,
+        bottom_pane,
+        terminal_size.height,
+        width,
+        other_fixed_rows,
+    );
 
     let bp_renderable = BottomPaneRenderable(bottom_pane);
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
@@ -1004,15 +1052,40 @@ mod task_board_draw_tests {
     use super::super::work_board_projection::{
         SessionTask, SessionTaskStatusKind, TaskStoreHealth,
     };
-    use super::{ActiveView, active_viewport, sync_task_footer, task_board_truth_line};
+    use super::{
+        ActiveView, active_viewport, fit_task_board_lines, sync_task_footer, task_board_truth_line,
+    };
     use crate::tui::{
-        bottom_pane::footer::Footer,
-        chat_widget, status_indicator,
+        bottom_pane::{BottomPane, footer::Footer},
+        chat_widget,
+        slash_menu::SlashItem,
+        status_indicator,
         task_board_observer::{
             LiveWorkTaskBoardUpdate, ProjectedTaskTruthState, TaskBoardTruthState, WorkBoardContext,
         },
     };
+    use ratatui::text::Line;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn task_board_yields_rows_to_an_open_command_palette() {
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.set_slash_items(vec![SlashItem::simple("/model", "pick a model")]);
+        bottom_pane.replace_composer_text("/m");
+        assert!(bottom_pane.slash_menu_is_open());
+
+        let lines = (0..20)
+            .map(|index| Line::from(format!("task {index}")))
+            .collect::<Vec<_>>();
+        let bottom_rows = bottom_pane.desired_height(80);
+        let capped = fit_task_board_lines(Some(lines), &bottom_pane, 24, 80, 0)
+            .expect("a visible board should remain when rows are available");
+
+        let max_board_rows = 24u16.saturating_sub(bottom_rows).saturating_sub(1);
+        assert_eq!(capped.len(), usize::from(max_board_rows));
+        assert!(capped.len() < 20);
+        assert!(bottom_pane.slash_menu_is_open());
+    }
 
     fn draw_task(id: &str, title: &str) -> SessionTask {
         SessionTask {

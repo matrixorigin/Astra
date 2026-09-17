@@ -3,7 +3,71 @@ use super::io::{
     csl_log_path_for, csl_store_base_dir, read_optional_file_bytes, restore_optional_file_bytes,
     sync_parent_dir, write_bytes_atomic,
 };
+use crate::cli::session::session_continuation;
 use crate::cli::session::session_state::SessionState;
+
+/// Move a broken derived CSL projection aside without deleting evidence. The
+/// rename stays in the same directory, so readers either see the old complete
+/// file or no file at all; a later canonical replay can then write a fresh
+/// projection at the original path.
+pub(crate) fn quarantine_corrupt_csl_projection(
+    sid: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let path = csl_log_path_for(sid);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("CSL path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("CSL path has no valid file name: {}", path.display()))?;
+    let quarantine = parent.join(format!("{file_name}.corrupt-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(&path, &quarantine)
+        .map_err(|error| format!("quarantine corrupt CSL projection: {error}"))?;
+    sync_parent_dir(&quarantine)?;
+    Ok(Some(quarantine))
+}
+
+pub(crate) async fn rebuild_csl_from_canonical_continuation(
+    sid: &str,
+    continuation: &session_continuation::SessionContinuation,
+    recent_tools: &[String],
+) -> Result<
+    (
+        astra_turn_core::conversation_log::manager::CslManager,
+        astra_turn_core::conversation_log::SessionStateCompact,
+    ),
+    String,
+> {
+    let session_state = astra_turn_core::conversation_log::SessionStateCompact {
+        source_cursor: Some(continuation.resume.cursor.clone()),
+        recent_tools: recent_tools.to_vec(),
+        deferred_tool_activations: continuation.deferred_tool_activations.clone(),
+        ..Default::default()
+    };
+    let turn = continuation
+        .completed_turn_count
+        .unwrap_or(continuation.resume.cursor.completed_turn);
+    write_full_csl_snapshot_atomic(sid, turn, &continuation.messages, &session_state)?;
+    let store = std::sync::Arc::new(
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
+    );
+    let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
+        store,
+        sid.to_string(),
+        Default::default(),
+    )
+    .map_err(|error| format!("reinitialize CSL manager after quarantine: {error}"))?;
+    if !continuation.messages.is_empty() || turn > 0 {
+        mgr.load()
+            .await
+            .map_err(|error| format!("reload rebuilt CSL projection: {error}"))?;
+    }
+    Ok((mgr, session_state))
+}
 
 pub(crate) async fn ensure_loaded_csl_state(
     state: &mut SessionState,
@@ -40,7 +104,60 @@ pub(crate) async fn ensure_loaded_csl_state(
     match mgr.load().await {
         Ok(Some(mat)) => Ok(Some(mat.session_state)),
         Ok(None) => Ok(None),
-        Err(e) => Err(format!("load CSL state for recovery sync: {e}")),
+        Err(error) => {
+            // CSL is a derived projection. If the canonical journal can be
+            // replayed, quarantine and rebuild the damaged projection now so
+            // every subsequent fresh manager sees a valid file. Preserve the
+            // load error when no canonical recovery source exists.
+            let canonical_recovery = session_continuation::load_session_continuation_for_recovery(
+                sid,
+            )
+            .filter(|continuation| {
+                matches!(
+                    continuation.resume.source,
+                    astra_turn_types::ResumeSourceV1::CanonicalJournal
+                )
+            });
+            if let Some(continuation) = canonical_recovery {
+                tracing::warn!(
+                    session_id = %sid,
+                    error = %error,
+                    "CSL projection is corrupt during recovery sync; quarantining and rebuilding from canonical journal"
+                );
+                state.csl_manager = None;
+                if let Err(quarantine_error) = quarantine_corrupt_csl_projection(sid) {
+                    tracing::warn!(
+                        session_id = %sid,
+                        error = %quarantine_error,
+                        "could not quarantine corrupt CSL projection; canonical recovery remains available"
+                    );
+                    return Ok(None);
+                }
+                match rebuild_csl_from_canonical_continuation(
+                    sid,
+                    &continuation,
+                    &state.recent_tools,
+                )
+                .await
+                {
+                    Ok((mgr, session_state)) => {
+                        state.csl_manager = Some(mgr);
+                        Ok(Some(session_state))
+                    }
+                    Err(rebuild_error) => {
+                        tracing::warn!(
+                            session_id = %sid,
+                            error = %rebuild_error,
+                            "canonical recovery succeeded but CSL rebuild remains pending"
+                        );
+                        state.csl_manager = None;
+                        Ok(None)
+                    }
+                }
+            } else {
+                Err(format!("load CSL state for recovery sync: {error}"))
+            }
+        }
     }
 }
 pub(crate) async fn rebuild_csl_from_history(

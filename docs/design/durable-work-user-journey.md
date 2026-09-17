@@ -2,7 +2,7 @@
 
 > Status: target design contract; current support and verification limits are
 > described in the final section.
-> Last updated: 2026-09-15.
+> Last updated: 2026-09-16.
 
 This document owns the user-visible journey for finding, observing, continuing,
 and changing the execution provider for one durable Work across TUI, Web, and
@@ -319,6 +319,31 @@ workspace safe.
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.
+  A checkout claim is an active single-writer fence rather than a permanent
+  Session lock: an idle owner can be transferred atomically to a fresh Session
+  after its live execution slot and unresolved invocation records are clear.
+  Abandoned running slots are reclaimable only after both the owner lease and
+  the shared stale window expire; manually paused or unresolved work remains
+  fenced until an explicit recovery action settles it. A fresh Session is
+  never redirected to `/resume` another Session merely because it shares the
+  same checkout.
+- Recovery points now have one shared typed manifest for Work, branch, Session
+  cursor/context head, Run frontier, execution binding, Workspace snapshot,
+  Artifact references, and environment requirements. The Workspace manifest
+  validates the capture declaration shape, matching fingerprints, canonical
+  paths, content aggregates, file/blob digests, symlink boundaries, and
+  MatrixOne Git4Data source references. A server-authored safe-boundary
+  publisher builds the manifest from canonical Work/Session facts, rejects an
+  active writer, reservation, Run, or changing provider, and publishes it only
+  after a locked re-check. Exact request retries are stable and changed request
+  bodies conflict. `GET` recovery-point views expose a server-derived
+  assessment: conversation and Work state can be verified while the current
+  stage explicitly reports `workspace_not_captured`; published does not mean
+  portable or automatically restorable. The lower-level preparing capture is
+  retained for staging and is never treated as a published point. Recovery
+  points are removed with branch cleanup. This is still not cross-Edge
+  migration, workspace content restore, historical rollback, or Server
+  Run-owner recovery.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

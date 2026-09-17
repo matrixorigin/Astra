@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v78";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v81";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1161,13 +1161,13 @@ pub async fn admit_session_execution_write(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error> {
     admit_session_event_write(tx, session_id, user_id, false).await?;
 
     // Lock the derived slot before any run row. A missing slot is a valid
     // state; the SELECT still establishes the canonical access order for
     // engines that protect the key range on FOR UPDATE.
-    let _: Option<String> = query_scalar(
+    let run_id: Option<String> = query_scalar(
         "SELECT run_id FROM agent_session_execution_slots
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
@@ -1175,7 +1175,7 @@ pub async fn admit_session_execution_write(
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(())
+    Ok(run_id)
 }
 
 /// Admit the session and execution slot before locking an exact run.
@@ -1187,7 +1187,7 @@ pub async fn admit_session_scoped_run_write(
     run_id: &str,
     allow_missing_run: bool,
 ) -> Result<bool, sqlx::Error> {
-    admit_session_execution_write(tx, session_id, user_id).await?;
+    let _ = admit_session_execution_write(tx, session_id, user_id).await?;
     let run_exists: Option<i32> = query_scalar(
         "SELECT 1 FROM agent_runs
          WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
@@ -2008,6 +2008,55 @@ async fn existing_table_columns(
     .collect::<Result<BTreeSet<_>, _>>()
 }
 
+#[derive(Clone, Debug)]
+struct WeightedAdmissionColumnShape {
+    data_type: String,
+    numeric_precision: Option<i64>,
+    numeric_scale: Option<i64>,
+    nullable: bool,
+}
+
+async fn weighted_admission_table_shapes(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+) -> Result<BTreeMap<String, WeightedAdmissionColumnShape>, sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    let rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let name: String = row.try_get("COLUMN_NAME")?;
+            let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+                "YES" => true,
+                "NO" => false,
+                value => {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                    )));
+                }
+            };
+            Ok((
+                name,
+                WeightedAdmissionColumnShape {
+                    data_type: row.try_get("DATA_TYPE")?,
+                    numeric_precision: row.try_get("NUMERIC_PRECISION")?,
+                    numeric_scale: row.try_get("NUMERIC_SCALE")?,
+                    nullable,
+                },
+            ))
+        })
+        .collect()
+}
+
 async fn table_exists(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2024,6 +2073,120 @@ async fn table_exists(
     .fetch_optional(pool)
     .await
     .map(|row| row.is_some())
+}
+
+/// The current admission protocol stores materialized usage beside the
+/// durable gate. `CREATE TABLE IF NOT EXISTS` cannot add those columns to a
+/// database created by an older contract, and this branch intentionally has
+/// no compatibility migration. Refuse that physical schema explicitly before
+/// publishing a new readiness marker; operators must recreate the database
+/// with the current contract instead.
+async fn reject_obsolete_weighted_admission_schema(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    const GATE: &str = "session_weighted_admission_gates";
+    const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
+    const REQUIRED_GATE_COLUMNS: &[&str] = &[
+        "usage_initialized",
+        "global_resident_bytes",
+        "global_context_tokens",
+        "global_provider_slots",
+        "global_cpu_units",
+        "global_io_bytes",
+    ];
+
+    if !table_exists(pool, database, GATE).await? {
+        // A brand-new database has no admission tables yet; the bootstrap DDL
+        // below will create the complete current shape.
+        return Ok(());
+    }
+
+    let gate_columns = weighted_admission_table_shapes(pool, database, GATE).await?;
+    let missing = REQUIRED_GATE_COLUMNS
+        .iter()
+        .filter(|column| !gate_columns.contains_key(**column))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(sqlx::Error::Protocol(format!(
+            "weighted admission schema is older than v81; missing {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            missing.join(", ")
+        )));
+    }
+    if !table_exists(pool, database, OWNER_USAGE).await? {
+        return Err(sqlx::Error::Protocol(format!(
+            "weighted admission schema is incomplete for v81; missing table {OWNER_USAGE}. Compatibility migration is disabled; recreate database {database} with the current schema"
+        )));
+    }
+
+    let mut mismatches = Vec::new();
+    if let Some(column) = gate_columns.get("usage_initialized")
+        && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
+    {
+        mismatches.push(format!(
+            "{GATE}.usage_initialized must be NOT NULL TINYINT (found {}{})",
+            column.data_type,
+            if column.nullable { " NULL" } else { "" }
+        ));
+    }
+    for name in [
+        "global_resident_bytes",
+        "global_context_tokens",
+        "global_provider_slots",
+        "global_cpu_units",
+        "global_io_bytes",
+    ] {
+        if let Some(column) = gate_columns.get(name)
+            && (!column.data_type.eq_ignore_ascii_case("decimal")
+                || column.numeric_precision != Some(20)
+                || column.numeric_scale != Some(0)
+                || column.nullable)
+        {
+            mismatches.push(format!(
+                "{GATE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
+                column.data_type,
+                column.numeric_precision,
+                column.numeric_scale,
+                if column.nullable { " NULL" } else { "" }
+            ));
+        }
+    }
+
+    let owner_columns = weighted_admission_table_shapes(pool, database, OWNER_USAGE).await?;
+    for name in [
+        "resident_bytes",
+        "context_tokens",
+        "provider_slots",
+        "cpu_units",
+        "io_bytes",
+    ] {
+        match owner_columns.get(name) {
+            None => mismatches.push(format!("{OWNER_USAGE}.{name} is missing")),
+            Some(column)
+                if !column.data_type.eq_ignore_ascii_case("decimal")
+                    || column.numeric_precision != Some(20)
+                    || column.numeric_scale != Some(0)
+                    || column.nullable =>
+            {
+                mismatches.push(format!(
+                    "{OWNER_USAGE}.{name} must be NOT NULL DECIMAL(20,0) (found {}({:?},{:?}){})",
+                    column.data_type,
+                    column.numeric_precision,
+                    column.numeric_scale,
+                    if column.nullable { " NULL" } else { "" }
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if !mismatches.is_empty() {
+        return Err(sqlx::Error::Protocol(format!(
+            "weighted admission schema is not the current v81 physical shape: {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            mismatches.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn agent_runs_canonical_columns() -> BTreeSet<String> {
@@ -3578,12 +3741,44 @@ async fn backfill_conversation_manifest_segments(
     }
 }
 
+async fn ensure_workspace_claim_activity_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_id",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_id VARCHAR(128) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_generation",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_generation BIGINT NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        database,
+        "session_execution_workspace_claims",
+        "active_execution_expires_at_ms",
+        "ALTER TABLE session_execution_workspace_claims ADD COLUMN active_execution_expires_at_ms BIGINT NULL",
+    )
+    .await
+}
+
 async fn ensure_core_schema_while_leased(
     settings: &MatrixOneSettings,
     pool: sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    reject_obsolete_weighted_admission_schema(&pool, &settings.database).await?;
     if core_schema_contract_is_current(&pool).await? {
+        ensure_workspace_claim_activity_columns(&pool, &settings.database).await?;
         verify_core_schema_catalog(&pool, &settings.database).await?;
         verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
         verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
@@ -4262,6 +4457,9 @@ async fn ensure_core_schema_while_leased(
             workspace_identity VARCHAR(8192) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             branch_id VARCHAR(128) NOT NULL,
+            active_execution_id VARCHAR(128) NULL,
+            active_execution_generation BIGINT NULL,
+            active_execution_expires_at_ms BIGINT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (isolation_domain, owner_user_id, workspace_identity_hash),
             UNIQUE KEY uq_session_execution_workspace_claim_session
@@ -4272,6 +4470,11 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    // The activity lease is the canonical cross-process fact that a claimed
+    // checkout is currently executing.  Keep the migration explicit so a
+    // database created by an earlier binary cannot silently admit a transfer
+    // in the gap between turn admission and durable Run/slot publication.
+    ensure_workspace_claim_activity_columns(&pool, &settings.database).await?;
 
     core_schema_create!(
         pool,
@@ -4710,10 +4913,39 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "session_weighted_admission_owner_usage",
+        "CREATE TABLE IF NOT EXISTS session_weighted_admission_owner_usage (
+            scope_name VARCHAR(64) NOT NULL,
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
+            resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (scope_name, isolation_domain, owner_user_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Create the owner usage table before the gate row. If startup is
+    // interrupted before the gate DDL, the next run sees no gate and retries
+    // bootstrap; it cannot publish a gate that will fail the v81 preflight
+    // because its owner table is missing.
+    core_schema_create!(
+        pool,
         "session_weighted_admission_gates",
         "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
             scope_name VARCHAR(64) NOT NULL,
             capacity_hash CHAR(64) NULL,
+            usage_initialized TINYINT NOT NULL DEFAULT 0,
+            global_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            global_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            global_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            global_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            global_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (scope_name)
         )",

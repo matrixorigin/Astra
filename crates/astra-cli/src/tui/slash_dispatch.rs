@@ -38,6 +38,29 @@ pub(crate) struct WorkStartRequest {
     pub goal: String,
 }
 
+/// A Work can be the first action in a fresh TUI conversation. Ordinary chat
+/// input lazily creates the server Session, but requiring a meaningless
+/// message before `/work start` makes the explicit Work command fail on the
+/// state it is meant to create.
+async fn ensure_work_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    if let Some(session_id) = state
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    {
+        return Ok(session_id.to_owned());
+    }
+
+    let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| "Not logged in. Use /login.".to_string())?;
+    crate::cli::slash::slash_state::bind_initial_session(api, profile, &token, state).await
+}
+
 /// Session-lifecycle controls that must be honored before an input can enter
 /// the active-run intent ledger. These controls are phase-independent: a
 /// settling model turn must never reinterpret them as conversational input.
@@ -370,17 +393,17 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 SlashResult::Handled
             }
             WorkCommandRoute::Start(goal) => {
-                let Some(session_id) = ctx
-                    .state
-                    .session_id
-                    .as_deref()
-                    .filter(|session_id| !session_id.is_empty())
-                    .map(str::to_owned)
-                else {
-                    ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then start Work."
-                            .to_string(),
-                    );
+                let session_id = match ensure_work_session(ctx.api, ctx.profile, ctx.state).await {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        ctx.show_error(format!("Work could not start: {error}"));
+                        return SlashResult::Handled;
+                    }
+                };
+                if session_id.is_empty() {
+                    // Keep the command boundary safe if a future state
+                    // implementation ever returns an empty identity.
+                    ctx.show_error("Work could not start: session identity is empty".to_string());
                     return SlashResult::Handled;
                 };
                 ctx.show_response("Starting Work…".to_string());
@@ -2991,15 +3014,11 @@ pub(crate) fn session_hub_view(
         .as_deref()
         .filter(|owner| !owner.is_empty() && Some(*owner) != Some(snapshot.session_id.as_str()))
     {
-        if snapshot.session_id.is_empty() {
-            pairs.push(("recovery", format!("available via /resume {owner}")));
-        } else {
-            pairs.push((
-                "execution",
-                format!("not admitted · checkout belongs to Session {owner}"),
-            ));
-            pairs.push(("next", format!("/resume {owner}")));
-        }
+        // This is only an optional previous-session hint. A fresh Session is
+        // never considered blocked or redirected because another Session was
+        // used in the same checkout; the server admission fence reports an
+        // active conflict only when it is actually live.
+        pairs.push(("previous", format!("available via /resume {owner}")));
     }
     if let Some(error) =
         session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())
@@ -4322,6 +4341,75 @@ mod model_catalog_loading_tests {
                 .and_then(|profile| profile.access_token.as_deref()),
             Some("valid-access")
         );
+    }
+}
+
+#[cfg(test)]
+mod work_start_session_tests {
+    use super::ensure_work_session;
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+    use crate::cli::session::session_state::SessionState;
+    use crate::test_utils::ProcessEnvGuard;
+    use crate::tests::{isolate_credentials, isolated_sessions_dir};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn save_profile(access_token: &str) {
+        let mut credentials = CredentialsFile {
+            current_profile: Some("default".into()),
+            ..Default::default()
+        };
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("user-id-1".into()),
+                access_token: Some(access_token.into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).expect("save isolated credentials");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn work_start_bootstraps_a_fresh_session_before_binding_work() {
+        let (_sessions, _session_guard) = isolated_sessions_dir();
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("work-access");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .and(header("authorization", "Bearer work-access"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": "fresh-work-session"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let mut state = SessionState::default();
+        let session_id = ensure_work_session(&api, None, &mut state)
+            .await
+            .expect("fresh Work should create its Session");
+
+        assert_eq!(session_id, "fresh-work-session");
+        assert_eq!(state.session_id.as_deref(), Some("fresh-work-session"));
+    }
+
+    #[tokio::test]
+    async fn work_start_reuses_the_current_session_without_touching_auth_or_transport() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id("existing-work-session");
+
+        let session_id = ensure_work_session(&api, None, &mut state)
+            .await
+            .expect("existing Session should be reused");
+
+        assert_eq!(session_id, "existing-work-session");
     }
 }
 

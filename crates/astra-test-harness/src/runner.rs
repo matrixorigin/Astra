@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::case::Case;
+use crate::workspace::SourceSnapshot;
 
 pub(crate) const PROTOCOL_ERROR_MARKER: &str = "[astra-test:protocol-error]";
 
@@ -179,9 +180,14 @@ pub struct RunnerConfig {
     /// Models to run each case against when the case's `models:`
     /// field is empty. CLI `--models` provides this.
     pub fallback_models: Vec<String>,
-    /// Optional shared working directory — harness runs from here
-    /// so relative paths in cases (if ever added) are stable.
+    /// Optional shared working directory — harness runs from here so
+    /// relative paths in cases (if ever added) are stable. An explicit value
+    /// is an intentional shared-workspace choice.
     pub working_dir: Option<PathBuf>,
+    /// Immutable source snapshot used for per-job temporary worktrees. The
+    /// CLI captures this once at suite admission; library callers retain the
+    /// current-directory behavior by default.
+    pub workspace_source: Option<SourceSnapshot>,
     /// Optional profile name passed as `--profile <name>` to astra
     /// subprocesses. Set by preflight auto-register to isolate
     /// harness credentials from the user's active profile.
@@ -212,6 +218,7 @@ impl RunnerConfig {
             astra_bin: astra_bin.into(),
             fallback_models: Vec::new(),
             working_dir: None,
+            workspace_source: None,
             profile: None,
             artifact_owner_scopes: Vec::new(),
             require_session_subsystem_health: false,
@@ -222,6 +229,11 @@ impl RunnerConfig {
     }
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {
         self.fallback_models = models;
+        self
+    }
+
+    pub fn with_workspace_source(mut self, source: SourceSnapshot) -> Self {
+        self.workspace_source = Some(source);
         self
     }
 

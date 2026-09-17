@@ -59,6 +59,13 @@ import {
 } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
 import { PATH_EDGES_STATUS } from "@astra/sdk";
+import workspaceBindingContract from "../../../fixtures/contracts/workspace_binding_request.json";
+
+// Independent server fixture: this intentionally does not import the SDK
+// constant, so a stale Web major cannot make the route tests self-consistent.
+const SERVER_INTERACTION_API_MAJOR_HEADER =
+  "x-astra-agent-interaction-api-major";
+const SERVER_INTERACTION_API_MAJOR = "3";
 
 const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
 const mockGetChat = vi.mocked(getChat);
@@ -89,7 +96,9 @@ function makeBackendStream() {
   );
 
   return {
-    headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+    headers: new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+    }),
     body: {
       getReader: () => ({
         read,
@@ -110,7 +119,9 @@ function makeBackendFrameStream(frames: string[]) {
   const cancel = vi.fn();
 
   return {
-    headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+    headers: new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+    }),
     body: {
       getReader: () => ({
         async read() {
@@ -312,6 +323,56 @@ describe("chat stream route proxy cancellation", () => {
     const body = await response.text();
     expect(body).toContain("RUNTIME_PROTOCOL_MISMATCH");
     expect(body).toContain("missing the interaction protocol contract");
+    expect(runtime.fetchResponse.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
+    expect(backend.body.getReader().read).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
+  it("rejects a server interaction major from the previous contract", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    backend.headers = new Headers({
+      [SERVER_INTERACTION_API_MAJOR_HEADER]: "1",
+    });
+    const runtime = {
+      sdk: {
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        headers: backend.headers,
+        body: backend.body,
+      }),
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "hello",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const body = await response.text();
+    expect(body).toContain("RUNTIME_PROTOCOL_MISMATCH");
+    expect(body).toContain(
+      "Astra Server interaction protocol 1 is incompatible with Web 3",
+    );
     expect(runtime.fetchResponse.mock.calls[0]?.[1]?.signal.aborted).toBe(true);
     expect(backend.body.getReader().read).not.toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
@@ -926,7 +987,9 @@ describe("chat stream route proxy cancellation", () => {
     expect(signal?.aborted).toBe(true);
     resolveFetch({
       ok: true,
-      headers: new Headers({ "x-astra-agent-interaction-api-major": "1" }),
+      headers: new Headers({
+        [SERVER_INTERACTION_API_MAJOR_HEADER]: SERVER_INTERACTION_API_MAJOR,
+      }),
       body: makeBackendStream().body,
     });
   });
@@ -966,12 +1029,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "none",
-          display_name: "Web",
-          authority: "none",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.none,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-control-plane",
@@ -1047,12 +1105,7 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
-        workspace_binding: {
-          kind: "server_sandbox",
-          display_name: "Server sandbox",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.server_sandbox,
         executor_binding: {
           kind: "server_local",
           executor_id: "server-local",
@@ -1155,13 +1208,7 @@ describe("chat stream route proxy cancellation", () => {
         attachments: [],
         model_selection: { offering_id: "model-backend" },
         enabled_tools: ["github", "web_fetch", "web_search"],
-        workspace_binding: {
-          kind: "edge_workspace",
-          display_name: "MacBook Pro",
-          cwd: "/Users/test/astra",
-          authority: "read_write",
-          fallback_policy: "disabled",
-        },
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: {
           kind: "edge_agent",
           executor_id: "edge-1",
@@ -1453,10 +1500,7 @@ describe("chat stream route proxy cancellation", () => {
         parts: [],
         attachments: [],
         model_selection: { offering_id: "model-backend" },
-        workspace_binding: expect.objectContaining({
-          kind: "edge_workspace",
-          cwd: "/Users/test/astra",
-        }),
+        workspace_binding: workspaceBindingContract.edge_workspace,
         executor_binding: expect.objectContaining({
           kind: "edge_agent",
           executor_id: "edge-1",

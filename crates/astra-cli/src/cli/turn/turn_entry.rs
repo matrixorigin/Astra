@@ -295,6 +295,12 @@ pub(crate) async fn handle_chat_input_with_ui(
     let session_id =
         ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
 
+    // Typing an ordinary message is an explicit choice to keep working in the
+    // current Session. Clear the optional startup hint before admission so a
+    // local writer conflict cannot leave `/session` pointing at an old
+    // resumable Session after this input has already been submitted.
+    crate::cli::session::session_input::clear_pending_recovery_for_ordinary_chat_input(state);
+
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
@@ -484,9 +490,12 @@ pub(super) fn acquire_interactive_turn_admission(
     let lease = match SessionExecutionLease::try_acquire(&session_id) {
         Ok(lease) => lease,
         Err(SessionExecutionLeaseError::Conflict { .. }) => {
-            return Err(format!(
-                "session `{session_id}` already has an active execution"
-            ));
+            return Err(
+                "Session is busy\nAnother local client is currently using this same Session.\n\
+                 Request was not admitted.\nNo model or tool ran.\nPress Ctrl+R to restore the \
+                 submitted input, then retry when it finishes.\nOpen a new Session for independent work."
+                    .to_string(),
+            );
         }
         Err(error @ SessionExecutionLeaseError::Io { .. }) => {
             return Err(error.to_string());
@@ -716,6 +725,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         state.set_session_id(session_id.clone());
+        state.pending_recovery = Some("stale-session-hint".to_string());
         state.model = Some("mock-model".to_string());
         let ctx = TurnContext {
             api: &api,
@@ -735,7 +745,14 @@ mod tests {
         .await
         .expect_err("the interactive contender must lose admission");
 
-        assert!(error.contains("already has an active execution"), "{error}");
+        assert!(error.contains("Session is busy"), "{error}");
+        assert!(error.contains("same Session"), "{error}");
+        assert!(error.contains("No model or tool ran"), "{error}");
+        assert!(error.contains("Ctrl+R"), "{error}");
+        assert!(
+            state.pending_recovery.is_none(),
+            "submitted ordinary input must clear the stale startup recovery hint"
+        );
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             0,

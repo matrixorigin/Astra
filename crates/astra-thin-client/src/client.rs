@@ -1052,6 +1052,96 @@ impl ThinClient {
         Ok(targets)
     }
 
+    /// Read the owner-scoped, server-authored recovery points for one Work
+    /// branch. The response includes the same derived coverage explanation
+    /// used by Web and TUI.
+    pub async fn get_work_branch_recovery_points(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+    ) -> Result<astra_server_types::WorkRecoveryPointListResponseV1, ThinClientError> {
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?);
+        let response = response.send().await?;
+        let points: astra_server_types::WorkRecoveryPointListResponseV1 =
+            Self::typed_json_or_error(response).await?;
+        if points.work_id != work_id || points.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Work recovery-point identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        Ok(points)
+    }
+
+    /// Ask the server to capture a safe-boundary recovery point. The request
+    /// is intentionally small: the server owns the manifest and assessment.
+    pub async fn post_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &astra_server_types::WorkRecoveryPointCreateRequestV1,
+    ) -> Result<astra_server_types::WorkRecoveryPointResponseV1, ThinClientError> {
+        let path = paths::work_branch_recovery_points(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid Work branch identity".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        let point: astra_server_types::WorkRecoveryPointResponseV1 =
+            Self::typed_json_or_error(response).await?;
+        if point.0.work_id != work_id || point.0.branch_id != branch_id {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Work recovery-point identity disagrees with the requested branch",
+                ),
+            ));
+        }
+        Ok(point)
+    }
+
+    pub async fn get_work_branch_recovery_point(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        recovery_point_id: &str,
+    ) -> Result<astra_server_types::WorkRecoveryPointResponseV1, ThinClientError> {
+        let path = paths::work_branch_recovery_point(work_id, branch_id, recovery_point_id)
+            .ok_or_else(|| {
+                ThinClientError::InvalidInput("invalid recovery point identity".into())
+            })?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        let point: astra_server_types::WorkRecoveryPointResponseV1 =
+            Self::typed_json_or_error(response).await?;
+        if point.0.work_id != work_id
+            || point.0.branch_id != branch_id
+            || point.0.recovery_point_id != recovery_point_id
+        {
+            return Err(ThinClientError::Json(
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Work recovery-point identity disagrees with the requested point",
+                ),
+            ));
+        }
+        Ok(point)
+    }
+
     /// Resolve one already-known session to the public Work branch that owns
     /// it. A session that is not Work-backed is a typed 404, never an empty or
     /// guessed binding.

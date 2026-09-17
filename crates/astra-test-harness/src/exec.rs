@@ -37,11 +37,29 @@ use crate::session_identity::{
 pub trait CaseExecutor: Send + Sync {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome;
 
+    /// Execute using the runner configuration for this root job. The default
+    /// keeps custom in-process executors source-compatible; the CLI and
+    /// external command implementations override it so each job can receive
+    /// its own isolated working directory.
+    async fn execute_with_config(
+        &self,
+        _cfg: &RunnerConfig,
+        case: &Case,
+        model: &str,
+    ) -> RunOutcome {
+        self.execute(case, model).await
+    }
+
     /// Shell command a developer can paste to reproduce this run.
     /// Default returns an empty string — CLI impl overrides this to
     /// improve FAIL reports.
     fn reproducer(&self, _case: &Case, _model: &str) -> String {
         String::new()
+    }
+
+    /// Reproducer using the root job's runner configuration.
+    fn reproducer_with_config(&self, _cfg: &RunnerConfig, case: &Case, model: &str) -> String {
+        self.reproducer(case, model)
     }
 }
 
@@ -124,32 +142,49 @@ impl CaseExecutor for AstraCliExecutor {
         run_case_subprocess(&self.cfg, case, model).await
     }
 
-    fn reproducer(&self, case: &Case, model: &str) -> String {
-        // Mirrors the args assembled below. Quote the prompt so it
-        // survives a copy-paste.
-        let has_session_id_in_extras = has_session_id(&case.extra_cli_args);
-        let mut parts = vec![
-            shell_escape(self.cfg.astra_bin.display().to_string()),
-            "chat".into(),
-            "-m".into(),
-            shell_escape(case.prompt.clone()),
-        ];
-        if !has_session_id_in_extras {
-            parts.push("--no-resume".into());
-        }
-        parts.extend([
-            "--model".into(),
-            shell_escape(model.to_string()),
-            "--json".into(),
-            "--stream-events".into(),
-            "\"$(mktemp -d)/events.jsonl\"".into(),
-            "-y".into(),
-        ]);
-        for extra in &case.extra_cli_args {
-            parts.push(shell_escape(extra.clone()));
-        }
-        parts.join(" ")
+    async fn execute_with_config(
+        &self,
+        cfg: &RunnerConfig,
+        case: &Case,
+        model: &str,
+    ) -> RunOutcome {
+        run_case_subprocess(cfg, case, model).await
     }
+
+    fn reproducer(&self, case: &Case, model: &str) -> String {
+        format_reproducer(&self.cfg, case, model)
+    }
+
+    fn reproducer_with_config(&self, cfg: &RunnerConfig, case: &Case, model: &str) -> String {
+        format_reproducer(cfg, case, model)
+    }
+}
+
+fn format_reproducer(cfg: &RunnerConfig, case: &Case, model: &str) -> String {
+    // Mirrors the args assembled below. Quote the prompt so it
+    // survives a copy-paste.
+    let has_session_id_in_extras = has_session_id(&case.extra_cli_args);
+    let mut parts = vec![
+        shell_escape(cfg.astra_bin.display().to_string()),
+        "chat".into(),
+        "-m".into(),
+        shell_escape(case.prompt.clone()),
+    ];
+    if !has_session_id_in_extras {
+        parts.push("--no-resume".into());
+    }
+    parts.extend([
+        "--model".into(),
+        shell_escape(model.to_string()),
+        "--json".into(),
+        "--stream-events".into(),
+        "\"$(mktemp -d)/events.jsonl\"".into(),
+        "-y".into(),
+    ]);
+    for extra in &case.extra_cli_args {
+        parts.push(shell_escape(extra.clone()));
+    }
+    parts.join(" ")
 }
 
 fn shell_escape(s: String) -> String {
@@ -805,11 +840,13 @@ impl ExternalCmdExecutor {
             timeout_seconds,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl CaseExecutor for ExternalCmdExecutor {
-    async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+    async fn execute_internal(
+        &self,
+        case: &Case,
+        model: &str,
+        working_dir: Option<&std::path::Path>,
+    ) -> RunOutcome {
         use tokio::process::Command;
 
         let input = serde_json::json!({
@@ -840,14 +877,18 @@ impl CaseExecutor for ExternalCmdExecutor {
         }
 
         let start = std::time::Instant::now();
-        let child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&self.cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .kill_on_drop(true);
+        if let Some(working_dir) = working_dir {
+            command.current_dir(working_dir);
+        }
+        let child = command.spawn();
 
         let mut child = match child {
             Ok(c) => c,
@@ -903,6 +944,23 @@ impl CaseExecutor for ExternalCmdExecutor {
         }
         out.duration_ms = start.elapsed().as_millis() as u64;
         out
+    }
+}
+
+#[async_trait::async_trait]
+impl CaseExecutor for ExternalCmdExecutor {
+    async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+        self.execute_internal(case, model, None).await
+    }
+
+    async fn execute_with_config(
+        &self,
+        cfg: &RunnerConfig,
+        case: &Case,
+        model: &str,
+    ) -> RunOutcome {
+        self.execute_internal(case, model, cfg.working_dir.as_deref())
+            .await
     }
 
     fn reproducer(&self, case: &Case, model: &str) -> String {

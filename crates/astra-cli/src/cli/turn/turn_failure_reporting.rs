@@ -53,42 +53,70 @@ pub(crate) async fn reconcile_and_report_turn_failure(
 /// Render a server admission rejection without pretending that a model turn
 /// or durable Run existed. The HTTP request reached the server, but admission
 /// stopped it before any model or tool work ran. Keep the newly-created Session
-/// attached and make recovery explicit; never silently restore another Session.
+/// attached; never silently restore or redirect it to another Session.
 pub(crate) fn report_admission_rejection(
     state: &mut SessionState,
     failure: &crate::TurnFailure,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
+    // Admission rejection belongs to the newly opened Session. Any stale
+    // recovery pointer inherited by the process must not turn a second local
+    // Session into an implicit /resume of the old owner.
+    state.pending_recovery = None;
     let metadata = failure.partial.error_metadata.as_ref();
-    if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
-        let owner = metadata
-            .and_then(|value| value.get("owner_session_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        // Keep the newly-created Session attached. It is a real, empty
-        // Session whose execution has not been admitted; clearing only the
-        // local identity would leave the remote row and long-lived producers
-        // out of sync. The owner is retained as an explicit recovery target
-        // for `/session` and `/resume`, never auto-restored.
-        if state.turn == 0
-            && state.history.is_empty()
-            && let Some(owner) = owner
-        {
-            state.pending_recovery = Some(owner.to_string());
+    match failure.partial.error_code.as_deref() {
+        Some("execution_workspace_claimed") => {
+            let owner = metadata
+                .and_then(|value| value.get("owner_session_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            let mut message = String::from("Workspace is busy\n");
+            if let Some(owner) = owner {
+                message.push_str(&format!(
+                    "  Session {owner} is actively using this checkout.\n"
+                ));
+                message.push_str(
+                    "  Your new Session is still open; wait for that run to finish, or choose another worktree.\n",
+                );
+            } else {
+                message.push_str(
+                    "  Another active execution is using this checkout; wait for it to finish, or choose another worktree.\n",
+                );
+            }
+            message.push_str(
+                "  Request was not admitted; no model or tool ran.\n  Press Ctrl+R to restore the submitted input, then retry when the checkout is available.",
+            );
+            ui.show_error(&message);
+            return;
         }
-        let mut message = String::from("Workspace unavailable\n");
-        if let Some(owner) = owner {
-            message.push_str(&format!("  Session {owner} owns this checkout.\n"));
-            message.push_str(&format!("  Resume it explicitly with: /resume {owner}\n"));
+        Some("session_writer_conflict") => {
+            ui.show_error(
+                "Session is busy\n  Another client is currently using this same Session.\n  Request was not admitted; no model or tool ran.\n  Press Ctrl+R to restore the submitted input, then retry when it finishes. Open a new Session for independent work.",
+            );
+            return;
         }
-        message.push_str(
-            "  Request was not admitted; no model or tool ran.\n  Use another worktree, or retry this new Session after the checkout is available.",
-        );
-        ui.show_error(&message);
-        return;
+        Some("execution_workspace_claim_lost") => {
+            ui.show_error(
+                "Execution changed while this turn was starting\n  Request was not admitted; no model or tool ran.\n  Press Ctrl+R to restore the submitted input, then retry, or choose another worktree if the checkout is busy.",
+            );
+            return;
+        }
+        Some("conversation_cursor_conflict") => {
+            ui.show_error(
+                "Session changed in another client\n  Request was not admitted; no model or tool ran.\n  Press Ctrl+R to restore the submitted input, then retry with the latest Session state.",
+            );
+            return;
+        }
+        Some("conversation_authority_fenced") => {
+            ui.show_error(
+                "Session authority changed in another client\n  Request was not admitted; no model or tool ran.\n  Press Ctrl+R to restore the submitted input, then refresh the Session and retry.",
+            );
+            return;
+        }
+        _ => {}
     }
     ui.show_error(
-        "Session execution is busy\n  Request was not admitted; no model or tool ran.\n  Retry this new Session after the current operation finishes, then send the same input again.",
+        "Session execution is unavailable\n  Request was not admitted; no model or tool ran.\n  Retry the same input after the current operation finishes.",
     );
 }
 
@@ -761,7 +789,10 @@ mod tests {
         );
         crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
 
-        let mut state = SessionState::default();
+        let mut state = SessionState {
+            pending_recovery: Some("previous-session".into()),
+            ..SessionState::default()
+        };
         let failure = crate::TurnFailure {
             error: "workspace is busy".into(),
             partial: crate::PartialTurnData {
@@ -779,6 +810,10 @@ mod tests {
 
         report_admission_rejection(&mut state, &failure, &mut ui);
 
+        assert!(
+            state.pending_recovery.is_none(),
+            "a rejected draft must clear a stale in-process recovery hint"
+        );
         assert_eq!(
             crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
                 .last_session_id
@@ -786,6 +821,108 @@ mod tests {
             Some("previous-session"),
             "a rejected draft must never replace the last resumable session"
         );
+    }
+
+    #[test]
+    fn admission_rejection_explains_same_session_writer_conflict() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "same Session is busy".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_writer_conflict".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "retry_session_or_open_new"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, &failure, &mut ui);
+
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("Another client"));
+        assert!(ui.errors[0].contains("same Session"));
+        assert!(ui.errors[0].contains("no model or tool ran"));
+        assert!(ui.errors[0].contains("Ctrl+R"));
+        assert!(!ui.errors[0].contains("new Session is still open"));
+    }
+
+    #[test]
+    fn admission_rejection_explains_claim_lost_before_side_effects() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "workspace changed".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("execution_workspace_claim_lost".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "retry_or_choose_workspace"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, &failure, &mut ui);
+
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("changed while this turn was starting"));
+        assert!(ui.errors[0].contains("no model or tool ran"));
+        assert!(ui.errors[0].contains("choose another worktree"));
+    }
+
+    #[test]
+    fn admission_rejection_explains_cursor_refresh_without_calling_it_a_busy_session() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "cursor changed".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("conversation_cursor_conflict".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "refresh_and_retry"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, &failure, &mut ui);
+
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("changed in another client"));
+        assert!(ui.errors[0].contains("latest Session state"));
+        assert!(!ui.errors[0].contains("already active"));
+    }
+
+    #[test]
+    fn admission_rejection_explains_fenced_authority_as_a_refresh() {
+        let mut state = SessionState::default();
+        let failure = crate::TurnFailure {
+            error: "authority changed".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("conversation_authority_fenced".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "refresh_and_retry"
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        report_admission_rejection(&mut state, &failure, &mut ui);
+
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("authority changed"));
+        assert!(ui.errors[0].contains("refresh the Session"));
+        assert!(ui.errors[0].contains("no model or tool ran"));
     }
 
     #[test]

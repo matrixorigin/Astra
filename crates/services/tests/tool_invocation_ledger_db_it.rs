@@ -527,8 +527,10 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         )
         .await
         .unwrap();
-    assert_eq!(compacted.archived_records, 6);
-    assert_eq!(compacted.remaining_records, 0);
+    // Resolved rows are compacted, while the two outcome-unknown rows stay
+    // hot as the canonical safety fence for recovery publication.
+    assert_eq!(compacted.archived_records, 4);
+    assert_eq!(compacted.remaining_records, 2);
     assert!(compacted.artifact_id.is_some());
     let archived_diagnostics = ledger
         .lifecycle_diagnostics(
@@ -538,7 +540,8 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         )
         .await
         .unwrap();
-    assert_eq!(archived_diagnostics.hot_total, 0);
+    assert_eq!(archived_diagnostics.hot_total, 2);
+    assert_eq!(archived_diagnostics.outcome_unknown, 2);
     assert_eq!(archived_diagnostics.archive_chunks, 1);
     assert_eq!(archived_diagnostics.durable_artifact_references, 2);
     let result_reference: (String, String) = sqlx::query_as(
@@ -573,7 +576,7 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(hot_rows, 0);
+    assert_eq!(hot_rows, 2);
     for (identity, expected) in identities.iter().zip(&expected) {
         assert_eq!(ledger.get(identity).await.unwrap().as_ref(), Some(expected));
         assert!(matches!(
@@ -603,6 +606,7 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         .await
         .unwrap();
     assert_eq!(replay.archived_records, 0);
+    assert_eq!(replay.remaining_records, 2);
     assert_eq!(replay.artifact_id, None);
     let stale = identity(&prefix, "stale-after-compaction");
     assert!(matches!(

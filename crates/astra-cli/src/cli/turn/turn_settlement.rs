@@ -227,11 +227,15 @@ mod tests {
 
         assert_eq!(state.turn, 0);
         assert_eq!(state.session_id.as_deref(), Some("session-current"));
-        assert_eq!(state.pending_recovery.as_deref(), Some("session-owner"));
+        assert!(
+            state.pending_recovery.is_none(),
+            "a new Session must not be redirected to the previous owner"
+        );
         assert!(state.last_turn_event.is_none());
         assert_eq!(ui.errors.len(), 1);
-        assert!(ui.errors[0].contains("Workspace unavailable"));
-        assert!(ui.errors[0].contains("/resume session-owner"));
+        assert!(ui.errors[0].contains("Workspace is busy"));
+        assert!(ui.errors[0].contains("actively using this checkout"));
+        assert!(!ui.errors[0].contains("/resume"));
         assert!(ui.errors[0].contains("no model or tool ran"));
     }
 }

@@ -43,6 +43,8 @@ pub enum WorkConflictResource {
     WorkEventIdentity,
     WorkAttentionReceipt,
     WorkProposalIdentity,
+    RecoveryPointIdentity,
+    RecoveryPointRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +103,8 @@ pub enum WorkRepositoryError {
     SessionNotBindable,
     #[error("the existing session has an active run")]
     SessionBusy,
+    #[error("Work recovery point is unavailable at the requested boundary: {code}")]
+    RecoveryPointUnavailable { code: &'static str },
     #[error("canonical Work identity conflict: {resource:?}")]
     Conflict { resource: WorkConflictResource },
     #[error("corrupt persisted {entity}: {source}")]

@@ -10019,7 +10019,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     );
     assert_eq!(
         same_session.1.0.detail,
-        "another controller owns this canonical session branch"
+        "This Session is already active in another client; wait for it to finish, then retry the same input, or open a new Session for independent work"
     );
     assert_eq!(
         llm.requests.load(Ordering::SeqCst),
@@ -14018,6 +14018,7 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
 fn workspace_binding_request_rejects_cwd_alias_and_unknown_fields() {
     for (field, value) in [
         ("cwd", json!("/Users/test/repo")),
+        ("fallback_policy", json!("disabled")),
         ("unexpected", json!(true)),
     ] {
         let mut payload = json!({
@@ -14034,6 +14035,27 @@ fn workspace_binding_request_rejects_cwd_alias_and_unknown_fields() {
             serde_json::from_value::<astra_services::runs::WorkspaceBindingRequest>(payload)
                 .expect_err("workspace binding compatibility fields must fail closed");
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+}
+
+#[test]
+fn workspace_binding_request_fixture_matches_canonical_server_schema() {
+    let fixture: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/contracts/workspace_binding_request.json"
+        )))
+        .expect("workspace binding request fixture must be valid JSON");
+
+    for name in ["none", "server_sandbox", "edge_workspace"] {
+        let binding = fixture
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture is missing {name} binding"));
+        serde_json::from_value::<astra_services::runs::WorkspaceBindingRequest>(binding)
+            .unwrap_or_else(|error| {
+                panic!("fixture binding {name} must match request schema: {error}")
+            });
     }
 }
 

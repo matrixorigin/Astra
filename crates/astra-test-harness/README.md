@@ -90,6 +90,27 @@ therefore does not manufacture compaction pressure; compaction mechanics and
     --runs 3 --parallel 2
 ```
 
+### Workspace isolation
+
+When `--working-dir` is omitted and the suite is inside a clean Git checkout,
+the harness captures the repository's commit ID once, then gives every root
+execution job its own temporary detached worktree from that exact snapshot,
+reusing that worktree for the job's follow-up turns, and removes it after the
+job. A later clean commit in the source checkout does not change the run.
+This keeps a live TUI session and parallel harness jobs from claiming the same
+physical workspace. The source must be clean so the agent's workspace comes
+from one committed source snapshot; the selected `--astra-bin` is resolved
+independently. Otherwise the run fails with an instruction to commit or pass
+an explicit `--working-dir <DIR>`.
+An explicit directory is a deliberate shared-workspace choice and is also the
+path for non-Git suites.
+
+The live dashboard adds `session_lifecycle` to each report row. `archived`
+means the created session was deleted after its journal was captured;
+`cleanup_error` means retention is unknown; `retained` is used when the run
+did not own the session. Archived identities are evidence handles, not resume
+handles.
+
 ### `--astra-bin` resolution
 
 The harness auto-detects the astra binary in this order:

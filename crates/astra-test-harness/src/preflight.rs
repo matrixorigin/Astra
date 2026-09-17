@@ -28,6 +28,8 @@ pub enum PreflightError {
     AuthFailed { detail: String },
     #[error("model `{model}` unavailable: {detail}")]
     ModelUnavailable { model: String, detail: String },
+    #[error("could not create an isolated preflight workspace: {detail}")]
+    ProbeWorkspaceUnavailable { detail: String },
 }
 
 const OWNER_READINESS_PROBE_USER: &str = "astra-owner-readiness-probe";
@@ -157,9 +159,26 @@ pub async fn run_preflight(
     if require_memoria {
         check_memoria_readiness(&readiness).await?;
     }
+    // A model probe is a real `astra chat` invocation. Running it from the
+    // caller's checkout can therefore acquire that checkout's physical
+    // workspace claim, even with `--no-resume`. This made a healthy harness
+    // fail merely because an interactive TUI happened to be open in the same
+    // directory. Probe from an empty, disposable directory so readiness is
+    // about the server/model contract and never mutates or contends with a
+    // user's workspace.
+    let probe_workspace =
+        tempfile::tempdir().map_err(|error| PreflightError::ProbeWorkspaceUnavailable {
+            detail: error.to_string(),
+        })?;
     let mut effective_profile = requested_profile.map(str::to_string);
     for model in models {
-        effective_profile = check_model(astra_bin, model, effective_profile.as_deref()).await?;
+        effective_profile = check_model(
+            astra_bin,
+            model,
+            effective_profile.as_deref(),
+            probe_workspace.path(),
+        )
+        .await?;
     }
     Ok(effective_profile)
 }
@@ -365,6 +384,7 @@ async fn check_model(
     astra_bin: &Path,
     model: &str,
     profile: Option<&str>,
+    probe_workspace: &Path,
 ) -> Result<Option<String>, PreflightError> {
     let mut command = astra_command(astra_bin, profile);
     command.args([
@@ -382,6 +402,7 @@ async fn check_model(
         command
             .env("NO_PROXY", "localhost,127.0.0.1")
             .env("no_proxy", "localhost,127.0.0.1")
+            .current_dir(probe_workspace)
             .output(),
     )
     .await;
@@ -418,7 +439,7 @@ async fn check_model(
         eprintln!(
             "[astra-test] preflight: auth failed, attempting auto-register in profile `{auto_profile}`..."
         );
-        match try_auto_register(astra_bin, auto_profile).await {
+        match try_auto_register(astra_bin, auto_profile, probe_workspace).await {
             Ok(()) => {
                 // Retry the model check after registration.
                 let mut retry_command = astra_command(astra_bin, Some(auto_profile));
@@ -437,6 +458,7 @@ async fn check_model(
                     retry_command
                         .env("NO_PROXY", "localhost,127.0.0.1")
                         .env("no_proxy", "localhost,127.0.0.1")
+                        .current_dir(probe_workspace)
                         .output(),
                 )
                 .await;
@@ -555,7 +577,11 @@ async fn check_model(
 /// Try to register a test user via `astra admin` and login via astra CLI.
 /// The CLI is the only owner of credential persistence; a successful login
 /// means the requested profile is ready for every subsequent subprocess.
-async fn try_auto_register(astra_bin: &Path, profile: &str) -> Result<(), String> {
+async fn try_auto_register(
+    astra_bin: &Path,
+    profile: &str,
+    probe_workspace: &Path,
+) -> Result<(), String> {
     if !astra_bin.exists() {
         return Err("astra binary disappeared before registration".to_string());
     }
@@ -573,6 +599,7 @@ async fn try_auto_register(astra_bin: &Path, profile: &str) -> Result<(), String
         ])
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1")
+        .current_dir(probe_workspace)
         .output()
         .await;
 
@@ -589,6 +616,7 @@ async fn try_auto_register(astra_bin: &Path, profile: &str) -> Result<(), String
         ])
         .env("NO_PROXY", "localhost,127.0.0.1")
         .env("no_proxy", "localhost,127.0.0.1")
+        .current_dir(probe_workspace)
         .output()
         .await;
 
@@ -809,7 +837,14 @@ mod tests {
 
     #[tokio::test]
     async fn model_check_spawn_failure() {
-        let result = check_model(Path::new("/nonexistent/astra"), "gpt-4", None).await;
+        let probe_workspace = tempfile::tempdir().unwrap();
+        let result = check_model(
+            Path::new("/nonexistent/astra"),
+            "gpt-4",
+            None,
+            probe_workspace.path(),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(PreflightError::ModelUnavailable { .. })
@@ -843,7 +878,7 @@ mod tests {
         )
         .unwrap();
 
-        let profile = check_model(&bin, "deepseek", Some("isolated-harness"))
+        let profile = check_model(&bin, "deepseek", Some("isolated-harness"), dir.path())
             .await
             .unwrap();
         assert_eq!(profile.as_deref(), Some("isolated-harness"));
@@ -989,7 +1024,9 @@ mod tests {
         )
         .unwrap();
 
-        try_auto_register(&bin, "isolated-harness").await.unwrap();
+        try_auto_register(&bin, "isolated-harness", dir.path())
+            .await
+            .unwrap();
 
         let calls = fs::read_to_string(log).unwrap();
         let lines: Vec<&str> = calls.lines().collect();

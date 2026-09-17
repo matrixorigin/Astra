@@ -57,7 +57,7 @@ async fn reset_scope(pool: &astra_core::SharedPool) {
         .expect("clear multi-server reservations");
     sqlx::query(
         "UPDATE session_weighted_admission_gates
-         SET capacity_hash = NULL
+         SET capacity_hash = NULL, usage_initialized = 0
          WHERE scope_name = ?",
     )
     .bind(ADMISSION_SCOPE)

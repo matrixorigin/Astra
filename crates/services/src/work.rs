@@ -55,6 +55,7 @@ mod proposal_acceptance_repository;
 mod proposal_identity;
 mod proposal_queue;
 mod proposal_repository;
+mod recovery_point;
 mod repository;
 mod runtime_event_outbox;
 mod subject;
@@ -211,6 +212,11 @@ pub use proposal::{
     WorkProposalSourceKind, WorkProposalStatus,
 };
 pub use proposal_identity::WorkProposalInvocationIdentity;
+pub use recovery_point::{
+    DatabaseWorkRecoveryPointRepository, NewServerWorkRecoveryPoint, NewWorkRecoveryPoint,
+    WORK_RECOVERY_POINT_SCHEMA_VERSION, WorkRecoveryPointQuery, WorkRecoveryPointRecord,
+    WorkRecoveryPointStatus,
+};
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
@@ -1331,6 +1337,44 @@ pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL: &str =
     )
 )";
 
+pub(crate) const WORK_RECOVERY_POINTS_CREATE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS work_recovery_points (
+    owner_id VARCHAR(128) NOT NULL,
+    work_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    recovery_point_id VARCHAR(128) NOT NULL,
+    request_id VARCHAR(256) NOT NULL,
+    request_hash CHAR(71) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    manifest_json LONGTEXT NULL,
+    manifest_hash CHAR(71) NULL,
+    failure_reason VARCHAR(1024) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    published_at DATETIME(6) NULL,
+    PRIMARY KEY (owner_id, work_id, recovery_point_id),
+    UNIQUE KEY uq_work_recovery_point_request (owner_id, work_id, request_id),
+    INDEX idx_work_recovery_points_branch_status (
+        owner_id, work_id, branch_id, status, created_at, recovery_point_id
+    ),
+    INDEX idx_work_recovery_points_owner_created (
+        owner_id, created_at, work_id, recovery_point_id
+    ),
+    CONSTRAINT chk_work_recovery_point_status CHECK (
+        status IN ('preparing', 'published', 'failed', 'aborted')
+    ),
+    CONSTRAINT chk_work_recovery_point_ready_shape CHECK (
+        (status = 'published'
+         AND manifest_json IS NOT NULL AND manifest_hash IS NOT NULL AND published_at IS NOT NULL
+         AND failure_reason IS NULL)
+        OR (status <> 'published' AND published_at IS NULL)
+    ),
+    CONSTRAINT chk_work_recovery_point_failure_shape CHECK (
+        (status = 'failed' AND failure_reason IS NOT NULL)
+        OR (status <> 'failed' AND failure_reason IS NULL)
+    )
+)";
+
 /// Canonical schema owned by the Work domain.
 ///
 /// Storage initialization consumes this manifest directly so adding a Work
@@ -1412,6 +1456,7 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         "work_runtime_event_outbox",
         WORK_RUNTIME_EVENT_OUTBOX_CREATE_SQL,
     ),
+    ("work_recovery_points", WORK_RECOVERY_POINTS_CREATE_SQL),
 ];
 
 pub(crate) use runtime_event_outbox::enqueue_root_run_terminal_event;
@@ -2092,6 +2137,7 @@ mod tests {
             "work_acceptance_decisions",
             "work_events",
             "work_attention_receipts",
+            "work_recovery_points",
         ] {
             assert!(
                 table_names.contains(required),

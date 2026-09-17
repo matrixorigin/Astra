@@ -261,6 +261,31 @@ fn enter_submits_selected_command() {
 }
 
 #[test]
+fn command_palette_reopens_for_the_next_command_after_submission() {
+    let mut bp = fresh();
+    type_string(&mut bp, "/work");
+
+    let action = bp.handle_key(special(KeyCode::Enter));
+    assert!(matches!(
+        action,
+        BottomPaneAction::SubmitInput(ref text) if text == "/work"
+    ));
+    assert!(!bp.slash_menu_is_open());
+    assert!(bp.composer.is_empty());
+
+    type_string(&mut bp, "/m");
+    assert!(
+        bp.slash_menu_is_open(),
+        "the next slash command should reopen the palette after /work completes"
+    );
+    assert!(
+        bp.slash_menu_names().iter().any(|name| name == "/model"),
+        "the /model command should be discoverable after /work; got {:?}",
+        bp.slash_menu_names()
+    );
+}
+
+#[test]
 fn enter_on_empty_matches_does_not_submit_garbage() {
     let mut bp = fresh();
     type_string(&mut bp, "/zzz_no_such_command");

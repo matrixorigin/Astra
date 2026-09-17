@@ -69,10 +69,15 @@ parallel state machine must not be introduced to make a scale test pass.
 
 ## Admission and failure behavior
 
-- A run waits only at the existing bounded local run-admission boundary; the
-  HTTP request must not hold a database connection while waiting for a provider.
+- A run waits only at the existing bounded admission boundary; the local
+  durable-gate queue, the database-pool acquire, and the cross-server gate
+  lock share one run admission deadline. The HTTP request must not hold a
+  database connection while waiting in the local queue.
 - A distributed capacity rejection is explicit and typed, with retryable HTTP
   semantics and metrics. It must not look like a provider failure.
+- If the admission deadline expires before the durable reservation can be
+  decided, the request returns an explicit retryable admission-timeout error;
+  cancelled local waiters leave no semaphore permit behind.
 - Cancellation releases local and durable admission promptly. TTL cleanup is a
   recovery path, not normal capacity accounting.
 - A database or provider outage preserves durable run state and exposes a
@@ -90,12 +95,23 @@ Every capacity change reports, per workload and per pod count:
 - durable event/control-plane QPS and end-to-end turn latency.
 
 The first implementation stage aligns local and durable admission configuration
-and records the configuration in the shared gate. The second stage aggregates
-active reservation usage inside the locked MatrixOne transaction and returns
-one exact decimal row. Rust parses the decimal totals as `u64` and rejects
-negative or out-of-range stored rows, so the optimization does not change the
-capacity invariant. This reduces result transfer and client materialization;
-it does not remove the serialized gate or claim a p95 improvement by itself.
+and records the configuration in the shared gate. The second stage keeps exact
+global and per-owner usage in the durable protocol: normal reserve and release
+mutate those counters in the same gate transaction, while expiry or an explicit
+session cleanup marks them dirty and the next admission rebuilds them from the
+reservation rows. Rust parses the decimal totals as `u64` and rejects negative
+or out-of-range stored rows, so the optimization does not change the capacity
+invariant. The rebuild is a repair path; the steady-state decision is O(1) in
+the number of active reservations.
+
+The local controller has one async admission permit because one durable scope
+has one gate row. Requests wait before acquiring a database connection, so a
+burst cannot consume the whole pool while queued behind that row. Renewals and
+releases use the same boundary. The durable gate remains the cross-server
+serialization point; it is therefore a measured throughput boundary for a
+deployment that raises the cluster budget high enough to admit every request.
+Scaling that case further requires a sharded or lease-based capacity protocol,
+not a larger SQL pool or an early rejection cache.
 
 The third stage adds a four-pool, 1000-attempt MatrixOne harness. It proves that
 independent server pools share the same durable global and owner budgets, keeps

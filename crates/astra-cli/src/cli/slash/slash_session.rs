@@ -5168,6 +5168,20 @@ fn materialize_prepared_session_history(
 
 async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHistory, String> {
     let restored_journal = session_runtime::restored_journal_state(session_id)?;
+    // The local journal is the recovery authority. Load it before the derived
+    // CSL projection so a stale/corrupt projection cannot prevent `/resume`
+    // from opening a session whose canonical conversation is intact. Do not
+    // treat a checkpoint/CSL fallback as authoritative here: only an exact
+    // canonical-journal continuation can justify bypassing a broken CSL.
+    let canonical_continuation = session_continuation::load_session_continuation_for_recovery(
+        session_id,
+    )
+    .filter(|continuation| {
+        matches!(
+            continuation.resume.source,
+            astra_turn_types::ResumeSourceV1::CanonicalJournal
+        )
+    });
     // Try CSL first — full-fidelity message history via CslManager.
     let base_dir = session_journal::local_owner_sessions_dir();
     let store = std::sync::Arc::new(
@@ -5183,16 +5197,77 @@ async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHist
         Ok(materialized) => {
             materialize_prepared_session_history(mgr, materialized, restored_journal, session_id)
         }
-        Err(e) => {
-            return Err(format!("load CSL state for session {session_id}: {e}"));
+        Err(error) if canonical_continuation.is_some() => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "CSL projection is corrupt during resume; quarantining and rebuilding from canonical journal"
+            );
+            let rebuilt =
+                match crate::cli::session::session_recovery::csl::quarantine_corrupt_csl_projection(
+                    session_id,
+                ) {
+                    Ok(Some(_)) => {
+                        if let Some(continuation) = canonical_continuation.as_ref() {
+                            match crate::cli::session::session_recovery::csl::rebuild_csl_from_canonical_continuation(
+                                session_id,
+                                continuation,
+                                &restored_journal.session.recent_tools,
+                            )
+                            .await
+                        {
+                            Ok(rebuilt) => Some(rebuilt),
+                            Err(rebuild_error) => {
+                                tracing::warn!(
+                                    session_id,
+                                    error = %rebuild_error,
+                                    "canonical resume succeeded but CSL rebuild remains pending"
+                                );
+                                None
+                            }
+                        }
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(quarantine_error) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %quarantine_error,
+                            "could not quarantine corrupt CSL projection during resume"
+                        );
+                        None
+                    }
+                };
+            if let Some((mut rebuilt_mgr, _)) = rebuilt {
+                let rebuilt_materialized = rebuilt_mgr.load().await.ok().flatten();
+                materialize_prepared_session_history(
+                    rebuilt_mgr,
+                    rebuilt_materialized,
+                    restored_journal.clone(),
+                    session_id,
+                )
+            } else {
+                // Do not retain a manager whose projection failed causal
+                // validation. Canonical history remains available even if
+                // the best-effort derived projection repair is pending.
+                materialize_prepared_session_history(
+                    mgr,
+                    None,
+                    restored_journal.clone(),
+                    session_id,
+                )
+            }
+        }
+        Err(error) => {
+            return Err(format!("load CSL state for session {session_id}: {error}"));
         }
     };
 
     // The canonical journal lane is authoritative even when the asynchronous
     // CSL projection has not caught up yet.
-    if let Some(continuation) =
-        session_continuation::load_session_continuation_for_recovery(session_id)
-    {
+    if let Some(continuation) = canonical_continuation {
         let canonical_history =
             session_continuation::history_pairs_from_messages(&continuation.messages);
         if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
@@ -7261,14 +7336,13 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_from_corrupt_csl_returns_error_instead_of_falling_back() {
+    async fn restore_from_corrupt_csl_without_canonical_journal_returns_error() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("corrupt-csl-{}", uuid::Uuid::new_v4());
         let store = astra_services::local_session_artifact_store();
         let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &session_id)
             .expect("owner-bound test session dir");
         std::fs::create_dir_all(&session_dir).unwrap();
-        write_local_resumable_session(&session_id, 2);
         std::fs::write(
             session_dir.join("conversation_log.jsonl"),
             "{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[]\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
@@ -7284,6 +7358,96 @@ mod resume_tests {
         assert!(
             state.history.is_empty(),
             "lossy journal fallback should not run"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn restore_from_corrupt_csl_uses_canonical_journal() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("corrupt-csl-journal-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        let owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, &session_id)
+                .unwrap();
+        let canonical_messages = vec![
+            serde_json::json!({"role": "user", "content": "recover this session"}),
+            serde_json::json!({"role": "assistant", "content": "from the journal"}),
+        ];
+        let prepared = active.prepare_commit(1, None, canonical_messages).unwrap();
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&session_id),
+                    1,
+                    Some("gpt-5"),
+                    "recover this session",
+                    "from the journal",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(prepared.commit),
+            )
+            .unwrap();
+
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &session_id)
+            .expect("owner-bound test session dir");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("conversation_log.jsonl"),
+            "not-json\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
+        )
+        .unwrap();
+
+        let mut state = SessionState::default();
+        restore_journal_history_if_available(&mut state, &session_id)
+            .await
+            .expect("canonical journal should bypass a broken CSL projection");
+
+        assert_eq!(
+            state.history,
+            vec![(
+                "recover this session".to_string(),
+                "from the journal".to_string()
+            )]
+        );
+        assert!(
+            state.csl_manager.is_some(),
+            "canonical resume should rebuild a usable CSL manager"
+        );
+        assert!(
+            session_dir.join("conversation_log.jsonl").exists(),
+            "canonical resume should leave a repaired CSL projection"
+        );
+        assert!(
+            std::fs::read_dir(&session_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("conversation_log.jsonl.corrupt-"))
+                }),
+            "the corrupt projection should remain available as quarantined evidence"
+        );
+        assert_eq!(
+            state
+                .active_conversation
+                .as_ref()
+                .expect("canonical active conversation")
+                .source(),
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal
         );
     }
 

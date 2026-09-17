@@ -69,6 +69,16 @@ pub struct ToolInvocationLifecycleDiagnostics {
     pub compaction_cursor_updated_at: Option<String>,
 }
 
+/// One unresolved invocation observed at a recovery publication boundary.
+/// The ledger remains the authority for whether an effect crossed the
+/// provider boundary; recovery only uses this bounded identity to fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryEffectFrontier {
+    pub run_id: String,
+    pub state: String,
+    pub identity_key: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ToolInvocationArchiveChunk {
     version: String,
@@ -200,6 +210,37 @@ impl DatabaseToolInvocationLedger {
             Some(row) => decode_record(&row, identity).map(Some),
             None => self.load_archived_record(identity).await,
         }
+    }
+
+    /// Lock and inspect one unresolved effect for a Session. Run admission
+    /// acquires the same session execution-slot fence before dispatching, so
+    /// this check cannot race a new prepared/dispatched row at publication.
+    pub(crate) async fn lock_recovery_effect_frontier(
+        tx: &mut Transaction<'_, MySql>,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<Option<RecoveryEffectFrontier>, sqlx::Error> {
+        sqlx::query(
+            "SELECT run_id, state, identity_key
+             FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ?
+               AND (state IN ('prepared', 'dispatched', 'outcome_unknown')
+                    OR dispatch_certainty = 'unknown')
+             ORDER BY updated_at ASC, run_id ASC, identity_key ASC
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|row| {
+            Ok(RecoveryEffectFrontier {
+                run_id: row.try_get("run_id")?,
+                state: row.try_get("state")?,
+                identity_key: row.try_get("identity_key")?,
+            })
+        })
+        .transpose()
     }
 
     /// Bounded, owner-scoped evidence for introspect/reflect. This is a
@@ -601,9 +642,12 @@ impl DatabaseToolInvocationLedger {
         })
     }
 
-    /// Move a bounded batch of a terminal run's invocation records from the
-    /// hot CAS table into one owner-scoped archive artifact. The artifact,
-    /// lookup range, durable reference, and hot-row deletion commit together.
+    /// Move a bounded batch of a terminal run's resolved invocation records
+    /// from the hot CAS table into one owner-scoped archive artifact. Rows
+    /// whose dispatch certainty is `unknown` stay hot until an explicit
+    /// resolution, because recovery publication must be able to lock and
+    /// inspect that uncertainty after compaction. The artifact, lookup range,
+    /// durable reference, and hot-row deletion commit together.
     pub async fn compact_terminal_run_batch(
         &self,
         user_id: &str,
@@ -643,6 +687,8 @@ impl DatabaseToolInvocationLedger {
                         AS dispatch_lease_expires_at_epoch_ms
              FROM tool_invocation_ledger
              WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state <> 'outcome_unknown'
+               AND dispatch_certainty <> 'unknown'
              ORDER BY identity_key
              LIMIT ? FOR UPDATE",
         )
@@ -653,10 +699,21 @@ impl DatabaseToolInvocationLedger {
         .fetch_all(&mut *tx)
         .await?;
         if rows.is_empty() {
+            let remaining_records: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(ToolInvocationCompactionOutcome {
                 archived_records: 0,
-                remaining_records: 0,
+                remaining_records: u64::try_from(remaining_records).map_err(|_| {
+                    ToolInvocationLedgerStoreError::InvalidCompactionCount(remaining_records)
+                })?,
                 artifact_id: None,
             });
         }

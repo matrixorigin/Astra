@@ -213,6 +213,11 @@ async fn load_compaction_candidates_after(
                WHERE ledger.user_id = ar.user_id
                  AND ledger.session_id = ar.session_id
                  AND ledger.run_id = ar.run_id
+                 AND (
+                     ledger.state IN ('prepared', 'dispatched')
+                     OR (ledger.state IN ('succeeded', 'failed', 'rejected')
+                         AND ledger.dispatch_certainty <> 'unknown')
+                 )
            )
            AND (
                ar.updated_at > ?
@@ -584,6 +589,132 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+    async fn unknown_only_terminal_run_is_not_reclaimed_by_compactor() {
+        let pool = online_pool().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("compaction-unknown-user-{suffix}");
+        let session_id = format!("compaction-unknown-session-{suffix}");
+        let run_id = format!("compaction-unknown-run-{suffix}");
+        let cursor_name = format!("compaction-unknown-cursor-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
+             VALUES (?, ?, 'compaction-test', 'unknown-only run', 'active', '{}', NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+              owner_pod_id, owner_lease_expires_at, run_generation)
+             VALUES (?, ?, ?, ?, ?, 'running', 'compactor-test-owner',
+                     TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        let ledger =
+            astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(pool.clone());
+        let decision = ToolInvocationDecision::new(&json!({"route": "server_local"})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "registry-v1").unwrap(),
+            &json!({"command": "unknown-only"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        let identity = ToolInvocationIdentity::new(
+            &user_id,
+            &session_id,
+            &run_id,
+            "turn-unknown-only",
+            "call-unknown-only",
+        )
+        .unwrap();
+        ledger
+            .prepare(&identity, &fingerprint, &decision)
+            .await
+            .unwrap();
+        ledger
+            .claim_dispatch(
+                &identity,
+                "unknown-only-worker",
+                90_000,
+                astra_services::tool_invocation_ledger::ToolInvocationDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    expected_owner_pod_id: "compactor-test-owner".to_string(),
+                    expected_execution_binding_generation: None,
+                },
+            )
+            .await
+            .unwrap();
+        ledger
+            .mark_outcome_unknown(&identity, "unknown-only-worker")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE agent_runs
+             SET status = 'completed', updated_at = TIMESTAMPADD(SECOND, 1, '2090-01-01 00:00:00')
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+            .bind(&cursor_name)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let (first, first_wrapped) = claim_compaction_candidates(&pool, &cursor_name, 10)
+            .await
+            .unwrap();
+        assert!(first.is_empty());
+        assert!(!first_wrapped);
+        let (second, second_wrapped) = claim_compaction_candidates(&pool, &cursor_name, 10)
+            .await
+            .unwrap();
+        assert!(second.is_empty());
+        assert!(!second_wrapped);
+
+        sqlx::query("DELETE FROM maintenance_sweep_cursors WHERE sweep_name = ?")
+            .bind(&cursor_name)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
             .bind(&user_id)
             .bind(&session_id)
             .execute(pool.get())

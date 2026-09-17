@@ -1,7 +1,7 @@
 //! Suite orchestration with parallel execution, circuit breaker,
 //! failure classification, and retry on rate-limit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -17,12 +17,13 @@ use crate::criteria::{
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
-use crate::model_profiles::{ModelReuseSupport, load_profiles};
+use crate::model_profiles::{ModelPromptCacheProfile, ModelReuseSupport, load_profiles};
 use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
 use crate::session_identity::delete_server_session;
 use crate::session_identity::is_valid_server_session_id;
+use crate::workspace::IsolatedWorkspace;
 
 fn attach_durable_judger_evidence(outcome: &mut RunOutcome, session: &SessionCapture) {
     if session.journal_tool_calls().is_empty() {
@@ -250,11 +251,43 @@ pub struct SuiteRunner<'a> {
 }
 
 impl<'a> SuiteRunner<'a> {
+    /// Resolve model capability metadata once at suite admission.
+    ///
+    /// Isolated jobs run from detached Git worktrees. Those worktrees contain
+    /// tracked source only, while `.models.yaml` is intentionally ignored so
+    /// provider/configuration metadata never becomes part of an evaluated
+    /// checkout. Keep the capability snapshot in the runner instead of
+    /// looking it up from each job's execution directory.
+    fn model_profiles_for_run(&self) -> HashMap<String, ModelPromptCacheProfile> {
+        match &self.runner_cfg.workspace_source {
+            Some(source) => load_profiles(Some(source.repository_root())),
+            None => load_profiles(self.runner_cfg.working_dir.as_deref()),
+        }
+    }
+
+    fn prepare_job_workspace(&self) -> Result<(RunnerConfig, Option<IsolatedWorkspace>), String> {
+        let mut cfg = self.runner_cfg.clone();
+        if cfg.working_dir.is_some() && cfg.workspace_source.is_some() {
+            return Err(
+                "runner configuration cannot set both working_dir and workspace_source; choose an explicit working directory or an isolated Git source snapshot"
+                    .into(),
+            );
+        }
+        let Some(source) = cfg.workspace_source.clone() else {
+            return Ok((cfg, None));
+        };
+        let workspace = IsolatedWorkspace::create(&source).map_err(|error| error.to_string())?;
+        cfg.working_dir = Some(workspace.path().to_path_buf());
+        cfg.workspace_source = None;
+        Ok((cfg, Some(workspace)))
+    }
+
     /// Run every (case × model) pair with concurrency control and circuit breaker.
     pub async fn run_all(&self, cases: &[Case]) -> SuiteReport {
         let wall_start = std::time::Instant::now();
         let started_at = chrono::Utc::now().to_rfc3339();
         let run_id = self.run_id.clone();
+        let model_profiles = Arc::new(self.model_profiles_for_run());
 
         // Build the work items: (case, model, run_index) triples.
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
@@ -368,8 +401,30 @@ impl<'a> SuiteRunner<'a> {
                         sequence: crate::dashboard::next_dashboard_event_sequence(),
                     });
                 }
+                let (job_cfg, _job_workspace) = match self.prepare_job_workspace() {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let report =
+                            self.workspace_failure_case_report(case, model, *run_index, &error);
+                        if let Some(ref tx) = self.dashboard_tx {
+                            let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                run_id: run_id.clone(),
+                                report: Arc::new(report.clone()),
+                                sequence: crate::dashboard::next_dashboard_event_sequence(),
+                            });
+                        }
+                        suite.runs.push(report);
+                        continue;
+                    }
+                };
                 let mut report = self
-                    .run_one_with_progress(case, model, &run_id, *run_index)
+                    .run_one_with_progress(
+                        case,
+                        model,
+                        *run_index,
+                        &job_cfg,
+                        model_profiles.as_ref(),
+                    )
                     .await;
                 report.run_index = *run_index;
                 self.update_circuit_breaker(
@@ -414,6 +469,7 @@ impl<'a> SuiteRunner<'a> {
                     let dashboard_tx = self.dashboard_tx.clone();
                     let run_id = self.run_id.clone();
                     let cancel_flag = self.cancel_flag.clone();
+                    let model_profiles = model_profiles.clone();
                     async move {
                         if cancel_flag
                             .as_ref()
@@ -508,8 +564,31 @@ impl<'a> SuiteRunner<'a> {
                                 sequence: crate::dashboard::next_dashboard_event_sequence(),
                             });
                         }
+                        let (job_cfg, _job_workspace) = match self.prepare_job_workspace() {
+                            Ok(context) => context,
+                            Err(error) => {
+                                let report = self
+                                    .workspace_failure_case_report(case, &model, run_index, &error);
+                                if let Some(ref tx) = dashboard_tx {
+                                    let _ =
+                                        tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                            run_id: run_id.clone(),
+                                            report: Arc::new(report.clone()),
+                                            sequence:
+                                                crate::dashboard::next_dashboard_event_sequence(),
+                                        });
+                                }
+                                return report;
+                            }
+                        };
                         let mut report = self
-                            .run_one_with_progress(case, &model, &run_id, run_index)
+                            .run_one_with_progress(
+                                case,
+                                &model,
+                                run_index,
+                                &job_cfg,
+                                model_profiles.as_ref(),
+                            )
                             .await;
                         report.run_index = run_index;
                         self.update_circuit_breaker(
@@ -600,10 +679,11 @@ impl<'a> SuiteRunner<'a> {
 
     async fn load_session_until_settled(
         &self,
+        cfg: &RunnerConfig,
         session_id: &str,
         settled_subsystem: Option<&str>,
     ) -> Option<SessionCapture> {
-        let deadline = tokio::time::Instant::now() + self.runner_cfg.session_settle_timeout;
+        let deadline = tokio::time::Instant::now() + cfg.session_settle_timeout;
         let mut latest = None;
         loop {
             if let Some(capture) = self.session_loader.load(session_id) {
@@ -615,7 +695,7 @@ impl<'a> SuiteRunner<'a> {
                 latest = Some(capture);
             }
             if settled_subsystem.is_none()
-                || self.runner_cfg.session_settle_timeout.is_zero()
+                || cfg.session_settle_timeout.is_zero()
                 || tokio::time::Instant::now() >= deadline
             {
                 return latest;
@@ -624,8 +704,14 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
-    async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
-        if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
+    async fn run_one(
+        &self,
+        case: &Case,
+        model: &str,
+        cfg: &RunnerConfig,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
+    ) -> CaseRunReport {
+        if let Some(report) = self.skip_for_unsupported_cache_scope(model_profiles, case, model) {
             eprintln!(
                 "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
                 case.name, model
@@ -637,7 +723,7 @@ impl<'a> SuiteRunner<'a> {
         // teardown. Preserve the setup failure, then flow through the same
         // finalization path so shared state is always cleaned up.
         let setup_error = if let Some(ref cmd) = case.setup_cmd {
-            match self.run_shell_hook("setup_cmd", case, cmd).await {
+            match self.run_shell_hook(cfg, "setup_cmd", case, cmd).await {
                 Ok(()) => None,
                 Err(error) => {
                     eprintln!("[astra-test] {error}");
@@ -654,7 +740,7 @@ impl<'a> SuiteRunner<'a> {
                 .with_text("setup_cmd failed")
                 .with_stderr(format!("[astra-test] {error}"))
         } else {
-            self.executor.execute(case, model).await
+            self.executor.execute_with_config(cfg, case, model).await
         };
         let mut attempts = vec![AttemptRecord {
             attempt_index: 0,
@@ -720,7 +806,10 @@ impl<'a> SuiteRunner<'a> {
                     cleanup_memory_records: false,
                     requires_memoria: false,
                 };
-                let step_outcome = self.executor.execute(&step_case, model).await;
+                let step_outcome = self
+                    .executor
+                    .execute_with_config(cfg, &step_case, model)
+                    .await;
 
                 // Evaluate step-level criteria against this step's outcome.
                 let mut step_criteria_results = if !step.criteria.is_empty() {
@@ -868,7 +957,7 @@ impl<'a> SuiteRunner<'a> {
                 );
                 let first_attempt = outcome.clone();
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                outcome = self.executor.execute(case, model).await;
+                outcome = self.executor.execute_with_config(cfg, case, model).await;
                 attempts.push(AttemptRecord {
                     attempt_index: 1,
                     outcome: outcome.clone(),
@@ -928,9 +1017,9 @@ impl<'a> SuiteRunner<'a> {
         if let Some(scope) = case.required_cache_scope {
             criteria.push(Criterion::PromptCacheReuseScope { scope });
         }
-        let health_gate_required = self.runner_cfg.require_session_subsystem_health
-            || (self.runner_cfg.require_memoria_subsystem_health && case.requires_memoria());
-        let health_gate_already_present = if self.runner_cfg.require_session_subsystem_health {
+        let health_gate_required = cfg.require_session_subsystem_health
+            || (cfg.require_memoria_subsystem_health && case.requires_memoria());
+        let health_gate_already_present = if cfg.require_session_subsystem_health {
             crate::criteria::has_unconditional_session_subsystem_health(&criteria)
         } else {
             crate::criteria::has_unconditional_memoria_subsystem_health(&criteria)
@@ -940,13 +1029,13 @@ impl<'a> SuiteRunner<'a> {
                 settled_subsystem: Some("post_loop_memory".into()),
             });
         }
-        let settled_subsystem = if self.runner_cfg.require_session_subsystem_health {
+        let settled_subsystem = if cfg.require_session_subsystem_health {
             crate::criteria::unconditional_settled_subsystem(&criteria)
         } else {
             crate::criteria::unconditional_memoria_settled_subsystem(&criteria)
         };
 
-        let cleanup_enabled = self.runner_cfg.cleanup_created_sessions
+        let cleanup_enabled = cfg.cleanup_created_sessions
             && case
                 .extra_cli_args
                 .iter()
@@ -963,7 +1052,7 @@ impl<'a> SuiteRunner<'a> {
         if cleanup_enabled {
             for session_id in &owned_session_ids {
                 if let Some(capture) = self
-                    .load_session_until_settled(session_id, settled_subsystem.as_deref())
+                    .load_session_until_settled(cfg, session_id, settled_subsystem.as_deref())
                     .await
                 {
                     cleanup_captures.insert(session_id.clone(), capture);
@@ -988,7 +1077,7 @@ impl<'a> SuiteRunner<'a> {
                 || requires_session_capture(&criteria))
         {
             session = if let Some(session_id) = outcome.session_id.as_deref() {
-                self.load_session_until_settled(session_id, settled_subsystem.as_deref())
+                self.load_session_until_settled(cfg, session_id, settled_subsystem.as_deref())
                     .await
             } else {
                 None
@@ -1145,7 +1234,7 @@ impl<'a> SuiteRunner<'a> {
         };
 
         let reproducer = {
-            let r = self.executor.reproducer(case, model);
+            let r = self.executor.reproducer_with_config(cfg, case, model);
             if r.is_empty() { None } else { Some(r) }
         };
 
@@ -1167,13 +1256,15 @@ impl<'a> SuiteRunner<'a> {
         // case. Previously teardown ran before the judger, destroying
         // evidence that the judger tried to independently verify.
         let teardown_error = if let Some(ref cmd) = case.teardown_cmd {
-            self.run_shell_hook("teardown_cmd", case, cmd).await.err()
+            self.run_shell_hook(cfg, "teardown_cmd", case, cmd)
+                .await
+                .err()
         } else {
             None
         };
         let mut cleanup_errors: Vec<String> = teardown_error.into_iter().collect();
         cleanup_errors.extend(
-            self.cleanup_session_owned_memories(case, session.as_ref())
+            self.cleanup_session_owned_memories(cfg, case, session.as_ref())
                 .await,
         );
         if cleanup_enabled {
@@ -1185,12 +1276,8 @@ impl<'a> SuiteRunner<'a> {
                 cleanup_ready_session_ids(&owned_session_ids, &cleanup_captures);
             cleanup_errors.extend(capture_errors);
             for session_id in ready_ids {
-                if let Err(error) = delete_server_session(
-                    &self.runner_cfg.astra_bin,
-                    self.runner_cfg.profile.as_deref(),
-                    &session_id,
-                )
-                .await
+                if let Err(error) =
+                    delete_server_session(&cfg.astra_bin, cfg.profile.as_deref(), &session_id).await
                 {
                     cleanup_errors.push(format!(
                         "[astra-test] created session cleanup failed for {session_id}: {error}"
@@ -1273,11 +1360,12 @@ impl<'a> SuiteRunner<'a> {
         &self,
         case: &Case,
         model: &str,
-        run_id: &str,
         run_index: u32,
+        cfg: &RunnerConfig,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
     ) -> CaseRunReport {
         let started = Instant::now();
-        let mut execution = Box::pin(self.run_one(case, model));
+        let mut execution = Box::pin(self.run_one(case, model, cfg, model_profiles));
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         // Consume interval's immediate first tick so the first heartbeat is
         // a real five-second observation rather than a duplicate start event.
@@ -1294,7 +1382,7 @@ impl<'a> SuiteRunner<'a> {
                     );
                     if let Some(ref tx) = self.dashboard_tx {
                         let _ = tx.send(crate::dashboard::DashboardEvent::CaseProgress {
-                            run_id: run_id.to_string(),
+                            run_id: self.run_id.clone(),
                             case_name: case.name.clone(),
                             model: model.to_string(),
                             run_index,
@@ -1313,6 +1401,7 @@ impl<'a> SuiteRunner<'a> {
     /// purge here: a topic can overlap concurrent cases or user data.
     async fn cleanup_session_owned_memories(
         &self,
+        cfg: &RunnerConfig,
         case: &Case,
         session: Option<&SessionCapture>,
     ) -> Vec<String> {
@@ -1337,11 +1426,11 @@ impl<'a> SuiteRunner<'a> {
 
         let mut errors = Vec::new();
         for memory_id in session.created_memory_ids() {
-            let mut command = tokio::process::Command::new(&self.runner_cfg.astra_bin);
-            if let Some(profile) = &self.runner_cfg.profile {
+            let mut command = tokio::process::Command::new(&cfg.astra_bin);
+            if let Some(profile) = &cfg.profile {
                 command.arg("--profile").arg(profile);
             }
-            if let Some(working_dir) = &self.runner_cfg.working_dir {
+            if let Some(working_dir) = &cfg.working_dir {
                 command.current_dir(working_dir);
             }
             command
@@ -1384,9 +1473,15 @@ impl<'a> SuiteRunner<'a> {
     /// failure or its diagnostic output. Hooks are part of test validity, not
     /// best-effort convenience: `sh -e` prevents a later successful command
     /// from masking an earlier failed cleanup/setup operation.
-    async fn run_shell_hook(&self, hook: &str, case: &Case, script: &str) -> Result<(), String> {
+    async fn run_shell_hook(
+        &self,
+        cfg: &RunnerConfig,
+        hook: &str,
+        case: &Case,
+        script: &str,
+    ) -> Result<(), String> {
         let mut command = tokio::process::Command::new("sh");
-        if let Some(working_dir) = &self.runner_cfg.working_dir {
+        if let Some(working_dir) = &cfg.working_dir {
             command.current_dir(working_dir);
         }
         command.arg("-e").arg("-c").arg(script).kill_on_drop(true);
@@ -1451,6 +1546,52 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
+    fn workspace_failure_case_report(
+        &self,
+        case: &Case,
+        model: &str,
+        run_index: u32,
+        detail: &str,
+    ) -> CaseRunReport {
+        let reason = format!("harness workspace unavailable: {detail}");
+        let criteria = case
+            .criteria
+            .iter()
+            .cloned()
+            .map(|criterion| crate::criteria::CriterionResult {
+                severity: crate::criteria::criterion_severity(&criterion),
+                criterion,
+                passed: false,
+                detail: reason.clone(),
+                full_detail: None,
+                score: None,
+            })
+            .collect();
+        CaseRunReport {
+            case_name: case.name.clone(),
+            model: model.to_string(),
+            status: CaseRunStatus::Unavailable,
+            run_index,
+            capability: case.capability.clone(),
+            weight: case.weight,
+            difficulty: case.difficulty,
+            outcome: RunOutcome::new(model)
+                .with_text(reason.clone())
+                .with_stderr(reason),
+            criteria,
+            steps: Vec::new(),
+            attempts: Vec::new(),
+            session: None,
+            session_captures: Vec::new(),
+            execution: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: Some(FailureClass::InfraVerificationUnavailable),
+            has_warnings: false,
+        }
+    }
+
     fn cancelled_case_report(
         &self,
         case: &Case,
@@ -1497,10 +1638,14 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
-    fn skip_for_unsupported_cache_scope(&self, case: &Case, model: &str) -> Option<CaseRunReport> {
+    fn skip_for_unsupported_cache_scope(
+        &self,
+        model_profiles: &HashMap<String, ModelPromptCacheProfile>,
+        case: &Case,
+        model: &str,
+    ) -> Option<CaseRunReport> {
         let required = case.required_cache_scope?;
-        let profiles = load_profiles(self.runner_cfg.working_dir.as_deref());
-        let reuse_support = profiles
+        let reuse_support = model_profiles
             .get(model)
             .map(|profile| profile.reuse_support)
             .unwrap_or(ModelReuseSupport::Unknown);
@@ -1610,6 +1755,33 @@ mod tests {
             cleanup_memory_records: false,
             requires_memoria: false,
         }
+    }
+
+    fn captured_then_removed_source_snapshot() -> crate::workspace::SourceSnapshot {
+        let source = tempfile::tempdir().expect("source tempdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(source.path())
+                .args(args)
+                .output()
+                .expect("git should be installed");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "harness@example.invalid"]);
+        git(&["config", "user.name", "Astra Harness"]);
+        std::fs::write(source.path().join("README.md"), "fixture\n").expect("fixture");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        let snapshot = crate::workspace::SourceSnapshot::capture(source.path())
+            .expect("capture source snapshot");
+        drop(source);
+        snapshot
     }
 
     #[test]
@@ -2710,6 +2882,92 @@ mod tests {
         assert_eq!(
             report.runs[0].failure_class,
             Some(crate::classify::FailureClass::InfraVerificationUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_jobs_keep_model_metadata_from_the_admitted_source_root() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("git should be installed");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "harness@example.invalid"]);
+        git(&["config", "user.name", "Astra Harness"]);
+        std::fs::write(repo.path().join("README.md"), "fixture\n").expect("fixture");
+        std::fs::write(repo.path().join(".gitignore"), ".models.yaml\n")
+            .expect("ignore local model metadata");
+        git(&["add", "README.md", ".gitignore"]);
+        git(&["commit", "--quiet", "-m", "fixture"]);
+        // Model capability metadata is intentionally ignored by Git. It must
+        // still be resolved from the source root before jobs move into
+        // detached worktrees, where this file is absent.
+        std::fs::write(
+            repo.path().join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  provider: openai
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+"#,
+        )
+        .expect("write ignored model metadata");
+        let source = crate::workspace::SourceSnapshot::capture(repo.path())
+            .expect("capture source snapshot");
+
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["kimi-k2.6".into()]);
+        cfg.workspace_source = Some(source);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let mut case = case_with("isolated-cache-prefix", vec![]);
+        case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
+        let report = runner.run_all(&[case]).await;
+
+        assert_eq!(report.unavailable(), 1);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
+        assert!(
+            report.runs[0]
+                .outcome
+                .text
+                .contains("reuse_scope=IntraTurnRounds"),
+            "source-root metadata should classify the isolated job as unavailable: {:#?}",
+            report.runs[0]
+        );
+        assert!(
+            exec.calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "unsupported isolated cases must not execute"
         );
     }
 
@@ -4025,6 +4283,217 @@ mod tests {
         // Parallel path sorts by (case_name, model, run_index).
         let names: Vec<&str> = report.runs.iter().map(|r| r.case_name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_jobs_get_distinct_worktrees_and_keep_followups_bound() {
+        struct WorkspaceRecordingExecutor {
+            observations: Arc<std::sync::Mutex<Vec<(String, PathBuf)>>>,
+        }
+
+        #[async_trait]
+        impl CaseExecutor for WorkspaceRecordingExecutor {
+            async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+                outcome_ok(model, &case.name, &[])
+            }
+
+            async fn execute_with_config(
+                &self,
+                cfg: &RunnerConfig,
+                case: &Case,
+                model: &str,
+            ) -> RunOutcome {
+                self.observations.lock().unwrap().push((
+                    case.name.clone(),
+                    cfg.working_dir
+                        .clone()
+                        .expect("isolated job has a working directory"),
+                ));
+                // Keep both root jobs live long enough for the test to cover
+                // the actual parallel branch rather than serial scheduling.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                outcome_ok(model, &case.name, &[])
+            }
+        }
+
+        fn git(repo: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .expect("git should be installed");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        git(repo.path(), &["init", "--quiet"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "harness@example.invalid"],
+        );
+        git(repo.path(), &["config", "user.name", "Astra Harness"]);
+        std::fs::write(repo.path().join("README.md"), "fixture\n").expect("fixture");
+        git(repo.path(), &["add", "README.md"]);
+        git(repo.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = WorkspaceRecordingExecutor {
+            observations: observations.clone(),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let source = crate::workspace::source_snapshot_for_suite(repo.path())
+            .expect("snapshot source")
+            .expect("git source");
+        let cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_workspace_source(source);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig {
+                parallel: 2,
+                ..Default::default()
+            },
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut with_follow_up = case_with("root-a", vec![]);
+        with_follow_up.steps.push(crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: vec![],
+            timeout_seconds: Some(60),
+        });
+        let report = runner
+            .run_all(&[with_follow_up, case_with("root-b", vec![])])
+            .await;
+        assert_eq!(report.passed(), 2);
+
+        let observations = observations.lock().unwrap();
+        let a_paths: Vec<_> = observations
+            .iter()
+            .filter(|(case, _)| case == "root-a" || case == "root-a__step0")
+            .map(|(_, path)| path.clone())
+            .collect();
+        let b_paths: Vec<_> = observations
+            .iter()
+            .filter(|(case, _)| case == "root-b")
+            .map(|(_, path)| path.clone())
+            .collect();
+        assert_eq!(a_paths.len(), 2, "root and follow-up must execute");
+        assert_eq!(a_paths[0], a_paths[1], "follow-up must reuse root worktree");
+        assert_eq!(b_paths.len(), 1, "second root job must execute");
+        assert_ne!(
+            a_paths[0], b_paths[0],
+            "parallel root jobs must be isolated"
+        );
+        assert!(
+            !a_paths[0].exists() && !b_paths[0].exists(),
+            "job worktrees must be removed after each job"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_admission_failure_is_unavailable_in_serial_and_parallel_runs() {
+        for parallel in [1, 2] {
+            let cfg =
+                RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+            let mut cfg = cfg;
+            cfg.workspace_source = Some(captured_then_removed_source_snapshot());
+            let exec = FakeExecutor::new();
+            let judger = FixedJudger { score: 1.0 };
+            let loader = NoopSessionLoader;
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: cfg,
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig {
+                    parallel,
+                    ..Default::default()
+                },
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+
+            let report = runner.run_all(&[case_with("workspace", vec![])]).await;
+            assert_eq!(report.total(), 1);
+            assert_eq!(report.passed(), 0);
+            assert_eq!(report.failed(), 0, "admission is not product failure");
+            assert_eq!(report.unavailable(), 1);
+            assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
+            assert_eq!(
+                report.runs[0].failure_class,
+                Some(FailureClass::InfraVerificationUnavailable)
+            );
+            assert!(
+                report.runs[0]
+                    .outcome
+                    .text
+                    .contains("harness workspace unavailable")
+            );
+            assert!(
+                exec.calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty(),
+                "executor must not run without an admitted workspace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_explicit_working_dir_and_workspace_source_is_unavailable() {
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg =
+            RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        cfg.working_dir = Some(PathBuf::from("/explicit"));
+        cfg.workspace_source = Some(captured_then_removed_source_snapshot());
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let report = runner.run_all(&[case_with("ambiguous", vec![])]).await;
+        assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
+        assert!(
+            report.runs[0]
+                .outcome
+                .text
+                .contains("cannot set both working_dir and workspace_source")
+        );
+        assert!(
+            exec.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ mod runtime_environment;
 
 mod tool;
 mod workspace;
+mod workspace_snapshot;
 
 pub use binding::*;
 pub use capability::*;
@@ -34,3 +35,4 @@ pub use provider::*;
 pub use runtime_environment::*;
 pub use tool::*;
 pub use workspace::*;
+pub use workspace_snapshot::*;

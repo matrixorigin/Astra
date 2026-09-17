@@ -1710,7 +1710,12 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
-    let child_request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    // The child request is emitted only after the parent has completed its
+    // own model round and the server control-plane spawn has admitted the
+    // child. Keep this synchronization bound aligned with the suite's
+    // per-test budget so hosted runner scheduling cannot turn a healthy
+    // event path into a false timeout.
+    let child_request = wait_for_sse(&mut rx, "tool_request", 30).await;
     assert_eq!(child_request["tool"], "read_file");
     assert_eq!(child_request["request_id"], "call-child-read-file");
     assert_eq!(

@@ -1121,6 +1121,124 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn ensure_loaded_csl_state_uses_canonical_journal_when_snapshot_is_corrupt() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("csl-corrupt-journal-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        let owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, &sid)
+                .unwrap();
+        let prepared = active
+            .prepare_commit(
+                1,
+                None,
+                vec![
+                    serde_json::json!({"role": "user", "content": "recover"}),
+                    serde_json::json!({"role": "assistant", "content": "journal"}),
+                ],
+            )
+            .unwrap();
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    Some("gpt-5"),
+                    "recover",
+                    "journal",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(prepared.commit),
+            )
+            .unwrap();
+
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &sid).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("conversation_log.jsonl"),
+            "not-json\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
+        )
+        .unwrap();
+
+        let mut state = SessionState::default();
+        let loaded = ensure_loaded_csl_state(&mut state, &sid)
+            .await
+            .expect("canonical journal should keep recovery sync available");
+        assert!(loaded.is_some());
+        assert!(
+            state.csl_manager.is_some(),
+            "canonical recovery should rebuild a usable CSL manager"
+        );
+        let csl_path = csl_log_path_for(&sid);
+        assert!(csl_path.exists(), "recovery should rebuild the CSL file");
+        let quarantine = std::fs::read_dir(csl_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("conversation_log.jsonl.corrupt-"))
+            })
+            .expect("corrupt CSL should be quarantined");
+        assert_eq!(std::fs::read(quarantine).unwrap(), b"not-json\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n");
+
+        // A fresh process can load and append after the repair; the original
+        // corrupt projection must not poison the next successful turn.
+        let store = std::sync::Arc::new(
+            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
+        );
+        let mut fresh_manager = astra_turn_core::conversation_log::manager::CslManager::new(
+            store,
+            sid.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let materialized = fresh_manager
+            .load()
+            .await
+            .expect("reload rebuilt CSL")
+            .expect("rebuilt snapshot");
+        assert_eq!(materialized.messages.len(), 2);
+        fresh_manager
+            .persist_turn(
+                2,
+                &[
+                    serde_json::json!({"role": "user", "content": "recover"}),
+                    serde_json::json!({"role": "assistant", "content": "journal"}),
+                    serde_json::json!({"role": "user", "content": "next"}),
+                    serde_json::json!({"role": "assistant", "content": "ok"}),
+                ],
+                &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            )
+            .await
+            .expect("subsequent turn should append to repaired CSL");
+        let mut reloaded = astra_turn_core::conversation_log::manager::CslManager::new(
+            std::sync::Arc::new(
+                astra_turn_core::conversation_log::file_store::FileCslStore::new(
+                    csl_store_base_dir(),
+                ),
+            ),
+            sid,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.load().await.unwrap().unwrap().messages.len(), 4);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn load_previous_recovery_state_returns_err_when_checkpoint_dir_is_invalid() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("checkpoint-bad-{}", uuid::Uuid::new_v4());

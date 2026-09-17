@@ -164,6 +164,26 @@ Returns event records for list views, including `content` and `metadata`.
 > runtime. They are not public capabilities; use the versioned Work API under
 > `/v1/works` for the canonical work/task graph contract.
 
+### Work recovery points
+
+`POST /v1/works/{work_id}/branches/{branch_id}/recovery-points` asks the server
+to save the current safe boundary. The request contains only `request_id`, an
+optional `reason`, and optional revision preconditions; the server creates the
+manifest from canonical Work, Session, and execution facts. An active writer,
+reservation, Run, or provider switch returns `capture_boundary_busy`.
+
+`GET` on the same collection and on
+`.../recovery-points/{recovery_point_id}` returns the immutable publication
+record and a derived coverage assessment. The collection is a bounded recent
+history view (32 points by default); it is not a complete archival export and
+does not currently expose a continuation cursor. `published` means the
+referenced Work and conversation facts were verified. It does not promise
+portable files or an automatic restore action; the first publisher reports
+`workspace_not_captured` until a Workspace snapshot store is available.
+If the response is `effect_review_required`, an external operation is still
+uncertain; the error is non-retryable and the client should inspect that effect
+before requesting another boundary.
+
 ### GET /events/{event_id}
 
 ### GET /events/session/{session_id}

@@ -5596,6 +5596,7 @@ pub(crate) async fn run_tui_session(
                 }
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
+                bottom_pane.sync_popups();
                 frame_requester.schedule_frame();
             }
             Some(effect) = model_catalog_rx.recv() => {
@@ -6152,6 +6153,12 @@ pub(crate) async fn run_tui_session(
                                         );
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
+                                    // Native commands may change the composer,
+                                    // active view, or dynamic completion catalog
+                                    // while they run. Recompute popup ownership
+                                    // at the command boundary so the next `/…`
+                                    // starts from the current UI state.
+                                    bottom_pane.sync_popups();
                                     finish_submission_feedback(
                                         &mut bottom_pane,
                                         &mut status_indicator,

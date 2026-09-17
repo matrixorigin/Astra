@@ -551,6 +551,77 @@ pub(super) async fn load_plan_context_for_session(
     Ok(context)
 }
 
+/// Verify every immutable Work fact referenced by a recovery boundary. This
+/// is intentionally owned by the Work plan repository: a recovery publisher
+/// must not duplicate the goal, criteria, graph, and item decoding rules.
+/// The caller still has to re-read the mutable revision pointers under its
+/// publication lock after this bounded verification completes.
+pub(super) async fn verify_recovery_anchor(
+    repository: &DatabaseWorkRepository,
+    owner_id: &WorkOwnerId,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+) -> Result<(), WorkRepositoryError> {
+    let mut transaction = repository.pool.get().begin().await.map_err(|source| {
+        WorkRepositoryError::persistence("begin Work recovery anchor verification", source)
+    })?;
+    let (basis, graph) = load_basis_and_graph(
+        &mut transaction,
+        owner_id,
+        WorkPlanLookup::Branch { work_id, branch_id },
+    )
+    .await?;
+    if basis.work_id != *work_id || basis.branch_id != *branch_id {
+        return Err(WorkRepositoryError::Conflict {
+            resource: super::repository::WorkConflictResource::RecoveryPointIdentity,
+        });
+    }
+    let criteria_set_revision = basis.criteria_set_revision;
+    // Decode every referenced immutable item, rather than only the bounded
+    // page returned by the public Task Graph endpoint. This proves the exact
+    // graph revision can be reconstructed before it is recorded in a point.
+    let _items = load_graph_items(&mut transaction, owner_id, work_id, &graph.item_refs).await?;
+    transaction.commit().await.map_err(|source| {
+        WorkRepositoryError::persistence("commit Work recovery anchor verification", source)
+    })?;
+
+    // Criteria have their own canonical reader because the set manifest and
+    // each immutable definition are stored separately. Reusing that reader
+    // here proves the member-manifest hash, member count, every referenced
+    // revision, definition kind, canonical JSON, and definition hash. Keep
+    // this after the graph transaction commits: the reader owns its snapshot
+    // transaction and must also work when the pool is configured with one
+    // connection.
+    let mut offset = 0u16;
+    loop {
+        let query = super::WorkCriteriaQuery::new(
+            owner_id.clone(),
+            work_id.clone(),
+            Some(criteria_set_revision),
+            offset,
+            super::criteria::WORK_CRITERIA_PAGE_MAX_ITEMS,
+        )
+        .map_err(super::repository::invalid_mutation)?;
+        let page = super::criteria_read_repository::load_criteria_page(repository, query).await?;
+        if page.basis.criteria_set_revision != criteria_set_revision {
+            return Err(WorkRepositoryError::Conflict {
+                resource: super::repository::WorkConflictResource::RecoveryPointIdentity,
+            });
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if cursor.criteria_set_revision != criteria_set_revision || cursor.offset <= offset {
+            return Err(WorkRepositoryError::corrupt(
+                "Work recovery criteria anchor",
+                std::io::Error::other("criterion page cursor is not monotonic"),
+            ));
+        }
+        offset = cursor.offset;
+    }
+    Ok(())
+}
+
 /// Load one coherent execution cut for the durable Work coordinator.
 ///
 /// This is deliberately separate from the public paged Task Graph endpoint:

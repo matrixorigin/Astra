@@ -11,6 +11,7 @@ import {
   validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 import type { WorkspaceSelection } from "@/lib/api/types";
+import workspaceBindingContract from "../../../fixtures/contracts/workspace_binding_request.json";
 
 function edgeSelection(overrides: Partial<EdgeSelection> = {}): EdgeSelection {
   return {
@@ -28,12 +29,7 @@ type EdgeSelection = Extract<WorkspaceSelection, { kind: "edge_workspace" }>;
 
 describe("defaultWorkspaceBinding", () => {
   it("returns default Web binding without exposing an absent workspace", () => {
-    expect(defaultWorkspaceBinding()).toEqual({
-      kind: "none",
-      display_name: "Web",
-      authority: "none",
-      fallback_policy: "disabled",
-    });
+    expect(defaultWorkspaceBinding()).toEqual(workspaceBindingContract.none);
   });
 });
 
@@ -51,13 +47,14 @@ describe("defaultExecutorBinding", () => {
 
 describe("edgeWorkspaceBinding", () => {
   it("maps an edge selection to a workspace binding", () => {
-    expect(edgeWorkspaceBinding(edgeSelection())).toEqual({
-      kind: "edge_workspace",
-      display_name: "Test Mac",
-      cwd: "/Users/test/project",
-      authority: "read_write",
-      fallback_policy: "disabled",
-    });
+    expect(
+      edgeWorkspaceBinding(
+        edgeSelection({
+          cwd: "/Users/test/astra",
+          displayName: "MacBook Pro",
+        }),
+      ),
+    ).toEqual(workspaceBindingContract.edge_workspace);
   });
 
   it("falls back to edgeAgentId when displayName is missing", () => {

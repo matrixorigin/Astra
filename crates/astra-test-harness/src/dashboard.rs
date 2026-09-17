@@ -19,6 +19,58 @@ use tokio::sync::{Mutex, broadcast};
 use crate::report::{CaseRunReport, SuiteReport};
 use crate::runner::{RunOutcome, parse_strict_cli_outcome};
 
+/// The dashboard owns sessions created by its harness runs and deletes them
+/// after their journals are archived. Keep that lifecycle explicit in the
+/// dashboard wire projection so a deleted identity is never presented as a
+/// resumable session. The generic harness report remains unchanged.
+fn dashboard_session_lifecycle(report: &CaseRunReport) -> &'static str {
+    let Some(session_id) = report.outcome.session_id.as_deref() else {
+        return "none";
+    };
+    if report.failure_class == Some(crate::classify::FailureClass::HarnessCleanupFailed) {
+        return "cleanup_error";
+    }
+    if report
+        .session_captures
+        .iter()
+        .any(|capture| capture.session_id == session_id)
+    {
+        "archived"
+    } else {
+        "retained"
+    }
+}
+
+fn dashboard_case_report_value(report: &CaseRunReport) -> serde_json::Value {
+    let mut value = serde_json::to_value(report)
+        .expect("CaseRunReport serialization should be infallible for dashboard output");
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert(
+            "session_lifecycle".into(),
+            serde_json::Value::String(dashboard_session_lifecycle(report).into()),
+        );
+    }
+    value
+}
+
+fn dashboard_suite_report_value(report: &SuiteReport) -> serde_json::Value {
+    let mut value = serde_json::to_value(report)
+        .expect("SuiteReport serialization should be infallible for dashboard output");
+    if let serde_json::Value::Object(fields) = &mut value
+        && let Some(serde_json::Value::Array(runs)) = fields.get_mut("runs")
+    {
+        for (run_value, report) in runs.iter_mut().zip(&report.runs) {
+            if let serde_json::Value::Object(run_fields) = run_value {
+                run_fields.insert(
+                    "session_lifecycle".into(),
+                    serde_json::Value::String(dashboard_session_lifecycle(report).into()),
+                );
+            }
+        }
+    }
+    value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct OrchestratePlan {
@@ -260,7 +312,7 @@ impl Serialize for DashboardEvent {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", "case_completed")?;
                 m.serialize_entry("run_id", run_id)?;
-                m.serialize_entry("report", report.as_ref())?;
+                m.serialize_entry("report", &dashboard_case_report_value(report))?;
                 m.serialize_entry("sequence", sequence)?;
                 m.end()
             }
@@ -272,7 +324,7 @@ impl Serialize for DashboardEvent {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", "suite_completed")?;
                 m.serialize_entry("run_id", run_id)?;
-                m.serialize_entry("report", report.as_ref())?;
+                m.serialize_entry("report", &dashboard_suite_report_value(report))?;
                 m.serialize_entry("sequence", sequence)?;
                 m.end()
             }
@@ -503,7 +555,7 @@ fn snapshot_json(snapshot: &DashboardSnapshot) -> serde_json::Value {
         "run_id": snapshot.run_id,
         "sequence": snapshot.sequence,
         "progress": snapshot.progress,
-        "report": snapshot.report,
+        "report": snapshot.report.as_ref().map(dashboard_suite_report_value),
         "error": snapshot.error,
     })
 }
@@ -698,7 +750,7 @@ async fn report_handler(State(state): State<AppState>) -> Json<serde_json::Value
         "run_id": snapshot.run_id,
         "running": snapshot.running,
         "error": snapshot.error,
-        "report": snapshot.report,
+        "report": snapshot.report.as_ref().map(dashboard_suite_report_value),
     }))
 }
 
@@ -1277,6 +1329,10 @@ async fn execute_run(
     use crate::runner::{RunnerConfig, resolve_runner_profile_owner};
     use crate::suite::{ScopedDiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner};
 
+    // Capture the source before reading case files, then validate it again
+    // after selection so the dashboard cannot mix case definitions from one
+    // clean commit with worktrees from another.
+    let workspace_source = crate::workspace::source_snapshot_for_suite(&config.suite_dir)?;
     let mut cases = Case::load_dir(&config.suite_dir)?;
 
     if !req.cases.is_empty() {
@@ -1302,15 +1358,25 @@ async fn execute_run(
         }
     }
 
+    if let Some(ref snapshot) = workspace_source {
+        crate::workspace::ensure_snapshot_unchanged(snapshot)?;
+        eprintln!(
+            "[astra-test] live dashboard suite will use one isolated worktree per execution job from {} at {}",
+            snapshot.repository_root().display(),
+            snapshot.revision()
+        );
+    }
+
     let fallback_models = req.models.clone();
     let mut runner_cfg = RunnerConfig::new(config.astra_bin.clone())
         .with_fallback_models(fallback_models)
         .with_required_memoria_subsystem_health();
-    runner_cfg.working_dir = None;
+    runner_cfg.workspace_source = workspace_source;
     let runner_identity = resolve_runner_profile_owner(None).map_err(anyhow::Error::msg)?;
     astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());
     runner_cfg.profile = Some(runner_identity.profile_name);
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
+    runner_cfg.cleanup_created_sessions = true;
 
     let judger_model = req.judger_model.as_deref().unwrap_or(&config.judger_model);
     let judger_cfg = JudgerConfig::new(config.astra_bin.clone(), judger_model);
@@ -1443,6 +1509,76 @@ mod tests {
         assert_eq!(json["run_id"], "run-7");
         assert_eq!(json["error"], "no cases matched the selection");
         assert_eq!(json["sequence"], 9);
+    }
+
+    #[test]
+    fn dashboard_report_marks_deleted_sessions_as_archived_evidence() {
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let report = CaseRunReport {
+            case_name: "case".into(),
+            model: "model".into(),
+            status: crate::report::CaseRunStatus::Passed,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("model").with_session_id(session_id),
+            criteria: vec![],
+            steps: vec![],
+            attempts: vec![],
+            session: None,
+            session_captures: vec![crate::session_capture::SessionCapture {
+                session_id: session_id.into(),
+                journal_path: "/tmp/archive.jsonl".into(),
+                events: vec![],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            }],
+            reproducer: None,
+            execution: None,
+            digest: None,
+            digest_error: None,
+            failure_class: None,
+            has_warnings: false,
+        };
+        let value = dashboard_case_report_value(&report);
+        assert_eq!(value["session_lifecycle"], "archived");
+
+        let event = serde_json::to_value(DashboardEvent::CaseCompleted {
+            run_id: "run-1".into(),
+            report: Arc::new(report),
+            sequence: 1,
+        })
+        .expect("serialize case event");
+        assert_eq!(event["report"]["session_lifecycle"], "archived");
+    }
+
+    #[test]
+    fn dashboard_report_marks_cleanup_errors_as_non_resumable_unknown() {
+        let report = CaseRunReport {
+            case_name: "case".into(),
+            model: "model".into(),
+            status: crate::report::CaseRunStatus::Failed,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("model")
+                .with_session_id("550e8400-e29b-41d4-a716-446655440000"),
+            criteria: vec![],
+            steps: vec![],
+            attempts: vec![],
+            session: None,
+            session_captures: vec![],
+            execution: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: Some(crate::classify::FailureClass::HarnessCleanupFailed),
+            has_warnings: false,
+        };
+        assert_eq!(dashboard_session_lifecycle(&report), "cleanup_error");
     }
 
     #[test]

@@ -5478,6 +5478,10 @@ impl AgenticRunLifecycleService {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "distributed_session_admission_configuration_mismatch",
                 ),
+                astra_services::DistributedAdmissionError::AdmissionTimeout { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "distributed_session_admission_timeout",
+                ),
                 _ => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "distributed_session_admission_rejected",
@@ -5509,10 +5513,14 @@ impl AgenticRunLifecycleService {
                                 == head.as_ref().map(|head| head.cursor.clone())
                     })
                     .ok_or_else(|| {
-                        error_response_coded(
+                        error_response_coded_with_metadata(
                             StatusCode::CONFLICT,
-                            "conversation authority no longer owns the active writer lease",
+                            "This Session's execution authority changed in another client; refresh the Session and retry the same input",
                             "conversation_authority_fenced",
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "refresh_and_retry",
+                            }),
                         )
                     })?;
                 let distributed_reservation = distributed_admission.try_reserve(
@@ -5550,12 +5558,29 @@ impl AgenticRunLifecycleService {
                     | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => {
                         reservation
                     }
-                    Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+                    Ok(astra_services::ReserveTurnOutcome::Conflict { current_head }) => {
                         let _ = distributed_permit.release().await;
-                        return Err(error_response_coded(
+                        let cursor_changed = current_head.as_ref().map(|head| &head.cursor)
+                            != head.as_ref().map(|head| &head.cursor);
+                        if cursor_changed {
+                            return Err(error_response_coded_with_metadata(
+                                StatusCode::CONFLICT,
+                                "This Session changed in another client before your turn started; refresh and retry the same input",
+                                "conversation_cursor_conflict",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "refresh_and_retry",
+                                }),
+                            ));
+                        }
+                        return Err(error_response_coded_with_metadata(
                             StatusCode::CONFLICT,
-                            "canonical session cursor changed before turn reservation",
-                            "conversation_cursor_conflict",
+                            "This Session already has a turn in progress in another client; wait for it to finish, then retry the same input",
+                            "session_writer_conflict",
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "retry_session_or_open_new",
+                            }),
                         ));
                     }
                     Err(error) => {
@@ -5596,12 +5621,12 @@ impl AgenticRunLifecycleService {
                             return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
                                 format!(
-                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
+                                    "This checkout is currently in use by active Session {owner_session_id}; wait for it to finish or choose another worktree"
                                 ),
                                 "execution_workspace_claimed",
                                 json!({
                                     "admission_state": "rejected",
-                                    "recovery_action": "resume_session",
+                                    "recovery_action": "wait_or_choose_workspace",
                                     "owner_session_id": owner_session_id,
                                     "owner_branch_id": owner_branch_id,
                                 }),
@@ -5703,12 +5728,12 @@ impl AgenticRunLifecycleService {
                             return Err(error_response_coded_with_metadata(
                                 StatusCode::CONFLICT,
                                 format!(
-                                    "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
+                                    "This checkout is currently in use by active Session {owner_session_id}; wait for it to finish or choose another worktree"
                                 ),
                                 "execution_workspace_claimed",
                                 json!({
                                     "admission_state": "rejected",
-                                    "recovery_action": "resume_session",
+                                    "recovery_action": "wait_or_choose_workspace",
                                     "owner_session_id": owner_session_id,
                                     "owner_branch_id": owner_branch_id,
                                 }),
@@ -5727,15 +5752,31 @@ impl AgenticRunLifecycleService {
                         reservation,
                     } => (lease, reservation),
                     astra_services::AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        active_lease_expires_at_unix_ms,
                         ..
                     } => {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
                         }
-                        return Err(error_response_coded(
+                        if active_lease_expires_at_unix_ms.is_none() {
+                            return Err(error_response_coded_with_metadata(
+                                StatusCode::CONFLICT,
+                                "This Session changed in another client before your turn started; refresh and retry the same input",
+                                "conversation_cursor_conflict",
+                                json!({
+                                    "admission_state": "rejected",
+                                    "recovery_action": "refresh_and_retry",
+                                }),
+                            ));
+                        }
+                        return Err(error_response_coded_with_metadata(
                             StatusCode::CONFLICT,
-                            "another controller owns this canonical session branch",
+                            "This Session is already active in another client; wait for it to finish, then retry the same input, or open a new Session for independent work",
                             "session_writer_conflict",
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "retry_session_or_open_new",
+                            }),
                         ));
                     }
                     astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {
@@ -5746,10 +5787,14 @@ impl AgenticRunLifecycleService {
                         if let Ok(distributed_permit) = distributed_result {
                             let _ = distributed_permit.release().await;
                         }
-                        return Err(error_response_coded(
+                        return Err(error_response_coded_with_metadata(
                             StatusCode::CONFLICT,
-                            "canonical session cursor changed before turn reservation",
-                            "conversation_cursor_conflict",
+                            "This Session already has a turn in progress in another client; wait for it to finish, then retry the same input",
+                            "session_writer_conflict",
+                            json!({
+                                "admission_state": "rejected",
+                                "recovery_action": "retry_session_or_open_new",
+                            }),
                         ));
                     }
                 };
@@ -5772,6 +5817,40 @@ impl AgenticRunLifecycleService {
                 };
                 (distributed_permit, prior_messages, lease, reservation, true)
             };
+        // The turn admission claim is established before the durable Run
+        // record is published. Revalidate it while the canonical claim row is
+        // locked, so a concurrent provider switch or handoff cannot move the
+        // checkout between admission and the first model/tool side effect.
+        let expected_execution_binding_generation = request
+            .provider_runtime_authorized
+            .then_some(0_u64)
+            .or(request.execution_binding_generation);
+        if let Some(expected_generation) = expected_execution_binding_generation
+            && let Err(error) = coordinator
+                .verify_execution_workspace_claim_for_generation(
+                    &key,
+                    expected_generation,
+                    &reservation.reservation_id,
+                    reservation.writer_epoch,
+                )
+                .await
+        {
+            if release_writer_on_finish {
+                let _ = coordinator.release_writer(&lease).await;
+            }
+            let _ = distributed_permit.release().await;
+            return Err(error_response_coded_with_metadata(
+                StatusCode::CONFLICT,
+                format!(
+                    "This turn was not started because its execution workspace changed while it was being admitted: {error}"
+                ),
+                "execution_workspace_claim_lost",
+                json!({
+                    "admission_state": "rejected",
+                    "recovery_action": "retry_or_choose_workspace",
+                }),
+            ));
+        }
         let renewal_cancel = CancellationToken::new();
         let heartbeat_cancel = renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
@@ -5940,10 +6019,41 @@ impl AgenticRunLifecycleService {
                 "canonical commit succeeded but provider WAL payload retirement is pending"
             );
         }
+        if result.as_ref().is_ok_and(Option::is_some)
+            && let Err(error) = admission
+                .coordinator
+                .clear_execution_workspace_activity(
+                    &admission.lease.key,
+                    &admission.reservation.reservation_id,
+                    admission.reservation.writer_epoch,
+                )
+                .await
+        {
+            // The canonical reservation has already settled. A stale activity
+            // marker is safe because its expiry and conditional owner fence
+            // prevent a later execution from being cleared, but report the
+            // cleanup failure so operators can see a delayed handoff fence.
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                %error,
+                "canonical commit succeeded but execution workspace activity cleanup is pending"
+            );
+        }
         if admission.release_writer_on_finish {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
         }
-        let _ = admission.distributed_permit.release().await;
+        if let Err(error) = admission.distributed_permit.release().await {
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "distributed admission release is pending; the permit will retry on drop"
+            );
+        }
         admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
             astra_core::ClassifiedError::new(
@@ -5988,13 +6098,17 @@ impl AgenticRunLifecycleService {
                 ));
             }
         }
-        self.distributed_weighted_admission = Some(
+        let mut distributed_weighted_admission =
             astra_services::DatabaseWeightedAdmissionController::new(
                 pool.clone(),
                 self.admission_limits,
             )
-            .expect("per-owner distributed admission limits fit global limits"),
-        );
+            .expect("per-owner distributed admission limits fit global limits");
+        // Use the existing run admission budget for both the local durable
+        // gate queue and the database-pool acquire. This keeps a burst from
+        // waiting forever before the run-level admission timeout can act.
+        distributed_weighted_admission.with_admission_wait_timeout(run_admission_timeout());
+        self.distributed_weighted_admission = Some(distributed_weighted_admission);
         self.shared_pool = Some(pool);
         self
     }
@@ -9411,7 +9525,7 @@ impl AgenticRunLifecycleService {
                     } => (
                         StatusCode::CONFLICT,
                         "execution_workspace_claimed",
-                        "This checkout is already attached to another Session; resume that Session or use a separate worktree",
+                        "This checkout is currently in use by another active Session; wait for it to finish or choose a separate worktree",
                     ),
                     astra_services::SessionContextCoordinatorError::ExecutionBindingBusy => (
                         StatusCode::CONFLICT,
@@ -9437,31 +9551,31 @@ impl AgenticRunLifecycleService {
                         "Work execution selection is temporarily unavailable",
                     ),
                 };
-                    tracing::warn!(
-                        owner_id = %user_id,
-                        session_id = %session_id,
-                        error = %error,
-                        "failed to resolve durable Work execution selection"
+                tracing::warn!(
+                    owner_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "failed to resolve durable Work execution selection"
+                );
+                if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                    owner_session_id,
+                    owner_branch_id,
+                } = error
+                {
+                    return error_response_coded_with_metadata(
+                        status,
+                        format!(
+                            "This checkout is currently in use by active Session {owner_session_id}; wait for it to finish or choose another worktree"
+                        ),
+                        code,
+                        json!({
+                            "admission_state": "rejected",
+                            "recovery_action": "wait_or_choose_workspace",
+                            "owner_session_id": owner_session_id,
+                            "owner_branch_id": owner_branch_id,
+                        }),
                     );
-                    if let astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-                        owner_session_id,
-                        owner_branch_id,
-                    } = error
-                    {
-                        return error_response_coded_with_metadata(
-                            status,
-                            format!(
-                                "This checkout is already attached to Session {owner_session_id}; resume it before sending work here"
-                            ),
-                            code,
-                            json!({
-                                "admission_state": "rejected",
-                                "recovery_action": "resume_session",
-                                "owner_session_id": owner_session_id,
-                                "owner_branch_id": owner_branch_id,
-                            }),
-                        );
-                    }
+                }
                     if code == "execution_binding_busy" {
                         return error_response_coded_with_metadata(
                             status,

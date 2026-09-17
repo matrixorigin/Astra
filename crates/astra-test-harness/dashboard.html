@@ -2460,11 +2460,25 @@ function buildCaseDetailHTML(report) {
   // Session ID
   const sid = report.outcome.session_id;
   if (sid) {
-    html += `<div class="cd-section"><div class="cd-label">Session ID</div>
-      <div class="copyable-row">
-        <div class="copyable-text">${esc(sid)}</div>
-        <button class="copy-btn" type="button" data-copy="${esc(sid)}">&#128203; Copy</button>
-      </div></div>`;
+    const sessionLifecycle = report.session_lifecycle || 'retained';
+    if (sessionLifecycle === 'archived') {
+      html += `<div class="cd-section"><div class="cd-label">Archived session evidence</div>
+        <div class="copyable-row"><div class="copyable-text">${esc(sid)}</div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:5px">The harness deleted this session after capturing its journal. This identity is archived evidence and cannot be resumed.</div></div>`;
+    } else if (sessionLifecycle === 'cleanup_error') {
+      html += `<div class="cd-section"><div class="cd-label">Session ID · cleanup incomplete</div>
+        <div class="copyable-row">
+          <div class="copyable-text">${esc(sid)}</div>
+          <button class="copy-btn" type="button" data-copy="${esc(sid)}">&#128203; Copy</button>
+        </div>
+        <div style="font-size:11px;color:var(--yellow);margin-top:5px">Cleanup reported an error, so retention is unknown. Use this identity for investigation only; do not assume it is resumable.</div></div>`;
+    } else {
+      html += `<div class="cd-section"><div class="cd-label">Session ID</div>
+        <div class="copyable-row">
+          <div class="copyable-text">${esc(sid)}</div>
+          <button class="copy-btn" type="button" data-copy="${esc(sid)}">&#128203; Copy</button>
+        </div></div>`;
+    }
   }
 
   // Reproducer

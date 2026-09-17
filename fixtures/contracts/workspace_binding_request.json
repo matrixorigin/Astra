@@ -1,0 +1,22 @@
+{
+  "none": {
+    "kind": "none",
+    "display_name": "Web",
+    "authority": "none"
+  },
+  "server_sandbox": {
+    "kind": "server_sandbox",
+    "display_name": "Server sandbox",
+    "authority": "read_write"
+  },
+  "edge_workspace": {
+    "kind": "edge_workspace",
+    "display_name": "MacBook Pro",
+    "root": "/Users/test/astra",
+    "source": {
+      "kind": "edge_path",
+      "path": "/Users/test/astra"
+    },
+    "authority": "read_write"
+  }
+}

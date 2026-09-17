@@ -31,6 +31,13 @@ export const PATH_RUNS = "/runs";
 export const PATH_WORKS = "/v1/works";
 export const ASTRA_WORK_API_MAJOR_HEADER = "x-astra-work-api-major";
 export const ASTRA_WORK_API_MAJOR = "1";
+/**
+ * Major version of the interactive Server/Web/CLI stream contract.
+ * Keep this aligned with `astra_server_types::AGENT_INTERACTION_API_MAJOR`.
+ */
+export const ASTRA_AGENT_INTERACTION_API_MAJOR_HEADER =
+  "x-astra-agent-interaction-api-major";
+export const ASTRA_AGENT_INTERACTION_API_MAJOR = "3";
 
 export const PATH_EVENTS = "/events";
 

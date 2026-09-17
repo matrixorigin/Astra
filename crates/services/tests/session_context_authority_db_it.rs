@@ -726,15 +726,52 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         "edge-other",
         "/workspace/target",
     );
-    assert!(matches!(
+    let target_claim_hash: String = sqlx::query_scalar(
+        "SELECT workspace_identity_hash
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load target checkout claim before transfer");
+    // The completed switch left the first Session idle. An idle checkout is
+    // transferable to a fresh Session; only live execution evidence keeps the
+    // physical workspace fenced (covered by the admission/slot assertions in
+    // the dedicated claim test below).
+    let transferred = coordinator
+        .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
+        .await
+        .expect("an idle checkout claim transfers to the fresh Session");
+    assert_eq!(transferred.generation, 2);
+    assert_eq!(
         coordinator
-            .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
-            .await,
-        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            ref owner_session_id,
-            ref owner_branch_id,
-        }) if owner_session_id == &key.session_id && owner_branch_id == &key.branch_id
-    ));
+            .load_execution_binding(&other_key)
+            .await
+            .expect("load transferred execution binding")
+            .expect("transferred execution binding remains present"),
+        transferred
+    );
+    let transferred_claim: (String, String) = sqlx::query_as(
+        "SELECT session_id, branch_id
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND workspace_identity_hash = ?",
+    )
+    .bind(&other_key.isolation_domain)
+    .bind(&other_key.owner_user_id)
+    .bind(&target_claim_hash)
+    .fetch_one(pool.get())
+    .await
+    .expect("load transferred checkout claim");
+    assert_eq!(
+        transferred_claim,
+        (other_key.session_id.clone(), other_key.branch_id.clone())
+    );
 
     for table in [
         "session_execution_switches",
@@ -762,9 +799,9 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     let pool = common::setup_pool().await;
     let suffix = Uuid::new_v4().to_string();
     let owner_id = format!("execution-claim-owner-{suffix}");
-    let work_session_id = format!("execution-claim-work-session-{suffix}");
-    let ordinary_session_id = format!("execution-claim-ordinary-session-{suffix}");
-    let other_device_session_id = format!("execution-claim-other-device-session-{suffix}");
+    let work_session_id = format!("claim-work-{suffix}");
+    let ordinary_session_id = format!("claim-ordinary-{suffix}");
+    let other_device_session_id = format!("claim-other-device-{suffix}");
     let work_key = SessionKeyV1::owner_session("server", &owner_id, &work_session_id, "main");
     let ordinary_key =
         SessionKeyV1::owner_session("server", &owner_id, &ordinary_session_id, "main");
@@ -844,6 +881,284 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .await
         .expect("the first Session claims the checkout");
 
+    // Exercise the narrow admission window before an agent_runs/slot row is
+    // visible. The claim activity lease is the canonical fence in this gap;
+    // a second Session must still be rejected even when the run store has no
+    // evidence yet.
+    let work_actor = ActorContextV1::owner_user(
+        &owner_id,
+        "execution-claim-admission-db-it",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let (work_lease, work_reservation) = match coordinator
+        .acquire_writer_and_reserve_turn(
+            &work_key,
+            None,
+            &work_actor,
+            Duration::from_secs(30),
+            "claim-admission-writer",
+            "claim-admission-turn",
+            Some(work_edge.generation),
+        )
+        .await
+        .expect("admit active workspace claim")
+    {
+        AcquireWriterAndReserveTurnOutcome::Ready { lease, reservation } => (lease, reservation),
+        other => panic!("unexpected workspace claim admission outcome: {other:?}"),
+    };
+    let activity: (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT active_execution_id, active_execution_generation,
+                active_execution_expires_at_ms
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load active workspace turn reservation");
+    assert_eq!(
+        activity.0.as_deref(),
+        Some(work_reservation.reservation_id.as_str())
+    );
+    assert_eq!(activity.1, Some(work_reservation.writer_epoch as i64));
+    assert!(activity.2.is_some());
+
+    // Two local controllers may observe the same canonical Session, but the
+    // second turn cannot enter the model/tool boundary while the first one is
+    // active. This is the user-facing single-writer rule for two TUI windows
+    // opened against one Session.
+    coordinator
+        .verify_execution_workspace_claim_for_generation(
+            &work_key,
+            work_edge.generation,
+            &work_reservation.reservation_id,
+            work_reservation.writer_epoch,
+        )
+        .await
+        .expect("the admitting controller retains the active workspace claim");
+
+    // A retained writer can commit one turn and reserve the next one. The
+    // activity marker follows the per-turn reservation, so cleanup from the
+    // completed turn must not erase the newer turn's checkout fence.
+    let first_cursor = match coordinator
+        .commit_turn(
+            &work_reservation,
+            CanonicalTurnDeltaV1 {
+                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                config_version_id: None,
+                mode: CanonicalDeltaModeV1::Append,
+                logical_segments: vec![vec![serde_json::json!({
+                    "role": "user",
+                    "content": "first turn",
+                })]],
+            },
+            "claim-admission-commit",
+        )
+        .await
+        .expect("commit the first retained-writer turn")
+    {
+        CoordinatorMutationV1::Applied { cursor } => cursor,
+        other => panic!("unexpected first retained-writer commit: {other:?}"),
+    };
+    let work_reservation_next = match coordinator
+        .reserve_turn(
+            &work_lease,
+            Some(&first_cursor),
+            Duration::from_secs(30),
+            "claim-admission-turn-next",
+            Some(work_edge.generation),
+        )
+        .await
+        .expect("reserve the second turn under the retained writer")
+    {
+        ReserveTurnOutcome::Reserved(reservation) => reservation,
+        ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
+        other => panic!("unexpected second retained-writer reservation: {other:?}"),
+    };
+    let next_activity: Option<String> = sqlx::query_scalar(
+        "SELECT active_execution_id
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load second active workspace reservation");
+    assert_eq!(
+        next_activity.as_deref(),
+        Some(work_reservation_next.reservation_id.as_str())
+    );
+    let renewed_next = coordinator
+        .renew_turn_authority(&work_lease, &work_reservation_next, Duration::from_secs(60))
+        .await
+        .expect("a retained writer can renew its newer turn");
+    assert_eq!(renewed_next.writer_lease.lease_id, work_lease.lease_id);
+    assert_eq!(
+        renewed_next.turn_reservation.reservation_id,
+        work_reservation_next.reservation_id
+    );
+    assert_eq!(
+        renewed_next.turn_reservation.expected_cursor,
+        Some(first_cursor.clone())
+    );
+    let mut tampered_next = work_reservation_next.clone();
+    tampered_next.expected_cursor = None;
+    assert!(matches!(
+        coordinator
+            .renew_turn_authority(&work_lease, &tampered_next, Duration::from_secs(60))
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    let after_tampered_renewal: Option<i64> = sqlx::query_scalar(
+        "SELECT active_execution_expires_at_ms
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load activity after rejecting a tampered renewal");
+    assert_eq!(
+        after_tampered_renewal,
+        Some(renewed_next.turn_reservation.expires_at_unix_ms)
+    );
+    let stale_renewal = coordinator
+        .renew_turn_authority(&work_lease, &work_reservation, Duration::from_secs(60))
+        .await;
+    assert!(matches!(
+        stale_renewal,
+        Err(SessionContextCoordinatorError::Fenced)
+    ));
+    coordinator
+        .clear_execution_workspace_activity(
+            &work_key,
+            &work_reservation.reservation_id,
+            work_reservation.writer_epoch,
+        )
+        .await
+        .expect("stale first-turn cleanup is idempotent");
+    let after_stale_cleanup: Option<String> = sqlx::query_scalar(
+        "SELECT active_execution_id
+         FROM session_execution_workspace_claims
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&work_key.isolation_domain)
+    .bind(&work_key.owner_user_id)
+    .bind(&work_key.session_id)
+    .bind(&work_key.branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("reload active workspace reservation after stale cleanup");
+    assert_eq!(
+        after_stale_cleanup.as_deref(),
+        Some(work_reservation_next.reservation_id.as_str())
+    );
+    coordinator
+        .verify_execution_workspace_claim_for_generation(
+            &work_key,
+            work_edge.generation,
+            &work_reservation_next.reservation_id,
+            work_reservation_next.writer_epoch,
+        )
+        .await
+        .expect("the second turn retains its workspace fence after stale cleanup");
+    let duplicate_actor = ActorContextV1::owner_user(
+        &owner_id,
+        "execution-claim-second-controller",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    assert!(matches!(
+        coordinator
+            .acquire_writer_and_reserve_turn(
+                &work_key,
+                None,
+                &duplicate_actor,
+                Duration::from_secs(30),
+                "claim-second-controller-writer",
+                "claim-second-controller-turn",
+                Some(work_edge.generation),
+            )
+            .await
+            .expect("second controller admission result"),
+        AcquireWriterAndReserveTurnOutcome::WriterConflict {
+            active_lease_expires_at_unix_ms: Some(_),
+            ..
+        }
+    ));
+
+    let mut ordinary_admission_edge = edge_binding(
+        &ordinary_initial.logical_workspace_id,
+        2,
+        "edge-admission-race",
+        "materialization-shared-device",
+    );
+    ordinary_admission_edge.state = SessionExecutionBindingStateV1::Switching;
+    assert!(matches!(
+        coordinator
+            .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_admission_edge)
+            .await,
+        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. })
+    ));
+    coordinator
+        .release_writer(&work_lease)
+        .await
+        .expect("release admission window claim");
+
+    // Keep the first owner actively executing while the second Session tries
+    // to bind the same physical checkout. Idle claims are intentionally
+    // transferable; this durable slot is the evidence that must keep this
+    // concurrent admission fenced.
+    let active_claim_run_id = format!("active-claim-run-{suffix}");
+    sqlx::query(
+        "INSERT INTO agent_runs
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+          owner_pod_id, owner_lease_expires_at)
+         VALUES (?, ?, ?, ?, ?, 'running', ?, TIMESTAMPADD(MINUTE, 10, NOW(6)))",
+    )
+    .bind(&active_claim_run_id)
+    .bind(&owner_id)
+    .bind(&work_session_id)
+    .bind(&active_claim_run_id)
+    .bind(&active_claim_run_id)
+    .bind("workspace-claim-test")
+    .execute(pool.get())
+    .await
+    .expect("install active workspace owner run");
+    sqlx::query(
+        "INSERT INTO agent_session_execution_slots
+         (user_id, session_id, run_id, acquired_at, updated_at)
+         VALUES (?, ?, ?, NOW(6), NOW(6))",
+    )
+    .bind(&owner_id)
+    .bind(&work_session_id)
+    .bind(&active_claim_run_id)
+    .execute(pool.get())
+    .await
+    .expect("install active workspace owner slot");
+
     let mut ordinary_edge = edge_binding(
         &ordinary_initial.logical_workspace_id,
         2,
@@ -872,6 +1187,44 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         ordinary_after.workspace.kind,
         astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
     );
+
+    sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?")
+        .bind(&owner_id)
+        .bind(&work_session_id)
+        .execute(pool.get())
+        .await
+        .expect("release active workspace owner slot");
+    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&owner_id)
+        .bind(&active_claim_run_id)
+        .execute(pool.get())
+        .await
+        .expect("release active workspace owner run");
+
+    // Once the previous owner is truly idle, a fresh Session may take over
+    // the same checkout without an explicit `/resume`. The transfer is
+    // serialized by the claim row and returns the new Session's generation.
+    let mut ordinary_takeover = edge_binding(
+        &ordinary_initial.logical_workspace_id,
+        2,
+        "edge-reclaimed",
+        "materialization-shared-device",
+    );
+    ordinary_takeover.state = SessionExecutionBindingStateV1::Switching;
+    coordinator
+        .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_takeover)
+        .await
+        .expect("an idle checkout claim can transfer to a fresh Session");
+    let ordinary_takeover_ready = edge_binding(
+        &ordinary_initial.logical_workspace_id,
+        3,
+        "edge-reclaimed",
+        "materialization-shared-device",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_takeover_ready)
+        .await
+        .expect("the fresh Session can finish the transferred binding");
 
     let mut other_device_preparing = edge_binding(
         &other_device_initial.logical_workspace_id,
@@ -924,23 +1277,23 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     assert_eq!(switched.generation, 5);
     let mut ordinary_reclaim = edge_binding(
         &ordinary_initial.logical_workspace_id,
-        2,
+        4,
         "edge-reclaimed",
         "materialization-shared-device",
     );
     ordinary_reclaim.state = SessionExecutionBindingStateV1::Switching;
     coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_reclaim)
+        .compare_and_swap_execution_binding(&ordinary_key, 3, &ordinary_reclaim)
         .await
         .expect("the old materialization can be prepared after the handoff");
     let ordinary_reclaim = edge_binding(
         &ordinary_initial.logical_workspace_id,
-        3,
+        5,
         "edge-reclaimed",
         "materialization-shared-device",
     );
     coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_reclaim)
+        .compare_and_swap_execution_binding(&ordinary_key, 4, &ordinary_reclaim)
         .await
         .expect("the old materialization is released after the handoff");
 

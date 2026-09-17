@@ -261,6 +261,88 @@ pub struct WorkExecutionViewV1 {
     pub failure_code: Option<String>,
 }
 
+/// Request a server-authored recovery point. The server reads the manifest
+/// from canonical Work/Session facts; clients cannot submit paths, hashes, or
+/// capability claims.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointCreateRequestV1 {
+    pub request_id: String,
+    #[serde(default)]
+    pub reason: Option<astra_turn_types::RecoveryPointReasonV1>,
+    #[serde(default)]
+    pub expected_work_revision: Option<u64>,
+    #[serde(default)]
+    pub expected_branch_revision: Option<u64>,
+    #[serde(default)]
+    pub expected_graph_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRecoveryPointV1 {
+    pub schema_version: u32,
+    pub owner_id: String,
+    pub work_id: String,
+    pub branch_id: String,
+    pub recovery_point_id: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub status: String,
+    pub manifest: Option<astra_turn_types::RecoveryPointManifestV1>,
+    pub manifest_hash: Option<String>,
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub published_at: Option<String>,
+    pub assessment: astra_turn_types::RecoveryPointAssessmentV1,
+}
+
+#[cfg(feature = "server")]
+impl From<astra_services::work::WorkRecoveryPointRecord> for WorkRecoveryPointV1 {
+    fn from(record: astra_services::work::WorkRecoveryPointRecord) -> Self {
+        Self {
+            schema_version: record.schema_version,
+            owner_id: record.owner_id.as_str().to_owned(),
+            work_id: record.work_id.as_str().to_owned(),
+            branch_id: record.branch_id.as_str().to_owned(),
+            recovery_point_id: record.recovery_point_id,
+            request_id: record.request_id.as_str().to_owned(),
+            request_hash: record.request_hash.as_str().to_owned(),
+            status: serde_json::to_value(record.status)
+                .expect("recovery point status is serializable")
+                .as_str()
+                .expect("recovery point status is a string")
+                .to_owned(),
+            manifest: record.manifest,
+            manifest_hash: record.manifest_hash.map(|hash| hash.as_str().to_owned()),
+            failure_reason: record.failure_reason,
+            created_at: record
+                .created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            updated_at: record
+                .updated_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            published_at: record
+                .published_at
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+            assessment: record.assessment,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct WorkRecoveryPointResponseV1(pub WorkRecoveryPointV1);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkRecoveryPointListResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub recovery_points: Vec<WorkRecoveryPointV1>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkExecutionTargetV1 {

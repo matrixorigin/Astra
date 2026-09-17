@@ -200,6 +200,41 @@ export type WorkspaceBinding = {
   fallback_policy?: "disabled";
 };
 
+/**
+ * Workspace boundary accepted on chat/run requests.
+ *
+ * This is intentionally separate from `WorkspaceBinding`, which describes the
+ * workspace observed in runtime events. Requests use the server's canonical
+ * `root`/`source` fields; event-only fields such as `cwd` and
+ * `fallback_policy` must never be sent back to the runtime.
+ */
+export type WorkspaceSourceRequest =
+  | { kind: "edge_path"; path: string }
+  | {
+      kind: "uploaded_snapshot";
+      artifact_id: string;
+      root?: string;
+    }
+  | {
+      kind: "git_checkout";
+      repository: string;
+      reference?: string;
+    }
+  | { kind: "template"; template_id: string }
+  | { kind: "dataset_bundle"; dataset_id: string }
+  | { kind: "artifact_bundle"; artifact_id: string }
+  | { kind: "scratch" }
+  | { kind: "persistent_volume"; volume_id: string };
+
+/** Canonical workspace boundary accepted by the runtime request schema. */
+export type WorkspaceBindingRequest = {
+  kind: "server_sandbox" | "edge_workspace" | "cloud_workspace" | "none";
+  display_name?: string;
+  root?: string;
+  source?: WorkspaceSourceRequest;
+  authority?: "read_only" | "read_write" | "none";
+};
+
 export type ExecutorBinding = {
   kind:
     | "server_local"
@@ -965,7 +1000,7 @@ export type ChatConfig = {
   /** Catalog surfacing — sent as `skill_search` (snake_case fields on the wire). */
   skillSearch?: SkillSearchSettings;
   /** Optional explicit workspace boundary for direct SDK integrations. */
-  workspaceBinding?: WorkspaceBinding;
+  workspaceBinding?: WorkspaceBindingRequest;
   /** Optional explicit executor boundary for direct SDK integrations. */
   executorBinding?: ExecutorBinding;
 };
@@ -1052,7 +1087,7 @@ export type ChatRequest = {
    * array intentionally disables all user-selectable optional tools. */
   enabledTools?: string[];
   skillSearch?: SkillSearchSettings;
-  workspaceBinding?: WorkspaceBinding;
+  workspaceBinding?: WorkspaceBindingRequest;
   executorBinding?: ExecutorBinding;
 };
 

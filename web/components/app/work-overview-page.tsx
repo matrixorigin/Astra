@@ -935,7 +935,7 @@ export function WorkOverviewPage({
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
             <WorkExecutionCard
-              key={branchId}
+              key={`execution:${branchId}`}
               workId={overview.work_id}
               branchId={branchId}
               initialExecution={initialExecution}
@@ -1171,7 +1171,7 @@ export function WorkOverviewPage({
 
             {patchArtifacts !== undefined ? (
               <WorkPatchReviewCard
-                key={branchId}
+                key={`patch:${branchId}`}
                 workId={overview.work_id}
                 branchId={branchId}
                 initial={patchArtifacts}

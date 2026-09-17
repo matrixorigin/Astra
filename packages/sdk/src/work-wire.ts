@@ -186,7 +186,7 @@ export function decodeWorkExecutionViewV1(value: unknown): WorkExecutionViewV1 {
     ),
     placement: oneOf(object.placement, ["server", "edge"] as const, `${path}.placement`),
     executor_id: nullableExecutionIdentity(object.executor_id, `${path}.executor_id`),
-    executor_name: nullableExecutionIdentity(object.executor_name, `${path}.executor_name`),
+    executor_name: nullableDisplayLabel(object.executor_name, `${path}.executor_name`),
     operation_id: nullableExecutionIdentity(object.operation_id, `${path}.operation_id`),
     attempt,
     failure_code: executionFailureCode(object.failure_code, `${path}.failure_code`),
@@ -220,8 +220,8 @@ export function decodeWorkExecutionTargetPageV1(
     targetIds.add(executorId);
     return {
       executor_id: executorId,
-      display_name: nullableExecutionIdentity(target.display_name, `${targetPath}.display_name`),
-      hostname: nullableExecutionIdentity(target.hostname, `${targetPath}.hostname`),
+      display_name: nullableDisplayLabel(target.display_name, `${targetPath}.display_name`),
+      hostname: nullableDisplayLabel(target.hostname, `${targetPath}.hostname`),
       capabilities: target.capabilities.map((capability, capabilityIndex) =>
         capabilityIdentity(capability, `${targetPath}.capabilities[${capabilityIndex}]`)),
       connected: booleanValue(target.connected, `${targetPath}.connected`),
@@ -335,6 +335,20 @@ function opaqueIdentity(value: unknown, path: string): string {
     throw new TypeError(`${path} is not a canonical identity`);
   }
   return parsed;
+}
+
+/** User-facing labels may contain normal spaces, but never control chars. */
+function displayLabel(value: unknown, path: string): string {
+  const parsed = nonEmptyString(value, path);
+  if (/[\u0000-\u001f\u007f]/u.test(parsed)) {
+    throw new TypeError(`${path} must not contain control characters`);
+  }
+  return parsed;
+}
+
+function nullableDisplayLabel(value: unknown, path: string): string | null {
+  if (value === null) return null;
+  return displayLabel(value, path);
 }
 
 function resourceIdentity(value: unknown, path: string): string {

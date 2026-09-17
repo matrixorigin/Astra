@@ -271,43 +271,63 @@ fn resolve_workspace_astra_bin(ancestor: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+fn resolve_existing_astra_bin(path: &std::path::Path, cwd: &std::path::Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = std::fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "astra binary {:?} does not exist or cannot be resolved from {}",
+            path,
+            cwd.display()
+        )
+    })?;
+    if !resolved.is_file() {
+        anyhow::bail!("astra binary {:?} is not a file", resolved.display());
+    }
+    Ok(resolved)
+}
+
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     if let Some(p) = explicit {
-        if !p.is_file() {
-            anyhow::bail!(
+        return resolve_existing_astra_bin(&p, &cwd).with_context(|| {
+            format!(
                 "--astra-bin {:?} does not exist or is not a file",
                 p.display()
-            );
-        }
-        return Ok(p);
+            )
+        });
     }
     if let Ok(env_path) = std::env::var("ASTRA_BIN")
         && !env_path.trim().is_empty()
     {
         let p = PathBuf::from(env_path);
-        if p.is_file() {
+        if let Ok(resolved) = resolve_existing_astra_bin(&p, &cwd) {
             eprintln!(
                 "[astra-test] using astra bin from ASTRA_BIN: {}",
-                p.display()
+                resolved.display()
             );
-            return Ok(p);
+            return Ok(resolved);
         }
     }
     if let Some(found) = find_on_path("astra") {
+        let resolved = resolve_existing_astra_bin(&found, &cwd)?;
         eprintln!(
             "[astra-test] using astra bin from PATH: {}",
-            found.display()
+            resolved.display()
         );
-        return Ok(found);
+        return Ok(resolved);
     }
-    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
     for ancestor in cwd.ancestors() {
         if let Some(candidate) = resolve_workspace_astra_bin(ancestor) {
+            let resolved = resolve_existing_astra_bin(&candidate, &cwd)?;
             eprintln!(
                 "[astra-test] using astra bin from workspace: {}",
-                candidate.display()
+                resolved.display()
             );
-            return Ok(candidate);
+            return Ok(resolved);
         }
     }
     anyhow::bail!(
@@ -382,6 +402,14 @@ async fn main() -> Result<()> {
             "--suite is required in CLI mode. Use --live-dashboard for the web console."
         )
     })?;
+    // Capture the source revision before reading case files. After the case
+    // matrix is assembled below, admission verifies that this exact source
+    // is still clean and current; only then may slow pre-flight probes run.
+    let workspace_source = if args.working_dir.is_none() {
+        astra_test_harness::workspace::source_snapshot_for_suite(suite_path)?
+    } else {
+        None
+    };
     let mut cases = Case::load_dir(suite_path)
         .with_context(|| format!("load cases from {}", suite_path.display()))?;
     if cases.is_empty() {
@@ -431,6 +459,15 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
     let mut runner_profile = args.profile.clone();
+
+    if let Some(ref snapshot) = workspace_source {
+        astra_test_harness::workspace::ensure_snapshot_unchanged(snapshot)?;
+        eprintln!(
+            "[astra-test] live Git suite will use one isolated worktree per execution job from {} at {}",
+            snapshot.repository_root().display(),
+            snapshot.revision()
+        );
+    }
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
@@ -495,6 +532,7 @@ async fn main() -> Result<()> {
         .with_fallback_models(fallback_models.clone())
         .with_required_memoria_subsystem_health();
     runner_cfg.working_dir = args.working_dir.clone();
+    runner_cfg.workspace_source = workspace_source;
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
     runner_cfg.cleanup_created_sessions = true;
@@ -696,7 +734,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_astra_bin;
+    use super::{resolve_existing_astra_bin, resolve_workspace_astra_bin};
     use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
     use std::time::Duration;
@@ -733,6 +771,20 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         fs::write(&release_bin, b"release-newer").unwrap();
         assert_eq!(resolve_workspace_astra_bin(dir.path()), Some(release_bin));
+    }
+
+    #[test]
+    fn explicit_relative_binary_is_resolved_before_subprocess_cwd_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug = dir.path().join("target/debug");
+        fs::create_dir_all(&debug).unwrap();
+        let binary = debug.join("astra");
+        fs::write(&binary, b"binary").unwrap();
+
+        let resolved =
+            resolve_existing_astra_bin(std::path::Path::new("target/debug/astra"), dir.path())
+                .unwrap();
+        assert_eq!(resolved, fs::canonicalize(binary).unwrap());
     }
 
     #[test]

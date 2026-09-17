@@ -185,8 +185,18 @@ impl CslManager {
             self.load().await?;
         }
         let session_state = session_state.for_csl_continuity();
+        // Turn provenance is an execution transport detail. It may be present
+        // on a partial/failure response that reaches this deferred projection,
+        // while the canonical cursor is deliberately computed from the
+        // prompt-facing message shape. Strip it before validating the cursor
+        // and before storing the CSL snapshot so a failed turn cannot make a
+        // later `/resume` reject an otherwise valid canonical journal.
+        let mut canonical_messages = messages.to_vec();
+        for message in &mut canonical_messages {
+            astra_turn_types::clear_turn_message_provenance(message);
+        }
         if let Some(cursor) = session_state.source_cursor.as_ref() {
-            validate_csl_source_cursor(&self.session_id, cursor, messages)?;
+            validate_csl_source_cursor(&self.session_id, cursor, &canonical_messages)?;
             if cursor.completed_turn != turn {
                 return Err(CslStoreError::CausalProjection(format!(
                     "CSL projection turn {turn} does not match cursor turn {}",
@@ -211,7 +221,7 @@ impl CslManager {
                             ));
                         }
                         if cursor.compaction_generation == previous.compaction_generation
-                            && !messages.starts_with(&self.last_canonical_messages)
+                            && !canonical_messages.starts_with(&self.last_canonical_messages)
                         {
                             return Err(CslStoreError::CausalProjection(
                                 "CSL projection does not extend the prior canonical messages"
@@ -229,9 +239,8 @@ impl CslManager {
         }
         record_full_history_clone(
             astra_core::history_work::HistoryWorkSite::CslPersistInputClone,
-            messages,
+            &canonical_messages,
         );
-        let mut canonical_messages = messages.to_vec();
         carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
         let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
@@ -653,6 +662,31 @@ mod tests {
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.last_seq, 1);
         assert_eq!(mat.messages[0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn turn_provenance_does_not_poison_resume_cursor_validation() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = test_manager(&tmp);
+        let canonical = vec![user_msg("hello"), assistant_msg("partial")];
+        let mut delivered = canonical.clone();
+        for message in &mut delivered {
+            assert!(astra_turn_types::mark_turn_message(message, "run-partial"));
+        }
+        let state = state_at_cursor("test-session", 1, &canonical);
+
+        mgr.persist_turn(1, &delivered, &state)
+            .await
+            .expect("deferred CSL projection should accept transport provenance");
+
+        let mut loader = test_manager(&tmp);
+        let materialized = loader.load().await.unwrap().expect("snapshot");
+        assert_eq!(materialized.messages, canonical);
+        assert!(materialized.messages.iter().all(|message| {
+            message
+                .get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        }));
     }
 
     #[tokio::test]

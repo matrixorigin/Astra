@@ -2750,6 +2750,26 @@ test("execution decoders enforce identity, bounded targets, and terminal generat
   );
 });
 
+test("execution decoders preserve human-readable executor labels", () => {
+  const labelledView = {
+    ...executionView,
+    executor_name: "MacBook Pro",
+  };
+  expect(decodeWorkExecutionViewV1(labelledView).executor_name).toBe("MacBook Pro");
+
+  const labelledTargets = structuredClone(executionTargets);
+  labelledTargets.targets[0].display_name = "OpenShell Gateway";
+  labelledTargets.targets[0].hostname = "MacBook Pro";
+  expect(decodeWorkExecutionTargetPageV1(labelledTargets).targets[0]).toMatchObject({
+    display_name: "OpenShell Gateway",
+    hostname: "MacBook Pro",
+  });
+
+  expect(() =>
+    decodeWorkExecutionViewV1({ ...executionView, executor_name: "bad\nname" }),
+  ).toThrow("must not contain control characters");
+});
+
 test("execution client methods use no-store reads and sealed mutation bodies", async () => {
   const fetchMock = vi
     .fn()

@@ -1108,6 +1108,11 @@ impl DatabaseWorkBranchDeletionService {
                 "DELETE FROM work_branch_control_operations
                  WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
             ),
+            (
+                "delete branch recovery points",
+                "DELETE FROM work_recovery_points
+                 WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+            ),
         ] {
             sqlx::query(statement)
                 .bind(owner_id.as_str())

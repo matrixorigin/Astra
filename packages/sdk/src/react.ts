@@ -14,6 +14,8 @@ export type {
   ChatMessage,
   ToolCall,
   WorkspaceBinding,
+  WorkspaceBindingRequest,
+  WorkspaceSourceRequest,
   ExecutorBinding,
   PlanState,
   TokenUsage,
