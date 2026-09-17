@@ -153,6 +153,7 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_run_owner_generation: None,
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,

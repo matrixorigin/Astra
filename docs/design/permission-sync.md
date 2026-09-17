@@ -78,3 +78,32 @@ Revocation should be durable and provider-visible. Revoked grants should not be 
 - Revocation wins over stale local state.
 - Web can observe Edge waiting for permission.
 - Plan mode denial is reported distinctly from permission denial.
+
+## Runtime mode selection
+
+Permission-mode selection is an authenticated Run control, separate from model
+guidance. A request binds the expected Session and an idempotency key to a typed
+mode. The durable journal assigns its revision. Only the owning user's active
+root Run accepts requests; children retain inherited restrictions.
+
+Before each model round, the shared loop captures the latest selection and
+commits an application acknowledgement under the current owner generation.
+Failure to commit prevents the model call. A request arriving during a round
+cannot alter that round's captured policy. Recovery reapplies the durable
+selection under the new owner generation. Selection never advances guidance
+cursors or rewrites the stable prompt prefix or tool schema.
+
+The ordered application event updates the CLI policy owner and its root sandbox
+overlay before subsequent tool dispatch. Explicit skill restrictions remain in
+force. TUI intent is pending until its exact request identity is acknowledged;
+a delayed acknowledgement cannot erase a newer selection. When execution ends
+before another model round, the selected preference applies to the next user
+response. No session transcript is resumed implicitly.
+
+When a selection arrives during an approval wait, execution supersedes unstarted
+requests through the existing approval lifecycle and advances to the next model
+round. Completed results are retained; running tools are not reauthorized.
+The CLI stops the obsolete wait without posting a conflicting second approval
+decision. A local acceptance notification wakes promptly; another device's
+selection is discovered by bounded indexed reads only while approval is pending.
+Closed waiters are removed from the TUI without manufacturing an approval.

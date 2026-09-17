@@ -3304,6 +3304,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         break;
     }
 
+    // Cancellation and pause have priority over round control. Capture the
+    // permission selection before any mode-dependent preparation begins.
+    super::permission_boundary::apply_round_permission_mode(host, state)
+        .await
+        .map_err(|error| error.to_string())?;
+
     if let Err(error) = super::execution_phase::checked_completion_evidence(state) {
         super::execution_phase::finish_unavailable_verification(state, error);
         try_write_heavy_checkpoint(state);

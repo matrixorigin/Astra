@@ -556,16 +556,60 @@ fn decode_mode_for_mirror(value: u8) -> PermissionMode {
     PermissionMode::from_mirror_code(value)
 }
 
-/// Read-only handle to the live permission mode held by a
-/// [`PermissionManager`]. Cheap to clone; cheap to read. Used by
-/// the status-line refresh path where the TUI can't borrow the
-/// manager while the agentic loop holds `&mut state`.
+type ScopedModeSelection = (String, astra_turn_types::RunPermissionModeSelection);
+type SharedModeSelection = std::sync::Arc<std::sync::Mutex<Option<ScopedModeSelection>>>;
+
+/// A wake-up for unstarted approval waits, never authority to execute a tool.
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionControlSignal {
+    pub(crate) sender: tokio::sync::watch::Sender<Option<ScopedModeSelection>>,
+    applied: SharedModeSelection,
+}
+
+impl PermissionControlSignal {
+    pub(crate) fn accepted(
+        &self,
+        run_id: &str,
+        selection: &astra_turn_types::RunPermissionModeSelection,
+    ) {
+        let applied = astra_core::sync_poison::recover_mutex_lock(&self.applied);
+        if applied
+            .as_ref()
+            .is_some_and(|(run, ack)| run == run_id && ack.revision >= selection.revision)
+        {
+            return;
+        }
+        self.sender.send_if_modified(|pending| {
+            if pending
+                .as_ref()
+                .is_some_and(|(run, old)| run == run_id && old.revision >= selection.revision)
+            {
+                return false;
+            }
+            *pending = Some((run_id.to_owned(), selection.clone()));
+            true
+        });
+    }
+}
+
+/// Read-only view of the policy owner, available while execution borrows it.
 #[derive(Clone, Debug)]
 pub(crate) struct PermissionModeMirror {
     inner: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    applied_request_id: SharedModeSelection,
 }
 
 impl PermissionModeMirror {
+    pub(crate) fn applied_request_id(&self) -> Option<String> {
+        astra_core::sync_poison::recover_mutex_lock(&self.applied_request_id)
+            .as_ref()
+            .map(|(_, selection)| selection.request_id.clone())
+    }
+
+    pub(crate) fn applied_selection(&self) -> Option<ScopedModeSelection> {
+        astra_core::sync_poison::recover_mutex_lock(&self.applied_request_id).clone()
+    }
+
     pub(crate) fn current(&self) -> PermissionMode {
         decode_mode_for_mirror(self.inner.load(std::sync::atomic::Ordering::Acquire))
     }
@@ -576,6 +620,7 @@ impl PermissionModeMirror {
     pub(crate) fn from_encoded(encoded: u8) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(encoded)),
+            applied_request_id: Default::default(),
         }
     }
 }
@@ -1100,6 +1145,8 @@ pub(crate) struct PermissionManager {
     /// next-turn boundary) would not reach the chip until the
     /// outer select woke up. Updated atomically inside `set_mode`.
     mode_mirror: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    applied_mode_request_id: SharedModeSelection,
+    permission_control_signal: tokio::sync::watch::Sender<Option<ScopedModeSelection>>,
     session_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides,
     denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker,
@@ -1310,7 +1357,36 @@ impl PermissionManager {
     pub(crate) fn mode_mirror_handle(&self) -> PermissionModeMirror {
         PermissionModeMirror {
             inner: std::sync::Arc::clone(&self.mode_mirror),
+            applied_request_id: self.applied_mode_request_id.clone(),
         }
+    }
+
+    pub(crate) fn permission_control_signal(&self) -> PermissionControlSignal {
+        PermissionControlSignal {
+            sender: self.permission_control_signal.clone(),
+            applied: self.applied_mode_request_id.clone(),
+        }
+    }
+
+    pub(crate) fn apply_acknowledged_mode(
+        &mut self,
+        run_id: &str,
+        selection: &astra_turn_types::RunPermissionModeSelection,
+    ) {
+        self.set_mode(selection.mode);
+        let mut applied =
+            astra_core::sync_poison::recover_mutex_lock(&self.applied_mode_request_id);
+        *applied = Some((run_id.to_owned(), selection.clone()));
+        self.permission_control_signal.send_if_modified(|pending| {
+            if pending.as_ref().is_some_and(|(run, pending)| {
+                run == run_id && pending.revision <= selection.revision
+            }) {
+                *pending = None;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub(crate) fn set_active_session_id(&mut self, session_id: &str) {
@@ -1416,6 +1492,8 @@ impl PermissionManager {
             mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 encode_mode_for_mirror(mode),
             )),
+            applied_mode_request_id: Default::default(),
+            permission_control_signal: tokio::sync::watch::channel(None).0,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1550,6 +1628,8 @@ impl PermissionManager {
             mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 encode_mode_for_mirror(mode),
             )),
+            applied_mode_request_id: Default::default(),
+            permission_control_signal: tokio::sync::watch::channel(None).0,
             session_overrides:
                 astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
@@ -1649,6 +1729,8 @@ impl PermissionManager {
             mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 encode_mode_for_mirror(mode),
             )),
+            applied_mode_request_id: Default::default(),
+            permission_control_signal: tokio::sync::watch::channel(None).0,
             session_overrides,
             turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
             ),

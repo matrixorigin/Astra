@@ -16,9 +16,8 @@ pub(crate) struct StatusContext {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub permission_mode: PermissionMode,
-    /// A permission policy selected while the current turn is still
-    /// running. It is a UI-only intent and must never replace
-    /// `permission_mode` until the turn settles.
+    /// A requested policy, pending until execution acknowledges application.
+    /// This presentation state never grants tool authority.
     pub pending_permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
@@ -330,12 +329,9 @@ impl StatusLine {
             permission_style,
         ));
 
-        // A staged mode is a next-turn intent, not a second current policy.
-        // Keep it visually subordinate and avoid saying `next: Ask` when a
-        // cycle has returned to the already-active mode.
-        if let Some(next_mode) = ctx.pending_permission_mode
-            && next_mode != ctx.permission_mode
-        {
+        // Returning to the active mode may still supersede a remote request.
+        // Keep that intent visible until its application is acknowledged.
+        if let Some(next_mode) = ctx.pending_permission_mode {
             out.left.push(Segment::styled(
                 format!("next: {}", permission_mode_label(next_mode)),
                 muted,

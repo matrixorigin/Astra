@@ -1021,6 +1021,7 @@ pub(crate) async fn stream_chat_sse(
         skill_produced_output: false,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         permission_context: Some(root_permission_context),
+        applied_permission_mode: None,
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,

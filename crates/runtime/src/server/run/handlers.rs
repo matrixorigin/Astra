@@ -265,6 +265,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "provider_interaction_required"
             | "provider_interaction_resolved"
             | "user_intent"
+            | "permission_mode_applied"
             | "user_intent_applied"
             | "user_intent_returned"
             | "run_finished"
@@ -578,10 +579,14 @@ pub(crate) async fn stream_run_handler(
                     event_rx,
                 )
             } else {
-                sse_json_response(transform_stream_run_events_for_client(
+                let mut events = vec![serde_json::json!({
+                    "type":"session_info", "session_id":stream.session_id, "run_id":stream.run_id,
+                })];
+                events.extend(transform_stream_run_events_for_client(
                     &run_id,
                     stream.events,
-                ))
+                ));
+                sse_json_response(events)
             }
         }
         Err((status, error)) => sse_error_response_from_error_with_context(
@@ -734,6 +739,41 @@ pub(crate) async fn submit_run_user_intent_handler(
         duplicate: result.duplicate,
         event_index: result.event_index,
     }))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct RunPermissionModeQuery {
+    pub expected_session_id: String,
+}
+
+pub(crate) async fn request_permission_mode_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<astra_turn_types::RunPermissionModeRequest>,
+) -> Result<Json<astra_turn_types::RunPermissionModeSelection>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .request_permission_mode(user.user_id, run_id, request)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn permission_mode_snapshot_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunPermissionModeQuery>,
+) -> Result<Json<astra_turn_types::RunPermissionModeSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .execution
+        .run_lifecycle_service
+        .permission_mode_snapshot(user.user_id, query.expected_session_id, run_id)
+        .await
+        .map(Json)
 }
 
 #[cfg(test)]

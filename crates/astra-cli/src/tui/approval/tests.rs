@@ -95,8 +95,8 @@ fn focus_wraps_at_the_ends() {
     let mut q = ApprovalQueue::new();
     enqueue(&mut q, "a");
     enqueue(&mut q, "b");
-    q.move_focus_up();
-    assert_eq!(q.focus_index(), Some(1), "up from 0 wraps to last");
+    q.move_focus_down();
+    assert_eq!(q.focus_index(), Some(1));
     q.move_focus_down();
     assert_eq!(q.focus_index(), Some(0), "down from last wraps to first");
 }
@@ -105,7 +105,6 @@ fn focus_wraps_at_the_ends() {
 fn move_focus_on_empty_queue_is_noop() {
     let mut q = ApprovalQueue::new();
     q.move_focus_down();
-    q.move_focus_up();
     assert_eq!(q.focus_index(), None);
 }
 

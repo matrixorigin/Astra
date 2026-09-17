@@ -1289,7 +1289,7 @@ impl BottomPane {
         self.skill_popup = None;
     }
 
-    pub(crate) fn stage_permission_mode_for_next_turn(
+    pub(crate) fn stage_permission_mode_for_next_round(
         &mut self,
         mode: crate::cli::permission_manager::PermissionMode,
     ) {
@@ -1297,17 +1297,15 @@ impl BottomPane {
         self.footer.set_pending_permission_mode(mode);
     }
 
-    /// Clear a staged next-turn policy and its status-line presentation.
-    /// Used when a repeated cycle returns to the live policy or when a
-    /// pending selection is cancelled before settlement.
+    /// Clear a pending selection after acknowledgement or response settlement.
     pub(crate) fn clear_staged_permission_mode(&mut self) {
         self.staged_permission_mode = None;
         self.footer.clear_pending_permission_mode();
     }
 
-    /// Peek at the policy selected for the next turn without consuming it.
+    /// Peek at the requested policy without consuming it.
     /// Repeated runtime shortcuts use this value as their cycle cursor while
-    /// the currently executing turn keeps its original policy.
+    /// the currently executing round keeps its captured policy.
     pub(crate) fn staged_permission_mode(
         &self,
     ) -> Option<crate::cli::permission_manager::PermissionMode> {
@@ -1453,9 +1451,6 @@ impl BottomPane {
     }
 
     /// Move focus within the pending-approval queue.
-    pub fn move_approval_focus_up(&mut self) {
-        self.approval_queue.move_focus_up();
-    }
     pub fn move_approval_focus_down(&mut self) {
         self.approval_queue.move_focus_down();
     }
@@ -1791,10 +1786,6 @@ impl BottomPane {
                 self.move_approval_focus_down();
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::BackTab if self.slash_menu.is_none() && self.mention_menu.is_none() => {
-                self.move_approval_focus_up();
-                Some(BottomPaneAction::Consumed)
-            }
             _ => None,
         }
     }
@@ -1998,7 +1989,8 @@ impl BottomPane {
     }
 
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
-        let mut changed = false;
+        let mut changed = self.approval_queue.prune_closed() > 0;
+        self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
             view.pre_draw_tick(now);
         }

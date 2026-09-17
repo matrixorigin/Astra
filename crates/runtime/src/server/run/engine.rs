@@ -789,6 +789,48 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
 }
 
 impl RunEngine {
+    pub async fn request_permission_mode(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &astra_services::runs::RunPermissionModeRequest,
+    ) -> Result<astra_services::runs::RunPermissionModeSelection, String> {
+        self.store
+            .request_permission_mode(user_id, run_id, request)
+            .await
+    }
+    pub async fn permission_mode_snapshot(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::RunPermissionModeSnapshot>, String> {
+        self.store
+            .permission_mode_snapshot(user_id, session_id, run_id)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_permission_mode(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+        selection: &astra_services::runs::RunPermissionModeSelection,
+        round_index: u32,
+    ) -> Result<bool, String> {
+        self.store
+            .apply_permission_mode(
+                user_id,
+                session_id,
+                run_id,
+                generation,
+                selection,
+                round_index,
+            )
+            .await
+    }
+
     /// Create a new engine backed by the given store.
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
@@ -3609,6 +3651,35 @@ impl RunEngine {
 
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
+    async fn permission_mode_snapshot(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<astra_services::runs::RunPermissionModeSnapshot>, String> {
+        RunEngine::permission_mode_snapshot(self, user_id, session_id, run_id).await
+    }
+    async fn apply_permission_mode(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+        selection: &astra_services::runs::RunPermissionModeSelection,
+        round_index: u32,
+    ) -> Result<bool, String> {
+        RunEngine::apply_permission_mode(
+            self,
+            user_id,
+            session_id,
+            run_id,
+            generation,
+            selection,
+            round_index,
+        )
+        .await
+    }
+
     #[allow(clippy::blocks_in_conditions)]
     async fn control_status(
         &self,

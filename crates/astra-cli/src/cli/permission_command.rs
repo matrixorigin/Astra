@@ -58,16 +58,15 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
 
 /// Return the next mode for the low-friction Shift+Tab cycle.
 ///
-/// The cycle only covers the reversible everyday policies. `Bypass` stays an
-/// explicit, confirmed choice and `Deny` stays sticky so a shortcut cannot
-/// silently widen or revoke the user's capability policy.
+/// The shortcut is an explicit user policy selection, including Bypass.
+/// Deny stays sticky; leaving it requires an explicit mode selection.
 pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
     match current {
         PermissionMode::Deny => PermissionMode::Deny,
         PermissionMode::Prompt => PermissionMode::AcceptEdits,
         PermissionMode::AcceptEdits => PermissionMode::Plan,
         PermissionMode::Plan => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::Prompt,
+        PermissionMode::Auto => PermissionMode::Bypass,
         PermissionMode::Bypass => PermissionMode::Prompt,
     }
 }
@@ -254,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_cycle_is_reversible_and_keeps_explicit_modes_out() {
+    fn permission_mode_cycle_includes_bypass_and_keeps_deny_sticky() {
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Prompt),
             PermissionMode::AcceptEdits
@@ -269,7 +268,7 @@ mod tests {
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Prompt
+            PermissionMode::Bypass
         );
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Bypass),

@@ -159,6 +159,29 @@ pub enum UserIntentApplyAck {
 /// cancel/pause control without sticky sessions.
 #[async_trait]
 pub trait RunStatusProvider: Send + Sync {
+    /// Read requested and applied permission choices at a model-round boundary.
+    async fn permission_mode_snapshot(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<astra_turn_types::RunPermissionModeSnapshot>, String> {
+        Ok(None)
+    }
+
+    /// Acknowledge the captured choice under the exact durable execution owner.
+    async fn apply_permission_mode(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _expected_owner_generation: u64,
+        _selection: &astra_turn_types::RunPermissionModeSelection,
+        _round_index: u32,
+    ) -> Result<bool, String> {
+        Err("permission-mode acknowledgement is unsupported".into())
+    }
+
     /// Returns `Some(Cancelled)`, `Some(Paused)`, or `None` if the run is
     /// still active (or doesn't exist). Transient lookup failures must be
     /// surfaced so callers do not confuse control-plane unavailability with a

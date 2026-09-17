@@ -2762,6 +2762,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
+    if matches!(
+        admitted_tool_call_control,
+        super::host::AdmittedToolCallControl::PermissionModePending
+    ) {
+        // Permission choices are independent of guidance/action epochs. All
+        // current-round terminal facts are persisted above; the next loop
+        // iteration captures and acknowledges the choice before preparation.
+        state.step_recorder.end_turn(false);
+        return Ok(TurnToolPhaseControl::ContinueLoop);
+    }
+
     if tool_round_superseded {
         if !superseding_guidance_applied {
             let applied =

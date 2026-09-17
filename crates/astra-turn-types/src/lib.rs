@@ -22,6 +22,8 @@ pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
+mod permission_mode;
+pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionMode};
 mod provider_canonical_transition;
 mod provider_contract;
 mod result_quality;
@@ -198,4 +200,10 @@ pub use verification_frontier::{
     BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
     VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
     WorkspaceObservationProof,
+};
+
+pub mod permission_control;
+pub use permission_control::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
 };

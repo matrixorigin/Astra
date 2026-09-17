@@ -1062,6 +1062,11 @@ where
         .map_err(|_| crate::error::ThinClientError::InvalidSseJson(raw.clone()))
 }
 
+pub use astra_turn_types::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+mod permission_control;
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
@@ -6,6 +7,10 @@ use astra_core::{
 use astra_turn_types::{
     ModelSelection, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
     ToolInvocationResultPayload, UserIntentDelivery, UserIntentStatus,
+};
+pub use astra_turn_types::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -48,6 +53,29 @@ pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResp
 
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
+    async fn request_permission_mode(
+        &self,
+        _user_id: String,
+        _run_id: String,
+        _request: RunPermissionModeRequest,
+    ) -> Result<RunPermissionModeSelection, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Permission mode control is unavailable",
+        ))
+    }
+    async fn permission_mode_snapshot(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _run_id: String,
+    ) -> Result<RunPermissionModeSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Permission mode control is unavailable",
+        ))
+    }
+
     /// Return the process-wide durable run-owner identity, when this
     /// lifecycle implementation uses shared run leases.
     ///
@@ -4386,6 +4414,35 @@ pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
 
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
+    async fn request_permission_mode(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _request: &RunPermissionModeRequest,
+    ) -> Result<RunPermissionModeSelection, String> {
+        Err("permission mode control is not supported by this store".into())
+    }
+    async fn permission_mode_snapshot(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        Ok(None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_permission_mode(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _run_id: &str,
+        _generation: u64,
+        _selection: &RunPermissionModeSelection,
+        _round_index: u32,
+    ) -> Result<bool, String> {
+        Err("permission mode application is not supported by this store".into())
+    }
+
     /// Process-local durable owner capability used to fence external action
     /// dispatch. Callers must carry this exact value from the store that
     /// claimed the run; reconstructing it from the current database row would
@@ -6699,6 +6756,44 @@ fn event_metadata_projection_patch_hash(
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
+    async fn request_permission_mode(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunPermissionModeRequest,
+    ) -> Result<RunPermissionModeSelection, String> {
+        self.request_permission_mode_inner(user_id, run_id, request)
+            .await
+    }
+    async fn permission_mode_snapshot(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+            .await
+    }
+    async fn apply_permission_mode(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+        selection: &RunPermissionModeSelection,
+        round_index: u32,
+    ) -> Result<bool, String> {
+        self.apply_permission_mode_inner(
+            user_id,
+            session_id,
+            run_id,
+            generation,
+            selection,
+            round_index,
+        )
+        .await
+    }
+
     async fn reconcile_execution_handoff(
         &self,
         claim: &RecoveryClaim,
@@ -14027,6 +14122,44 @@ impl DatabaseRunStateStore {
 
 #[async_trait]
 impl RunStateStore for DatabaseRunStateStore {
+    async fn request_permission_mode(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request: &RunPermissionModeRequest,
+    ) -> Result<RunPermissionModeSelection, String> {
+        self.request_permission_mode_inner(user_id, run_id, request)
+            .await
+    }
+    async fn permission_mode_snapshot(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RunPermissionModeSnapshot>, String> {
+        self.permission_mode_snapshot_inner(user_id, session_id, run_id)
+            .await
+    }
+    async fn apply_permission_mode(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        generation: u64,
+        selection: &RunPermissionModeSelection,
+        round_index: u32,
+    ) -> Result<bool, String> {
+        self.apply_permission_mode_inner(
+            user_id,
+            session_id,
+            run_id,
+            generation,
+            selection,
+            round_index,
+        )
+        .await
+    }
+
     async fn reconcile_execution_handoff(
         &self,
         claim: &RecoveryClaim,
@@ -23573,6 +23706,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "runtime.control.handoff.requested",
     "runtime.control.handoff.rejected",
     "user_intent_accepted",
+    "permission_mode_applied",
     "user_intent_applied",
     "user_intent_returned",
     "context_meta",
@@ -24129,6 +24263,22 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 }
             }
             out
+        }
+        "permission_mode_applied" => {
+            let Ok(applied) = serde_json::from_value::<RunPermissionModeApplied>(
+                serde_json::Value::Object(data.clone()),
+            ) else {
+                return serde_json::Value::Null;
+            };
+            let mut event = serde_json::json!({"type":"permission_mode_applied", "request_id":applied.selection.request_id,
+                "mode":applied.selection.mode,"revision":applied.selection.revision,
+                "round_index":applied.round_index,"owner_generation":applied.owner_generation});
+            for key in ["run_id", "session_id"] {
+                if let Some(value) = data.get(key) {
+                    event[key] = value.clone();
+                }
+            }
+            event
         }
         "user_intent_applied" => {
             let mut out = serde_json::json!({ "type": "user_intent_applied" });
@@ -24758,6 +24908,312 @@ mod tests {
                 "invalid fingerprint was accepted: {invalid_fingerprint:?}"
             );
         }
+    }
+
+    #[test]
+    fn permission_mode_application_has_one_live_and_replay_shape() {
+        let applied = RunPermissionModeApplied {
+            selection: RunPermissionModeSelection {
+                request_id: "change".into(),
+                mode: astra_turn_types::PermissionMode::Bypass,
+                revision: 10,
+            },
+            owner_generation: 2,
+            round_index: 3,
+        };
+        let mut data = serde_json::to_value(applied).unwrap();
+        data["run_id"] = "run-1".into();
+        data["session_id"] = "session-1".into();
+        let replay = transform_run_event_for_client(
+            serde_json::json!({"event_type":"permission_mode_applied","data":data}),
+        );
+        assert_eq!(replay["run_id"], "run-1");
+        assert_eq!(replay["session_id"], "session-1");
+        assert_eq!(replay["revision"], 10);
+        assert_eq!(replay["mode"], "bypass");
+        assert_eq!(transform_run_event_for_client(replay.clone()), replay);
+        assert!(
+            transform_run_event_for_client(
+                serde_json::json!({"event_type":"permission_mode_applied","data":{}})
+            )
+            .is_null()
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_mode_control_is_owned_idempotent_and_round_scoped() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("permission-run"))
+            .await
+            .unwrap();
+        let request = RunPermissionModeRequest {
+            expected_session_id: "s1".into(),
+            request_id: "mode-1".into(),
+            mode: astra_turn_types::PermissionMode::Bypass,
+        };
+        assert!(
+            store
+                .request_permission_mode("other", "permission-run", &request)
+                .await
+                .is_err()
+        );
+        let first = store
+            .request_permission_mode("u1", "permission-run", &request)
+            .await
+            .unwrap();
+        assert_eq!(first.revision, 0);
+        assert_eq!(
+            store
+                .request_permission_mode("u1", "permission-run", &request)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut conflicting = request.clone();
+        conflicting.mode = astra_turn_types::PermissionMode::Deny;
+        assert!(
+            store
+                .request_permission_mode("u1", "permission-run", &conflicting)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .permission_mode_snapshot("u1", "other", "permission-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .permission_mode_snapshot("u1", "s1", "permission-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .applied
+                .is_none()
+        );
+        assert!(
+            !store
+                .apply_permission_mode("u1", "s1", "permission-run", 1, &first, 1)
+                .await
+                .unwrap()
+        );
+        let mut forged = first.clone();
+        forged.mode = astra_turn_types::PermissionMode::Deny;
+        assert!(
+            !store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &forged, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &first, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &first, 1)
+                .await
+                .unwrap()
+        );
+        conflicting.request_id = "mode-2".into();
+        let second = store
+            .request_permission_mode("u1", "permission-run", &conflicting)
+            .await
+            .unwrap();
+        let snapshot = store
+            .permission_mode_snapshot("u1", "s1", "permission-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.requested, Some(second.clone()));
+        assert_eq!(snapshot.applied.unwrap().selection, first);
+        assert!(
+            store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &second, 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &first, 3)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_run_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "control operations must not hydrate run history"
+        );
+        store
+            .request_run_cancellation("u1", "permission-run")
+            .await
+            .unwrap();
+        conflicting.request_id = "mode-3".into();
+        assert!(
+            store
+                .request_permission_mode("u1", "permission-run", &conflicting)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .apply_permission_mode("u1", "s1", "permission-run", 0, &second, 3)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_mode_application_requires_live_owner_and_recovers_selected_revision() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("permission-owner"))
+            .await
+            .unwrap();
+        let request = RunPermissionModeRequest {
+            expected_session_id: "s1".into(),
+            request_id: "change".into(),
+            mode: astra_turn_types::PermissionMode::Bypass,
+        };
+        let selected = store
+            .request_permission_mode("u1", "permission-owner", &request)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .apply_permission_mode("u1", "s1", "permission-owner", 0, &selected, 2)
+                .await
+                .unwrap()
+        );
+        {
+            let mut runs = store.runs.write().await;
+            let run = runs.get_mut("permission-owner").unwrap();
+            run.run_generation = 1;
+            run.owner_pod_id = Some("other-owner".into());
+        }
+        assert!(
+            !store
+                .apply_permission_mode("u1", "s1", "permission-owner", 1, &selected, 0)
+                .await
+                .unwrap()
+        );
+        store
+            .runs
+            .write()
+            .await
+            .get_mut("permission-owner")
+            .unwrap()
+            .owner_pod_id = None;
+        assert!(
+            store
+                .apply_permission_mode("u1", "s1", "permission-owner", 1, &selected, 0)
+                .await
+                .unwrap()
+        );
+        let snapshot = store
+            .permission_mode_snapshot("u1", "s1", "permission-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.applied.unwrap(),
+            RunPermissionModeApplied {
+                selection: selected,
+                owner_generation: 1,
+                round_index: 0
+            }
+        );
+        store
+            .runs
+            .write()
+            .await
+            .get_mut("permission-owner")
+            .unwrap()
+            .status = STATUS_COMPLETED.into();
+        let mut next = request;
+        next.request_id = "later".into();
+        assert!(
+            store
+                .request_permission_mode("u1", "permission-owner", &next)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_permission_mode_control_round_snapshot() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("permission-user-{nonce}");
+        let session = format!("permission-session-{nonce}");
+        let id = format!("permission-run-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        store.insert_run(run).await.unwrap();
+        let request = RunPermissionModeRequest {
+            expected_session_id: session.clone(),
+            request_id: "change".into(),
+            mode: astra_turn_types::PermissionMode::Plan,
+        };
+        let selected = store
+            .request_permission_mode(&user, &id, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .request_permission_mode(&user, &id, &request)
+                .await
+                .unwrap(),
+            selected
+        );
+        let generation = store
+            .load_run(&user, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_generation;
+        assert!(
+            !store
+                .apply_permission_mode(&user, &session, &id, generation + 1, &selected, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .apply_permission_mode(&user, &session, &id, generation, &selected, 1)
+                .await
+                .unwrap()
+        );
+        let snapshot = store
+            .permission_mode_snapshot(&user, &session, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.applied.unwrap().selection, selected);
+        assert!(
+            store
+                .permission_mode_snapshot("other", &session, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cleanup_database_run_fixture(&pool, &user, &id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id=? AND session_id=?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {

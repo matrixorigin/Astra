@@ -438,6 +438,8 @@ pub enum AdmittedToolCallControl {
     /// A newer durable user intent won action admission. No call in the
     /// rejected batch (or any later batch) was started.
     Superseded,
+    /// A pending permission choice closed unstarted approvals; recapture at the next round.
+    PermissionModePending,
     /// Durable action authority could not be established. Calls are returned
     /// as typed fail-closed results, but there is no guidance to apply.
     FailedClosed,
@@ -877,6 +879,22 @@ pub trait AgenticLoopHost: Send {
     /// Defaults to [`TurnInteractionMode::NonInteractive`] which preserves
     /// the pre-existing behaviour (nudges enabled) for any host that
     /// hasn't been updated yet.
+    /// Install the permission snapshot for this round, without changing tool schemas.
+    fn apply_permission_mode(
+        &mut self,
+        _mode: astra_turn_types::PermissionMode,
+    ) -> Result<(), String> {
+        Err("host does not support permission-mode application".into())
+    }
+
+    /// Publish only after durable application has committed.
+    async fn on_permission_mode_applied(
+        &mut self,
+        _state: &AgenticLoopState,
+        _applied: &astra_turn_types::RunPermissionModeApplied,
+    ) {
+    }
+
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
         TurnInteractionMode::NonInteractive
     }
@@ -2589,6 +2607,8 @@ pub enum VolatileKind {
     /// Structured soft-policy evidence for the next LLM decision point.
     /// This is not a user correction or runtime command.
     PolicyAdvisory,
+    /// Applied permission interaction choice for this model round.
+    PermissionMode,
     /// Per-round anchor for the current user goal. It is rebuilt from
     /// authoritative runtime state immediately before each LLM request.
     ActiveTurnFrame,
@@ -2681,6 +2701,7 @@ impl VolatileKind {
                 | Self::HarnessBoundary
                 | Self::PlanModeMarker
                 | Self::SelfStatus
+                | Self::PermissionMode
                 | Self::PolicyAdvisory
                 | Self::UserIntentBoundary
                 | Self::BehaviorAdvisory
@@ -2697,7 +2718,8 @@ impl VolatileKind {
     pub fn delivery_class(self) -> astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass {
         use astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass;
         match self {
-            Self::BudgetAdvisory
+            Self::PermissionMode
+            | Self::BudgetAdvisory
             | Self::ActiveTurnFrame
             | Self::CompactResume
             | Self::Mailbox
@@ -3316,6 +3338,8 @@ pub struct AgenticLoopState {
     /// run. External action admission must carry it so a recovered/stale
     /// executor cannot start new effects on a newer owner's run.
     pub current_run_owner_generation: Option<u64>,
+    /// In-memory projection of the durable permission revision selected for this round.
+    pub applied_permission_mode: Option<astra_turn_types::RunPermissionModeSelection>,
     /// Why this loop is allowed to consume model capacity. This is set by the
     /// run owner before execution and remains stable for the lifetime of the
     /// loop; provider, access source, and model selection are separate facts.
@@ -5314,6 +5338,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         current_session_id: None,
         current_run_id: None,
         current_run_owner_generation: None,
+        applied_permission_mode: None,
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: None,
@@ -7026,6 +7051,7 @@ pub(crate) mod tests {
             current_session_id: Some("test-session".to_string()),
             current_run_id: None,
             current_run_owner_generation: None,
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,

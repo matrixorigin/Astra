@@ -471,6 +471,18 @@ impl ApprovalQueue {
         id
     }
 
+    /// Remove presentation entries whose owning operation stopped waiting.
+    /// This never sends a decision or grants permission.
+    pub fn prune_closed(&mut self) -> usize {
+        let before = self.entries.len();
+        self.entries.retain_mut(|entry| {
+            entry.response_txs.retain(|sender| !sender.is_closed());
+            !entry.response_txs.is_empty()
+        });
+        self.clamp_focus();
+        before - self.entries.len()
+    }
+
     pub fn focused(&self) -> Option<&PendingApproval> {
         self.entries.get(self.focus)
     }
@@ -539,17 +551,6 @@ impl ApprovalQueue {
 
     pub fn views(&self) -> Vec<ApprovalView> {
         self.entries.iter().map(ApprovalView::from).collect()
-    }
-
-    pub fn move_focus_up(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        self.focus = if self.focus == 0 {
-            self.entries.len() - 1
-        } else {
-            self.focus - 1
-        };
     }
 
     pub fn move_focus_down(&mut self) {
@@ -1660,5 +1661,35 @@ mod tests {
             crate::cli::chat_stream::ApprovalResponse::Deny,
             "mode pivots must preserve hard denials instead of converting them to AllowOnce",
         );
+    }
+    #[test]
+    fn prune_closed_preserves_live_approval_without_deciding_it() {
+        let mut queue = ApprovalQueue::new();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let (live_tx, mut live_rx) = oneshot::channel();
+        queue.push(
+            "bash".into(),
+            "old".into(),
+            None,
+            "reason".into(),
+            serde_json::json!({"command":"old"}),
+            closed_tx,
+        );
+        queue.push(
+            "write_file".into(),
+            "live".into(),
+            None,
+            "reason".into(),
+            serde_json::json!({"path":"a"}),
+            live_tx,
+        );
+        drop(closed_rx);
+        assert_eq!(queue.prune_closed(), 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.focused().unwrap().tool, "write_file");
+        assert!(matches!(
+            live_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 }

@@ -1035,6 +1035,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(self.user_id.clone()),

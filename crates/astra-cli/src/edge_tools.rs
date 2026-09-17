@@ -1291,6 +1291,14 @@ fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> 
     Ok(Some(id.to_string()))
 }
 
+/// Sandbox basis captured for one foreground exchange. A permission change may
+/// replace the root mode overlay but must retain an explicit skill restriction.
+#[derive(Clone)]
+pub(crate) struct PermissionSandboxBasis {
+    pub(crate) baseline: Option<SandboxPolicy>,
+    pub(crate) skill_policy: Option<SandboxPolicy>,
+}
+
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -1304,6 +1312,7 @@ pub struct ToolExecutor {
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
+    pub(crate) permission_sandbox_basis: std::sync::Mutex<Option<PermissionSandboxBasis>>,
 
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
@@ -1493,6 +1502,22 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    pub(crate) fn apply_runtime_permission_sandbox(
+        &self,
+        mode: crate::cli::permission_manager::PermissionMode,
+    ) {
+        let basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
+        let Some(basis) = basis.as_ref() else {
+            return;
+        };
+        let next = basis.skill_policy.clone().or_else(|| {
+            (mode != crate::cli::permission_manager::PermissionMode::Bypass)
+                .then(|| basis.baseline.clone())
+                .flatten()
+        });
+        *astra_core::sync_poison::recover_rwlock_write(&self.sandbox_policy) = next;
+    }
+
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
@@ -1509,6 +1534,7 @@ impl ToolExecutor {
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
+            permission_sandbox_basis: std::sync::Mutex::new(None),
 
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
@@ -4154,10 +4180,18 @@ impl ToolExecutor {
         {
             return Err(SandboxExpansionError::SystemSensitivePath);
         }
+        let mut basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
         if let Ok(mut guard) = self.sandbox_policy.write() {
             match *guard {
                 Some(ref mut policy) => {
                     policy.allowed_paths.push(dir.clone());
+                    if let Some(basis) = basis.as_mut() {
+                        if basis.skill_policy.is_some() {
+                            basis.skill_policy = Some(policy.clone());
+                        } else {
+                            basis.baseline = Some(policy.clone());
+                        }
+                    }
                 }
                 None => return Err(SandboxExpansionError::NoSandboxPolicy),
             }

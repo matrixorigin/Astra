@@ -234,9 +234,26 @@ fn accumulated_control_duration_ms(prior_duration_ms: Option<u64>, recovery_ms: 
 struct SandboxPolicyGuard<'a> {
     slot: &'a std::sync::RwLock<Option<SandboxPolicy>>,
     saved: Option<SandboxPolicy>,
+    mode_basis: Option<&'a std::sync::Mutex<Option<crate::edge_tools::PermissionSandboxBasis>>>,
 }
 
 impl<'a> SandboxPolicyGuard<'a> {
+    fn for_permission_mode(
+        executor: &'a crate::edge_tools::ToolExecutor,
+        skill_policy: Option<SandboxPolicy>,
+        mode: PermissionMode,
+    ) -> Self {
+        let mut guard = Self::install(&executor.sandbox_policy, None);
+        *astra_core::sync_poison::recover_mutex_lock(&executor.permission_sandbox_basis) =
+            Some(crate::edge_tools::PermissionSandboxBasis {
+                baseline: guard.saved.clone(),
+                skill_policy,
+            });
+        guard.mode_basis = Some(&executor.permission_sandbox_basis);
+        executor.apply_runtime_permission_sandbox(mode);
+        guard
+    }
+
     /// Replace the slot with `next` (or restore the previous value if `next` is `None`)
     /// and return a guard that resets to whatever the slot held before the call when
     /// it goes out of scope.
@@ -250,27 +267,21 @@ impl<'a> SandboxPolicyGuard<'a> {
         // If `next` is Some, it replaces the previous policy for the duration of the guard.
         *write = next.or_else(|| saved.clone());
         drop(write);
-        Self { slot, saved }
-    }
-
-    /// Temporarily remove filesystem sandboxing for a root Bypass turn.
-    ///
-    /// `None` in the executor slot is the existing full-filesystem contract,
-    /// but [`Self::install`] deliberately interprets `next=None` as "keep the
-    /// current policy" for ordinary turns. Keep this explicit constructor so
-    /// a user-selected Bypass mode cannot be confused with absence of a skill
-    /// override. A skill-provided policy still takes precedence at the call
-    /// site and can narrow the turn.
-    fn install_unrestricted(slot: &'a std::sync::RwLock<Option<SandboxPolicy>>) -> Self {
-        let mut write = astra_core::sync_poison::recover_rwlock_write(&slot);
-        let saved = write.take();
-        drop(write);
-        Self { slot, saved }
+        Self {
+            slot,
+            saved,
+            mode_basis: None,
+        }
     }
 }
 
 impl Drop for SandboxPolicyGuard<'_> {
     fn drop(&mut self) {
+        if let Some(basis) = self.mode_basis {
+            if let Some(basis) = astra_core::sync_poison::recover_mutex_lock(basis).take() {
+                self.saved = basis.baseline;
+            }
+        }
         let mut write = astra_core::sync_poison::recover_rwlock_write(&self.slot);
         *write = self.saved.take();
     }
@@ -1024,6 +1035,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         self.agent_live_event_sink.clone()
     }
 
+    fn apply_permission_mode(&mut self, mode: PermissionMode) -> Result<(), String> {
+        self.perm_manager.set_mode(mode);
+        self.executor.apply_runtime_permission_sandbox(mode);
+        Ok(())
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -1159,20 +1176,11 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // The guard restores the previous policy on drop — including on the
         // `?` early-return path below — so a turn that errored out cannot leak
         // a skill-scoped policy into subsequent turns.
-        let _sandbox_guard = if let Some(skill_policy) =
-            state.skills.execution.sandbox_policy.clone()
-        {
-            // A selected skill may intentionally narrow even a root Bypass
-            // turn; explicit capability constraints remain authoritative.
-            SandboxPolicyGuard::install(&self.executor.sandbox_policy, Some(skill_policy))
-        } else if self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Bypass
-        {
-            // Bypass is a root user-authorized full-filesystem profile, not
-            // merely "auto-approve while retaining the Standard sandbox".
-            SandboxPolicyGuard::install_unrestricted(&self.executor.sandbox_policy)
-        } else {
-            SandboxPolicyGuard::install(&self.executor.sandbox_policy, None)
-        };
+        let _sandbox_guard = SandboxPolicyGuard::for_permission_mode(
+            &self.executor,
+            state.skills.execution.sandbox_policy.clone(),
+            self.perm_manager.mode(),
+        );
         let send_message_context = state
             .messaging
             .mailbox
@@ -2411,35 +2419,64 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_sandbox_guard_removes_and_restores_the_policy() {
-        let original = astra_runtime::tool_sandbox::SandboxPolicy::for_project("/workspace");
-        let slot = std::sync::RwLock::new(Some(original.clone()));
-
+    fn runtime_permission_sandbox_restores_baseline_and_preserves_skill_restrictions() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let original = astra_runtime::tool_sandbox::SandboxPolicy::for_project(temp.path());
+        *executor.sandbox_policy.write().unwrap() = Some(original.clone());
         {
-            let _guard = SandboxPolicyGuard::install_unrestricted(&slot);
-            assert!(slot.read().unwrap().is_none());
-        }
-
-        let restored = slot.read().unwrap();
-        let restored = restored.as_ref().expect("policy restored");
-        assert_eq!(restored.isolation, original.isolation);
-        assert_eq!(restored.project_root, original.project_root);
-    }
-
-    #[test]
-    fn skill_sandbox_guard_can_narrow_an_unrestricted_slot() {
-        let slot = std::sync::RwLock::new(None);
-        let skill_policy = astra_runtime::tool_sandbox::SandboxPolicy::strict("/workspace");
-
-        {
-            let _guard = SandboxPolicyGuard::install(&slot, Some(skill_policy));
+            let _guard =
+                SandboxPolicyGuard::for_permission_mode(&executor, None, PermissionMode::Prompt);
+            executor.apply_runtime_permission_sandbox(PermissionMode::Bypass);
+            assert!(executor.sandbox_policy.read().unwrap().is_none());
+            executor.apply_runtime_permission_sandbox(PermissionMode::Plan);
             assert_eq!(
-                slot.read().unwrap().as_ref().map(|policy| policy.isolation),
-                Some(astra_runtime::tool_sandbox::IsolationLevel::Strict)
+                executor
+                    .sandbox_policy
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .isolation,
+                original.isolation
             );
         }
-
-        assert!(slot.read().unwrap().is_none());
+        assert!(executor.permission_sandbox_basis.lock().unwrap().is_none());
+        assert_eq!(
+            executor
+                .sandbox_policy
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .project_root,
+            original.project_root
+        );
+        {
+            let skill = astra_runtime::tool_sandbox::SandboxPolicy::strict(temp.path());
+            let _guard = SandboxPolicyGuard::for_permission_mode(
+                &executor,
+                Some(skill),
+                PermissionMode::Prompt,
+            );
+            for mode in [
+                PermissionMode::Bypass,
+                PermissionMode::Auto,
+                PermissionMode::Prompt,
+            ] {
+                executor.apply_runtime_permission_sandbox(mode);
+                assert_eq!(
+                    executor
+                        .sandbox_policy
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .isolation,
+                    astra_runtime::tool_sandbox::IsolationLevel::Strict
+                );
+            }
+        }
     }
 
     #[test]

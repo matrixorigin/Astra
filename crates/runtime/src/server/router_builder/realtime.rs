@@ -193,6 +193,11 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::server::run::handlers::cancel_run_handler),
         )
         .route(
+            "/chat/runs/{run_id}/permission-mode",
+            post(crate::server::run::handlers::request_permission_mode_handler)
+                .get(crate::server::run::handlers::permission_mode_snapshot_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/intents",
             post(crate::server::run::handlers::submit_run_user_intent_handler),
         )

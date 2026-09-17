@@ -15,9 +15,8 @@ pub(crate) struct Footer {
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<PermissionMode>,
-    /// A mode selected for the next turn while the current turn is still
-    /// active. This is presentation state; the live policy remains in the
-    /// permission-mode mirror until settlement.
+    /// A pending selection, cleared when execution acknowledges application.
+    /// The policy owner supplies the current mode through its read-only mirror.
     pending_permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     /// Current request's usable context-window occupancy. This deliberately

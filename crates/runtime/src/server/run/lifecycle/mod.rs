@@ -633,6 +633,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "user_prompt_required"
                 | "provider_interaction_required"
                 | "provider_interaction_resolved"
+                | "permission_mode_applied"
                 | "user_intent_applied"
                 | "user_intent_returned"
                 | "stream_gap"
@@ -1142,7 +1143,20 @@ fn canonical_edge_interaction_events(event: &Value) -> Vec<Value> {
 }
 
 fn incrementally_persisted_edge_interaction_event(event: &Value) -> bool {
-    !canonical_edge_interaction_events(event).is_empty()
+    // Permission application is committed by the round-control owner before
+    // emitting its flat client projection. Never append that projection as a
+    // second (and differently shaped) durable permission receipt at settlement.
+    event.get("type").and_then(Value::as_str) == Some("permission_mode_applied")
+        || !canonical_edge_interaction_events(event).is_empty()
+}
+
+#[cfg(test)]
+#[test]
+fn permission_mode_applied_projection_has_one_durable_owner() {
+    let event = json!({"type":"permission_mode_applied","request_id":"change","mode":"bypass","revision":1});
+    assert!(attached_stream_event_requires_reliable_delivery(&event));
+    assert!(incrementally_persisted_edge_interaction_event(&event));
+    assert!(!live_delta_event_for_persistence(&event));
 }
 
 struct DurableHostInteractionSink {
@@ -12539,6 +12553,7 @@ impl AgenticRunLifecycleService {
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
             current_run_owner_generation: None,
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: None,
@@ -19121,6 +19136,44 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         events
     }
 
+    async fn request_permission_mode(
+        &self,
+        user_id: String,
+        run_id: String,
+        request: astra_services::runs::RunPermissionModeRequest,
+    ) -> Result<astra_services::runs::RunPermissionModeSelection, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .request_permission_mode(&user_id, &run_id, &request)
+            .await
+            .map_err(|e| {
+                let status = match e.as_str() {
+                    "permission run not found" => StatusCode::NOT_FOUND,
+                    "permission request identity conflict"
+                    | "permission run is inactive"
+                    | "permission run is cancelled" => StatusCode::CONFLICT,
+                    _ if e.starts_with("permission request requires") => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                error_response(status, &e)
+            })
+    }
+    async fn permission_mode_snapshot(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+    ) -> Result<astra_services::runs::RunPermissionModeSnapshot, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.run_engine
+            .permission_mode_snapshot(&user_id, &session_id, &run_id)
+            .await
+            .map_err(|e| Self::durable_persist_error("permission mode lookup", e))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
     async fn submit_run_user_intent(
         &self,
         run_id: String,
@@ -23121,6 +23174,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             current_run_owner_generation: config.execution_owner_generation,
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: Some(config.user_id.clone()),

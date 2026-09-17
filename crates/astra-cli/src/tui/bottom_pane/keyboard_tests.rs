@@ -43,7 +43,7 @@ fn backtab_cycles_permission_mode_when_composer_is_active() {
 }
 
 #[test]
-fn backtab_keeps_approval_navigation_when_approval_is_pending() {
+fn backtab_cycles_permission_mode_while_approval_is_pending() {
     let mut pane = BottomPane::new();
     let (tx, _rx) = oneshot::channel::<ApprovalResponse>();
     pane.enqueue_approval(
@@ -57,7 +57,7 @@ fn backtab_keeps_approval_navigation_when_approval_is_pending() {
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]

@@ -72,6 +72,61 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ---
 
+## Active run permission mode
+
+### POST /chat/runs/{run_id}/permission-mode
+
+The authenticated owner can select a permission policy for an active root run.
+The session ID must match the run. Request IDs are idempotent; reusing an ID
+with another mode returns 409.
+
+```json
+{"expected_session_id":"session-1","request_id":"change-1","mode":"bypass"}
+```
+
+Modes use the canonical wire values: `prompt`, `accept_edits`, `plan`, `auto`,
+`bypass`, and `deny`. Here `plan` means read-only tool policy; it does not create
+or approve a planning workflow.
+
+The response acknowledges durable acceptance:
+
+```json
+{"request_id":"change-1","mode":"bypass","revision":12}
+```
+
+The run captures the latest accepted policy at its next model-round boundary.
+An already-started round keeps its captured server policy. Acceptance alone is
+not proof of application. The `permission_mode_applied` stream event reports
+`request_id`, `mode`, `revision`, `round_index`, and `owner_generation` after the
+runtime has applied the policy and durably recorded the acknowledgement.
+Bypass retains capability restrictions and policy hard denies.
+
+Missing, foreign, non-root, or session-mismatched runs return 404. Inactive runs
+and request identity conflicts return 409; unavailable storage or an
+unconfirmed commit returns 503. Retry an unconfirmed request with the same
+request ID.
+
+### GET /chat/runs/{run_id}/permission-mode?expected_session_id={session_id}
+
+Returns a bounded snapshot for recovering a pending acknowledgement:
+
+```json
+{
+  "requested":{"request_id":"change-1","mode":"bypass","revision":12},
+  "applied":{
+    "selection":{"request_id":"change-1","mode":"bypass","revision":12},
+    "round_index":3,
+    "owner_generation":0
+  }
+}
+```
+
+Either field can be `null`. A newer `requested` revision than the `applied`
+selection remains pending. Clients can stop polling once the requested revision
+is acknowledged; ordinary observation uses the run stream.
+
+---
+
 ## Agents
 
 ### POST /agents

@@ -1372,6 +1372,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_produced_output: false,
             thinking,
             permission_context: Some(permission_context),
+            applied_permission_mode: None,
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,

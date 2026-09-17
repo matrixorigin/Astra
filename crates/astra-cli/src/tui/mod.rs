@@ -40,6 +40,7 @@ mod markdown;
 mod markdown_render;
 mod mention_menu;
 pub(crate) mod path_style;
+mod permission_control;
 mod plan_mode;
 mod plan_task_observer;
 mod render;

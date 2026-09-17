@@ -57,3 +57,8 @@ pub use work::{
     WorkItemVerificationStatusV2, WorkTaskGraphBasisV2, WorkTaskGraphCursorV2,
     WorkTaskGraphDependencyV2, WorkTaskGraphItemV2, WorkTaskGraphPageV2,
 };
+
+pub use protocol::{
+    RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
+    RunPermissionModeSnapshot,
+};

@@ -1595,6 +1595,41 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// Request a policy for the next model round; acceptance is not application.
+    pub async fn request_run_permission_mode(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &astra_turn_types::RunPermissionModeRequest,
+    ) -> Result<astra_turn_types::RunPermissionModeSelection, ThinClientError> {
+        let url = self.url(&paths::chat_run_permission_mode(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+    /// Read bounded requested/applied acknowledgements while a change is pending.
+    pub async fn get_run_permission_mode(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        expected_session_id: &str,
+    ) -> Result<astra_turn_types::RunPermissionModeSnapshot, ThinClientError> {
+        let url = self.url(&paths::chat_run_permission_mode(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .query(&[("expected_session_id", expected_session_id)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     /// `POST /chat/runs/{run_id}/intents` — guide the active durable run.
     pub async fn submit_run_user_intent(
         &self,
@@ -3058,6 +3093,50 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let response = client.cancel_run(Some("tok"), "run-1").await.unwrap();
         assert_eq!(response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn wiremock_permission_mode_request_and_snapshot() {
+        let srv = MockServer::start().await;
+        let selected = serde_json::json!({"request_id":"mode-1","mode":"bypass","revision":12});
+        Mock::given(method("POST")).and(path("/chat/runs/run-1/permission-mode"))
+            .and(header("authorization","Bearer tok"))
+            .and(body_json(serde_json::json!({"expected_session_id":"session-1","request_id":"mode-1","mode":"bypass"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&selected)).expect(1).mount(&srv).await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1/permission-mode"))
+            .and(wiremock::matchers::query_param(
+                "expected_session_id",
+                "session-1",
+            ))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"requested":selected,"applied":null})),
+            )
+            .expect(1)
+            .mount(&srv)
+            .await;
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let receipt = client
+            .request_run_permission_mode(
+                Some("tok"),
+                "run-1",
+                &astra_turn_types::RunPermissionModeRequest {
+                    expected_session_id: "session-1".into(),
+                    request_id: "mode-1".into(),
+                    mode: astra_turn_types::PermissionMode::Bypass,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.revision, 12);
+        let snapshot = client
+            .get_run_permission_mode(Some("tok"), "run-1", "session-1")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.requested, Some(receipt));
+        assert!(snapshot.applied.is_none());
     }
 
     #[tokio::test]

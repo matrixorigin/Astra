@@ -655,6 +655,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_produced_output: false,
             thinking: child_thinking,
             permission_context: Some(permission_context),
+            applied_permission_mode: None,
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,

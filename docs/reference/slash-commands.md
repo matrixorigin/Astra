@@ -130,12 +130,16 @@ read-only; server configuration changes are not available here.
 `/config edit` remains accepted as an alias for `/config`. `/allow` opens a mode
 picker with no arguments. Its modes include `auto`, `bypass`, `read_only`,
 `accept_edits`, `prompt`, and `deny`; additional actions show rules, manage
-workspace trust, or inspect the permission trace. The TUI asks for confirmation
-before enabling `bypass`. In the TUI, `Shift+Tab` cycles the everyday modes
-`Ask → Edits → Read-only → Auto`; during a running turn the current mode remains
-visible and the selected mode is shown as the next-turn value, taking effect at
-the next safe turn boundary. `Bypass`
-and `Deny` remain explicit `/allow` choices.
+workspace trust, or inspect the permission trace. The picker asks for confirmation
+before enabling `bypass`. `Shift+Tab` explicitly cycles
+`Ask → Edits → Read-only → Auto → Bypass → Ask`; `Deny` remains an explicit
+`/allow` choice. Shift+Tab also works while an inline approval is waiting;
+Tab navigates approval entries, while open modal pickers retain their own navigation.
+During execution the selected mode appears as `next: …` until
+the server applies it before the next model round. It does not wait for another
+user message. Already executing tools retain their captured policy. The current
+mode chip changes only after execution acknowledges the change. If the response
+ends first, the selection becomes the next response's mode.
 
 `/instructions` opens the project-instructions actions. The accepted forms are
 `/instructions show`, `/instructions reload`, and `/instructions off`.

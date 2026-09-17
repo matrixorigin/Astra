@@ -121,7 +121,7 @@ fn ask_mode_is_visible_as_the_safe_default() {
 }
 
 #[test]
-fn pending_mode_is_shown_as_a_next_turn_intent() {
+fn pending_mode_is_shown_as_a_next_round_intent() {
     let c = StatusContext {
         permission_mode: PermissionMode::Prompt,
         pending_permission_mode: Some(PermissionMode::Auto),
@@ -132,14 +132,14 @@ fn pending_mode_is_shown_as_a_next_turn_intent() {
 }
 
 #[test]
-fn pending_mode_matching_current_is_not_duplicated() {
+fn pending_mode_matching_current_remains_visible_until_acknowledged() {
     let c = StatusContext {
         permission_mode: PermissionMode::Prompt,
         pending_permission_mode: Some(PermissionMode::Prompt),
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert_eq!(s.plain(), "Ask");
+    assert_eq!(s.plain(), "Ask  next: Ask");
 }
 
 #[test]

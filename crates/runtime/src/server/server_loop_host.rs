@@ -4427,6 +4427,8 @@ struct EdgeActionAdmissionContext {
     user_id: String,
     run_id: String,
     control_cursor: usize,
+    session_id: String,
+    permission_revision: i64,
     expected_control_epoch: i64,
     expected_owner_generation: u64,
     session_turn: u32,
@@ -4435,6 +4437,7 @@ struct EdgeActionAdmissionContext {
 
 enum EdgeApprovalWait {
     Allowed,
+    PermissionModeChanged,
     Denied(astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery),
     Superseded,
     Cancelled,
@@ -6390,7 +6393,28 @@ impl ServerAgenticLoopHost {
                 }
             }
         }
-        self.resolve_deferred_tool_admission(state, admission)
+        let mut admission = self.resolve_deferred_tool_admission(state, admission);
+        // Stable discovery declares capabilities independently of the round's
+        // interaction choice. Enforce that choice on resolved logical calls,
+        // including deferred carriers, before any delivery or tool side effect.
+        let restricted = interaction_scoped_tool_restrictions(self.turn_interaction_mode());
+        let mut admitted = Vec::with_capacity(admission.admitted.len());
+        for invocation in std::mem::take(&mut admission.admitted) {
+            let name = astra_turn_core::tool::args::shape::tool_call_name(
+                invocation.logical_target_call(),
+            )
+            .unwrap_or_default();
+            if restricted.contains(name) {
+                admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                    invocation,
+                    result: "The current permission interaction mode does not allow this user prompt; the tool was not executed.".into(),
+                });
+            } else {
+                admitted.push(invocation);
+            }
+        }
+        admission.admitted = admitted;
+        admission
     }
 
     fn deferred_activation_descriptor_is_current(
@@ -6472,9 +6496,6 @@ impl ServerAgenticLoopHost {
     fn current_deferred_tool_contract_schemas(&self, state: &AgenticLoopState) -> Vec<Value> {
         let mut restricted = state.restricted_tools.clone();
         restricted.extend(self.runtime_allowlist_restrictions(state));
-        restricted.extend(interaction_scoped_tool_restrictions(
-            self.turn_interaction_mode(),
-        ));
         let fanout_start_admitted = self.work_admission_topology_authoritative
             && self.work_admission_execution_topology
                 == astra_services::WorkExecutionTopology::ParallelSubruns;
@@ -6512,9 +6533,6 @@ impl ServerAgenticLoopHost {
     ) -> Vec<Value> {
         let mut restricted = state.restricted_tools.clone();
         restricted.extend(self.runtime_allowlist_restrictions(state));
-        restricted.extend(interaction_scoped_tool_restrictions(
-            self.turn_interaction_mode(),
-        ));
         let deferred_candidates = self
             .deferred_tool_schemas
             .iter()
@@ -12416,6 +12434,14 @@ impl ServerAgenticLoopHost {
                 .unwrap_or_else(|| self.user_id.clone()),
             run_id: run_id.to_string(),
             control_cursor: state.user_intents.user_intent_cursor(),
+            session_id: state
+                .current_session_id
+                .clone()
+                .unwrap_or_else(|| self.session_id.clone()),
+            permission_revision: state
+                .applied_permission_mode
+                .as_ref()
+                .map_or(-1, |mode| mode.revision),
             expected_control_epoch: i64::try_from(state.user_intents.user_intent_cursor())
                 .unwrap_or(i64::MAX),
             expected_owner_generation,
@@ -12709,6 +12735,26 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    async fn wait_for_permission_mode_change(
+        context: &EdgeActionAdmissionContext,
+    ) -> Result<(), String> {
+        let mut poll_interval = Duration::from_millis(100);
+        loop {
+            let snapshot = context
+                .run_control
+                .permission_mode_snapshot(&context.user_id, &context.session_id, &context.run_id)
+                .await?;
+            if snapshot
+                .and_then(|snapshot| snapshot.requested)
+                .is_some_and(|requested| requested.revision > context.permission_revision)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(poll_interval).await;
+            poll_interval = poll_interval.saturating_mul(2).min(Duration::from_secs(1));
+        }
+    }
+
     async fn wait_edge_approval_or_guidance(
         &self,
         context: &EdgeActionAdmissionContext,
@@ -12731,6 +12777,8 @@ impl ServerAgenticLoopHost {
         tokio::pin!(shared_approval);
         let guidance = Self::wait_for_edge_guidance(context);
         tokio::pin!(guidance);
+        let mode_change = Self::wait_for_permission_mode_change(context);
+        tokio::pin!(mode_change);
         let client_cancel = self.client_cancel_token.clone();
         let cancelled = async move {
             match client_cancel {
@@ -12742,6 +12790,10 @@ impl ServerAgenticLoopHost {
         tokio::select! {
             biased;
             () = &mut cancelled => EdgeApprovalWait::Cancelled,
+            changed = &mut mode_change => match changed {
+                Ok(()) => EdgeApprovalWait::PermissionModeChanged,
+                Err(error) => EdgeApprovalWait::FailedClosed(error),
+            },
             guidance = &mut guidance => match guidance {
                 Ok(()) => EdgeApprovalWait::Superseded,
                 Err(error) => EdgeApprovalWait::FailedClosed(error),
@@ -12777,6 +12829,10 @@ impl ServerAgenticLoopHost {
                         tokio::select! {
                             biased;
                             () = &mut cancelled => EdgeApprovalWait::Cancelled,
+                            changed = &mut mode_change => match changed {
+                                Ok(()) => EdgeApprovalWait::PermissionModeChanged,
+                                Err(error) => EdgeApprovalWait::FailedClosed(error),
+                            },
                             guidance = &mut guidance => match guidance {
                                 Ok(()) => EdgeApprovalWait::Superseded,
                                 Err(error) => EdgeApprovalWait::FailedClosed(error),
@@ -13475,7 +13531,9 @@ impl ServerAgenticLoopHost {
                     EdgeApprovalWait::Denied(_) => {
                         astra_turn_types::ExplainAnalyzeOutcomeV1::Rejected
                     }
-                    EdgeApprovalWait::Superseded | EdgeApprovalWait::Cancelled => {
+                    EdgeApprovalWait::Superseded
+                    | EdgeApprovalWait::PermissionModeChanged
+                    | EdgeApprovalWait::Cancelled => {
                         astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
                     }
                     EdgeApprovalWait::FailedClosed(_) => {
@@ -13575,6 +13633,42 @@ impl ServerAgenticLoopHost {
                             control = AdmittedToolCallControl::FailedClosed;
                             break 'batches;
                         }
+                    }
+                    EdgeApprovalWait::PermissionModeChanged => {
+                        // A requested mode is not yet applied authority. Close only
+                        // unstarted approvals and return to the next model boundary;
+                        // completed calls retain their exact results and current
+                        // in-flight work is never reclassified or auto-approved.
+                        let reason = "A permission-mode change is pending for the next model round; this unstarted tool was not executed.";
+                        let unstarted = batch_calls
+                            .iter()
+                            .map(|call| (**call).clone())
+                            .collect::<Vec<_>>();
+                        let completed = results_by_id.keys().cloned().collect::<HashSet<_>>();
+                        let close = self
+                            .close_unstarted_edge_approvals(&unstarted, &completed, reason)
+                            .await;
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "permission_mode_pending",
+                            reason,
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = if close.is_ok() {
+                            AdmittedToolCallControl::PermissionModePending
+                        } else {
+                            AdmittedToolCallControl::FailedClosed
+                        };
+                        break 'batches;
                     }
                     EdgeApprovalWait::Superseded => {
                         let close_error = self
@@ -14297,6 +14391,9 @@ impl ServerAgenticLoopHost {
             let reason = match &control {
                 AdmittedToolCallControl::Superseded => {
                     "newer user guidance superseded the unstarted approval"
+                }
+                AdmittedToolCallControl::PermissionModePending => {
+                    "a permission-mode change is pending for the next model round"
                 }
                 AdmittedToolCallControl::FailedClosed => {
                     "the provider batch stopped before this approved action could start"
@@ -15407,7 +15504,7 @@ impl ServerAgenticLoopHost {
     ///
     /// 1. widen check
     /// 2. runtime allowlist restrictions
-    /// 3. interaction-scoped restrictions (always applied)
+    /// 3. interaction choices are enforced at call admission, preserving schema bytes
     /// 4. boost rescue
     /// 5. activated-deferred-tool rescue
     ///
@@ -15430,14 +15527,11 @@ impl ServerAgenticLoopHost {
         if consume_widen {
             let _ = std::mem::take(&mut state.widen_selection_pending);
         }
-        // 2-3. Layer hard restrictions from the merged base. Advisory
-        // boosting and dynamic activation must never override a capability or
-        // permission boundary already present in this set.
+        // 2-3. Layer hard capability restrictions from the merged base.
+        // Interaction-mode changes are enforced on resolved tool calls, so
+        // the provider's schema declaration stays stable across rounds.
         let mut effective = state.restricted_tools.clone();
         effective.extend(self.runtime_allowlist_restrictions(state));
-        effective.extend(interaction_scoped_tool_restrictions(
-            self.turn_interaction_mode(),
-        ));
         if state.hooks.completion_settlement.text_only && !retain_text_only_wire_surface {
             effective.extend(
                 self.tool_schemas
@@ -16307,6 +16401,43 @@ fn server_context_manifest_identity(
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn apply_permission_mode(
+        &mut self,
+        mode: astra_turn_types::PermissionMode,
+    ) -> Result<(), String> {
+        use astra_turn_types::PermissionMode;
+        self.interaction_mode = Some(match mode {
+            PermissionMode::Auto | PermissionMode::Bypass => RequestedTurnInteractionMode::Auto,
+            PermissionMode::Deny => RequestedTurnInteractionMode::Deny,
+            PermissionMode::Prompt | PermissionMode::AcceptEdits | PermissionMode::Plan => {
+                RequestedTurnInteractionMode::Prompt
+            }
+        });
+        Ok(())
+    }
+
+    async fn on_permission_mode_applied(
+        &mut self,
+        state: &AgenticLoopState,
+        applied: &astra_turn_types::RunPermissionModeApplied,
+    ) {
+        self.emit_committed_lifecycle_projection(json!({
+            "type": "permission_mode_applied",
+            "run_id": state.current_run_id,
+            "session_id": state.current_session_id,
+            "request_id": applied.selection.request_id,
+            "mode": applied.selection.mode,
+            "revision": applied.selection.revision,
+            "round_index": applied.round_index,
+            "owner_generation": applied.owner_generation,
+        }))
+        .await;
+    }
+
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        ServerAgenticLoopHost::turn_interaction_mode(self)
+    }
+
     fn context_manifest_identity(
         &self,
         state: &AgenticLoopState,
@@ -17092,8 +17223,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.tool_admission_snapshot_entries()
     }
 
-    fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
-        self.read_plan_authoring_active()
+    fn plan_mode_active(&self, state: &AgenticLoopState) -> bool {
+        state
+            .applied_permission_mode
+            .as_ref()
+            .is_some_and(|selection| selection.mode == astra_turn_types::PermissionMode::Plan)
+            || self.read_plan_authoring_active()
     }
 
     fn render_final_text(&mut self, text: &str) {
@@ -21708,6 +21843,8 @@ mod tests {
             user_id: user_id.to_string(),
             run_id: run_id.to_string(),
             control_cursor: 0,
+            session_id: "edge-action-session".into(),
+            permission_revision: -1,
             expected_control_epoch: -1,
             expected_owner_generation: 0,
             session_turn: 0,
@@ -22531,6 +22668,9 @@ mod tests {
                 panic!("authority-lost denial was consumed as an ordinary user denial")
             }
             EdgeApprovalWait::Superseded => panic!("authority-lost denial became superseded"),
+            EdgeApprovalWait::PermissionModeChanged => {
+                panic!("authority-lost denial became a mode change")
+            }
             EdgeApprovalWait::Cancelled => panic!("authority-lost denial became cancellation"),
         }
     }
@@ -32511,6 +32651,159 @@ mod tests {
     }
 
     #[test]
+    fn permission_mode_keeps_schema_discovery_stable_and_gates_ask_user_admission() {
+        use astra_turn_types::PermissionMode;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "owner".into(),
+            "session".into(),
+        )
+        .with_edge_tools(sample_edge_tools_with_ask_user())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .build();
+        let mut state = create_test_state();
+        let before = host.visible_turn_tools(&mut state);
+        assert!(schema_names(&before).contains("ask_user"));
+        let call = json!({"id":"question", "type":"function", "function":{"name":"ask_user", "arguments":"{}"}});
+        for (mode, allowed) in [
+            (PermissionMode::Bypass, false),
+            (PermissionMode::Deny, false),
+            (PermissionMode::Prompt, true),
+        ] {
+            host.apply_permission_mode(mode).unwrap();
+            assert_eq!(host.visible_turn_tools(&mut state), before);
+            let admission = host.canonicalize_tool_admission_for_state(&state, crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(call.clone())],
+                rejected: Vec::new(), completion_action_applied: false,
+            });
+            assert_eq!(admission.admitted.len(), usize::from(allowed));
+            assert_eq!(admission.rejected.len(), usize::from(!allowed));
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_mode_request_wakes_pending_approval_without_applying_mid_round() {
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        engine
+            .start_run("mode-run", "owner", "session")
+            .await
+            .unwrap();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "owner".into(),
+            "session".into(),
+        )
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .build();
+        let mut audit = test_approval_audit_context("owner", "session");
+        audit.run_id = "mode-run".into();
+        host.set_approval_audit_context(audit);
+        let context = EdgeActionAdmissionContext {
+            run_control: Arc::new(engine.clone()),
+            user_id: "owner".into(),
+            run_id: "mode-run".into(),
+            session_id: "session".into(),
+            permission_revision: -1,
+            control_cursor: 0,
+            expected_control_epoch: -1,
+            expected_owner_generation: 0,
+            session_turn: 0,
+            llm_round: 0,
+        };
+        let call = json!({"id":"pending-write", "type":"function", "function":{"name":"write_file", "arguments":"{}"}});
+        let request = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            engine
+                .request_permission_mode(
+                    "owner",
+                    "mode-run",
+                    &astra_turn_types::RunPermissionModeRequest {
+                        expected_session_id: "session".into(),
+                        request_id: "mode-request".into(),
+                        mode: astra_turn_types::PermissionMode::Bypass,
+                    },
+                )
+                .await
+                .unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                host.wait_edge_approval_or_guidance(&context, &call, Duration::from_secs(300))
+            ),
+            request,
+        );
+        assert!(matches!(
+            outcome.unwrap(),
+            EdgeApprovalWait::PermissionModeChanged
+        ));
+        assert!(
+            engine
+                .permission_mode_snapshot("owner", "session", "mode-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .applied
+                .is_none()
+        );
+        let sink = Arc::new(RecordingApprovalCleanupSink::default());
+        host.set_interaction_sink(sink.clone());
+        host.install_runtime_tool_schemas(vec![json!({"type":"function", "function":{"name":"write_file", "description":"Write", "parameters":{"type":"object","properties":{}}}})], Default::default());
+        let calls = host.canonical_provider_tool_calls(&[call]).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            host.deliver_edge_tools_via_ledger("mode-run", "turn", &calls, &context),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.control,
+            AdmittedToolCallControl::PermissionModePending
+        );
+        assert_eq!(sink.denials.lock().unwrap().len(), 1);
+        assert!(
+            !host
+                .emitted_events
+                .iter()
+                .any(|event| event["type"] == "tool_request")
+        );
+    }
+
+    #[test]
+    fn applied_permission_mode_updates_interaction_and_read_only_gate() {
+        use astra_turn_types::{PermissionMode, RunPermissionModeSelection};
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "owner".into(),
+            "session".into(),
+        )
+        .build();
+        let mut state = create_test_state();
+        for (mode, expected_interaction, read_only) in [
+            (PermissionMode::Bypass, TurnInteractionMode::Auto, false),
+            (PermissionMode::Deny, TurnInteractionMode::Deny, false),
+            (PermissionMode::Plan, TurnInteractionMode::Prompt, true),
+            (PermissionMode::Prompt, TurnInteractionMode::Prompt, false),
+        ] {
+            host.apply_permission_mode(mode).unwrap();
+            state.applied_permission_mode = Some(RunPermissionModeSelection {
+                request_id: "request".into(),
+                revision: 1,
+                mode,
+            });
+            assert_eq!(host.turn_interaction_mode(), expected_interaction);
+            assert_eq!(host.plan_mode_active(&state), read_only);
+        }
+    }
+
+    #[test]
     fn plan_authoring_flag_activates_plan_mode_gate() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -37519,6 +37812,7 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_run_owner_generation: None,
+            applied_permission_mode: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
@@ -40687,8 +40981,8 @@ mod tests {
     }
 
     #[test]
-    fn headless_turn_policy_excludes_ask_user_from_final_tools() {
-        let host = ServerAgenticLoopHostBuilder::new(
+    fn headless_turn_policy_keeps_stable_ask_user_schema_without_prompt_authority() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
             "u".to_string(),
@@ -40699,12 +40993,8 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        let state = create_test_state();
-        let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(interaction_scoped_tool_restrictions(
-            TurnInteractionMode::Headless,
-        ));
-        let visible_tools = host.filtered_turn_tools(&effective_restricted);
+        let mut state = create_test_state();
+        let visible_tools = host.visible_turn_tools(&mut state);
         let final_tools = astra_turn_core::tool_schema_prune::prune_tool_schemas(
             &visible_tools,
             crate::prompts::CompactionTier::Normal,
@@ -40735,7 +41025,7 @@ mod tests {
         );
         assert!(!policy.allow_ask_user);
         assert!(
-            !policy
+            policy
                 .visible_tool_names
                 .iter()
                 .any(|name| name == "ask_user")

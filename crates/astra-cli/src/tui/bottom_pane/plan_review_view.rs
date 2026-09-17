@@ -199,6 +199,17 @@ impl Drop for PlanReviewView {
 }
 
 impl BottomPaneView for PlanReviewView {
+    fn pre_draw_tick(&mut self, _now: std::time::Instant) {
+        if self
+            .response_tx
+            .as_ref()
+            .is_some_and(|sender| sender.is_closed())
+        {
+            self.response_tx = None;
+            self.completed = true;
+        }
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         // Reserve enough rows for the four choice rows + a hint line;
         // give the rest to the plan body.
@@ -372,5 +383,13 @@ mod tests {
             rx.try_recv().expect("decision sent"),
             PlanReviewDecision::Cancelled
         );
+    }
+    #[test]
+    fn closed_plan_review_waiter_dismisses_without_a_user_decision() {
+        let (mut view, receiver) = make_view();
+        drop(receiver);
+        view.pre_draw_tick(std::time::Instant::now());
+        assert!(view.is_complete());
+        assert!(view.response_tx.is_none());
     }
 }

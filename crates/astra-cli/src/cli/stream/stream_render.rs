@@ -1206,6 +1206,9 @@ pub(crate) struct EdgeSseContext<'a> {
 // Implements the runtime's `SseStreamHost` trait, wiring terminal rendering,
 // local tool execution, and permission prompts into the generic SSE consumer.
 
+#[derive(Debug, PartialEq, Eq)]
+struct PermissionModePending;
+
 /// CLI host for SSE stream consumption.
 ///
 /// Delegates protocol parsing to runtime's [`consume_sse_stream`] while handling:
@@ -1214,6 +1217,7 @@ pub(crate) struct EdgeSseContext<'a> {
 /// - Approval prompts via [`crate::cli::permission_manager::PermissionManager`]
 /// - Cloud API posting (tool results, approvals) via [`astra_thin_client::ThinClient`]
 struct CliSseStreamHost<'a> {
+    last_permission_selection: Option<astra_turn_types::RunPermissionModeSelection>,
     api: &'a astra_thin_client::ThinClient,
     token: String,
     auth_profile: Option<&'a str>,
@@ -1684,6 +1688,7 @@ impl<'a> CliSseStreamHost<'a> {
         let buffer_from_start = true;
         let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
+            last_permission_selection: None,
             api: ctx.api,
             token: ctx.token.to_string(),
             auth_profile,
@@ -2305,15 +2310,10 @@ impl<'a> CliSseStreamHost<'a> {
                         "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
                     ));
                 }
-                let response = if let Some(token) = self.cancel_token {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => ApprovalResponse::Deny,
-                        r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                    }
-                } else {
-                    resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-                };
+                let response = self
+                    .wait_for_approval_response(resp_rx, self.cancel_token)
+                    .await
+                    .unwrap_or(ApprovalResponse::Deny);
 
                 if response.is_approved() {
                     let save_warning_tx = self.stream_event_tx.clone();
@@ -3887,32 +3887,118 @@ impl CliSseStreamHost<'_> {
         out
     }
 
+    fn pending_permission_selection(&self) -> bool {
+        self.perm_manager.as_ref().is_some_and(|manager| {
+            manager
+                .permission_control_signal()
+                .sender
+                .borrow()
+                .as_ref()
+                .is_some_and(|(run_id, _)| {
+                    Some(run_id.as_str()) == self.last_bound_run_id.as_deref()
+                })
+        })
+    }
+
+    async fn wait_for_permission_selection(&self) {
+        let local = async {
+            let Some(manager) = self.perm_manager.as_ref() else {
+                return std::future::pending::<()>().await;
+            };
+            let mut signal = manager.permission_control_signal().sender.subscribe();
+            loop {
+                if self.pending_permission_selection() {
+                    return;
+                }
+                if signal.changed().await.is_err() {
+                    return std::future::pending::<()>().await;
+                }
+            }
+        };
+        let remote = async {
+            let (Some(run_id), Some(session_id)) = (
+                self.last_bound_run_id.as_deref(),
+                self.executor.active_session_id(),
+            ) else {
+                return std::future::pending::<()>().await;
+            };
+            loop {
+                // Cross-device requests have no local notification. Read only
+                // two indexed control facts while an approval is open.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Ok(Ok(snapshot)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.api.get_run_permission_mode(
+                        Some(self.token.as_str()),
+                        run_id,
+                        &session_id,
+                    ),
+                )
+                .await
+                    && snapshot.requested.as_ref().is_some_and(|requested| {
+                        self.last_permission_selection
+                            .as_ref()
+                            .is_none_or(|applied| applied.revision < requested.revision)
+                    })
+                {
+                    return;
+                }
+            }
+        };
+        tokio::select! { _ = local => {}, _ = remote => {} }
+    }
+
+    /// Supersede only unstarted approval waits. A mode request never grants
+    /// the waiting tool authority; the next model round captures the new policy.
+    async fn wait_for_approval_response(
+        &self,
+        response: tokio::sync::oneshot::Receiver<chat_stream::ApprovalResponse>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<chat_stream::ApprovalResponse, PermissionModePending> {
+        tokio::select! {
+            biased;
+            _ = self.wait_for_permission_selection() => Err(PermissionModePending),
+            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Ok(chat_stream::ApprovalResponse::Deny),
+            result = response => Ok(result.unwrap_or(chat_stream::ApprovalResponse::Deny)),
+        }
+    }
+
     async fn resolve_cloud_approval_via_tui(
         &mut self,
         tool: &str,
         detail: Option<&str>,
         display_label: Option<&str>,
         approval_kind: astra_thin_client::ApprovalKind,
-    ) -> astra_thin_client::ApprovalDecision {
+    ) -> Result<astra_thin_client::ApprovalDecision, PermissionModePending> {
         use crate::cli::chat_stream::ApprovalResponse;
         use astra_thin_client::ApprovalDecision;
+
+        if self.pending_permission_selection() {
+            return Err(PermissionModePending);
+        }
 
         // Plan review is a typed lifecycle interaction with four deliberate
         // outcomes, not an ordinary "allow this tool once" prompt. Route the
         // exact tool identity through the dedicated review surface and keep
         // semantic intent classification in the model/tool protocol.
         if tool == "exit_plan_mode" {
-            return match self.executor.resolve_remote_plan_review(detail).await {
-                Ok(true) => ApprovalDecision::Allow,
-                Ok(false) => ApprovalDecision::Deny,
-                Err(error) => {
-                    astra_core::agent_warn!(
-                        "permission",
-                        "Could not open plan review for server-owned run: {error}"
-                    );
-                    ApprovalDecision::Deny
-                }
-            };
+            return Ok(
+                match tokio::select! {
+                    biased;
+                    _ = self.wait_for_permission_selection() => return Err(PermissionModePending),
+                    outcome = self.executor.resolve_remote_plan_review(detail) => outcome,
+                } {
+                    Ok(true) => ApprovalDecision::Allow,
+                    Ok(false) => ApprovalDecision::Deny,
+                    Err(error) => {
+                        astra_core::agent_warn!(
+                            "permission",
+                            "Could not open plan review for server-owned run: {error}"
+                        );
+                        ApprovalDecision::Deny
+                    }
+                },
+            );
         }
 
         if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
@@ -3923,7 +4009,7 @@ impl CliSseStreamHost<'_> {
                 self.render_policy.is_silent(),
             )
         }) {
-            return decision;
+            return Ok(decision);
         }
 
         let Some(tx) = &self.approval_request_tx else {
@@ -3931,7 +4017,7 @@ impl CliSseStreamHost<'_> {
                 "permission",
                 "Auto-denied cloud approval for {tool}: no TUI approval sink installed"
             );
-            return ApprovalDecision::Deny;
+            return Ok(ApprovalDecision::Deny);
         };
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -3987,20 +4073,14 @@ impl CliSseStreamHost<'_> {
                 "permission",
                 "Auto-denied cloud approval for {tool}: {error}"
             );
-            return ApprovalDecision::Deny;
+            return Ok(ApprovalDecision::Deny);
         }
 
-        let response = if let Some(token) = self.effective_tool_cancel_token() {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => ApprovalResponse::Deny,
-                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-            }
-        } else {
-            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-        };
+        let response = self
+            .wait_for_approval_response(resp_rx, self.effective_tool_cancel_token().as_ref())
+            .await?;
 
-        match response {
+        Ok(match response {
             ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
             ApprovalResponse::AlwaysAllow => {
                 let action = approval_memory_action(&response, always_scope, true);
@@ -4026,7 +4106,7 @@ impl CliSseStreamHost<'_> {
                 }
             }
             ApprovalResponse::Deny => ApprovalDecision::Deny,
-        }
+        })
     }
 
     async fn ask_user_via_tui(&mut self, args: &serde_json::Value) -> String {
@@ -4300,6 +4380,43 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == Some("permission_mode_applied") {
+            let data = event.get("data").unwrap_or(event);
+            let session_id = data.get("session_id").and_then(Value::as_str);
+            let run_id = data.get("run_id").and_then(Value::as_str);
+            if run_id.is_none()
+                || session_id.is_none()
+                || self.last_bound_run_id.as_deref() != run_id
+                || self.executor.active_session_id().as_deref() != session_id
+            {
+                return Err("permission acknowledgement belongs to another execution".into());
+            }
+            let selection: astra_turn_types::RunPermissionModeSelection =
+                serde_json::from_value(data.clone())
+                    .map_err(|error| format!("invalid permission acknowledgement: {error}"))?;
+            if selection.revision < 0 || selection.request_id.is_empty() {
+                return Err("invalid permission revision or request identity".into());
+            }
+            if let Some(previous) = &self.last_permission_selection {
+                if selection.revision < previous.revision {
+                    return Ok(());
+                }
+                if selection.revision == previous.revision {
+                    return if selection == *previous {
+                        Ok(())
+                    } else {
+                        Err("conflicting permission acknowledgement revision".into())
+                    };
+                }
+            }
+            let manager = self.perm_manager.as_mut().ok_or_else(|| {
+                "permission acknowledgement has no local policy owner".to_string()
+            })?;
+            self.executor
+                .apply_runtime_permission_sandbox(selection.mode);
+            manager.apply_acknowledged_mode(run_id.expect("validated run identity"), &selection);
+            self.last_permission_selection = Some(selection);
+        }
         // The canonical accumulator deliberately retains the first session id
         // when a later `session_info` conflicts. Inspect the accepted raw
         // identity fact as a second exactness check so the request lease sees
@@ -5114,17 +5231,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             metadata: Some(Box::new(metadata)),
                         },
                     ) {
-                        Ok(()) => {
-                            if let Some(token) = self.effective_tool_cancel_token() {
-                                tokio::select! {
-                                    biased;
-                                    _ = token.cancelled() => ApprovalResponse::Deny,
-                                    r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                                }
-                            } else {
-                                resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-                            }
-                        }
+                        Ok(()) => self
+                            .wait_for_approval_response(
+                                resp_rx,
+                                self.effective_tool_cancel_token().as_ref(),
+                            )
+                            .await
+                            .unwrap_or(ApprovalResponse::Deny),
                         Err(error) => {
                             denied_output =
                                 Some(format!("Error: {t} requires approval, but {error}"));
@@ -5399,19 +5512,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                     resp_tx,
                                                 ),
                                             ) {
-                                                Ok(()) => {
-                                                    if let Some(token) = execution_cancel.as_ref() {
-                                                        tokio::select! {
-                                                            biased;
-                                                            _ = token.cancelled() => ApprovalResponse::Deny,
-                                                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                                                        }
-                                                    } else {
-                                                        resp_rx
-                                                            .await
-                                                            .unwrap_or(ApprovalResponse::Deny)
-                                                    }
-                                                }
+                                                Ok(()) => self
+                                                    .wait_for_approval_response(
+                                                        resp_rx,
+                                                        execution_cancel.as_ref(),
+                                                    )
+                                                    .await
+                                                    .unwrap_or(ApprovalResponse::Deny),
                                                 Err(error) => {
                                                     astra_core::agent_warn!(
                                                         "permission",
@@ -5420,6 +5527,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                     ApprovalResponse::Deny
                                                 }
                                             };
+                                        let pm = self.perm_manager.as_mut().expect(
+                                            "permission owner retained across approval wait",
+                                        );
                                         let selected_scope = response.always_scope(
                                             astra_turn_core::permission::scope::AllowScope::Project,
                                         );
@@ -5774,7 +5884,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.resolve_cloud_approval_via_tui(tool, detail, display_label, approval_kind)
                 .await
         } else {
-            astra_thin_client::ApprovalDecision::Deny
+            Ok(astra_thin_client::ApprovalDecision::Deny)
+        };
+        let Ok(decision) = decision else {
+            return EdgeApprovalResult {
+                request_id: request_id.to_owned(),
+                decision: "deny".into(),
+                reason: Some("Permission mode change superseded the unstarted approval".into()),
+            };
         };
         let allowed = matches!(
             &decision,
@@ -5857,12 +5974,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
             decisions
         } else {
-            vec![astra_thin_client::ApprovalDecision::Deny; requests.len()]
+            (0..requests.len())
+                .map(|_| Ok(astra_thin_client::ApprovalDecision::Deny))
+                .collect()
         };
 
         let mut results = Vec::with_capacity(requests.len());
         let mut callback_delivery_open = self.callback_failure.is_none() && !self.auth_failure;
         for (request, decision) in requests.iter().zip(decisions) {
+            let Ok(decision) = decision else {
+                results.push(EdgeApprovalResult {
+                    request_id: request.request_id.clone(),
+                    decision: "deny".into(),
+                    reason: Some("Permission mode change superseded the unstarted approval".into()),
+                });
+                continue;
+            };
             let allowed = matches!(
                 &decision,
                 astra_thin_client::ApprovalDecision::Allow
@@ -6438,13 +6565,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 resp_tx,
                             ),
                         ) {
-                            Ok(()) => {
-                                tokio::select! {
-                                    biased;
-                                    _ = retry_cancel.cancelled() => ApprovalResponse::Deny,
-                                    r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                                }
-                            }
+                            Ok(()) => self
+                                .wait_for_approval_response(resp_rx, Some(&retry_cancel))
+                                .await
+                                .unwrap_or(ApprovalResponse::Deny),
                             Err(error) => {
                                 outputs[pos].0.output = format!(
                                     "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
@@ -11104,7 +11228,177 @@ mod tests {
 
         let (decision, ()) = tokio::join!(decision_fut, responder);
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(decision, Ok(astra_thin_client::ApprovalDecision::Allow));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn permission_mode_request_unblocks_cloud_approval_without_conflicting_callback() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        let signal = pm.permission_control_signal();
+        let mirror = pm.mode_mirror_handle();
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: Some(approval_tx),
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        host.last_bound_run_id = Some("run-mode-change".into());
+        let decision_fut = host.resolve_approval(
+            "approval-1",
+            "write_file",
+            astra_thin_client::ApprovalKind::Standard,
+            Some("session-mode-change"),
+            Some("run-mode-change"),
+            Some("src/main.rs"),
+            None,
+        );
+        let responder = async {
+            let mut request = approval_rx.recv().await.expect("approval request");
+            signal.accepted(
+                "run-mode-change",
+                &astra_turn_types::RunPermissionModeSelection {
+                    request_id: "mode-1".into(),
+                    mode: crate::cli::permission_manager::PermissionMode::Bypass,
+                    revision: 1,
+                },
+            );
+            request.response_tx.closed().await;
+        };
+        let (decision, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(decision_fut, responder)
+        })
+        .await
+        .expect("mode selection must unblock pending approval");
+        assert_eq!(decision.decision, "deny");
+        assert!(host.callback_failure.is_none());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "server owns closure; do not post conflicting denial"
+        );
+        assert_eq!(
+            mirror.current(),
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn permission_mode_already_applied_remotely_unblocks_stale_local_approval() {
+        let server = MockServer::start().await;
+        let selection =
+            serde_json::json!({"request_id":"remote-mode", "mode":"bypass", "revision":9});
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-mode-change/permission-mode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requested": selection,
+                "applied": {"selection": selection, "round_index":2, "owner_generation":1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path())
+                .with_active_session_id("session-mode-change"),
+        );
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        let mirror = pm.mode_mirror_handle();
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: Some(approval_tx),
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        host.last_bound_run_id = Some("run-mode-change".into());
+        let decision_fut = host.resolve_approval(
+            "approval-1",
+            "write_file",
+            astra_thin_client::ApprovalKind::Standard,
+            Some("session-mode-change"),
+            Some("run-mode-change"),
+            Some("src/main.rs"),
+            None,
+        );
+        let responder = async {
+            let mut request = approval_rx.recv().await.expect("approval request");
+            request.response_tx.closed().await;
+        };
+        let (decision, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(decision_fut, responder)
+        })
+        .await
+        .expect("mode selection must unblock pending approval");
+        assert_eq!(decision.decision, "deny");
+        assert!(host.callback_failure.is_none());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET"),
+            "server owns closure; do not post conflicting denial"
+        );
+        assert_eq!(
+            mirror.current(),
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
     }
 
     #[serial_test::serial]
@@ -11164,7 +11458,7 @@ mod tests {
         };
         let (decision, ()) = tokio::join!(decision_fut, responder);
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(decision, Ok(astra_thin_client::ApprovalDecision::Allow));
         assert_eq!(
             executor.take_pending_permission_mode_change(),
             Some(crate::cli::permission_manager::PermissionMode::AcceptEdits)
@@ -11831,7 +12125,10 @@ mod tests {
             decision
         };
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+        assert_eq!(
+            decision,
+            Ok(astra_thin_client::ApprovalDecision::AllowSession)
+        );
 
         let args = serde_json::json!({"path": "src/main.rs"});
         let mut reloaded =
@@ -11911,7 +12208,10 @@ mod tests {
             decision
         };
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+        assert_eq!(
+            decision,
+            Ok(astra_thin_client::ApprovalDecision::AllowSession)
+        );
 
         let args = serde_json::json!({"path": ".env"});
         assert!(matches!(
@@ -11996,7 +12296,10 @@ mod tests {
             decision
         };
 
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+        assert_eq!(
+            decision,
+            Ok(astra_thin_client::ApprovalDecision::AllowSession)
+        );
         assert_eq!(
             pm.preflight_cloud_approval_decision(
                 "bash",
@@ -13445,6 +13748,70 @@ mod tests {
                 "policy_feedback": {"state": "not_evaluated"}
             }
         })
+    }
+
+    #[tokio::test]
+    async fn permission_application_event_updates_policy_and_rejects_stale_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path())
+                .with_active_session_id("permission-session"),
+        );
+        let mut manager = crate::cli::permission_manager::PermissionManager::new(false);
+        let mirror = manager.mode_mirror_handle();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut manager),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.last_bound_run_id = Some("permission-run".into());
+        let event = serde_json::json!({"type":"permission_mode_applied",
+            "session_id":"permission-session", "run_id":"permission-run",
+            "request_id":"mode-2", "mode":"bypass", "revision":2,
+            "round_index":2, "owner_generation":1});
+        host.on_accepted_sse_event(&event).await.unwrap();
+        assert_eq!(
+            mirror.current(),
+            crate::cli::permission_manager::PermissionMode::Bypass
+        );
+        assert_eq!(mirror.applied_request_id().as_deref(), Some("mode-2"));
+        let mut older = event.clone();
+        older["revision"] = serde_json::json!(1);
+        older["mode"] = serde_json::json!("prompt");
+        older["request_id"] = serde_json::json!("mode-1");
+        host.on_accepted_sse_event(&older).await.unwrap();
+        assert_eq!(
+            mirror.current(),
+            crate::cli::permission_manager::PermissionMode::Bypass
+        );
+        let mut conflicting = event.clone();
+        conflicting["mode"] = serde_json::json!("prompt");
+        assert!(host.on_accepted_sse_event(&conflicting).await.is_err());
+        let mut wrong_session = event.clone();
+        wrong_session["session_id"] = serde_json::json!("another-session");
+        assert!(host.on_accepted_sse_event(&wrong_session).await.is_err());
+        assert_eq!(mirror.applied_request_id().as_deref(), Some("mode-2"));
     }
 
     #[serial_test::serial]

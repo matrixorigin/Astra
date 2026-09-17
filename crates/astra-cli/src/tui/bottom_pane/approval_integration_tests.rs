@@ -789,14 +789,15 @@ fn draft_navigation_does_not_cycle_pending_approvals() {
 }
 
 #[test]
-fn shift_tab_cycles_pending_approvals_backward() {
+fn shift_tab_selects_permission_mode_without_changing_pending_approval_focus() {
     let mut bp = BottomPane::new();
     let _rx1 = enqueue(&mut bp, "alpha");
     let _rx2 = enqueue(&mut bp, "beta");
 
-    // Move to second, then BackTab should go back to first.
+    // Tab still selects approvals; Shift+Tab keeps its global mode meaning.
     let _ = bp.handle_key(special(KeyCode::Tab));
     assert_eq!(bp.focused_approval_index(), Some(1));
-    let _ = bp.handle_key(special(KeyCode::BackTab));
-    assert_eq!(bp.focused_approval_index(), Some(0));
+    let action = bp.handle_key(special(KeyCode::BackTab));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+    assert_eq!(bp.focused_approval_index(), Some(1));
 }

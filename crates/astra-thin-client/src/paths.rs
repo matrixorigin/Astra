@@ -454,6 +454,10 @@ pub fn session_audit_errors(session_id: &str) -> String {
     format!("/sessions/{session_id}/audit/errors")
 }
 
+pub fn chat_run_permission_mode(run_id: &str) -> String {
+    format!("{}/permission-mode", chat_run(run_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
