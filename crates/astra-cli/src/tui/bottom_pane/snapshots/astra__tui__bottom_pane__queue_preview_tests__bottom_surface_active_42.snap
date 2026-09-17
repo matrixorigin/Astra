@@ -5,4 +5,4 @@ expression: "snapshot_text(&pane, Rect::new(0, 0, 42, 5))"
   ─────────────────────────── 95k / 800k
 › Message Astra
 
-  sonnet-4.6              ~/github/astra
+  sonnet-4.6  Ask         ~/github/astra
