@@ -8,6 +8,13 @@ pub(crate) trait ReplUiAdapter: Send {
     fn show_info(&mut self, msg: &str);
     fn show_status(&mut self, msg: &str);
     fn blank_line(&mut self);
+
+    /// Put input back in an interactive composer after a request that was
+    /// rejected before admission. The return value tells callers whether the
+    /// surface accepted ownership of the draft; line mode has no composer.
+    fn restore_input(&mut self, _text: &str, _session_id: Option<&str>) -> bool {
+        false
+    }
 }
 
 /// Line-mode adapter: writes to stderr with semantic color (existing behavior).

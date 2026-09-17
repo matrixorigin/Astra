@@ -15,6 +15,10 @@ pub(crate) struct Footer {
     pub cwd: Option<String>,
     pub is_turn_active: bool,
     pub permission_mode: Option<PermissionMode>,
+    /// A mode selected for the next turn while the current turn is still
+    /// active. This is presentation state; the live policy remains in the
+    /// permission-mode mirror until settlement.
+    pending_permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     /// Current request's usable context-window occupancy. This deliberately
     /// does not use cumulative session/billing token totals.
@@ -50,6 +54,7 @@ impl Footer {
             cwd: current_cwd_display(),
             is_turn_active: false,
             permission_mode: None,
+            pending_permission_mode: None,
             git_branch: detect_git_branch(),
             context_window: None,
             raw_context_window_tokens: None,
@@ -81,6 +86,19 @@ impl Footer {
         self.mode_mirror = Some(mirror);
     }
 
+    pub(crate) fn set_pending_permission_mode(&mut self, mode: PermissionMode) {
+        self.pending_permission_mode = Some(mode);
+    }
+
+    pub(crate) fn clear_pending_permission_mode(&mut self) {
+        self.pending_permission_mode = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_permission_mode(&self) -> Option<PermissionMode> {
+        self.pending_permission_mode
+    }
+
     /// Resolve the live permission mode: prefer the lock-free mirror
     /// when available; otherwise fall back to the cached field (for
     /// tests and early-init renders before the mirror is wired).
@@ -96,6 +114,7 @@ impl Footer {
             model: self.model.clone(),
             cwd: self.cwd.clone(),
             permission_mode: self.live_mode(),
+            pending_permission_mode: self.pending_permission_mode,
             // Prefer the cached field refreshed by `refresh_env()`,
             // but fall back to a direct probe if the footer has not
             // been initialized yet (useful for early renders/tests).
@@ -322,5 +341,79 @@ mod tests {
             Some(ContextWindowUsage::estimated(12_000, 180_000))
         );
         assert_eq!(footer.raw_context_window_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn pending_permission_mode_is_ui_only_and_clears_when_consumed() {
+        let mut footer = Footer::new();
+        assert_eq!(footer.pending_permission_mode(), None);
+
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        assert_eq!(
+            footer.pending_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Auto)
+        );
+
+        footer.clear_pending_permission_mode();
+        assert_eq!(footer.pending_permission_mode(), None);
+    }
+
+    #[test]
+    fn pending_permission_mode_reaches_the_rendered_bottom_status() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut footer = Footer::new();
+        footer.permission_mode = Some(crate::cli::permission_manager::PermissionMode::Prompt);
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+
+        assert!(rendered.contains("Ask"), "current mode must remain visible");
+        assert!(
+            rendered.contains("next: Auto"),
+            "staged mode must be visible while the turn runs; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn pending_permission_mode_does_not_override_the_live_mode_mirror() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let mirror = state.perm_manager.mode_mirror_handle();
+        let mut footer = Footer::new();
+        footer.set_mode_mirror(mirror);
+        footer.set_pending_permission_mode(crate::cli::permission_manager::PermissionMode::Auto);
+
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(rendered.contains("Ask"));
+        assert!(rendered.contains("next: Auto"));
+
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+        let mut buf = Buffer::empty(area);
+        footer.render(area, &mut buf);
+        let rendered: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(rendered.contains("Read-only"));
+        assert!(rendered.contains("next: Auto"));
+        assert!(
+            !rendered.contains("Ask"),
+            "pending intent must not replace the live mirror; got {rendered:?}"
+        );
     }
 }

@@ -70,7 +70,7 @@ pub(crate) async fn settle_failed_turn(
     failure: &mut crate::TurnFailure,
 ) {
     if failure.partial.admission_rejected {
-        report_admission_rejection(state, failure, dispatch.ui);
+        report_admission_rejection(state, dispatch.line, failure, dispatch.ui);
         clear_recovery_scoped_turn_restrictions(state);
         return;
     }
@@ -230,8 +230,9 @@ mod tests {
         assert_eq!(state.pending_recovery.as_deref(), Some("session-owner"));
         assert!(state.last_turn_event.is_none());
         assert_eq!(ui.errors.len(), 1);
-        assert!(ui.errors[0].contains("Workspace unavailable"));
-        assert!(ui.errors[0].contains("/resume session-owner"));
-        assert!(ui.errors[0].contains("no model or tool ran"));
+        assert!(ui.errors[0].contains("Workspace is already in use"));
+        assert!(ui.errors[0].contains("/resume"));
+        assert!(ui.errors[0].contains("No model or tool ran"));
+        assert_eq!(ui.restored_inputs, vec!["hi"]);
     }
 }

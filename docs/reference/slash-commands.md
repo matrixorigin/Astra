@@ -47,6 +47,12 @@ current working directory. `/session list` remains accepted as an alias for
 `/resume`. `/session fork` is a line-mode command and is not available in the
 TUI.
 
+If a new session targets a checkout already owned by another session, admission
+stops before model or tool work. The TUI keeps the new session attached and
+returns the draft to its composer; use `/resume` and choose a session explicitly
+to continue existing work, or switch to another worktree for the new session.
+Astra never resumes or takes over a session implicitly.
+
 ## Work
 
 | Command | What it does |
@@ -126,8 +132,9 @@ picker with no arguments. Its modes include `auto`, `bypass`, `read_only`,
 `accept_edits`, `prompt`, and `deny`; additional actions show rules, manage
 workspace trust, or inspect the permission trace. The TUI asks for confirmation
 before enabling `bypass`. In the TUI, `Shift+Tab` cycles the everyday modes
-`Ask → Edits → Read-only → Auto`; during a running turn the selected mode is
-shown immediately and takes effect at the next safe turn boundary. `Bypass`
+`Ask → Edits → Read-only → Auto`; during a running turn the current mode remains
+visible and the selected mode is shown as the next-turn value, taking effect at
+the next safe turn boundary. `Bypass`
 and `Deny` remain explicit `/allow` choices.
 
 `/instructions` opens the project-instructions actions. The accepted forms are

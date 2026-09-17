@@ -1,3 +1,19 @@
+/// A rejected submission that must be returned to the matching composer.
+/// Session identity prevents a late event from overwriting a draft after the
+/// user has switched sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreInputRequest {
+    pub(crate) text: String,
+    pub(crate) session_id: Option<String>,
+    /// Stable identity for one rejected submission. The event loop uses it
+    /// to make delivery idempotent when a queued event and the fallback lane
+    /// overlap or when a late duplicate arrives after the composer changed.
+    pub(crate) submission_id: String,
+}
+
+pub(crate) type RestoreInputQueue =
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<RestoreInputRequest>>>;
+
 /// Events flowing from the SSE stream bridge and internal TUI actions
 /// into the main TUI event loop.
 #[derive(Debug, Clone)]
@@ -65,6 +81,9 @@ pub(crate) enum TuiAppEvent {
     WaitingForModel,
     ModelResponding,
     StatusLine(String),
+    /// Restore a user submission that never reached admission. The TUI keeps
+    /// it in the composer while the user chooses an explicit recovery action.
+    RestoreInput(RestoreInputRequest),
     UserIntentApplied {
         intent_id: String,
         delivery: astra_turn_types::UserIntentDelivery,

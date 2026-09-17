@@ -16,6 +16,10 @@ pub(crate) struct StatusContext {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub permission_mode: PermissionMode,
+    /// A permission policy selected while the current turn is still
+    /// running. It is a UI-only intent and must never replace
+    /// `permission_mode` until the turn settles.
+    pub pending_permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
     pub pending_approvals: usize,
@@ -169,6 +173,8 @@ impl Segment {
 pub(crate) struct StatusLine {
     pub left: Vec<Segment>,
     pub right: Vec<Segment>,
+    current_permission_mode: Option<PermissionMode>,
+    pending_permission_mode: Option<PermissionMode>,
 }
 
 fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
@@ -289,7 +295,11 @@ impl StatusLine {
     pub fn from_context(ctx: &StatusContext) -> Self {
         let theme = crate::tui::theme::current();
         let muted = Style::default().fg(theme.dim);
-        let mut out = Self::default();
+        let mut out = Self {
+            current_permission_mode: Some(ctx.permission_mode),
+            pending_permission_mode: ctx.pending_permission_mode,
+            ..Self::default()
+        };
 
         // ── Left: stable agent context, not a second live-status bar ─
         if let Some(model) = ctx.model.as_deref() {
@@ -300,48 +310,36 @@ impl StatusLine {
         }
 
         // Permission mode changes whether tools run automatically or ask first.
-        // Keep it visible so `/mode` feedback matches the persistent status line.
-        match ctx.permission_mode {
-            // Prompt is the safe default. Repeating it forever adds no new
-            // information; modes that materially change execution remain
-            // visible and colour-coded.
-            PermissionMode::Prompt => {}
-            PermissionMode::Auto => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-                ));
-            }
-            PermissionMode::Bypass => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    Style::default()
-                        .fg(theme.error)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            PermissionMode::Plan => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    Style::default()
-                        .fg(theme.command)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+        // Keep the *current* mode visible even for Ask: a mode transition must
+        // never make the persistent status line look empty or stale.
+        let permission_style = match ctx.permission_mode {
+            PermissionMode::Prompt => muted,
+            PermissionMode::Auto => Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+            PermissionMode::Bypass | PermissionMode::Deny => Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+            PermissionMode::Plan => Style::default()
+                .fg(theme.command)
+                .add_modifier(Modifier::BOLD),
             PermissionMode::AcceptEdits => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    Style::default().fg(theme.link).add_modifier(Modifier::BOLD),
-                ));
+                Style::default().fg(theme.link).add_modifier(Modifier::BOLD)
             }
-            PermissionMode::Deny => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    Style::default()
-                        .fg(theme.error)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+        };
+        out.left.push(Segment::styled(
+            permission_mode_label(ctx.permission_mode),
+            permission_style,
+        ));
+
+        // A staged mode is a next-turn intent, not a second current policy.
+        // Keep it visually subordinate and avoid saying `next: Ask` when a
+        // cycle has returned to the already-active mode.
+        if let Some(next_mode) = ctx.pending_permission_mode
+            && next_mode != ctx.permission_mode
+        {
+            out.left.push(Segment::styled(
+                format!("next: {}", permission_mode_label(next_mode)),
+                muted,
+            ));
         }
 
         if ctx.pending_approvals > 0 {
@@ -431,8 +429,8 @@ impl StatusLine {
 
     /// Draw into `area` of `buf`. Left side sticks to the left edge; right
     /// side is right-aligned. When the terminal is too narrow for both,
-    /// right-side segments are dropped one at a time (tail first) until
-    /// the line fits.
+    /// workspace decoration and secondary chips yield before the current
+    /// permission mode; a pending next-turn mode yields last.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -447,7 +445,14 @@ impl StatusLine {
         }
         let mut left_segments = self.left.clone();
         let mut right_segments = self.right.clone();
-        fit_clusters(&mut left_segments, &mut right_segments, available);
+        fit_clusters(
+            &mut left_segments,
+            &mut right_segments,
+            available,
+            self.current_permission_mode
+                .unwrap_or(PermissionMode::Prompt),
+            self.pending_permission_mode,
+        );
 
         let left_spans = join_segments(&left_segments, INNER_GAP, bg);
         let right_spans = join_segments(&right_segments, INNER_GAP, bg);
@@ -516,7 +521,24 @@ fn cluster_width(segments: &[Segment]) -> usize {
         + segments.len().saturating_sub(1) * 2
 }
 
-fn fit_clusters(left: &mut Vec<Segment>, right: &mut Vec<Segment>, available: usize) {
+fn compact_permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Plan => "RO",
+        PermissionMode::AcceptEdits => "Edits",
+        PermissionMode::Prompt => "Ask",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::Bypass => "Bypass",
+        PermissionMode::Deny => "Deny",
+    }
+}
+
+fn fit_clusters(
+    left: &mut Vec<Segment>,
+    right: &mut Vec<Segment>,
+    available: usize,
+    current_mode: PermissionMode,
+    pending_mode: Option<PermissionMode>,
+) {
     const CLUSTER_GAP: usize = 3;
     let total = |left: &[Segment], right: &[Segment]| {
         cluster_width(left)
@@ -524,27 +546,70 @@ fn fit_clusters(left: &mut Vec<Segment>, right: &mut Vec<Segment>, available: us
             + usize::from(!left.is_empty() && !right.is_empty()) * CLUSTER_GAP
     };
 
-    // Branch is decoration; cwd is the primary workspace anchor.
+    // Branch and cwd are workspace decoration. Branch yields first, then cwd
+    // yields before actionable permission state when the line is crowded.
     while right.len() > 1 && total(left, right) > available {
         right.pop();
     }
-    // Secondary left chips yield before model identity on very narrow screens.
-    while left.len() > 1 && total(left, right) > available {
-        left.pop();
-    }
+
+    // The current and next permission modes are actionable. Once the
+    // workspace identity no longer fits, remove it before either mode chip so
+    // a runtime choice cannot disappear exactly when the user needs feedback.
     if total(left, right) > available && !right.is_empty() {
-        if left.is_empty() {
-            right[0].text = truncate_end(&right[0].text, available.max(1));
-            right.truncate(1);
-        } else {
-            right.clear();
+        right.clear();
+    }
+
+    let is_current = |segment: &Segment| segment.text == permission_mode_label(current_mode);
+    let pending_label = pending_mode.map(|mode| format!("next: {}", permission_mode_label(mode)));
+    let is_pending = |segment: &Segment| {
+        pending_label
+            .as_deref()
+            .is_some_and(|label| segment.text == label)
+    };
+
+    // Secondary left chips (model, approval/task summaries, …) yield before
+    // the current/next mode pair. Remove from the tail to keep the existing
+    // stable order for everything that remains.
+    while total(left, right) > available {
+        let Some(index) = left.iter().enumerate().rev().find_map(|(index, segment)| {
+            (!is_current(segment) && !is_pending(segment)).then_some(index)
+        }) else {
+            break;
+        };
+        left.remove(index);
+    }
+
+    // If even the mode pair cannot fit, keep the current policy and elide the
+    // next-turn intent first. This is preferable to showing a stale current
+    // policy or an unlabeled status line on a very narrow terminal.
+    while total(left, right) > available {
+        let Some(index) = left.iter().position(&is_pending) else {
+            break;
+        };
+        left.remove(index);
+    }
+
+    // The current mode still gets a compact, recognizable label if the
+    // terminal is narrower than its full human label (for example `RO` for
+    // `Read-only`).
+    if total(left, right) > available {
+        if let Some(current_index) = left.iter().position(&is_current) {
+            left[current_index].text = compact_permission_mode_label(current_mode).to_string();
+            left.truncate(current_index + 1);
         }
     }
+
     if total(left, right) > available
-        && let Some(primary) = left.first_mut()
+        && let Some(current_index) = left.iter().position(&is_current)
     {
-        primary.text = truncate_end(&primary.text, available.max(1));
-        left.truncate(1);
+        left[current_index].text = truncate_end(&left[current_index].text, available.max(1));
+        left.truncate(current_index + 1);
+    }
+
+    // A pathological width can still leave a right-side segment after the
+    // mode fit above. Drop it rather than allowing a render overflow.
+    if total(left, right) > available {
+        right.clear();
     }
 }
 

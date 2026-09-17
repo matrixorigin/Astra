@@ -26,7 +26,7 @@
 │  ───────────────                                      95k / 800k │  ← Context rail
 │  › Message Astra                                                 │  ← Composer
 │                                                                  │
-│  sonnet-4.6                                      ~/dir  ⎇ branch │  ← Status
+│  sonnet-4.6  Ask                                ~/dir  ⎇ branch │  ← Status
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -78,7 +78,7 @@ read paths:
 |------|-------------|--------------|
 | **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
 | **Composer** | Two-row-minimum editing surface with `› ` prefix. Emacs keybindings, expands for multi-line input. | Always (unless an overlay is active) |
-| **Status** | Model and attention states on the left; workspace identity on the right. Default policy and key tutorials stay hidden. | When no popup/overlay is active |
+| **Status** | Model and the current permission mode on the left; a staged next-turn mode appears as `next: …`; workspace identity stays on the right. Key tutorials stay hidden. | When no popup/overlay is active |
 | **Slash Popup** | Full list of TUI-native commands under the composer; featured commands sort first, and typing filters the list. | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
@@ -232,7 +232,7 @@ show an unavailable message if typed in the workbench.
 | `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
 | `Alt+E` | Composer | Open the external editor |
 | `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |
-| `Shift+Tab` | Composer or active turn | Cycle Ask → Edits → Read-only → Auto; active-turn changes apply after settlement |
+| `Shift+Tab` | Composer or active turn | Cycle Ask → Edits → Read-only → Auto; the status line shows `next: …` during an active turn and applies the choice after settlement |
 | `Ctrl+U` | Composer | Kill to start of line |
 | `Esc` | Overlay/Popup | Close and return |
 | `/` | Composer | Slash command popup |

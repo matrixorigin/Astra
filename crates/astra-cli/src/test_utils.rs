@@ -398,6 +398,7 @@ pub(crate) struct TestUi {
     pub(crate) warnings: Vec<String>,
     pub(crate) infos: Vec<String>,
     pub(crate) statuses: Vec<String>,
+    pub(crate) restored_inputs: Vec<String>,
     pub(crate) blank_lines: usize,
 }
 
@@ -416,6 +417,11 @@ impl crate::cli::ui_adapter::ReplUiAdapter for TestUi {
 
     fn show_status(&mut self, msg: &str) {
         self.statuses.push(msg.to_string());
+    }
+
+    fn restore_input(&mut self, text: &str, _session_id: Option<&str>) -> bool {
+        self.restored_inputs.push(text.to_string());
+        true
     }
 
     fn blank_line(&mut self) {

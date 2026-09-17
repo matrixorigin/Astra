@@ -152,6 +152,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ContextSystemPromptTokens(_)
         | TuiAppEvent::ContextWindowMeasured(_)
         | TuiAppEvent::RequestTokenUsage(_)
+        | TuiAppEvent::RestoreInput(_)
         | TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
         | TuiAppEvent::TurnProjectionDrained

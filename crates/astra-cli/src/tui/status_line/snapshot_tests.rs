@@ -49,6 +49,18 @@ fn snapshot_auto_mode() {
 }
 
 #[test]
+fn snapshot_active_pending_mode() {
+    let ctx = StatusContext {
+        pending_permission_mode: Some(PermissionMode::Auto),
+        ..base_ctx()
+    };
+    crate::tui::testing::assert_tui_snapshot!(
+        "status_active_pending_mode_80",
+        render_ctx(&ctx, 80)
+    );
+}
+
+#[test]
 fn snapshot_deny_mode() {
     let ctx = StatusContext {
         permission_mode: PermissionMode::Deny,

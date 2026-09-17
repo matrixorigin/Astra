@@ -13,12 +13,12 @@ fn ctx() -> StatusContext {
 // ─── Left-side state ──────────────────────────────────────────────
 
 #[test]
-fn idle_hides_default_mode_and_tutorial_legend() {
+fn idle_shows_current_mode_without_tutorial_legend() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        !plain.contains("Ask"),
-        "the safe default should not consume permanent footer space; got {plain:?}"
+        plain.contains("Ask"),
+        "the active permission mode must remain visible; got {plain:?}"
     );
     assert!(
         !plain.contains("/commands"),
@@ -113,10 +113,33 @@ fn thinking_suffix_is_compacted_before_model_identity_is_lost() {
 // ─── Permission mode chip ─────────────────────────────────────────
 
 #[test]
-fn ask_mode_is_the_unlabelled_safe_default() {
+fn ask_mode_is_visible_as_the_safe_default() {
     let s = StatusLine::from_context(&ctx());
-    assert!(!s.plain().contains("Ask"));
-    assert!(s.left.is_empty());
+    assert!(s.plain().contains("Ask"));
+    assert_eq!(s.left.len(), 1);
+    assert_eq!(s.left[0].text, "Ask");
+}
+
+#[test]
+fn pending_mode_is_shown_as_a_next_turn_intent() {
+    let c = StatusContext {
+        permission_mode: PermissionMode::Prompt,
+        pending_permission_mode: Some(PermissionMode::Auto),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    assert_eq!(s.plain(), "Ask  next: Auto");
+}
+
+#[test]
+fn pending_mode_matching_current_is_not_duplicated() {
+    let c = StatusContext {
+        permission_mode: PermissionMode::Prompt,
+        pending_permission_mode: Some(PermissionMode::Prompt),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    assert_eq!(s.plain(), "Ask");
 }
 
 #[test]
@@ -257,7 +280,7 @@ fn long_cwd_truncates_with_leading_ellipsis() {
 }
 
 #[test]
-fn narrow_footer_drops_mode_before_model_identity() {
+fn narrow_footer_preserves_mode_before_model_identity() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -274,12 +297,41 @@ fn narrow_footer_drops_mode_before_model_identity() {
         .map(|x| buf[(x, 0)].symbol().to_string())
         .collect();
     assert!(
-        rendered.contains("sonnet-4.6"),
-        "model should survive narrow layouts; got {rendered:?}"
+        rendered.contains("Auto"),
+        "current permission mode should survive narrow layouts; got {rendered:?}"
     );
     assert!(
-        !rendered.contains("Auto"),
-        "mode chip should yield before the model on narrow widths; got {rendered:?}"
+        !rendered.contains("sonnet-4.6"),
+        "secondary model identity should yield before the mode; got {rendered:?}"
+    );
+}
+
+#[test]
+fn narrow_footer_preserves_pending_mode_before_workspace_identity() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("sonnet-4.6".into()),
+        cwd: Some("~/projects/astra".into()),
+        pending_permission_mode: Some(PermissionMode::Auto),
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 40, 1);
+    let mut buf = Buffer::empty(area);
+    s.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+
+    assert!(
+        rendered.contains("Ask") && rendered.contains("next: Auto"),
+        "current and pending mode should survive a 40-column layout; got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("~/projects/astra"),
+        "workspace identity should yield before actionable permission state; got {rendered:?}"
     );
 }
 
@@ -346,14 +398,14 @@ fn status_segments_use_whitespace_instead_of_punctuation_chrome() {
 // ─── Composition hygiene ──────────────────────────────────────────
 
 #[test]
-fn empty_context_produces_no_permanent_chrome() {
+fn empty_context_still_identifies_permission_mode() {
     let s = StatusLine::from_context(&ctx());
     assert_eq!(
         s.left
             .iter()
             .map(|seg| seg.text.as_str())
             .collect::<Vec<_>>(),
-        Vec::<&str>::new()
+        vec!["Ask"]
     );
 }
 

@@ -53,12 +53,16 @@ pub(crate) async fn reconcile_and_report_turn_failure(
 /// Render a server admission rejection without pretending that a model turn
 /// or durable Run existed. The HTTP request reached the server, but admission
 /// stopped it before any model or tool work ran. Keep the newly-created Session
-/// attached and make recovery explicit; never silently restore another Session.
+/// attached, return the draft to the composer, and make recovery explicit;
+/// never silently restore another Session.
 pub(crate) fn report_admission_rejection(
     state: &mut SessionState,
+    line: &str,
     failure: &crate::TurnFailure,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
+    let draft_restored =
+        !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
     let metadata = failure.partial.error_metadata.as_ref();
     if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
         let owner = metadata
@@ -76,20 +80,32 @@ pub(crate) fn report_admission_rejection(
         {
             state.pending_recovery = Some(owner.to_string());
         }
-        let mut message = String::from("Workspace unavailable\n");
-        if let Some(owner) = owner {
-            message.push_str(&format!("  Session {owner} owns this checkout.\n"));
-            message.push_str(&format!("  Resume it explicitly with: /resume {owner}\n"));
+        let mut message = admission_rejection_message(draft_restored, true);
+        if owner.is_some() {
+            message.push_str("  To continue existing work, run /resume and choose the session.\n");
         }
-        message.push_str(
-            "  Request was not admitted; no model or tool ran.\n  Use another worktree, or retry this new Session after the checkout is available.",
-        );
+        message.push_str("  To keep this new session, switch to another worktree and retry.\n");
+        message.push_str("  No model or tool ran.");
         ui.show_error(&message);
         return;
     }
-    ui.show_error(
-        "Session execution is busy\n  Request was not admitted; no model or tool ran.\n  Retry this new Session after the current operation finishes, then send the same input again.",
-    );
+    let mut message = admission_rejection_message(draft_restored, false);
+    message.push_str("  No model or tool ran.");
+    ui.show_error(&message);
+}
+
+fn admission_rejection_message(draft_restored: bool, workspace_claimed: bool) -> String {
+    let mut message = if workspace_claimed {
+        String::from("Workspace is already in use\n")
+    } else {
+        String::from("Session execution is busy\n")
+    };
+    if draft_restored {
+        message.push_str("  Your message was not sent; the draft is back in the composer.\n");
+    } else {
+        message.push_str("  Your message was not sent; retry it after the conflict clears.\n");
+    }
+    message
 }
 
 async fn reconcile_failure_accounting(
@@ -339,8 +355,9 @@ pub(crate) fn report_turn_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_durable_run_accounting, await_failure_reconciliation_before_deadline,
-        reconcile_and_report_turn_failure, report_admission_rejection, report_turn_failure,
+        admission_rejection_message, apply_durable_run_accounting,
+        await_failure_reconciliation_before_deadline, reconcile_and_report_turn_failure,
+        report_admission_rejection, report_turn_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tests::heavy_checkpoint_with_runtime_state;
@@ -381,6 +398,19 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn line_surface_does_not_claim_a_composer_restore() {
+        let mut line_ui = crate::cli::ui_adapter::LineUiAdapter;
+        assert!(!crate::cli::ui_adapter::ReplUiAdapter::restore_input(
+            &mut line_ui,
+            "draft",
+            Some("session-current"),
+        ));
+        let message = admission_rejection_message(false, true);
+        assert!(message.contains("retry it after the conflict clears"));
+        assert!(!message.contains("back in the composer"));
     }
 
     #[tokio::test]
@@ -777,7 +807,7 @@ mod tests {
         };
         let mut ui = crate::tests::TestUi::default();
 
-        report_admission_rejection(&mut state, &failure, &mut ui);
+        report_admission_rejection(&mut state, "draft", &failure, &mut ui);
 
         assert_eq!(
             crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
@@ -786,6 +816,7 @@ mod tests {
             Some("previous-session"),
             "a rejected draft must never replace the last resumable session"
         );
+        assert_eq!(ui.restored_inputs, vec!["draft"]);
     }
 
     #[test]

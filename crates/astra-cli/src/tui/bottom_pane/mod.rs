@@ -1294,6 +1294,15 @@ impl BottomPane {
         mode: crate::cli::permission_manager::PermissionMode,
     ) {
         self.staged_permission_mode = Some(mode);
+        self.footer.set_pending_permission_mode(mode);
+    }
+
+    /// Clear a staged next-turn policy and its status-line presentation.
+    /// Used when a repeated cycle returns to the live policy or when a
+    /// pending selection is cancelled before settlement.
+    pub(crate) fn clear_staged_permission_mode(&mut self) {
+        self.staged_permission_mode = None;
+        self.footer.clear_pending_permission_mode();
     }
 
     /// Peek at the policy selected for the next turn without consuming it.
@@ -1308,7 +1317,9 @@ impl BottomPane {
     pub(crate) fn take_staged_permission_mode(
         &mut self,
     ) -> Option<crate::cli::permission_manager::PermissionMode> {
-        self.staged_permission_mode.take()
+        let mode = self.staged_permission_mode.take();
+        self.footer.clear_pending_permission_mode();
+        mode
     }
 
     fn close_mention(&mut self) {
