@@ -160,12 +160,12 @@ fn append_tree(
             let round = node
                 .round_index
                 .filter(|round| verbose || *round > 0)
-                .map(|round| format!(" · round {}", round + 1))
+                .map(|round| format!(" · round {}", u64::from(round).saturating_add(1)))
                 .unwrap_or_default();
             let attempt = node
                 .attempt_index
                 .filter(|attempt| verbose || *attempt > 0)
-                .map(|attempt| format!(" · attempt {}", attempt + 1))
+                .map(|attempt| format!(" · attempt {}", u64::from(attempt).saturating_add(1)))
                 .unwrap_or_default();
             lines.push(format!(
                 "{tree}{} · {duration} · {state}{round}{attempt} · {offset}",

@@ -72,6 +72,7 @@ pub mod diff_utils;
 pub mod edge_tools;
 pub mod entrypoint;
 pub(crate) mod explain_analyze_artifact;
+pub(crate) mod explain_analyze_html;
 pub(crate) mod explain_analyze_report;
 pub mod git_branch_cache;
 pub mod lock_recovery;
