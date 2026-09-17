@@ -111,6 +111,53 @@ pub struct RuntimeConfig {
     pub explain: ExplainConfig,
 }
 
+/// Human-readable Explain Analyze report formats.
+///
+/// The canonical artifact remains JSON regardless of this choice. These
+/// values select only the local, derived presentation written for a person.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainReportFormat {
+    Html,
+    Markdown,
+    Text,
+}
+
+impl ExplainReportFormat {
+    pub const DEFAULT: Self = Self::Html;
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "html" => Ok(Self::Html),
+            "markdown" | "md" => Ok(Self::Markdown),
+            "text" | "txt" | "plain" => Ok(Self::Text),
+            other => Err(format!(
+                "invalid Explain Analyze report format `{other}` (expected html, markdown, or text)"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Markdown => "markdown",
+            Self::Text => "text",
+        }
+    }
+}
+
+impl Default for ExplainReportFormat {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for ExplainReportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// User-facing Explain Analyze presentation settings.
 ///
 /// The live TUI projection is intentionally bounded: it is a compact status
@@ -125,6 +172,11 @@ pub struct ExplainConfig {
     /// choose `5` over a user config choosing `3`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_rows: Option<u8>,
+    /// Derived report format for local human-readable artifacts. `None`
+    /// preserves the built-in HTML default while allowing higher-precedence
+    /// config layers to explicitly override a lower layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_format: Option<ExplainReportFormat>,
 }
 
 fn default_explain_live_rows() -> u8 {
@@ -139,6 +191,11 @@ impl ExplainConfig {
         self.live_rows
             .unwrap_or_else(default_explain_live_rows)
             .clamp(1, 5)
+    }
+
+    /// Resolve the format used for the next report publication.
+    pub fn effective_report_format(&self) -> ExplainReportFormat {
+        self.report_format.unwrap_or_default()
     }
 }
 
@@ -2718,6 +2775,9 @@ impl RuntimeConfig {
         if let Some(live_rows) = explain.live_rows {
             self.explain.live_rows = Some(live_rows);
         }
+        if let Some(report_format) = explain.report_format {
+            self.explain.report_format = Some(report_format);
+        }
 
         self
     }
@@ -3072,7 +3132,10 @@ mod tests {
                 max_ceiling: 1200,
                 reflect_after_consecutive_zero: 5,
             }),
-            explain: ExplainConfig { live_rows: Some(3) },
+            explain: ExplainConfig {
+                live_rows: Some(3),
+                ..ExplainConfig::default()
+            },
         });
 
         assert_eq!(merged.version, "2.0");
@@ -3156,16 +3219,111 @@ mod tests {
     #[test]
     fn explicit_explain_default_overrides_a_lower_precedence_value() {
         let user = RuntimeConfig {
-            explain: ExplainConfig { live_rows: Some(3) },
+            explain: ExplainConfig {
+                live_rows: Some(3),
+                ..ExplainConfig::default()
+            },
             ..RuntimeConfig::default()
         };
         let project = RuntimeConfig {
-            explain: ExplainConfig { live_rows: Some(5) },
+            explain: ExplainConfig {
+                live_rows: Some(5),
+                ..ExplainConfig::default()
+            },
             ..RuntimeConfig::default()
         };
         let merged = RuntimeConfig::default().merge(user).merge(project);
         assert_eq!(merged.explain.live_rows, Some(5));
         assert_eq!(merged.explain.effective_live_rows(), 5);
+    }
+
+    #[test]
+    fn explain_report_format_defaults_to_html_and_preserves_layer_precedence() {
+        let user = RuntimeConfig {
+            explain: ExplainConfig {
+                report_format: Some(ExplainReportFormat::Markdown),
+                ..ExplainConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        let project = RuntimeConfig {
+            explain: ExplainConfig {
+                report_format: Some(ExplainReportFormat::Html),
+                ..ExplainConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            RuntimeConfig::default().explain.effective_report_format(),
+            ExplainReportFormat::Html
+        );
+        assert_eq!(
+            RuntimeConfig::default()
+                .merge(user.clone())
+                .explain
+                .effective_report_format(),
+            ExplainReportFormat::Markdown
+        );
+        assert_eq!(
+            RuntimeConfig::default()
+                .merge(user.clone())
+                .merge(project)
+                .explain
+                .effective_report_format(),
+            ExplainReportFormat::Html
+        );
+        assert_eq!(
+            ExplainReportFormat::parse("md"),
+            Ok(ExplainReportFormat::Markdown)
+        );
+        assert!(ExplainReportFormat::parse("pdf").is_err());
+    }
+
+    #[test]
+    fn explain_report_format_toml_round_trip_uses_canonical_values() {
+        for format in [
+            ExplainReportFormat::Html,
+            ExplainReportFormat::Markdown,
+            ExplainReportFormat::Text,
+        ] {
+            let config = RuntimeConfig {
+                explain: ExplainConfig {
+                    report_format: Some(format),
+                    ..ExplainConfig::default()
+                },
+                ..RuntimeConfig::default()
+            };
+            let encoded = config.to_toml().expect("Explain config should serialize");
+            assert!(encoded.contains(&format!("report_format = \"{}\"", format.as_str())));
+            let decoded: RuntimeConfig =
+                toml::from_str(&encoded).expect("Explain config should parse");
+            assert_eq!(decoded.explain.report_format, Some(format));
+        }
+        assert!(toml::from_str::<RuntimeConfig>("[explain]\nreport_format = \"pdf\"\n").is_err());
+    }
+
+    #[test]
+    fn explain_report_format_none_preserves_lower_precedence_value() {
+        let lower = RuntimeConfig {
+            explain: ExplainConfig {
+                report_format: Some(ExplainReportFormat::Markdown),
+                ..ExplainConfig::default()
+            },
+            ..RuntimeConfig::default()
+        };
+        let higher = RuntimeConfig {
+            explain: ExplainConfig::default(),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(
+            RuntimeConfig::default()
+                .merge(lower)
+                .merge(higher)
+                .explain
+                .effective_report_format(),
+            ExplainReportFormat::Markdown
+        );
     }
 
     #[test]

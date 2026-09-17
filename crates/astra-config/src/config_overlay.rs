@@ -22,7 +22,9 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink};
+use crate::runtime_config::{
+    ExplainReportFormat, RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink,
+};
 use astra_core::runtime_limits::{
     MODEL_CONTEXT_INPUT_BUDGET_RATIO, RuntimeLimits, context_window_for_model,
 };
@@ -351,6 +353,14 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
                 allow_fraction: false,
             },
             value: Value::from(config.explain.effective_live_rows()),
+        },
+        SettingItem {
+            id: "explain.report_format".to_string(),
+            label: "Explain Analyze report format".to_string(),
+            kind: SettingKind::Enum {
+                options: vec!["html".into(), "markdown".into(), "text".into()],
+            },
+            value: Value::from(config.explain.effective_report_format().as_str()),
         },
     ]
 }
@@ -721,6 +731,19 @@ pub fn apply_edit(
             ensure_range(n as f64, 1.0, 5.0, id)?;
             config.explain.live_rows = Some(n as u8);
         }
+        "explain.report_format" => {
+            let value = new_value
+                .as_str()
+                .ok_or_else(|| OverlayError::TypeMismatch {
+                    path: id.to_string(),
+                    expected: "string".to_string(),
+                    got: describe(&new_value),
+                })?;
+            config.explain.report_format = Some(
+                ExplainReportFormat::parse(value)
+                    .map_err(|error| OverlayError::InvalidInvariant(error))?,
+            );
+        }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),
     }
     Ok(config)
@@ -798,6 +821,37 @@ mod tests {
             .expect("valid Explain Analyze row count should apply");
         assert_eq!(updated.explain.live_rows, Some(3));
         assert!(apply_edit(updated, "explain.live_rows", Value::from(6)).is_err());
+    }
+
+    #[test]
+    fn explain_report_format_is_catalogued_and_editable() {
+        let config = RuntimeConfig::default();
+        let item = build_settings_catalog(&config)
+            .into_iter()
+            .find(|item| item.id == "explain.report_format")
+            .expect("catalog must expose Explain Analyze report format");
+        assert_eq!(item.value, Value::from("html"));
+        assert_eq!(
+            item.kind,
+            SettingKind::Enum {
+                options: vec!["html".into(), "markdown".into(), "text".into()]
+            }
+        );
+        let updated = apply_edit(config, "explain.report_format", Value::from("markdown"))
+            .expect("valid Explain Analyze report format should apply");
+        assert_eq!(
+            updated.explain.effective_report_format(),
+            ExplainReportFormat::Markdown
+        );
+        assert!(apply_edit(updated, "explain.report_format", Value::from("pdf")).is_err());
+        assert!(
+            apply_edit(
+                RuntimeConfig::default(),
+                "explain.report_format",
+                Value::Bool(true)
+            )
+            .is_err()
+        );
     }
 
     #[test]

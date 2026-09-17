@@ -220,6 +220,21 @@ fn show_config() {
             .yellow()
     );
 
+    // Explain Analyze presentation
+    stdout_println!("\n{}", "🔎 Explain Analyze".bold());
+    stdout_println!(
+        "  live_rows: {}",
+        config.explain.effective_live_rows().to_string().yellow()
+    );
+    stdout_println!(
+        "  report_format: {}",
+        config
+            .explain
+            .effective_report_format()
+            .to_string()
+            .yellow()
+    );
+
     stdout_println!(
         "\n{}",
         "Use `/config paths` to see configuration file locations.".dim()
@@ -585,6 +600,27 @@ fn show_diff() {
             current
                 .trace
                 .category_enabled(TraceCategory::LlmExchanges)
+                .to_string()
+                .yellow()
+        );
+    }
+
+    if current.explain.effective_live_rows() != default.explain.effective_live_rows() {
+        has_diff = true;
+        stdout_println!(
+            "  explain.live_rows: {} → {}",
+            default.explain.effective_live_rows().to_string().dim(),
+            current.explain.effective_live_rows().to_string().yellow()
+        );
+    }
+    if current.explain.effective_report_format() != default.explain.effective_report_format() {
+        has_diff = true;
+        stdout_println!(
+            "  explain.report_format: {} → {}",
+            default.explain.effective_report_format().to_string().dim(),
+            current
+                .explain
+                .effective_report_format()
                 .to_string()
                 .yellow()
         );
