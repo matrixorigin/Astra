@@ -63,7 +63,13 @@ pub struct JournalDigest {
     pub schema_version: &'static str,
     pub session_id: String,
     pub journal_file: String,
-    /// Non-empty lines in the JSONL file.
+    /// Additional owner-scoped runtime journals linked by the canonical
+    /// conversation cursor. Root turn durability remains in `journal_file`;
+    /// these files contribute child/run telemetry that would otherwise be
+    /// invisible from a profile-scoped CLI journal.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub supplemental_journal_files: Vec<String>,
+    /// Non-empty lines across the primary and linked runtime JSONL files.
     pub journal_lines_non_empty: usize,
     /// Lines that were non-empty but not valid `JournalEvent` JSON.
     pub journal_lines_malformed: usize,
@@ -103,6 +109,11 @@ pub struct Aggregates {
     pub session_start_count: usize,
     pub session_end_count: usize,
     pub total_tokens_in: u64,
+    /// Root-run prompt-cache reads and writes. `total_tokens_in` remains fresh
+    /// input for compatibility; add all three buckets for provider input.
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub total_provider_input_tokens: u64,
     pub total_tokens_out: u64,
     pub total_duration_ms: u64,
     pub total_tool_calls: u64,
@@ -110,12 +121,18 @@ pub struct Aggregates {
     pub subrun_count: usize,
     /// Sum of child-run LLM token input. Duration is cumulative work, not wall time.
     pub subrun_total_tokens_in: u64,
+    pub subrun_total_cache_read_tokens: u64,
+    pub subrun_total_cache_creation_tokens: u64,
+    pub subrun_total_provider_input_tokens: u64,
     pub subrun_total_tokens_out: u64,
     pub subrun_total_duration_ms: u64,
     pub subrun_total_tool_calls: u64,
     /// Root plus child-run work. Use these for the total session cost; root
     /// totals above remain intentionally scoped to the parent conversation.
     pub inclusive_total_tokens_in: u64,
+    pub inclusive_total_cache_read_tokens: u64,
+    pub inclusive_total_cache_creation_tokens: u64,
+    pub inclusive_total_provider_input_tokens: u64,
     pub inclusive_total_tokens_out: u64,
     pub inclusive_total_tool_calls: u64,
     /// Tool records that produced fresh observations, excluding cache hits,
@@ -149,6 +166,10 @@ pub struct TurnRow {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,6 +247,10 @@ pub struct LlmRoundRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -284,6 +309,10 @@ pub struct TurnErrRow {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +397,32 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
         }
     }
     stats
+}
+
+fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolCallStats {
+    let record_stats = tool_call_stats(event.tool_calls.as_ref());
+    let record_count = event.tool_calls.as_ref().map_or(0, Vec::len);
+    let Some(outcomes) = event
+        .tool_outcomes
+        .as_ref()
+        .filter(|outcomes| outcomes.is_consistent())
+        .filter(|outcomes| outcomes.requested as usize > record_count)
+    else {
+        return record_stats;
+    };
+
+    ToolCallStats {
+        ok: outcomes
+            .succeeded
+            .saturating_add(outcomes.reused)
+            .saturating_add(outcomes.suppressed),
+        fail: outcomes
+            .failed
+            .saturating_add(outcomes.rejected)
+            .saturating_add(outcomes.deferred),
+        fresh: outcomes.succeeded,
+        noop_or_cached: outcomes.reused.saturating_add(outcomes.suppressed),
+    }
 }
 
 /// Treat a tool call as a failure when either:
@@ -548,15 +603,30 @@ fn llm_round_row(ev: &session_journal::JournalEvent) -> LlmRoundRow {
             .map(String::from),
         tool_calls_returned: ev.tool_calls_returned,
         tokens_in: ev.tokens_in,
+        cache_read_tokens: ev.cache_read_tokens,
+        cache_creation_tokens: ev.cache_creation_tokens,
         tokens_out: ev.tokens_out,
         duration_ms: ev.duration_ms,
     }
 }
 
 fn subrun_identity(ev: &session_journal::JournalEvent) -> Option<SubrunIdentity> {
-    if let Some(scope) = ev.producer_scope.as_ref()
-        && scope.agent_id.is_some()
-    {
+    if let Some(scope) = ev.producer_scope.as_ref() {
+        let typed_child_purpose = ev
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("purpose"))
+            .and_then(serde_json::Value::as_str)
+            == Some("sub_agent");
+        let child_source = ev
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("source"))
+            .and_then(serde_json::Value::as_str)
+            == Some("child_agent");
+        if scope.agent_id.is_none() && !typed_child_purpose && !child_source {
+            return None;
+        }
         return Some(SubrunIdentity {
             run_id: scope.run_id.clone(),
             parent_run_id: scope.parent_run_id.clone(),
@@ -596,9 +666,83 @@ fn attempt_run_id(rounds: &[LlmRoundRow]) -> Option<String> {
     rounds.iter().rev().find_map(|round| round.run_id.clone())
 }
 
-pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
-    let (events, journal_lines_non_empty, journal_lines_malformed) =
+fn contributes_runtime_digest_detail(event_type: &JournalEventType) -> bool {
+    matches!(
+        event_type,
+        JournalEventType::LlmRound
+            | JournalEventType::Compact
+            | JournalEventType::StallDetected
+            | JournalEventType::InterruptionRecorded
+            | JournalEventType::ToolCallError
+            | JournalEventType::Error
+    )
+}
+
+fn read_linked_digest_journals(
+    session_id: &str,
+) -> Result<
+    (
+        Vec<session_journal::JournalEvent>,
+        usize,
+        usize,
+        Vec<String>,
+    ),
+    String,
+> {
+    let (mut events, mut non_empty, mut malformed) =
         session_journal::read_journal_for_digest(session_id).map_err(|e| e.to_string())?;
+    let owner_id = events.iter().rev().find_map(|event| {
+        event
+            .conversation_commit
+            .as_ref()
+            .map(|commit| commit.cursor.owner_id.trim())
+            .filter(|owner| !owner.is_empty())
+            .map(ToString::to_string)
+    });
+    let Some(owner_id) = owner_id else {
+        return Ok((events, non_empty, malformed, Vec::new()));
+    };
+
+    let primary_path = session_journal::journal_file_path(session_id);
+    let owner_path = session_journal::journal_file_path_for_user(&owner_id, session_id)
+        .map_err(|error| error.to_string())?;
+    if owner_path == primary_path || !owner_path.exists() {
+        return Ok((events, non_empty, malformed, Vec::new()));
+    }
+
+    let (owner_events, owner_non_empty, owner_malformed) =
+        session_journal::read_journal_for_digest_for_user(&owner_id, session_id)
+            .map_err(|error| error.to_string())?;
+    // A deployment may mirror runtime detail into both journals. Preserve
+    // physical line counts while de-duplicating identical typed events so the
+    // aggregate does not charge the same provider round twice.
+    let mut known_runtime_events: std::collections::BTreeSet<String> = events
+        .iter()
+        .filter(|event| contributes_runtime_digest_detail(&event.event_type))
+        .filter_map(|event| serde_json::to_string(event).ok())
+        .collect();
+    events.extend(owner_events.into_iter().filter(|event| {
+        contributes_runtime_digest_detail(&event.event_type)
+            && serde_json::to_string(event)
+                .map(|identity| known_runtime_events.insert(identity))
+                .unwrap_or(true)
+    }));
+    // RFC3339 timestamps sort chronologically. Rust's stable sort preserves
+    // writer order for events emitted at the same instant.
+    events.sort_by(|left, right| left.ts.cmp(&right.ts));
+    non_empty = non_empty.saturating_add(owner_non_empty);
+    malformed = malformed.saturating_add(owner_malformed);
+    Ok((
+        events,
+        non_empty,
+        malformed,
+        vec![owner_path.to_string_lossy().into_owned()],
+    ))
+}
+
+pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
+    let (events, journal_lines_non_empty, journal_lines_malformed, supplemental_journal_files) =
+        read_linked_digest_journals(session_id)?;
     let journal_file = session_journal::journal_file_path(session_id)
         .to_string_lossy()
         .into_owned();
@@ -611,6 +755,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut other_errors = Vec::new();
 
     let mut total_tokens_in: u64 = 0;
+    let mut total_cache_read_tokens: u64 = 0;
+    let mut total_cache_creation_tokens: u64 = 0;
     let mut total_tokens_out: u64 = 0;
     let mut total_duration_ms: u64 = 0;
     let mut total_tool_calls: u64 = 0;
@@ -631,6 +777,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         std::collections::BTreeMap::new();
     let mut subrun_ids = std::collections::BTreeSet::new();
     let mut subrun_total_tokens_in = 0u64;
+    let mut subrun_total_cache_read_tokens = 0u64;
+    let mut subrun_total_cache_creation_tokens = 0u64;
     let mut subrun_total_tokens_out = 0u64;
     let mut subrun_total_duration_ms = 0u64;
     let mut subrun_total_tool_calls = 0u64;
@@ -661,7 +809,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     total_root_llm_rounds += u64::from(rounds);
                     root_attempts_with_llm_rounds += 1;
                 }
-                let stats = tool_call_stats(ev.tool_calls.as_ref());
+                let stats = authoritative_tool_call_stats(ev);
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if stats.total() > 0 {
@@ -710,6 +858,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 if let Some(ti) = ev.tokens_in {
                     total_tokens_in += ti;
                 }
+                total_cache_read_tokens += ev.cache_read_tokens.unwrap_or(0);
+                total_cache_creation_tokens += ev.cache_creation_tokens.unwrap_or(0);
                 if let Some(to) = ev.tokens_out {
                     total_tokens_out += to;
                 }
@@ -742,6 +892,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     ts: ev.ts.clone(),
                     model: ev.model.clone(),
                     tokens_in: ev.tokens_in,
+                    cache_read_tokens: ev.cache_read_tokens,
+                    cache_creation_tokens: ev.cache_creation_tokens,
                     tokens_out: ev.tokens_out,
                     duration_ms: ev.duration_ms,
                     ttft_ms: ev.ttft_ms,
@@ -825,7 +977,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     total_root_llm_rounds += u64::from(rounds);
                     root_attempts_with_llm_rounds += 1;
                 }
-                let stats = tool_call_stats(ev.tool_calls.as_ref());
+                let stats = authoritative_tool_call_stats(ev);
                 let effective_total = if stats.total() > 0 {
                     u64::from(stats.total())
                 } else {
@@ -858,6 +1010,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     }
                 }
                 total_tokens_in += ev.tokens_in.unwrap_or(0);
+                total_cache_read_tokens += ev.cache_read_tokens.unwrap_or(0);
+                total_cache_creation_tokens += ev.cache_creation_tokens.unwrap_or(0);
                 total_tokens_out += ev.tokens_out.unwrap_or(0);
                 total_duration_ms += ev.duration_ms.unwrap_or(0);
                 turn_errors.push(TurnErrRow {
@@ -867,6 +1021,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     attempt_run_id: pending_attempt_run_id,
                     model: ev.model.clone(),
                     tokens_in: ev.tokens_in,
+                    cache_read_tokens: ev.cache_read_tokens,
+                    cache_creation_tokens: ev.cache_creation_tokens,
                     tokens_out: ev.tokens_out,
                     duration_ms: ev.duration_ms,
                     tool_calls_ok: if stats.total() > 0 {
@@ -959,6 +1115,8 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                 if let Some(identity) = subrun_identity(ev) {
                     subrun_ids.insert(identity.run_id.clone());
                     subrun_total_tokens_in += ev.tokens_in.unwrap_or(0);
+                    subrun_total_cache_read_tokens += ev.cache_read_tokens.unwrap_or(0);
+                    subrun_total_cache_creation_tokens += ev.cache_creation_tokens.unwrap_or(0);
                     subrun_total_tokens_out += ev.tokens_out.unwrap_or(0);
                     subrun_total_duration_ms += ev.duration_ms.unwrap_or(0);
                     subrun_total_tool_calls += u64::from(ev.tool_calls_returned.unwrap_or(0));
@@ -1006,11 +1164,18 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
         0,
         events.len(),
     );
+    let total_provider_input_tokens = total_tokens_in
+        .saturating_add(total_cache_read_tokens)
+        .saturating_add(total_cache_creation_tokens);
+    let subrun_total_provider_input_tokens = subrun_total_tokens_in
+        .saturating_add(subrun_total_cache_read_tokens)
+        .saturating_add(subrun_total_cache_creation_tokens);
 
     Ok(JournalDigest {
         schema_version: SCHEMA_VERSION,
         session_id: session_id.to_string(),
         journal_file,
+        supplemental_journal_files,
         journal_lines_non_empty,
         journal_lines_malformed,
         aggregates: Aggregates {
@@ -1023,15 +1188,27 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             session_start_count,
             session_end_count,
             total_tokens_in,
+            total_cache_read_tokens,
+            total_cache_creation_tokens,
+            total_provider_input_tokens,
             total_tokens_out,
             total_duration_ms,
             total_tool_calls,
             subrun_count: subrun_ids.len(),
             subrun_total_tokens_in,
+            subrun_total_cache_read_tokens,
+            subrun_total_cache_creation_tokens,
+            subrun_total_provider_input_tokens,
             subrun_total_tokens_out,
             subrun_total_duration_ms,
             subrun_total_tool_calls,
             inclusive_total_tokens_in: total_tokens_in + subrun_total_tokens_in,
+            inclusive_total_cache_read_tokens: total_cache_read_tokens
+                .saturating_add(subrun_total_cache_read_tokens),
+            inclusive_total_cache_creation_tokens: total_cache_creation_tokens
+                .saturating_add(subrun_total_cache_creation_tokens),
+            inclusive_total_provider_input_tokens: total_provider_input_tokens
+                .saturating_add(subrun_total_provider_input_tokens),
             inclusive_total_tokens_out: total_tokens_out + subrun_total_tokens_out,
             inclusive_total_tool_calls: total_tool_calls + subrun_total_tool_calls,
             total_fresh_tool_calls,
@@ -1067,14 +1244,17 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
 
 pub fn print_text(d: &JournalDigest) {
     use crossterm::style::Stylize;
-    println!("  {} {}", "schema_version:".dim(), d.schema_version);
-    println!(
+    stdout_println!("  {} {}", "schema_version:".dim(), d.schema_version);
+    stdout_println!(
         "  {} {}",
         "session_id:".dim(),
         d.session_id.as_str().magenta()
     );
-    println!("  {} {}", "journal_file:".dim(), d.journal_file);
-    println!(
+    stdout_println!("  {} {}", "journal_file:".dim(), d.journal_file);
+    for file in &d.supplemental_journal_files {
+        stdout_println!("  {} {}", "runtime_journal:".dim(), file);
+    }
+    stdout_println!(
         "  {} non_empty={} malformed={}",
         "journal_lines:".dim(),
         d.journal_lines_non_empty.to_string().magenta(),
@@ -1085,8 +1265,8 @@ pub fn print_text(d: &JournalDigest) {
         }
     );
     let a = &d.aggregates;
-    println!("\n  {}", "Aggregates".bold().magenta());
-    println!(
+    stdout_println!("\n  {}", "Aggregates".bold().magenta());
+    stdout_println!(
         "  attempts={} turns={} turn_errors={} compacts={} stalls={} errors={}",
         a.attempt_count.to_string().magenta(),
         a.turn_count.to_string().magenta(),
@@ -1095,7 +1275,7 @@ pub fn print_text(d: &JournalDigest) {
         a.stall_count,
         a.error_event_count
     );
-    println!(
+    stdout_println!(
         "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} fresh={} noop_or_cached={} tool_failures={}",
         a.total_tokens_in.to_string().magenta(),
         a.total_tokens_out.to_string().magenta(),
@@ -1105,20 +1285,41 @@ pub fn print_text(d: &JournalDigest) {
         a.total_noop_or_cached_tool_calls,
         a.tool_calls_failed
     );
-    println!("\n  {}", "Averages (per root attempt)".bold().magenta());
-    println!(
+    stdout_println!(
+        "  provider_input={} (fresh={} cache_read={} cache_write={})",
+        a.total_provider_input_tokens.to_string().magenta(),
+        a.total_tokens_in,
+        a.total_cache_read_tokens,
+        a.total_cache_creation_tokens
+    );
+    if a.subrun_count > 0 {
+        stdout_println!(
+            "  inclusive_provider_input={} (root={} subruns={}) subrun_count={}",
+            a.inclusive_total_provider_input_tokens
+                .to_string()
+                .magenta(),
+            a.total_provider_input_tokens,
+            a.subrun_total_provider_input_tokens,
+            a.subrun_count
+        );
+    }
+    stdout_println!("\n  {}", "Averages (per root attempt)".bold().magenta());
+    stdout_println!(
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
-        a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
+        a.avg_tokens_in,
+        a.avg_tokens_out,
+        a.avg_duration_ms
     );
     if a.avg_llm_rounds > 0.0 {
-        println!(
+        stdout_println!(
             "  llm_rounds={:.1} tool_calls_per_round={:.1}",
-            a.avg_llm_rounds, a.avg_tool_calls_per_round
+            a.avg_llm_rounds,
+            a.avg_tool_calls_per_round
         );
     }
     if !d.turns.is_empty() {
-        println!("\n  {}", "Turns".bold().magenta());
-        println!(
+        stdout_println!("\n  {}", "Turns".bold().magenta());
+        stdout_println!(
             "  {}",
             format!(
                 "{:>4} {:>5} {:>7} {:>7} {:>8}  user_preview",
@@ -1134,7 +1335,7 @@ pub fn print_text(d: &JournalDigest) {
                 .turn_id
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            println!(
+            stdout_println!(
                 "  {:>4} {:>5} {:>7} {:>7} {:>8}  {}",
                 t.seq,
                 tid,
@@ -1159,7 +1360,7 @@ pub fn print_text(d: &JournalDigest) {
                 } else {
                     format!("{} ok", group.ok_count)
                 };
-                println!(
+                stdout_println!(
                     "                          {} {} — {}",
                     scope.as_str().dim(),
                     status.as_str().dim(),
@@ -1187,7 +1388,7 @@ pub fn print_text(d: &JournalDigest) {
                 if let Some(run_id) = round.run_id.as_deref() {
                     stats.push(format!("run={run_id}"));
                 }
-                println!(
+                stdout_println!(
                     "                          {} {}",
                     scope.as_str().dim(),
                     stats.join(" · ").dim()
@@ -1196,10 +1397,10 @@ pub fn print_text(d: &JournalDigest) {
         }
     }
     if !d.subruns.is_empty() {
-        println!("\n  {}", "Subruns".bold().magenta());
+        stdout_println!("\n  {}", "Subruns".bold().magenta());
         for subrun in &d.subruns {
             let agent = subrun.agent_id.as_deref().unwrap_or("unknown agent");
-            println!(
+            stdout_println!(
                 "  {} · {} · {} rounds",
                 agent,
                 subrun.run_id.as_str().dim(),
@@ -1208,25 +1409,25 @@ pub fn print_text(d: &JournalDigest) {
         }
     }
     if !d.compaction_events.is_empty() {
-        println!(
+        stdout_println!(
             "\n  {} {}",
             "compaction_events:".dim(),
             d.compaction_events.len().to_string().magenta()
         );
         for e in &d.compaction_events {
-            println!(
+            stdout_println!(
                 "    {} {} {}",
                 e.ts.as_str().dim(),
                 format!("turn={:?}", e.turn).dim(),
                 e.detail
             );
             if let Some(sp) = e.detail.get("summary_preview").and_then(|v| v.as_str()) {
-                println!("      {}", sp.dim());
+                stdout_println!("      {}", sp.dim());
             }
         }
     }
     if !d.interruptions.is_empty() {
-        println!(
+        stdout_println!(
             "\n  {} {}",
             "interruptions:".yellow(),
             d.interruptions.len().to_string().magenta()
@@ -1236,7 +1437,7 @@ pub fn print_text(d: &JournalDigest) {
                 .agentic_step
                 .map(|step| format!(" step={step}"))
                 .unwrap_or_default();
-            println!(
+            stdout_println!(
                 "    {} {}{} {}",
                 e.ts.as_str().dim(),
                 format!("turn={:?}", e.turn).dim(),
@@ -1246,13 +1447,13 @@ pub fn print_text(d: &JournalDigest) {
         }
     }
     if !d.stalls.is_empty() {
-        println!(
+        stdout_println!(
             "\n  {} {}",
             "stalls:".yellow(),
             d.stalls.len().to_string().magenta()
         );
         for e in &d.stalls {
-            println!(
+            stdout_println!(
                 "    {} {} {}",
                 e.ts.as_str().dim(),
                 format!("turn={:?}", e.turn).dim(),
@@ -1261,13 +1462,13 @@ pub fn print_text(d: &JournalDigest) {
         }
     }
     if !d.turn_errors.is_empty() {
-        println!(
+        stdout_println!(
             "\n  {} {}",
             "turn_errors:".red(),
             d.turn_errors.len().to_string().magenta()
         );
         for e in &d.turn_errors {
-            println!(
+            stdout_println!(
                 "    {} {} {}",
                 e.ts.as_str().dim(),
                 format!("turn={:?}", e.turn).dim(),
@@ -1276,13 +1477,13 @@ pub fn print_text(d: &JournalDigest) {
         }
     }
     if !d.other_errors.is_empty() {
-        println!(
+        stdout_println!(
             "\n  {} {}",
             "other_errors:".red(),
             d.other_errors.len().to_string().magenta()
         );
         for e in &d.other_errors {
-            println!("    {} {}", e.ts.as_str().dim(), e.detail);
+            stdout_println!("    {} {}", e.ts.as_str().dim(), e.detail);
         }
     }
 }
@@ -1302,7 +1503,7 @@ pub(crate) fn run_digest(
                 s.as_bytes(),
                 digest.turns.len(),
             );
-            println!("{s}");
+            stdout_println!("{s}");
         }
         "text" => print_text(&digest),
         _ => {
@@ -1412,7 +1613,7 @@ mod tests {
             turn.tool_groups.iter().any(|group| {
                 group.round == Some(0)
                     && group.call_count == 1
-                    && group.tools.iter().any(|tool| tool.starts_with("Git"))
+                    && group.tools.iter().any(|tool| tool.starts_with("git"))
             }),
             "digest should preserve the first repeated git round"
         );
@@ -1438,7 +1639,7 @@ mod tests {
         let sid = "test-digest-telemetry-00000000-0000-0000-0000-000000000004";
         fs::write(
             journal_path_for_test(sid),
-            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"bridge_inprocess","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"server_loop","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
 {"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
 {"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":3,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"continue","tool_calls":[{"name":"bash","ok":true,"ms":10}],"llm_rounds":1}
 "#,
@@ -1455,7 +1656,7 @@ mod tests {
         assert_eq!(d.turns[0].llm_round_details.len(), 1);
         let round = &d.turns[0].llm_round_details[0];
         assert_eq!(round.agentic_step, Some(5));
-        assert_eq!(round.source.as_deref(), Some("bridge_inprocess"));
+        assert_eq!(round.source.as_deref(), Some("server_loop"));
         assert_eq!(round.run_id.as_deref(), Some("run-1"));
         assert_eq!(round.finish_reason.as_deref(), Some("tool_calls"));
     }
@@ -1511,6 +1712,55 @@ mod tests {
                 .find(|subrun| subrun.run_id == "child-new")
                 .and_then(|subrun| subrun.llm_round_details[0].local_turn),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn digest_follows_canonical_owner_cursor_to_runtime_subruns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+        let sid = "test-digest-linked-owner-00000000-0000-0000-0000-000000000013";
+        let owner = "account-owner-42";
+        let child_event = format!(
+            r#"{{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"{sid}","producer_scope":{{"run_id":"child-run","local_turn":1}},"round":0,"tokens_in":123,"cache_read_tokens":900,"cache_creation_tokens":10,"tokens_out":12,"duration_ms":45,"tool_calls_returned":2,"metadata":{{"purpose":"sub_agent","source":"agentic_loop"}}}}"#
+        );
+        fs::write(
+            journal_path_for_test(sid),
+            child_event.clone()
+                + "\n"
+                + &format!(
+                r#"{{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"{sid}","turn":1,"tokens_in":100,"cache_read_tokens":400,"cache_creation_tokens":5,"tool_calls":[],"conversation_commit":{{"schema_version":1,"base_root_hash":"base","cursor":{{"schema_version":1,"owner_id":"{owner}","session_id":"{sid}","branch_id":"main","completed_turn":1,"journal_event_seq":1,"conversation_seq":1,"canonical_root_hash":"root","projection_schema":1,"compaction_generation":0}},"delta":{{"kind":"append","messages":[]}}}}}}"#
+            )
+                + "\n",
+        )
+        .expect("write profile journal");
+        let owner_path =
+            astra_services::session_journal::journal_file_path_for_user(owner, sid).unwrap();
+        fs::create_dir_all(owner_path.parent().expect("owner journal parent"))
+            .expect("owner journal parent");
+        fs::write(&owner_path, child_event + "\n").expect("write owner runtime journal");
+
+        let digest = build_digest(sid, DigestFocus::All).expect("linked digest");
+        assert_eq!(digest.turns.len(), 1);
+        assert_eq!(digest.subruns.len(), 1);
+        assert_eq!(digest.subruns[0].run_id, "child-run");
+        assert_eq!(digest.aggregates.subrun_total_tokens_in, 123);
+        assert_eq!(digest.aggregates.total_provider_input_tokens, 505);
+        assert_eq!(digest.aggregates.subrun_total_cache_read_tokens, 900);
+        assert_eq!(digest.aggregates.subrun_total_cache_creation_tokens, 10);
+        assert_eq!(digest.aggregates.subrun_total_provider_input_tokens, 1_033);
+        assert_eq!(
+            digest.aggregates.inclusive_total_provider_input_tokens,
+            1_538
+        );
+        assert_eq!(
+            digest.subruns[0].llm_round_details[0].cache_read_tokens,
+            Some(900)
+        );
+        assert_eq!(digest.supplemental_journal_files.len(), 1);
+        assert_eq!(
+            digest.journal_lines_non_empty, 3,
+            "physical line count spans both journals even when a mirrored event is de-duplicated"
         );
     }
 
@@ -2096,6 +2346,26 @@ mod tests {
         assert!(d.failed_tool_calls.is_empty());
         // But aggregate counts still work
         assert_eq!(d.aggregates.tool_calls_failed, 1);
+    }
+
+    #[test]
+    fn digest_uses_remote_tool_outcomes_when_call_details_are_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-remote-outcomes-00000000-0000-0000-0000-000000000014";
+        fs::write(
+            journal_path_for_test(sid),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":3,"tool_outcomes":{"requested":4,"executed":3,"succeeded":2,"failed":1,"rejected":1,"reused":0,"suppressed":0,"deferred":0}}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::Summary).expect("digest");
+        assert_eq!(d.aggregates.total_tool_calls, 4);
+        assert_eq!(d.aggregates.total_fresh_tool_calls, 2);
+        assert_eq!(d.aggregates.tool_calls_failed, 2);
+        assert_eq!(d.turns[0].tool_calls_ok, 2);
+        assert_eq!(d.turns[0].tool_calls_fail, 2);
     }
 
     #[test]

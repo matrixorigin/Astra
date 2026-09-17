@@ -12,6 +12,10 @@ pub(crate) struct CaptureTrace<'a> {
     pub session_turn_source: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub user_query_event_id: Option<&'a str>,
+    /// Final resolved deployment capability used to assemble this exact
+    /// provider request. Cache diagnosis must consume this shape instead of
+    /// guessing from provider or model names.
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 }
 
 fn sanitize_component(raw: &str) -> String {
@@ -126,6 +130,7 @@ pub(crate) fn build_capture_payload_json(
         "response": response,
         "outcome": outcome,
         "trace": build_capture_trace_json(turn, round, trace),
+        "cache_capability": trace.and_then(|trace| trace.cache_capability),
     })
 }
 
@@ -181,6 +186,7 @@ pub(crate) fn build_remote_capture_record(
             "provider": provider,
             "outcome": outcome,
             "trace": build_capture_trace_json(turn, round, trace),
+            "cache_capability": trace.and_then(|trace| trace.cache_capability),
         })),
         references: Vec::new(),
     }
@@ -432,6 +438,7 @@ fn persist_capture_inner(
         "outcome": outcome,
         "response": response,
         "trace": build_capture_trace_json(turn, round, trace),
+        "cache_capability": trace.and_then(|trace| trace.cache_capability),
     });
 
     let serialization_site =
@@ -650,6 +657,7 @@ mod tests {
                 session_turn_source: Some("header"),
                 turn_chain_id: Some("chain-1"),
                 user_query_event_id: Some("query-1"),
+                cache_capability: None,
             }),
         )
         .expect("capture path");
@@ -762,6 +770,7 @@ mod tests {
                 session_turn_source: Some("state"),
                 turn_chain_id: Some("chain-7"),
                 user_query_event_id: Some("query-7"),
+                cache_capability: None,
             }),
         );
         assert_eq!(record.artifact_kind, "llm_capture");
@@ -803,6 +812,7 @@ mod tests {
                 session_turn_source: Some("state"),
                 turn_chain_id: Some("chain-local"),
                 user_query_event_id: Some("query-local"),
+                cache_capability: None,
             }),
         )
         .await
@@ -870,6 +880,7 @@ mod tests {
                 session_turn_source: Some("header"),
                 turn_chain_id: Some("chain-remote"),
                 user_query_event_id: Some("query-remote"),
+                cache_capability: None,
             }),
         )
         .await

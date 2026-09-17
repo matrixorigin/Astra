@@ -1,15 +1,18 @@
 name: fork_prefix_spawn_inherits
 description: |
   **What**: Spawn a child agent with inherit_prefix and verify the full capture-resolve-probe cycle via the CLI path.
-  **Tests**: Fork-prefix pipeline for spawn_agent — parent captures prefix on turn_completed, child resolves via InMemoryPrefixStore.
+  **Tests**: Fork-prefix pipeline for canonical agent spawn — parent captures prefix on turn_completed, child resolves via InMemoryPrefixStore.
   **Why**: Regression for the CLI-exercisable fork-prefix path (distinct from server-side DelegationEngine), ensuring prefix inheritance works end-to-end.
   **Pass means**: The child resolved the parent's prefix, produced the expected reply, and the parent surfaced it in the final answer.
-  **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or spawn_agent tool dispatch is broken.
+  **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or canonical agent spawn dispatch is broken.
 prompt: |
-  You have a `spawn_agent` tool. Call it with:
-    agent_id: "child-delegate-G2"
-    task: "Say the exact text: delegate-G2-ok. Do not use any tools, just reply with that text."
-    inherit_prefix: {}
+  Use the `agent` tool with:
+    action: "spawn"
+    name: "child-delegate-G2"
+    description: "Probe inherited prefix"
+    prompt: "Say the exact text: delegate-G2-ok. Do not use any tools, just reply with that text."
+    inherit_prefix:
+      required: true
 
   Surface the child's exact reply in your final answer.
   Do not use any other tools.
@@ -20,19 +23,22 @@ criteria:
     code: 0
   - type: tool_called
     name: agent
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /inherit_prefix/required
+    equals: true
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /result
+    equals: delegate-G2-ok
   - type: text_contains
     needle: "delegate-G2-ok"
-    # Direct structural check (mirrors judger question). Both check the same
-    # thing — either pass confirms the child's reply surfaced in output.
-  - type: tools_count_between
-    min: 1
-    max: 6
-  - type: judger
-    question: |
-      Did the parent invoke spawn_agent and did the child reply with
-      "delegate-G2-ok" (or close)? The final answer should surface
-      the child's reply.
-      Score 1.0 if the child replied and the text surfaces it.
-      Score 0.5 if spawn succeeded but the reply is garbled.
-      Score 0.0 if no spawn happened or the agent fabricated a result.
-    threshold: 0.5

@@ -120,13 +120,17 @@ impl ChatComposer {
     pub fn clear_and_submit(&mut self) -> String {
         let raw = self.textarea.text().to_string();
         let expanded = self.expand_pastes(&raw);
-        if !expanded.trim().is_empty() {
-            // Dedup consecutive entries — typing the same command twice
-            // in a row shouldn't double up the history list.
-            if self.history.last() != Some(&expanded) {
-                self.history.push(expanded.clone());
-                self.persist_entry(&expanded);
-            }
+        // Submission is a semantic boundary, not just a key event. Keep
+        // whitespace-only drafts out of the event loop and preserve them so
+        // an accidental Enter cannot erase what the user typed.
+        if expanded.trim().is_empty() {
+            return String::new();
+        }
+        // Dedup consecutive entries — typing the same command twice in a row
+        // shouldn't double up the history list.
+        if self.history.last() != Some(&expanded) {
+            self.history.push(expanded.clone());
+            self.persist_entry(&expanded);
         }
         self.textarea.clear();
         self.history_index = None;
@@ -377,7 +381,7 @@ impl ChatComposer {
         }
         match self.textarea.handle_key(key) {
             TextAreaAction::Submit => {
-                if self.textarea.is_empty() {
+                if self.textarea.text().trim().is_empty() {
                     ComposerAction::Consumed
                 } else {
                     ComposerAction::Submit
@@ -575,6 +579,7 @@ fn truncate_end(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod paste_tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     #[test]
     fn short_paste_is_inserted_verbatim() {
@@ -660,6 +665,19 @@ mod paste_tests {
         // belt-and-suspenders it so accidental empty submits stay quiet).
         let out = c.clear_and_submit();
         assert!(out.is_empty());
+        assert!(!c.is_flashing());
+    }
+
+    #[test]
+    fn whitespace_submit_is_consumed_without_clearing_the_draft() {
+        let mut c = ChatComposer::new_ephemeral();
+        c.set_text("  \n\t");
+
+        assert_eq!(
+            c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ComposerAction::Consumed
+        );
+        assert_eq!(c.text(), "  \n\t");
         assert!(!c.is_flashing());
     }
 

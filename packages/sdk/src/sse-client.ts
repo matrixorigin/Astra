@@ -50,6 +50,19 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
   return events;
 }
 
+function isTerminalEvent(event: StreamEvent): boolean {
+  return (
+    event.type === 'turn_complete' ||
+    event.type === 'run_finished' ||
+    event.type === 'run_cancelled' ||
+    event.type === 'run_error' ||
+    event.type === 'run_interrupted' ||
+    event.type === 'run_paused' ||
+    event.type === 'run_waiting' ||
+    (event.type === 'error' && event.retryable !== true)
+  );
+}
+
 /**
  * Fetch-based SSE client with automatic retry and custom auth headers.
  *
@@ -63,6 +76,7 @@ export class SSEClient {
   private retryCount = 0;
   private closed = false;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private sawTerminalEvent = false;
 
   constructor(options: SSEClientOptions) {
     this.options = {
@@ -79,6 +93,7 @@ export class SSEClient {
 
   private async connectAttempt(): Promise<void> {
     this.closed = false;
+    this.sawTerminalEvent = false;
     this.options.onStateChange?.('connecting');
 
     this.controller = new AbortController();
@@ -107,6 +122,12 @@ export class SSEClient {
       });
 
       if (!response.ok) {
+        if (this.options.decodeHttpError) {
+          const event = await this.options.decodeHttpError(response);
+          this.options.onStateChange?.('error');
+          this.options.onEvent(event);
+          return;
+        }
         const detail = await readHttpErrorMessage(response);
         throw new Error(detail);
       }
@@ -145,6 +166,8 @@ export class SSEClient {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let streamFailed = false;
+    let streamError: unknown;
 
     try {
       this.resetHeartbeatTimer();
@@ -160,6 +183,15 @@ export class SSEClient {
           this.processSSEChunk(part);
         }
       }
+    } catch (error) {
+      // Once the server has published a protocol terminal, a trailing socket
+      // reset is transport noise rather than a second failure of the turn.
+      // Preserve the successful terminal projection and only surface stream
+      // errors that happen before it.
+      if (!this.sawTerminalEvent) {
+        streamFailed = true;
+        streamError = error;
+      }
     } finally {
       // Flush remaining buffer (handles events without trailing \n\n)
       buffer += decoder.decode();
@@ -168,6 +200,12 @@ export class SSEClient {
       }
       this.clearHeartbeatTimer();
       reader.releaseLock();
+    }
+    if (streamFailed) throw streamError;
+    if (this.options.requireTerminalEvent && !this.sawTerminalEvent) {
+      throw new Error(
+        'SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)',
+      );
     }
   }
 
@@ -190,6 +228,7 @@ export class SSEClient {
     try {
       const event = JSON.parse(data) as StreamEvent;
       this.resetHeartbeatTimer();
+      this.sawTerminalEvent ||= isTerminalEvent(event);
       this.options.onEvent(event);
     } catch {
       // Ignore malformed JSON
@@ -200,7 +239,10 @@ export class SSEClient {
     this.clearHeartbeatTimer();
     if (!this.options.heartbeatTimeoutMs || this.options.heartbeatTimeoutMs <= 0) return;
     this.heartbeatTimer = setTimeout(() => {
-      if (this.closed) return;
+      // A terminal lifecycle event is authoritative. A provider/proxy that
+      // keeps the HTTP body open after it has published that event must not
+      // turn an otherwise completed turn into a retryable heartbeat error.
+      if (this.closed || this.sawTerminalEvent) return;
       this.controller?.abort();
       this.options.onStateChange?.('error');
       this.options.onEvent({

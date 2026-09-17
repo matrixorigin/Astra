@@ -1,0 +1,40 @@
+name: agent_model_override_completion
+description: |
+  **What**: Spawn one child with an explicit model and require its durable terminal result.
+  **Tests**: The public agent schema, runtime input, spawn context, and child executor agree on model override support.
+  **Why**: A schema-only model field causes a retry with inherited defaults and silently defeats routing intent.
+  **Pass means**: One canonical spawn accepted the explicit model and the child completed with the exact result.
+  **Fail means**: The field was rejected, silently retried away, or the selected child failed to reach a completed terminal state.
+prompt: |
+  Call `agent` exactly once with:
+    action: "spawn"
+    name: "explicit-model-child"
+    description: "Verify explicit child model"
+    prompt: "Reply with the exact text: model-override-ok. Do not use tools."
+    model: "deepseek-v4-flash"
+
+  Return the child's exact reply. Do not retry and do not use other tools.
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /model
+    equals: deepseek-v4-flash
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /result
+    equals: model-override-ok
+  - type: text_contains
+    needle: model-override-ok

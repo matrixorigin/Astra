@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, query};
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
 const TRUST_SLO_TARGET: f64 = 0.95;
 const ZERO_IQR_NOISE_BAND: f64 = 0.05;
 const SESSION_QUALITY_LEVEL: &str = "session";
+const MAX_QUALITY_ASSESSMENT_ID_BYTES: usize = 64;
 const MEMORIA_CONNECT_TIMEOUT_SECS: u64 = 10;
 const MEMORIA_REQUEST_TIMEOUT_SECS: u64 = 30;
 const UPSERT_SESSION_QUALITY_ASSESSMENT_SQL: &str = "INSERT INTO eval_quality_assessments \
@@ -423,7 +425,11 @@ fn memoria_http_client(headers: HeaderMap) -> Result<reqwest::Client, reqwest::E
 }
 
 fn session_quality_assessment_id(session_id: &str) -> String {
-    format!("session:{session_id}")
+    let readable = format!("session:{session_id}");
+    if readable.len() <= MAX_QUALITY_ASSESSMENT_ID_BYTES {
+        return readable;
+    }
+    format!("{:x}", Sha256::digest(readable.as_bytes()))
 }
 
 fn classify_drift_severity(delta: f64) -> Option<DriftSeverity> {
@@ -3210,6 +3216,21 @@ mod tests {
         assert_eq!(
             session_quality_assessment_id("sess-123"),
             "session:sess-123".to_string()
+        );
+    }
+
+    #[test]
+    fn session_quality_assessment_id_hashes_long_session_ids_within_storage_limit() {
+        let session_id = "cb2b42e5ac07479cac5948285040961f63a1e602598b43a5b2b1aa2facf89ee5";
+        let assessment_id = session_quality_assessment_id(session_id);
+
+        assert_eq!(assessment_id.len(), MAX_QUALITY_ASSESSMENT_ID_BYTES);
+        assert_eq!(assessment_id, session_quality_assessment_id(session_id));
+        assert_ne!(
+            assessment_id,
+            session_quality_assessment_id(
+                "cb2b42e5ac07479cac5948285040961f63a1e602598b43a5b2b1aa2facf89ee6"
+            )
         );
     }
 

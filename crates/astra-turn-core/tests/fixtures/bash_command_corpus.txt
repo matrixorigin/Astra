@@ -49,7 +49,7 @@ cut -d, -f1 data.csv
 awk "{print \$1}" file.txt
 sed -n "1,10p" file.txt
 
-# ── read-only: build/test/git inspection ─────────────────────
+# ── build/test tools (may execute repository code) + inspection ──
 cargo check
 cargo check --workspace
 cargo build --release

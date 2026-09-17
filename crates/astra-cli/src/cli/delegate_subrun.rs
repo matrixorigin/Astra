@@ -11,9 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     server::delegation::engine::{SubRunConfig, SubRunExecutor},
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -34,7 +33,7 @@ use super::spawn_subrun::{
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::edge_tools;
 
-const DELEGATE_MAX_TURNS: usize = 25;
+const DELEGATE_INITIAL_TURNS: usize = 25;
 
 // ─── Worktree Path Validation ───────────────────────────────────────────────
 
@@ -252,6 +251,20 @@ fn build_restricted_tools(
 #[async_trait]
 impl SubRunExecutor for CliDelegateSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        let runtime_ceiling = astra_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(
+                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
+                    &config.context,
+                ),
+            )?;
+        let explicit_hard_limit = config
+            .max_turns
+            .map(|turns| {
+                std::num::NonZeroUsize::new(turns as usize)
+                    .ok_or_else(|| "max_turns must be positive".to_string())
+            })
+            .transpose()?;
         // Resolve once per child run. Every model and tool boundary inside the
         // run uses this same credential snapshot; the next child observes a
         // later parent refresh through the provider.
@@ -305,9 +318,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            effective_model.as_deref().unwrap_or(""),
-        );
+        // The model alias does not establish a cache protocol. The admitted
+        // server execution owns provider-specific request shaping.
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
@@ -461,6 +474,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 .map(|ip| ip.prefix_messages.as_slice()),
             &user_message,
             force_reasoning_field,
+            &config.run_id,
         );
 
         if host.journal.is_some() {
@@ -474,17 +488,27 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 
         let task_profile = infer_task_execution_profile(&config.task);
+        let agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
+                task_profile,
+                runtime_ceiling,
+                config
+                    .initial_turns
+                    .map_or(DELEGATE_INITIAL_TURNS, |turns| turns as usize),
+                explicit_hard_limit,
+            );
         let subrun_session_id = format!("delegate-{}-{}", config.run_id, profile.agent_id);
         let user_id = cli_user_id();
-        let step_recorder = StepRecorder::with_persistence(
+        let step_recorder = StepRecorder::with_persistence_for_run(
             &user_id,
             &subrun_session_id,
             &format!("{}-run", config.run_id),
+            &config.run_id,
         );
 
         let mut state = AgenticLoopState {
-            observation_store: None,
             observation_journal: Default::default(),
+            tool_ledger_receipt: Default::default(),
             messages,
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
@@ -493,6 +517,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             session_memory_state: Default::default(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
+            current_run_owner_generation: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -514,12 +540,12 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             last_finish_reason: None,
             total_observation_tool_calls: 0,
             has_any_usage: false,
-            max_turns: DELEGATE_MAX_TURNS,
-            remaining_turns: DELEGATE_MAX_TURNS,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
-            agentic_turn_budget: task_profile.agentic_turn_budget,
+            max_turns: agentic_turn_budget.initial_turns,
+            remaining_turns: agentic_turn_budget.initial_turns,
+            charged_iterations: 0,
+            agentic_turn_budget,
+            budget_is_explicit: explicit_hard_limit.is_some(),
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -579,8 +605,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),
                 token: self.cancel_token.clone(),
+                execution_lease_lost: None,
+                resolved_origin: None,
             },
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
@@ -593,7 +622,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             message: config.task.clone(),
             user_intent: config.task.clone(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             has_prior_assistant_turn: false,
             turn_intent: None,
             task_profile,
@@ -620,17 +649,15 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: 0,
             thinking: child_thinking,
-            recent_file_reads: Vec::new(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,
@@ -641,8 +668,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: Some(config.run_id.clone()),
+            root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
             turn_event_buffer: None,
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
@@ -998,6 +1025,66 @@ mod tests {
         assert_eq!(identity.run_id, "run-1");
         assert_eq!(identity.parent_run_id.as_deref(), Some("parent-run-1"));
         assert_eq!(identity.next_item_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_zero_cap_before_resolving_credentials() {
+        use super::{SubRunConfig, SubRunExecutor};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "unused".into(),
+            None,
+            PathBuf::from("."),
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto),
+            None,
+        )
+        .with_token_provider(Arc::new(move || {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+        let mut registry = astra_services::coordination::AgentProfileRegistry::new();
+        register_default_agents(&mut registry);
+        let config = SubRunConfig {
+            run_id: "invalid-cap-child".into(),
+            parent_run_id: "parent".into(),
+            agent_profile: registry.get("coder").unwrap().clone(),
+            task: "No execution should begin".into(),
+            session_id: "session".into(),
+            user_id: "user".into(),
+            execution_owner_generation: None,
+            execution_owner_generation_sink: None,
+            previous_output: None,
+            context: HashMap::new(),
+            forward_headers: HashMap::new(),
+            admitted_model_execution: None,
+            interaction_mode: astra_services::runs::RequestedTurnInteractionMode::Headless,
+            request_constraints: Default::default(),
+            recursion_depth: 0,
+            max_turns: Some(0),
+            initial_turns: None,
+            pause_flag: None,
+            checkpoint_gate: None,
+            mailbox: None,
+            progress_emitter: None,
+            live_event_sink: None,
+            cancel_token: None,
+            inherited_prefix: None,
+            execution_metadata: None,
+            delegation_chain: Vec::new(),
+            work_item: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+        };
+        let error = executor.execute(config).await.unwrap_err();
+        assert_eq!(error, "max_turns must be positive");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

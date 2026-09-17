@@ -65,7 +65,7 @@ impl ReflectRequest {
         Self {
             topic,
             facet,
-            depth: ObservationDepth::from_arg(depth.unwrap_or("diagnostic")),
+            depth: ObservationDepth::from_arg(depth.unwrap_or("summary")),
             horizon: ObservationHorizon::from_arg(horizon.unwrap_or("session")),
             source_policy: SourcePolicy::from_arg(source_policy.unwrap_or("auto")),
             include_context,
@@ -247,6 +247,13 @@ fn analysis_view_for_topic_facet(topic: ObservationTopic, facet: ObservationFace
         (ObservationTopic::Execution, ObservationFacet::Errors) => "execution_errors",
         (ObservationTopic::Execution, ObservationFacet::Trace) => "execution_trace",
         (ObservationTopic::Execution, _) => "execution_tools",
+        // Keep the requested runtime facet in the analysis view. Previously
+        // every runtime facet fell through to `runtime_performance`, so a
+        // typed `topic=runtime, facet=errors` request silently disabled the
+        // error-pattern/evidence path even though the report still claimed
+        // that errors were being analyzed.
+        (ObservationTopic::Runtime, ObservationFacet::Errors) => "runtime_errors",
+        (ObservationTopic::Runtime, ObservationFacet::Trace) => "runtime_trace",
         (ObservationTopic::Knowledge, _) => "knowledge_context",
         (ObservationTopic::Runtime, _) => "runtime_performance",
         (ObservationTopic::Overview, _) => "overview",
@@ -338,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn omitted_depth_prefers_summary_without_weakening_explicit_diagnostics() {
+        let default = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
+        assert_eq!(default.depth, ObservationDepth::Summary);
+        for (value, expected) in [
+            ("diagnostic", ObservationDepth::Diagnostic),
+            ("forensic", ObservationDepth::Forensic),
+        ] {
+            let explicit =
+                ReflectRequest::from_observation_params(None, None, Some(value), None, 20, "");
+            assert_eq!(explicit.depth, expected);
+        }
+        assert_eq!(
+            ReflectRequest::decision_trace(20, "why").depth,
+            ObservationDepth::Diagnostic
+        );
+    }
+
+    #[test]
     fn default_request_is_overview_without_legacy_input() {
         let request = ReflectRequest::from_observation_params(
             None,
@@ -371,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_minimal_depth_alias_defaults_to_diagnostic() {
+    fn removed_minimal_depth_alias_uses_summary_default() {
         let request = ReflectRequest::from_observation_params(
             Some("execution"),
             Some("errors"),
@@ -434,6 +459,33 @@ mod tests {
             assert_eq!(request.topic, topic, "facet={facet}");
             assert_eq!(request.analysis_view, analysis_view, "facet={facet}");
         }
+    }
+
+    #[test]
+    fn runtime_error_and_trace_facets_keep_their_analysis_view() {
+        let errors = ReflectRequest::from_observation_params(
+            Some("runtime"),
+            Some("errors"),
+            Some("diagnostic"),
+            Some("session"),
+            20,
+            "what failed?",
+        );
+        assert_eq!(errors.topic, ObservationTopic::Runtime);
+        assert_eq!(errors.facet, ObservationFacet::Errors);
+        assert_eq!(errors.analysis_view, "runtime_errors");
+
+        let trace = ReflectRequest::from_observation_params(
+            Some("runtime"),
+            Some("trace"),
+            Some("diagnostic"),
+            Some("session"),
+            20,
+            "where was the time spent?",
+        );
+        assert_eq!(trace.topic, ObservationTopic::Runtime);
+        assert_eq!(trace.facet, ObservationFacet::Trace);
+        assert_eq!(trace.analysis_view, "runtime_trace");
     }
 
     #[test]

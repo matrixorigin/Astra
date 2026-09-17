@@ -32,7 +32,7 @@ fn completion_admission_estimated_tokens(
     messages: &[serde_json::Value],
     max_output_tokens: u32,
 ) -> u64 {
-    crate::prompts::estimate_tokens(messages, 0, 0)
+    crate::prompts::estimate_wire_input_tokens(messages, 0)
         .saturating_add(max_output_tokens as usize)
         .try_into()
         .unwrap_or(u64::MAX)
@@ -89,6 +89,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            &user.user_id,
             &selection,
             None,
             None,
@@ -96,39 +97,52 @@ pub(super) async fn completions_handler(
         )
         .await?
     } else {
-        let matrixone =
-            crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|error| {
+        let offering_id = if let Some(offering_id) = state
+            .model_service
+            .default_user_model_offering_id(user.user_id.clone())
+            .await?
+        {
+            offering_id
+        } else {
+            if !state
+                .model_service
+                .allows_deployment_models(user.user_id.clone())
+                .await?
+            {
+                return Err(crate::error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "Configure and select your own BYOK model; deployment model fallback is disabled",
+                    "missing_model_selection",
+                ));
+            }
+            let matrixone =
+                crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|error| {
+                    crate::error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("MatrixOne configuration unavailable: {error}"),
+                        "model_catalog_unavailable",
+                    )
+                })?;
+            astra_services::resolve_reasoning_offering(
+                &matrixone,
+                &state.fernet_encryptor,
+                state.admin.config_service.as_ref(),
+                state.shared_pool.as_ref().map(|pool| pool.get()),
+            )
+            .await
+            .map_err(|error| {
                 crate::error_response_coded(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("MatrixOne configuration unavailable: {error}"),
-                    "model_catalog_unavailable",
+                    format!("Default Offering resolution failed: {error}"),
+                    "model_default_unavailable",
                 )
-            })?;
-        let selected = astra_services::resolve_reasoning_offering(
-            &matrixone,
-            &state.fernet_encryptor,
-            state.admin.config_service.as_ref(),
-            state.shared_pool.as_ref().map(|pool| pool.get()),
-        )
-        .await
-        .map_err(|error| {
-            crate::error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Default Offering resolution failed: {error}"),
-                "model_default_unavailable",
-            )
-        })?;
-        let offering = state
+            })?
+            .offering_id
+        };
+        state
             .model_service
-            .revalidate_model_offering(selected.offering_id)
-            .await?;
-        astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
-            crate::error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Default Offering execution configuration is invalid: {error}"),
-                "model_execution_configuration_invalid",
-            )
-        })?
+            .admit_model_offering(user.user_id.clone(), offering_id)
+            .await?
     };
 
     // 3. Durably admit the logical invocation before provider I/O. Auxiliary
@@ -186,7 +200,7 @@ pub(super) async fn completions_handler(
             provider_timeout,
         )
         .await;
-    let parsed = match parsed {
+    let parsed = match parsed.into_result() {
         Ok(parsed) => parsed,
         Err(error) if crate::turn::llm::durable::is_ledger_error(&error) => {
             return Err(inference_ledger_http_error(error));
@@ -233,6 +247,18 @@ pub(super) async fn completions_handler(
 fn inference_ledger_http_error(
     error: astra_core::ClassifiedError,
 ) -> (StatusCode, Json<ErrorResponse>) {
+    // This endpoint accepts caller-owned session scope, unlike the agent loop's
+    // server-owned run authority. Preserve the typed cause across that boundary;
+    // an unavailable caller scope is not an internal ledger failure.
+    if crate::turn::llm::durable::inference_scope_rejection(&error)
+        == Some(astra_services::InferenceScopeRejection::Unavailable)
+    {
+        return crate::error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "The requested inference scope is unavailable",
+            "invalid_inference_scope",
+        );
+    }
     let (status, error_code) = match error.kind {
         astra_core::ErrorKind::InvalidRequest => {
             (StatusCode::BAD_REQUEST, "invalid_inference_scope")
@@ -277,6 +303,48 @@ mod tests {
     use axum::http::{HeaderValue, header::AUTHORIZATION};
     use serde_json::json;
     use std::sync::Arc;
+
+    #[test]
+    fn inference_scope_http_mapping_uses_typed_cause_not_diagnostic_text() {
+        use astra_core::{ClassifiedError, ErrorKind};
+        use astra_services::InferenceScopeRejection;
+        for (source, reason, expected) in [
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                Some(InferenceScopeRejection::Unavailable),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                Some(InferenceScopeRejection::GuidancePending),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                "other",
+                Some(InferenceScopeRejection::Unavailable),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let error = ClassifiedError::new(ErrorKind::ContractViolation, "scope unavailable")
+                .with_details_json(
+                    json!({"source": source, "scope_rejection": reason}).to_string(),
+                );
+            assert_eq!(inference_ledger_http_error(error).0, expected);
+        }
+        assert_eq!(
+            inference_ledger_http_error(ClassifiedError::new(
+                ErrorKind::DatabaseError,
+                "scope unavailable"
+            ))
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     struct Healthy;
 
@@ -345,6 +413,8 @@ mod tests {
                     fallback_chain: Vec::new(),
                     tags: Vec::new(),
                     request_body_overrides: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(32_000),
@@ -535,8 +605,13 @@ mod tests {
     fn completion_admission_estimate_covers_prompt_and_server_bounded_output() {
         let messages = vec![json!({"role": "user", "content": "classify this request"})];
         let estimate = completion_admission_estimated_tokens(&messages, 64);
+        let expected = (crate::prompts::estimate_wire_input_tokens(&messages, 0) + 64) as u64;
+        assert_eq!(estimate, expected);
         assert!(estimate >= 64);
-        assert!(estimate > 14_000, "shared prompt estimate must be included");
+        assert!(
+            estimate < 14_000,
+            "opaque completion requests must not inherit the agent system-prompt estimate"
+        );
     }
 
     #[test]
@@ -910,33 +985,83 @@ mod tests {
                 .is_cancelled()
         );
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
-            loop {
-                poll.tick().await;
-                let row = sqlx::query(
-                    "SELECT i.status AS invocation_status, a.status AS attempt_status
+        let cancellation_converged =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
+                loop {
+                    poll.tick().await;
+                    let row = sqlx::query(
+                        "SELECT i.status AS invocation_status, a.status AS attempt_status
                      FROM inference_invocations i
                      JOIN inference_provider_attempts a
                        ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
                      WHERE i.user_id = 'test-user' AND i.session_id = ?
                        AND i.operation_id = 'completion_proxy:memory_extraction'
                        AND i.logical_attempt = 3",
-                )
-                .bind(&session_id)
-                .fetch_optional(pool)
-                .await
-                .expect("poll cancelled durable inference");
-                if row.as_ref().is_some_and(|row| {
-                    row.get::<String, _>("invocation_status") == "delivery_unknown"
-                        && row.get::<String, _>("attempt_status") == "delivery_unknown"
-                }) {
-                    break;
+                    )
+                    .bind(&session_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("poll cancelled durable inference");
+                    if row.as_ref().is_some_and(|row| {
+                        row.get::<String, _>("invocation_status") == "delivery_unknown"
+                            && row.get::<String, _>("attempt_status") == "delivery_unknown"
+                    }) {
+                        break;
+                    }
                 }
-            }
-        })
-        .await
-        .expect("detached settlement must converge after caller cancellation");
+            })
+            .await;
+        if let Err(error) = cancellation_converged {
+            let invocation_status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inference_invocations
+                 WHERE user_id = 'test-user' AND session_id = ?
+                   AND operation_id = 'completion_proxy:memory_extraction'
+                   AND logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled invocation diagnostic");
+            let attempt_status = sqlx::query_scalar::<_, String>(
+                "SELECT a.status FROM inference_provider_attempts a
+                 JOIN inference_invocations i
+                   ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
+                 WHERE i.user_id = 'test-user' AND i.session_id = ?
+                   AND i.operation_id = 'completion_proxy:memory_extraction'
+                   AND i.logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled attempt diagnostic");
+            let debt = sqlx::query(
+                "SELECT debt.terminal_status, debt.provider_delivery_state,
+                        debt.reconciliation_status
+                 FROM inference_invocation_settlement_debts debt
+                 JOIN inference_invocations i
+                   ON debt.user_id = i.user_id AND debt.invocation_id = i.invocation_id
+                 WHERE i.user_id = 'test-user' AND i.session_id = ?
+                   AND i.operation_id = 'completion_proxy:memory_extraction'
+                   AND i.logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled settlement debt diagnostic")
+            .map(|row| {
+                (
+                    row.get::<String, _>("terminal_status"),
+                    row.get::<String, _>("provider_delivery_state"),
+                    row.get::<String, _>("reconciliation_status"),
+                )
+            });
+            panic!(
+                "detached settlement must converge after caller cancellation: {error}; \
+                 invocation_status={invocation_status:?}, attempt_status={attempt_status:?}, \
+                 debt={debt:?}"
+            );
+        }
 
         for statement in [
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = 'test-user' AND session_id = ?",

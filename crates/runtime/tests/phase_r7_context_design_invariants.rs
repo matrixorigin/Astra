@@ -12,7 +12,7 @@
 //!
 //! Adversarial posture: assertions parse JSON and walk exact fields.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 
@@ -349,7 +349,7 @@ fn tool_result_placeholder_is_overwritten_by_real_result() {
 //
 // NOTE: This scenario is weakened from "invoke a real subrun" because
 // `ServerSkillSubRunExecutor::run_subrun` requires a live MatrixOne
-// connection for real LLM calls and is not wired to the `bridge-e2e-hooks`
+// connection for real LLM calls and is not wired to the `e2e-hooks`
 // mock path. We instead exercise the isolation contract directly: a
 // fresh host + state populated as the subrun does in production leaks no
 // parent history into its captured outgoing request.

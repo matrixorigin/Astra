@@ -75,6 +75,43 @@ fn known_run_finished_still_passes_through() {
 }
 
 #[test]
+fn runtime_feedback_projects_only_the_server_authored_frame() {
+    let frame = json!({
+        "schema_version": 4,
+        "identity": {
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "topology": "cli_server"
+        }
+    });
+    let out = transform_run_event_for_client(json!({
+        "type": "runtime_feedback",
+        "runtime_feedback": frame,
+        "internal_diagnostic": "must not cross the client boundary"
+    }));
+    assert_eq!(
+        out,
+        json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
+        })
+    );
+
+    assert!(
+        transform_run_event_for_client(json!({"type": "runtime_feedback"})).is_null(),
+        "a missing canonical frame must not become an empty public observation"
+    );
+    assert!(
+        transform_run_event_for_client(json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": "not-a-frame"
+        }))
+        .is_null(),
+        "a non-object frame must fail closed at the public boundary"
+    );
+}
+
+#[test]
 fn known_agent_interrupted_still_passes_through() {
     let ok = json!({
         "type": "agent_interrupted",
@@ -88,4 +125,99 @@ fn known_agent_interrupted_still_passes_through() {
         obj.get("type").and_then(Value::as_str),
         Some("agent_interrupted")
     );
+}
+
+#[test]
+fn typed_tool_execution_fact_survives_live_and_replay_projection() {
+    // A pre-admission rejection is terminal even when the human-readable
+    // result is just an error string.  The typed fact must survive both the
+    // live client-shaped path and the durable event replay path.
+    let live = transform_run_event_for_client(json!({
+        "type": "tool_call_end",
+        "call_id": "call-stale",
+        "tool": "agent_fanout",
+        "status": "rejected",
+        "success": false,
+        "executed": false,
+        "result": "deferred tool descriptor is stale",
+        "internal_diagnostic": "must not cross the boundary",
+    }));
+    assert_eq!(live["executed"], false);
+    assert!(live.get("internal_diagnostic").is_none());
+
+    let replay = transform_run_event_for_client(json!({
+        "event_type": "tool_result",
+        "data": {
+            "tool_call_id": "call-stale",
+            "name": "agent_fanout",
+            "status": "rejected",
+            "success": false,
+            "executed": false,
+            "output": "deferred tool descriptor is stale",
+        },
+    }));
+    assert_eq!(replay["type"], "tool_call_end");
+    assert_eq!(replay["call_id"], "call-stale");
+    assert_eq!(replay["executed"], false);
+}
+
+#[test]
+fn oversized_terminal_preserves_unknown_execution_as_distinct_from_missing() {
+    let out = transform_run_event_for_client(json!({
+        "type": "tool_call_end",
+        "call_id": "call-unknown",
+        "tool": "agent_fanout",
+        "status": "failed",
+        "success": false,
+        "executed": null,
+        "result": "Execution outcome could not be confirmed",
+        "executor": {"extension": "x".repeat(128 * 1024)},
+    }));
+    assert_eq!(out["payload_truncated"], true);
+    assert_eq!(out.get("executed"), Some(&Value::Null));
+}
+
+#[test]
+fn reused_terminal_disposition_survives_live_replay_and_size_projection() {
+    let terminal = json!({
+        "call_id": "call-reused", "tool": "agent_fanout",
+        "status": "completed", "success": true,
+        "executed": false, "disposition": "reused",
+        "result": {"group_id": "existing-group", "executed": true},
+    });
+    for oversized in [false, true] {
+        let mut data = terminal.clone();
+        if oversized {
+            data["executor"] = json!({"extension": "x".repeat(128 * 1024)});
+        }
+        let replay = json!({"event_type": "tool_result", "data": data});
+        data["type"] = json!("tool_call_end");
+        for event in [data, replay] {
+            let out = transform_run_event_for_client(event);
+            assert_eq!(out["disposition"], "reused");
+            assert_eq!(out["executed"], false);
+            assert_eq!(out["result"]["group_id"], "existing-group");
+            assert_eq!(out["result"]["executed"], true);
+        }
+    }
+}
+
+#[test]
+fn bounded_lifecycle_summary_never_changes_control_identity() {
+    let group_id = "g".repeat(1500);
+    let out = transform_run_event_for_client(json!({
+        "type": "tool_call_end", "call_id": "call-large-group",
+        "tool": "agent_fanout", "executed": true,
+        "result": {
+            "status": "completed", "group_id": group_id,
+            "results": ["x".repeat(70_000)],
+            "work_unit_observation": {
+                "id": group_id, "kind": "agent_fanout", "status": "completed",
+                "revision": 1, "mode": "current", "wake_policy": "none"
+            }
+        }
+    }));
+    assert_eq!(out["result"]["truncated"], true);
+    assert_eq!(out["result"]["group_id"], group_id);
+    assert_eq!(out["result"]["work_unit_observation"]["id"], group_id);
 }

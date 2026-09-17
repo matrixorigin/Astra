@@ -3,7 +3,7 @@
 //! Motivation: the existing unit tests in `cloud_approval_policy::tests`
 //! pin point-wise behaviour for hand-written samples. They cannot catch a
 //! classifier regression that *shifts the distribution* — e.g. a refactor
-//! that accidentally classifies every `cargo check` invocation as
+//! that accidentally classifies every literal inspection invocation as
 //! mutating. Such a regression would silently flood users with approval
 //! prompts in production.
 //!
@@ -63,16 +63,16 @@ fn corpus_is_representative() {
     );
 }
 
-/// Read-only commands must dominate the corpus. If a classifier change
-/// causes this ratio to collapse, users will see a flood of approval
-/// prompts for commands they previously ran frictionlessly.
+/// Literal inspection commands must remain a large share of the corpus. The
+/// fixture intentionally includes build tools which may execute repository
+/// code and therefore require approval even for `check`-shaped subcommands.
 #[test]
-fn read_only_majority_is_preserved() {
+fn read_only_inspection_floor_is_preserved() {
     let b = classify_corpus();
     let ratio = b.read_only as f64 / b.total as f64;
     assert!(
-        ratio >= 0.45,
-        "read-only ratio collapsed: {}/{} = {:.2} (expected >= 0.45). \
+        ratio >= 0.40,
+        "read-only ratio collapsed: {}/{} = {:.2} (expected >= 0.40). \
          Buckets: {:?}. Investigate `strip_benign_fd_redirects` or \
          `matches_read_only_prefix` for over-conservative changes.",
         b.read_only,

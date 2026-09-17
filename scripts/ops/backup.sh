@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Backup MatrixOne database
 
-set -e
+set -euo pipefail
 
 # Configuration
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
@@ -23,7 +23,7 @@ DB_HOST="${MATRIXONE_HOST:-localhost}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD}"
-DB_NAME="${ASTRA_DATABASE:-astra}"
+DB_NAME="${ASTRA_DATABASE:-astra_runtime}"
 
 echo "🔄 Starting database backup..."
 echo "   Database: ${DB_NAME}"
@@ -32,21 +32,38 @@ echo "   Backup file: ${BACKUP_FILE}"
 
 # Create backup directory
 mkdir -p "${BACKUP_DIR}"
+TEMP_BACKUP="${BACKUP_FILE}.tmp"
+trap 'rm -f "${TEMP_BACKUP}"' EXIT
+
+matrixone_container_ids=""
+if command -v docker >/dev/null 2>&1 && \
+   { [ "${DB_HOST}" = "localhost" ] || [ "${DB_HOST}" = "127.0.0.1" ]; }; then
+    matrixone_container_ids="$(docker ps \
+        --filter label=com.docker.compose.service=matrixone \
+        --format '{{.ID}}' 2>/dev/null || true)"
+fi
+matrixone_container_count="$(printf '%s\n' "${matrixone_container_ids}" | sed '/^$/d' | wc -l | tr -d ' ')"
 
 # Perform backup
-if command -v docker &> /dev/null && docker ps | grep -q matrixone; then
-    # Use Docker if MatrixOne is running in container
-    echo "   Using Docker container..."
-    docker exec matrixone mysqldump \
-        -h127.0.0.1 -P${DB_PORT} -u${DB_USER} -p${DB_PASSWORD} \
-        ${DB_NAME} > "${BACKUP_FILE}"
+if [ "${matrixone_container_count}" -eq 1 ]; then
+    echo "   Using local Compose MatrixOne service..."
+    MYSQL_PWD="${DB_PASSWORD}" docker exec -e MYSQL_PWD "${matrixone_container_ids}" \
+        mysqldump -h127.0.0.1 -P6001 -u"${DB_USER}" "${DB_NAME}" > "${TEMP_BACKUP}"
+elif [ "${matrixone_container_count}" -gt 1 ]; then
+    echo "Error: multiple local MatrixOne Compose containers found; stop unused stacks." >&2
+    exit 1
 else
-    # Use local mysqldump
+    if ! command -v mysqldump >/dev/null 2>&1; then
+        echo "Error: mysqldump is required when no local Compose MatrixOne service is available." >&2
+        exit 1
+    fi
     echo "   Using local mysqldump..."
-    mysqldump \
-        -h${DB_HOST} -P${DB_PORT} -u${DB_USER} -p${DB_PASSWORD} \
-        ${DB_NAME} > "${BACKUP_FILE}"
+    MYSQL_PWD="${DB_PASSWORD}" mysqldump \
+        -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" \
+        "${DB_NAME}" > "${TEMP_BACKUP}"
 fi
+
+mv "${TEMP_BACKUP}" "${BACKUP_FILE}"
 
 # Compress backup
 echo "🗜️  Compressing backup..."
@@ -68,7 +85,7 @@ echo "   Size: ${BACKUP_SIZE}"
 # fi
 
 # Optional: Clean old backups (keep last 7 days)
-if [ "${CLEANUP_OLD_BACKUPS:-true}" = "true" ]; then
+if [ "${CLEANUP_OLD_BACKUPS:-false}" = "true" ]; then
     echo "🧹 Cleaning old backups (keeping last 7 days)..."
     find "${BACKUP_DIR}" -name "astra_backup_*.sql.gz" -mtime +7 -delete
     echo "✅ Cleanup completed"

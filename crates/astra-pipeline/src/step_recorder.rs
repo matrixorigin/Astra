@@ -296,6 +296,10 @@ pub struct StepRecorder {
     user_id: String,
     session_id: String,
     task_id: String,
+    /// The authoritative server run that owns persisted events.  This is
+    /// deliberately independent from task_id: child task labels are not run
+    /// identities.
+    invocation_run_id: Option<String>,
     events: Vec<StepEvent>,
     current_step: Option<Step>,
     turn_number: u32,
@@ -325,6 +329,7 @@ impl StepRecorder {
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             task_id: task_id.to_string(),
+            invocation_run_id: None,
             events: Vec::new(),
             current_step: None,
             turn_number: 0,
@@ -347,7 +352,15 @@ impl StepRecorder {
     ///
     /// Scans existing checkpoints so `checkpoint_count` starts after the
     /// highest existing file number, preventing cross-turn overwrites.
-    pub fn with_persistence(user_id: &str, session_id: &str, task_id: &str) -> Self {
+    /// Create a recorder with an explicit server-owned invocation identity.
+    /// `task_id` is only a local step label; it must never be inferred as the
+    /// run identity for child/delegated executions.
+    pub fn with_persistence_for_run(
+        user_id: &str,
+        session_id: &str,
+        task_id: &str,
+        run_id: &str,
+    ) -> Self {
         let file_store = FileBackedEventStore::empty(user_id, session_id);
         let persisted_summary = persisted_event_summary(user_id, session_id);
         let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
@@ -360,6 +373,7 @@ impl StepRecorder {
             file_store: Some(file_store),
             attach_persistence_on_session_adoption: false,
             persistence_required: true,
+            invocation_run_id: Some(run_id.to_string()),
             events: Vec::new(),
             step_sequence: persisted_summary.next_step_sequence,
             checkpoint_count: existing_max.saturating_add(1),
@@ -375,6 +389,22 @@ impl StepRecorder {
     /// `ephemeral` session would leave forensic history under the wrong owner,
     /// while tying this decision to unrelated context-manifest persistence can
     /// silently lose the first turn altogether.
+    /// Deferred-persistence variant with an explicit server-owned run id.
+    pub fn with_deferred_persistence_for_run(
+        user_id: &str,
+        provisional_session_id: &str,
+        task_id: &str,
+        run_id: &str,
+    ) -> Self {
+        let mut recorder =
+            Self::with_deferred_persistence(user_id, provisional_session_id, task_id);
+        recorder.invocation_run_id = Some(run_id.to_string());
+        recorder
+    }
+
+    /// Create an in-memory recorder whose session and run identity are both
+    /// unresolved until the server admits the request.  The task id remains a
+    /// local correlation label; it is never written as a durable run id.
     pub fn with_deferred_persistence(
         user_id: &str,
         provisional_session_id: &str,
@@ -385,12 +415,76 @@ impl StepRecorder {
         recorder
     }
 
+    /// Bind an in-memory recorder to the server-owned run before any events
+    /// become durable. This is primarily useful for explicit test seams and
+    /// embedders; production constructors should use the `*_for_run` forms.
+    pub fn with_invocation_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.invocation_run_id = Some(run_id.into());
+        self
+    }
+
     /// Attach persistence only when this recorder was explicitly constructed
     /// in deferred-persistence mode.
     pub fn attach_persistence_if_configured(&mut self, session_id: &str) {
+        if self.attach_persistence_on_session_adoption
+            && self
+                .invocation_run_id
+                .as_deref()
+                .is_some_and(|run_id| !run_id.trim().is_empty())
+        {
+            self.attach_persistence(session_id);
+        }
+    }
+
+    /// Bind the recorder to the authoritative server session/run pair.
+    ///
+    /// A CLI turn starts recording before HTTP admission so the live UI can
+    /// show useful phases.  Those observations stay in memory until both
+    /// identities arrive from the server.  Rewriting the buffered event ids
+    /// here is what prevents a client correlation id (or an empty id) from
+    /// becoming durable trace identity.
+    pub fn bind_authoritative_run(&mut self, session_id: &str, run_id: &str) {
+        if session_id.trim().is_empty() || run_id.trim().is_empty() {
+            return;
+        }
+
+        self.invocation_run_id = Some(run_id.to_string());
+        for event in &mut self.events {
+            event.run_id = run_id.to_string();
+            if let Some(payload) = event.payload.as_mut()
+                && let Some(trace_context) = payload
+                    .get_mut("trace_context")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                trace_context.insert(
+                    "run_id".to_string(),
+                    serde_json::Value::String(run_id.to_string()),
+                );
+            }
+        }
+
         if self.attach_persistence_on_session_adoption {
             self.attach_persistence(session_id);
         }
+    }
+
+    /// Drop observations from a turn rejected before durable admission.
+    ///
+    /// This intentionally has no effect on an already-bound recorder: once a
+    /// server-owned run exists, its persisted evidence is authoritative even
+    /// when a later stream phase fails.
+    pub fn discard_uncommitted(&mut self) {
+        if !self.attach_persistence_on_session_adoption || self.file_store.is_some() {
+            return;
+        }
+        self.events.clear();
+        self.current_step = None;
+        self.current_step_sequence = None;
+        self.phase_log.clear();
+        self.tool_timings.clear();
+        self.invocation_run_id = None;
+        self.attach_persistence_on_session_adoption = false;
+        self.persistence_error = None;
     }
 
     /// Attach file-backed persistence after the authoritative session id becomes known.
@@ -452,8 +546,8 @@ impl StepRecorder {
 
         let step = Step::new(
             format!(
-                "{}-turn-{}-step-{}",
-                self.session_id, visible_turn, step_sequence
+                "{}-run-{}-turn-{}-step-{}",
+                self.session_id, self.task_id, visible_turn, step_sequence
             ),
             self.task_id.clone(),
             format!("turn-{}", visible_turn),
@@ -1390,12 +1484,14 @@ impl StepRecorder {
         Some(HeavyCheckpoint {
             light,
             conversation_cursor: None,
+            run_execution_budget: None,
+            run_execution_control: None,
             messages: messages.to_vec(),
             budget_remaining_tokens,
             budget_remaining_rounds,
             blocked_tools: blocked_tools.to_vec(),
             recent_tools: recent_tools.to_vec(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: self
                 .current_step
                 .as_ref()
@@ -1409,6 +1505,7 @@ impl StepRecorder {
             pipeline_state: None,    // Set by caller after construction
             compaction_state: None,  // Set by caller after construction
             config_version_id: None, // Set by caller after construction (Step 2a)
+            workspace_observation_quarantine: None,
         })
     }
 
@@ -1433,7 +1530,8 @@ impl StepRecorder {
 
     fn emit(&mut self, step_id: &str, event_type: StepEventType) {
         let event = StepEvent {
-            event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
+            event_id: format!("evt-{}", uuid::Uuid::now_v7().simple()),
+            run_id: self.invocation_run_id.clone().unwrap_or_default(),
             canonical_event_id: None,
             step_id: step_id.to_string(),
             event_type,
@@ -1452,7 +1550,8 @@ impl StepRecorder {
             .map_or("unknown".to_string(), |s| s.step_id().to_string());
         let caused_by = self.caused_by_for_next_event();
         let event = StepEvent {
-            event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
+            event_id: format!("evt-{}", uuid::Uuid::now_v7().simple()),
+            run_id: self.invocation_run_id.clone().unwrap_or_default(),
             canonical_event_id: None,
             step_id,
             event_type,
@@ -1465,6 +1564,18 @@ impl StepRecorder {
     }
 
     fn append_recorded_event(&mut self, event: StepEvent) {
+        if self.persistence_required
+            && self
+                .invocation_run_id
+                .as_deref()
+                .is_none_or(|run_id| run_id.trim().is_empty())
+        {
+            self.record_persistence_error(format!(
+                "step-event persistence requires a non-empty invocation run id; dropping {}",
+                event.event_id
+            ));
+            return;
+        }
         if let Some(ref mut fs) = self.file_store {
             if let Err(error) = fs.append(event.clone()) {
                 self.record_persistence_error(format!(
@@ -1496,6 +1607,7 @@ impl StepRecorder {
                 "visible_turn": self.turn_number,
                 "round_index": self.round_index,
                 "step_sequence": self.current_step_sequence,
+                "run_id": self.invocation_run_id,
             }
         })
     }
@@ -1552,9 +1664,9 @@ fn rebind_step(step: &mut Step, previous_session_id: &str, session_id: &str) {
 }
 
 fn rebind_step_id(step_id: &mut String, previous_session_id: &str, session_id: &str) {
-    let previous_prefix = format!("{previous_session_id}-turn-");
+    let previous_prefix = format!("{previous_session_id}-");
     if let Some(suffix) = step_id.strip_prefix(&previous_prefix) {
-        *step_id = format!("{session_id}-turn-{suffix}");
+        *step_id = format!("{session_id}-{suffix}");
     }
 }
 
@@ -1565,20 +1677,33 @@ struct PersistedEventSummary {
 }
 
 fn persisted_event_summary(user_id: &str, session_id: &str) -> PersistedEventSummary {
+    const SUMMARY_MAX_BYTES: usize = 256 * 1024;
+    const SUMMARY_MAX_EVENTS: usize = 1_024;
     let mut max_sequence = None;
     let mut tail_event_id = None;
-    if let Err(error) = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
-        if let Some(sequence) = step_sequence_from_event(event) {
-            max_sequence = Some(max_sequence.map_or(sequence, |max: u32| max.max(sequence)));
+    match FileBackedEventStore::load_recent_events_bounded(
+        user_id,
+        session_id,
+        SUMMARY_MAX_BYTES,
+        SUMMARY_MAX_EVENTS,
+    ) {
+        Ok(window) => {
+            for event in &window.events {
+                if let Some(sequence) = step_sequence_from_event(event) {
+                    max_sequence =
+                        Some(max_sequence.map_or(sequence, |max: u32| max.max(sequence)));
+                }
+                tail_event_id = Some(event.event_id.clone());
+            }
         }
-        tail_event_id = Some(event.event_id.clone());
-    }) {
-        astra_core::agent_warn!(
-            "step_recorder",
-            "Failed to scan persisted step sequence for session {}: {}",
-            session_id,
-            error
-        );
+        Err(error) => {
+            astra_core::agent_warn!(
+                "step_recorder",
+                "Failed to read persisted step tail for session {}: {}",
+                session_id,
+                error
+            );
+        }
     }
     PersistedEventSummary {
         next_step_sequence: max_sequence.map_or(0, |seq| seq.saturating_add(1)),
@@ -2324,7 +2449,7 @@ mod tests {
         );
         crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 5, &heavy).unwrap();
 
-        let rec = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
+        let rec = StepRecorder::with_persistence_for_run(TEST_USER_ID, sid, "task-1", "test-run");
         // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
             rec.summary().checkpoints,
@@ -2349,12 +2474,12 @@ mod tests {
         assert_eq!(rec.summary().session_id, "sess-adopted");
         assert_eq!(
             rec.current_step().unwrap().step_id(),
-            "sess-adopted-turn-0-step-0"
+            "sess-adopted-run-task-1-turn-0-step-0"
         );
         assert!(
             rec.events()
                 .iter()
-                .all(|event| event.step_id == "sess-adopted-turn-0-step-0")
+                .all(|event| event.step_id == "sess-adopted-run-task-1-turn-0-step-0")
         );
 
         let parsed =
@@ -2364,7 +2489,7 @@ mod tests {
         assert!(
             parsed
                 .iter()
-                .any(|event| event.step_id == "sess-adopted-turn-0-step-0")
+                .any(|event| event.step_id == "sess-adopted-run-task-1-turn-0-step-0")
         );
         assert!(
             !crate::step_checkpoint::owner_session_dir_for(TEST_USER_ID, "ephemeral")
@@ -2378,8 +2503,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
 
-        let mut deferred =
-            StepRecorder::with_deferred_persistence(TEST_USER_ID, "ephemeral", "task-deferred");
+        let mut deferred = StepRecorder::with_deferred_persistence_for_run(
+            TEST_USER_ID,
+            "ephemeral",
+            "task-deferred",
+            "test-run",
+        );
         deferred.begin_turn(1);
         deferred.record_plan(&["read_file".into()], 0.0, 4000);
         deferred.attach_persistence_if_configured("sess-deferred");
@@ -2390,11 +2519,11 @@ mod tests {
                 .all_events()
                 .to_vec();
         assert!(!deferred_events.is_empty());
-        assert!(
-            deferred_events
-                .iter()
-                .all(|event| event.step_id.starts_with("sess-deferred-turn-1-step-"))
-        );
+        assert!(deferred_events.iter().all(|event| {
+            event
+                .step_id
+                .starts_with("sess-deferred-run-task-deferred-turn-1-step-")
+        }));
 
         let mut memory_only = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-memory");
         memory_only.begin_turn(1);
@@ -2407,6 +2536,73 @@ mod tests {
                 .all_events()
                 .is_empty(),
             "ordinary in-memory recorders must not gain disk side effects merely because a response carries a session id"
+        );
+    }
+
+    #[test]
+    fn deferred_persistence_binds_authoritative_run_before_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut recorder = StepRecorder::with_deferred_persistence(
+            TEST_USER_ID,
+            "session-local",
+            "client-correlation",
+        );
+        recorder.begin_turn(0);
+        recorder.record_plan(&["bash".into()], 0.0, 4000);
+        assert!(
+            recorder
+                .events()
+                .iter()
+                .all(|event| event.run_id.is_empty())
+        );
+        assert!(
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-authoritative")
+                .all_events()
+                .is_empty()
+        );
+
+        recorder.bind_authoritative_run("sess-authoritative", "run-server-1");
+        recorder.end_turn(true);
+
+        let persisted =
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-authoritative")
+                .all_events()
+                .to_vec();
+        assert!(!persisted.is_empty());
+        assert!(persisted.iter().all(|event| event.run_id == "run-server-1"));
+        assert!(persisted.iter().all(|event| {
+            event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("trace_context"))
+                .and_then(|context| context.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some("run-server-1")
+        }));
+    }
+
+    #[test]
+    fn deferred_persistence_discards_pre_admission_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut recorder = StepRecorder::with_deferred_persistence(
+            TEST_USER_ID,
+            "session-local",
+            "client-correlation",
+        );
+        recorder.begin_turn(0);
+        recorder.record_plan(&["bash".into()], 0.0, 4000);
+        recorder.discard_uncommitted();
+
+        assert!(recorder.events().is_empty());
+        assert!(recorder.current_step().is_none());
+        assert!(
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "session-local")
+                .all_events()
+                .is_empty()
         );
     }
 
@@ -2433,13 +2629,15 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "sess-continued";
 
-        let mut first = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
+        let mut first =
+            StepRecorder::with_persistence_for_run(TEST_USER_ID, sid, "task-1", "run-1");
         first.begin_turn_with_context(0, 0);
         first.end_turn(false);
         let previous_tail = first.events().last().unwrap().event_id.clone();
         drop(first);
 
-        let mut second = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-2");
+        let mut second =
+            StepRecorder::with_persistence_for_run(TEST_USER_ID, sid, "task-2", "run-2");
         assert!(
             second.events().is_empty(),
             "persistent recorder must not materialize historical journals into memory"
@@ -2448,7 +2646,7 @@ mod tests {
 
         assert_eq!(
             second.current_step().unwrap().step_id(),
-            "sess-continued-turn-1-step-1"
+            "sess-continued-run-task-2-turn-1-step-1"
         );
         let created = second.events().last().unwrap();
         assert_eq!(created.event_type, StepEventType::StepCreated);
@@ -2476,6 +2674,21 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn concurrent_run_namespaces_cannot_alias_step_or_event_identity() {
+        let mut root = StepRecorder::new(TEST_USER_ID, "shared-session", "root-run");
+        let mut child = StepRecorder::new(TEST_USER_ID, "shared-session", "child-run");
+
+        root.begin_turn_with_context(1, 0);
+        child.begin_turn_with_context(1, 0);
+
+        assert_ne!(
+            root.current_step().unwrap().step_id(),
+            child.current_step().unwrap().step_id()
+        );
+        assert_ne!(root.events()[0].event_id, child.events()[0].event_id);
     }
 
     #[test]
@@ -2519,7 +2732,8 @@ mod tests {
 
     #[test]
     fn regression_step_events_jsonl_satisfies_trace_invariants() {
-        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1")
+            .with_invocation_run_id("run-regression");
         rec.begin_turn(3);
         rec.record_plan(&["read_file".into()], 0.2, 4000);
         rec.begin_act(1);
@@ -2558,6 +2772,7 @@ mod tests {
         let mut event_ids = std::collections::HashSet::new();
         let mut created_step_ids = std::collections::HashSet::new();
         for (idx, event) in parsed.iter().enumerate() {
+            assert_eq!(event.run_id, "run-regression");
             assert!(
                 event_ids.insert(event.event_id.clone()),
                 "event_id must be unique: {}",

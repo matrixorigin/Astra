@@ -505,24 +505,44 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
 }
 
 fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
-    request
-        .get("agent_type")
-        .and_then(serde_json::Value::as_str)
-        == Some("general-purpose")
+    request.get("message").and_then(serde_json::Value::as_str)
+        == Some(astra_cli::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
         && request
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|messages| {
-                messages.iter().rev().find(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                })
-            })
-            .and_then(|message| message.get("content"))
+            .pointer("/context/agent_type")
             .and_then(serde_json::Value::as_str)
-            == Some(astra_cli::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
+            == Some("general-purpose")
 }
 
 fn summarize_mock_request(request: &serde_json::Value) -> String {
+    let latest_message = request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| messages.last())
+        .map(|message| {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let calls = message
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            call.pointer("/function/name")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            format!("latest={role}:{content:?} calls={calls:?}")
+        })
+        .unwrap_or_else(|| "latest=<none>".to_string());
     let edge_tool_names = request
         .get("edge_tools")
         .and_then(serde_json::Value::as_array)
@@ -582,12 +602,18 @@ fn summarize_mock_request(request: &serde_json::Value) -> String {
         .unwrap_or_default();
 
     format!(
-        "agent_id={:?} agent_type={:?} edge_tools={edge_tool_names:?} assistant_tool_calls={assistant_tool_calls:?} tool_results={tool_result_names:?}",
+        "agent_id={:?} agent_type={:?} message={:?} context={:?} {latest_message} edge_tools={edge_tool_names:?} assistant_tool_calls={assistant_tool_calls:?} tool_results={tool_result_names:?}",
         request.get("agent_id").and_then(serde_json::Value::as_str),
         request
             .get("agent_type")
             .and_then(serde_json::Value::as_str),
+        request.get("message").and_then(serde_json::Value::as_str),
+        request.get("context"),
     )
+}
+
+fn request_edge_profile(request: &serde_json::Value) -> Option<&serde_json::Value> {
+    request.pointer("/context/edge_profile")
 }
 
 async fn wait_for_agent_journey_child_request(
@@ -620,44 +646,24 @@ async fn wait_for_agent_journey_child_request(
 }
 
 fn is_fanout_journey_child_request(request: &serde_json::Value) -> bool {
-    request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|content| {
+    let message = request.get("message").and_then(serde_json::Value::as_str);
+    request.get("context").is_some()
+        && message.is_some_and(|content| {
             astra_cli::cli::mock_llm::FANOUT_JOURNEY_CHILD_TASKS.contains(&content)
         })
 }
 
 fn is_fanout_reconciliation_request(request: &serde_json::Value) -> bool {
-    request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        == Some(astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE)
+    let message = request.get("message").and_then(serde_json::Value::as_str);
+    request.get("context").is_some()
+        && message
+            == Some(astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE)
 }
 
 fn is_fanout_status_question(request: &serde_json::Value) -> bool {
-    request
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
-        == Some(astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION)
+    let message = request.get("message").and_then(serde_json::Value::as_str);
+    request.get("context").is_some()
+        && message == Some(astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION)
 }
 
 fn is_fanout_root_request(request: &serde_json::Value) -> bool {
@@ -670,8 +676,8 @@ async fn wait_for_three_fanout_children(
 ) {
     let deadline = tokio::time::Instant::now() + UI_TRANSITION_TIMEOUT;
     loop {
-        let count = mock
-            .received_requests()
+        let received = mock.received_requests();
+        let count = received
             .iter()
             .filter(|request| is_fanout_journey_child_request(request))
             .count();
@@ -680,7 +686,11 @@ async fn wait_for_three_fanout_children(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "expected three fanout child requests, got {count}\n{}",
+            "expected three fanout child requests, got {count}; observed requests: {:?}\n{}",
+            received
+                .iter()
+                .map(summarize_mock_request)
+                .collect::<Vec<_>>(),
             astra.screen_diagnostic()
         );
         astra.receive(Duration::from_millis(25));
@@ -757,12 +767,16 @@ async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
     astra.wait_for("Message", Duration::from_secs(15));
     astra.write(b"create_a_resumable_session\r");
     astra.wait_for("successfully.", Duration::from_secs(10));
+    // The completion text can be painted before the input surface has
+    // returned to its idle state. Synchronize on the actual prompt before
+    // injecting /exit so a loaded workspace cannot race the command parser.
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.write(b"/exit\r");
+    astra.wait_for("Stopping", UI_TRANSITION_TIMEOUT);
 
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
-    let output = astra.output_tail();
-    assert!(output.contains("Stopping"), "{output}");
+    let output = String::from_utf8_lossy(&astra.output);
     assert!(output.contains("Resume this session with:"), "{output}");
     assert!(output.contains("astra --resume mock-session"), "{output}");
 }
@@ -1054,7 +1068,7 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_settlement() {
+async fn foreground_status_guidance_has_precise_acceptance_and_never_claims_application() {
     let _journey = pty_journey_lock().lock().await;
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_fanout_child(
         astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
@@ -1079,7 +1093,7 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
         UI_TRANSITION_TIMEOUT,
     );
     astra.wait_for_before(
-        "Guidance queued · Three mock reviews: 2/3 settled, 1 running",
+        "Guidance accepted; not yet applied. It replaces stale work before next unstarted action.",
         "Astra knows Three mock reviews completed as one foreground work group.",
         UI_TRANSITION_TIMEOUT,
     );
@@ -1089,46 +1103,39 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
         Duration::from_secs(10),
     );
 
-    let status_requests = mock
-        .received_requests()
-        .into_iter()
-        .filter(is_fanout_status_question)
-        .collect::<Vec<_>>();
+    let guidance_requests = mock.guidance_requests();
     assert_eq!(
-        status_requests.len(),
+        guidance_requests.len(),
         1,
-        "one status question gets one analysis"
+        "one active-run guidance submission gets one typed intent"
     );
-    let status_request = &status_requests[0];
-    let active_work = status_request
-        .pointer("/edge_profile/runtime_volatile_injections")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|injections| {
-            injections
-                .iter()
-                .find(|injection| injection["kind"] == "active_work_snapshot")
-        })
-        .expect("active guidance must carry canonical typed group truth");
-    assert_eq!(active_work["delivery_class"], "required_context");
+    let guidance_request = &guidance_requests[0];
     assert_eq!(
-        active_work["payload"]["authority"],
-        "runtime_required_context"
+        guidance_request["delivery"], "guide_current_run",
+        "foreground guidance must use the server-owned run-intent lane"
     );
     assert_eq!(
-        active_work["payload"]["schema"],
-        "active_work_guidance_context.v1"
+        guidance_request["input"]["content"],
+        astra_cli::cli::mock_llm::FANOUT_JOURNEY_STATUS_QUESTION
     );
-    let snapshot = &active_work["payload"]["snapshots"][0];
-    assert_eq!(snapshot["schema"], "active_work_snapshot.v1");
-    assert_eq!(snapshot["authority"], "run_control_provider");
-    assert_eq!(
-        snapshot["projection_state"],
-        "superseded_by_newer_producer_observation"
+    let active_work = &guidance_request["input"]["astra_runtime_context"];
+    assert_eq!(active_work["authority"], "run_control_provider");
+    assert_eq!(active_work["schema"], "active_work_snapshot.v1");
+    assert!(
+        active_work["background_work_snapshot"]
+            .as_str()
+            .is_some_and(|snapshot| {
+                snapshot.contains("kind=\"agent_fanout\"")
+                    && snapshot.contains("status=\"running\"")
+                    && snapshot.contains("active=\"")
+                    && snapshot.contains("terminal=\"")
+            }),
+        "guidance must carry a typed running fanout snapshot: {active_work}"
     );
-    let observation = &snapshot["work_unit_observations"][0];
+    let observation = &active_work["work_unit_observations"][0];
     assert_eq!(observation["id"], "mock-review-group");
     assert_eq!(observation["kind"], "agent_fanout");
-    assert_eq!(observation["status"], "completed");
+    assert_eq!(observation["status"], "running");
     assert!(
         !String::from_utf8_lossy(&astra.output).contains("All three reviewers completed"),
         "a non-terminal group must never be presented as settled"
@@ -1143,14 +1150,16 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
         "terminal fanout group exactly once.",
         Duration::from_secs(12),
     );
+    astra.wait_for_absent("Running Agent Fanout", Duration::from_secs(3));
+    astra.wait_for("total · ttft", Duration::from_secs(5));
     let received = mock.received_requests();
     assert_eq!(
         received
             .iter()
             .filter(|request| is_fanout_status_question(request))
             .count(),
-        1,
-        "terminal settlement must not replay the status question"
+        0,
+        "server-owned guidance must not replay the user text as a second chat admission"
     );
     assert_eq!(
         received
@@ -1226,17 +1235,39 @@ async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
         .filter(|request| is_fanout_root_request(request))
         .collect::<Vec<_>>();
     assert_eq!(root_requests.len(), 3, "partial fan-in gets one synthesis");
-    let final_request = root_requests
-        .last()
-        .expect("final parent request")
-        .to_string();
-    assert!(
-        final_request.contains("\\\"completed\\\":2") || final_request.contains("\"completed\":2"),
-        "canonical partial aggregate must disclose 2 completed slots: {final_request}"
+    let fanout_result = mock
+        .tool_results()
+        .into_iter()
+        .find(|result| {
+            result.get("request_id").and_then(serde_json::Value::as_str)
+                == Some("call-start-fanout")
+        })
+        .expect("the accepted fanout callback must be recorded");
+    assert_eq!(
+        fanout_result["session_id"], "mock-session",
+        "fanout callback must retain the stream session identity"
     );
-    assert!(
-        final_request.contains("\\\"failed\\\":1") || final_request.contains("\"failed\":1"),
-        "canonical partial aggregate must disclose one failed slot: {final_request}"
+    assert_eq!(
+        fanout_result["run_id"], "mock-run-fanout-root",
+        "fanout callback must retain the durable fanout run identity"
+    );
+    assert_eq!(
+        fanout_result["turn_chain_id"], "mock-turn-chain-fanout-root",
+        "fanout callback must retain the fanout turn-chain identity"
+    );
+    let fanout_output = fanout_result
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let fanout_value: serde_json::Value = serde_json::from_str(fanout_output)
+        .expect("canonical fanout callback output must remain structured JSON");
+    assert_eq!(
+        fanout_value["completed"], 2,
+        "canonical partial aggregate must disclose 2 completed slots: {fanout_result}"
+    );
+    assert_eq!(
+        fanout_value["failed"], 1,
+        "canonical partial aggregate must disclose one failed slot: {fanout_result}"
     );
     assert_eq!(
         received
@@ -1309,8 +1340,8 @@ async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
         "an explicitly backgrounded work group must wake exactly once"
     );
     assert_eq!(
-        reconciliation_requests[0]
-            .pointer("/edge_profile/runtime_reconciliation_turn")
+        request_edge_profile(reconciliation_requests[0])
+            .and_then(|profile| profile.get("runtime_reconciliation_turn"))
             .and_then(serde_json::Value::as_bool),
         Some(true),
         "background wake must use the typed runtime reconciliation lane"
@@ -1372,8 +1403,8 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
         .collect::<Vec<_>>();
     assert_eq!(status_requests.len(), 1);
     let status_request = &status_requests[0];
-    let active_work = status_request
-        .pointer("/edge_profile/runtime_volatile_injections")
+    let active_work = request_edge_profile(status_request)
+        .and_then(|profile| profile.get("runtime_volatile_injections"))
         .and_then(serde_json::Value::as_array)
         .and_then(|injections| {
             injections
@@ -1399,7 +1430,10 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
     mock.release_held_response();
 
     astra.wait_for(
-        "Parent reconciled one terminal fanout group exactly once.",
+        // Keep the screen assertion shorter than the remaining terminal row;
+        // the exact-once property is asserted structurally against received
+        // requests immediately below rather than inferred from line wrapping.
+        "Parent reconciled one",
         Duration::from_secs(12),
     );
     assert_eq!(

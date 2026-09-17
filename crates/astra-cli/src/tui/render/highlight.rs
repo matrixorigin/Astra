@@ -1,8 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::super::color::is_light;
-use super::super::terminal_palette::default_bg;
+use super::super::theme::Theme;
 
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
@@ -69,25 +68,15 @@ struct Palette {
     punctuation: Color,
 }
 
-fn palette() -> Palette {
-    if default_bg().is_some_and(is_light) {
-        Palette {
-            keyword: Color::Rgb(148, 40, 148),
-            type_name: Color::Rgb(0, 92, 145),
-            string: Color::Rgb(22, 115, 46),
-            comment: Color::Rgb(100, 116, 139),
-            number: Color::Rgb(135, 89, 0),
-            punctuation: Color::Rgb(100, 116, 139),
-        }
-    } else {
-        Palette {
-            keyword: Color::Rgb(199, 146, 234),
-            type_name: Color::Rgb(130, 170, 255),
-            string: Color::Rgb(173, 219, 103),
-            comment: Color::Rgb(117, 132, 161),
-            number: Color::Rgb(247, 140, 108),
-            punctuation: Color::Rgb(137, 151, 177),
-        }
+fn palette(theme: &Theme) -> Palette {
+    // Reuse the selected UI profile, including plain and ANSI fallbacks.
+    Palette {
+        keyword: theme.gutter,
+        type_name: theme.accent,
+        string: theme.success,
+        comment: theme.dim,
+        number: theme.warn,
+        punctuation: theme.fg,
     }
 }
 
@@ -479,8 +468,53 @@ pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'stati
         Some(language) => language,
         None => return code.lines().map(|l| Line::raw(l.to_string())).collect(),
     };
-    let palette = palette();
+    let palette = palette(super::super::theme::current());
     code.lines()
         .map(|line| highlight_line(line, language, palette))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighting_uses_selected_light_dark_and_plain_themes() {
+        for theme in [
+            Theme::light(),
+            Theme::dark(),
+            Theme::light_ansi(),
+            Theme::dark_ansi(),
+            Theme::light_256(),
+            Theme::dark_256(),
+            Theme::terminal_default(),
+            Theme::plain(),
+        ] {
+            let line = highlight_line(
+                "let name: String = \"text\"; // note",
+                Language::Rust,
+                palette(&theme),
+            );
+            let keyword = line.spans.iter().find(|s| s.content == "let").unwrap();
+            let type_name = line.spans.iter().find(|s| s.content == "String").unwrap();
+            let punctuation = line.spans.iter().find(|s| s.content == ";").unwrap();
+            let comment = line.spans.iter().find(|s| s.content == "// note").unwrap();
+            let string = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains("text"))
+                .unwrap();
+            assert_eq!(string.style.fg, Some(theme.success));
+            if theme == Theme::plain() {
+                assert!(
+                    line.spans
+                        .iter()
+                        .all(|s| s.style.fg.is_none() || s.style.fg == Some(Color::Reset))
+                );
+            } else {
+                assert_ne!(keyword.style.fg, type_name.style.fg, "{theme:?}");
+                assert_ne!(punctuation.style.fg, comment.style.fg, "{theme:?}");
+            }
+        }
+    }
 }

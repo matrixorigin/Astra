@@ -15,10 +15,11 @@ pub use agent_result_status::{
     render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
 };
 pub use agent_tool::{
-    AgentToolContext, AgentTranscriptLocation, handle_agent_fanout_tool,
-    handle_agent_get_result_action, handle_agent_send_message_with_router,
-    handle_agent_spawn_action, handle_agent_tool, normalize_agent_spawn_args,
-    recover_agent_fanout_tool_result, render_agent_runtime_binding_error,
+    AgentToolContext, AgentTranscriptLocation, WorkspaceMutationAuthority,
+    handle_agent_fanout_tool, handle_agent_get_result_action,
+    handle_agent_send_message_with_router, handle_agent_spawn_action, handle_agent_tool,
+    normalize_agent_spawn_args, recover_agent_fanout_tool_result,
+    render_agent_runtime_binding_error,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,
@@ -38,6 +39,7 @@ pub use astra_turn_core::orchestration_progress::{
 };
 pub use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
+pub use astra_turn_core::orchestration_types::CancellationOrigin;
 pub mod permission_sync {
     pub use astra_turn_core::permission::sync::*;
 }
@@ -48,11 +50,26 @@ pub use permission_sync::{
     PermissionRequestMessaging, PermissionResponse, PermissionResponseMessaging, PermissionRule,
     PermissionSyncContext, PermissionSyncHandle, PermissionUpdate,
 };
+
+/// Reserved runtime sideband key for inheriting the root workspace-effect
+/// decision. Model-authored context is overwritten at the root boundary.
+pub(crate) const WORKSPACE_MUTATION_CONTEXT_KEY: &str = "__astra_workspace_mutation";
+
+pub(crate) fn workspace_mutation_from_context(
+    context: &std::collections::HashMap<String, serde_json::Value>,
+) -> astra_config::user_profile::WorkspaceMutationIntent {
+    context
+        .get(WORKSPACE_MUTATION_CONTEXT_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
 pub use spawner::{
-    AgentHistoryRecord, AgentStatus, DescendantCancellationReason, DurableAgentReconciler,
-    DynamicAgentSpawner, FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary,
-    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult,
-    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
-    WaitForAgentOutcome, project_subrun_status_to_spawn,
+    AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
+    DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
+    FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID,
+    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability, SpawnRunConfig,
+    SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
+    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
     spawn_completion_status_from_finish_reason,
 };

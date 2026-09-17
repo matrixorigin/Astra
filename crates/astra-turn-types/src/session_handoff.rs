@@ -249,6 +249,21 @@ pub struct HandoffOperationWatermarksV1 {
     pub pending_outbox_count: u32,
 }
 
+impl HandoffOperationWatermarksV1 {
+    pub fn validate(&self) -> Result<(), SessionHandoffValidationError> {
+        if self.run_id.is_some() != self.run_generation.is_some() {
+            return Err(SessionHandoffValidationError::InvalidCoordinate);
+        }
+        if let Some(run_id) = &self.run_id {
+            validate_identity("run_id", run_id, 128)?;
+        }
+        if let Some(checkpoint_id) = &self.checkpoint_id {
+            validate_identity("checkpoint_id", checkpoint_id, 128)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandoffRiskEvidenceV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +272,11 @@ pub struct HandoffRiskEvidenceV1 {
     pub unknown_effect_invocation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_authorization_id: Option<String>,
+    /// Database time at which the Server fenced the old authority, stopped
+    /// every durable run, and sealed the complete set of possibly dispatched
+    /// effects. Absence means takeover is not yet safe to hydrate or expose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects_sealed_at_unix_ms: Option<i64>,
 }
 
 impl HandoffRiskEvidenceV1 {
@@ -269,6 +289,9 @@ impl HandoffRiskEvidenceV1 {
         }
         if let Some(id) = &self.forced_authorization_id {
             validate_identity("forced_authorization_id", id, 512)?;
+        }
+        if self.effects_sealed_at_unix_ms.is_some_and(|time| time <= 0) {
+            return Err(SessionHandoffValidationError::InvalidCoordinate);
         }
         for id in &self.unknown_effect_invocation_ids {
             validate_identity("unknown_effect_invocation_id", id, 512)?;
@@ -287,6 +310,10 @@ impl HandoffRiskEvidenceV1 {
 
     pub fn permits_forced_fence(&self) -> bool {
         self.forced_authorization_id.is_some()
+    }
+
+    pub fn effects_are_sealed(&self) -> bool {
+        self.effects_sealed_at_unix_ms.is_some()
     }
 }
 
@@ -327,11 +354,39 @@ pub struct SessionHandoffRecordV1 {
 }
 
 impl SessionHandoffRecordV1 {
+    /// Once a graceful handoff has checkpointed, retries must keep the same
+    /// execution snapshot, including when an intermediate step is blocked.
+    pub fn replace_watermarks(
+        &mut self,
+        watermarks: HandoffOperationWatermarksV1,
+    ) -> Result<(), SessionHandoffValidationError> {
+        watermarks.validate()?;
+        let state = self.blocked_from.unwrap_or(self.state);
+        if self.mode == SessionHandoffModeV1::Graceful
+            && matches!(
+                state,
+                SessionHandoffStateV1::Checkpointed
+                    | SessionHandoffStateV1::Fencing
+                    | SessionHandoffStateV1::Fenced
+                    | SessionHandoffStateV1::Hydrating
+                    | SessionHandoffStateV1::Active
+            )
+            && (self.watermarks.run_id != watermarks.run_id
+                || self.watermarks.run_generation != watermarks.run_generation
+                || self.watermarks.checkpoint_id != watermarks.checkpoint_id)
+        {
+            return Err(SessionHandoffValidationError::CheckpointIdentityChanged);
+        }
+        self.watermarks = watermarks;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), SessionHandoffValidationError> {
         if self.schema_version != SESSION_HANDOFF_SCHEMA_VERSION {
             return Err(SessionHandoffValidationError::UnsupportedSchema);
         }
         validate_identity("handoff_id", &self.handoff_id, 128)?;
+        self.watermarks.validate()?;
         validate_identity("idempotency_key", &self.idempotency_key, 512)?;
         validate_identity("reason", &self.reason, 1_024)?;
         if let Some(detail) = &self.status_detail {
@@ -364,6 +419,15 @@ impl SessionHandoffRecordV1 {
         self.risk.validate()?;
         if self.mode == SessionHandoffModeV1::Forced && !self.risk.permits_forced_fence() {
             return Err(SessionHandoffValidationError::ForcedEvidenceRequired);
+        }
+        if self.mode == SessionHandoffModeV1::Forced
+            && matches!(
+                self.state,
+                SessionHandoffStateV1::Hydrating | SessionHandoffStateV1::Active
+            )
+            && !self.risk.effects_are_sealed()
+        {
+            return Err(SessionHandoffValidationError::ForcedEffectsNotSealed);
         }
         Ok(())
     }
@@ -455,6 +519,8 @@ pub fn valid_transition(
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SessionHandoffValidationError {
+    #[error("checkpointed handoff execution identity cannot be replaced")]
+    CheckpointIdentityChanged,
     #[error("unsupported handoff schema version")]
     UnsupportedSchema,
     #[error("invalid handoff identity field {field}")]
@@ -478,6 +544,8 @@ pub enum SessionHandoffValidationError {
     },
     #[error("forced takeover requires a verified authorization identity")]
     ForcedEvidenceRequired,
+    #[error("forced takeover effects were not sealed after fencing")]
+    ForcedEffectsNotSealed,
     #[error("too many unknown effect identities")]
     TooManyEffects,
     #[error("duplicate unknown effect identity")]
@@ -547,6 +615,7 @@ mod tests {
                     unsynced_suffix_root: None,
                     unknown_effect_invocation_ids: vec!["invocation-unknown".into()],
                     forced_authorization_id: Some("reauth-proof".into()),
+                    effects_sealed_at_unix_ms: None,
                 }
             } else {
                 HandoffRiskEvidenceV1::default()
@@ -559,6 +628,85 @@ mod tests {
             updated_at_unix_ms: 1_000,
             transition_seq: 1,
         }
+    }
+
+    #[test]
+    fn checkpoint_identity_survives_blocked_retries() {
+        let mut handoff = record(SessionHandoffModeV1::Graceful);
+        let bound = HandoffOperationWatermarksV1 {
+            run_id: Some("run".into()),
+            run_generation: Some(0),
+            checkpoint_id: Some("checkpoint".into()),
+            ..Default::default()
+        };
+        handoff.replace_watermarks(bound.clone()).unwrap();
+        for state in [
+            SessionHandoffStateV1::Checkpointed,
+            SessionHandoffStateV1::Fencing,
+            SessionHandoffStateV1::Fenced,
+            SessionHandoffStateV1::Hydrating,
+            SessionHandoffStateV1::Active,
+        ] {
+            for blocked in [false, true] {
+                handoff.state = if blocked {
+                    SessionHandoffStateV1::Blocked
+                } else {
+                    state
+                };
+                handoff.blocked_from = blocked.then_some(state);
+                handoff.replace_watermarks(bound.clone()).unwrap();
+                let mut changed_run = bound.clone();
+                changed_run.run_id = Some("other-run".into());
+                let mut changed_generation = bound.clone();
+                changed_generation.run_generation = Some(1);
+                let mut changed_checkpoint = bound.clone();
+                changed_checkpoint.checkpoint_id = Some("other-checkpoint".into());
+                for changed in [
+                    changed_run,
+                    changed_generation,
+                    changed_checkpoint,
+                    HandoffOperationWatermarksV1::default(),
+                ] {
+                    assert_eq!(
+                        handoff.replace_watermarks(changed),
+                        Err(SessionHandoffValidationError::CheckpointIdentityChanged)
+                    );
+                    assert_eq!(handoff.watermarks, bound);
+                }
+                let mut progress = bound.clone();
+                progress.delivery_generation = Some(1);
+                handoff.replace_watermarks(progress.clone()).unwrap();
+                assert_eq!(handoff.watermarks, progress);
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_run_coordinates_are_paired_but_idle_sessions_need_no_run() {
+        let mut handoff = record(SessionHandoffModeV1::Graceful);
+        assert!(handoff.validate().is_ok());
+        handoff.watermarks.run_id = Some("run-1".into());
+        assert_eq!(
+            handoff.validate(),
+            Err(SessionHandoffValidationError::InvalidCoordinate)
+        );
+        handoff.watermarks.run_generation = Some(0);
+        assert!(handoff.validate().is_ok());
+        handoff.watermarks.run_id = None;
+        assert_eq!(
+            handoff.validate(),
+            Err(SessionHandoffValidationError::InvalidCoordinate)
+        );
+        handoff.watermarks.run_generation = None;
+        handoff.watermarks.checkpoint_id = Some(String::new());
+        assert_eq!(
+            handoff.validate(),
+            Err(SessionHandoffValidationError::InvalidIdentity {
+                field: "checkpoint_id"
+            })
+        );
+        handoff.watermarks.checkpoint_id = Some("checkpoint-1".into());
+        assert!(handoff.validate().is_ok());
     }
 
     #[test]
@@ -602,6 +750,19 @@ mod tests {
                 1_003,
             )
             .unwrap();
+        forced
+            .transition(
+                SessionHandoffStateV1::Fenced,
+                SessionHandoffStateV1::Hydrating,
+                1_004,
+            )
+            .unwrap();
+        assert_eq!(
+            forced.validate(),
+            Err(SessionHandoffValidationError::ForcedEffectsNotSealed)
+        );
+        forced.risk.effects_sealed_at_unix_ms = Some(1_004);
+        forced.validate().unwrap();
     }
 
     #[test]

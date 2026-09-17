@@ -957,12 +957,13 @@ fn default_skill_type() -> String {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishSkillRequest {
     pub name: String,
     pub version: String,
     pub description: String,
     pub dependencies: Option<Vec<String>>,
-    pub manifest: Option<serde_json::Value>,
+    pub manifest: serde_json::Value,
     #[serde(default = "default_skill_type")]
     pub skill_type: String,
     #[serde(default)]
@@ -1044,14 +1045,16 @@ mod tests {
     }
 
     #[test]
-    fn publish_request_defaults() {
+    fn publish_request_requires_typed_manifest() {
         let json = r#"{"name":"test","version":"1.0","description":"desc"}"#;
+        assert!(serde_json::from_str::<PublishSkillRequest>(json).is_err());
+        let json = r#"{"name":"test","version":"1.0","description":"desc","manifest":{"instructions":"do it"}}"#;
         let req: PublishSkillRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.category, "user");
         assert_eq!(req.priority, 5);
         assert_eq!(req.skill_type, "local");
         assert!(req.remote_url.is_none());
-        assert!(req.manifest.is_none());
+        assert_eq!(req.manifest["instructions"], "do it");
     }
 
     #[test]
@@ -1060,6 +1063,7 @@ mod tests {
             "name":"remote-test",
             "version":"1.0",
             "description":"desc",
+            "manifest": {},
             "skill_type":"remote",
             "remote_url":"https://example.com/skills/run"
         }"#;

@@ -23,16 +23,32 @@ pub fn normalize_prompt_facing_runtime_messages(
             continue;
         }
 
-        if let Some(delivery) = runtime_message_delivery(&message) {
-            if delivery == RuntimeMessageDelivery::RequiredContext
-                && let Some(content) = message.get("content").and_then(Value::as_str)
-                && !content.trim().is_empty()
-            {
-                normalized
-                    .required_runtime_texts
-                    .push(content.trim().to_string());
+        if is_runtime_owned_message(&message) {
+            let Some(delivery) = runtime_message_delivery(&message) else {
+                // Unknown runtime protocol data is never conversational user
+                // input. Provider assembly reports the contract violation;
+                // prompt-facing projections fail closed by excluding it.
+                continue;
+            };
+            match delivery {
+                RuntimeMessageDelivery::RequiredContext => {
+                    if let Some(content) = message.get("content").and_then(Value::as_str)
+                        && !content.trim().is_empty()
+                    {
+                        normalized
+                            .required_runtime_texts
+                            .push(content.trim().to_string());
+                    }
+                    continue;
+                }
+                RuntimeMessageDelivery::AppendOnlyRequiredContext => {
+                    normalized.messages.push(message);
+                    continue;
+                }
+                RuntimeMessageDelivery::EphemeralControl | RuntimeMessageDelivery::Projection => {
+                    continue;
+                }
             }
-            continue;
         }
 
         normalized.messages.push(message);
@@ -43,12 +59,220 @@ pub fn normalize_prompt_facing_runtime_messages(
 /// Preserve provider tool frames for recovery while excluding messages owned
 /// by the runtime and internal skill auto-route roundtrips.
 pub fn sanitize_recoverable_runtime_messages(messages: Vec<Value>) -> Vec<Value> {
+    sanitize_durable_message_values(
+        messages
+            .into_iter()
+            .filter(|message| {
+                runtime_message_delivery(message)
+                    == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
+                    || (!is_runtime_owned_message(message)
+                        && !is_internal_skill_auto_route_message(message))
+            })
+            .collect(),
+    )
+}
+
+/// Redact a cloned message graph before it crosses a checkpoint/journal
+/// boundary. The caller retains the original graph for live provider use.
+pub fn sanitize_durable_message_values(mut messages: Vec<Value>) -> Vec<Value> {
+    for message in &mut messages {
+        sanitize_embedded_assistant_tool_arguments(message);
+        let assistant_frame = message.get("role").and_then(Value::as_str) == Some("assistant");
+        sanitize_json_except_assistant_tool_arguments(
+            message,
+            assistant_frame,
+            AssistantToolPath::None,
+            true,
+            None,
+        );
+    }
     messages
-        .into_iter()
-        .filter(|message| {
-            !is_runtime_owned_message(message) && !is_internal_skill_auto_route_message(message)
-        })
-        .collect()
+}
+
+/// Apply the generic display boundary while leaving the already-normalized
+/// assistant tool-argument string opaque. That string is a nested JSON
+/// document: rescanning its serialized form can match the quotes/field name
+/// of an inner credential and make the inner document unparsable. Only the
+/// exact `assistant → tool_calls[] → function → arguments` string path is
+/// skipped; every other same-named field goes through the generic sanitizer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssistantToolPath {
+    None,
+    ToolCallsArray,
+    ToolCallObject,
+    FunctionObject,
+}
+
+fn sanitize_json_except_assistant_tool_arguments(
+    value: &mut Value,
+    assistant_frame: bool,
+    path: AssistantToolPath,
+    at_message_root: bool,
+    object_key: Option<&str>,
+) {
+    match value {
+        Value::String(_) => {
+            let mut leaf = std::mem::replace(value, Value::Null);
+            if let Some(key) = object_key {
+                astra_tools::credential_redaction::redact_credentials_in_json_field(&mut leaf, key);
+            } else {
+                astra_tools::credential_redaction::redact_credentials_in_json(&mut leaf);
+            }
+            *value = leaf;
+        }
+        Value::Array(values) => {
+            for child in values {
+                let child_path = if path == AssistantToolPath::ToolCallsArray && child.is_object() {
+                    AssistantToolPath::ToolCallObject
+                } else {
+                    AssistantToolPath::None
+                };
+                sanitize_json_except_assistant_tool_arguments(
+                    child,
+                    assistant_frame,
+                    child_path,
+                    false,
+                    None,
+                );
+            }
+        }
+        Value::Object(values) => {
+            // These fields are only protocol metadata when they occur at the
+            // root of a canonical tool message.  The same names inside user
+            // content, tool output, or an unknown nested object remain
+            // ordinary data and must pass through credential redaction.
+            let tool_result_frame =
+                at_message_root && values.get("role").and_then(Value::as_str) == Some("tool");
+            let tool_result_call_id = values
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let tool_result_run_id = values
+                .get(crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                .and_then(Value::as_str);
+            let tool_result_run_id = tool_result_run_id.map(str::to_owned);
+            let artifact_descriptor_is_bound = tool_result_frame
+                && values
+                    .get(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                    .and_then(crate::tool_result_storage::parse_tool_result_artifact_descriptor)
+                    .is_some_and(|descriptor| {
+                        crate::tool_result_storage::artifact_descriptor_matches_identity(
+                            &descriptor,
+                            tool_result_call_id.as_deref(),
+                            tool_result_run_id.as_deref(),
+                        )
+                    });
+            if tool_result_frame && !artifact_descriptor_is_bound {
+                // A malformed or cross-message descriptor is not ordinary
+                // user data: drop it rather than retaining a plausible but
+                // unauthorised recovery hint in the durable journal.
+                values.remove(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD);
+            }
+            for (key, child) in values {
+                if tool_result_frame
+                    && key == crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
+                    && child
+                        .as_str()
+                        .is_some_and(crate::tool_result_storage::is_valid_tool_result_run_id)
+                {
+                    // A validated root run id is canonical ownership metadata,
+                    // not model-visible prose.  Invalid values fall through
+                    // to the generic sanitizer instead of becoming an
+                    // identity exemption.
+                    continue;
+                }
+                if tool_result_frame
+                    && key == crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
+                {
+                    if artifact_descriptor_is_bound {
+                        let descriptor =
+                            crate::tool_result_storage::parse_tool_result_artifact_descriptor(
+                                child,
+                            )
+                            .expect("bound artifact descriptor must remain parseable");
+                        // Rebuild the exact typed descriptor so an otherwise
+                        // valid object cannot smuggle unknown nested fields
+                        // (for example a credential) across the durable
+                        // boundary.
+                        if let Ok(canonical) = serde_json::to_value(descriptor) {
+                            *child = canonical;
+                            continue;
+                        }
+                    }
+                }
+                if assistant_frame
+                    && path == AssistantToolPath::FunctionObject
+                    && key == "arguments"
+                    && child.is_string()
+                {
+                    continue;
+                }
+                let next_path = if at_message_root
+                    && assistant_frame
+                    && key == "tool_calls"
+                    && child.is_array()
+                {
+                    AssistantToolPath::ToolCallsArray
+                } else if path == AssistantToolPath::ToolCallObject
+                    && key == "function"
+                    && child.is_object()
+                {
+                    AssistantToolPath::FunctionObject
+                } else {
+                    AssistantToolPath::None
+                };
+                sanitize_json_except_assistant_tool_arguments(
+                    child,
+                    assistant_frame,
+                    next_path,
+                    false,
+                    Some(key),
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Assistant tool calls carry a second JSON document in
+/// `tool_calls[].function.arguments`. This protocol-specific parse belongs at
+/// the message boundary, not in the generic JSON metadata sanitizer. Invalid
+/// inner JSON is replaced with a parseable sentinel instead of being copied to
+/// a durable checkpoint.
+fn sanitize_embedded_assistant_tool_arguments(message: &mut Value) {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let Some(arguments) = tool_call
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let safe_arguments = match serde_json::from_str::<Value>(&arguments) {
+            Ok(mut parsed) => {
+                astra_tools::credential_redaction::redact_credentials_in_json(&mut parsed);
+                serde_json::to_string(&parsed).unwrap_or_else(|_| {
+                    r#"{"_astra_redaction":"arguments_unavailable"}"#.to_string()
+                })
+            }
+            Err(_) => r#"{"_astra_redaction":"arguments_unavailable"}"#.to_string(),
+        };
+        if let Some(arguments_value) = tool_call
+            .get_mut("function")
+            .and_then(Value::as_object_mut)
+            .and_then(|function| function.get_mut("arguments"))
+        {
+            *arguments_value = Value::String(safe_arguments);
+        }
+    }
 }
 
 fn is_internal_skill_auto_route_message(message: &Value) -> bool {
@@ -104,11 +328,20 @@ mod tests {
             "another arbitrary payload",
             RuntimeMessageDelivery::EphemeralControl,
         );
+        let append_only = runtime_owned_message(
+            "user",
+            "durable runtime authority",
+            RuntimeMessageDelivery::AppendOnlyRequiredContext,
+        );
 
-        let got =
-            normalize_prompt_facing_runtime_messages(vec![ordinary.clone(), required, ephemeral]);
+        let got = normalize_prompt_facing_runtime_messages(vec![
+            ordinary.clone(),
+            required,
+            ephemeral,
+            append_only.clone(),
+        ]);
 
-        assert_eq!(got.messages, vec![ordinary]);
+        assert_eq!(got.messages, vec![ordinary, append_only]);
         assert_eq!(
             got.required_runtime_texts,
             vec!["required payload without a magic prefix"]
@@ -128,6 +361,44 @@ mod tests {
             sanitize_recoverable_runtime_messages(vec![ordinary.clone(), owned]),
             vec![ordinary]
         );
+    }
+
+    #[test]
+    fn recovery_preserves_append_only_required_context_in_place() {
+        let first = json!({"role": "user", "content": "do the work"});
+        let runtime = runtime_owned_message(
+            "user",
+            "<runtime-required-context>\nlatest authority\n</runtime-required-context>",
+            RuntimeMessageDelivery::AppendOnlyRequiredContext,
+        );
+        let assistant = json!({"role": "assistant", "content": "continuing"});
+
+        assert_eq!(
+            sanitize_recoverable_runtime_messages(vec![
+                first.clone(),
+                runtime.clone(),
+                assistant.clone(),
+            ]),
+            vec![first, runtime, assistant]
+        );
+    }
+
+    #[test]
+    fn prompt_facing_normalization_drops_unknown_runtime_delivery() {
+        let malformed = json!({
+            "role": "user",
+            "content": "future runtime control",
+            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD: {
+                "producer": "runtime",
+                "delivery": "future_delivery",
+            },
+        });
+        let human = json!({"role": "user", "content": "real request"});
+
+        let got = normalize_prompt_facing_runtime_messages(vec![malformed, human.clone()]);
+
+        assert_eq!(got.messages, vec![human]);
+        assert!(got.required_runtime_texts.is_empty());
     }
 
     #[test]
@@ -153,6 +424,248 @@ mod tests {
         assert_eq!(
             sanitize_recoverable_runtime_messages(messages),
             vec![json!({"role": "user", "content": "review changes"})]
+        );
+    }
+
+    #[test]
+    fn recoverable_checkpoint_messages_redact_tool_call_arguments() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-secret",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": format!("{{\"command\":\"tool --token {secret}\"}}")
+                }
+            }]
+        })];
+
+        let safe = sanitize_recoverable_runtime_messages(messages);
+        let encoded = serde_json::to_string(&safe).expect("checkpoint messages serialize");
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("[REDACTED:TOKEN_ARGUMENT]"));
+        assert_eq!(safe[0]["tool_calls"][0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn durable_checkpoint_redacts_quoted_and_indexed_embedded_arguments() {
+        let token = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let access_key = "SECRET_ACCESS_VALUE_abcdefghijklmnopqrstuvwxyz";
+        let arguments = serde_json::to_string(&json!({
+            "command": format!(
+                r#"tool --token "{token}"; python3 -c 'os.environ["AWS_SECRET_ACCESS_KEY"] = "{access_key}"'"#
+            ),
+            "api_key": token,
+            "path": "src/main.rs"
+        }))
+        .unwrap();
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-quoted",
+                "function": {"name": "bash", "arguments": arguments}
+            }]
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert!(!encoded.contains(token));
+        assert!(!encoded.contains(access_key));
+        let inner: Value = serde_json::from_str(
+            safe[0]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments remain a JSON string"),
+        )
+        .expect("sanitized arguments remain parseable");
+        assert!(inner["command"].as_str().unwrap().contains("[REDACTED:"));
+        assert_eq!(inner["path"], "src/main.rs");
+        assert_eq!(inner["api_key"], "[REDACTED:SECRET_FIELD]");
+    }
+
+    #[test]
+    fn assistant_metadata_function_arguments_are_not_exempt() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": {
+                "function": {"arguments": format!("tool --token {secret}")}
+            }
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn nested_content_tool_calls_do_not_get_protocol_exemption() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": {
+                "tool_calls": [{
+                    "function": {"arguments": format!("tool --token {secret}")}
+                }]
+            }
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn malformed_tool_frame_shapes_fail_closed_through_generic_sanitizer() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": {"function": {"arguments": format!("--token {secret}")}}
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [[{"function": {"arguments": format!("--token {secret}")}}]]
+            }),
+            json!({
+                "role": "assistant",
+                "tool_calls": [{"function": format!("--token {secret}")}]
+            }),
+        ];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert!(!encoded.contains(secret));
+        assert_eq!(encoded.matches("[REDACTED:").count(), 3);
+    }
+
+    #[test]
+    fn non_string_tool_arguments_are_sanitized_by_key() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-object-arguments",
+                "function": {
+                    "name": "bash",
+                    "arguments": {"api_key": "short-but-still-secret"}
+                }
+            }]
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        assert_eq!(
+            safe[0]["tool_calls"][0]["function"]["arguments"]["api_key"],
+            "[REDACTED:SECRET_FIELD]"
+        );
+    }
+
+    #[test]
+    fn malformed_embedded_tool_arguments_are_replaced_fail_closed() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let messages = vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-malformed",
+                "function": {
+                    "name": "bash",
+                    "arguments": format!(r#"{{\"command\":\"tool --token {secret}"#)
+                }
+            }]
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).unwrap();
+        assert!(!encoded.contains(secret));
+        assert_eq!(
+            safe[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"_astra_redaction":"arguments_unavailable"}"#
+        );
+    }
+
+    #[test]
+    fn nested_artifact_metadata_is_not_a_durable_sanitizer_exemption() {
+        let secret = "sk-protocol-nested-secret-abcdefghijklmnopqrstuvwxyz";
+        let descriptor = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 4,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "api_key": secret,
+        });
+        let messages = vec![json!({
+            "role": "user",
+            "content": {
+                "_astra_tool_result_artifact": descriptor,
+                "_astra_tool_result_run_id": secret,
+            }
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        let encoded = serde_json::to_string(&safe).expect("durable messages serialize");
+        assert!(!encoded.contains(secret));
+        assert!(encoded.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn valid_root_tool_artifact_metadata_is_canonicalized_and_preserved() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "bounded recovery projection",
+            "tool_call_id": "call-1",
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-1",
+            crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: {
+                "version": 1,
+                "call_id": "call-1",
+                "run_id": "run-1",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        assert_eq!(
+            safe[0][crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD],
+            "run-1"
+        );
+        assert_eq!(
+            safe[0][crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD],
+            json!({
+                "version": 1,
+                "call_id": "call-1",
+                "run_id": "run-1",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_root_tool_artifact_metadata_is_not_preserved_as_authority() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "bounded recovery projection",
+            "tool_call_id": "call-actual",
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-actual",
+            crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD: {
+                "version": 1,
+                "call_id": "call-other",
+                "run_id": "run-other",
+                "byte_len": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        })];
+
+        let safe = sanitize_durable_message_values(messages);
+        assert!(
+            safe[0]
+                .get(crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .is_none(),
+            "a descriptor bound to another call/run must not survive durable sanitization"
         );
     }
 }

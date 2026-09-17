@@ -60,9 +60,6 @@ pub struct CompactionEvent {
     pub compression_ratio: f64,
     /// Whether LLM summary was generated.
     pub has_summary: bool,
-    /// Files recovered as attachments.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub recovered_files: Vec<String>,
     /// Session memory fallback reason (if applicable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sm_fallback_reason: Option<String>,
@@ -89,7 +86,6 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: boundary.summary.is_some(),
-            recovered_files: boundary.recent_files.clone(),
             sm_fallback_reason: None,
         }
     }
@@ -119,7 +115,6 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: memories_retrieved > 0,
-            recovered_files: Vec::new(),
             sm_fallback_reason: None,
         }
     }
@@ -149,7 +144,6 @@ impl CompactionEvent {
             tokens_saved,
             compression_ratio,
             has_summary: false,
-            recovered_files: Vec::new(),
             sm_fallback_reason: Some(reason.to_string()),
         }
     }

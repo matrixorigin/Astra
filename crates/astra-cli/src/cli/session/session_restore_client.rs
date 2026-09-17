@@ -20,6 +20,9 @@ fn validate_restored_session(
             restored.session_id
         ));
     }
+    if restored.resume_bundle.is_none() {
+        return Err("resume response omitted required versioned ResumeBundle".to_string());
+    }
     if let Some(bundle) = restored.resume_bundle.as_ref() {
         let expected_owner = cli_utils::cli_user_id();
         if bundle.schema_version != astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION {
@@ -40,17 +43,14 @@ fn validate_restored_session(
                 bundle.cursor.owner_id
             ));
         }
-        if bundle.cursor.schema_version != 0
-            && bundle.cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
-        {
+        if bundle.cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION {
             return Err(format!(
                 "resume cursor schema {} is unsupported",
                 bundle.cursor.schema_version
             ));
         }
-        if bundle.cursor.schema_version != 0
-            && bundle.cursor.projection_schema
-                != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        if bundle.cursor.projection_schema
+            != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
             && bundle.cursor.projection_schema
                 != astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
         {
@@ -74,11 +74,9 @@ fn validate_restored_session(
         if !bundle.validates_root() {
             return Err("resume bundle conversation root validation failed".to_string());
         }
-        if !restored.conversation_messages.is_empty()
-            && restored.conversation_messages != bundle.conversation_messages
-        {
+        if !restored.conversation_messages.is_empty() {
             return Err(
-                "resume response contains divergent legacy messages and resume bundle".to_string(),
+                "resume response contains removed standalone conversation_messages".to_string(),
             );
         }
     }
@@ -277,6 +275,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("mismatched owner"), "{error}");
+    }
+
+    #[test]
+    fn remote_restore_requires_a_bundle_even_for_an_empty_session() {
+        let error = validate_restored_session(
+            "empty-session",
+            RestoredSession {
+                session_id: "empty-session".into(),
+                turn_count: 0,
+                resume_bundle: None,
+                conversation_messages: Vec::new(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("required versioned ResumeBundle"), "{error}");
     }
 
     async fn mock_cloud_resumable_list(server: &MockServer, sessions: &[RestoredSession]) {

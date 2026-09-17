@@ -1,11 +1,15 @@
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
 use crate::storage::{log_session_audit, session_record_from_row};
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use astra_core::{
+    ErrorResponse, MatrixOneSettings, SharedPool, error_response, error_response_coded,
+    internal_error,
+};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
@@ -36,6 +40,19 @@ pub trait SessionService: Send + Sync {
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    async fn create_provider_session(
+        &self,
+        _identity: ProviderSessionCreationIdentity,
+        _request: SessionCreateRequestData,
+        _quota: crate::resource_governor::LimitCheck,
+    ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::NOT_IMPLEMENTED,
+            "Provider session creation is not configured",
+            "provider_session_creation_unconfigured",
+        ))
+    }
+
     async fn list_sessions(
         &self,
         filter: SessionListFilter,
@@ -46,6 +63,17 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// Resolve a session for an already authenticated provider request.
+    /// Implementations may classify confirmed absence as `session_not_found`;
+    /// an owner-hidden 404 must never carry that recovery code.
+    async fn get_session_for_provider_request(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.get_session(session_id, user_id).await
+    }
 
     async fn update_session(
         &self,
@@ -69,11 +97,73 @@ pub trait SessionService: Send + Sync {
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SessionCreateRequestData {
     pub agent_id: Option<String>,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderSessionCreationIdentity {
+    user_id: String,
+    session_id: String,
+}
+
+impl ProviderSessionCreationIdentity {
+    pub fn from_principal(
+        principal: &super::AuthPrincipal,
+        client_session_ref: &str,
+    ) -> Result<Self, (StatusCode, Json<ErrorResponse>)> {
+        let super::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin
+        else {
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                "client_session_ref requires provider request authorization",
+                "provider_session_creation_forbidden",
+            ));
+        };
+        if context.edge_agent_id.is_some() {
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                "Edge registration cannot create provider sessions",
+                "provider_session_creation_forbidden",
+            ));
+        }
+        if client_session_ref.is_empty()
+            || client_session_ref.len() > 255
+            || client_session_ref.trim() != client_session_ref
+            || client_session_ref.chars().any(char::is_control)
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "client_session_ref must be an exact nonempty string of at most 255 bytes",
+                "client_session_ref_invalid",
+            ));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"astra.provider-session-creation.v1\0");
+        for value in [
+            &context.provider_id,
+            &context.external_subject,
+            &context.provider_scope_id,
+            &principal.user.user_id,
+            client_session_ref,
+        ] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        Ok(Self {
+            user_id: principal.user.user_id.clone(),
+            session_id: format!("{:x}", hash.finalize()),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionCreationResult {
+    pub session: SessionRecord,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -349,6 +439,86 @@ struct SessionDeletionOutcome {
 }
 
 impl DatabaseSessionService {
+    async fn create_session_record(
+        &self,
+        user_id: String,
+        session_id: String,
+        request: SessionCreateRequestData,
+        provider_creation: Option<(String, crate::resource_governor::LimitCheck)>,
+    ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let title = request
+            .title
+            .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
+        let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
+
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?;
+
+        if let Some((payload_hash, quota)) = &provider_creation {
+            let existing = query(
+                "SELECT provider_creation_hash FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+            ).bind(&session_id).bind(&user_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
+            if let Some(existing) = existing {
+                let existing_hash: Option<String> = existing
+                    .try_get("provider_creation_hash")
+                    .map_err(internal_error)?;
+                if existing_hash.as_deref() != Some(payload_hash.as_str()) {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "client_session_ref was already used with different creation parameters",
+                        "session_creation_conflict",
+                    ));
+                }
+                let record = self
+                    .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+                    .await?
+                    .ok_or_else(|| internal_error("failed to read idempotent session"))?;
+                tx.commit().await.map_err(internal_error)?;
+                return Ok(SessionCreationResult {
+                    session: record,
+                    created: false,
+                });
+            }
+            crate::resource_governor::enforce_session_create_quota(quota)?;
+        }
+
+        query(
+            "INSERT INTO agent_sessions \
+             (session_id, user_id, agent_id, title, status, event_count, created_at, updated_at, last_active_at, `metadata`, provider_creation_hash) \
+             VALUES (?, ?, ?, ?, 'active', 0, NOW(), NOW(), NOW(), ?, ?)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(&request.agent_id)
+        .bind(&title)
+        .bind(metadata)
+        .bind(provider_creation.as_ref().map(|(hash, _)| hash.as_str()))
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        // Read our own insert in the same transaction. A new pooled transaction
+        // can use an older MatrixOne snapshot and miss a successfully committed
+        // session. Keep database-generated fields, but only return after commit
+        // succeeds so a commit failure cannot be reported as successful creation.
+        let record = self
+            .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+            .await?
+            .ok_or_else(|| internal_error("failed to read created session"))?;
+        tx.commit().await.map_err(internal_error)?;
+        let details = serde_json::json!({
+            "title": record.title,
+            "agent_id": record.agent_id,
+        });
+        log_session_audit(&pool, &user_id, "session_create", &session_id, details).await;
+        Ok(SessionCreationResult {
+            session: record,
+            created: true,
+        })
+    }
+
     pub fn new(matrixone: MatrixOneSettings) -> Self {
         Self {
             matrixone,
@@ -395,9 +565,43 @@ impl DatabaseSessionService {
                 )
             })?;
 
-        let hard_delete = hard_delete_session(pool, session_id, user_id)
-            .await
-            .map_err(internal_error)?;
+        let hard_delete = match hard_delete_session(pool, session_id, user_id).await {
+            Ok(outcome) => outcome,
+            // The owner check above and the delete transaction are necessarily
+            // separate. A concurrent owner delete may therefore win before
+            // this request marks the session or after both requests have
+            // marked it but before this request locks the delete fence. Both
+            // are missing-resource outcomes, never internal-server errors.
+            Err(error)
+                if error
+                    == "delete_session.mark_deleting: session not found or not owned by user" =>
+            {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            Err(error)
+                if error
+                    == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
+            {
+                // A missing fence is only the expected concurrent-delete race
+                // when the owning session disappeared with it. Preserve a
+                // genuine lifecycle inconsistency as an internal error.
+                if self
+                    .fetch_session_for_user(pool, session_id, user_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Session {session_id} 不存在"),
+                    ));
+                }
+                return Err(internal_error(error));
+            }
+            Err(error) => return Err(internal_error(error)),
+        };
 
         Ok(SessionDeletionOutcome {
             session: existing,
@@ -436,46 +640,26 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let session_id = Uuid::new_v4().to_string();
-        let title = request
-            .title
-            .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
-        let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
-
-        let mut tx = pool.begin().await.map_err(internal_error)?;
-        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
             .await
-            .map_err(internal_error)?;
+            .map(|result| result.session)
+    }
 
-        query(
-            "INSERT INTO agent_sessions \
-             (session_id, user_id, agent_id, title, status, event_count, created_at, updated_at, last_active_at, `metadata`) \
-             VALUES (?, ?, ?, ?, 'active', 0, NOW(), NOW(), NOW(), ?)",
+    async fn create_provider_session(
+        &self,
+        identity: ProviderSessionCreationIdentity,
+        request: SessionCreateRequestData,
+        quota: crate::resource_governor::LimitCheck,
+    ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        let payload = crate::registry_payload::canonical_serialize(&request)?;
+        let payload_hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        self.create_session_record(
+            identity.user_id,
+            identity.session_id,
+            request,
+            Some((payload_hash, quota)),
         )
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(&request.agent_id)
-        .bind(&title)
-        .bind(metadata)
-        .execute(&mut *tx)
         .await
-        .map_err(internal_error)?;
-        // Read our own insert in the same transaction. A new pooled transaction
-        // can use an older MatrixOne snapshot and miss a successfully committed
-        // session. Keep database-generated fields, but only return after commit
-        // succeeds so a commit failure cannot be reported as successful creation.
-        let record = self
-            .fetch_session_for_user(&mut *tx, &session_id, &user_id)
-            .await?
-            .ok_or_else(|| internal_error("failed to read created session"))?;
-        tx.commit().await.map_err(internal_error)?;
-        let details = serde_json::json!({
-            "title": record.title,
-            "agent_id": record.agent_id,
-        });
-        log_session_audit(&pool, &user_id, "session_create", &session_id, details).await;
-        Ok(record)
     }
 
     async fn list_sessions(
@@ -570,6 +754,38 @@ impl SessionService for DatabaseSessionService {
             })?;
 
         Ok(session)
+    }
+
+    async fn get_session_for_provider_request(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        match self.get_session(session_id.clone(), user_id).await {
+            Ok(session) => Ok(session),
+            Err(error) if error.0 == StatusCode::NOT_FOUND => {
+                // Only the failed lookup needs classification. Do not turn a
+                // hidden foreign session or a database failure into permission
+                // to rebuild a conversation on the provider's side.
+                let pool = self.get_pool().await.map_err(internal_error)?;
+                let exists = query("SELECT 1 FROM agent_sessions WHERE session_id = ? LIMIT 1")
+                    .bind(&session_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some();
+                if exists {
+                    Err(error)
+                } else {
+                    Err(error_response_coded(
+                        StatusCode::NOT_FOUND,
+                        "Session not found",
+                        "session_not_found",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn update_session(
@@ -882,6 +1098,94 @@ impl SessionService for UnconfiguredSessionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider_principal(provider: &str, subject: &str, scope: &str) -> crate::AuthPrincipal {
+        crate::AuthPrincipal {
+            user: crate::AuthUserRecord {
+                user_id: "mapped-user".to_string(),
+                username: "mapped-user".to_string(),
+                email: "mapped@example.test".to_string(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                crate::AuthProviderAuthorizedRequestContext {
+                    provider_id: provider.to_string(),
+                    external_subject: subject.to_string(),
+                    provider_scope_id: scope.to_string(),
+                    request_authorization_id: "request-1".to_string(),
+                    edge_agent_id: None,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn provider_session_identity_is_stable_and_partitioned() {
+        let principal = provider_principal("provider-a", "a", "bc");
+        let identity =
+            ProviderSessionCreationIdentity::from_principal(&principal, "conversation-1").unwrap();
+        assert_eq!(
+            identity,
+            ProviderSessionCreationIdentity::from_principal(&principal, "conversation-1").unwrap()
+        );
+        assert_eq!(identity.session_id.len(), 64);
+        crate::validate_persisted_session_id(&identity.session_id).unwrap();
+        for different in [
+            provider_principal("other", "a", "bc"),
+            provider_principal("provider-a", "ab", "c"),
+            provider_principal("provider-a", "a", "other"),
+        ] {
+            assert_ne!(
+                identity,
+                ProviderSessionCreationIdentity::from_principal(&different, "conversation-1")
+                    .unwrap()
+            );
+        }
+        assert_ne!(
+            identity,
+            ProviderSessionCreationIdentity::from_principal(&principal, "conversation-2").unwrap()
+        );
+        let mut another_request = principal.clone();
+        if let crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
+            &mut another_request.origin
+        {
+            context.request_authorization_id = "request-after-response-loss".to_string();
+        }
+        assert_eq!(
+            identity,
+            ProviderSessionCreationIdentity::from_principal(&another_request, "conversation-1")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_session_identity_rejects_invalid_reference_and_non_request_credentials() {
+        let mut principal = provider_principal("provider-a", "user", "scope-a");
+        for invalid in ["", " padded", "padded ", "line\nbreak", &"x".repeat(256)] {
+            let error =
+                ProviderSessionCreationIdentity::from_principal(&principal, invalid).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+        if let crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) =
+            &mut principal.origin
+        {
+            context.edge_agent_id = Some("runner-1".to_string());
+        }
+        assert_eq!(
+            ProviderSessionCreationIdentity::from_principal(&principal, "ref")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        principal.origin = crate::AuthPrincipalOrigin::Internal;
+        assert_eq!(
+            ProviderSessionCreationIdentity::from_principal(&principal, "ref")
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[test]
     fn session_list_limit_has_hard_cap_and_minimum() {

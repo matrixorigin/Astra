@@ -3,10 +3,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_stream::Stream;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug)]
 pub(crate) enum TuiEvent {
@@ -24,16 +23,16 @@ pub(crate) enum TuiEvent {
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
     crossterm_stream: EventStream,
-    draw_stream: BroadcastStream<()>,
+    draw_stream: ReceiverStream<()>,
     poll_draw_first: bool,
 }
 
 impl TuiEventStream {
-    pub(crate) fn new(draw_rx: broadcast::Receiver<()>) -> Self {
+    pub(crate) fn new(draw_rx: mpsc::Receiver<()>) -> Self {
         Self {
             pending: VecDeque::new(),
             crossterm_stream: EventStream::new(),
-            draw_stream: BroadcastStream::new(draw_rx),
+            draw_stream: ReceiverStream::new(draw_rx),
             poll_draw_first: false,
         }
     }
@@ -44,7 +43,14 @@ impl TuiEventStream {
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         loop {
-            match Pin::new(&mut self.crossterm_stream).poll_next(cx) {
+            let event = Pin::new(&mut self.crossterm_stream).poll_next(cx);
+            #[cfg(unix)]
+            if let Some(params) = crossterm::event::cached_primary_device_attributes() {
+                astra_tools::display_sixel::set_sixel_supported(
+                    params.iter().skip(1).any(|&param| param == 4),
+                );
+            }
+            match event {
                 Poll::Ready(Some(Ok(event))) => {
                     if let Some(mapped) = map_crossterm_event(event) {
                         return Poll::Ready(Some(mapped));
@@ -60,10 +66,7 @@ impl TuiEventStream {
 
     fn poll_draw_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
         match Pin::new(&mut self.draw_stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(TuiEvent::Draw)),
-            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {
-                Poll::Ready(Some(TuiEvent::Draw))
-            }
+            Poll::Ready(Some(())) => Poll::Ready(Some(TuiEvent::Draw)),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

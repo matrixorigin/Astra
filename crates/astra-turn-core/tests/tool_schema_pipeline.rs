@@ -145,11 +145,19 @@ fn compact_history_strips_property_descriptions() {
     }
 }
 
-// ── cp-schema-prune-aggressive-drops-optional ────────────────────────────────
+// ── cp-schema-prune-aggressive-preserves-shape ───────────────────────────────
 #[test]
-fn aggressive_prune_drops_optional_parameters() {
+fn aggressive_prune_preserves_parameter_shape() {
     let tools = sample_tools();
     let pruned = prune_tool_schemas(&tools, CompactionTier::AggressivePrune);
+    let original = tools
+        .iter()
+        .find(|t| {
+            t.pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "read_file")
+        })
+        .expect("original read_file present");
     let read_file = pruned
         .iter()
         .find(|t| {
@@ -158,17 +166,22 @@ fn aggressive_prune_drops_optional_parameters() {
                 .is_some_and(|n| n == "read_file")
         })
         .expect("read_file present");
-    let props = read_file
-        .pointer("/function/parameters/properties")
-        .and_then(Value::as_object);
-    if let Some(p) = props {
-        // `path` is required and must stay; `start` is optional.
-        assert!(p.contains_key("path"));
-        assert!(
-            !p.contains_key("start"),
-            "optional `start` must be dropped at AggressivePrune",
-        );
+    let mut expected = original["function"]["parameters"].clone();
+    for property in expected["properties"]
+        .as_object_mut()
+        .expect("sample properties")
+        .values_mut()
+    {
+        property
+            .as_object_mut()
+            .expect("sample property schema")
+            .remove("description");
     }
+    assert_eq!(
+        read_file["function"]["parameters"], expected,
+        "AggressivePrune may remove guidance annotations, never required or optional invocation shape"
+    );
+    assert!(read_file["function"].get("description").is_none());
 }
 
 // ── cp-excluded-names-filter-composes ────────────────────────────────────────

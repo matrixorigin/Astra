@@ -1,0 +1,10 @@
+[
+  {"name":"healthy","body":{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":0,"ready":true},
+  {"name":"optional_degraded","body":{"status":"degraded","database":"connected","memoria":"unavailable","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":3,"ready":true},
+  {"name":"disconnected","body":{"status":"degraded","database":"disconnected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":3,"ready":false},
+  {"name":"unsupported_api","body":{"status":"healthy","database":"connected","interaction_api_major":"2","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":0,"ready":false},
+  {"name":"missing_identity","body":{"status":"healthy","database":"connected","interaction_api_major":"3"},"exit_code":0,"ready":false},
+  {"name":"contradictory_exit","body":{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":3,"ready":false},
+  {"name":"transport_error","body":{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"exit_code":1,"ready":false},
+  {"name":"not_object","body":[],"exit_code":0,"ready":false}
+]

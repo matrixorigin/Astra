@@ -206,6 +206,10 @@ fn classify_thin_client_error(error: ThinClientError) -> ClassifiedError {
             ErrorKind::ServerError,
             "Astra Server returned an invalid memory inference response",
         ),
+        ThinClientError::IncompatibleRuntime { .. } => (
+            ErrorKind::ServerError,
+            "Astra Server memory inference protocol is incompatible with this CLI; restart or upgrade the Server",
+        ),
     };
     ClassifiedError::new(kind, message)
 }

@@ -44,6 +44,7 @@ pub(super) struct JwtClaims {
     pub(super) token_type: Option<String>,
     pub(super) sid: Option<String>,
     pub(super) origin: Option<String>,
+    pub(super) iat: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -13,13 +13,29 @@ pub enum ModelReuseSupport {
 }
 
 impl ModelReuseSupport {
+    /// Whether the profile positively proves support for `required`.
+    /// Unknown metadata is deliberately fail-closed for capability claims;
+    /// callers may still execute the case and collect runtime evidence.
     pub fn supports(self, required: PromptCacheReuseScope) -> bool {
         match (self, required) {
-            (Self::Unknown, _) => true,
+            (Self::Unknown, _) => false,
             (Self::ConversationTurns, _) => true,
             (Self::IntraTurnRounds, PromptCacheReuseScope::IntraTurnRounds) => true,
             (Self::IntraTurnRounds, PromptCacheReuseScope::ConversationTurns) => false,
         }
+    }
+
+    /// Metadata explicitly proves that the requested scope cannot run on the
+    /// model. Unknown metadata is not an exclusion: the suite executes the
+    /// case so its criteria can provide actual evidence.
+    pub fn explicitly_unsupported(self, required: PromptCacheReuseScope) -> bool {
+        matches!(
+            (self, required),
+            (
+                Self::IntraTurnRounds,
+                PromptCacheReuseScope::ConversationTurns
+            )
+        )
     }
 }
 
@@ -131,6 +147,15 @@ mod tests {
         );
         assert!(
             !ModelReuseSupport::IntraTurnRounds.supports(PromptCacheReuseScope::ConversationTurns)
+        );
+        assert!(!ModelReuseSupport::Unknown.supports(PromptCacheReuseScope::ConversationTurns));
+        assert!(
+            ModelReuseSupport::IntraTurnRounds
+                .explicitly_unsupported(PromptCacheReuseScope::ConversationTurns)
+        );
+        assert!(
+            !ModelReuseSupport::Unknown
+                .explicitly_unsupported(PromptCacheReuseScope::ConversationTurns)
         );
     }
 

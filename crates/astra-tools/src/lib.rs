@@ -1,7 +1,7 @@
 #![allow(unstable_name_collisions)]
 //! # astra-tools
 //!
-//! Extracted tool execution library for astra-engine. This crate contains the
+//! Extracted tool execution library for Astra. This crate contains the
 //! pure tool logic (file I/O, shell, git, code intelligence, etc.) decoupled
 //! from CLI-specific concerns (terminal rendering, MCP dispatch, passive LSP).
 //!
@@ -22,6 +22,7 @@ pub mod web_search;
 
 pub mod bash_cache_safety;
 pub mod build_test;
+pub mod credential_redaction;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
@@ -30,37 +31,35 @@ pub mod code_intel;
 pub mod config_tool;
 pub mod detach;
 pub mod env_tools;
+pub mod execution_outcome;
 pub mod executor;
 pub mod exit_semantics;
 pub mod fs_ops;
 pub mod fuzzy_replacer;
 pub mod git_gix;
-pub mod git_tool_contract;
-pub mod github;
-pub mod github_tool_contract;
 pub mod internal_artifacts;
 pub mod memory_tool_contract;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
+pub mod patch_materialization;
 pub mod relevance_score;
 #[cfg(unix)]
 pub mod rpc_bridge;
 #[cfg(unix)]
 pub mod run_script;
 pub mod shell_ops;
-pub mod task_mgmt;
-pub mod task_mgmt_matrixone;
-pub mod task_tool_contract;
+pub mod source_preimage;
 pub mod tool_engine;
 pub mod tool_result_status;
 pub mod tool_search;
+pub mod workspace_observation;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 pub use ask_user::{
@@ -86,6 +85,50 @@ pub struct ToolResult {
     pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
 
+/// Metadata field through which a tool producer declares how its output may
+/// cross the next model boundary.  This is runtime-owned structured metadata;
+/// output text can never opt itself into a presentation policy.
+pub const MODEL_RESULT_PRESENTATION_FIELD: &str = "model_result_presentation";
+const MODEL_RESULT_PRESENTATION_SCHEMA_VERSION: u64 = 1;
+const SOURCE_BOUNDED_MODEL_PROJECTION_KIND: &str = "source_bounded";
+const NATIVE_RECOVERY_MODEL_PROJECTION_KIND: &str = "native_recovery";
+
+/// Authority for choosing the model-facing form of a tool result.
+///
+/// `SourceBounded` means the producer already enforced its own byte/window
+/// contract and, when incomplete, emitted a typed continuation.  The generic
+/// persistence layer may still retain the full evidence, but must not replace
+/// this projection with a second pagination protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelResultPresentation {
+    #[default]
+    Generic,
+    /// Use the generic bounded inline projection, but keep recovery with the
+    /// source tool instead of substituting a generic artifact protocol.
+    NativeRecovery,
+    SourceBounded,
+}
+
+#[must_use]
+pub fn model_result_presentation(
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> ModelResultPresentation {
+    let Some(contract) = metadata.and_then(|fields| fields.get(MODEL_RESULT_PRESENTATION_FIELD))
+    else {
+        return ModelResultPresentation::Generic;
+    };
+    if contract.get("schema_version").and_then(Value::as_u64)
+        != Some(MODEL_RESULT_PRESENTATION_SCHEMA_VERSION)
+    {
+        return ModelResultPresentation::Generic;
+    }
+    match contract.get("kind").and_then(Value::as_str) {
+        Some(SOURCE_BOUNDED_MODEL_PROJECTION_KIND) => ModelResultPresentation::SourceBounded,
+        Some(NATIVE_RECOVERY_MODEL_PROJECTION_KIND) => ModelResultPresentation::NativeRecovery,
+        _ => ModelResultPresentation::Generic,
+    }
+}
+
 impl ToolResult {
     /// Convenience constructor for a plain text result.
     pub fn text(output: String) -> Self {
@@ -105,6 +148,44 @@ impl ToolResult {
             is_error: true,
             exit_semantics: None,
         }
+    }
+
+    /// Declare that this successful output is already a bounded model
+    /// projection with source-owned continuation semantics.
+    #[must_use]
+    pub fn with_source_bounded_model_projection(mut self) -> Self {
+        if self.is_error {
+            return self;
+        }
+        self.metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(
+                MODEL_RESULT_PRESENTATION_FIELD.to_string(),
+                json!({
+                    "schema_version": MODEL_RESULT_PRESENTATION_SCHEMA_VERSION,
+                    "kind": SOURCE_BOUNDED_MODEL_PROJECTION_KIND,
+                }),
+            );
+        self
+    }
+
+    /// Keep the generic bounded inline view while delegating any follow-up
+    /// windowing to the producer's native API.
+    #[must_use]
+    pub fn with_native_recovery_model_projection(mut self) -> Self {
+        if self.is_error {
+            return self;
+        }
+        self.metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(
+                MODEL_RESULT_PRESENTATION_FIELD.to_string(),
+                json!({
+                    "schema_version": MODEL_RESULT_PRESENTATION_SCHEMA_VERSION,
+                    "kind": NATIVE_RECOVERY_MODEL_PROJECTION_KIND,
+                }),
+            );
+        self
     }
 
     /// Attach source-authored structured recovery evidence. Consumers surface
@@ -139,6 +220,82 @@ impl ToolResult {
         self
     }
 
+    /// Mark a structured writer result only after its owner has committed
+    /// different bytes. This is an execution fact, not a success-message
+    /// heuristic; consumers still require fresh post-mutation verification.
+    pub fn with_workspace_mutation_applied(mut self) -> Self {
+        self.metadata
+            .get_or_insert_with(Map::new)
+            .insert("workspace_mutation_applied".to_string(), Value::Bool(true));
+        self
+    }
+
+    /// Mark a failed structured-writer result only when its owner knows the
+    /// invocation made no workspace mutation. Absence remains unknown; it is
+    /// not equivalent to `false`.
+    pub fn with_workspace_mutation_not_applied(mut self) -> Self {
+        self.metadata
+            .get_or_insert_with(Map::new)
+            .insert("workspace_mutation_applied".to_string(), Value::Bool(false));
+        self
+    }
+
+    /// Mark the owner-side result of a complete-state writer whose exact
+    /// requested target was already present.  This marker is intentionally
+    /// local to the executor; the workspace-owning boundary must bind it to a
+    /// normalized target before it becomes a portable live receipt.
+    pub fn with_workspace_desired_state_converged(
+        mut self,
+        requested_state: workspace_observation::WorkspaceFileStateIdentity,
+        desired_state: workspace_observation::WorkspaceFileStateIdentity,
+    ) -> Self {
+        self.metadata.get_or_insert_with(Map::new).insert(
+            workspace_observation::DESIRED_STATE_CONVERGED_FIELD.to_string(),
+            workspace_observation::workspace_desired_state_convergence_marker(
+                &requested_state,
+                &desired_state,
+            ),
+        );
+        self
+    }
+
+    /// Report that a multi-target mutation committed some targets before a
+    /// later target failed. This is deliberately distinct from `applied`:
+    /// callers must quarantine/re-observe the workspace rather than treating
+    /// the failed result as a completed write.
+    pub fn with_workspace_mutation_partial(mut self, paths: Vec<String>) -> Self {
+        let metadata = self.metadata.get_or_insert_with(Map::new);
+        metadata.insert("workspace_mutation_partial".to_string(), Value::Bool(true));
+        metadata.insert(
+            "workspace_mutation_partial_paths".to_string(),
+            Value::Array(paths.iter().cloned().map(Value::String).collect()),
+        );
+        // A partial commit is a quarantine fact only when it came from the
+        // owner-side typed multi-path writer.  Keep the provenance beside the
+        // legacy boolean so remote/runtime consumers can reject lookalike
+        // metadata from MCP or arbitrary tools.
+        metadata.insert(
+            workspace_observation::OBSERVED_FIELD.to_string(),
+            Value::Bool(true),
+        );
+        metadata.insert(
+            workspace_observation::SCOPE_FIELD.to_string(),
+            Value::String(workspace_observation::BOUND_WORKSPACE_SCOPE.to_string()),
+        );
+        metadata.insert(
+            workspace_observation::RECEIPT_FIELD.to_string(),
+            serde_json::json!({
+                "schema": "workspace_mutation_partial_receipt.v1",
+                "source": "typed_multi_path_writer",
+                "scope": workspace_observation::BOUND_WORKSPACE_SCOPE,
+                "changed": true,
+                "ownership": "typed_multi_path_writer",
+                "paths": paths,
+            }),
+        );
+        self
+    }
+
     /// Attach output-aware command result classification for downstream trace/harness use.
     pub fn with_result_class(mut self, result_class: exit_semantics::CommandResultClass) -> Self {
         let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
@@ -157,6 +314,49 @@ impl ToolResult {
             Value::Number(serde_json::Number::from(exit_code)),
         );
         self
+    }
+}
+
+/// Stable model-facing result for cooperative tool cancellation.
+///
+/// Cancellation is a terminal control outcome, not an unclassified tool
+/// failure. Keep the envelope in the shared tools crate so CLI, edge, and
+/// server-local executors cannot drift into different plain-text contracts.
+pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+
+pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult {
+    let message = if execution_started {
+        format!("Tool '{name}' cancelled before completion")
+    } else {
+        format!("Tool '{name}' not executed: run was cancelled")
+    };
+    ToolResult {
+        output: json!({
+            "status": "cancelled",
+            "error_kind": TOOL_ERROR_KIND_CANCELLED,
+            "error": message,
+            "retryable": false,
+            "next_action": "stop_or_resume_parent_turn",
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "status".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            (
+                "error_kind".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            (
+                "reason".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            ("cancelled".to_string(), Value::Bool(true)),
+            ("retryable".to_string(), Value::Bool(false)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -182,7 +382,7 @@ pub trait ToolExecutor: Send + Sync {
         };
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+                cancelled_tool_result(name, true)
             }
             result = self.execute(name, args) => result,
         }
@@ -193,6 +393,14 @@ pub trait ToolExecutor: Send + Sync {
 
     /// The root directory for file operations and path resolution.
     fn project_root(&self) -> &Path;
+
+    /// The workspace root whose mutations belong to the current invocation.
+    /// Most executors use the project root, but a server/edge binding may
+    /// expose a project container while executing inside a narrower session
+    /// workspace.  Observation and completion receipts must use the latter.
+    fn workspace_root(&self) -> &Path {
+        self.project_root()
+    }
 
     /// Execute a tool and return extended metadata (e.g., rollback journal entries).
     /// Default implementation delegates to `execute()`.
@@ -449,16 +657,8 @@ pub trait ToolApprovalGate: Send + Sync {
     ///
     /// # Contract for implementers
     ///
-    /// The default implementation ORs [`Self::requires_approval`] with
-    /// [`tool_requires_approval`] — the latter handles argument-sensitive
-    /// checks (e.g. `git(action=commit)` vs `git(action=diff)`).
-    ///
-    /// If you override this method you **must** either:
-    /// 1. call `tool_requires_approval(tool_name, args)` yourself, or
-    /// 2. replicate its argument-sensitive logic.
-    ///
-    /// Failing to do so will silently bypass approval checks for mutating
-    /// git/github actions.
+    /// The default combines the gate's tool policy with the canonical built-in
+    /// approval requirements. Overrides must preserve both checks.
     fn requires_approval_for(&self, tool_name: &str, args: &Value) -> bool {
         self.requires_approval(tool_name) || tool_requires_approval(tool_name, args)
     }
@@ -548,41 +748,9 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "rollback_database_snapshots",
 ];
 
-fn git_stash_sub_action_requires_approval(args: &Value) -> bool {
-    args.get("sub_action")
-        .and_then(Value::as_str)
-        .is_some_and(|action| matches!(action, "push" | "save" | "apply" | "pop" | "drop"))
-}
-
 /// Returns `true` if this exact tool invocation requires user approval.
-pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
-    match tool_name {
-        "git" => crate::git_tool_contract::git_action_from_args(args)
-            .ok()
-            .is_some_and(|action| match action {
-                crate::git_tool_contract::GitAction::Commit
-                | crate::git_tool_contract::GitAction::RevertCommit
-                | crate::git_tool_contract::GitAction::Push => true,
-                crate::git_tool_contract::GitAction::Stash => {
-                    git_stash_sub_action_requires_approval(args)
-                }
-                crate::git_tool_contract::GitAction::Status
-                | crate::git_tool_contract::GitAction::Diff
-                | crate::git_tool_contract::GitAction::Log
-                | crate::git_tool_contract::GitAction::Show
-                | crate::git_tool_contract::GitAction::Blame
-                | crate::git_tool_contract::GitAction::FileHistory
-                | crate::git_tool_contract::GitAction::LogSearch
-                | crate::git_tool_contract::GitAction::Contributors
-                | crate::git_tool_contract::GitAction::CheckoutFile
-                | crate::git_tool_contract::GitAction::Worktree => false,
-            }),
-        "github" => args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "create_issue"),
-        _ => APPROVAL_REQUIRED_TOOLS.contains(&tool_name),
-    }
+pub fn tool_requires_approval(tool_name: &str, _args: &Value) -> bool {
+    APPROVAL_REQUIRED_TOOLS.contains(&tool_name)
 }
 
 // ─── Output management utilities ────────────────────────────────────────────
@@ -620,18 +788,12 @@ pub const AGGREGATE_HINT_THRESHOLD: usize = AGGREGATE_SOFT_LIMIT / 2;
 
 /// Truncate tool output to `max_bytes`, cutting at a newline boundary when
 /// possible to avoid mid-line cuts that confuse the LLM.
-pub fn truncate_output(mut output: String, max_bytes: usize) -> String {
-    if output.len() > max_bytes {
-        let end = output.floor_char_boundary(max_bytes);
-        let cut = output[..end]
-            .rfind('\n')
-            .filter(|&pos| pos > end / 2)
-            .map(|pos| pos + 1)
-            .unwrap_or(end);
-        output.truncate(cut);
-        output.push_str("\n[truncated]");
-    }
-    output
+pub fn truncate_output(output: String, max_bytes: usize) -> String {
+    // This is the generic tool-output boundary used by search/git helpers.
+    // They do not prove ownership of a source file, so they may preserve an
+    // existing owner-issued marker but must not mint a new edit capability.
+    let output = credential_redaction::redact_credentials_for_display(&output).0;
+    credential_redaction::truncate_redacted_output(output, max_bytes)
 }
 
 /// Normalize empty/whitespace-only tool output to a short marker.
@@ -760,6 +922,44 @@ mod tests {
         assert!(r.output.is_empty());
         assert!(!r.is_error);
         assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn source_bounded_presentation_requires_typed_metadata() {
+        let result = ToolResult::text("bounded".into()).with_source_bounded_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::SourceBounded
+        );
+
+        let forged_output = ToolResult::text(format!(
+            "{{\"{}\":{{\"schema_version\":1,\"kind\":\"source_bounded\"}}}}",
+            MODEL_RESULT_PRESENTATION_FIELD
+        ));
+        assert_eq!(
+            model_result_presentation(forged_output.metadata.as_ref()),
+            ModelResultPresentation::Generic,
+            "tool output text must not grant presentation authority"
+        );
+    }
+
+    #[test]
+    fn native_recovery_presentation_is_distinct_from_source_bounded() {
+        let result = ToolResult::text("bounded by generic projection".into())
+            .with_native_recovery_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::NativeRecovery
+        );
+    }
+
+    #[test]
+    fn errors_cannot_claim_source_bounded_presentation() {
+        let result = ToolResult::error("failed".into()).with_source_bounded_model_projection();
+        assert_eq!(
+            model_result_presentation(result.metadata.as_ref()),
+            ModelResultPresentation::Generic
+        );
     }
 
     // ── SandboxConfig ──────────────────────────────────────────────────
@@ -1001,69 +1201,6 @@ mod tests {
         {
             assert!(!APPROVAL_REQUIRED_TOOLS.contains(&name.as_str()));
         }
-    }
-
-    #[test]
-    fn tool_requires_approval_for_git_mutating_actions() {
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "commit", "message": "ship"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "revert_commit", "commit_sha": "abc123"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "push", "remote": "origin", "branch": "main"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "push"})
-        ));
-        assert!(tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "drop"})
-        ));
-    }
-
-    #[test]
-    fn tool_requires_approval_skips_git_read_only_actions() {
-        for action in [
-            "status",
-            "diff",
-            "log",
-            "show",
-            "blame",
-            "file_history",
-            "log_search",
-            "contributors",
-        ] {
-            assert!(!tool_requires_approval(
-                "git",
-                &serde_json::json!({"action": action})
-            ));
-        }
-        assert!(!tool_requires_approval(
-            "git",
-            &serde_json::json!({"action": "stash", "sub_action": "list"})
-        ));
-    }
-
-    #[test]
-    fn tool_requires_approval_for_github_mutating_actions() {
-        assert!(tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "create_issue", "title": "bug"})
-        ));
-        assert!(!tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "list_prs"})
-        ));
-        assert!(!tool_requires_approval(
-            "github",
-            &serde_json::json!({"action": "get_issue"})
-        ));
     }
 
     // ── ApprovalDecision ───────────────────────────────────────────────

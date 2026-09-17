@@ -23,8 +23,8 @@ difficulty: 3
 weight: 1.0
 timeout_seconds: 240
 steps:
-  - prompt: 'Now read the first 20 lines of crates/astra-turn-core/src/context_pipeline.rs and explain what ContextPipeline does.'
-  - prompt: 'Read crates/astra-turn-core/src/context_planner.rs lines 60-100 and explain the plan_turn function.'
+  - prompt: 'Now read the first 20 lines of crates/astra-turn-core/src/context/pipeline.rs and explain what ContextPipeline does.'
+  - prompt: 'Read crates/astra-turn-core/src/context/planner.rs lines 60-100 and explain the plan_turn function.'
   - prompt: 'Based on everything you read so far, what are the 4 phases of the pipeline? Reply concisely.'
   - prompt: 'Reply ACK. Do not call any tools.'
   - prompt: 'Reply ACK. Do not call any tools.'

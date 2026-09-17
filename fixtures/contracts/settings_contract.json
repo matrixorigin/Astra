@@ -5,7 +5,7 @@
     "matrixone_user": "root",
     "matrixone_password": "111",
     "matrixone_database": "astra_runtime",
-    "bridge_secret": "dev-bridge-secret-change-me"
+    "runtime_root_secret": "dev-runtime-root-secret-change-me"
   },
   "override_env": {
     "MATRIXONE_HOST": "matrixone.internal",
@@ -14,7 +14,7 @@
     "MATRIXONE_PASSWORD": "super-secret",
     "ASTRA_DATABASE": "agent_db",
     "ASTRA_JWT_SECRET": "override-jwt-secret-key-at-least-32-chars-",
-    "ASTRA_BRIDGE_SECRET": "bridge-secret-prod"
+    "ASTRA_RUNTIME_ROOT_SECRET": "runtime-root-secret-prod"
   },
   "expected_override_settings": {
     "matrixone_host": "matrixone.internal",
@@ -22,6 +22,6 @@
     "matrixone_user": "agent",
     "matrixone_password": "super-secret",
     "matrixone_database": "agent_db",
-    "bridge_secret": "bridge-secret-prod"
+    "runtime_root_secret": "runtime-root-secret-prod"
   }
 }

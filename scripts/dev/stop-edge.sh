@@ -5,6 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/edge-process.sh"
 
 if [ -f "$REPO_ROOT/.env" ]; then
     set -a
@@ -27,41 +29,25 @@ if [ "${ASTRA_EDGE_LOCK_HELD:-0}" != "1" ]; then
 fi
 trap 'if [ "$LOCK_ACQUIRED" = "1" ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi' EXIT
 
-is_astra_edge() {
-    local pid=$1
-    local comm
-    comm=$(cat "/proc/$pid/comm" 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null || true)
-    [[ "$comm" == "astra-edge" ]]
-}
-
 kill_and_wait() {
     local pid=$1
-    is_astra_edge "$pid" || return
+    edge_process_is_owned "$REPO_ROOT" "$pid" || return
     kill "$pid" 2>/dev/null || return
     for _ in {1..8}; do
         sleep 1
-        kill -0 "$pid" 2>/dev/null || return
+        edge_process_is_owned "$REPO_ROOT" "$pid" || return
     done
-    kill -9 "$pid" 2>/dev/null || true
+    if edge_process_is_owned "$REPO_ROOT" "$pid"; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
 }
 
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
-    if kill -0 "$PID" 2>/dev/null && is_astra_edge "$PID"; then
+    if edge_process_is_owned "$REPO_ROOT" "$PID"; then
         kill_and_wait "$PID"
     fi
     rm -f "$PID_FILE"
 fi
 
-PIDS=$(pgrep -x "astra-edge" 2>/dev/null || true)
-if [ -n "$PIDS" ]; then
-    for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
-    done
-    sleep 2
-    for pid in $(pgrep -x "astra-edge" 2>/dev/null || true); do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-fi
-
-echo "✅ astra-edge stopped"
+echo "✅ Repo-managed astra-edge stopped"

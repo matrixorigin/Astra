@@ -45,8 +45,26 @@ pub enum PersonalSkillError {
         skill_name: String,
         version_id: String,
     },
-    #[error("skill version is quarantined: version_id={version_id}")]
-    VersionQuarantined { version_id: String },
+    #[error("skill version is not activatable: version_id={version_id}, status={status}")]
+    VersionNotActivatable { version_id: String, status: String },
+    #[error("session not found or inactive: owner={owner_user_id}, session={session_id}")]
+    SessionNotActive {
+        owner_user_id: String,
+        session_id: String,
+    },
+    #[error("run not found: owner={owner_user_id}, run={run_id}")]
+    RunNotFound {
+        owner_user_id: String,
+        run_id: String,
+    },
+    #[error(
+        "invalid active personal skill projection: owner={owner_user_id}, session={session_id}, skill={skill_name}"
+    )]
+    InvalidActiveProjection {
+        owner_user_id: String,
+        session_id: String,
+        skill_name: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,13 +109,23 @@ pub struct UserSkillEvaluationRecord {
     pub created_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivePersonalSkillRecord {
+    pub skill_name: String,
+    pub version_id: String,
+    pub version: String,
+    pub content_markdown: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserSkillSource {
     pub skill_name: String,
     pub visibility: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitUserSkillVersion {
     pub version: String,
     pub manifest_json: Value,
@@ -106,21 +134,14 @@ pub struct SubmitUserSkillVersion {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivateUserSkillVersion {
     pub session_id: String,
     pub version_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InstallUserSkill {
-    pub version_id: Option<String>,
-    pub scope: Option<String>,
-    pub session_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub auto_activate_on_topic_match: Option<bool>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordUserSkillEvaluation {
     pub source_id: String,
     pub version_id: String,
@@ -337,112 +358,147 @@ impl DatabasePersonalSkillStore {
                 skill_name: skill_name.to_string(),
                 version_id: version_id.to_string(),
             })?;
-        if version.status == "quarantined" {
-            return Err(PersonalSkillError::VersionQuarantined {
+        if version.status != "published" {
+            return Err(PersonalSkillError::VersionNotActivatable {
                 version_id: version_id.to_string(),
+                status: version.status,
             });
         }
-        DatabaseStateProjectionStore::new(self.pool.clone())
+        let activation = DatabaseStateProjectionStore::new(self.pool.clone())
             .activate_personal_skill_from_ui(owner_user_id, session_id, skill_name, version_id)
-            .await
-            .map_err(|source| PersonalSkillError::StateProjection {
-                operation: "activate_user_skill_version",
-                entity: version_id.to_string(),
-                source: Box::new(source),
-            })?;
-        Ok(version)
-    }
-
-    pub async fn install_skill(
-        &self,
-        owner_user_id: &str,
-        skill_name: &str,
-        request: InstallUserSkill,
-    ) -> Result<(), PersonalSkillError> {
-        let version = if let Some(version_id) = request.version_id.as_deref() {
-            self.load_version_by_id(owner_user_id, skill_name, version_id)
-                .await?
-                .ok_or_else(|| PersonalSkillError::VersionNotFound {
+            .await;
+        match activation {
+            Ok(()) => {}
+            Err(StateProjectionError::SessionNotActive { .. }) => {
+                return Err(PersonalSkillError::SessionNotActive {
+                    owner_user_id: owner_user_id.to_string(),
+                    session_id: session_id.to_string(),
+                });
+            }
+            Err(StateProjectionError::PersonalSkillVersionUnavailable { .. }) => {
+                return Err(PersonalSkillError::VersionNotFound {
                     owner_user_id: owner_user_id.to_string(),
                     skill_name: skill_name.to_string(),
                     version_id: version_id.to_string(),
-                })?
-                .version
-        } else {
-            self.latest_published_version(owner_user_id, skill_name)
-                .await?
-                .unwrap_or_else(|| "draft".to_string())
-        };
-        let installation_id = Uuid::new_v4().to_string();
-        let scope = request.scope.unwrap_or_else(|| "user".to_string());
-        let auto_activate = if request.auto_activate_on_topic_match.unwrap_or(false) {
-            1_i64
-        } else {
-            0_i64
-        };
-        let existing = sqlx::query(
-            "SELECT installation_id FROM skill_installations
-             WHERE user_id = ? AND skill_name = ? LIMIT 1",
+                });
+            }
+            Err(StateProjectionError::PersonalSkillVersionNotActivatable { status, .. }) => {
+                return Err(PersonalSkillError::VersionNotActivatable {
+                    version_id: version_id.to_string(),
+                    status,
+                });
+            }
+            Err(source) => {
+                return Err(PersonalSkillError::StateProjection {
+                    operation: "activate_user_skill_version",
+                    entity: version_id.to_string(),
+                    source: Box::new(source),
+                });
+            }
+        }
+        Ok(version)
+    }
+
+    pub async fn load_active_for_session(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<ActivePersonalSkillRecord>, PersonalSkillError> {
+        let rows = sqlx::query(
+            "SELECT state.item_key AS skill_name, state.payload_json,
+                    versions.version_id, versions.version, versions.content_markdown,
+                    versions.status AS version_status
+             FROM session_state_items state
+             JOIN agent_sessions sessions
+               ON sessions.user_id = state.user_id AND sessions.session_id = state.session_id
+              AND sessions.status = 'active'
+             LEFT JOIN user_skill_versions versions
+               ON versions.owner_user_id = state.user_id
+              AND versions.skill_name = state.item_key
+              AND versions.version_id = JSON_UNQUOTE(JSON_EXTRACT(state.payload_json, '$.version_id'))
+             WHERE state.user_id = ? AND state.session_id = ?
+               AND state.scope = 'session' AND state.category = 'active_skill'
+               AND state.status = 'active'
+             ORDER BY state.item_key ASC LIMIT 65",
         )
         .bind(owner_user_id)
-        .bind(skill_name)
-        .fetch_optional(self.pool.get())
+        .bind(session_id)
+        .fetch_all(self.pool.get())
         .await
         .map_err(|source| PersonalSkillError::Database {
-            operation: "load_existing_skill_installation",
-            entity: skill_name.to_string(),
+            operation: "load_active_personal_skills",
+            entity: session_id.to_string(),
             source,
         })?;
-        if let Some(row) = existing {
-            let existing_id = row_string(
-                &row,
-                "load_existing_skill_installation",
-                skill_name,
-                "installation_id",
-            )?;
-            sqlx::query(
-                "UPDATE skill_installations
-                 SET skill_version = ?, status = 'installed', scope = ?, session_id = ?,
-                     workspace_id = ?, auto_activate_on_topic_match = ?, updated_at = NOW(6)
-                 WHERE installation_id = ?",
-            )
-            .bind(&version)
-            .bind(&scope)
-            .bind(&request.session_id)
-            .bind(&request.workspace_id)
-            .bind(auto_activate)
-            .bind(&existing_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| PersonalSkillError::Database {
-                operation: "update_user_skill_installation",
-                entity: skill_name.to_string(),
-                source,
-            })?;
-        } else {
-            sqlx::query(
-                "INSERT INTO skill_installations
-                 (installation_id, user_id, skill_name, skill_version, status, scope, session_id,
-                  workspace_id, auto_activate_on_topic_match, installed_at, updated_at)
-                 VALUES (?, ?, ?, ?, 'installed', ?, ?, ?, ?, NOW(6), NOW(6))",
-            )
-            .bind(&installation_id)
-            .bind(owner_user_id)
-            .bind(skill_name)
-            .bind(&version)
-            .bind(&scope)
-            .bind(&request.session_id)
-            .bind(&request.workspace_id)
-            .bind(auto_activate)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| PersonalSkillError::Database {
-                operation: "insert_user_skill_installation",
-                entity: skill_name.to_string(),
-                source,
-            })?;
+        if rows.len() > 64 {
+            return Err(PersonalSkillError::InvalidActiveProjection {
+                owner_user_id: owner_user_id.to_string(),
+                session_id: session_id.to_string(),
+                skill_name: "<too-many-active-skills>".to_string(),
+            });
         }
-        Ok(())
+        rows.into_iter()
+            .map(|row| {
+                let skill_name = row_string(
+                    &row,
+                    "load_active_personal_skills",
+                    session_id,
+                    "skill_name",
+                )?;
+                let payload_raw = row_string(
+                    &row,
+                    "load_active_personal_skills",
+                    session_id,
+                    "payload_json",
+                )?;
+                let payload: Value = serde_json::from_str(&payload_raw).map_err(|source| {
+                    PersonalSkillError::Json {
+                        operation: "deserialize_active_personal_skill",
+                        entity: skill_name.clone(),
+                        source,
+                    }
+                })?;
+                let projected_name = payload.get("skill_name").and_then(Value::as_str);
+                let projected_version = payload.get("version_id").and_then(Value::as_str);
+                let version_id =
+                    row.try_get::<Option<String>, _>("version_id")
+                        .map_err(|source| {
+                            db_error("load_active_personal_skills", &skill_name, source)
+                        })?;
+                let version_status =
+                    row.try_get::<Option<String>, _>("version_status")
+                        .map_err(|source| {
+                            db_error("load_active_personal_skills", &skill_name, source)
+                        })?;
+                if projected_name != Some(skill_name.as_str())
+                    || projected_version.is_none()
+                    || version_id.as_deref() != projected_version
+                    || version_status.as_deref() != Some("published")
+                {
+                    return Err(PersonalSkillError::InvalidActiveProjection {
+                        owner_user_id: owner_user_id.to_string(),
+                        session_id: session_id.to_string(),
+                        skill_name,
+                    });
+                }
+                Ok(ActivePersonalSkillRecord {
+                    skill_name,
+                    version_id: version_id.expect("validated present"),
+                    version: row_string(
+                        &row,
+                        "load_active_personal_skills",
+                        session_id,
+                        "version",
+                    )?,
+                    content_markdown: row_string(
+                        &row,
+                        "load_active_personal_skills",
+                        session_id,
+                        "content_markdown",
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub async fn record_evaluation(
@@ -451,6 +507,27 @@ impl DatabasePersonalSkillStore {
         skill_name: &str,
         request: RecordUserSkillEvaluation,
     ) -> Result<UserSkillEvaluationRecord, PersonalSkillError> {
+        if let Some(run_id) = request.run_id.as_deref() {
+            let exists = sqlx::query(
+                "SELECT 1 AS owned FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
+            )
+            .bind(owner_user_id)
+            .bind(run_id)
+            .fetch_optional(self.pool.get())
+            .await
+            .map_err(|source| PersonalSkillError::Database {
+                operation: "validate_user_skill_evaluation_run",
+                entity: run_id.to_string(),
+                source,
+            })?
+            .is_some();
+            if !exists {
+                return Err(PersonalSkillError::RunNotFound {
+                    owner_user_id: owner_user_id.to_string(),
+                    run_id: run_id.to_string(),
+                });
+            }
+        }
         let evaluation_id = format!("skill-eval-{}", Uuid::new_v4());
         let payload = request.payload_json.unwrap_or(Value::Null);
         let payload_json =
@@ -472,6 +549,10 @@ impl DatabasePersonalSkillStore {
                AND sources.skill_name = ?
                AND sources.source_id = ?
                AND versions.version_id = ?
+               AND (? IS NULL OR EXISTS (
+                    SELECT 1 FROM agent_runs runs
+                    WHERE runs.user_id = sources.owner_user_id AND runs.run_id = ?
+               ))
              LIMIT 1",
         )
         .bind(&evaluation_id)
@@ -484,6 +565,8 @@ impl DatabasePersonalSkillStore {
         .bind(skill_name)
         .bind(&request.source_id)
         .bind(&request.version_id)
+        .bind(&request.run_id)
+        .bind(&request.run_id)
         .execute(self.pool.get())
         .await
         .map_err(|source| PersonalSkillError::Database {
@@ -492,6 +575,27 @@ impl DatabasePersonalSkillStore {
             source,
         })?;
         if result.rows_affected() == 0 {
+            if let Some(run_id) = request.run_id.as_deref() {
+                let run_still_exists = sqlx::query(
+                    "SELECT 1 AS owned FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
+                )
+                .bind(owner_user_id)
+                .bind(run_id)
+                .fetch_optional(self.pool.get())
+                .await
+                .map_err(|source| PersonalSkillError::Database {
+                    operation: "revalidate_user_skill_evaluation_run",
+                    entity: run_id.to_string(),
+                    source,
+                })?
+                .is_some();
+                if !run_still_exists {
+                    return Err(PersonalSkillError::RunNotFound {
+                        owner_user_id: owner_user_id.to_string(),
+                        run_id: run_id.to_string(),
+                    });
+                }
+            }
             return Err(PersonalSkillError::VersionNotFound {
                 owner_user_id: owner_user_id.to_string(),
                 skill_name: skill_name.to_string(),
@@ -513,35 +617,6 @@ impl DatabasePersonalSkillStore {
             source,
         })?;
         evaluation_from_row(row, "load_user_skill_evaluation", &evaluation_id)
-    }
-
-    pub async fn auto_activate_candidates(
-        &self,
-        owner_user_id: &str,
-    ) -> Result<Vec<String>, PersonalSkillError> {
-        let rows = sqlx::query(
-            "SELECT skill_name FROM skill_installations FORCE INDEX (idx_si_auto_activate)
-             WHERE user_id = ? AND auto_activate_on_topic_match = 1 AND status = 'installed'
-             ORDER BY updated_at DESC LIMIT 32",
-        )
-        .bind(owner_user_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| PersonalSkillError::Database {
-            operation: "load_auto_activate_skill_candidates",
-            entity: owner_user_id.to_string(),
-            source,
-        })?;
-        rows.into_iter()
-            .map(|row| {
-                row_string(
-                    &row,
-                    "load_auto_activate_skill_candidates",
-                    owner_user_id,
-                    "skill_name",
-                )
-            })
-            .collect()
     }
 
     async fn load_source(
@@ -606,36 +681,6 @@ impl DatabasePersonalSkillStore {
         })?;
         row.map(|row| version_from_row(row, "load_user_skill_version", version_id))
             .transpose()
-    }
-
-    async fn latest_published_version(
-        &self,
-        owner_user_id: &str,
-        skill_name: &str,
-    ) -> Result<Option<String>, PersonalSkillError> {
-        let row = sqlx::query(
-            "SELECT version FROM user_skill_versions FORCE INDEX (idx_user_skill_versions_owner_name)
-             WHERE owner_user_id = ? AND skill_name = ? AND status = 'published'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(owner_user_id)
-        .bind(skill_name)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| PersonalSkillError::Database {
-            operation: "load_latest_published_user_skill_version",
-            entity: skill_name.to_string(),
-            source,
-        })?;
-        row.map(|row| {
-            row_string(
-                &row,
-                "load_latest_published_user_skill_version",
-                skill_name,
-                "version",
-            )
-        })
-        .transpose()
     }
 }
 

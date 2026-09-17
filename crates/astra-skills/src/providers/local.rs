@@ -28,6 +28,19 @@ impl LocalSkillProvider {
         }
     }
 
+    /// Create with walk-up search paths anchored at an explicit project root.
+    ///
+    /// Unlike [`Self::standard`], discovery is anchored at `project_root` instead
+    /// of the process current directory. Tool execution may run in a workspace
+    /// that differs from the process cwd (e.g. a CLI process launched from a
+    /// monorepo while the session workspace is a nested repository); anchoring
+    /// at the explicit root keeps that workspace's project skills visible.
+    pub fn with_project_root(project_root: &std::path::Path) -> Self {
+        Self {
+            search_paths: loader::skill_search_paths_from_root(project_root),
+        }
+    }
+
     /// Create with only user-level HOME search paths.
     ///
     /// This is the provider API servers should use for their deployment-local
@@ -257,6 +270,26 @@ mod tests {
             LocalSkillProvider::with_paths(vec![PathBuf::from("/nonexistent/path/skills")]);
         let manifests = provider.discover().await.unwrap();
         assert!(manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_project_root_anchors_discovery_at_explicit_root() {
+        let root = TempDir::new().unwrap();
+        // Project-local skill dirs under the explicit root.
+        std::fs::create_dir_all(root.path().join(".astra").join("skills")).unwrap();
+        std::fs::create_dir_all(root.path().join(".agent").join("skills")).unwrap();
+        create_test_skill(
+            &root.path().join(".astra").join("skills"),
+            "rooted-skill",
+            "---\nname: rooted-skill\ndescription: From project root\n---\nRooted.",
+        );
+
+        let provider = LocalSkillProvider::with_project_root(root.path());
+        let manifests = provider.discover().await.unwrap();
+        assert!(
+            manifests.iter().any(|m| m.name == "rooted-skill"),
+            "project-root-anchored discovery must find the project skill, got: {manifests:?}"
+        );
     }
 
     #[tokio::test]

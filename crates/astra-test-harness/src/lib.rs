@@ -39,6 +39,7 @@
 //! without building from the `astra-test` binary.
 
 pub mod artifacts;
+pub mod capability_coverage;
 pub mod case;
 pub mod classify;
 pub mod criteria;
@@ -53,6 +54,7 @@ pub mod preflight;
 pub mod report;
 pub mod runner;
 pub mod session_capture;
+pub(crate) mod session_identity;
 pub mod suite;
 pub mod summarizer;
 #[cfg(test)]

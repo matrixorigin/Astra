@@ -4,7 +4,6 @@
 //! unified diffs. A future `IdeDiffSink` can reuse [`summarize_unified_diff`] /
 //! parsed hunks for MCP / editor RPC.
 
-use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -135,7 +134,7 @@ impl DiffSink for TerminalDiffSink {
         if !self.bump() {
             return;
         }
-        let _ = writeln!(io::stdout(), "{}", self.clip(line).magenta().bold());
+        stdout_println!("{}", self.clip(line).magenta().bold());
     }
 
     fn stats_line(&mut self, stats: DiffStats) {
@@ -146,7 +145,7 @@ impl DiffSink for TerminalDiffSink {
             "  {} file(s)  +{}  -{}",
             stats.files, stats.lines_added, stats.lines_removed
         );
-        let _ = writeln!(io::stdout(), "{}", s.green());
+        stdout_println!("{}", s.green());
     }
 
     fn meta(&mut self, line: &str) {
@@ -154,7 +153,7 @@ impl DiffSink for TerminalDiffSink {
             return;
         }
         let line = hyperlink_diff_path_meta(line);
-        let _ = writeln!(io::stdout(), "{}", self.clip(&line).dim());
+        stdout_println!("{}", self.clip(&line).dim());
     }
 
     fn hunk_header(&mut self, line: &str) {
@@ -162,12 +161,8 @@ impl DiffSink for TerminalDiffSink {
             return;
         }
         let max_chars = self.width.saturating_sub(3);
-        let _ = write!(io::stdout(), "{}", "│ ".dim());
-        let _ = writeln!(
-            io::stdout(),
-            "{}",
-            self.clip_with(line, max_chars).magenta()
-        );
+        stdout_print!("{}", "│ ".dim());
+        stdout_println!("{}", self.clip_with(line, max_chars).magenta());
     }
 
     fn add_line(&mut self, line: &str) {
@@ -177,9 +172,9 @@ impl DiffSink for TerminalDiffSink {
         let body = line.strip_prefix('+').unwrap_or(line);
         let max_body = self.width.saturating_sub(4);
         let body_clip = self.clip_with(body, max_body);
-        let _ = write!(io::stdout(), "{}", "│ ".dim());
-        let _ = write!(io::stdout(), "{}", "+".green().bold());
-        let _ = writeln!(io::stdout(), "{}", body_clip.green());
+        stdout_print!("{}", "│ ".dim());
+        stdout_print!("{}", "+".green().bold());
+        stdout_println!("{}", body_clip.green());
     }
 
     fn del_line(&mut self, line: &str) {
@@ -189,9 +184,9 @@ impl DiffSink for TerminalDiffSink {
         let body = line.strip_prefix('-').unwrap_or(line);
         let max_body = self.width.saturating_sub(4);
         let body_clip = self.clip_with(body, max_body);
-        let _ = write!(io::stdout(), "{}", "│ ".dim());
-        let _ = write!(io::stdout(), "{}", "-".red().bold());
-        let _ = writeln!(io::stdout(), "{}", body_clip.red());
+        stdout_print!("{}", "│ ".dim());
+        stdout_print!("{}", "-".red().bold());
+        stdout_println!("{}", body_clip.red());
     }
 
     fn context_line(&mut self, line: &str) {
@@ -199,16 +194,15 @@ impl DiffSink for TerminalDiffSink {
             return;
         }
         let max_chars = self.width.saturating_sub(3);
-        let _ = write!(io::stdout(), "{}", "│ ".dim());
-        let _ = writeln!(io::stdout(), "{}", self.clip_with(line, max_chars).dim());
+        stdout_print!("{}", "│ ".dim());
+        stdout_println!("{}", self.clip_with(line, max_chars).dim());
     }
 }
 
 impl TerminalDiffSink {
     pub fn finish(&mut self) {
         if self.truncated {
-            let _ = writeln!(
-                io::stdout(),
+            stdout_println!(
                 "{}",
                 format!(
                     "  … output truncated (>{MAX_RENDER_LINES} lines). Narrow with: /diff <path>"
@@ -216,7 +210,7 @@ impl TerminalDiffSink {
                 .yellow()
             );
         }
-        let _ = io::stdout().flush();
+        let _ = crate::cli::stream::output_sink::flush_stdout();
     }
 }
 
@@ -467,9 +461,9 @@ pub(crate) fn run_diff_command(repo_root: &Path, arg: &str, term_width: usize) {
                         eprintln!("{}", "  No changes.".dim());
                     } else {
                         for line in text.lines() {
-                            let _ = writeln!(io::stdout(), "{}", line);
+                            stdout_println!("{}", line);
                         }
-                        let _ = io::stdout().flush();
+                        let _ = crate::cli::stream::output_sink::flush_stdout();
                     }
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),

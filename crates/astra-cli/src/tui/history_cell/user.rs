@@ -262,15 +262,63 @@ mod tests {
 
     #[test]
     fn user_input_surface_spans_the_full_rendered_width_with_breathing_rows() {
+        const CASE: &str = "ASTRA_TEST_USER_SURFACE_PROFILE";
+        if std::env::var_os(CASE).is_none() {
+            // Isolate the process-wide theme cache and terminal hints. The
+            // default/unstyled surface must be tested alongside coloured ones.
+            let test = format!(
+                "{}::user_input_surface_spans_the_full_rendered_width_with_breathing_rows",
+                module_path!().split_once("::").unwrap().1
+            );
+            for profile in ["auto", "light", "dark", "plain", "no-color"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &test, "--nocapture"])
+                    .env(CASE, profile)
+                    .env(
+                        "ASTRA_TUI_THEME",
+                        if profile == "no-color" {
+                            "light"
+                        } else {
+                            profile
+                        },
+                    )
+                    .env("COLORTERM", "truecolor")
+                    .env_remove("NO_COLOR")
+                    .env_remove("COLORFGBG")
+                    .env_remove("ASTRA_TERMINAL_FG")
+                    .env_remove("ASTRA_TERMINAL_BG");
+                if profile == "no-color" {
+                    child.env("NO_COLOR", "1");
+                }
+                let output = child.output().expect("run isolated user surface test");
+                assert!(output.status.success(), "{profile}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{output:?}"
+                );
+            }
+            return;
+        }
+
         let width = 48;
         let cell = UserCell::new("review these changes");
         let paragraph =
             crate::tui::render::line_utils::FullRowParagraph::new(cell.display_lines(width))
                 .wrap(ratatui::widgets::Wrap { trim: false });
         let buffer = draw_widget(paragraph, width, 3);
-        let expected = crate::tui::style::user_message_style()
-            .bg
-            .expect("user surface always has a background");
+        let style = crate::tui::style::user_message_style();
+        let profile = std::env::var(CASE).unwrap();
+        if matches!(profile.as_str(), "light" | "dark") {
+            assert!(style.bg.is_some_and(|bg| bg != Color::Reset));
+            assert!(style.fg.is_some_and(|fg| fg != Color::Reset));
+        } else {
+            assert_eq!(style, Style::default());
+        }
+        let expected = style.bg.unwrap_or(Color::Reset);
+        let text_cell = &buffer[(3, 1)];
+        assert_eq!(text_cell.symbol(), "r");
+        assert_eq!(text_cell.fg, style.fg.unwrap_or(Color::Reset));
 
         for y in 0..3 {
             assert!(

@@ -15,7 +15,6 @@ allowed_tools:
   - read_file
   - grep
   - glob
-  - git
 ---
 
 # Unhappy Path Audit

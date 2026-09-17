@@ -10,9 +10,6 @@ pub(crate) fn suggest_followup(
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || state.plan_mode_active()
-        || state.executing_plan.is_some()
-        || state.plan_handle.is_some()
-        || state.pending_approval.is_some()
         || state.last_turn_interrupted
     {
         return None;
@@ -24,12 +21,7 @@ pub(crate) fn suggest_followup(
         result
             .tool_call_records
             .iter()
-            .map(|record| {
-                astra_turn_core::followup_suggestion::tool_marker(
-                    &record.name,
-                    record.args_full.as_deref(),
-                )
-            })
+            .map(|record| record.name.clone())
             .collect()
     };
 
@@ -108,18 +100,6 @@ mod tests {
         .expect("suggestion");
         assert_eq!(suggestion.text, "commit this");
         assert_eq!(suggestion.kind, FollowupSuggestionKind::Commit);
-    }
-
-    #[test]
-    fn suggests_push_after_commit_turn() {
-        let suggestion = suggest_followup(
-            "commit it",
-            &base_state(),
-            &result_with_git_action_commit_record("Committed the changes."),
-        )
-        .expect("suggestion");
-        assert_eq!(suggestion.text, "push it");
-        assert_eq!(suggestion.kind, FollowupSuggestionKind::Push);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 {
+  "cache_capability": {"protocol":"StrictHistoryMatch","volatile_placement":"CurrentUserOnly","volatile_delivery":"RequiredOnly","reuse_scope":"IntraTurnRounds"},
   "model": "MiniMax-M2.7",
   "outcome": "success",
   "provider": "openai",

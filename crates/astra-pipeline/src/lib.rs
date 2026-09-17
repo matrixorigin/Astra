@@ -14,5 +14,6 @@ pub mod step_restore;
 pub mod tool_health_types;
 pub mod trace_query;
 pub use tool_health_types::{
-    TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolOutcome, ToolOutcomeCacheEntry,
+    TOOL_OUTCOME_RING_CAPACITY, ToolHealthEntry, ToolHealthIdentity, ToolOutcome,
+    ToolOutcomeCacheEntry,
 };

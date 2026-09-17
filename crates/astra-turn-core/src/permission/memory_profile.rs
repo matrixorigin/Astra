@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn cargo_build_cd_wrapper_uses_command_family_without_block() {
         let args = serde_json::json!({
-            "command": "cd /home/xupeng/github/astra && cargo build -p astra-turn-core -p astra-cli"
+            "command": "cd /workspace/astra && cargo build -p astra-turn-core -p astra-cli"
         });
         let profile = permission_memory_profile("bash", &args);
         assert_eq!(
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn quoted_grep_regex_stays_exact_without_compound_block() {
         let args = serde_json::json!({
-            "command": r#"cd /home/xupeng/github/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#
+            "command": r#"cd /workspace/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#
         });
         let profile = permission_memory_profile("bash", &args);
         assert_eq!(profile.match_target, AllowMatchTarget::Exact);

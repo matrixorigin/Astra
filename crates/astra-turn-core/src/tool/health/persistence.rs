@@ -120,7 +120,10 @@ pub fn build_snapshot(tool_health: &[ToolHealthEntry]) -> LearningSnapshot {
     LearningSnapshot {
         version: 1,
         snapshot_epoch: now_epoch,
-        tool_health: tool_health.to_vec(),
+        tool_health: tool_health
+            .iter()
+            .map(super::validated_health_entry)
+            .collect(),
     }
 }
 
@@ -213,7 +216,10 @@ pub fn merge_tool_health(
         }
     }
 
-    let mut merged: Vec<ToolHealthEntry> = by_name.into_values().collect();
+    let mut merged: Vec<ToolHealthEntry> = by_name
+        .values()
+        .map(super::validated_health_entry)
+        .collect();
     merged.sort_by(|a, b| a.name.cmp(&b.name));
     (merged, cloud_wins, cloud_only)
 }
@@ -224,11 +230,14 @@ fn merge_recent_outcomes(
 ) -> Vec<astra_pipeline::ToolOutcomeCacheEntry> {
     use std::collections::HashMap;
 
-    let mut by_signature: HashMap<String, Vec<astra_pipeline::ToolOutcome>> = HashMap::new();
+    let mut by_signature: HashMap<
+        astra_pipeline::ToolHealthIdentity,
+        Vec<astra_pipeline::ToolOutcome>,
+    > = HashMap::new();
     for source in [local, cloud] {
         for entry in source {
             by_signature
-                .entry(entry.signature.clone())
+                .entry(entry.identity.clone())
                 .or_default()
                 .extend(entry.outcomes.iter().cloned());
         }
@@ -236,7 +245,7 @@ fn merge_recent_outcomes(
 
     let mut merged: Vec<_> = by_signature
         .into_iter()
-        .filter_map(|(signature, mut outcomes)| {
+        .filter_map(|(identity, mut outcomes)| {
             outcomes.sort_by_key(|outcome| {
                 (
                     outcome.at_epoch,
@@ -250,13 +259,11 @@ fn merge_recent_outcomes(
                 let overflow = outcomes.len() - astra_pipeline::TOOL_OUTCOME_RING_CAPACITY;
                 outcomes.drain(..overflow);
             }
-            (!outcomes.is_empty()).then_some(astra_pipeline::ToolOutcomeCacheEntry {
-                signature,
-                outcomes,
-            })
+            (!outcomes.is_empty())
+                .then_some(astra_pipeline::ToolOutcomeCacheEntry { identity, outcomes })
         })
         .collect();
-    merged.sort_by(|left, right| left.signature.cmp(&right.signature));
+    merged.sort_by(|left, right| left.identity.cmp(&right.identity));
     merged
 }
 

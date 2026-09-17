@@ -13,7 +13,7 @@
 //! let provider = LocalSessionProvider::new(&state);
 //! let mut facts = provider.extract_facts();
 //! facts.token_pressure = provider.token_pressure();
-//! facts.task_completion_ratio = provider.task_completion_ratio();
+//! facts.performance.token_pressure = provider.token_pressure();
 //! let actions = policy.decide(&facts);
 //! ```
 
@@ -99,14 +99,6 @@ impl ObservationProvider for LocalSessionProvider<'_> {
 // ─── SessionStateProvider impl ───────────────────────────────────────────────
 
 impl SessionStateProvider for LocalSessionProvider<'_> {
-    fn task_completion_ratio(&self) -> f64 {
-        let snapshot = &self.state.hooks.task_board_snapshot;
-        if !snapshot.has_any_tracked_tasks() {
-            return 0.0;
-        }
-        snapshot.completed_count as f64 / snapshot.tracked_count.max(1) as f64
-    }
-
     fn current_phase_label(&self) -> &'static str {
         "execution"
     }
@@ -225,22 +217,6 @@ mod tests {
     // ── SessionStateProvider tests ──────────────────────────────────────
 
     #[test]
-    fn session_provider_empty_board_is_unknown_not_complete() {
-        let state = make_state();
-        let p = make_provider(&state);
-        assert!((p.task_completion_ratio() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn session_provider_completed_board_is_complete() {
-        let mut state = make_state();
-        state.hooks.task_board_snapshot.tracked_count = 2;
-        state.hooks.task_board_snapshot.completed_count = 2;
-        let p = make_provider(&state);
-        assert!((p.task_completion_ratio() - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn session_provider_phase_and_turns() {
         let state = make_state();
         let p = make_provider(&state);
@@ -266,7 +242,6 @@ mod tests {
         // All three traits work together without conflict
         let _pressure = p.token_pressure();
         let _facts = p.extract_facts();
-        let _ratio = p.task_completion_ratio();
         let _trends = p.compute_trends();
         let _cache = p.cache_hit_ratio();
         let _errors = p.current_error_rate();

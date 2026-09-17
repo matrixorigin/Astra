@@ -201,6 +201,15 @@ pub(crate) struct EdgeInvocationJournal {
     _lock: std::fs::File,
 }
 
+impl Drop for EdgeInvocationJournal {
+    fn drop(&mut self) {
+        // Closing the descriptor normally releases an advisory lock, but an
+        // explicit unlock makes the restart boundary deterministic across
+        // supported filesystems and lock backends.
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EdgeInvocationJournalStatus {
     pub(crate) records: usize,

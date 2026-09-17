@@ -1,13 +1,16 @@
 name: Test Suite
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop, moi-dev]
+    branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -15,6 +18,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  scope:
+    name: Determine test scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test_cli: ${{ steps.scope.outputs.test_cli }}
+      test_runtime: ${{ steps.scope.outputs.test_runtime }}
+      test_services: ${{ steps.scope.outputs.test_services }}
+      test_core: ${{ steps.scope.outputs.test_core }}
+      online_core: ${{ steps.scope.outputs.online_core }}
+      online_integration: ${{ steps.scope.outputs.online_integration }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A PR merge commit plus both parents is enough for the path diff.
+          # Detection falls back to all scopes if a longer push range is absent.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        run: python3 scripts/ci/ci_scope.py
+
   # All shards start immediately. A previous compile-only job added a ~20 minute
   # barrier, but rust-cache intentionally removes workspace binaries before
   # saving, so the shards still had to compile and link their own test targets.
@@ -25,7 +50,7 @@ jobs:
   #   shard-a: astra-cli (split by edge_tools group) — shell tests need process isolation
   #   shard-b: astra-runtime (3151) + contracts (19)
   #   shard-c: astra-turn-core (2167) + astra-services (1186) + plan/prompts
-  #   shard-d: remaining core crates + bridge-e2e-hooks (3176, mostly overlaps runtime)
+  #   shard-d: remaining core crates + server e2e-hooks (3176, mostly overlaps runtime)
   #
   # Runtime profile guardrails are intentionally covered across these shards
   # instead of running `make test-runtime-profiles` as a separate CI job. That
@@ -37,8 +62,12 @@ jobs:
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
+    needs: scope
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RUN_TESTS: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,23 +81,33 @@ jobs:
           - segment: edge-fs-tools
             filter: "test(/edge_tools::fs_tools::/)"
             command_timeout: 25m
+          # Required branch-protection context; the retired Git tool shard
+          # now exercises the session worktree lifecycle.
           - segment: edge-git-gix
-            filter: "test(/edge_tools::git_gix::/)"
+            filter: "test(/edge_tools::worktree::/) or test(/edge_tools::tests::worktree_tests::/)"
             command_timeout: 25m
           - segment: edge-rest
-            filter: "test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::fs_tools::/) and not test(/edge_tools::git_gix::/)"
+            filter: "test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::fs_tools::/) and not test(/edge_tools::worktree::/) and not test(/edge_tools::tests::worktree_tests::/)"
             command_timeout: 25m
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Skip unaffected test segment
+        if: env.RUN_TESTS != 'true'
+        run: echo "No astra-cli test impact detected."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_TESTS == 'true'
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_TESTS == 'true'
         with:
           shared-key: ci-test
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'non-edge' }}
       - name: Prebuild mock MCP server
-        if: matrix.segment == 'non-edge'
+        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
         run: cargo build --manifest-path Cargo.toml -p astra-cli --bin mock_mcp_server
       - name: "Test astra-cli (${{ matrix.segment }})"
+        if: env.RUN_TESTS == 'true'
         env:
           NEXTEST_FILTER: ${{ matrix.filter }}
         run: >-
@@ -76,22 +115,26 @@ jobs:
           --manifest-path Cargo.toml -p astra-cli
           --profile ci --lib --bins -E "$NEXTEST_FILTER"
       - name: Test astra-cli runtime profile guardrail
-        if: matrix.segment == 'non-edge'
+        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
         run: >-
           timeout ${{ matrix.command_timeout }} cargo nextest run
           --manifest-path Cargo.toml -p astra-cli
           --profile ci --lib
-          -E 'test(/local_cli_catalog_uses_runtime_env_surface_for_local_runtime/)'
+          -E 'test(/local_cli_catalog_exposes_the_root_work_lifecycle/)'
       - name: Dump processes on failure
-        if: failure()
-        run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
+        if: failure() && env.RUN_TESTS == 'true'
+        run: pgrep -af 'cargo|nextest|astra|bash|sleep' || true
 
   shard-b:
     name: "Test: astra-runtime"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_runtime == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-test
@@ -103,24 +146,26 @@ jobs:
         run: |
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
           cargo nextest run --manifest-path Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
-      - name: Comment contract failure on PR
-        if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Regression Gate\n\n❌ Contract tests failed — see [shard-b logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
-            });
+      - name: Summarize contract failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Regression gate"
+            echo
+            echo "Contract tests failed. Inspect the preceding shard-b steps for the failing contract."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   shard-c:
     name: "Test: turn-core + services + plan"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_services == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-test
@@ -133,10 +178,14 @@ jobs:
 
   shard-d:
     name: "Test: core crates + bridge hooks"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-test
@@ -148,12 +197,107 @@ jobs:
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
           -p astra-config -p astra-edge
+          -p astra-credentials -p astra-mcp -p astra-memoria
+          -p astra-harness -p astra-test-harness
+          -p astra-logging -p astra-sync-protocol
           --profile ci
-      - name: Test bridge-e2e-hooks (selective)
+      - name: Test server e2e-hooks (selective)
+        env:
+          RUST_MIN_STACK: "16777216"
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
-          --features bridge-e2e-hooks --profile ci
+          --features e2e-hooks --profile ci
           -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
+
+  vendored-terminal:
+    name: "Test: vendored terminal (${{ matrix.os }})"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustc --version
+      # The patched crate is deliberately outside the application workspace.
+      # These are parser/unit tests, not the real-reader PTY regression suite.
+      - name: Test vendored terminal units
+        run: |
+          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream
+          cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream,use-dev-tty
+
+  terminal-pty:
+    name: "Test: terminal PTY (${{ matrix.os }})"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-terminal-pty
+          install-nextest: false
+      # Separate Cargo invocations prevent feature unification from silently
+      # selecting dev-tty for the nominal default-reader test run.
+      - name: Test real terminal readers through PTYs
+        run: |
+          cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+          cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
+
+  macos-workspace-coordination:
+    name: "Test: macOS workspace coordination"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-test-macos-workspace-coordination
+      - name: Lint macOS workspace coordination
+        run: >-
+          cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
+          --all-targets -- -D warnings
+      - name: Initialize system Git for bounded observation probes
+        timeout-minutes: 1
+        # Checkout uses Homebrew Git, but the hardened observer selects
+        # /usr/bin/git with a cleared environment. Initialize that executable
+        # before its first use under the production two-second probe deadline.
+        # Keep the timing visible so runner startup failures are diagnosable.
+        run: |
+          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
+            -c core.untrackedCache=false rev-parse --show-toplevel
+      - name: Test macOS workspace coordination invariants
+        # Several invariants launch re-exec lock contenders while fingerprint
+        # probes deliberately have a short wall-clock deadline. Keep the module
+        # serial on shared CI hosts; the contender test supplies explicit
+        # cross-process concurrency without starving unrelated probes.
+        run: >-
+          cargo test --locked --manifest-path Cargo.toml -p astra-tools
+          workspace_observation::tests:: -- --test-threads=1
+      - name: Test macOS CLI Bash execution
+        run: >-
+          cargo test --locked --manifest-path Cargo.toml -p astra-cli
+          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
 
   # Online tests run beside the offline shards instead of waiting for an
   # unrelated compile-only job. CI keeps each live-DB lane serial; the
@@ -161,6 +305,8 @@ jobs:
   # two jobs share test-binary link and live-DB work more evenly.
   test-online:
     name: "Test: online (${{ matrix.lane }})"
+    needs: scope
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -168,6 +314,10 @@ jobs:
       matrix:
         lane: [core, integration]
     env:
+      RUN_TESTS: >-
+        ${{ needs.scope.result != 'success' ||
+            (matrix.lane == 'core' && needs.scope.outputs.online_core == 'true') ||
+            (matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true') }}
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
       MATRIXONE_USER: root
@@ -175,19 +325,26 @@ jobs:
       ASTRA_AUTO_CREATE_DATABASE: "1"
       ASTRA_JWT_SECRET: ci-jwt-secret-key-at-least-32-chars-long
       ASTRA_TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-      ASTRA_TEST_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
-      ASTRA_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
+      ASTRA_TEST_E2E_SECRET: ci-server-e2e-secret-at-least-32-chars
+      ASTRA_RUNTIME_ROOT_SECRET: ci-runtime-root-secret-at-least-32-chars
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
-      MEMORIA_EMBEDDING_PROVIDER: openai
+      MEMORIA_EMBEDDING_PROVIDER: ${{ secrets.EMBEDDING_API_KEY != '' && 'openai' || 'mock' }}
       MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
-      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
-      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM }}
+      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
       ASTRA_ONLINE_LANE: ${{ matrix.lane }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Skip unaffected online lane
+        if: env.RUN_TESTS != 'true'
+        run: echo "No online-test impact detected."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_TESTS == 'true'
+        with:
+          persist-credentials: false
       - name: Prepare dependency env
+        if: env.RUN_TESTS == 'true'
         run: |
           cp .env.example .env
           {
@@ -199,20 +356,24 @@ jobs:
             echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
           } >> .env
       - name: Start dependencies
+        if: env.RUN_TESTS == 'true'
         run: make dev-deps-up
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_TESTS == 'true'
         with:
           shared-key: ci-test
       - name: Wait for dependencies
+        if: env.RUN_TESTS == 'true'
         run: make dev-deps-wait
       - name: Run online tests
+        if: env.RUN_TESTS == 'true'
         env:
           ASTRA_TEST_DB_IT: "1"
           ASTRA_TEST_DB_IT_TEST_THREADS: "1"
         run: make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
       - name: Dump dependency logs
-        if: failure()
+        if: failure() && env.RUN_TESTS == 'true'
         run: make dev-deps-logs-once
       - name: Stop dependencies
-        if: always()
+        if: always() && env.RUN_TESTS == 'true'
         run: make dev-deps-down

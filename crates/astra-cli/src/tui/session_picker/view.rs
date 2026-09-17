@@ -211,13 +211,6 @@ fn render_detail(disco: &SessionDiscovery, area: Rect, buf: &mut Buffer) {
     }
     lines.push(Line::from(tail));
 
-    if let Some(goal) = entry.plan_goal.as_deref() {
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::styled("Goal · ", accent),
-            Span::styled(goal.to_string(), dim),
-        ]));
-    }
     if let Some(sum) = entry.summary.as_deref() {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(sum.to_string(), dim)));
@@ -338,7 +331,6 @@ mod tests {
             model: "sonnet-4.6".into(),
             updated_at: iso.into(),
             checkpoints: 2,
-            plan_goal: None,
         }
     }
 
@@ -462,7 +454,7 @@ mod tests {
 
     #[test]
     fn shorten_path_tail_ellipsizes() {
-        let s = shorten_path("/home/xupeng/astra/very/deep/path/inside", 20);
+        let s = shorten_path("/workspace/astra/very/deep/path/inside", 20);
         assert!(s.starts_with('…'));
         assert!(s.chars().count() <= 20);
     }

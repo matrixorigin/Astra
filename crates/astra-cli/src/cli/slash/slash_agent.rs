@@ -148,7 +148,7 @@ fn show_history(ctx: &AgentCommandContext) {
         eprintln!(
             "  {} {} {} [{} ok / {} failed]",
             run_status_icon(&entry.status),
-            entry.delegation_id.as_str().white().bold(),
+            entry.delegation_id.as_str().bold(),
             format!("[{}]", entry.pattern).dim(),
             entry.succeeded.to_string().green(),
             entry.failed.to_string().red()
@@ -166,7 +166,7 @@ fn show_history(ctx: &AgentCommandContext) {
             eprintln!(
                 "    {} {} {}",
                 run_status_icon(&sub_run.status),
-                sub_run.agent_id.as_str().white().bold(),
+                sub_run.agent_id.as_str().bold(),
                 format!("[{}]", sub_run.status).dim()
             );
             if let Some(preview) = &sub_run.output_preview {
@@ -265,7 +265,7 @@ async fn show_tree(ctx: &AgentCommandContext) {
     eprintln!("  {}", "─".repeat(60).dim());
 
     if !fanout_groups.is_empty() {
-        eprintln!("  {}", "Agent fanout groups".white().bold());
+        eprintln!("  {}", "Agent fanout groups".bold());
         for line in render_fanout_groups(&fanout_groups) {
             eprintln!("  {}", line);
         }
@@ -275,7 +275,7 @@ async fn show_tree(ctx: &AgentCommandContext) {
         if !fanout_groups.is_empty() {
             eprintln!();
         }
-        eprintln!("  {}", "Spawned agents".white().bold());
+        eprintln!("  {}", "Spawned agents".bold());
         let forest = AgentTreeNode::build_forest(&agents);
         let rendered = render_agent_forest(&forest);
         for line in rendered.lines() {
@@ -287,7 +287,7 @@ async fn show_tree(ctx: &AgentCommandContext) {
         if !agents.is_empty() {
             eprintln!();
         }
-        eprintln!("  {}", "Journal-backed delegations".white().bold());
+        eprintln!("  {}", "Journal-backed delegations".bold());
         for line in render_delegation_tree(&delegations) {
             eprintln!("  {}", line);
         }
@@ -307,34 +307,26 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
             eprintln!(
                 "\n  {} {}",
                 "🤖 Agent".magenta().bold(),
-                state.agent_id.as_str().white().bold()
+                state.agent_id.as_str().bold()
             );
             eprintln!("  {}", "─".repeat(50).dim());
-            eprintln!("  {} {}", "Type:".white().bold(), state.agent_type);
+            eprintln!("  {} {}", "Type:".bold(), state.agent_type);
             eprintln!(
                 "  {} {}",
-                "Description:".white().bold(),
+                "Description:".bold(),
                 state.description.as_str().magenta()
             );
+            eprintln!("  {} {}", "Status:".bold(), format_status(&state.status));
+            eprintln!("  {} {}", "Run ID:".bold(), state.run_id.as_str().dim());
             eprintln!(
                 "  {} {}",
-                "Status:".white().bold(),
-                format_status(&state.status)
-            );
-            eprintln!(
-                "  {} {}",
-                "Run ID:".white().bold(),
-                state.run_id.as_str().dim()
-            );
-            eprintln!(
-                "  {} {}",
-                "Parent:".white().bold(),
+                "Parent:".bold(),
                 state.parent_run_id.as_str().dim()
             );
             if let Some(slot) = state.fanout_slot.as_ref() {
                 eprintln!(
                     "  {} {} slot {}/{}",
-                    "Fanout:".white().bold(),
+                    "Fanout:".bold(),
                     slot.group_id.as_str().magenta(),
                     slot.slot_index + 1,
                     slot.target_count
@@ -342,17 +334,13 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
             }
 
             if let Some(ref addr) = state.messaging_address {
-                eprintln!(
-                    "  {} {}",
-                    "Address:".white().bold(),
-                    addr.to_string().green()
-                );
+                eprintln!("  {} {}", "Address:".bold(), addr.to_string().green());
             }
 
             if let Some(ref path) = state.worktree_path {
                 eprintln!(
                     "  {} {}",
-                    "Worktree:".white().bold(),
+                    "Worktree:".bold(),
                     path.display().to_string().dim()
                 );
             }
@@ -362,23 +350,15 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 .elapsed()
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|_| "?".to_string());
-            eprintln!("  {} {}", "Running for:".white().bold(), elapsed);
+            eprintln!("  {} {}", "Running for:".bold(), elapsed);
 
             eprintln!("\n  {}", "📊 Metrics".magenta().bold());
             eprintln!("  {}", "─".repeat(30).dim());
-            eprintln!(
-                "  {} {}",
-                "Turns:".white().bold(),
-                state.metrics.turns_completed
-            );
-            eprintln!(
-                "  {} {}",
-                "Tool calls:".white().bold(),
-                state.metrics.tool_calls
-            );
+            eprintln!("  {} {}", "Turns:".bold(), state.metrics.turns_completed);
+            eprintln!("  {} {}", "Tool calls:".bold(), state.metrics.tool_calls);
             eprintln!(
                 "  {} {} prompt, {} completion",
-                "Tokens:".white().bold(),
+                "Tokens:".bold(),
                 state.metrics.prompt_tokens,
                 state.metrics.completion_tokens
             );
@@ -404,7 +384,7 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
         eprintln!(
             "\n  {} {}",
             "🤝 Delegation".magenta().bold(),
-            entry.delegation_id.as_str().white().bold()
+            entry.delegation_id.as_str().bold()
         );
         eprintln!("  {}", "─".repeat(50).dim());
         for line in render_delegation_status_lines(&entry, &events) {
@@ -435,7 +415,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
             eprintln!(
                 "\n  {} {} {}",
                 "🔐 Permissions for".magenta().bold(),
-                state.agent_id.as_str().white().bold(),
+                state.agent_id.as_str().bold(),
                 format!("[{}]", state.agent_type).dim()
             );
             eprintln!("  {}", "─".repeat(50).dim());
@@ -444,7 +424,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
 
             // Permission request stats
             if state.metrics.permission_requests > 0 {
-                eprintln!("\n  {}", "📮 Permission Requests".white().bold());
+                eprintln!("\n  {}", "📮 Permission Requests".bold());
                 eprintln!(
                     "    Sent: {}, Approved: {}, Denied: {}",
                     state.metrics.permission_requests.to_string().magenta(),
@@ -462,7 +442,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
 
             // Recent denials
             if !state.permission_summary.recent_denials.is_empty() {
-                eprintln!("\n  {}", "🚫 Recent Denials".white().bold());
+                eprintln!("\n  {}", "🚫 Recent Denials".bold());
                 for tool in &state.permission_summary.recent_denials {
                     eprintln!("    {} {}", "•".red(), tool);
                 }
@@ -504,16 +484,16 @@ fn print_permission_summary(
         "deny" => "deny".red(),
         _ => summary.mode.as_str().dim(),
     };
-    eprintln!("  {} {}", "Mode:".white().bold(), mode_styled);
+    eprintln!("  {} {}", "Mode:".bold(), mode_styled);
     eprintln!(
         "  {} {} allow, {} deny",
-        "Rules:".white().bold(),
+        "Rules:".bold(),
         summary.allow_rules.to_string().green(),
         summary.deny_rules.to_string().red()
     );
     eprintln!(
         "  {} {}",
-        "Parent escalation:".white().bold(),
+        "Parent escalation:".bold(),
         if summary.has_parent {
             "enabled".green()
         } else {
@@ -523,7 +503,7 @@ fn print_permission_summary(
     if metrics.tools_blocked > 0 {
         eprintln!(
             "  {} {}",
-            "Tools blocked:".white().bold(),
+            "Tools blocked:".bold(),
             metrics.tools_blocked.to_string().red()
         );
     }
@@ -573,7 +553,7 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     eprintln!(
         "  {} Shutdown request sent to {}",
         theme::icon_ok(),
-        agent_id.white().bold()
+        agent_id.bold()
     );
 }
 
@@ -656,7 +636,7 @@ async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     eprintln!(
         "\n  {} Streaming logs for {} (Ctrl+C to stop)\n",
         "📋".magenta(),
-        agent_id.white().bold()
+        agent_id.bold()
     );
 
     // Subscribe to progress events
@@ -711,7 +691,7 @@ fn show_delegation_logs(session_id: Option<&str>, query: &str) -> Result<bool, S
     eprintln!(
         "\n  {} {}\n",
         "📋 Delegation logs for".magenta(),
-        delegation_id.as_str().white().bold()
+        delegation_id.as_str().bold()
     );
     for event in events {
         match event.event_type {
@@ -842,7 +822,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         ProgressEventType::Waiting { reason } => {
             format!("{} {}", "⏸ Waiting:".yellow(), reason)
         }
-        ProgressEventType::Cancelled { reason } => {
+        ProgressEventType::Cancelled { reason, .. } => {
             format!("{} {}", "⊘ Cancelled:".yellow(), reason)
         }
         ProgressEventType::PermissionDenied {
@@ -914,37 +894,31 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
 fn show_help() {
     eprintln!("\n  {}", "🤖 Agent Commands".magenta().bold());
     eprintln!("  {}", "─".repeat(50).dim());
+    eprintln!("  {}  List recent agents and delegations", "/agent".bold());
     eprintln!(
         "  {}  List recent agents and delegations",
-        "/agent".white().bold()
-    );
-    eprintln!(
-        "  {}  List recent agents and delegations",
-        "/agent list".white().bold()
+        "/agent list".bold()
     );
     eprintln!(
         "  {}  Show delegation history for this session",
-        "/agent history".white().bold()
+        "/agent history".bold()
     );
     eprintln!(
         "  {}  Show delegation tree (hierarchy)",
-        "/agent tree".white().bold()
+        "/agent tree".bold()
     );
     eprintln!(
         "  {}  Watch tree with real-time updates",
-        "/agent watch".white().bold()
+        "/agent watch".bold()
     );
-    eprintln!(
-        "  {}  Show agent status",
-        "/agent status <id>".white().bold()
-    );
+    eprintln!("  {}  Show agent status", "/agent status <id>".bold());
     eprintln!(
         "  {}  Show permission details",
-        "/agent permissions <id>".white().bold()
+        "/agent permissions <id>".bold()
     );
-    eprintln!("  {}  Stop an agent", "/agent stop <id>".white().bold());
-    eprintln!("  {}  Show agent logs", "/agent logs <id>".white().bold());
-    eprintln!("  {}  Show this help", "/agent help".white().bold());
+    eprintln!("  {}  Stop an agent", "/agent stop <id>".bold());
+    eprintln!("  {}  Show agent logs", "/agent logs <id>".bold());
+    eprintln!("  {}  Show this help", "/agent help".bold());
     eprintln!();
     eprintln!(
         "  {}",
@@ -1059,7 +1033,7 @@ fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::Spaw
         eprintln!(
             "  {} {} {} ({}){}",
             status_icon(&agent.status),
-            agent.agent_id.as_str().white().bold(),
+            agent.agent_id.as_str().bold(),
             format!("[{}]", agent.agent_type).dim(),
             elapsed.dim(),
             if agent.has_permission_issues {
@@ -1109,7 +1083,7 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
         eprintln!(
             "  {} {} {} [{} ok / {} failed]",
             run_status_icon(&entry.status),
-            entry.delegation_id.as_str().white().bold(),
+            entry.delegation_id.as_str().bold(),
             format!("[{}]", entry.pattern).dim(),
             entry.succeeded.to_string().green(),
             entry.failed.to_string().red()
@@ -1174,7 +1148,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
         AgentFanoutSlotStatus::Interrupted => "interrupted",
         AgentFanoutSlotStatus::Failed => "failed",
         AgentFanoutSlotStatus::CancelledByUser => "stopped by user",
-        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled by parent budget",
+        AgentFanoutSlotStatus::CancelledByRuntime => "cancelled by runtime",
         AgentFanoutSlotStatus::TimedOut => "timed out",
     }
 }
@@ -2041,6 +2015,7 @@ mod tests {
 
     #[test]
     fn load_recent_delegations_collects_summary_and_subruns() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2127,6 +2102,7 @@ mod tests {
 
     #[test]
     fn load_delegation_events_filters_matching_delegation() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-logs-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2162,7 +2138,7 @@ mod tests {
             ))
             .unwrap();
 
-        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-log")
+        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-logs")
             .unwrap()
             .unwrap();
         assert_eq!(delegation_id, "del-logs");
@@ -2172,6 +2148,7 @@ mod tests {
 
     #[test]
     fn load_recent_delegations_includes_running_subruns() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-running-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2349,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn build_watch_snapshot_with_fanout_names_parent_budget_cancellation() {
+    fn build_watch_snapshot_with_fanout_names_runtime_cancellation() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 2);
         group
             .set_slot_request(0, Some("auth".to_string()), "auth", "review auth flow")
@@ -2358,17 +2335,14 @@ mod tests {
         group
             .record_terminal_by_agent(
                 "auth@run-1",
-                AgentFanoutSlotStatus::CancelledByParentBudget,
+                AgentFanoutSlotStatus::CancelledByRuntime,
                 Some("turn budget exhausted".to_string()),
             )
             .unwrap();
 
         let snapshot = build_watch_snapshot_with_fanout(&[], &[group], &[]);
 
-        assert!(
-            snapshot.contains("cancelled by parent budget"),
-            "{snapshot}"
-        );
+        assert!(snapshot.contains("cancelled by runtime"), "{snapshot}");
         assert!(!snapshot.contains("cancelled by budget"), "{snapshot}");
     }
 
@@ -2590,6 +2564,7 @@ mod tests {
             spawn_tool_call_id: None,
             execution_metadata: None,
             delegation_chain: Vec::new(),
+            workspace_mutation: Default::default(),
         };
         let input = SpawnAgentInput {
             description: "watch test agent".to_string(),
@@ -2628,12 +2603,16 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_watch_snapshot_change_detects_journal_updates() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let journal_dir = session_journal::current_journal_dir_override()
+            .expect("isolated journal directory must be installed");
         let sid = format!("slash-agent-watch-test-{}", uuid::Uuid::new_v4());
         let last_snapshot = build_watch_snapshot(&[], &[]);
         let mut rx = None;
         let sid_for_writer = sid.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let _writer_guard = session_journal::JournalDirGuard::new(journal_dir);
             let writer = session_journal::JournalWriter::new(&sid_for_writer).unwrap();
             writer
                 .append(&JournalEvent::delegation_started(

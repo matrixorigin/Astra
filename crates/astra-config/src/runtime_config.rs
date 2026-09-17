@@ -75,12 +75,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub safety: SafetyConfig,
 
-    /// Fork-prefix cache inheritance configuration.
+    /// Fork-prefix cache telemetry configuration.
     ///
-    /// Controls whether child spawns inherit their parent's cacheable
-    /// prefix (for prompt-cache reuse) and how fork-cache telemetry
-    /// events are emitted. Defaults to disabled — operators must
-    /// opt in explicitly.
+    /// Parent-prefix capture and eligible child inheritance are always on.
+    /// This section controls only telemetry emission.
     #[serde(default)]
     pub fork_prefix: ForkPrefixConfig,
 
@@ -107,6 +105,41 @@ pub struct RuntimeConfig {
     /// Budget policy for auto-expansion based on outcome streaks.
     #[serde(default)]
     pub budget_policy: Option<BudgetPolicyConfig>,
+
+    /// Explain Analyze presentation and capture preferences.
+    #[serde(default)]
+    pub explain: ExplainConfig,
+}
+
+/// User-facing Explain Analyze presentation settings.
+///
+/// The live TUI projection is intentionally bounded: it is a compact status
+/// lane, not a second scrollback. The bound is also enforced by the renderer
+/// so hand-written config files cannot make the live pane take over the
+/// terminal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExplainConfig {
+    /// Maximum number of rows used by the live TUI Explain Analyze projection.
+    /// `None` means the built-in five-row default was not explicitly
+    /// configured. Keeping that distinction lets a project config explicitly
+    /// choose `5` over a user config choosing `3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_rows: Option<u8>,
+}
+
+fn default_explain_live_rows() -> u8 {
+    5
+}
+
+impl ExplainConfig {
+    /// Effective live-row value used by presentation surfaces. Keep this
+    /// helper public so every UI boundary applies the same defensive cap to
+    /// hand-edited config files.
+    pub fn effective_live_rows(&self) -> u8 {
+        self.live_rows
+            .unwrap_or_else(default_explain_live_rows)
+            .clamp(1, 5)
+    }
 }
 
 // ─── Budget Policy Configuration ────────────────────────────────────────────
@@ -180,42 +213,47 @@ impl Default for AgentBindingRegistryConfig {
 /// Per-turn agentic-loop budget knobs editable via `/config`.
 ///
 /// Defaults of 0 mean "fall through to [`astra_core::RuntimeLimits`]"
-/// (which itself defaults to 150/0). Setting a positive value here
+/// (which leaves total rounds uncapped unless explicitly configured). A positive value here
 /// overrides the env-driven default for the CLI without requiring a
 /// process restart with new `ASTRA_*` exports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RuntimeLimitsConfig {
-    /// Max tool calls per user message (regular chat turn).
-    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
+    /// Maximum execution rounds per user message (regular chat turn).
+    /// 0 = inherit the optional `RuntimeLimits::max_turns` constraint.
     #[serde(default)]
     pub max_turns: u32,
 
-    /// Max tool calls per plan subtask. 0 = fall back to `max_turns`.
+    /// Maximum execution rounds per plan subtask. 0 = fall back to `max_turns`.
     #[serde(default)]
     pub plan_subtask_max_turns: u32,
 }
 
 impl RuntimeLimitsConfig {
-    /// Resolve the effective per-turn tool-call ceiling.
+    /// Resolve an optional explicit per-turn execution-round ceiling.
     ///
     /// Config values > 0 override the env-driven [`astra_core::RuntimeLimits`]
     /// singleton. A plan subtask first consults `plan_subtask_max_turns`,
     /// then falls back to `max_turns`, then finally to the env/built-in
     /// `effective_plan_subtask_turns()` behavior.
-    pub fn resolve_turn_ceiling(&self, is_plan_subtask: bool) -> usize {
+    pub fn resolve_turn_ceiling(
+        &self,
+        is_plan_subtask: bool,
+    ) -> Result<Option<std::num::NonZeroUsize>, String> {
         let env_limits = astra_core::RuntimeLimits::global();
         if is_plan_subtask {
             if self.plan_subtask_max_turns > 0 {
-                self.plan_subtask_max_turns as usize
+                Ok(std::num::NonZeroUsize::new(
+                    self.plan_subtask_max_turns as usize,
+                ))
             } else if self.max_turns > 0 {
-                self.max_turns as usize
+                Ok(std::num::NonZeroUsize::new(self.max_turns as usize))
             } else {
                 env_limits.effective_plan_subtask_turns()
             }
         } else if self.max_turns > 0 {
-            self.max_turns as usize
+            Ok(std::num::NonZeroUsize::new(self.max_turns as usize))
         } else {
-            env_limits.max_turns
+            env_limits.max_rounds()
         }
     }
 }
@@ -245,59 +283,12 @@ pub enum ForkCacheSinkKind {
 /// Captures happen on every parent turn end, spawns with
 /// `inherit_prefix` reuse captured prefixes, and telemetry events
 /// flow to the configured `sink`.
-///
-/// Thresholds tune the classifier in `fork_cache_event::evaluate`.
-///
-/// Invariants:
-/// - `miss_floor > 0.0`
-/// - `hit_threshold > miss_floor`
-/// - `hit_threshold <= 1.0`
-///
-/// Invalid values silently fall back to classifier defaults at
-/// runtime (via `ForkCacheThresholds::validate`); callers that want
-/// strict config rejection should `validate()` the loaded config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ForkPrefixConfig {
-    /// Deprecated no-op. Fork capture is now always-on. Retained
-    /// for backward-compatible TOML deserialization only.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Telemetry sink to install. `Noop` discards events; `Stderr`
     /// writes JSON lines with `[fork-cache]` prefix.
     #[serde(default)]
     pub sink: ForkCacheSinkKind,
-
-    /// Ratio (observed/expected cache_read_tokens) at or above
-    /// which a probe classifies as `Hit`. Default 0.80.
-    #[serde(default = "default_fork_hit_threshold")]
-    pub hit_threshold: f64,
-
-    /// Ratio below which a probe classifies as `Miss`. Between
-    /// `miss_floor` and `hit_threshold` is `PartialDrift`. Default
-    /// 0.05 — distinguishes "essentially nothing reused" from
-    /// "some reuse happened".
-    #[serde(default = "default_fork_miss_floor")]
-    pub miss_floor: f64,
-}
-
-fn default_fork_hit_threshold() -> f64 {
-    0.80
-}
-
-fn default_fork_miss_floor() -> f64 {
-    0.05
-}
-
-impl Default for ForkPrefixConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sink: ForkCacheSinkKind::Noop,
-            hit_threshold: default_fork_hit_threshold(),
-            miss_floor: default_fork_miss_floor(),
-        }
-    }
 }
 
 /// Safety-guard configuration.
@@ -382,6 +373,7 @@ impl Default for RuntimeConfig {
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
             budget_policy: None,
+            explain: ExplainConfig::default(),
         }
     }
 }
@@ -399,13 +391,19 @@ impl Default for RuntimeConfig {
 ///   system-reminder block. The model calls `tool_search(query="select:X")`
 ///   to pull a schema into context when it needs X.
 ///
+/// This is a local prompt-cost policy: a CLI/Edge process and a Server process
+/// may each resolve their own configuration. It never grants execution
+/// authority. The active deployment boundary's capability binding, allowlist,
+/// and runtime readiness still filter the resulting candidate surface.
+///
 /// # `pinned_tools` semantics
 ///
 /// **Within a single config file** (e.g. one `runtime.toml`), entries
 /// apply additively to the built-in [`DEFAULT_PINNED`](runtime crate) set:
-/// - A plain name (e.g. `"github"`) *adds* that tool to the pinned set.
+/// - A plain name (e.g. `"web_search"`) *adds* that tool to the pinned set.
 /// - A name prefixed with `-` (e.g. `"-grep"`) *removes* a default from
-///   the pinned set (it lands in deferred instead).
+///   the pinned set (it lands in deferred instead). `tool_search` is the
+///   activation protocol floor and cannot be removed.
 /// - Unknown names, whitespace-only, bare `-`, or `--foo` are silently
 ///   ignored (see `ToolSurface::build`).
 ///
@@ -420,7 +418,7 @@ impl Default for RuntimeConfig {
 /// Example `runtime.toml`:
 /// ```toml
 /// [tool_surface]
-/// pinned_tools = ["github", "memory", "-grep"]
+/// pinned_tools = ["web_search", "memory", "-grep"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolSurfaceConfig {
@@ -883,11 +881,6 @@ pub struct ToolSelectionConfig {
     #[serde(default = "default_max_tool_schema_tokens")]
     pub max_tool_schema_tokens: u32,
 
-    /// Deprecated scenario-driven override for the removed tool selector budget.
-    /// 0 = no override. Retained so older config files continue to deserialize.
-    #[serde(default)]
-    pub tool_budget_tokens: u32,
-
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
@@ -898,16 +891,6 @@ pub struct ToolSelectionConfig {
     /// Prevents pathological turns where the agent requests 50+ tool calls.
     #[serde(default)]
     pub max_tools_per_turn: u32,
-
-    /// Round budget warning — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_warning: u32,
-
-    /// Round budget limit — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_limit: u32,
 
     /// Circuit breaker: consecutive stall rounds (no new patterns, no mutations)
     /// before tripping. 0 = use default (3).
@@ -1209,18 +1192,6 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger budget pressure.
-    pub fn effective_round_budget_warning(&self) -> u32 {
-        200
-    }
-
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger the old phase1/phase2 logic.
-    pub fn effective_round_budget_limit(&self) -> u32 {
-        200
-    }
-
     /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
     pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
         resolve_threshold(self.circuit_breaker_stall_threshold, 6, 3)
@@ -1457,11 +1428,8 @@ impl Default for ToolSelectionConfig {
             prefer_recent_tools: default_true(),
             recent_tool_boost: default_recent_tool_boost(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
-            tool_budget_tokens: 0,
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
-            round_budget_warning: 0,
-            round_budget_limit: 0,
             circuit_breaker_stall_threshold: 0,
             circuit_breaker_repetition_threshold: 0,
             circuit_breaker_half_open_patience: 0,
@@ -1533,7 +1501,7 @@ pub struct SessionTraceConfig {
     /// Serialized as a lowercase string: `"error"`, `"warn"`, `"info"`,
     /// `"debug"`, `"trace"`.
     #[serde(default = "default_trace_level")]
-    pub min_level: TraceLevelSerde,
+    pub min_level: TraceLevel,
 
     /// Which event categories to emit. `All` means every category.
     #[serde(default = "default_trace_categories")]
@@ -1551,9 +1519,6 @@ pub struct SessionTraceConfig {
 
 // Re-export shared trace types from astra-core
 pub use astra_core::TraceLevel;
-
-// Backward-compatible type alias for serde deserialization
-pub type TraceLevelSerde = TraceLevel;
 
 fn default_trace_level() -> TraceLevel {
     TraceLevel::Info
@@ -2173,6 +2138,7 @@ impl RuntimeConfig {
             runtime_limits,
             agent_binding_registry,
             budget_policy,
+            explain,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -2267,11 +2233,8 @@ impl RuntimeConfig {
             prefer_recent_tools,
             recent_tool_boost,
             max_tool_schema_tokens,
-            tool_budget_tokens,
             max_identical_tool_calls,
             max_tools_per_turn,
-            round_budget_warning,
-            round_budget_limit,
             circuit_breaker_stall_threshold,
             circuit_breaker_repetition_threshold,
             circuit_breaker_half_open_patience,
@@ -2314,11 +2277,6 @@ impl RuntimeConfig {
             default_max_tool_schema_tokens(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.tool_budget_tokens,
-            tool_budget_tokens,
-            0,
-        );
-        merge_if_non_default(
             &mut self.tool_selection.max_identical_tool_calls,
             max_identical_tool_calls,
             0,
@@ -2326,16 +2284,6 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.max_tools_per_turn,
             max_tools_per_turn,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.round_budget_warning,
-            round_budget_warning,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.round_budget_limit,
-            round_budget_limit,
             0,
         );
         merge_if_non_default(
@@ -2531,11 +2479,7 @@ impl RuntimeConfig {
             sampling_rate,
         } = trace.normalize();
         merge_if_non_default(&mut self.trace.profile, profile, TraceProfile::default());
-        merge_if_non_default(
-            &mut self.trace.min_level,
-            min_level,
-            TraceLevelSerde::default(),
-        );
+        merge_if_non_default(&mut self.trace.min_level, min_level, TraceLevel::default());
         merge_if_non_default(
             &mut self.trace.enabled_categories,
             enabled_categories,
@@ -2734,9 +2678,8 @@ impl RuntimeConfig {
 
         // ForkPrefixConfig: whole-struct replacement when `other`
         // differs from default. Simple enough to treat atomically —
-        // sub-field merging would just add complexity without
-        // meaningful use cases (you either want fork-prefix on with
-        // a specific sink / thresholds, or off).
+        // sub-field merging would add complexity without a meaningful use
+        // case because the section owns one telemetry sink.
         if fork_prefix != ForkPrefixConfig::default() {
             self.fork_prefix = fork_prefix;
         }
@@ -2767,6 +2710,13 @@ impl RuntimeConfig {
         );
         if budget_policy.is_some() {
             self.budget_policy = budget_policy;
+        }
+
+        // Explain presentation keeps an explicit optional value so a higher
+        // precedence file can intentionally restore the built-in default
+        // (`5`) over a lower-precedence custom value.
+        if let Some(live_rows) = explain.live_rows {
+            self.explain.live_rows = Some(live_rows);
         }
 
         self
@@ -2815,8 +2765,8 @@ impl RuntimeConfig {
                 .enabled_categories
                 .push(TraceCategory::LlmExchanges);
         }
-        // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
-        // is now always-on. The `enabled` field is a deprecated no-op.
+        // ASTRA_FORK_INHERIT_PREFIX is intentionally ignored: fork capture
+        // and eligible inheritance are always on.
     }
 
     /// Get configuration as TOML string.
@@ -2932,11 +2882,19 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization() {
+    fn canonical_config_serialization_excludes_retired_fields() {
         let config = RuntimeConfig::default();
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("max_history_tokens"));
         assert!(toml.contains("retrieval_top_k"));
+        assert!(!toml.contains("tool_budget_tokens"));
+        assert!(!toml.contains("round_budget_warning"));
+        assert!(!toml.contains("round_budget_limit"));
+
+        let fork_prefix = toml::to_string(&config.fork_prefix).unwrap();
+        assert!(!fork_prefix.contains("enabled"));
+        assert!(!fork_prefix.contains("hit_threshold"));
+        assert!(!fork_prefix.contains("miss_floor"));
     }
 
     #[test]
@@ -2994,6 +2952,7 @@ mod tests {
         assert!(toml.contains("[memory_pressure]"));
         assert!(toml.contains("[context_window]"));
         assert!(toml.contains("[agent_binding_registry]"));
+        assert_eq!(config.explain.effective_live_rows(), 5);
     }
 
     #[test]
@@ -3023,11 +2982,8 @@ mod tests {
                 prefer_recent_tools: false,
                 recent_tool_boost: 0.4,
                 max_tool_schema_tokens: 22000,
-                tool_budget_tokens: 0,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
-                round_budget_warning: 0,
-                round_budget_limit: 0,
                 circuit_breaker_stall_threshold: 0,
                 circuit_breaker_repetition_threshold: 0,
                 circuit_breaker_half_open_patience: 0,
@@ -3051,7 +3007,7 @@ mod tests {
             },
             trace: SessionTraceConfig {
                 profile: TraceProfile::Custom,
-                min_level: TraceLevelSerde::Debug,
+                min_level: TraceLevel::Debug,
                 enabled_categories: vec![
                     TraceCategory::ToolCalls,
                     TraceCategory::LlmExchanges,
@@ -3116,9 +3072,11 @@ mod tests {
                 max_ceiling: 1200,
                 reflect_after_consecutive_zero: 5,
             }),
+            explain: ExplainConfig { live_rows: Some(3) },
         });
 
         assert_eq!(merged.version, "2.0");
+        assert_eq!(merged.explain.live_rows, Some(3));
         assert_eq!(merged.compression.max_history_tokens, 12345);
         assert!((merged.compression.compression_threshold - 0.65).abs() < 0.001);
         assert!(!merged.compression.preserve_tool_calls);
@@ -3143,7 +3101,7 @@ mod tests {
         assert_eq!(merged.tool_policy.redundant_reads_eval_threshold, 9);
 
         assert_eq!(merged.trace.profile, TraceProfile::Custom);
-        assert_eq!(merged.trace.min_level, TraceLevelSerde::Debug);
+        assert_eq!(merged.trace.min_level, TraceLevel::Debug);
         assert!(merged.trace.category_enabled(TraceCategory::ToolCalls));
         assert!(merged.trace.category_enabled(TraceCategory::LlmExchanges));
         assert!(
@@ -3196,11 +3154,18 @@ mod tests {
     }
 
     #[test]
-    fn round_budget_defaults() {
-        // Deprecated: always returns 200 (effectively disabled).
-        let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
+    fn explicit_explain_default_overrides_a_lower_precedence_value() {
+        let user = RuntimeConfig {
+            explain: ExplainConfig { live_rows: Some(3) },
+            ..RuntimeConfig::default()
+        };
+        let project = RuntimeConfig {
+            explain: ExplainConfig { live_rows: Some(5) },
+            ..RuntimeConfig::default()
+        };
+        let merged = RuntimeConfig::default().merge(user).merge(project);
+        assert_eq!(merged.explain.live_rows, Some(5));
+        assert_eq!(merged.explain.effective_live_rows(), 5);
     }
 
     #[test]
@@ -3209,12 +3174,15 @@ mod tests {
             max_turns: 8,
             plan_subtask_max_turns: 0,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(false), 8);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(false),
+            Ok(std::num::NonZeroUsize::new(8))
+        );
     }
 
     #[test]
     fn runtime_turn_ceiling_falls_back_to_env_when_zero() {
-        let env_max = astra_core::RuntimeLimits::global().max_turns;
+        let env_max = astra_core::RuntimeLimits::global().max_rounds();
         let cfg = RuntimeLimitsConfig {
             max_turns: 0,
             plan_subtask_max_turns: 0,
@@ -3228,7 +3196,10 @@ mod tests {
             max_turns: 100,
             plan_subtask_max_turns: 20,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(true), 20);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(true),
+            Ok(std::num::NonZeroUsize::new(20))
+        );
     }
 
     #[test]
@@ -3237,7 +3208,10 @@ mod tests {
             max_turns: 30,
             plan_subtask_max_turns: 0,
         };
-        assert_eq!(cfg.resolve_turn_ceiling(true), 30);
+        assert_eq!(
+            cfg.resolve_turn_ceiling(true),
+            Ok(std::num::NonZeroUsize::new(30))
+        );
     }
 
     #[test]
@@ -3248,40 +3222,6 @@ mod tests {
             plan_subtask_max_turns: 0,
         };
         assert_eq!(cfg.resolve_turn_ceiling(true), env_effective);
-    }
-
-    #[test]
-    fn round_budget_custom_values() {
-        // Deprecated: custom values are ignored, always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 10,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_enforces_above_warning() {
-        // Deprecated: always returns 200 regardless of config.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 8,
-            round_budget_limit: 5,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_zero_uses_default_regardless_of_warning() {
-        // Deprecated: always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 0,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
@@ -3899,12 +3839,9 @@ mod tests {
     // ─── Fork-prefix config ─────────────────────────────────────────
 
     #[test]
-    fn fork_prefix_defaults_to_disabled_noop_sink() {
+    fn fork_prefix_defaults_to_noop_sink() {
         let cfg = ForkPrefixConfig::default();
-        assert!(!cfg.enabled, "fork-prefix must default to disabled");
         assert_eq!(cfg.sink, ForkCacheSinkKind::Noop);
-        assert!((cfg.hit_threshold - 0.80).abs() < 1e-9);
-        assert!((cfg.miss_floor - 0.05).abs() < 1e-9);
     }
 
     #[test]
@@ -3913,16 +3850,10 @@ mod tests {
             version = "1.0"
 
             [fork_prefix]
-            enabled = true
             sink = "stderr"
-            hit_threshold = 0.85
-            miss_floor = 0.10
         "#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Stderr);
-        assert!((cfg.fork_prefix.hit_threshold - 0.85).abs() < 1e-9);
-        assert!((cfg.fork_prefix.miss_floor - 0.10).abs() < 1e-9);
     }
 
     #[test]
@@ -3930,7 +3861,6 @@ mod tests {
         // A TOML without the section must not fail — defaults fill in.
         let toml_str = r#"version = "1.0""#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Noop);
     }
 
@@ -3940,26 +3870,13 @@ mod tests {
         // tripwire pins both directions so a future rename to e.g.
         // `SnakeCase` is an explicit breaking config change.
         let s = toml::to_string(&ForkPrefixConfig {
-            enabled: true,
             sink: ForkCacheSinkKind::Stderr,
-            ..Default::default()
         })
         .unwrap();
         assert!(
             s.contains("sink = \"stderr\""),
             "expected lowercase serialization, got {s}"
         );
-    }
-
-    #[test]
-    fn fork_prefix_enabled_field_is_deprecated_noop() {
-        // The `enabled` field remains for backward-compatible TOML
-        // deserialization but has no runtime effect. Fork capture is
-        // always-on.
-        let cfg = ForkPrefixConfig::default();
-        // Default value doesn't matter for runtime behavior since
-        // the field is a no-op; we just verify it deserializes.
-        let _ = cfg.enabled;
     }
 
     // ─── SessionTraceConfig::from_cli() tests ─────────────────────
@@ -3996,12 +3913,12 @@ mod tests {
 
     #[test]
     fn from_cli_levels() {
-        let cases: &[(&str, TraceLevelSerde)] = &[
-            ("error", TraceLevelSerde::Error),
-            ("warn", TraceLevelSerde::Warn),
-            ("info", TraceLevelSerde::Info),
-            ("debug", TraceLevelSerde::Debug),
-            ("trace", TraceLevelSerde::Trace),
+        let cases: &[(&str, TraceLevel)] = &[
+            ("error", TraceLevel::Error),
+            ("warn", TraceLevel::Warn),
+            ("info", TraceLevel::Info),
+            ("debug", TraceLevel::Debug),
+            ("trace", TraceLevel::Trace),
         ];
         for (name, expected) in cases {
             let cfg = SessionTraceConfig::from_cli(None, Some(name), None)
@@ -4050,7 +3967,7 @@ mod tests {
             SessionTraceConfig::from_cli(Some("dev"), Some("debug"), Some("tool_calls,budget"))
                 .expect("combined overrides");
         assert_eq!(cfg.profile, TraceProfile::Custom);
-        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(cfg.min_level, TraceLevel::Debug);
         assert_eq!(cfg.enabled_categories.len(), 2);
         assert!(cfg.enabled_categories.contains(&TraceCategory::ToolCalls));
         assert!(cfg.enabled_categories.contains(&TraceCategory::Budget));
@@ -4081,7 +3998,7 @@ mod tests {
             .with_cli_overrides(None, Some("debug"), None)
             .expect("level-only override should succeed");
         assert_eq!(cfg.profile, TraceProfile::Custom);
-        assert_eq!(cfg.min_level, TraceLevelSerde::Debug);
+        assert_eq!(cfg.min_level, TraceLevel::Debug);
         assert_eq!(
             cfg.enabled_categories,
             TraceCategory::individual_categories().to_vec()

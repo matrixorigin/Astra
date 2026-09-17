@@ -28,46 +28,51 @@ pub(crate) struct OneShotSessionRouting {
 
 impl OneShotSessionRouting {
     fn take_continuation(&mut self) -> Result<Option<SessionContinuation>, String> {
+        let remote_bundle = self.resume_metadata.resume_bundle.take();
+        if self.server_session_id.is_some() && remote_bundle.is_none() {
+            return Err(
+                "selected Server session omitted required versioned ResumeBundle".to_string(),
+            );
+        }
+        if let (Some(expected_session_id), Some(bundle)) =
+            (self.server_session_id.as_deref(), remote_bundle.as_ref())
+            && bundle.cursor.session_id != expected_session_id
+        {
+            return Err(format!(
+                "remote ResumeBundle belongs to session `{}`, expected `{expected_session_id}`",
+                bundle.cursor.session_id
+            ));
+        }
+
+        // A canonical bundle returned for an attached Server session is the
+        // authority, while the CLI journal is only a local replica. Their
+        // journal sequence numbers are allocated by independent stores and
+        // therefore cannot participate in one cursor ordering. Selecting the
+        // Server bundle directly also avoids replaying a potentially long
+        // local journal merely to compare incomparable clocks.
+        if self.server_session_id.is_some()
+            && remote_bundle.as_ref().is_some_and(|bundle| {
+                bundle.source == astra_turn_types::ResumeSourceV1::CanonicalJournal
+            })
+        {
+            let remote = remote_bundle.expect("canonical remote bundle was checked above");
+            if !remote.validates_root() {
+                tracing::warn!(
+                    "remote one-shot resume bundle does not materialize its declared root"
+                );
+                return Err(
+                    "remote one-shot resume bundle failed canonical root validation".to_string(),
+                );
+            }
+            return continuation_from_resume_bundle(remote)
+                .map(Some)
+                .ok_or_else(|| "remote ResumeBundle failed causal validation".to_string());
+        }
+
         let local = self
             .history_source_session_id
             .as_deref()
             .and_then(load_session_continuation_for_recovery);
-        let remote_bundle = self.resume_metadata.resume_bundle.take().or_else(|| {
-            let messages = std::mem::take(&mut self.resume_metadata.continuation_messages);
-            if messages.is_empty() {
-                return None;
-            }
-            let session_id = self
-                .history_source_session_id
-                .as_deref()
-                .or(self.server_session_id.as_deref())
-                .unwrap_or("remote-continuation");
-            let cursor = astra_turn_types::legacy_resume_cursor(
-                &crate::cli::cli_config::cli_utils::cli_user_id(),
-                session_id,
-                self.resume_metadata.completed_turn_count,
-                &messages,
-            );
-            astra_turn_types::select_resume_bundle(
-                None,
-                [astra_turn_types::ResumeCandidateV1 {
-                    source: astra_turn_types::ResumeSourceV1::Checkpoint,
-                    cursor,
-                    conversation_messages: messages,
-                    materialized_conversation_root_hash: None,
-                    degraded_reasons: vec![
-                        astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-                        astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
-                        astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback,
-                    ],
-                    repair_actions: vec![
-                        astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
-                    ],
-                    projections: astra_turn_types::ResumeProjectionSetV1::default(),
-                }],
-            )
-            .ok()
-        });
 
         let mut candidates = Vec::with_capacity(2);
         if let Some(local) = local.as_ref() {
@@ -116,11 +121,17 @@ impl OneShotSessionRouting {
     /// tool-surface state on the same causal path.
     pub(crate) fn continuation_turn_inputs(
         &mut self,
-    ) -> Result<(Option<Vec<serde_json::Value>>, Vec<String>), String> {
+    ) -> Result<
+        (
+            Option<Vec<serde_json::Value>>,
+            Vec<astra_turn_types::DeferredToolActivation>,
+        ),
+        String,
+    > {
         Ok(match self.take_continuation()? {
             Some(continuation) => (
                 Some(continuation.messages),
-                continuation.activated_deferred_tool_names,
+                continuation.deferred_tool_activations,
             ),
             None => (None, Vec::new()),
         })
@@ -140,7 +151,7 @@ impl OneShotSessionRouting {
 
     /// Return the 1-based turn index for the next Server-owned turn.
     ///
-    /// Auxiliary inference runs before the main `/chat/turn` request, so it
+    /// Auxiliary inference runs before the main `/chat/stream` request, so it
     /// cannot rely on that request's stale-turn recovery to repair its causal
     /// scope. A resumed Server session must start from the authoritative
     /// completed-turn count obtained during restore. Local-only continuation
@@ -193,26 +204,38 @@ async fn load_one_shot_resume_metadata(
     profile: Option<&str>,
     session_id: Option<&str>,
     server_session: bool,
-) -> OneShotSessionResumeMetadata {
+) -> Result<OneShotSessionResumeMetadata, String> {
     let Some(session_id) = session_id else {
-        return OneShotSessionResumeMetadata::default();
+        return Ok(OneShotSessionResumeMetadata::default());
     };
 
-    let mut restored = restore_session_snapshot_with_client(profile, api, session_id).await;
+    let mut restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
+        Ok(restored) => restored,
+        Err(error) if server_session => {
+            return Err(format!(
+                "selected Server session {session_id} could not be restored: {error}"
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to restore automatic local continuation; starting a new session"
+            );
+            return Ok(OneShotSessionResumeMetadata::default());
+        }
+    };
     if server_session
         && restored
             .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
             .is_some_and(|snapshot| !snapshot.restored_from_cloud)
     {
-        // Local CSL/checkpoints remain the highest-fidelity conversation
-        // source, but the Server owns the causal turn sequence. Reconcile a
-        // local snapshot with the remote turn count so another process or
-        // device cannot make auxiliary inference reuse an old ledger key.
+        // The Server owns both the canonical conversation and turn sequence
+        // for an attached session. Local state can locate that session, but
+        // cannot replace missing Server resume authority.
         match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
             Ok(Some(remote)) => {
-                if let Ok(Some(local)) = restored.as_mut() {
+                if let Some(local) = restored.as_mut() {
                     // The Server turn clock is authoritative for a networked
                     // session. Conversation selection remains cursor/root
                     // based in `continuation`; do not splice remote messages
@@ -225,29 +248,35 @@ async fn load_one_shot_resume_metadata(
                     local.model = remote.model.clone();
                     local.permission_mode = remote.permission_mode.clone();
                     local.conversation_messages = remote.conversation_messages;
-                    local.activated_deferred_tool_names = remote.activated_deferred_tool_names;
                     local.resume_bundle = remote.resume_bundle;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                return Err(format!(
+                    "selected Server session {session_id} has no authoritative restore bundle"
+                ));
+            }
             Err(error) => {
-                tracing::warn!(
-                    %session_id,
-                    %error,
-                    "failed to reconcile local resume metadata with authoritative server turn"
-                );
+                return Err(format!(
+                    "selected Server session {session_id} could not load its authoritative restore bundle: {error}"
+                ));
             }
         }
     }
 
     match restored {
-        Ok(Some(restored)) => {
+        Some(restored) => {
             let continuation_messages = if restored.resume_bundle.is_some() {
                 Vec::new()
             } else {
                 sanitize_continuation_messages(restored.conversation_messages)
             };
-            OneShotSessionResumeMetadata {
+            if server_session && restored.resume_bundle.is_none() {
+                return Err(format!(
+                    "selected Server session {session_id} omitted required versioned ResumeBundle"
+                ));
+            }
+            Ok(OneShotSessionResumeMetadata {
                 // Server turn admission and conversation hydration are
                 // separate deterministic planes. A checkpoint may lag the
                 // Server head; it must not roll back the next turn index.
@@ -256,17 +285,12 @@ async fn load_one_shot_resume_metadata(
                 permission_mode: restored.permission_mode,
                 continuation_messages,
                 resume_bundle: restored.resume_bundle,
-            }
+            })
         }
-        Ok(None) => OneShotSessionResumeMetadata::default(),
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to restore one-shot session metadata; continuing without metadata"
-            );
-            OneShotSessionResumeMetadata::default()
-        }
+        None if server_session => Err(format!(
+            "selected Server session {session_id} has no restorable canonical state"
+        )),
+        None => Ok(OneShotSessionResumeMetadata::default()),
     }
 }
 
@@ -274,7 +298,7 @@ async fn attach_one_shot_resume_metadata(
     mut routing: OneShotSessionRouting,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
-) -> OneShotSessionRouting {
+) -> Result<OneShotSessionRouting, String> {
     let metadata_session_id = routing
         .history_source_session_id
         .as_deref()
@@ -285,8 +309,8 @@ async fn attach_one_shot_resume_metadata(
         metadata_session_id,
         routing.server_session_id.is_some(),
     )
-    .await;
-    routing
+    .await?;
+    Ok(routing)
 }
 
 pub(crate) async fn resolve_one_shot_session_routing(
@@ -317,7 +341,7 @@ pub(crate) async fn resolve_one_shot_session_routing(
                 select_one_shot_session_routing(Some(session_id), None, None)
             }
         };
-        return Ok(attach_one_shot_resume_metadata(routing, api, profile).await);
+        return attach_one_shot_resume_metadata(routing, api, profile).await;
     }
 
     let local_session_id = local_resumable_last_session_id(profile);
@@ -336,7 +360,7 @@ pub(crate) async fn resolve_one_shot_session_routing(
         }
     };
     let routing = select_one_shot_session_routing(None, remote_session_id, local_session_id);
-    Ok(attach_one_shot_resume_metadata(routing, api, profile).await)
+    attach_one_shot_resume_metadata(routing, api, profile).await
 }
 
 #[cfg(test)]
@@ -359,6 +383,20 @@ mod tests {
         workspace.permission_mode = Some("plan".to_string());
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "previous question"}),
+            serde_json::json!({"role": "assistant", "content": "previous answer"}),
+        ];
+        let cursor = astra_turn_core::active_conversation::ActiveConversation::empty(
+            astra_services::local_owner_scope().id(),
+            session_id,
+        )
+        .unwrap()
+        .prepare_commit(1, None, messages.clone())
+        .unwrap()
+        .next
+        .cursor()
+        .clone();
         let heavy = HeavyCheckpoint {
             light: LightCheckpoint {
                 protocol_version: PROTOCOL_VERSION,
@@ -370,16 +408,15 @@ mod tests {
                 total_tokens: 42,
                 created_at: epoch_ms(),
             },
-            conversation_cursor: None,
-            messages: vec![
-                serde_json::json!({"role": "user", "content": "previous question"}),
-                serde_json::json!({"role": "assistant", "content": "previous answer"}),
-            ],
+            conversation_cursor: Some(cursor),
+            messages,
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -390,6 +427,7 @@ mod tests {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         write_step_checkpoint(
@@ -405,7 +443,7 @@ mod tests {
         session_id: &str,
         sequence: u64,
         messages: Vec<serde_json::Value>,
-        activated_deferred_tool_names: Vec<String>,
+        deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     ) -> astra_turn_types::ResumeBundleV1 {
         let cursor = astra_turn_types::SessionCursorV1 {
             schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
@@ -423,7 +461,7 @@ mod tests {
         let activation = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
             cursor.clone(),
             astra_turn_types::ResumeActivationProjectionV1 {
-                deferred_tool_names: activated_deferred_tool_names,
+                deferred_tool_activations,
             },
         );
         astra_turn_types::select_resume_bundle(
@@ -462,6 +500,32 @@ mod tests {
             .and(path(format!("/sessions/{session_id}")))
             .and(header_exists("authorization"))
             .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_missing_resume(server: &MockServer, session_id: &str) {
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_cloud_resumable_session(server: &MockServer, session_id: &str) {
+        Mock::given(method("GET"))
+            .and(path("/sessions/resumable"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                astra_services::session_restore::ResumableSessionsResponse {
+                    sessions: vec![astra_services::session_restore::RestoredSession {
+                        session_id: session_id.to_string(),
+                        turn_count: 1,
+                        ..Default::default()
+                    }],
+                },
+            ))
             .mount(server)
             .await;
     }
@@ -531,7 +595,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn continuation_prefers_local_canonical_evidence_over_lossy_restore_projection() {
+    fn continuation_rejects_unversioned_remote_projection_before_local_selection() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("routing-canonical-{}", uuid::Uuid::new_v4());
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
@@ -554,10 +618,7 @@ mod tests {
                 }),
                 serde_json::json!({"role": "assistant", "content": "done"}),
             ],
-            &astra_turn_core::conversation_log::SessionStateCompact {
-                activated_deferred_tool_names: vec!["github".to_string()],
-                ..Default::default()
-            },
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
         )
         .unwrap();
         let routing = OneShotSessionRouting {
@@ -572,24 +633,10 @@ mod tests {
             },
         };
 
-        let continuation = routing
+        let error = routing
             .continuation()
-            .expect("causal selection")
-            .expect("continuation");
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "one-shot routing must restore prompt-visible activation from the same canonical projection as its messages"
-        );
-
-        assert!(
-            continuation
-                .messages
-                .iter()
-                .any(|message| message["role"] == "tool"
-                    && message["content"] == "canonical evidence"),
-            "a lower-fidelity restore projection must not replace canonical local history"
-        );
+            .expect_err("unversioned remote history must fail closed");
+        assert!(error.contains("required versioned ResumeBundle"), "{error}");
     }
 
     #[test]
@@ -663,11 +710,85 @@ mod tests {
                 .all(|message| message["content"] != "stale local answer"),
             "an older CSL history must not be paired with a newer restored turn clock"
         );
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "a newer restored projection must reconstruct activation from its own durable tool-search evidence"
+        assert!(continuation.deferred_tool_activations.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attached_session_uses_server_canonical_authority_across_journal_clock_domains() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("routing-authority-{}", uuid::Uuid::new_v4());
+        let owner_id = astra_services::local_owner_scope().id().to_string();
+        let server_messages = vec![
+            serde_json::json!({"role": "user", "content": "server question"}),
+            serde_json::json!({"role": "assistant", "content": "server answer"}),
+        ];
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, &session_id)
+                .unwrap();
+        let first = active
+            .prepare_commit(1, None, server_messages.clone())
+            .unwrap();
+        let mut local_messages = server_messages.clone();
+        local_messages.extend([
+            serde_json::json!({"role": "user", "content": "unacknowledged local question"}),
+            serde_json::json!({"role": "assistant", "content": "unacknowledged local answer"}),
+        ]);
+        let second = first.next.prepare_commit(2, None, local_messages).unwrap();
+        let writer = astra_services::session_journal::JournalWriter::new(&session_id).unwrap();
+        for (turn, commit) in [(1, first.commit), (2, second.commit)] {
+            writer
+                .append(
+                    &astra_services::session_journal::JournalEvent::turn(
+                        Some(&session_id),
+                        turn,
+                        Some("test-model"),
+                        "display user",
+                        "display assistant",
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                    .with_conversation_commit(commit),
+                )
+                .unwrap();
+        }
+
+        let mut server_bundle = typed_resume_bundle(&session_id, 1, server_messages, Vec::new());
+        server_bundle.source = astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        // Server and CLI journals allocate event sequences independently. A
+        // larger Server event sequence combined with a smaller conversation
+        // sequence is not a fork and must never be compared as one clock.
+        server_bundle.cursor.journal_event_seq = 100;
+        let routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.clone()),
+            history_source_session_id: Some(session_id),
+            resume_metadata: OneShotSessionResumeMetadata {
+                completed_turn_count: 1,
+                resume_bundle: Some(server_bundle),
+                ..Default::default()
+            },
+        };
+
+        let continuation = routing
+            .continuation()
+            .expect("Server authority must resolve independent journal clocks")
+            .expect("canonical Server continuation");
+
+        assert!(
+            continuation
+                .messages
+                .iter()
+                .any(|message| message["content"] == "server answer")
         );
+        assert!(
+            continuation
+                .messages
+                .iter()
+                .all(|message| message["content"] != "unacknowledged local answer")
+        );
+        assert_eq!(continuation.resume.cursor.journal_event_seq, 100);
     }
 
     #[test]
@@ -858,7 +979,11 @@ mod tests {
                     &session_id,
                     4,
                     remote_messages,
-                    vec!["github".to_string()],
+                    vec![astra_turn_types::DeferredToolActivation {
+                        name: "github".to_string(),
+                        schema_digest: "sha256:remote".to_string(),
+                        descriptor: None,
+                    }],
                 )),
                 restored_from_cloud: true,
                 ..Default::default()
@@ -904,7 +1029,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn networked_resume_uses_server_clock_instead_of_unacked_local_clock() {
+    async fn networked_resume_rejects_an_authoritative_response_without_a_bundle() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
@@ -941,16 +1066,73 @@ mod tests {
         .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let routing =
-            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id), true)
-                .await
-                .expect("resume should tolerate a lagging remote projection");
+        let error = resolve_one_shot_session_routing(&api, Some("default"), Some(session_id), true)
+            .await
+            .expect_err("a selected Server session must not resume without a typed bundle");
 
-        assert_eq!(
-            routing.next_server_turn_index(),
-            1,
-            "a local-only turn clock is not proof that the Server accepted those turns"
+        assert!(
+            error.contains("required versioned ResumeBundle"),
+            "unexpected error: {error}"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn explicit_server_session_propagates_missing_restore_state() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_existing_session(&server, &session_id).await;
+        mock_missing_resume(&server, &session_id).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error =
+            resolve_one_shot_session_routing(&api, Some("default"), Some(session_id.clone()), true)
+                .await
+                .expect_err("an explicit session with no restore state must fail closed");
+
+        assert!(error.contains("no restorable canonical state"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn automatically_selected_server_session_propagates_missing_restore_state() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        mock_cloud_resumable_session(&server, &session_id).await;
+        mock_missing_resume(&server, &session_id).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = resolve_one_shot_session_routing(&api, Some("default"), None, true)
+            .await
+            .expect_err("a selected Server session with no restore state must fail closed");
+
+        assert!(error.contains("no restorable canonical state"), "{error}");
     }
 
     #[serial_test::serial]
@@ -990,7 +1172,11 @@ mod tests {
                     &session_id,
                     5,
                     cloud_messages,
-                    vec!["github".to_string()],
+                    vec![astra_turn_types::DeferredToolActivation {
+                        name: "github".to_string(),
+                        schema_digest: "sha256:cloud".to_string(),
+                        descriptor: None,
+                    }],
                 )),
                 restored_from_cloud: true,
                 ..Default::default()
@@ -1015,11 +1201,7 @@ mod tests {
             .continuation()
             .expect("causal selection")
             .expect("cloud resume messages should feed one-shot continuation");
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "cloud checkpoint sidecars must survive even when compaction removed tool-search evidence"
-        );
+        assert_eq!(continuation.deferred_tool_activations.len(), 1);
         assert_eq!(continuation.messages.len(), 2);
         assert_eq!(continuation.messages[0]["content"], "cloud question");
         assert_eq!(continuation.messages[1]["content"], "cloud answer");

@@ -6,36 +6,109 @@ Scripts are organized by responsibility and kept dependency-light.
 
 ```text
 scripts/
-├── dev/
-│   ├── init.sh
-│   ├── start-api.sh
-│   └── stop-api.sh
-├── load/
-│   ├── cleanup_pressure_probe.py
-│   ├── durable_event_pressure_probe.py
-│   ├── extract_slow_sql.py
-│   ├── mock_openai_server.py
-│   ├── multi_cli_capacity_probe.py
-│   └── db_capacity_report.py
-├── schema/
-│   └── schema_inventory.py
-├── setup/
-│   └── demo-init.sh
-├── ops/
-│   ├── backup.sh
-│   ├── deploy.sh
-│   ├── health_check.sh
-│   └── restore.sh
-└── README.md
+├── ci/       # repository contracts and changed-path CI routing
+├── dev/      # local API, Web, and Edge lifecycle helpers
+├── e2e/      # capability and test-case manifest validators
+├── harness/  # Terminal-Bench lifecycle and offline contract tests
+├── load/     # capacity probes, mock provider, reports, and unit tests
+├── ops/      # deployment, health, backup, and restore helpers
+├── schema/   # schema inventory and its contract tests
+├── setup/    # interactive stack and demo environment initialization
+└── *.sh/*.py # release, production-baseline, and diagram utilities
 ```
 
+## Offline Contract Tests
+
+These checks need no service, database, model provider, or API credential. The
+repository and routing checks always run; CI routes the remaining suites only
+when their owning script area changes:
+
+```sh
+python3 scripts/ci/validate_repository.py
+python3 scripts/ci/test_ci_scope.py
+python3 -m unittest \
+  scripts.harness.test_benchmark_model_seed \
+  scripts.harness.test_case_history \
+  scripts.harness.test_fresh_database_contract
+bash scripts/harness/test_local_gateway_contract.sh
+python3 -m unittest discover -s scripts/load -p 'test_*.py'
+python3 scripts/schema/test_schema_inventory.py
+python3 scripts/e2e/validate_capability_matrix.py
+```
+
+The repository validator covers local documentation links, JSON and shell
+syntax, pinned GitHub Actions, mirrored agent instructions, accidental tracked
+artifacts, executable script modes, and monitoring metric references.
+
+Rust CI installs mold using only the runner's Ubuntu sources (`ubuntu.sources`,
+or `sources.list` on older images). Third-party repository outages therefore do
+not block linker setup. These APT options apply only to the install step, retain
+signature and package integrity verification, and keep Ubuntu download failures
+fatal; they do not modify the runner's source configuration.
+
+Rust CI uses `scripts/ci/configure-sccache.sh` to probe the optional compiler
+cache before enabling it. Backend startup failures fall back to direct `rustc`,
+and sccache's native I/O fallback covers interruptions after startup. The
+offline fault-injection contract is included in `validate_repository.py`.
+
+The remaining Harness tests exercise Harbor integration contracts and require
+the benchmark environment. Run the complete suite there with
+`python3 -m unittest discover -s scripts/harness -p 'test_*.py'`.
+
 ## Key Scripts
+
+### `scripts/harness/`
+
+Owns the Terminal-Bench/Harbor benchmark lifecycle: preflight checks, fresh
+database contracts, process supervision, sealed run snapshots, verifier
+readiness, recovery metadata, and the current benchmark launcher. Its colocated
+tests cover both dependency-free lifecycle contracts and Harbor integration.
+
+Run the dependency-free harness tests without starting a benchmark:
+
+```sh
+python3 -m unittest \
+  scripts.harness.test_benchmark_model_seed \
+  scripts.harness.test_case_history \
+  scripts.harness.test_fresh_database_contract
+bash scripts/harness/test_local_gateway_contract.sh
+```
+
+See the [Terminal-Bench results](../README.md#terminal-bench-21) for the public
+benchmark summary.
 
 ### `scripts/dev/init.sh`
 Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
 
+### `scripts/lib/env_file.sh`
+Provides the canonical, non-evaluating reader and placeholder checks for Astra
+environment templates. Source this helper instead of independently parsing
+dotenv values in setup or deployment scripts.
+
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
+
+### `scripts/setup/stack-setup.sh`
+Runs the human-facing first-run flow behind `make stack-setup`. It validates the
+intended installation before asking for provider configuration, validates the
+embedding endpoint before startup, inventories current Compose state, and gives
+explicit update/separate/leave and retry/stop/inspect choices. It keeps keys out
+of output, verifies the complete stack, persists the CLI API URL, shows
+administrator/model status, and optionally delegates admin/model configuration
+to `astra admin setup`. Use `make stack-up` and
+explicit variables for automation. Installation naming, independent volume/log
+paths, automatic port selection, and final host-port uniqueness checks are owned by
+`scripts/setup/stack_identity.sh` and its contract tests.
+
+`scripts/setup/stack_env_write.sh` owns credential-safe environment updates and
+the EXIT cleanup contract for setup staging and per-write temporary files.
+
+`scripts/setup/stack_status.sh` owns the read-only model-catalog projection
+used by the wizard's status summary, including active and inactive model names.
+
+### `scripts/setup/check_embedding.py`
+Performs the credential-safe OpenAI-compatible embedding probe used by the
+wizard and verifies that the returned vector matches the configured dimension.
 
 ### `scripts/load/multi_cli_capacity_probe.py`
 Runs a stdlib-only concurrent `POST /chat/stream` SSE capacity probe for the
@@ -75,6 +148,32 @@ python3 scripts/load/db_capacity_report.py --probe-summary tmp/capacity-probe/mo
 admission limits, DB pressure, and DB saturation. Do not treat slow SQL count
 alone as proof that production DB capacity is insufficient; a production claim
 also needs multi-pod or staging/prod MatrixOne metrics.
+
+### `scripts/load/work_surface_capacity_probe.py`
+
+Runs a read-only, concurrent `GET /v1/works/{work_id}/branches/{branch_id}/execution`
+probe for the cross-surface Work journey. The `cross-surface-100` profile maps
+100 readers over 25 owners and four Session/Work pairs per owner, records p50,
+p95, and p99 projection latency, and reports the expected active-view polling
+rate. Identifier templates accept `{owner_index}`, `{session_index}`,
+`{reader_index}`, `{round_index}`, and `{request_id}`. Use distinct access
+tokens for owner isolation; `--check-owner-isolation` sends a paired foreign
+owner request and requires the API's not-found response without recording
+credentials.
+
+```sh
+python3 scripts/load/work_surface_capacity_probe.py --profile cross-surface-100 \
+  --base-url http://127.0.0.1:3000 \
+  --work-id-template 'work-{owner_index}-{session_index}' \
+  --branch-id-template 'branch-{owner_index}-{session_index}' \
+  --token-file tokens.json --require-distinct-users --check-owner-isolation \
+  --max-p95-ms 1000 --max-p99-ms 2000 \
+  --output-dir tmp/capacity-probe/work-surface-100
+```
+
+Run with `--dry-run` first to verify the owner/Session mapping. The probe
+does not claim database capacity by itself; combine its summary with API,
+database, browser, and Edge metrics from the same deployment window.
 
 ### `scripts/load/cleanup_pressure_probe.py`
 Runs ignored live MatrixOne cleanup pressure probes for the current retention
@@ -129,14 +228,104 @@ python3 scripts/schema/schema_inventory.py --fail-on-duplicates --fail-on-foreig
 python3 scripts/schema/test_schema_inventory.py
 ```
 
-### Public CLI Installer
-The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
+### `scripts/e2e/validate_capability_matrix.py`
+Validates that every `system_test` name in the product capability matrix still
+resolves to a real Rust function somewhere under `crates/`. This is an
+offline, dependency-free guard against renamed or deleted evidence anchors:
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+python3 scripts/e2e/validate_capability_matrix.py
 ```
 
-Keep installer behavior there so the public install path, documentation, and release assets stay in one repository.
+### `scripts/render_readme_diagrams.py`
+Regenerates the README architecture diagrams under `docs/assets/diagrams/` as
+matching light and dark SVG pairs. Standard library only:
+
+```sh
+python3 scripts/render_readme_diagrams.py
+```
+
+Edit the diagram definitions in this script rather than the generated SVG, then
+commit the regenerated files.
+
+### `scripts/render_readme_demo.py`
+Regenerates the 20-second illustrative context-to-execution walkthrough
+embedded near the top of the README. It uses the repository's Inconsolata
+fonts and dark TUI theme colors, and requires Pillow:
+
+```sh
+python3 scripts/render_readme_demo.py
+```
+
+Keep the flow explicitly labeled as illustrative so the asset explains Astra's
+runtime contract without being mistaken for a captured live session.
+
+### `scripts/install-astra.sh`
+Installs a checksum-verified archive containing the `astra` CLI and
+`astra-edge` User Runner from this repository's GitHub Releases:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The installer, source tag, release assets, and user documentation deliberately
+live in the same repository. Checksums are mandatory; a missing or mismatched
+checksum fails the installation. Existing clients are backed up during the
+two-binary replacement and restored if the update cannot finish. After a
+successful install, the script prints a version-matched source checkout and
+`make stack-setup` command so the CLI, User Runner, Server, MatrixOne, and
+Memoria do not silently drift across releases.
+
+### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
+The release workflows use these scripts as shared, locally testable gates.
+The first requires every versioned workspace surface, including the default
+all-in-one Astra image, to match the selected release version. Its optional
+`--root <path>` argument lets the trusted release controller inspect a
+historical source worktree without executing scripts from that worktree. The
+second requires the complete four-platform client archive set, verifies every
+checksum and archive layout, and creates the aggregate checksum manifest.
+`scripts/ci/test_release_contract.sh` exercises the success, rollback, and
+tampering paths without compiling binaries or publishing artifacts.
+`scripts/ci/test_release_manifest_contract.sh` separately proves immutable
+Docker-tag creation, exact recovery, and rejection of duplicate platform
+candidates with an offline registry fixture. The shared
+`scripts/reconcile-docker-manifest.sh` performs the same platform-to-digest
+reconciliation at the actual publication boundary.
+`scripts/reconcile-docker-candidate-tag.sh` creates or verifies one immutable,
+run-scoped staging tag per server platform so registry cleanup cannot discard
+an otherwise retained recovery candidate.
+`scripts/copy-immutable-container-tag.sh` copies a verified manifest between
+repositories only after `scripts/inspect-harbor-artifact.py` resolves the exact
+target through Harbor's structured API. A 404 from that artifact endpoint
+permits first publication for either a new repository or a new tag;
+authentication, network, malformed-response, and registry failures fail closed.
+An existing tag is accepted only when its digest already matches the source.
+
+### `scripts/verify_github_release_assets.py`
+
+Before a draft GitHub Release becomes public, this gate requires the remote
+asset set to match the locally verified files exactly by name, byte size,
+upload state, and GitHub SHA-256 digest. Missing, additional, incomplete, and
+changed assets all fail closed.
+
+`scripts/prepare_github_release_body.py` binds a draft body to its immutable
+release owner and source. A repeated staging attempt reuses and verifies the
+same body without appending generated notes, while unrelated manual drafts are
+rejected.
+
+### `scripts/prepare-release-version.py`
+
+Used by `make release-prepare VERSION=X.Y.Z` to synchronize all release version
+surfaces before review. It starts only from a consistent, unmodified version
+set, stages every replacement before replacing any destination, and validates
+the result. It deliberately leaves MatrixOne and Memoria digest selection to a
+maintainer.
 
 ### `scripts/ops/*.sh`
 Operational helpers for health checks, backup/restore, and deployment.
+`deploy.sh [api-replicas]` validates and starts the canonical production
+Compose profile using root `.env.production` (override the path with
+`ASTRA_PRODUCTION_ENV_FILE`). `validate_production_env.sh` enforces required
+values, immutable image selection, trusted CORS origins, and minimum secret
+lengths without evaluating the environment file.

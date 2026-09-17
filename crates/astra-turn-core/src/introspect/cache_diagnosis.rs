@@ -37,6 +37,11 @@ pub struct RoundSnapshot {
     pub round: u32,
     pub provider: String,
     pub model: String,
+    /// Exact resolved cache shape used to assemble this request. Old captures
+    /// may not contain it; shape-dependent rules must then stay silent rather
+    /// than guess from provider/model names.
+    #[serde(default)]
+    pub cache_capability: Option<crate::cache_placement::CacheCapability>,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     /// Count of tool schemas sent in this request.
@@ -122,6 +127,11 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let cache_capability = v
+        .get("cache_capability")
+        .or_else(|| v.pointer("/trace/cache_capability"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
     let usage = v.get("response").and_then(|r| r.get("usage"));
     let cache_read_tokens = usage
         .and_then(|u| u.get("cached_input_tokens"))
@@ -224,6 +234,7 @@ pub fn snapshot_from_capture_json(v: &serde_json::Value) -> RoundSnapshot {
         round,
         provider,
         model,
+        cache_capability,
         cache_read_tokens,
         cache_creation_tokens,
         tool_count,
@@ -316,7 +327,7 @@ pub fn load_session_captures(session_dir: &std::path::Path) -> std::io::Result<V
         if !name.starts_with("llm_capture_t") || !name.ends_with(".json") {
             continue;
         }
-        // Accept both the production name (`llm_capture_t3_r0_bridge_inprocess_success_…`)
+        // Accept both the production name (`llm_capture_t3_r0_server_loop_success_…`)
         // and the scrubbed fixture name (`t3_r0.json`). The `t{N}_r{M}`
         // tokens always appear and fully identify the position.
         let rest = name.trim_start_matches("llm_capture_");
@@ -641,19 +652,18 @@ fn rule_cache_creation_waste(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
 /// - `TailSuffix` providers (OpenAI auto-prefix): volatile content
 ///   must be in the LAST message only. Earlier positions are inside
 ///   the auto-prefix and break on every change.
-/// - `CurrentUserOnly` providers (MiniMax strict history): volatile
-///   content may only appear on round 0 of a visible turn. Session
-///   986a553e observed volatile bytes at msg[7] in every tool-loop
-///   round, causing cache_read to collapse from 7680 to 0 for six
-///   consecutive rounds.
+/// - `CurrentUserOnly` placement keeps any admitted runtime context at
+///   the current-user boundary. Whether optional content is admitted is
+///   a separate delivery policy and cannot be inferred from placement.
 /// - `Free` / unknown: not enforced.
 ///
-/// Signal is provider+model aware; wrong-placement gets Critical,
+/// Signal is driven by the exact capability captured from the resolved model
+/// offering; wrong-placement gets Critical,
 /// matching-placement is silent. If `volatile_msg_indices` is empty,
 /// the rule has nothing to check → silent.
 #[must_use]
 fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFinding> {
-    use crate::cache_placement::{CacheCapability, VolatilePlacement};
+    use crate::cache_placement::VolatilePlacement;
     // Take the most recent round with any volatile signal at a
     // message position we actually police. System messages carry
     // their own block-level cache_control layout (runtime owns that);
@@ -665,7 +675,7 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
             .iter()
             .any(|&idx| role_at(r, idx) != "system")
     })?;
-    let cap = CacheCapability::for_provider_and_model(&sample.provider, &sample.model);
+    let cap = sample.cache_capability?;
     // Last non-system volatile index — that's the relevant one.
     let vol_idx = *sample
         .volatile_msg_indices
@@ -754,7 +764,11 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
-        VolatilePlacement::Free => None,
+        // Append-only required controls become durable conversation frames;
+        // their consumed historical positions are intentionally not the tail.
+        // This legacy snapshot rule has no lifetime/provenance facts with
+        // which to diagnose that explicit deployment shape.
+        VolatilePlacement::AppendOnlyUserTail | VolatilePlacement::Free => None,
     }
 }
 
@@ -1003,6 +1017,9 @@ mod tests {
             round,
             provider: provider.into(),
             model: "test-model".into(),
+            cache_capability: Some(crate::cache_placement::CacheCapability::for_provider(
+                provider,
+            )),
             cache_read_tokens: cr,
             cache_creation_tokens: cc,
             tool_count,
@@ -1056,6 +1073,9 @@ mod tests {
             round,
             provider: provider.into(),
             model: model.into(),
+            cache_capability: Some(crate::cache_placement::CacheCapability::for_provider(
+                provider,
+            )),
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_count: 0,
@@ -1518,7 +1538,7 @@ mod tests {
     fn volatile_rule_fires_on_minimax_tool_loop_round() {
         // Session 986a553e fingerprint: MiniMax tool-loop round 1+ with
         // `## Self-Awareness` injected at a mid-history user message.
-        let rs = vec![snap_with_volatile(
+        let mut sample = snap_with_volatile(
             4,
             1,
             "openai",
@@ -1526,7 +1546,14 @@ mod tests {
             /* msg_cc */ &[],
             /* volatile */ &[7],
             /* message_count */ 11,
-        )];
+        );
+        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        });
+        let rs = vec![sample];
         let findings = evaluate_all(&rs);
         let f = findings
             .iter()
@@ -1545,15 +1572,14 @@ mod tests {
         // Updated contract (see CurrentUserOnly docs): even round 0
         // volatile injection on MiniMax is a cache-miss trigger,
         // because round 1+ won't have it and bytes at msg[1] differ.
-        let rs = vec![snap_with_volatile(
-            4,
-            0,
-            "openai",
-            "MiniMax-M2.7",
-            &[],
-            &[7],
-            8,
-        )];
+        let mut sample = snap_with_volatile(4, 0, "openai", "MiniMax-M2.7", &[], &[7], 8);
+        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        });
+        let rs = vec![sample];
         let findings = evaluate_all(&rs);
         assert!(
             findings
@@ -1693,7 +1719,7 @@ mod tests {
     /// This is the bug we're actually guarding against.
     #[test]
     fn volatile_rule_still_fires_on_user_mid_history() {
-        let rs = vec![snap_with_volatile_and_roles(
+        let mut sample = snap_with_volatile_and_roles(
             5,
             0,
             "bedrock",
@@ -1714,8 +1740,14 @@ mod tests {
                 "assistant",
                 "user",
             ],
-        )];
-        let findings = evaluate_all(&rs);
+        );
+        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::BedrockCachePoint,
+            volatile_placement: crate::cache_placement::VolatilePlacement::MarkerIsolated,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        });
+        let findings = evaluate_all(&[sample]);
         assert!(
             findings
                 .iter()
@@ -1741,6 +1773,33 @@ mod tests {
             !evaluate_all(&rs)
                 .iter()
                 .any(|f| f.rule_id == "volatile_in_cached_prefix"),
+        );
+    }
+
+    #[test]
+    fn volatile_rule_silent_without_captured_capability() {
+        let mut sample = snap_with_volatile(1, 0, "openai", "alias", &[], &[3], 6);
+        sample.cache_capability = None;
+        assert!(
+            !evaluate_all(&[sample])
+                .iter()
+                .any(|finding| finding.rule_id == "volatile_in_cached_prefix")
+        );
+    }
+
+    #[test]
+    fn volatile_rule_accepts_append_only_runtime_history_positions() {
+        let mut sample = snap_with_volatile(2, 3, "openai", "alias", &[], &[4], 9);
+        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: crate::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        });
+        assert!(
+            !evaluate_all(&[sample])
+                .iter()
+                .any(|finding| finding.rule_id == "volatile_in_cached_prefix")
         );
     }
 
@@ -1822,7 +1881,7 @@ mod tests {
 
     #[test]
     fn load_session_captures_picks_up_both_filename_styles() {
-        // Production files look like `llm_capture_t3_r0_bridge_inprocess_success_12345.json`,
+        // Production files look like `llm_capture_t3_r0_server_loop_success_12345.json`,
         // scrubbed fixture files look like `llm_capture_t3_r0.json` OR even `t3_r0.json`.
         // The loader must recognize the production style at minimum.
         let tmp = std::env::temp_dir().join(format!("astra-cache-test-{}", std::process::id(),));
@@ -1831,7 +1890,7 @@ mod tests {
         for e in std::fs::read_dir(&tmp).unwrap().flatten() {
             let _ = std::fs::remove_file(e.path());
         }
-        let prod_style = tmp.join("llm_capture_t1_r0_bridge_inprocess_success_42.json");
+        let prod_style = tmp.join("llm_capture_t1_r0_server_loop_success_42.json");
         let scrubbed_style = tmp.join("llm_capture_t2_r5_other.json");
         let unrelated = tmp.join("not_a_capture.json");
         for (p, turn, round) in [(&prod_style, 1, 0), (&scrubbed_style, 2, 5)] {

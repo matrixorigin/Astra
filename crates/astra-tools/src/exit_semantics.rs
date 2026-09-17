@@ -75,6 +75,20 @@ impl CommandResultClass {
     }
 }
 
+/// Source-authored recovery evidence for a command that executed but did not
+/// complete successfully. The command's process status is authoritative here:
+/// callers must not re-classify its stdout/stderr as tool-schema, credential,
+/// or transport failures.
+#[must_use]
+pub fn command_failed_evidence() -> astra_core::ToolFailureEvidence {
+    astra_core::ToolFailureEvidence::new(
+        astra_core::ErrorKind::Unknown,
+        astra_core::ToolFailureCause::CommandFailed,
+        false,
+        vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+    )
+}
+
 #[must_use]
 pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if exit_code == 0 {
@@ -88,7 +102,14 @@ pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     {
         return ExitSemantics::TimedOut;
     }
-    if exit_code == 141 && pipeline_sigpipe_is_benign(command) {
+    if matches!(exit_code, 141) && pipeline_sigpipe_is_benign(command) {
+        return ExitSemantics::PipelineTruncated;
+    }
+    // libcurl reports a downstream EPIPE as CURLE_WRITE_ERROR (23) instead of
+    // surfacing the shell's SIGPIPE status (141).  With a bounded passive sink
+    // such as `head -c`, that is the same normal truncation boundary; outside
+    // this typed pipeline shape, 23 remains a real command failure.
+    if exit_code == 23 && pipeline_curl_write_error_is_benign(command) {
         return ExitSemantics::PipelineTruncated;
     }
     if exit_code == 128 && matches!(command_family(command).as_deref(), Some("git")) {
@@ -145,26 +166,29 @@ pub fn classify_command_result(
     // can legitimately contain phrases such as "command not found" or
     // "test failed". Treating those phrases as control signals turns inspected
     // text into a false runtime failure.
-    if let Some(code) = exit_code {
-        // POSIX shells reserve 126 for "found but not executable" and 127 for
-        // "command not found". Both are authoritative environment failures;
-        // do not depend on localized or concurrently truncated stderr text to
-        // preserve that classification.
-        if matches!(code, 126 | 127) {
-            return CommandResultClass::EnvFailure;
-        }
-        match classify_exit(command, code) {
+    let exit_semantics = exit_code.map(|code| classify_exit(command, code));
+    // POSIX shells reserve 126 for "found but not executable" and 127 for
+    // "command not found". Both are authoritative environment failures; do
+    // not depend on localized or truncated stderr text.
+    if matches!(exit_code, Some(126 | 127)) {
+        return CommandResultClass::EnvFailure;
+    }
+    if let Some(semantics) = exit_semantics {
+        match semantics {
             ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
                 return CommandResultClass::Success;
             }
             ExitSemantics::EmptyResult => return CommandResultClass::EmptyResult,
-            ExitSemantics::DomainNegative => {
-                return if is_build_test_or_lint_command(command) {
-                    CommandResultClass::TestFailure
-                } else {
-                    CommandResultClass::DomainNegative
-                };
+            // Non-build domain negatives (notably `diff` and `test`) are
+            // complete semantic answers. Their output is domain data and
+            // must never be reinterpreted as an infrastructure signal.
+            ExitSemantics::DomainNegative if !is_build_test_or_lint_command(command) => {
+                return CommandResultClass::DomainNegative;
             }
+            // A build/test/lint non-zero needs a positive, executor-produced
+            // failure signature below before it can authorize repair. Unknown
+            // non-zero outcomes fail closed as inconclusive.
+            ExitSemantics::DomainNegative => {}
             ExitSemantics::TimedOut | ExitSemantics::Cancelled | ExitSemantics::Signaled => {
                 return CommandResultClass::ExecutionError;
             }
@@ -185,8 +209,15 @@ pub fn classify_command_result(
         return CommandResultClass::EnvFailure;
     }
 
-    if is_build_test_or_lint_command(command) && looks_like_build_or_test_failure(&lower) {
+    if matches!(exit_semantics, Some(ExitSemantics::DomainNegative))
+        && is_build_test_or_lint_command(command)
+        && looks_like_build_or_test_failure(&lower)
+    {
         return CommandResultClass::TestFailure;
+    }
+
+    if matches!(exit_semantics, Some(ExitSemantics::DomainNegative)) {
+        return CommandResultClass::Inconclusive;
     }
 
     match exit_code {
@@ -197,13 +228,7 @@ pub fn classify_command_result(
                 CommandResultClass::ExecutionError
             }
         }
-        None => {
-            if looks_like_build_or_test_failure(&lower) {
-                CommandResultClass::TestFailure
-            } else {
-                CommandResultClass::Inconclusive
-            }
-        }
+        None => CommandResultClass::Inconclusive,
     }
 }
 
@@ -376,6 +401,112 @@ fn pipeline_sigpipe_is_benign(command: &str) -> bool {
             .is_some_and(|last| is_passive_pipe_sink(last))
 }
 
+fn pipeline_curl_write_error_is_benign(command: &str) -> bool {
+    let final_command = last_shell_list_segment(command);
+    let segments = split_pipeline_segments(final_command);
+    // Without per-process wait status, only recognize the narrow two-process
+    // form for which libcurl's write error has an unambiguous owner: curl's
+    // stdout is directly connected to a bounded passive sink.  A longer
+    // pipeline can fail in an intermediate process, and an output redirect or
+    // curl's file-output options make code 23 a real curl failure rather than
+    // downstream EPIPE.
+    segments.len() == 2
+        && segment_family(segments.first().copied().unwrap_or_default()).as_deref() == Some("curl")
+        && curl_segment_writes_to_pipeline_stdout(segments[0])
+        && segments
+            .last()
+            .is_some_and(|last| is_passive_pipe_sink(last))
+}
+
+fn curl_segment_writes_to_pipeline_stdout(segment: &str) -> bool {
+    if has_unquoted_stdout_redirect(segment) {
+        return false;
+    }
+
+    shell_words(segment).into_iter().all(|token| {
+        !matches!(
+            token.as_str(),
+            "-o" | "-O" | "--output" | "--remote-name" | "--remote-name-all"
+        ) && !token.starts_with("--output=")
+            && !token.starts_with("--remote-name=")
+            // curl accepts the short option in attached form (`-ofile`).
+            && !(token.len() > 2
+                && token.starts_with('-')
+                && !token.starts_with("--")
+                && token.as_bytes()[1..].contains(&b'o'))
+    })
+}
+
+fn shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in segment.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn has_unquoted_stdout_redirect(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        match byte {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single && !in_double => {
+                let mut fd_start = index;
+                while fd_start > 0 && bytes[fd_start - 1].is_ascii_digit() {
+                    fd_start -= 1;
+                }
+                let fd = &bytes[fd_start..index];
+                // No explicit descriptor means stdout; descriptor 1 is
+                // stdout.  Other descriptors (notably 2>/dev/null) do not
+                // change the pipeline's stdout owner.
+                if fd.is_empty() || fd == b"1" {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn last_shell_list_segment(command: &str) -> &str {
     let bytes = command.as_bytes();
     let mut last_start = 0;
@@ -489,6 +620,13 @@ fn looks_like_env_failure(lower_output: &str) -> bool {
         "failed to create virtual environment",
         "error: externally-managed-environment",
         "no python at",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "could not resolve host",
+        "connection timed out",
+        "failed to download",
+        "no space left on device",
+        "permission denied",
     ]
     .iter()
     .any(|needle| lower_output.contains(needle))
@@ -517,7 +655,22 @@ fn looks_like_build_or_test_failure(lower_output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandResultClass, ExitSemantics, classify_command_result, classify_exit};
+    use super::{
+        CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
+        command_failed_evidence,
+    };
+
+    #[test]
+    fn command_failure_evidence_is_typed_and_non_retryable() {
+        let evidence = command_failed_evidence();
+        assert_eq!(evidence.kind, astra_core::ErrorKind::Unknown);
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::CommandFailed);
+        assert!(!evidence.retryable);
+        assert_eq!(
+            evidence.recovery_actions,
+            vec![astra_core::ToolRecoveryAction::InspectStructuredFailure]
+        );
+    }
 
     #[test]
     fn grep_no_match_is_empty_result() {
@@ -621,6 +774,45 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn curl_write_error_to_bounded_sink_is_pipeline_truncation() {
+        let command = "curl -s https://example.test/feed | head -c 2000";
+        assert_eq!(classify_exit(command, 23), ExitSemantics::PipelineTruncated);
+        assert_eq!(
+            classify_command_result(command, "{\"status\":\"ok\"}", "", Some(23)),
+            CommandResultClass::Success
+        );
+        assert_eq!(
+            classify_exit("curl -s -o /tmp/feed https://example.test/feed", 23),
+            ExitSemantics::ExecutionError
+        );
+        for command in [
+            "curl -s -o /dev/full https://example.test/feed | head -c 2000",
+            "curl -s --output=/dev/full https://example.test/feed | head -c 2000",
+            "curl -s https://example.test/feed > /dev/full | head -c 2000",
+            "curl -s https://example.test/feed 1>/dev/full | head -c 2000",
+            "curl -s -O https://example.test/feed | head -c 2000",
+            "curl -s https://example.test/feed | sed -n 1,10p | head -c 2000",
+        ] {
+            assert_eq!(
+                classify_exit(command, 23),
+                ExitSemantics::ExecutionError,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_exit(
+                "curl -s https://example.test/feed 2>/dev/null | head -c 2000",
+                23
+            ),
+            ExitSemantics::PipelineTruncated
+        );
+        assert_eq!(
+            classify_exit("python producer | head -c 2000", 23),
+            ExitSemantics::ExecutionError
+        );
     }
 
     #[test]
@@ -805,6 +997,35 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn nonzero_build_test_environment_failure_is_not_test_failure() {
+        assert_eq!(
+            classify_command_result(
+                "cargo test --lib",
+                "",
+                "error: failed to get dependency: network is unreachable",
+                Some(101),
+            ),
+            CommandResultClass::EnvFailure
+        );
+    }
+
+    #[test]
+    fn nonzero_build_test_without_positive_failure_evidence_is_inconclusive() {
+        assert_eq!(
+            classify_command_result("cargo test --lib", "", "process exited 101", Some(101)),
+            CommandResultClass::Inconclusive
+        );
+    }
+
+    #[test]
+    fn diff_domain_result_does_not_promote_its_content_to_environment_failure() {
+        assert_eq!(
+            classify_command_result("diff left right", "permission denied", "", Some(1)),
+            CommandResultClass::DomainNegative
+        );
     }
 
     #[test]

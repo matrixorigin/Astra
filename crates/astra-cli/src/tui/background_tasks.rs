@@ -14,15 +14,14 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use astra_core::work_unit::{
     ActiveWorkRegistry, WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus,
     WorkUnitWakePolicy,
 };
-use astra_pipeline::output_stream::OutputStream;
 use astra_services::session_workspace::BackgroundShellTaskProjection;
 use astra_text_utils::str_preview::truncate_line;
 use futures_util::FutureExt;
@@ -36,6 +35,41 @@ use crate::background_task_error::BackgroundTaskError;
 // ── Public types ────────────────────────────────────────────────────
 
 static NEXT_BG_ID: AtomicU32 = AtomicU32::new(1);
+
+// Background output is an append-only artifact that may be paged repeatedly
+// by the TUI.  Keep a bounded display-safe projection keyed by file
+// generation, so paging does not re-read and re-scan a 50 MiB artifact for
+// every 8 KiB request.  Only the safe projection is cached; raw output never
+// enters this process-wide cache.
+const SAFE_OUTPUT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct SafeOutputCache {
+    entries: HashMap<SafeOutputCacheKey, SafeOutputCacheEntry>,
+    bytes: usize,
+    tick: u64,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum SafeOutputCacheKey {
+    File(PathBuf),
+    Combined { stdout: PathBuf, stderr: PathBuf },
+}
+
+struct SafeOutputCacheEntry {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    secondary_len: Option<u64>,
+    secondary_modified: Option<std::time::SystemTime>,
+    settled: bool,
+    projection: Arc<astra_tools::credential_redaction::SafeOutputProjection>,
+    last_used: u64,
+}
+
+fn safe_output_cache() -> &'static Mutex<SafeOutputCache> {
+    static CACHE: OnceLock<Mutex<SafeOutputCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SafeOutputCache::default()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -322,6 +356,7 @@ struct ShellOutputProbeRequest {
     stderr_path: PathBuf,
     tail_bytes: Option<usize>,
     report_missing: bool,
+    settled: bool,
 }
 
 #[derive(Debug)]
@@ -891,8 +926,12 @@ impl BackgroundTaskRegistry {
                 &handle.stdout_path,
             ));
         }
-        read_tail_str(&handle.stdout_path, tail_bytes)
-            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
+        read_tail_str(
+            &handle.stdout_path,
+            tail_bytes,
+            handle.status().is_terminal(),
+        )
+        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read output from a task's stdout file starting at `offset`.
@@ -913,8 +952,13 @@ impl BackgroundTaskRegistry {
                 &handle.stdout_path,
             ));
         }
-        read_from_str(&handle.stdout_path, offset, max_bytes)
-            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
+        read_from_str(
+            &handle.stdout_path,
+            offset,
+            max_bytes,
+            handle.status().is_terminal(),
+        )
+        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read the model-facing combined stdout/stderr projection starting at
@@ -937,8 +981,14 @@ impl BackgroundTaskRegistry {
                 &handle.stdout_path,
             ));
         }
-        read_combined_from_str(&handle.stdout_path, &handle.stderr_path, offset, max_bytes)
-            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
+        read_combined_from_str(
+            &handle.stdout_path,
+            &handle.stderr_path,
+            offset,
+            max_bytes,
+            handle.status().is_terminal(),
+        )
+        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     pub async fn get_combined_output_since_async(
@@ -965,7 +1015,7 @@ impl BackgroundTaskRegistry {
                     &stdout_path,
                 ));
             }
-            read_combined_from_str(&stdout_path, &stderr_path, offset, max_bytes)
+            read_combined_from_str(&stdout_path, &stderr_path, offset, max_bytes, terminal)
                 .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
         })
         .await
@@ -1009,6 +1059,7 @@ impl BackgroundTaskRegistry {
                 &pattern,
                 context_lines,
                 max_bytes,
+                terminal,
             )
             .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
         })
@@ -1031,8 +1082,12 @@ impl BackgroundTaskRegistry {
             .tasks
             .get(id)
             .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        read_tail_str(&handle.stderr_path, tail_bytes)
-            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
+        read_tail_str(
+            &handle.stderr_path,
+            tail_bytes,
+            handle.status().is_terminal(),
+        )
+        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read stdout plus stderr if available. Missing stderr must not mask valid
@@ -1057,11 +1112,19 @@ impl BackgroundTaskRegistry {
         let (stdout, stdout_bytes) = if stdout_missing {
             (String::new(), 0)
         } else {
-            read_tail_str(&handle.stdout_path, tail_bytes)
-                .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?
+            read_tail_str(
+                &handle.stdout_path,
+                tail_bytes,
+                handle.status().is_terminal(),
+            )
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?
         };
-        let (stderr, stderr_bytes) =
-            read_tail_str(&handle.stderr_path, tail_bytes).unwrap_or_else(|_| (String::new(), 0));
+        let (stderr, stderr_bytes) = read_tail_str(
+            &handle.stderr_path,
+            tail_bytes,
+            handle.status().is_terminal(),
+        )
+        .unwrap_or_else(|_| (String::new(), 0));
         let combined = if stderr.trim().is_empty() {
             stdout
         } else if stdout.trim().is_empty() {
@@ -1083,8 +1146,12 @@ impl BackgroundTaskRegistry {
             .get(id)
             .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         let (combined, total_bytes) = self.get_combined_output(id, tail_bytes)?;
-        let stdout_lines = count_file_lines(&handle.stdout_path).unwrap_or(0);
-        let stderr_lines = count_file_lines(&handle.stderr_path).unwrap_or(0);
+        let stdout_lines =
+            count_redacted_file_lines(&handle.stdout_path, handle.status().is_terminal())
+                .unwrap_or(0);
+        let stderr_lines =
+            count_redacted_file_lines(&handle.stderr_path, handle.status().is_terminal())
+                .unwrap_or(0);
         Ok((
             combined,
             total_bytes,
@@ -1118,11 +1185,11 @@ impl BackgroundTaskRegistry {
             let (stdout, stdout_bytes) = if stdout_missing {
                 (String::new(), 0)
             } else {
-                read_tail_str(&stdout_path, tail_bytes)
+                read_tail_str(&stdout_path, tail_bytes, terminal)
                     .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))?
             };
-            let (stderr, stderr_bytes) =
-                read_tail_str(&stderr_path, tail_bytes).unwrap_or_else(|_| (String::new(), 0));
+            let (stderr, stderr_bytes) = read_tail_str(&stderr_path, tail_bytes, terminal)
+                .unwrap_or_else(|_| (String::new(), 0));
             let combined = if stderr.trim().is_empty() {
                 stdout
             } else if stdout.trim().is_empty() {
@@ -1130,8 +1197,8 @@ impl BackgroundTaskRegistry {
             } else {
                 format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
             };
-            let stdout_lines = count_file_lines(&stdout_path).unwrap_or(0);
-            let stderr_lines = count_file_lines(&stderr_path).unwrap_or(0);
+            let stdout_lines = count_redacted_file_lines(&stdout_path, terminal).unwrap_or(0);
+            let stderr_lines = count_redacted_file_lines(&stderr_path, terminal).unwrap_or(0);
             Ok((
                 combined,
                 stdout_bytes.saturating_add(stderr_bytes),
@@ -1209,6 +1276,7 @@ impl BackgroundTaskRegistry {
                 stderr_path: handle.stderr_path.clone(),
                 tail_bytes: (preview_due || probe_stalled_tail).then_some(8192),
                 report_missing: !monitors_lifecycle,
+                settled: status.is_terminal(),
             });
         }
         if requests.is_empty() {
@@ -1449,7 +1517,7 @@ async fn run_shell_task(
                             error: None,
                         }
                     } else {
-                        let err_tail = read_tail_str_async(stderr_path, 512)
+                        let err_tail = read_tail_str_async(stderr_path, 512, true)
                             .await
                             .map(|(s, _)| s)
                             .unwrap_or_default();
@@ -1638,7 +1706,7 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
                             error: None,
                         }
                     } else {
-                        let err_tail = read_tail_str_async(&stderr_path, 512)
+                        let err_tail = read_tail_str_async(&stderr_path, 512, true)
                             .await
                             .map(|(s, _)| s)
                             .unwrap_or_default();
@@ -1832,9 +1900,14 @@ async fn collect_shell_output_observations(
                 BackgroundTaskError::output_artifact_missing(&request.id, &request.stdout_path)
             });
         let tail = if let Some(max_bytes) = request.tail_bytes {
-            read_combined_tail_str_async(&request.stdout_path, &request.stderr_path, max_bytes)
-                .await
-                .ok()
+            read_combined_tail_str_async(
+                &request.stdout_path,
+                &request.stderr_path,
+                max_bytes,
+                request.settled,
+            )
+            .await
+            .ok()
         } else {
             None
         };
@@ -1848,39 +1921,26 @@ async fn collect_shell_output_observations(
     .await
 }
 
-async fn read_tail_str_async(path: &Path, max_bytes: usize) -> Result<(String, u64), String> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    let mut file = tokio::fs::File::open(path)
+async fn read_tail_str_async(
+    path: &Path,
+    max_bytes: usize,
+    settled: bool,
+) -> Result<(String, u64), String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_tail_str(&path, max_bytes, settled))
         .await
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let len = file
-        .metadata()
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if len == 0 {
-        return Ok((String::new(), 0));
-    }
-    let offset = len.saturating_sub(max_bytes as u64);
-    file.seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut buf = Vec::with_capacity(max_bytes.min(len as usize));
-    file.read_to_end(&mut buf)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((String::from_utf8_lossy(&buf).into_owned(), len))
+        .map_err(|error| format!("background output read task failed: {error}"))?
 }
 
 async fn read_combined_tail_str_async(
     stdout_path: &Path,
     stderr_path: &Path,
     max_bytes: usize,
+    settled: bool,
 ) -> Result<String, String> {
     let (stdout, stderr) = tokio::join!(
-        read_tail_str_async(stdout_path, max_bytes),
-        read_tail_str_async(stderr_path, max_bytes),
+        read_tail_str_async(stdout_path, max_bytes, settled),
+        read_tail_str_async(stderr_path, max_bytes, settled),
     );
     let stdout = stdout.map(|(text, _)| text).unwrap_or_default();
     let stderr = stderr.map(|(text, _)| text).unwrap_or_default();
@@ -1898,7 +1958,7 @@ async fn make_summary(stdout_path: &Path, exit_code: Option<i32>) -> String {
         .await
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let tail = read_tail_str_async(stdout_path, 200)
+    let tail = read_tail_str_async(stdout_path, 200, true)
         .await
         .map(|(s, _)| s)
         .unwrap_or_default();
@@ -1926,134 +1986,239 @@ fn instant_from_unix_epoch_millis(started_at_ms: u64) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn read_tail_str(path: &Path, max_bytes: usize) -> Result<(String, u64), String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len == 0 {
-        return Ok((String::new(), 0));
-    }
-    let offset = len.saturating_sub(max_bytes as u64);
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(max_bytes.min(len as usize));
-    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Ok((text, len))
+fn read_tail_str(path: &Path, max_bytes: usize, settled: bool) -> Result<(String, u64), String> {
+    let projection = read_safe_projection(path, settled)?;
+    let start = projection.total_bytes().saturating_sub(max_bytes);
+    let (chunk, _end, total, _) = projection.window(start, max_bytes);
+    Ok((chunk, total as u64))
 }
 
 fn read_from_str(
     path: &Path,
     offset: u64,
     max_bytes: usize,
+    settled: bool,
 ) -> Result<(String, u64, u64, u64), String> {
-    let stream = OutputStream::create(path.to_path_buf())
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let buf = stream
-        .read_from(offset, max_bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let end_offset = offset.saturating_add(buf.len() as u64);
-    let total_bytes = std::fs::metadata(path)
-        .map(|m| m.len())
-        .unwrap_or(end_offset);
-    let total_lines = count_file_lines(path).unwrap_or_else(|_| {
-        String::from_utf8_lossy(&buf)
-            .lines()
-            .count()
-            .try_into()
-            .unwrap_or(u64::MAX)
-    });
-    Ok((
-        String::from_utf8_lossy(&buf).into_owned(),
-        end_offset,
-        total_bytes,
-        total_lines,
-    ))
+    let projection = read_safe_projection(path, settled)?;
+    let total_bytes = projection.total_bytes() as u64;
+    if offset > total_bytes {
+        return Err(format!(
+            "offset {offset} beyond end of output ({total_bytes} bytes)"
+        ));
+    }
+    let (chunk, end, total, lines) = projection.window(offset as usize, max_bytes);
+    Ok((chunk, end as u64, total as u64, lines as u64))
 }
 
-enum CombinedOutputSegment<'a> {
-    File(&'a Path, u64),
-    Static(&'static [u8]),
+/// Build the owner-side model view before any byte window is applied. A
+/// credential may begin before a requested offset, so slicing the raw file
+/// first is not safe. Background output is bounded by MAX_OUTPUT_BYTES; the
+/// bounded full read keeps offset/end_offset semantics stable in this safe
+/// view while preventing cross-page secret fragments.
+fn read_redacted_file(path: &Path) -> Result<String, String> {
+    Ok(read_safe_projection(path, true)?.text().to_string())
 }
 
-impl CombinedOutputSegment<'_> {
-    fn len(&self) -> u64 {
-        match self {
-            Self::File(_, len) => *len,
-            Self::Static(bytes) => bytes.len() as u64,
+fn read_safe_projection(
+    path: &Path,
+    settled: bool,
+) -> Result<Arc<astra_tools::credential_redaction::SafeOutputProjection>, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    let key = SafeOutputCacheKey::File(path.to_path_buf());
+    if let Ok(mut cache) = safe_output_cache().lock() {
+        cache.tick = cache.tick.saturating_add(1);
+        let tick = cache.tick;
+        if let Some(entry) = cache.entries.get_mut(&key)
+            && entry.len == len
+            && entry.modified == modified
+            && entry.secondary_len.is_none()
+            && entry.secondary_modified.is_none()
+            && entry.settled == settled
+        {
+            entry.last_used = tick;
+            return Ok(entry.projection.clone());
         }
     }
+
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let raw = String::from_utf8_lossy(&bytes);
+    // A running append-only stream may end in the middle of a credential. Do
+    // not expose even the harmless-looking prefix; wait for the terminating
+    // newline or for the task to settle before publishing that logical line.
+    let raw = if !settled && !raw.ends_with('\n') {
+        raw.rfind('\n').map(|index| &raw[..=index]).unwrap_or("")
+    } else {
+        raw.as_ref()
+    };
+    // Background stdout/stderr is a presentation stream, not an
+    // authoritative workspace read.  It must therefore use a display-only
+    // marker: minting an edit-capable reference here would let a later
+    // offset/search page (or another session) pretend that an arbitrary
+    // process output owns source bytes.  Source-owned `read_file` remains the
+    // only path that issues an edit-capable marker.
+    let safe = astra_tools::credential_redaction::redact_credentials_for_display(raw).0;
+    let projection = Arc::new(astra_tools::credential_redaction::SafeOutputProjection::new(safe));
+
+    if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES
+        && let Ok(mut cache) = safe_output_cache().lock()
+    {
+        cache.tick = cache.tick.saturating_add(1);
+        let tick = cache.tick;
+        if let Some(previous) = cache.entries.remove(&key) {
+            cache.bytes = cache
+                .bytes
+                .saturating_sub(previous.projection.total_bytes());
+        }
+        while cache.bytes.saturating_add(projection.total_bytes()) > SAFE_OUTPUT_CACHE_MAX_BYTES {
+            let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(entry_key, _)| entry_key.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = cache.entries.remove(&oldest) {
+                cache.bytes = cache.bytes.saturating_sub(evicted.projection.total_bytes());
+            }
+        }
+        if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES.saturating_sub(cache.bytes) {
+            cache.bytes = cache.bytes.saturating_add(projection.total_bytes());
+            cache.entries.insert(
+                key,
+                SafeOutputCacheEntry {
+                    len,
+                    modified,
+                    secondary_len: None,
+                    secondary_modified: None,
+                    settled,
+                    projection: projection.clone(),
+                    last_used: tick,
+                },
+            );
+        }
+    }
+    Ok(projection)
+}
+
+fn combined_safe_projection(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    settled: bool,
+) -> Result<Arc<astra_tools::credential_redaction::SafeOutputProjection>, String> {
+    let stdout_metadata = std::fs::metadata(stdout_path).ok();
+    let stderr_metadata = std::fs::metadata(stderr_path).ok();
+    let stdout_len = stdout_metadata
+        .as_ref()
+        .map(std::fs::Metadata::len)
+        .unwrap_or(0);
+    let stderr_len = stderr_metadata
+        .as_ref()
+        .map(std::fs::Metadata::len)
+        .unwrap_or(0);
+    let stdout_modified = stdout_metadata.as_ref().and_then(|m| m.modified().ok());
+    let stderr_modified = stderr_metadata.as_ref().and_then(|m| m.modified().ok());
+    let key = SafeOutputCacheKey::Combined {
+        stdout: stdout_path.to_path_buf(),
+        stderr: stderr_path.to_path_buf(),
+    };
+
+    if let Ok(mut cache) = safe_output_cache().lock() {
+        cache.tick = cache.tick.saturating_add(1);
+        let tick = cache.tick;
+        if let Some(entry) = cache.entries.get_mut(&key)
+            && entry.len == stdout_len
+            && entry.modified == stdout_modified
+            && entry.secondary_len == Some(stderr_len)
+            && entry.secondary_modified == stderr_modified
+            && entry.settled == settled
+        {
+            entry.last_used = tick;
+            return Ok(entry.projection.clone());
+        }
+    }
+
+    let stdout = if stdout_metadata.is_some() {
+        read_safe_projection(stdout_path, settled)?
+            .text()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let stderr = if stderr_metadata.is_some() {
+        read_safe_projection(stderr_path, settled)?
+            .text()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let rendered = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        format!("<stderr>\n{stderr}\n</stderr>")
+    } else {
+        format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
+    };
+    let projection =
+        Arc::new(astra_tools::credential_redaction::SafeOutputProjection::new(rendered));
+
+    if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES
+        && let Ok(mut cache) = safe_output_cache().lock()
+    {
+        cache.tick = cache.tick.saturating_add(1);
+        let tick = cache.tick;
+        if let Some(previous) = cache.entries.remove(&key) {
+            cache.bytes = cache
+                .bytes
+                .saturating_sub(previous.projection.total_bytes());
+        }
+        while cache.bytes.saturating_add(projection.total_bytes()) > SAFE_OUTPUT_CACHE_MAX_BYTES {
+            let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(entry_key, _)| entry_key.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = cache.entries.remove(&oldest) {
+                cache.bytes = cache.bytes.saturating_sub(evicted.projection.total_bytes());
+            }
+        }
+        if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES.saturating_sub(cache.bytes) {
+            cache.bytes = cache.bytes.saturating_add(projection.total_bytes());
+            cache.entries.insert(
+                key,
+                SafeOutputCacheEntry {
+                    len: stdout_len,
+                    modified: stdout_modified,
+                    secondary_len: Some(stderr_len),
+                    secondary_modified: stderr_modified,
+                    settled,
+                    projection: projection.clone(),
+                    last_used: tick,
+                },
+            );
+        }
+    }
+    Ok(projection)
+}
+
+fn combined_redacted_text(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    settled: bool,
+) -> Result<String, String> {
+    Ok(combined_safe_projection(stdout_path, stderr_path, settled)?
+        .text()
+        .to_string())
 }
 
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-}
-
-fn combined_output_segments<'a>(
-    stdout_path: &'a Path,
-    stderr_path: &'a Path,
-) -> Vec<CombinedOutputSegment<'a>> {
-    let stdout_len = file_len(stdout_path);
-    let stderr_len = file_len(stderr_path);
-    let mut segments = Vec::new();
-    if stdout_len > 0 {
-        segments.push(CombinedOutputSegment::File(stdout_path, stdout_len));
-    }
-    if stderr_len > 0 {
-        if stdout_len > 0 {
-            segments.push(CombinedOutputSegment::Static(b"\n<stderr>\n"));
-        } else {
-            segments.push(CombinedOutputSegment::Static(b"<stderr>\n"));
-        }
-        segments.push(CombinedOutputSegment::File(stderr_path, stderr_len));
-        segments.push(CombinedOutputSegment::Static(b"\n</stderr>"));
-    }
-    segments
-}
-
-fn count_combined_output_lines(stdout_path: &Path, stderr_path: &Path) -> u64 {
-    let segments = combined_output_segments(stdout_path, stderr_path);
-    count_combined_segments_lines(&segments).unwrap_or(0)
-}
-
-fn count_combined_segments_lines(segments: &[CombinedOutputSegment<'_>]) -> Result<u64, String> {
-    use std::io::Read;
-
-    let mut lines = 0_u64;
-    let mut saw_any = false;
-    let mut last_byte = None;
-    let mut buf = [0_u8; 8192];
-    for segment in segments {
-        match segment {
-            CombinedOutputSegment::Static(bytes) => {
-                if bytes.is_empty() {
-                    continue;
-                }
-                saw_any = true;
-                lines = lines.saturating_add(bytes.iter().filter(|&&b| b == b'\n').count() as u64);
-                last_byte = bytes.last().copied();
-            }
-            CombinedOutputSegment::File(path, _) => {
-                let mut file = std::fs::File::open(path)
-                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                loop {
-                    let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        break;
-                    }
-                    saw_any = true;
-                    lines = lines
-                        .saturating_add(buf[..n].iter().filter(|&&b| b == b'\n').count() as u64);
-                    last_byte = Some(buf[n - 1]);
-                }
-            }
-        }
-    }
-    if saw_any && last_byte != Some(b'\n') {
-        lines = lines.saturating_add(1);
-    }
-    Ok(lines)
 }
 
 fn read_combined_from_str(
@@ -2061,61 +2226,17 @@ fn read_combined_from_str(
     stderr_path: &Path,
     offset: u64,
     max_bytes: usize,
+    settled: bool,
 ) -> Result<(String, u64, u64, u64), String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let segments = combined_output_segments(stdout_path, stderr_path);
-    let total_bytes = segments.iter().map(CombinedOutputSegment::len).sum::<u64>();
+    let projection = combined_safe_projection(stdout_path, stderr_path, settled)?;
+    let total_bytes = projection.total_bytes() as u64;
     if offset > total_bytes {
         return Err(format!(
             "offset {offset} beyond end of output ({total_bytes} bytes)"
         ));
     }
-
-    let mut remaining = max_bytes;
-    let mut cursor = 0_u64;
-    let mut out = Vec::new();
-    for segment in segments {
-        if remaining == 0 {
-            break;
-        }
-        let segment_len = segment.len();
-        let segment_end = cursor.saturating_add(segment_len);
-        if offset >= segment_end {
-            cursor = segment_end;
-            continue;
-        }
-
-        let segment_offset = offset.saturating_sub(cursor);
-        let available = segment_len.saturating_sub(segment_offset);
-        let take = available.min(remaining as u64) as usize;
-        match segment {
-            CombinedOutputSegment::Static(bytes) => {
-                let start = segment_offset as usize;
-                out.extend_from_slice(&bytes[start..start + take]);
-            }
-            CombinedOutputSegment::File(path, _) => {
-                let mut file = std::fs::File::open(path)
-                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                file.seek(SeekFrom::Start(segment_offset))
-                    .map_err(|e| e.to_string())?;
-                let mut buf = vec![0_u8; take];
-                file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                out.extend_from_slice(&buf);
-            }
-        }
-        remaining = remaining.saturating_sub(take);
-        cursor = segment_end;
-    }
-
-    let end_offset = offset.saturating_add(out.len() as u64);
-    let total_lines = count_combined_output_lines(stdout_path, stderr_path);
-    Ok((
-        String::from_utf8_lossy(&out).into_owned(),
-        end_offset,
-        total_bytes,
-        total_lines,
-    ))
+    let (output, end, total, lines) = projection.window(offset as usize, max_bytes);
+    Ok((output, end as u64, total as u64, lines as u64))
 }
 
 fn search_combined_output(
@@ -2124,6 +2245,7 @@ fn search_combined_output(
     pattern: &str,
     context_lines: usize,
     max_bytes: usize,
+    settled: bool,
 ) -> Result<(String, u64, bool), String> {
     let mut output = String::new();
     let mut matching_lines = 0_u64;
@@ -2139,6 +2261,7 @@ fn search_combined_output(
             pattern,
             context_lines,
             max_bytes,
+            settled,
             &mut output,
             &mut matching_lines,
             &mut truncated,
@@ -2155,15 +2278,19 @@ fn search_output_source(
     pattern: &str,
     context_lines: usize,
     max_bytes: usize,
+    settled: bool,
     output: &mut String,
     matching_lines: &mut u64,
     truncated: &mut bool,
 ) -> Result<(), String> {
     use std::io::BufRead;
 
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
+    // Search the owner-side redacted view, not raw output. In particular, a
+    // PEM block or assignment can span lines and would leak if each line were
+    // sanitized only after a raw window had already been selected.
+    let safe_text = read_safe_projection(path, settled)?;
+    let safe_text = safe_text.text();
+    let mut reader = std::io::BufReader::new(safe_text.as_bytes());
     let mut bytes = Vec::new();
     let mut prior_lines = VecDeque::<(u64, String)>::with_capacity(context_lines);
     let mut following_context = 0_usize;
@@ -2293,15 +2420,19 @@ fn count_file_lines(path: &Path) -> Result<u64, String> {
     Ok(lines)
 }
 
+fn count_redacted_file_lines(path: &Path, settled: bool) -> Result<u64, String> {
+    Ok(read_safe_projection(path, settled)?.total_lines() as u64)
+}
+
 fn read_combined_tail_str(
     stdout_path: &Path,
     stderr_path: &Path,
     max_bytes: usize,
 ) -> Result<String, String> {
-    let stdout = read_tail_str(stdout_path, max_bytes)
+    let stdout = read_tail_str(stdout_path, max_bytes, true)
         .map(|(s, _)| s)
         .unwrap_or_default();
-    let stderr = read_tail_str(stderr_path, max_bytes)
+    let stderr = read_tail_str(stderr_path, max_bytes, true)
         .map(|(s, _)| s)
         .unwrap_or_default();
     if stderr.trim().is_empty() {
@@ -2579,6 +2710,29 @@ mod tests {
         assert_eq!(second_end, 12);
         assert_eq!(second_total, 12);
         assert_eq!(second_total_lines, 2);
+    }
+
+    #[tokio::test]
+    async fn output_pagination_redacts_before_an_offset_inside_a_secret() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell(
+            "printf 'prefix AWS_SECRET_KEY=abcdefghijklmnopqrstuvwxyz0123456789 suffix'",
+            "redacted pagination",
+        );
+
+        wait_for_task_terminal(&mut reg, &id).await;
+        let (full, _, total, _) = reg
+            .get_output_since(&id, 0, 4096)
+            .expect("safe full output");
+        assert!(!full.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        let offset = "prefix AWS_SECRET_KEY=".len() as u64 + 3;
+        let (page, end, safe_total, _) = reg
+            .get_output_since(&id, offset, 64)
+            .expect("offset inside raw secret must still be safe");
+        assert!(!page.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert_eq!(safe_total, total);
+        assert!(end <= safe_total);
     }
 
     #[tokio::test]
@@ -2866,6 +3020,98 @@ mod tests {
         assert!(output.contains("line2"));
     }
 
+    #[test]
+    fn background_output_window_redacts_before_offset() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        let raw = "prefix AKIAIOSFODNN7EXAMPLE suffix\n";
+        std::fs::write(&path, raw).unwrap();
+        let safe = astra_tools::credential_redaction::redact_credentials_for_display(raw).0;
+        let marker_start = safe.find("[REDACTED:").expect("display marker");
+
+        let (before, before_end, total, _) =
+            read_from_str(&path, 0, marker_start + 2, true).unwrap();
+        assert!(!before.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!before.contains("[REDACTED:"));
+        assert_eq!(before_end as usize, marker_start);
+        assert_eq!(total as usize, safe.len());
+
+        let (after, after_end, _, _) =
+            read_from_str(&path, marker_start as u64 + 3, 128, true).unwrap();
+        assert!(!after.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!after.contains("[REDACTED:"));
+        assert!(after_end > before_end);
+    }
+
+    #[test]
+    fn background_safe_projection_cache_invalidates_on_file_generation_change() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        std::fs::write(&path, "first AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let first = read_redacted_file(&path).unwrap();
+        assert!(!first.contains("AKIAIOSFODNN7EXAMPLE"));
+
+        std::fs::write(&path, "second ghp_abcdefghijklmnopqrstuvwxyz0123456789\n").unwrap();
+        let second = read_redacted_file(&path).unwrap();
+        assert!(second.contains("second"));
+        assert!(!second.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(!second.contains("first"));
+    }
+
+    #[test]
+    fn running_output_drops_an_unterminated_credential_line_until_settled() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        std::fs::write(&path, "prefix\nAWS_SECRET_KEY=partial-secret").unwrap();
+
+        let running = read_safe_projection(&path, false).unwrap();
+        assert_eq!(running.text(), "prefix\n");
+        assert!(!running.text().contains("partial-secret"));
+
+        std::fs::write(
+            &path,
+            "prefix\nAWS_SECRET_KEY=abcdefghijklmnopqrstuvwxyz0123456789\n",
+        )
+        .unwrap();
+        let settled = read_safe_projection(&path, true).unwrap();
+        assert!(
+            !settled
+                .text()
+                .contains("abcdefghijklmnopqrstuvwxyz0123456789")
+        );
+        assert!(settled.text().contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn safe_projection_cache_reuses_the_same_projection_for_a_generation() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        std::fs::write(&path, "stable output\n").unwrap();
+
+        let first = read_safe_projection(&path, true).unwrap();
+        let second = read_safe_projection(&path, true).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.total_lines(), second.total_lines());
+    }
+
+    #[test]
+    fn combined_safe_projection_reuses_both_source_generations() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout");
+        let stderr = tmp.path().join("stderr");
+        std::fs::write(&stdout, "stdout\n").unwrap();
+        std::fs::write(&stderr, "stderr\n").unwrap();
+
+        let first = combined_safe_projection(&stdout, &stderr, true).unwrap();
+        let second = combined_safe_projection(&stdout, &stderr, true).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        std::fs::write(&stderr, "stderr changed\n").unwrap();
+        let changed = combined_safe_projection(&stdout, &stderr, true).unwrap();
+        assert!(!Arc::ptr_eq(&second, &changed));
+        assert!(changed.text().contains("stderr changed"));
+    }
+
     #[tokio::test]
     async fn render_background_task_list_xml_reports_typed_rows() {
         let tmp = crate::tests::test_temp_dir();
@@ -3144,7 +3390,7 @@ mod tests {
         std::fs::write(&stderr, "panic detail for failing_test_name\n").unwrap();
 
         let (output, matching_lines, truncated) =
-            search_combined_output(&stdout, &stderr, "failing_test_name", 1, 4096)
+            search_combined_output(&stdout, &stderr, "failing_test_name", 1, 4096, true)
                 .expect("search captured output");
 
         assert_eq!(matching_lines, 3, "{output}");
@@ -3164,7 +3410,7 @@ mod tests {
         std::fs::write(&stderr, "").unwrap();
 
         let (output, matching_lines, truncated) =
-            search_combined_output(&stdout, &stderr, "needle", 0, 43)
+            search_combined_output(&stdout, &stderr, "needle", 0, 43, true)
                 .expect("bounded search captured output");
 
         assert_eq!(matching_lines, 1);
@@ -3186,7 +3432,7 @@ mod tests {
         std::fs::write(&stderr, "needle four\n").unwrap();
 
         let (output, matching_lines, truncated) =
-            search_combined_output(&stdout, &stderr, "needle", 0, 16)
+            search_combined_output(&stdout, &stderr, "needle", 0, 16, true)
                 .expect("bounded search captured output");
 
         assert_eq!(matching_lines, 4, "{output}");

@@ -61,8 +61,22 @@ pub(crate) fn cancelled_runtime_tool_result_for_binding(
         )
     };
     attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_CANCELLED);
+    // The metadata is authoritative for the UI and durable event stream, but
+    // the model boundary historically received only the plain message.  That
+    // made an expected parent cancellation look like an unclassified tool
+    // failure and encouraged blind retries. Keep the human-readable message,
+    // while carrying the same terminal state in a small typed envelope so all
+    // transports expose one machine-readable contract.
+    let output = json!({
+        "status": "cancelled",
+        "error_kind": TOOL_ERROR_KIND_CANCELLED,
+        "error": message,
+        "retryable": false,
+        "next_action": "stop_or_resume_parent_turn",
+    })
+    .to_string();
     astra_tools::ToolResult {
-        output: message,
+        output,
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),

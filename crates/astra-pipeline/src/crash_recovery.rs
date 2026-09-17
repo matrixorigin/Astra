@@ -165,6 +165,14 @@ fn build_restored_from_scan(
     use crate::step_protocol::persisted_cache_key_is_context_bound;
     use std::collections::HashMap;
 
+    if let Some(quarantine) = heavy.workspace_observation_quarantine.as_ref()
+        && !quarantine.is_valid()
+    {
+        return Err(RecoveryError::CorruptedCheckpoint(
+            "workspace observation quarantine has an unknown reason or scope".to_string(),
+        ));
+    }
+
     if let Some(cursor) = heavy.conversation_cursor.as_ref() {
         if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
             || cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
@@ -203,10 +211,10 @@ fn build_restored_from_scan(
     }
 
     if cache_restore_report.rejected_unverified_entries > 0 {
-        tracing::warn!(
+        tracing::debug!(
             rejected_unverified_entries = cache_restore_report.rejected_unverified_entries,
             rejected_context_bound_entries = cache_restore_report.rejected_context_bound_entries,
-            "crash recovery retained completed results for audit but rejected them as executable replay authority"
+            "crash recovery retained non-executable completed-result audit"
         );
     }
 
@@ -219,9 +227,11 @@ fn build_restored_from_scan(
         messages: heavy.messages.clone(),
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
+        run_execution_budget: heavy.run_execution_budget.clone(),
+        run_execution_control: heavy.run_execution_control.clone(),
         blocked_tools: heavy.blocked_tools.clone(),
         recent_tools: heavy.recent_tools.clone(),
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
+        deferred_tool_activations: heavy.deferred_tool_activations.clone(),
         resume_turn: extract_turn_from_step_id(&heavy.light.step_id),
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -230,6 +240,7 @@ fn build_restored_from_scan(
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state.clone(),
         pipeline_state: heavy.pipeline_state.clone(),
+        workspace_observation_quarantine: heavy.workspace_observation_quarantine.clone(),
         cache_restore_report,
     })
 }
@@ -608,9 +619,23 @@ fn extract_tool_info_from_event(event: &StepEvent) -> Option<(String, u32)> {
     let tool_name = payload.get("tool_name")?.as_str()?.to_string();
     let tool_index = payload
         .get("tool_index")
+        .or_else(|| payload.get("slot_index"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some((tool_name, tool_index))
+}
+
+fn tool_call_correlation_key(event: &StepEvent, tool_name: &str, tool_index: u32) -> String {
+    if let Some(call_id) = event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("call_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+    {
+        return format!("step:{}:call:{call_id}", event.step_id);
+    }
+    format!("legacy:{}:{tool_name}:{tool_index}", event.step_id)
 }
 
 fn extract_idempotency_key_from_event(event: &StepEvent) -> Option<String> {
@@ -900,7 +925,9 @@ impl CrashRecoveryManager {
 
     /// Extract tool call records from journal events.
     fn extract_tool_calls(events: &[StepEvent]) -> Vec<ToolCallRecord> {
-        // Use (step_id, tool_name, tool_index) as key to correlate start/complete
+        // Prefer the executor-issued call id. Step/slot is retained only for
+        // legacy events: concurrent runs may share a session but never a
+        // logical tool-call identity.
         let mut started: HashMap<String, ToolCallRecord> = HashMap::new();
         let mut completed: Vec<ToolCallRecord> = Vec::new();
 
@@ -908,7 +935,7 @@ impl CrashRecoveryManager {
             match &event.event_type {
                 StepEventType::ToolCallStarted => {
                     if let Some((tool_name, tool_index)) = extract_tool_info_from_event(event) {
-                        let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
+                        let key = tool_call_correlation_key(event, &tool_name, tool_index);
                         started.insert(
                             key,
                             ToolCallRecord {
@@ -924,7 +951,7 @@ impl CrashRecoveryManager {
                 }
                 StepEventType::ToolCallCompleted => {
                     if let Some((tool_name, tool_index)) = extract_tool_info_from_event(event) {
-                        let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
+                        let key = tool_call_correlation_key(event, &tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Completed;
                             if record.idempotency_key.is_none() {
@@ -949,7 +976,7 @@ impl CrashRecoveryManager {
                 }
                 StepEventType::ToolCallFailed => {
                     if let Some((tool_name, tool_index)) = extract_tool_info_from_event(event) {
-                        let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
+                        let key = tool_call_correlation_key(event, &tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Failed;
                             if record.idempotency_key.is_none() {
@@ -961,7 +988,7 @@ impl CrashRecoveryManager {
                 }
                 StepEventType::ToolCallSkipped => {
                     if let Some((tool_name, tool_index)) = extract_tool_info_from_event(event) {
-                        let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
+                        let key = tool_call_correlation_key(event, &tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Skipped;
                             if record.idempotency_key.is_none() {
@@ -1218,6 +1245,7 @@ mod tests {
     ) -> StepEvent {
         StepEvent {
             event_id: event_id.to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: step_id.to_string(),
             event_type,
@@ -1238,6 +1266,7 @@ mod tests {
     ) -> StepEvent {
         StepEvent {
             event_id: event_id.to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: step_id.to_string(),
             event_type,
@@ -1296,6 +1325,7 @@ mod tests {
     ) -> StepEvent {
         StepEvent {
             event_id: event_id.to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: step_id.to_string(),
             event_type: StepEventType::ToolCallCompleted,
@@ -1477,6 +1507,47 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_runs_with_colliding_legacy_slots_correlate_by_call_id() {
+        let mut first_start = tool_started_event("e1", "shared-step", "bash", 0, 1000);
+        first_start.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-a");
+        let mut second_start = tool_started_event("e2", "shared-step", "bash", 0, 1001);
+        second_start.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-b");
+        let mut first_complete = tool_completed_event("e3", "shared-step", "bash", 0, 1002);
+        first_complete.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-a");
+
+        let records =
+            CrashRecoveryManager::extract_tool_calls(&[first_start, second_start, first_complete]);
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| {
+            record.status == ToolCallStatus::Completed && record.step_id == "shared-step"
+        }));
+        assert!(records.iter().any(|record| {
+            record.status == ToolCallStatus::StartedOnly && record.step_id == "shared-step"
+        }));
+    }
+
+    #[test]
+    fn provider_local_call_ids_remain_scoped_to_run_step_identity() {
+        let mut root_start = tool_started_event("e1", "root-run-step", "bash", 0, 1000);
+        root_start.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-1");
+        let mut child_start = tool_started_event("e2", "child-run-step", "bash", 0, 1001);
+        child_start.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-1");
+        let mut root_complete = tool_completed_event("e3", "root-run-step", "bash", 0, 1002);
+        root_complete.payload.as_mut().unwrap()["call_id"] = serde_json::json!("call-1");
+
+        let records =
+            CrashRecoveryManager::extract_tool_calls(&[root_start, child_start, root_complete]);
+
+        assert!(records.iter().any(|record| {
+            record.step_id == "root-run-step" && record.status == ToolCallStatus::Completed
+        }));
+        assert!(records.iter().any(|record| {
+            record.step_id == "child-run-step" && record.status == ToolCallStatus::StartedOnly
+        }));
+    }
+
+    #[test]
     fn scan_journal_extracts_persisted_idempotency_key_and_output_payload() {
         let mut mgr = CrashRecoveryManager::new();
         mgr.begin_recovery().unwrap();
@@ -1486,6 +1557,7 @@ mod tests {
         let cache_key = key.cache_key();
         let events = vec![StepEvent {
             event_id: "e1".to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "step-1".to_string(),
             event_type: StepEventType::ToolCallCompleted,
@@ -1566,6 +1638,24 @@ mod tests {
             gap_detected: None,
         };
         let mut heavy = make_test_heavy_checkpoint();
+        heavy.run_execution_budget = Some(crate::step_protocol::RunExecutionBudget::V1 {
+            run_id: "run".into(),
+            producer_owner_generation: 3,
+            charged_iterations: 2,
+            granted_iteration_boundary: 50,
+            remaining_iterations: 48,
+            effective_hard_turn_limit: None,
+        });
+        heavy.run_execution_control = Some(crate::step_protocol::RunExecutionControl::V2 {
+            hook_obligations: astra_turn_types::StopHookObligations::default(),
+            completion_settlement: astra_turn_types::CompletionSettlementState {
+                text_only: true,
+                outcome_reconciliation_retries: 1,
+                ..Default::default()
+            },
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        });
         heavy.messages = vec![
             serde_json::json!({"role": "user", "content": "recover this turn"}),
             serde_json::json!({
@@ -1581,6 +1671,8 @@ mod tests {
         ];
 
         let restored = build_restored_from_scan(&scan, &heavy).expect("restore succeeds");
+        assert_eq!(restored.run_execution_budget, heavy.run_execution_budget);
+        assert_eq!(restored.run_execution_control, heavy.run_execution_control);
         heavy.messages[0]["content"] = serde_json::json!("mutated checkpoint");
         heavy
             .messages

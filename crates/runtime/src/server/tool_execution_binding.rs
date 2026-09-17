@@ -218,6 +218,20 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Server-derived Session provider-selection generation. It is runtime
+    /// authority only and is deliberately omitted from serialized provider
+    /// requests and durable tool decisions.
+    #[serde(skip)]
+    pub execution_binding_generation: Option<u64>,
+    /// Trusted control epoch returned by durable action admission for this
+    /// exact dispatch. It is installed only after the ledger grants Execute,
+    /// never serialized to an external executor or accepted from tool args.
+    #[serde(skip)]
+    pub expected_control_epoch: Option<i64>,
+    /// Request-local completion authority; never accepted from serialized input.
+    #[serde(skip)]
+    pub task_resolution_authority:
+        Option<astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]
@@ -303,6 +317,16 @@ pub struct SelectedToolOfferSnapshot {
     pub provider_id: String,
     #[serde(default = "default_selected_offer_route")]
     pub route: ToolExecutionRouteKind,
+    /// Full-schema content address used when the selected provider owns a
+    /// dynamic tool name outside the builtin registry. Keeping this proof on
+    /// the offer prevents execution from degrading to name-only admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_digest: Option<String>,
+    /// Provider-native identity carried with the durable offer snapshot. A
+    /// public alias is not an execution identity and must never be recreated
+    /// during replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tool_id: Option<String>,
 }
 
 impl SelectedToolOfferSnapshot {
@@ -312,6 +336,8 @@ impl SelectedToolOfferSnapshot {
             offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
             provider_id,
             route: default_selected_offer_route(),
+            schema_digest: None,
+            native_tool_id: None,
         }
     }
 
@@ -325,6 +351,42 @@ impl SelectedToolOfferSnapshot {
             offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
             provider_id,
             route,
+            schema_digest: None,
+            native_tool_id: None,
+        }
+    }
+
+    pub fn new_with_route_and_digest(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+        schema_digest: Option<String>,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+            schema_digest,
+            native_tool_id: None,
+        }
+    }
+
+    pub fn new_with_route_digest_and_native(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+        schema_digest: Option<String>,
+        native_tool_id: impl Into<String>,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        let native_tool_id = native_tool_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+            schema_digest,
+            native_tool_id: (!native_tool_id.trim().is_empty()).then_some(native_tool_id),
         }
     }
 }
@@ -339,6 +401,8 @@ pub struct ExecutionBindingSnapshot {
     pub executor: ExecutorBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding_generation: Option<u64>,
 }
 
 impl ExecutionBindingSnapshot {
@@ -351,6 +415,7 @@ impl ExecutionBindingSnapshot {
             workspace,
             executor,
             runtime: Some(runtime),
+            execution_binding_generation: None,
         }
     }
 
@@ -359,6 +424,7 @@ impl ExecutionBindingSnapshot {
             workspace,
             executor,
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 }
@@ -369,6 +435,7 @@ pub(crate) struct ExecutionBindingState {
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     executor: ExecutorBinding,
     runtime: Option<astra_runtime_env::RuntimeBinding>,
+    execution_binding_generation: Option<u64>,
 }
 
 impl ExecutionBindingState {
@@ -378,6 +445,7 @@ impl ExecutionBindingState {
             workspace_record: None,
             executor: ExecutorBinding::server_control_plane(),
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 
@@ -388,6 +456,7 @@ impl ExecutionBindingState {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            execution_binding_generation: None,
         }
     }
 
@@ -413,6 +482,7 @@ impl ExecutionBindingState {
         self.workspace = snapshot.workspace;
         self.executor = snapshot.executor;
         self.runtime = snapshot.runtime;
+        self.execution_binding_generation = snapshot.execution_binding_generation;
     }
 
     pub(crate) fn set_workspace_record(
@@ -511,10 +581,16 @@ impl ExecutionBindingState {
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
         }
+        .with_execution_binding_generation(self.execution_binding_generation)
     }
 }
 
 impl ToolExecutionRequest {
+    fn with_execution_binding_generation(mut self, generation: Option<u64>) -> Self {
+        self.policy.execution_binding_generation = generation;
+        self
+    }
+
     pub(crate) fn with_selected_offer(mut self, offer: SelectedToolOfferSnapshot) -> Self {
         self.selected_offer = Some(offer);
         self
@@ -553,6 +629,23 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn durable_control_epoch_is_not_a_provider_wire_field() {
+        let mut policy = ToolPolicySnapshot {
+            expected_control_epoch: Some(7),
+            ..ToolPolicySnapshot::default()
+        };
+        let mut wire = serde_json::to_value(&policy).expect("serialize policy wire");
+        assert!(wire.get("expected_control_epoch").is_none());
+
+        wire["expected_control_epoch"] = json!(99);
+        policy = serde_json::from_value(wire).expect("decode provider-shaped policy");
+        assert_eq!(
+            policy.expected_control_epoch, None,
+            "external/provider bytes cannot manufacture action-admission authority"
+        );
+    }
 
     fn workspace_record() -> astra_runtime_env::WorkspaceRecord {
         astra_runtime_env::WorkspaceRecord {

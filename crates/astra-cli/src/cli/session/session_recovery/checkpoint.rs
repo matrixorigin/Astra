@@ -82,7 +82,7 @@ pub(crate) fn session_state_compact_from_heavy_checkpoint(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: heavy.recent_tools.clone(),
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
+        deferred_tool_activations: heavy.deferred_tool_activations.clone(),
         ..Default::default()
     }
 }
@@ -137,13 +137,18 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         astra_core::history_work::HistoryWorkSite::CliRecoveryCheckpointHistoryMaterialization,
         &state.history,
     );
-    let activated_deferred_tool_names =
-        astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
+    let deferred_tool_activations =
+        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &messages,
             state
-                .activated_deferred_tool_names
+                .deferred_tool_activations
                 .iter()
-                .chain(session_state.activated_deferred_tool_names.iter())
+                .chain(session_state.deferred_tool_activations.iter())
+                .chain(
+                    previous_heavy
+                        .into_iter()
+                        .flat_map(|heavy| heavy.deferred_tool_activations.iter()),
+                )
                 .cloned(),
         );
 
@@ -167,14 +172,13 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     let previous_budget_rounds = preserve_interrupted_recovery
         .then(|| previous_heavy.map(|heavy| heavy.budget_remaining_rounds))
         .flatten();
+    // Only an explicit, typed resume restriction may cross the recovery
+    // boundary. `HeavyCheckpoint::blocked_tools` has no provenance or expiry;
+    // copying it forward would make an old stall/health decision a permanent
+    // hard schema filter. The current request's capability/permission policy
+    // remains authoritative for all other tools.
     let interrupted_blocked_tools = if preserve_interrupted_recovery {
-        if state.resume_restricted_tools.is_empty() {
-            previous_heavy
-                .map(|heavy| heavy.blocked_tools.clone())
-                .unwrap_or_default()
-        } else {
-            state.resume_restricted_tools.clone()
-        }
+        state.resume_restricted_tools.clone()
     } else {
         Vec::new()
     };
@@ -184,6 +188,17 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     let interrupted_interruption = preserve_interrupted_recovery
         .then(|| previous_heavy.and_then(|heavy| heavy.interruption.clone()))
         .flatten();
+    // Quarantine is sticky safety state, not a turn-local interruption hint.
+    // Carry the live state whenever present; for an older CLI process that did
+    // not thread the field yet, preserve it from the interrupted checkpoint.
+    let workspace_observation_quarantine =
+        state.workspace_observation_quarantine.clone().or_else(|| {
+            preserve_interrupted_recovery
+                .then(|| {
+                    previous_heavy.and_then(|heavy| heavy.workspace_observation_quarantine.clone())
+                })
+                .flatten()
+        });
     let interrupted_delegation = preserve_interrupted_recovery
         .then(|| {
             previous_heavy
@@ -203,9 +218,11 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         // rounds. Zero here means "no active loop snapshot", and this legacy
         // diagnostic is never promoted into prompt or stop policy.
         budget_remaining_rounds: previous_budget_rounds.unwrap_or(0),
+        run_execution_budget: None,
+        run_execution_control: None,
         blocked_tools: interrupted_blocked_tools,
         recent_tools: state.recent_tools.clone(),
-        activated_deferred_tool_names,
+        deferred_tool_activations,
         memory_context: previous_heavy.and_then(|heavy| heavy.memory_context.clone()),
         delegation_id: interrupted_delegation
             .as_ref()
@@ -231,6 +248,7 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
             .then(|| state.runtime_pipeline_state.clone())
             .flatten(),
         config_version_id: state.config_version_id.clone(),
+        workspace_observation_quarantine,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -365,7 +383,7 @@ pub(crate) fn rollback_recovery_checkpoint(
 }
 
 /// Persist the current in-memory conversation state after a manual history mutation
-/// (`/undo`, `/redo`, `/compact`, `/session fork`) so the next resume/fork/headless
+/// (`/undo`, `/redo`, `/compact`) so the next resume/headless
 /// continuation sees the same context the user just saw.
 pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     state: &mut SessionState,
@@ -374,7 +392,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         return Ok(());
     };
 
-    super::super::session_projection::rebuild_continuation_anchor_from_live_state(state).await;
+    super::super::session_projection::rebuild_continuation_anchor_from_live_state(state);
     let user_id = recovery_user_id(state);
     let (previous_heavy, prev_state) = load_previous_recovery_state(state, &user_id, &sid).await?;
     let mut session_state = super::super::session_projection::build_full_session_state_compact(
@@ -582,5 +600,46 @@ mod tests {
         };
 
         assert_eq!(heavy.budget_remaining_tokens, 779_313);
+    }
+
+    #[test]
+    fn manual_recovery_checkpoint_does_not_recarry_unscoped_blocked_tools() {
+        let mut state = SessionState {
+            last_turn_interrupted: true,
+            ..Default::default()
+        };
+        let prior = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-checkpoint-policy",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            None,
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(mut prior_heavy) = prior else {
+            panic!("expected heavy checkpoint");
+        };
+        prior_heavy.blocked_tools = vec!["stale_tool".into()];
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-checkpoint-policy",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            Some(&prior_heavy),
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+        assert!(heavy.blocked_tools.is_empty());
+
+        state.resume_restricted_tools = vec!["explicit_tool".into()];
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "sess-checkpoint-policy",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            Some(&prior_heavy),
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+        assert_eq!(heavy.blocked_tools, vec!["explicit_tool"]);
     }
 }

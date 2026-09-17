@@ -25,17 +25,18 @@ import {
 import type {
   AgentSurfaceItem,
   ExecutorBinding,
-  SessionTask,
   ToolSurfaceItem,
   WorkspaceBinding,
   WorkSurfaceState,
 } from "@/lib/work-surface";
+import { WorkTaskGraph } from "@/components/app/work-task-graph";
 import type {
   ChatInsightsResponse,
   WorkSurfaceRunResponse,
 } from "@/lib/api/types";
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { cn } from "@/lib/utils/cn";
+import { workTaskCounts } from "@/lib/work-task-presentation";
 
 export type WorkSurfaceTab = "tasks" | "agents" | "tools" | "insights";
 type WorkSurfaceViewMode = "all" | "attention";
@@ -97,37 +98,29 @@ export function WorkSurfacePanel({
     payload: ChatInsightsResponse | null;
   }>({ loading: false, error: null, payload: null });
   const openSignalRef = useRef(openSignal);
-  const counts = useMemo(() => taskCounts(state.tasks), [state.tasks]);
+  const counts = useMemo(
+    () => workTaskCounts(state.taskGraph?.items.entries ?? []),
+    [state.taskGraph],
+  );
   const attentionCounts = useMemo(
     () => ({
-      tasks: state.tasks.filter(taskNeedsAttention).length,
+      tasks: counts.attention,
       agents: state.agents.filter(agentNeedsAttention).length,
       tools: state.tools.filter(toolNeedsAttention).length,
       insights: 0,
     }),
-    [state.agents, state.tasks, state.tools],
+    [counts.attention, state.agents, state.tools],
   );
-  const taskViewMode =
-    attentionCounts.tasks > 0 ? (viewModes.tasks ?? "all") : "all";
   const agentViewMode =
     attentionCounts.agents > 0 ? (viewModes.agents ?? "all") : "all";
   const toolViewMode =
     attentionCounts.tools > 0 ? (viewModes.tools ?? "all") : "all";
   const viewMode =
-    tab === "tasks"
-      ? taskViewMode
-      : tab === "agents"
+    tab === "agents"
         ? agentViewMode
         : tab === "tools"
           ? toolViewMode
           : "all";
-  const visibleTasks = useMemo(
-    () =>
-      taskViewMode === "attention"
-        ? state.tasks.filter(taskNeedsAttention)
-        : state.tasks,
-    [state.tasks, taskViewMode],
-  );
   const visibleAgents = useMemo(
     () =>
       agentViewMode === "attention"
@@ -141,10 +134,6 @@ export function WorkSurfacePanel({
         ? state.tools.filter(toolNeedsAttention)
         : state.tools,
     [state.tools, toolViewMode],
-  );
-  const visibleTaskCounts = useMemo(
-    () => taskCounts(visibleTasks),
-    [visibleTasks],
   );
   const agentActivityCount = state.agents.length;
   const toolActivityCount = state.tools.length;
@@ -429,24 +418,25 @@ export function WorkSurfacePanel({
           {state.warnings.join(" ")}
         </div>
       ) : null}
-      <AttentionViewToggle
-        tab={tab}
-        mode={viewMode}
-        attentionCount={attentionCounts[tab]}
-        totalCount={tabItemCount(tab, state)}
-        onModeChange={(mode) =>
-          setViewModes((current) => ({ ...current, [tab]: mode }))
-        }
-      />
+      {tab !== "tasks" ? (
+        <AttentionViewToggle
+          tab={tab}
+          mode={viewMode}
+          attentionCount={attentionCounts[tab]}
+          totalCount={tabItemCount(tab, state)}
+          onModeChange={(mode) =>
+            setViewModes((current) => ({ ...current, [tab]: mode }))
+          }
+        />
+      ) : null}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {tab === "tasks" ? (
-          <TaskBoard
-            tasks={visibleTasks}
-            allTasks={state.tasks}
-            loading={state.loading}
-            counts={visibleTaskCounts}
-          />
+          state.taskGraph ? (
+            <WorkTaskGraph initial={state.taskGraph} />
+          ) : (
+            <EmptySurface loading={state.loading} label="No Work plan for this conversation" />
+          )
         ) : null}
         {tab === "agents" ? (
           <AgentBoard
@@ -913,175 +903,6 @@ function formatInsightTime(value: string) {
   return Number.isNaN(date.getTime())
     ? "just now"
     : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function TaskBoard({
-  tasks,
-  allTasks,
-  loading,
-  counts,
-}: {
-  tasks: SessionTask[];
-  allTasks: SessionTask[];
-  loading: boolean;
-  counts: ReturnType<typeof taskCounts>;
-}) {
-  if (!tasks.length) {
-    return <EmptySurface loading={loading} label="No tasks yet" />;
-  }
-  const sorted = [...tasks].sort(taskSort);
-  const tasksById = new Map(allTasks.map((task) => [task.id, task]));
-  return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-3 divide-x divide-border/70 rounded-card border border-border/70 bg-bg p-1 text-center shadow-sm">
-        <Metric label="Working" value={counts.working} />
-        <Metric label="Queued" value={counts.queued} />
-        <Metric label="Done" value={counts.done} />
-      </div>
-      <div className="space-y-2.5">
-        {sorted.map((task) => (
-          <TaskCard key={task.id} task={task} tasksById={tasksById} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function TaskCard({
-  task,
-  tasksById,
-}: {
-  task: SessionTask;
-  tasksById: Map<string, SessionTask>;
-}) {
-  const subtasks = task.subtasks ?? [];
-  const done = subtasks.filter((item) => isDone(item.status)).length;
-  const progress = taskObservedProgress(task, done);
-  const running = task.status === "in_progress";
-  return (
-    <section
-      className={cn(
-        "rounded-card border bg-bg p-3 shadow-sm transition-colors",
-        taskNeedsAttention(task)
-          ? "border-warning/30 bg-warning/[0.025]"
-          : running
-            ? "border-accent/25 bg-accent/[0.02]"
-            : "border-border/70",
-      )}
-    >
-      <div className="flex items-start gap-3">
-        <StatusIcon status={task.status} />
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex items-start gap-2">
-            <div className="min-w-0 flex-1">
-              <h3 className="line-clamp-2 text-sm font-semibold leading-5 text-text">
-                {task.title}
-              </h3>
-              {task.active_form || task.description ? (
-                <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-muted">
-                  {task.active_form ?? task.description}
-                </p>
-              ) : null}
-            </div>
-            <StatusPill status={task.status} active={running} />
-          </div>
-          {progress ? (
-            <div>
-              <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-medium text-text-muted">
-                <span>{progress.label}</span>
-                <span className="tabular-nums">{progress.value}%</span>
-              </div>
-              <div className="h-1 overflow-hidden rounded-full bg-surface-muted">
-                <div
-                  className={cn(
-                    "h-full rounded-full transition-all duration-500",
-                    isDone(task.status)
-                      ? "bg-success"
-                      : running
-                        ? "bg-accent"
-                        : "bg-border-strong",
-                  )}
-                  style={{ width: `${progress.value}%` }}
-                />
-              </div>
-            </div>
-          ) : null}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-muted">
-            {subtasks.length ? (
-              <span>
-                {done}/{subtasks.length} subtasks
-              </span>
-            ) : (
-              <span>Updated {formatTaskUpdatedAt(task.updated_at)}</span>
-            )}
-            {task.owner ? <span>Owner {task.owner}</span> : null}
-            {task.blocks?.length ? (
-              <span>Unblocks {task.blocks.length}</span>
-            ) : null}
-          </div>
-          {task.blocked_by?.length ? (
-            <TaskDependencyStrip task={task} tasksById={tasksById} />
-          ) : null}
-          {subtasks.length ? (
-            <div className="space-y-1">
-              {subtasks.slice(0, 4).map((subtask) => (
-                <div
-                  key={subtask.id}
-                  className="flex items-center gap-2 text-xs"
-                >
-                  <StatusIcon status={subtask.status} small />
-                  <span
-                    className={cn(
-                      "min-w-0 flex-1 truncate",
-                      isDone(subtask.status)
-                        ? "text-text-muted line-through decoration-border-strong"
-                        : "text-text-secondary",
-                    )}
-                    title={subtask.title}
-                  >
-                    {subtask.title}
-                  </span>
-                </div>
-              ))}
-              {subtasks.length > 4 ? (
-                <div className="pl-5 text-[11px] text-text-muted">
-                  +{subtasks.length - 4} more
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function TaskDependencyStrip({
-  task,
-  tasksById,
-}: {
-  task: SessionTask;
-  tasksById: Map<string, SessionTask>;
-}) {
-  const blockers = (task.blocked_by ?? []).map((id) => ({
-    id,
-    title: tasksById.get(id)?.title ?? id,
-  }));
-  return (
-    <div className="rounded-[7px] border border-warning/20 bg-warning/[0.055] px-2.5 py-2">
-      <div className="flex items-start gap-2">
-        <Pause className="mt-0.5 size-3.5 shrink-0 text-warning" />
-        <div className="min-w-0 flex-1">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-warning">
-            Blocked by
-          </p>
-          <p className="mt-1 line-clamp-2 text-xs leading-5 text-text-secondary">
-            {blockers.map((blocker) => blocker.title).join(" · ")}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function AgentBoard({
@@ -2941,52 +2762,22 @@ function StatusIcon({
   return <Circle className={className} />;
 }
 
-function taskCounts(tasks: SessionTask[]) {
-  let working = 0;
-  let queued = 0;
-  let done = 0;
-  for (const task of tasks) {
-    if (task.status === "in_progress") working += 1;
-    else if (task.status === "pending" || task.status === "paused") queued += 1;
-    else if (isDone(task.status)) done += 1;
-  }
-  return { working, queued, done, open: working + queued };
-}
-
-function taskObservedProgress(task: SessionTask, completedSubtasks: number) {
-  const subtasks = task.subtasks ?? [];
-  if (subtasks.length) {
-    return {
-      value: Math.round((completedSubtasks / subtasks.length) * 100),
-      label: "Subtask completion",
-    };
-  }
-  if (isDone(task.status)) {
-    return { value: 100, label: "Completed" };
-  }
-  return null;
-}
-
-function formatTaskUpdatedAt(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? "recently"
-    : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
 function workbenchActivitySummary(state: WorkSurfaceState) {
   const parts: string[] = [];
-  const openTasks = state.tasks.filter(
-    (task) => !isDone(task.status) && task.status !== "cancelled",
-  ).length;
+  const taskCounts = workTaskCounts(state.taskGraph?.items.entries ?? []);
   const activeAgents = state.agents.filter((agent) =>
     isAgentActive(agent.status),
   ).length;
   const activeTools = state.tools.filter(
     (tool) => tool.status === "running" && !tool.finishedAt,
   ).length;
-  if (openTasks)
-    parts.push(`${openTasks} open task${openTasks === 1 ? "" : "s"}`);
+  if (taskCounts.attention) {
+    parts.push(
+      `${taskCounts.attention} task${taskCounts.attention === 1 ? "" : "s"} need attention`,
+    );
+  } else if (taskCounts.open) {
+    parts.push(`${taskCounts.open} open task${taskCounts.open === 1 ? "" : "s"}`);
+  }
   if (activeAgents) {
     parts.push(`${activeAgents} active agent${activeAgents === 1 ? "" : "s"}`);
   }
@@ -2997,19 +2788,10 @@ function workbenchActivitySummary(state: WorkSurfaceState) {
 }
 
 function tabItemCount(tab: WorkSurfaceTab, state: WorkSurfaceState) {
-  if (tab === "tasks") return state.tasks.length;
+  if (tab === "tasks") return state.taskGraph?.items.total ?? 0;
   if (tab === "agents") return state.agents.length;
   if (tab === "tools") return state.tools.length;
   return 0;
-}
-
-function taskNeedsAttention(task: SessionTask) {
-  return Boolean(
-    task.status === "blocked" ||
-    task.status === "paused" ||
-    task.status === "failed" ||
-    task.blocked_by?.length,
-  );
 }
 
 function agentNeedsAttention(agent: AgentSurfaceItem) {
@@ -3042,29 +2824,6 @@ function toolNeedsAttention(tool: ToolSurfaceItem) {
     tool.errorKind === "fallback_disabled" ||
     tool.errorKind === "workspace_executor_unavailable",
   );
-}
-
-function taskSort(left: SessionTask, right: SessionTask) {
-  const rank = (task: SessionTask) =>
-    task.status === "in_progress"
-      ? 0
-      : task.status === "pending"
-        ? 1
-        : task.status === "paused"
-          ? 2
-          : isDone(task.status)
-            ? 4
-            : 3;
-  return (
-    rank(left) - rank(right) ||
-    taskUpdatedAtMs(right) - taskUpdatedAtMs(left) ||
-    left.id.localeCompare(right.id)
-  );
-}
-
-function taskUpdatedAtMs(task: SessionTask) {
-  const timestamp = Date.parse(task.updated_at);
-  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function isDone(status: string) {

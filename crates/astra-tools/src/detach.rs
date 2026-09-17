@@ -133,20 +133,32 @@ fn sigterm_process_group(_child: &tokio::process::Child) {}
 /// and reap. Best-effort on Unix; falls back to `child.kill()` elsewhere.
 #[cfg(unix)]
 pub async fn sigkill_process_group(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        if pid <= i32::MAX as u32 {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-        } else {
-            tracing::warn!("sigkill_process_group: PID exceeds i32::MAX, skipping killpg");
-        }
-    }
+    sigkill_process_group_id(child.id());
     // Robust fallback: callers normally spawn with `process_group(0)`, but a
     // missing process group must never make shutdown wait on a live child.
     let _ = child.start_kill();
     // Always try to reap after signaling.
     let _ = child.wait().await;
 }
+
+/// Kill descendants after the process-group leader has already exited.
+/// `Child::try_wait` reaps the leader, so callers must capture its pid before
+/// checking the exit status and use this helper immediately afterwards.
+/// Without that hand-off, a shell can return success while `cmd &` continues
+/// writing after the observation lease has been released.
+#[cfg(unix)]
+pub fn sigkill_process_group_id(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    if pid <= i32::MAX as u32 {
+        let pgid = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+    } else {
+        tracing::warn!("sigkill_process_group_id: PID exceeds i32::MAX, skipping killpg");
+    }
+}
+
+#[cfg(not(unix))]
+pub fn sigkill_process_group_id(_pid: Option<u32>) {}
 
 #[cfg(not(unix))]
 pub async fn sigkill_process_group(child: &mut tokio::process::Child) {

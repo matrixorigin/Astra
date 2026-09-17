@@ -5,6 +5,7 @@ use std::sync::{Once, OnceLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ShutdownSignal {
+    Sigint,
     Sigterm,
     Sighup,
 }
@@ -12,6 +13,7 @@ pub(crate) enum ShutdownSignal {
 impl ShutdownSignal {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Sigint => "SIGINT",
             Self::Sigterm => "SIGTERM",
             Self::Sighup => "SIGHUP",
         }

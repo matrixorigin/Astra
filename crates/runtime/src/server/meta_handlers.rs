@@ -1,10 +1,8 @@
 use super::*;
-use crate::bridge::side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT};
 use astra_services::multi_agent::MetricTarget;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 // ─── MetricTarget bridge ────────────────────────────────────────────────────
 // Connect the services layer's MetricTarget trait to the runtime's
@@ -393,8 +391,8 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
         status: status.to_string(),
         database: database_health.database_label().to_string(),
         memoria: memoria_health.label().to_string(),
-        persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
-        persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
+        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
+        build_git_sha: astra_core::history_work_baseline::BUILD_GIT_SHA.to_string(),
     }
 }
 
@@ -455,8 +453,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     scrape_event_ingestion_metrics(&state);
     scrape_history_work_metrics(&state);
-    crate::turn::bridge::llm_stream::rate_limit_cooldown()
-        .scrape_metrics(&state.metrics_registry());
+    crate::turn::model_cooldown::rate_limit_cooldown().scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -605,7 +602,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn metrics_handler_scrapes_capacity_metrics() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
-        let cooldown = crate::turn::bridge::llm_stream::rate_limit_cooldown();
+        let cooldown = crate::turn::model_cooldown::rate_limit_cooldown();
         cooldown.reset_for_tests();
         cooldown.with("metrics-model", |rl| {
             rl.record_429(None, false);

@@ -23,7 +23,8 @@ This document defines how Astra documentation is organized so design stays usefu
 | Quickstart | `docs/quickstart/` | Setup and first-run flows. |
 | Reference | `docs/reference/` | API, CLI, config, command, and dependency reference. |
 | Testing contract | `docs/testing/` | Test strategy, matrix, and coverage expectations. |
-| Active plan | `plans/` | Time-bound or branch-bound work plan, analysis, or migration path. |
+| Product baseline | `docs/product/` | Versioned acceptance evidence and milestone decisions, not current user guidance. |
+| Local active plan | `plans/` (untracked) | Time-bound or branch-bound work plan, analysis, or migration path; move durable decisions into `docs/` before sharing. |
 
 ## Design doc template
 

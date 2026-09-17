@@ -1,0 +1,110 @@
+name: parallel_synthesized_review
+description: |
+  **What**: Review one commit through three independent specialist slots and
+  return one combined user-facing report.
+  **Tests**: The admission boundary distinguishes execution topology from
+  durable deliverables. A review may fan out, but its child findings are not a
+  task board and must never trigger `start_work`.
+  **Why**: Treating every reviewer perspective as an independently accepted
+  outcome creates an impossible durable-Work-plus-parallel contract, then the
+  old runtime rejected every later tool call and still reported completion.
+  **Pass means**: One three-slot fanout settles and the parent synthesizes it;
+  no durable Work is created and no generic child-spawn fallback is used.
+prompt: |
+  Review only the repository-root Cargo.toml workspace metadata from three independent angles:
+  workspace/package structure; dependency declarations; and public build metadata. Use exactly
+  one three-agent fanout, then return one synthesized review report for me. Each child must stay
+  within Cargo.toml, use at most two focused evidence reads, and return a concise result. The three
+  perspectives are evidence for that one report, not separately accepted deliverables. Do not
+  inspect git history or other files, and do not edit files.
+prompt_variants:
+  - id: chinese_user_boundary
+    prompt: |
+      请只审查仓库根目录 Cargo.toml 的 workspace 元数据，并使用三个独立视角：
+      workspace/package 结构、依赖声明、公开构建元数据。只做一次三 agent fanout，
+      每个 child 限定在 Cargo.toml 内，最多做两次聚焦证据读取并返回简洁结果，最后给我
+      一份综合 review 报告。三个视角只是这份报告的证据，不是三个需要分别验收的交付物。
+      不要查看 git 历史或其他文件，不要修改文件。
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 5
+weight: 3.0
+timeout_seconds: 300
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 3
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/terminal
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /provenance/all_slots_delivered
+    equals: true
+  - type: journal_tool_outcome_count
+    name: agent_fanout
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 0
+    max: 1
+  - type: journal_tool_outcome_count
+    name: tool_search
+    ok: false
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
+  - type: journal_turn_evaluation_success
+    equals: true
+  - type: journal_turn_evaluation_signal_count
+    kind: tool_outcome_failure
+    min: 0
+    max: 0
+  - type: journal_turn_evaluation_signal_count
+    kind: llm_round_churn
+    min: 0
+    max: 0
+  - type: session_subsystem_healthy
+    settled_subsystem: post_loop_memory
+  - type: tools_count_between
+    min: 1
+    max: 12
+  - type: turn_rounds_between
+    min: 2
+    max: 10

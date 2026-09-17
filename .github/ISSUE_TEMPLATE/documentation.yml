@@ -15,7 +15,6 @@ body:
     attributes:
       label: Describe the issue
       description: What's wrong or what content is missing.
-      render: Markdown
     validations:
       required: true
   - type: textarea

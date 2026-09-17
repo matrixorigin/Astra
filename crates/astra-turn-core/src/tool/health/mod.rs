@@ -12,8 +12,19 @@ pub mod persistence;
 use crate::action_compensation::{
     ExecutionOutcomeInput, FailureCategory, classify_execution_outcome_from_input,
 };
+use astra_pipeline::ToolHealthIdentity;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
+
+fn validated_health_entry(
+    entry: &astra_pipeline::ToolHealthEntry,
+) -> astra_pipeline::ToolHealthEntry {
+    let mut entry = entry.clone();
+    entry
+        .recent_outcomes
+        .retain(|outcome| outcome.identity.tool_name() == entry.name);
+    entry
+}
 
 /// Maximum number of historical outcomes cached per (tool, signature) key.
 /// Bounded to keep memory predictable: 8 entries × small struct ≈ 128 B/key.
@@ -23,7 +34,8 @@ pub const OUTCOME_RING_CAPACITY: usize = astra_pipeline::TOOL_OUTCOME_RING_CAPAC
 ///
 /// Records one execution of a specific `(tool_name, canonical_args)` signature
 /// so the agent can consult prior attempts before repeating work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolOutcome {
     /// Whether the call succeeded (quality != Error).
     pub success: bool,
@@ -38,6 +50,7 @@ pub struct ToolOutcome {
     /// `success == false`, but callers may also attach metadata for
     /// syntactically successful yet unfinished results (for example
     /// `FailureCategory::NonProgress` on a `still_running` poll).
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub failure_category: Option<FailureCategory>,
 }
 
@@ -45,7 +58,7 @@ pub struct ToolOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentOutcomeHint {
     pub tool_name: String,
-    pub signature: String,
+    pub identity: ToolHealthIdentity,
     pub success: bool,
     pub at_epoch: u64,
     pub failure_category: Option<FailureCategory>,
@@ -221,7 +234,8 @@ const CROSS_SESSION_AVOIDANCE_RATE: f64 = 0.7;
 const CROSS_SESSION_MIN_CALLS: usize = 8;
 
 /// Per-tool health record within a session.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolHealth {
     /// Calls that reached the executor.
     pub total_calls: usize,
@@ -278,32 +292,168 @@ pub struct ToolHealthTracker {
     /// `tool_result_semantics`). Exported through `ToolHealthEntry.recent_outcomes`
     /// so cross-session persistence and cloud sync can preserve recent identical-call
     /// evidence.
-    outcome_cache: HashMap<String, VecDeque<ToolOutcome>>,
-    /// Parallel ring of error previews keyed by the same signature as
-    /// `outcome_cache`. Each entry corresponds 1:1 with its `ToolOutcome`
-    /// partner. `None` for successes; `Some(first_200_chars)` for failures.
-    /// Kept separate so `ToolOutcome` stays `Copy`.
-    error_preview_cache: HashMap<String, VecDeque<Option<String>>>,
-    /// Parallel ring of monotonic insertion sequence numbers, 1:1 with
-    /// `outcome_cache` entries. Used as a final tie-breaker in
-    /// `recent_errors` so two failures sharing the same `at_epoch` *and*
-    /// `signature_hint` still order deterministically (newest insertion
-    /// first). Not persisted — purely session-local.
-    outcome_seq_cache: HashMap<String, VecDeque<u64>>,
-    /// Monotonic counter feeding `outcome_seq_cache`. Increments on every
+    signatures: HashMap<ToolHealthIdentity, SignatureHealth>,
+    /// Monotonic insertion sequence. Increments on every
     /// `record_outcome_with_preview` call.
     outcome_seq_counter: u64,
-    /// Cached tool name extracted from `sig_key` at insert time. Avoids
-    /// re-parsing the signature in `recent_errors()` and is robust against
-    /// future tool names that themselves contain ':'.
-    signature_to_tool: HashMap<String, String>,
-    /// Session-local cache-hit counts keyed by canonical tool signature.
-    /// Used to detect wasteful repeated cache hits without overblocking
-    /// unrelated calls to the same tool.
-    cache_hits_by_signature: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignatureHealth {
+    outcomes: VecDeque<OutcomeSample>,
+    cache_hit_count: usize,
+}
+
+/// One indivisible health observation, including its diagnostic ordering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSample {
+    pub outcome: ToolOutcome,
+    insertion_sequence: u64,
+    #[serde(skip)]
+    error_preview: Option<String>,
+}
+
+/// Same-run facts, unlike cross-session learning entries which deliberately
+/// reset streaks. Ordered entries also make checkpoint serialization stable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolHealthContinuation {
+    tools: std::collections::BTreeMap<String, ToolHealth>,
+    dirty_tools: std::collections::BTreeSet<String>,
+    last_sync_epoch: u64,
+    signatures: Vec<(ToolHealthIdentity, SignatureHealth)>,
+    outcome_seq_counter: u64,
+}
+
+impl serde::Serialize for ToolHealthTracker {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.checkpoint(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolHealthTracker {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let snapshot = <ToolHealthContinuation as serde::Deserialize>::deserialize(deserializer)?;
+        Self::restore(snapshot).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::ops::Deref for OutcomeSample {
+    type Target = ToolOutcome;
+    fn deref(&self) -> &Self::Target {
+        &self.outcome
+    }
 }
 
 impl ToolHealthTracker {
+    /// This sequence orders diagnostics, not execution or authorization.
+    /// At exhaustion compact retained ranks without changing relative order.
+    fn next_outcome_sequence(&mut self) -> u64 {
+        if self.outcome_seq_counter == u64::MAX {
+            let mut samples: Vec<_> = self
+                .signatures
+                .values_mut()
+                .flat_map(|health| health.outcomes.iter_mut())
+                .collect();
+            samples.sort_unstable_by_key(|sample| sample.insertion_sequence);
+            for (index, sample) in samples.iter_mut().enumerate() {
+                sample.insertion_sequence = index as u64 + 1;
+            }
+            // Resident OutcomeSamples occupy more than one byte each, so a
+            // successfully allocated vector cannot contain u64::MAX samples.
+            self.outcome_seq_counter = samples.len() as u64;
+        }
+        self.outcome_seq_counter += 1;
+        self.outcome_seq_counter
+    }
+
+    pub fn checkpoint(&self) -> ToolHealthContinuation {
+        let mut signatures: Vec<_> = self
+            .signatures
+            .iter()
+            .map(|(id, health)| {
+                let mut health = health.clone();
+                for sample in &mut health.outcomes {
+                    sample.error_preview = None;
+                }
+                (id.clone(), health)
+            })
+            .collect();
+        signatures.sort_by(|left, right| left.0.cmp(&right.0));
+        ToolHealthContinuation {
+            tools: self
+                .tools
+                .iter()
+                .map(|(name, health)| (name.clone(), health.clone()))
+                .collect(),
+            dirty_tools: self.dirty_tools.iter().cloned().collect(),
+            last_sync_epoch: self.last_sync_epoch,
+            signatures,
+            outcome_seq_counter: self.outcome_seq_counter,
+        }
+    }
+
+    pub fn restore(snapshot: ToolHealthContinuation) -> Result<Self, &'static str> {
+        for health in snapshot.tools.values() {
+            if health.total_failures > health.total_calls
+                || health.timeout_count > health.total_failures
+                || health.consecutive_failures > health.total_failures
+                || health.consecutive_successes > health.total_calls - health.total_failures
+                || (health.consecutive_failures != 0 && health.consecutive_successes != 0)
+            {
+                return Err("inconsistent tool health counters");
+            }
+        }
+        let mut identities = std::collections::HashSet::new();
+        let mut sequences = std::collections::HashSet::new();
+        let mut cache_hits = HashMap::<&str, usize>::new();
+        for (identity, health) in &snapshot.signatures {
+            if !identities.insert(identity) || health.outcomes.len() > OUTCOME_RING_CAPACITY {
+                return Err("invalid tool health identity or outcome window");
+            }
+            if health.cache_hit_count > 0 {
+                let total = cache_hits.entry(identity.tool_name()).or_default();
+                *total = total
+                    .checked_add(health.cache_hit_count)
+                    .ok_or("cache hit count overflow")?;
+                if snapshot
+                    .tools
+                    .get(identity.tool_name())
+                    .is_none_or(|tool| *total > tool.cache_hit_count)
+                {
+                    return Err("signature cache pressure exceeds tool aggregate");
+                }
+            }
+            let mut previous = 0;
+            for sample in &health.outcomes {
+                let sequence = sample.insertion_sequence;
+                if sequence <= previous
+                    || sequence > snapshot.outcome_seq_counter
+                    || !sequences.insert(sequence)
+                {
+                    return Err("invalid tool health outcome sequence");
+                }
+                previous = sequence;
+            }
+        }
+        if snapshot
+            .dirty_tools
+            .iter()
+            .any(|tool| !snapshot.tools.contains_key(tool))
+        {
+            return Err("tool health sync references an absent tool");
+        }
+        Ok(Self {
+            tools: snapshot.tools.into_iter().collect(),
+            dirty_tools: snapshot.dirty_tools.into_iter().collect(),
+            last_sync_epoch: snapshot.last_sync_epoch,
+            signatures: snapshot.signatures.into_iter().collect(),
+            outcome_seq_counter: snapshot.outcome_seq_counter,
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -413,19 +563,20 @@ impl ToolHealthTracker {
     /// Neutral for health scoring — the tool didn't actually execute.
     /// Does NOT break the consecutive failure streak (tool wasn't tested).
     pub fn record_cache_hit(&mut self, tool_name: &str) {
-        self.record_cache_hit_for_signature(tool_name, tool_name);
+        self.record_cache_hit_for_signature(&ToolHealthIdentity::new(tool_name.to_owned(), b""));
     }
 
     /// Record a cache hit for a canonical tool signature.
     /// This keeps overall per-tool diagnostics while letting waste detection
     /// key off the exact repeated request shape.
-    pub fn record_cache_hit_for_signature(&mut self, tool_name: &str, signature: &str) {
+    pub fn record_cache_hit_for_signature(&mut self, identity: &ToolHealthIdentity) {
+        let tool_name = identity.tool_name();
         let health = self.tools.entry(tool_name.to_string()).or_default();
         health.cache_hit_count += 1;
-        *self
-            .cache_hits_by_signature
-            .entry(signature.to_string())
-            .or_default() += 1;
+        self.signatures
+            .entry(identity.clone())
+            .or_default()
+            .cache_hit_count += 1;
         // Not counted as total_calls — the tool didn't run
         // Not counted as success or failure — no signal about tool health
         // Mark dirty for delta sync (cache stats changed)
@@ -434,11 +585,24 @@ impl ToolHealthTracker {
 
     /// Number of session-local cache hits recorded for the canonical signature.
     #[must_use]
-    pub fn cache_hits_for_signature(&self, signature: &str) -> usize {
-        self.cache_hits_by_signature
-            .get(signature)
-            .copied()
+    pub fn cache_hits_for_signature(&self, identity: &ToolHealthIdentity) -> usize {
+        self.signatures
+            .get(identity)
+            .map(|health| health.cache_hit_count)
             .unwrap_or_default()
+    }
+
+    /// Clear exact-signature cache pressure at a user-turn boundary.
+    ///
+    /// Aggregate cache-hit telemetry remains durable, but a repeated read is
+    /// only wasteful relative to the current request/response episode.  Carrying
+    /// this map forever would eventually suppress a legitimate fresh request
+    /// merely because an older turn asked for the same immutable-looking value.
+    pub fn clear_cache_hit_signatures(&mut self) {
+        self.signatures.retain(|_, health| {
+            health.cache_hit_count = 0;
+            !health.outcomes.is_empty()
+        });
     }
 
     /// Check whether health avoidance advice is active for a tool.
@@ -601,7 +765,7 @@ impl ToolHealthTracker {
         // Add historical entries that aren't in tracker at all (preserve timestamps)
         for entry in historical {
             if !session_tools.contains(&entry.name) {
-                result.push(entry.clone());
+                result.push(validated_health_entry(entry));
             }
         }
 
@@ -678,6 +842,9 @@ impl ToolHealthTracker {
                 },
             );
             for outcome_entry in &entry.recent_outcomes {
+                if outcome_entry.identity.tool_name() != entry.name {
+                    continue;
+                }
                 let ring: VecDeque<_> = outcome_entry
                     .outcomes
                     .iter()
@@ -699,34 +866,22 @@ impl ToolHealthTracker {
                     })
                     .collect();
                 if !ring.is_empty() {
-                    let preview_ring: VecDeque<Option<String>> =
-                        std::iter::repeat_with(|| None).take(ring.len()).collect();
                     // Allocate a contiguous block of seq numbers for this
                     // signature so persisted entries keep a deterministic
                     // tie-break order matching their original insertion order.
-                    let len = ring.len() as u64;
-                    let base = tracker.outcome_seq_counter.wrapping_add(1);
-                    let seq_ring: VecDeque<u64> = (0..len).map(|i| base.wrapping_add(i)).collect();
-                    tracker.outcome_seq_counter = tracker.outcome_seq_counter.wrapping_add(len);
-                    // Pre-extract tool name (first ':' split) so recent_errors
-                    // doesn't have to re-parse on every call.
-                    let tool = outcome_entry
-                        .signature
-                        .split_once(':')
-                        .map(|(t, _)| t.to_string())
-                        .unwrap_or_else(|| outcome_entry.signature.clone());
+                    let ring = ring
+                        .into_iter()
+                        .map(|outcome| OutcomeSample {
+                            outcome,
+                            insertion_sequence: tracker.next_outcome_sequence(),
+                            error_preview: None,
+                        })
+                        .collect();
                     tracker
-                        .outcome_cache
-                        .insert(outcome_entry.signature.clone(), ring);
-                    tracker
-                        .error_preview_cache
-                        .insert(outcome_entry.signature.clone(), preview_ring);
-                    tracker
-                        .outcome_seq_cache
-                        .insert(outcome_entry.signature.clone(), seq_ring);
-                    tracker
-                        .signature_to_tool
-                        .insert(outcome_entry.signature.clone(), tool);
+                        .signatures
+                        .entry(outcome_entry.identity.clone())
+                        .or_default()
+                        .outcomes = ring;
                 }
             }
         }
@@ -737,13 +892,13 @@ impl ToolHealthTracker {
         &self,
         tool_name: &str,
     ) -> Vec<astra_pipeline::ToolOutcomeCacheEntry> {
-        let prefix = format!("{tool_name}:");
         let mut entries: Vec<_> = self
-            .outcome_cache
+            .signatures
             .iter()
-            .filter(|(signature, ring)| signature.starts_with(&prefix) && !ring.is_empty())
+            .map(|(identity, health)| (identity, &health.outcomes))
+            .filter(|(identity, ring)| identity.tool_name() == tool_name && !ring.is_empty())
             .map(|(signature, ring)| astra_pipeline::ToolOutcomeCacheEntry {
-                signature: signature.clone(),
+                identity: signature.clone(),
                 outcomes: ring
                     .iter()
                     .map(|outcome| astra_pipeline::ToolOutcome {
@@ -758,7 +913,7 @@ impl ToolHealthTracker {
                     .collect(),
             })
             .collect();
-        entries.sort_by(|left, right| left.signature.cmp(&right.signature));
+        entries.sort_by(|left, right| left.identity.cmp(&right.identity));
         entries
     }
 
@@ -808,15 +963,12 @@ impl ToolHealthTracker {
     /// This indicates the LLM is making wasteful duplicate calls.
     pub fn cache_wasteful_tools(&self, threshold: usize) -> Vec<(&str, usize)> {
         let mut aggregated: HashMap<&str, usize> = HashMap::new();
-        for (signature, count) in &self.cache_hits_by_signature {
-            if *count < threshold {
+        for (signature, health) in &self.signatures {
+            if health.cache_hit_count < threshold {
                 continue;
             }
-            let tool_name = signature
-                .split_once(':')
-                .map(|(tool_name, _)| tool_name)
-                .unwrap_or(signature.as_str());
-            *aggregated.entry(tool_name).or_default() += *count;
+            let tool_name = signature.tool_name();
+            *aggregated.entry(tool_name).or_default() += health.cache_hit_count;
         }
         let mut wasteful: Vec<_> = aggregated.into_iter().collect();
         wasteful.sort_by(|left, right| left.0.cmp(right.0));
@@ -833,6 +985,13 @@ impl ToolHealthTracker {
         self.tools.values().map(|h| h.cache_hit_count).sum()
     }
 
+    /// Checked aggregate for validating persisted counters before resuming.
+    pub(crate) fn checked_total_cache_hits(&self) -> Option<usize> {
+        self.tools.values().try_fold(0usize, |total, health| {
+            total.checked_add(health.cache_hit_count)
+        })
+    }
+
     // ─── Outcome cache (P3.2) ─────────────────────────────────────────────
 
     /// Record a `ToolOutcome` under the canonical `(tool_name, args)` key.
@@ -840,67 +999,33 @@ impl ToolHealthTracker {
     /// `sig_key` is typically produced by `tool_dedup_signature` so identical
     /// calls land in the same ring. The ring is bounded by
     /// [`OUTCOME_RING_CAPACITY`]; oldest entries are evicted first.
-    pub fn record_outcome(&mut self, sig_key: &str, outcome: ToolOutcome) {
+    pub fn record_outcome(&mut self, sig_key: &ToolHealthIdentity, outcome: ToolOutcome) {
         self.record_outcome_with_preview(sig_key, outcome, None);
     }
 
     /// Record a `ToolOutcome` with an optional error preview string.
-    /// The preview is stored in a parallel ring so `ToolOutcome` stays `Copy`.
+    /// The outcome and its diagnostic metadata are inserted/evicted together.
     pub fn record_outcome_with_preview(
         &mut self,
-        sig_key: &str,
+        sig_key: &ToolHealthIdentity,
         outcome: ToolOutcome,
         error_preview: Option<&str>,
     ) {
         // Bump the monotonic counter once per call so the seq ring stays in
         // lockstep with the outcome ring even on collisions (same epoch +
         // signature_hint). Used as a final tie-breaker in recent_errors().
-        self.outcome_seq_counter = self.outcome_seq_counter.wrapping_add(1);
-        let seq = self.outcome_seq_counter;
+        let seq = self.next_outcome_sequence();
 
-        let ring = self
-            .outcome_cache
-            .entry(sig_key.to_string())
-            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
+        let ring = self.signatures.entry(sig_key.clone()).or_default();
+        let ring = &mut ring.outcomes;
         if ring.len() == OUTCOME_RING_CAPACITY {
             ring.pop_front();
         }
-        ring.push_back(outcome);
-
-        let preview_ring = self
-            .error_preview_cache
-            .entry(sig_key.to_string())
-            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
-        if preview_ring.len() == OUTCOME_RING_CAPACITY {
-            preview_ring.pop_front();
-        }
-        let capped = error_preview.map(|p| {
-            let s: String = p.chars().take(200).collect();
-            s
+        ring.push_back(OutcomeSample {
+            outcome,
+            insertion_sequence: seq,
+            error_preview: error_preview.map(|text| text.chars().take(200).collect()),
         });
-        preview_ring.push_back(capped);
-
-        let seq_ring = self
-            .outcome_seq_cache
-            .entry(sig_key.to_string())
-            .or_insert_with(|| VecDeque::with_capacity(OUTCOME_RING_CAPACITY));
-        if seq_ring.len() == OUTCOME_RING_CAPACITY {
-            seq_ring.pop_front();
-        }
-        seq_ring.push_back(seq);
-
-        // Remember the tool name extracted at insert time so recent_errors()
-        // doesn't have to re-parse `sig_key` (which is fragile if the tool
-        // name itself contains ':' — e.g. a future namespaced tool).
-        if !self.signature_to_tool.contains_key(sig_key) {
-            // sig_key format: `<tool>:<canonical_args>`. Anchor on the FIRST
-            // ':' only — args may contain colons, tool names do not.
-            let tool = sig_key
-                .split_once(':')
-                .map(|(t, _)| t.to_string())
-                .unwrap_or_else(|| sig_key.to_string());
-            self.signature_to_tool.insert(sig_key.to_string(), tool);
-        }
     }
 
     /// Return recent tool failures with error previews, newest first.
@@ -912,41 +1037,16 @@ impl ToolHealthTracker {
             seq: u64,
         }
         let mut entries: Vec<Pending> = Vec::new();
-        for (sig_key, ring) in &self.outcome_cache {
-            let preview_ring = self.error_preview_cache.get(sig_key);
-            let seq_ring = self.outcome_seq_cache.get(sig_key);
-            debug_assert_eq!(
-                preview_ring.map(VecDeque::len).unwrap_or(0),
-                ring.len(),
-                "tool health outcome and error-preview rings diverged for {sig_key}"
-            );
-            debug_assert_eq!(
-                seq_ring.map(VecDeque::len).unwrap_or(0),
-                ring.len(),
-                "tool health outcome and seq rings diverged for {sig_key}"
-            );
-            for (idx, outcome) in ring.iter().enumerate().rev() {
+        for (sig_key, health) in &self.signatures {
+            let ring = &health.outcomes;
+            for outcome in ring.iter().rev() {
                 if outcome.success {
                     continue;
                 }
-                // Prefer the cached tool name (recorded at insert time);
-                // fall back to splitting on the FIRST ':' for entries that
-                // were rebuilt from persisted state without a cached name.
-                let tool = self
-                    .signature_to_tool
-                    .get(sig_key)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        sig_key
-                            .split_once(':')
-                            .map(|(t, _)| t.to_string())
-                            .unwrap_or_else(|| sig_key.to_string())
-                    });
-                let sig_hint: String = sig_key.chars().take(60).collect();
-                let preview = preview_ring
-                    .and_then(|pr| pr.get(idx))
-                    .and_then(|p| p.clone());
-                let seq = seq_ring.and_then(|sr| sr.get(idx).copied()).unwrap_or(0);
+                let tool = sig_key.tool_name().to_owned();
+                let sig_hint = sig_key.display_hint();
+                let preview = outcome.error_preview.clone();
+                let seq = outcome.insertion_sequence;
                 entries.push(Pending {
                     entry: crate::introspect::ToolErrorEntry {
                         tool,
@@ -984,20 +1084,32 @@ impl ToolHealthTracker {
 
     /// Most recent outcome for a `(tool_name, args)` signature, if any.
     #[must_use]
-    pub fn recent_outcome(&self, sig_key: &str) -> Option<&ToolOutcome> {
-        self.outcome_cache.get(sig_key).and_then(|r| r.back())
+    pub fn recent_outcome(&self, sig_key: &ToolHealthIdentity) -> Option<&ToolOutcome> {
+        self.signatures
+            .get(sig_key)
+            .and_then(|health| health.outcomes.back())
+            .map(|sample| &sample.outcome)
     }
 
     /// Full history ring for a `(tool_name, args)` signature.
     #[must_use]
-    pub fn outcome_history(&self, sig_key: &str) -> Option<&VecDeque<ToolOutcome>> {
-        self.outcome_cache.get(sig_key)
+    pub fn outcome_history(
+        &self,
+        sig_key: &ToolHealthIdentity,
+    ) -> Option<&VecDeque<OutcomeSample>> {
+        self.signatures
+            .get(sig_key)
+            .filter(|health| !health.outcomes.is_empty())
+            .map(|health| &health.outcomes)
     }
 
     /// Total number of signatures currently cached (diagnostic).
     #[must_use]
     pub fn outcome_cache_len(&self) -> usize {
-        self.outcome_cache.len()
+        self.signatures
+            .values()
+            .filter(|health| !health.outcomes.is_empty())
+            .count()
     }
 
     /// Build a per-tool surface bias map from recent outcomes.
@@ -1032,7 +1144,8 @@ impl ToolHealthTracker {
         let mut fails: HashMap<String, usize> = HashMap::new();
         // Per-tool newest failure: (epoch, tag).
         let mut newest_fail: HashMap<String, (u64, Option<String>)> = HashMap::new();
-        for (signature, ring) in &self.outcome_cache {
+        for (signature, health) in &self.signatures {
+            let ring = &health.outcomes;
             let Some(outcome) = ring.back() else { continue };
             if outcome.at_epoch > 0
                 && max_age_secs > 0
@@ -1040,10 +1153,7 @@ impl ToolHealthTracker {
             {
                 continue;
             }
-            let tool_name = signature
-                .split_once(':')
-                .map(|(name, _)| name.to_string())
-                .unwrap_or_else(|| signature.clone());
+            let tool_name = signature.tool_name().to_owned();
             if outcome.success {
                 *successes.entry(tool_name).or_default() += 1;
             } else {
@@ -1101,11 +1211,9 @@ impl ToolHealthTracker {
         min_fail_rate: f64,
     ) -> Vec<(String, f64, u32)> {
         let mut agg: HashMap<String, (u32, u32)> = HashMap::new(); // (fails, total)
-        for (signature, ring) in &self.outcome_cache {
-            let tool_name = signature
-                .split_once(':')
-                .map(|(name, _)| name.to_string())
-                .unwrap_or_else(|| signature.clone());
+        for (signature, health) in &self.signatures {
+            let ring = &health.outcomes;
+            let tool_name = signature.tool_name().to_owned();
             let entry = agg.entry(tool_name).or_default();
             for outcome in ring {
                 entry.1 += 1;
@@ -1158,27 +1266,24 @@ impl ToolHealthTracker {
         max_age_epochs: u64,
     ) -> Vec<RecentOutcomeHint> {
         let max_epoch = self
-            .outcome_cache
+            .signatures
             .values()
-            .filter_map(|ring| ring.back().map(|o| o.at_epoch))
+            .filter_map(|health| health.outcomes.back().map(|o| o.at_epoch))
             .max()
             .unwrap_or(0);
         let min_epoch = max_epoch.saturating_sub(max_age_epochs);
 
         let mut hints: Vec<_> = self
-            .outcome_cache
+            .signatures
             .iter()
-            .filter_map(|(signature, ring)| {
-                ring.back().and_then(|outcome| {
+            .filter_map(|(signature, health)| {
+                health.outcomes.back().and_then(|outcome| {
                     if outcome.at_epoch < min_epoch {
                         None
                     } else {
                         Some(RecentOutcomeHint {
-                            tool_name: signature
-                                .split_once(':')
-                                .map(|(tool_name, _)| tool_name.to_string())
-                                .unwrap_or_else(|| signature.clone()),
-                            signature: signature.clone(),
+                            tool_name: signature.tool_name().to_owned(),
+                            identity: signature.clone(),
                             success: outcome.success,
                             at_epoch: outcome.at_epoch,
                             failure_category: outcome.failure_category,
@@ -1191,7 +1296,7 @@ impl ToolHealthTracker {
             right
                 .at_epoch
                 .cmp(&left.at_epoch)
-                .then_with(|| left.signature.cmp(&right.signature))
+                .then_with(|| left.identity.cmp(&right.identity))
         });
         hints.truncate(limit);
         hints
@@ -1403,20 +1508,63 @@ mod tests {
     #[test]
     fn cache_wasteful_requires_repeated_same_signature() {
         let mut tracker = ToolHealthTracker::new();
-        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
-        tracker.record_cache_hit_for_signature("read_file", "read_file:path=b.txt");
-        tracker.record_cache_hit_for_signature("read_file", "read_file:path=c.txt");
+        tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+            "read_file".into(),
+            "path=a.txt".as_bytes(),
+        ));
+        tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+            "read_file".into(),
+            "path=b.txt".as_bytes(),
+        ));
+        tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+            "read_file".into(),
+            "path=c.txt".as_bytes(),
+        ));
 
         assert!(
             tracker.cache_wasteful_tools(3).is_empty(),
             "three different cached read_file signatures should not look wasteful"
         );
 
-        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
-        tracker.record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
+        tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+            "read_file".into(),
+            "path=a.txt".as_bytes(),
+        ));
+        tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+            "read_file".into(),
+            "path=a.txt".as_bytes(),
+        ));
 
         let wasteful = tracker.cache_wasteful_tools(3);
         assert_eq!(wasteful, vec![("read_file", 3)]);
+    }
+
+    #[test]
+    fn clearing_cache_signature_pressure_keeps_aggregate_telemetry() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_cache_hit_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                "path=a.txt".as_bytes(),
+            ));
+        }
+        assert_eq!(tracker.total_cache_hits(), 3);
+        assert_eq!(
+            tracker.cache_hits_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                "path=a.txt".as_bytes()
+            )),
+            3
+        );
+        tracker.clear_cache_hit_signatures();
+        assert_eq!(
+            tracker.cache_hits_for_signature(&astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                "path=a.txt".as_bytes()
+            )),
+            0
+        );
+        assert_eq!(tracker.total_cache_hits(), 3);
     }
 
     // ── Persistence ──
@@ -1834,7 +1982,7 @@ mod tests {
             failure_rate: 1.0 / 3.0,
             last_updated_epoch: 1000,
             recent_outcomes: vec![ToolOutcomeCacheEntry {
-                signature: r#"bash:{"command":"pwd"}"#.to_string(),
+                identity: ToolHealthIdentity::new("bash".into(), br#"{"command":"pwd"}"#),
                 outcomes: vec![
                     ToolOutcome {
                         success: false,
@@ -1856,13 +2004,19 @@ mod tests {
 
         let tracker = ToolHealthTracker::from_entries(&entries);
         let restored = tracker
-            .outcome_history(r#"bash:{"command":"pwd"}"#)
+            .outcome_history(&astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"pwd"}"#.as_bytes(),
+            ))
             .expect("restored outcome history");
         assert_eq!(restored.len(), 2);
         assert_eq!(restored.back().map(|o| o.at_epoch), Some(20));
         assert!(
             tracker
-                .recent_outcome(r#"bash:{"command":"pwd"}"#)
+                .recent_outcome(&astra_pipeline::ToolHealthIdentity::new(
+                    "bash".into(),
+                    r#"{"command":"pwd"}"#.as_bytes()
+                ))
                 .unwrap()
                 .success
         );
@@ -1966,12 +2120,263 @@ mod tests {
     }
 
     #[test]
+    fn health_sequence_exhaustion_preserves_order_and_restorability() {
+        let id = ToolHealthIdentity::new("bash".into(), b"same-call");
+        let other = ToolHealthIdentity::new("read_file".into(), b"another-call");
+        let mut baseline = ToolHealthTracker::new();
+        for index in 0..12 {
+            baseline.record_outcome(
+                &id,
+                ToolOutcome {
+                    success: false,
+                    latency_ms: 1,
+                    result_hash: index,
+                    at_epoch: 7,
+                    failure_category: None,
+                },
+            );
+            baseline.record_outcome(
+                &other,
+                ToolOutcome {
+                    success: false,
+                    latency_ms: 2,
+                    result_hash: index,
+                    at_epoch: 7,
+                    failure_category: None,
+                },
+            );
+        }
+        let mut exhausted = baseline.clone();
+        for health in exhausted.signatures.values_mut() {
+            for sample in &mut health.outcomes {
+                sample.insertion_sequence *= 100;
+            }
+        }
+        exhausted.outcome_seq_counter = u64::MAX;
+        for index in 12..14 {
+            for state in [&mut baseline, &mut exhausted] {
+                state.record_outcome(
+                    &id,
+                    ToolOutcome {
+                        success: false,
+                        latency_ms: 3,
+                        result_hash: index,
+                        at_epoch: 7,
+                        failure_category: None,
+                    },
+                );
+            }
+        }
+        for identity in [&id, &other] {
+            let outcomes = |state: &ToolHealthTracker| {
+                state
+                    .outcome_history(identity)
+                    .unwrap()
+                    .iter()
+                    .map(|sample| sample.outcome)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(outcomes(&baseline), outcomes(&exhausted));
+        }
+        assert_eq!(
+            serde_json::to_value(baseline.recent_errors(16)).unwrap(),
+            serde_json::to_value(exhausted.recent_errors(16)).unwrap()
+        );
+        let restored = ToolHealthTracker::restore(exhausted.checkpoint()).unwrap();
+        assert_eq!(restored.outcome_seq_counter, exhausted.outcome_seq_counter);
+    }
+
+    #[test]
+    fn same_run_health_continuation_rejects_inconsistent_counters() {
+        let id = ToolHealthIdentity::new("bash".into(), b"request");
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_failure("bash");
+        tracker.record_cache_hit_for_signature(&id);
+        let valid = tracker.checkpoint();
+        for mutate in [
+            |h: &mut ToolHealth| h.total_failures = 2,
+            |h: &mut ToolHealth| h.timeout_count = 2,
+            |h: &mut ToolHealth| h.consecutive_failures = 2,
+            |h: &mut ToolHealth| h.consecutive_successes = 1,
+        ] {
+            let mut invalid = valid.clone();
+            mutate(invalid.tools.get_mut("bash").unwrap());
+            assert!(ToolHealthTracker::restore(invalid).is_err());
+        }
+        let mut invalid = valid.clone();
+        invalid.signatures[0].1.cache_hit_count = 2;
+        assert!(ToolHealthTracker::restore(invalid).is_err());
+        let mut invalid = valid;
+        invalid.tools.clear();
+        invalid.dirty_tools.clear();
+        assert!(ToolHealthTracker::restore(invalid).is_err());
+        // Outcome-only observations are valid without aggregate tool counters.
+        let mut outcome_only = ToolHealthTracker::new();
+        outcome_only.record_outcome(&id, ToolOutcome::new(false, 1, "failure"));
+        assert!(ToolHealthTracker::restore(outcome_only.checkpoint()).is_ok());
+    }
+
+    #[test]
+    fn same_run_health_continuation_preserves_decisions_and_order() {
+        let id = ToolHealthIdentity::new("bash".into(), b"ARG_SECRET_SENTINEL");
+        let cache_only = ToolHealthIdentity::scoped("read_file".into(), b"path", Some(9));
+        let mut continuous = ToolHealthTracker::new();
+        for index in 0..24 {
+            continuous.record_failure("bash");
+            continuous.record_outcome_with_preview(
+                &id,
+                ToolOutcome {
+                    success: false,
+                    latency_ms: 3,
+                    result_hash: index,
+                    at_epoch: 777,
+                    failure_category: Some(FailureCategory::NetworkError),
+                },
+                Some("ERROR_SECRET_SENTINEL"),
+            );
+            continuous.record_cache_hit_for_signature(&cache_only);
+        }
+        continuous.last_sync_epoch = 71;
+        let wire = serde_json::to_string(&continuous.checkpoint()).unwrap();
+        assert_eq!(serde_json::to_string(&continuous).unwrap(), wire);
+        let _: ToolHealthTracker = serde_json::from_str(&wire).unwrap();
+        assert!(!wire.contains("ARG_SECRET_SENTINEL"));
+        assert!(!wire.contains("ERROR_SECRET_SENTINEL"));
+        let mut restored =
+            ToolHealthTracker::restore(serde_json::from_str(&wire).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.checkpoint()).unwrap(),
+            serde_json::to_value(continuous.checkpoint()).unwrap()
+        );
+        assert_eq!(restored.cache_hits_for_signature(&cache_only), 24);
+        assert!(restored.outcome_history(&cache_only).is_none());
+        assert_eq!(restored.recent_outcome(&id), continuous.recent_outcome(&id));
+        assert_eq!(restored.recent_errors(8).len(), 8);
+        assert!(
+            restored
+                .recent_errors(8)
+                .iter()
+                .all(|entry| entry.error_preview.is_none())
+        );
+        for state in [&mut continuous, &mut restored] {
+            state.record_success("bash");
+            state.record_outcome(
+                &id,
+                ToolOutcome {
+                    success: true,
+                    latency_ms: 1,
+                    result_hash: 25,
+                    at_epoch: 778,
+                    failure_category: None,
+                },
+            );
+            state.clear_cache_hit_signatures();
+        }
+        assert_eq!(
+            serde_json::to_value(restored.checkpoint()).unwrap(),
+            serde_json::to_value(continuous.checkpoint()).unwrap()
+        );
+        assert_eq!(restored.signatures.len(), 1);
+        assert!(!restored.is_avoidance_advised("bash"));
+        let valid = restored.checkpoint();
+        let mut duplicate = valid.clone();
+        duplicate.signatures.push(duplicate.signatures[0].clone());
+        assert!(ToolHealthTracker::restore(duplicate).is_err());
+        let mut stale_counter = valid;
+        stale_counter.outcome_seq_counter = 0;
+        assert!(
+            serde_json::from_value::<ToolHealthTracker>(
+                serde_json::to_value(&stale_counter).unwrap()
+            )
+            .is_err()
+        );
+        assert!(ToolHealthTracker::restore(stale_counter).is_err());
+    }
+
+    #[test]
+    fn health_evidence_export_omits_arguments_and_preserves_lookup() {
+        let signature = &astra_pipeline::ToolHealthIdentity::new(
+            "bash".into(),
+            r#"{"command":"echo ARG_SECRET_SENTINEL"}"#.as_bytes(),
+        );
+        let other_signature = &astra_pipeline::ToolHealthIdentity::new(
+            "bash".into(),
+            r#"{"command":"echo another value"}"#.as_bytes(),
+        );
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_failure("bash");
+        let outcome = ToolOutcome {
+            success: false,
+            latency_ms: 19,
+            result_hash: 123,
+            at_epoch: 77,
+            failure_category: Some(FailureCategory::NetworkError),
+        };
+        tracker.record_outcome_with_preview(signature, outcome, Some("ERROR_SECRET_SENTINEL"));
+        tracker.record_cache_hit_for_signature(signature);
+        assert_eq!(tracker.cache_hits_for_signature(signature), 1);
+        assert_eq!(tracker.cache_hits_for_signature(other_signature), 0);
+        let exported = tracker.export();
+        let wire = serde_json::to_string(&exported).unwrap();
+        assert!(!wire.contains("ARG_SECRET_SENTINEL"));
+        assert!(!wire.contains("ERROR_SECRET_SENTINEL"));
+        let mut malformed_wire = serde_json::to_value(&exported).unwrap();
+        malformed_wire[0]["recent_outcomes"][0]["identity"] =
+            serde_json::json!("bash:ARG_SECRET_SENTINEL");
+        assert!(
+            serde_json::from_value::<Vec<astra_pipeline::ToolHealthEntry>>(malformed_wire).is_err()
+        );
+        {
+            let invalid_signature = ToolHealthIdentity::new("another_tool".into(), b"opaque");
+            let mut invalid = exported.clone();
+            invalid[0].recent_outcomes[0].identity = invalid_signature;
+            let imported = ToolHealthTracker::from_entries(&invalid);
+            assert_eq!(imported.outcome_cache_len(), 0);
+            assert_eq!(imported.export()[0].total_calls, 1);
+            assert!(
+                ToolHealthTracker::new().export_merged(&invalid)[0]
+                    .recent_outcomes
+                    .is_empty()
+            );
+            assert!(
+                persistence::build_snapshot(&invalid).tool_health[0]
+                    .recent_outcomes
+                    .is_empty()
+            );
+            let (merged, _, _) = persistence::merge_tool_health(&invalid, &invalid);
+            assert!(merged[0].recent_outcomes.is_empty());
+        }
+        let mut restored = ToolHealthTracker::from_entries(&exported);
+        assert_eq!(restored.recent_outcome(signature), Some(&outcome));
+        assert!(restored.recent_outcome(other_signature).is_none());
+        assert_eq!(restored.recent_errors(1)[0].error_preview, None);
+        restored.record_outcome(
+            signature,
+            ToolOutcome {
+                success: true,
+                at_epoch: 78,
+                ..outcome
+            },
+        );
+        assert_eq!(
+            restored.outcome_cache_len(),
+            1,
+            "lookup and writes must share the same identity"
+        );
+        assert_eq!(restored.outcome_history(signature).unwrap().len(), 2);
+        assert!(restored.recent_outcome(signature).unwrap().success);
+    }
+
+    #[test]
     fn latest_outcomes_propagate_failure_category() {
         use crate::action_compensation::ExecutionOutcomeInput;
 
         let mut tracker = ToolHealthTracker::new();
         tracker.record_outcome(
-            r#"bash:{"command":"curl https://x"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"curl https://x"}"#.as_bytes(),
+            ),
             ToolOutcome::with_classification(
                 false,
                 3_000,
@@ -1999,7 +2404,10 @@ mod tests {
     #[test]
     fn successful_outcome_can_carry_nonprogress_metadata() {
         let mut tracker = ToolHealthTracker::new();
-        let sig = r#"agent:{"action":"get_result","agent_id":"demo"}"#;
+        let sig = &astra_pipeline::ToolHealthIdentity::new(
+            "agent".into(),
+            r#"{"action":"get_result","agent_id":"demo"}"#.as_bytes(),
+        );
         tracker.record_success("agent");
         tracker.record_outcome(
             sig,
@@ -2025,7 +2433,7 @@ mod tests {
     #[test]
     fn outcome_cache_records_and_recalls_most_recent() {
         let mut tracker = ToolHealthTracker::new();
-        let sig = "grep:{\"pattern\":\"TODO\"}";
+        let sig = &ToolHealthIdentity::new("grep".into(), br#"{"pattern":"TODO"}"#);
         tracker.record_outcome(sig, ToolOutcome::new(true, 12, "match 1"));
         tracker.record_outcome(sig, ToolOutcome::new(true, 15, "match 2"));
 
@@ -2038,8 +2446,8 @@ mod tests {
     #[test]
     fn outcome_cache_isolates_distinct_signatures() {
         let mut tracker = ToolHealthTracker::new();
-        let sig_a = "grep:{\"pattern\":\"A\"}";
-        let sig_b = "grep:{\"pattern\":\"B\"}";
+        let sig_a = &ToolHealthIdentity::new("grep".into(), br#"{"pattern":"A"}"#);
+        let sig_b = &ToolHealthIdentity::new("grep".into(), br#"{"pattern":"B"}"#);
         tracker.record_outcome(sig_a, ToolOutcome::new(true, 10, "ra"));
         tracker.record_outcome(sig_b, ToolOutcome::new(false, 20, "rb"));
 
@@ -2051,7 +2459,7 @@ mod tests {
     #[test]
     fn outcome_cache_ring_is_bounded() {
         let mut tracker = ToolHealthTracker::new();
-        let sig = "bash:{}";
+        let sig = &astra_pipeline::ToolHealthIdentity::new("bash".into(), "{}".as_bytes());
         for i in 0..(OUTCOME_RING_CAPACITY + 5) {
             tracker.record_outcome(sig, ToolOutcome::new(true, i as u64, "ok"));
         }
@@ -2069,7 +2477,10 @@ mod tests {
     fn latest_outcomes_returns_newest_signatures_first() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_outcome(
-            r#"bash:{"command":"pwd"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"pwd"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: true,
                 latency_ms: 1,
@@ -2079,7 +2490,10 @@ mod tests {
             },
         );
         tracker.record_outcome(
-            r#"read_file:{"path":"Cargo.toml"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                r#"{"path":"Cargo.toml"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: false,
                 latency_ms: 2,
@@ -2105,7 +2519,10 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(10_000);
         tracker.record_outcome(
-            r#"bash:{"command":"pwd"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"pwd"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: true,
                 latency_ms: 1,
@@ -2115,7 +2532,10 @@ mod tests {
             },
         );
         tracker.record_outcome(
-            r#"bash:{"command":"ls"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"ls"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: true,
                 latency_ms: 1,
@@ -2125,7 +2545,10 @@ mod tests {
             },
         );
         tracker.record_outcome(
-            r#"read_file:{"path":"a"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                r#"{"path":"a"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: false,
                 latency_ms: 2,
@@ -2135,7 +2558,10 @@ mod tests {
             },
         );
         tracker.record_outcome(
-            r#"read_file:{"path":"b"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "read_file".into(),
+                r#"{"path":"b"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: false,
                 latency_ms: 2,
@@ -2157,7 +2583,10 @@ mod tests {
     fn outcome_bias_by_tool_drops_stale_entries() {
         let mut tracker = ToolHealthTracker::new();
         tracker.record_outcome(
-            r#"bash:{"command":"pwd"}"#,
+            &astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                r#"{"command":"pwd"}"#.as_bytes(),
+            ),
             ToolOutcome {
                 success: false,
                 latency_ms: 1,
@@ -2176,15 +2605,21 @@ mod tests {
         // bash: 3 fails out of 3 → 100% fail.
         for i in 0..3 {
             tracker.record_outcome(
-                &format!(r#"bash:{{"command":"a{i}"}}"#),
+                &ToolHealthIdentity::new(
+                    "bash".into(),
+                    format!(r#"{{"command":"a{i}"}}"#).as_bytes(),
+                ),
                 ToolOutcome::new(false, 10, "err"),
             );
         }
         // grep: 1 fail out of 4 → 25% fail.
-        tracker.record_outcome(r#"grep:{"p":"x"}"#, ToolOutcome::new(false, 5, "err"));
+        tracker.record_outcome(
+            &astra_pipeline::ToolHealthIdentity::new("grep".into(), r#"{"p":"x"}"#.as_bytes()),
+            ToolOutcome::new(false, 5, "err"),
+        );
         for i in 0..3 {
             tracker.record_outcome(
-                &format!(r#"grep:{{"p":"y{i}"}}"#),
+                &ToolHealthIdentity::new("grep".into(), format!(r#"{{"p":"y{i}"}}"#).as_bytes()),
                 ToolOutcome::new(true, 5, "ok"),
             );
         }
@@ -2198,7 +2633,10 @@ mod tests {
     #[test]
     fn high_failure_tools_filters_by_min_samples() {
         let mut tracker = ToolHealthTracker::new();
-        tracker.record_outcome(r#"bash:{}"#, ToolOutcome::new(false, 1, "e"));
+        tracker.record_outcome(
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), r#"{}"#.as_bytes()),
+            ToolOutcome::new(false, 1, "e"),
+        );
         // Only 1 sample < min_samples=3.
         let high = tracker.high_failure_tools(3, 0.5);
         assert!(high.is_empty());
@@ -2243,7 +2681,7 @@ mod tests {
             failure_category: Some(crate::action_compensation::FailureCategory::Timeout),
         };
         tracker.record_outcome_with_preview(
-            "bash:ls -la",
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), "ls -la".as_bytes()),
             outcome,
             Some("command timed out after 30s"),
         );
@@ -2251,7 +2689,11 @@ mod tests {
         let errors = tracker.recent_errors(10);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].tool, "bash");
-        assert_eq!(errors[0].signature_hint, "bash:ls -la");
+        assert_eq!(
+            errors[0].signature_hint,
+            ToolHealthIdentity::new("bash".into(), b"ls -la").display_hint()
+        );
+        assert!(!errors[0].signature_hint.contains("ls -la"));
         assert_eq!(
             errors[0].error_preview.as_deref(),
             Some("command timed out after 30s")
@@ -2270,7 +2712,11 @@ mod tests {
             at_epoch: 2000,
             failure_category: None,
         };
-        tracker.record_outcome_with_preview("read_file:src/main.rs", outcome, None);
+        tracker.record_outcome_with_preview(
+            &astra_pipeline::ToolHealthIdentity::new("read_file".into(), "src/main.rs".as_bytes()),
+            outcome,
+            None,
+        );
 
         let errors = tracker.recent_errors(10);
         assert!(
@@ -2291,7 +2737,7 @@ mod tests {
                 failure_category: None,
             };
             tracker.record_outcome_with_preview(
-                &format!("tool:{epoch}"),
+                &ToolHealthIdentity::new("tool".into(), epoch.to_string().as_bytes()),
                 outcome,
                 Some(&format!("error at {epoch}")),
             );
@@ -2315,7 +2761,11 @@ mod tests {
                 at_epoch: i,
                 failure_category: None,
             };
-            tracker.record_outcome_with_preview(&format!("tool:{i}"), outcome, Some("err"));
+            tracker.record_outcome_with_preview(
+                &ToolHealthIdentity::new("tool".into(), i.to_string().as_bytes()),
+                outcome,
+                Some("err"),
+            );
         }
 
         let errors = tracker.recent_errors(3);
@@ -2333,7 +2783,11 @@ mod tests {
             at_epoch: 1,
             failure_category: None,
         };
-        tracker.record_outcome_with_preview("bash:fail", outcome, Some(&long_msg));
+        tracker.record_outcome_with_preview(
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), "fail".as_bytes()),
+            outcome,
+            Some(&long_msg),
+        );
 
         let errors = tracker.recent_errors(1);
         assert_eq!(errors[0].error_preview.as_ref().unwrap().len(), 200);
@@ -2351,14 +2805,19 @@ mod tests {
                 failure_category: None,
             };
             tracker.record_outcome_with_preview(
-                "bash:same-sig",
+                &astra_pipeline::ToolHealthIdentity::new("bash".into(), "same-sig".as_bytes()),
                 outcome,
                 Some(&format!("error #{i}")),
             );
         }
 
         // Ring should be bounded to OUTCOME_RING_CAPACITY
-        let ring = tracker.outcome_history("bash:same-sig").unwrap();
+        let ring = tracker
+            .outcome_history(&astra_pipeline::ToolHealthIdentity::new(
+                "bash".into(),
+                "same-sig".as_bytes(),
+            ))
+            .unwrap();
         assert_eq!(ring.len(), OUTCOME_RING_CAPACITY);
     }
 
@@ -2372,7 +2831,10 @@ mod tests {
             at_epoch: 500,
             failure_category: None,
         };
-        tracker.record_outcome("bash:old-api", outcome);
+        tracker.record_outcome(
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), "old-api".as_bytes()),
+            outcome,
+        );
 
         let errors = tracker.recent_errors(10);
         assert_eq!(errors.len(), 1);
@@ -2380,8 +2842,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tool health outcome and error-preview rings diverged")]
-    fn recent_errors_asserts_preview_ring_sync_in_debug() {
+    fn outcome_and_diagnostics_share_one_record() {
         let mut tracker = ToolHealthTracker::new();
         let outcome = ToolOutcome {
             success: false,
@@ -2390,10 +2851,18 @@ mod tests {
             at_epoch: 500,
             failure_category: None,
         };
-        tracker.record_outcome_with_preview("bash:desync", outcome, Some("boom"));
-        tracker.error_preview_cache.remove("bash:desync");
-
-        let _ = tracker.recent_errors(10);
+        tracker.record_outcome_with_preview(
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), "desync".as_bytes()),
+            outcome,
+            Some("boom"),
+        );
+        let samples = tracker
+            .outcome_history(&ToolHealthIdentity::new("bash".into(), b"desync"))
+            .unwrap();
+        let sample = samples.back().unwrap();
+        assert_eq!(sample.outcome, outcome);
+        assert_eq!(sample.error_preview.as_deref(), Some("boom"));
+        assert_eq!(sample.insertion_sequence, 1);
     }
 
     /// Two failures with identical `at_epoch` AND identical `signature_hint`
@@ -2402,11 +2871,11 @@ mod tests {
     #[test]
     fn recent_errors_seq_breaks_full_tie() {
         let mut tracker = ToolHealthTracker::new();
-        // Identical 60-char prefix to force signature_hint collision; only
-        // the suffix differs.
-        let prefix = "bash:".to_string() + &"x".repeat(60);
-        let sig_a = format!("{prefix}A");
-        let sig_b = format!("{prefix}B");
+        // Repeated identical requests share their digest and timestamp;
+        // insertion sequence must still break the tie within the ring.
+        let sig_a =
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), "same-request".as_bytes());
+        let sig_b = sig_a;
         let mk = || ToolOutcome {
             success: false,
             latency_ms: 1,
@@ -2415,10 +2884,10 @@ mod tests {
             failure_category: None,
         };
         // Insert A first, then B. Both share at_epoch and signature_hint
-        // (since the hint truncates at 60 chars). Newest-first ordering
+        // (the same request digest). Newest-first ordering
         // must place B before A on every run.
-        tracker.record_outcome_with_preview(&sig_a, mk(), Some("a"));
-        tracker.record_outcome_with_preview(&sig_b, mk(), Some("b"));
+        tracker.record_outcome_with_preview(sig_a, mk(), Some("a"));
+        tracker.record_outcome_with_preview(sig_b, mk(), Some("b"));
 
         let errors = tracker.recent_errors(10);
         assert_eq!(errors.len(), 2);
@@ -2445,7 +2914,10 @@ mod tests {
         };
         // sig_key with multiple ':' — args contain colons (e.g. URL-like).
         tracker.record_outcome_with_preview(
-            "web_fetch:url=https://example.com:8080/path",
+            &astra_pipeline::ToolHealthIdentity::new(
+                "web_fetch".into(),
+                "url=https://example.com:8080/path".as_bytes(),
+            ),
             outcome,
             Some("boom"),
         );

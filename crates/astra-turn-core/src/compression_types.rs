@@ -275,7 +275,11 @@ impl From<Message> for Value {
                 || matches!(
                     k.as_str(),
                     astra_turn_types::USER_TURN_SEMANTICS_FIELD
-                        | astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD
+                        | astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD
+                        | astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD
+                        | crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
+                        | crate::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD
                 )
             {
                 map.insert(k, v);
@@ -289,6 +293,13 @@ impl Message {
     /// Returns `true` when this is a real user task message (not synthetic, not a tool_result array).
     pub fn is_plain_user_task(&self) -> bool {
         if self.role != "user" {
+            return false;
+        }
+        if self
+            .extra
+            .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+            .is_some_and(astra_turn_types::is_runtime_owned_provenance)
+        {
             return false;
         }
         // Anthropic tool_result arrays are never real user tasks.
@@ -468,6 +479,27 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_preserves_tool_result_artifact_metadata() {
+        let descriptor = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 42,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let v = json!({
+            "role": "tool",
+            "content": "<persisted-output>\nRecover with introspect(...)\n</persisted-output>",
+            "tool_call_id": "call-1",
+            "_astra_tool_result_run_id": "run-1",
+            "_astra_tool_result_artifact": descriptor,
+            "_astra_tool_result_advisories": ["use a targeted recovery read"],
+        });
+        let msg = Message::from(v.clone());
+        assert_eq!(Value::from(msg), v);
+    }
+
+    #[test]
     fn round_trip_anthropic_tool_result_array() {
         // Anthropic-format: content is an array of tool_result blocks.
         let v = json!({
@@ -633,7 +665,7 @@ mod tests {
                 "schema_version": 1,
                 "objective_relation": "refine"
             },
-            astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD: {
+            astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD: {
                 "schema_version": 1,
                 "turn_chain_id": "chain-1"
             },
@@ -663,7 +695,7 @@ mod tests {
             "stable turn semantics must survive canonical compaction"
         );
         assert!(
-            back.get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+            back.get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
                 .is_some(),
             "bridge turn identity must survive context optimization"
         );
@@ -754,6 +786,40 @@ mod tests {
         let mut m = mk_msg("user", Some("real content"));
         m.is_synthetic = true;
         assert!(!m.is_plain_user_task());
+    }
+
+    #[test]
+    fn append_only_runtime_user_preserves_provenance_and_is_not_a_user_task() {
+        let mut value = json!({"role": "user", "content": "runtime authority"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut value,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+
+        let message = Message::from(value);
+        assert!(!message.is_plain_user_task());
+        let round_trip = Value::from(message);
+        assert!(astra_turn_types::is_runtime_owned_message(&round_trip));
+        assert!(!astra_turn_types::is_human_user_message(&round_trip));
+    }
+
+    #[test]
+    fn unknown_runtime_delivery_round_trips_without_becoming_a_user_task() {
+        let value = json!({
+            "role": "user",
+            "content": "future runtime control",
+            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD: {
+                "producer": "runtime",
+                "delivery": "future_delivery",
+            },
+        });
+
+        let message = Message::from(value);
+        assert!(!message.is_plain_user_task());
+        let round_trip = Value::from(message);
+        assert!(astra_turn_types::is_runtime_owned_message(&round_trip));
+        assert!(!astra_turn_types::is_human_user_message(&round_trip));
     }
 
     #[test]

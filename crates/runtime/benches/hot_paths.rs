@@ -5,9 +5,9 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
-use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
+use astra_turn_core::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 
 // ── Tool Surface: always-load build (hot path, every turn) ──────
 
@@ -80,7 +80,6 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
-
     let mut group = c.benchmark_group("inject_required_tool_names");
     group.bench_function("5_required_into_2_visible", |b| {
         b.iter(|| {
@@ -135,7 +134,6 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
         schema_budget_used: 0,
         schema_budget_total: 800,
     };
-
     let mut group = c.benchmark_group("retain_invoked_tool_schemas");
     group.bench_function("5_results_1_visible", |b| {
         b.iter(|| {

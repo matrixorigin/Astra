@@ -5,7 +5,7 @@
 > **范围**：认证与租户隔离、Cloud 运行时、资源治理、Admin 运维、多客户端协议、部署拓扑、可观测性与安全。
 >
 > **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁；**专门刻画 SaaS 形态下的必测项**。
-> **相关文档**：[部署架构](../design/deployment-architecture.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Cloud Runtime](../design/multi-agent-cloud-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
+> **相关文档**：[客户端与部署](../design/client-surfaces-and-deployment.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Runtime](../design/multi-agent-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
 
 ---
 
@@ -21,12 +21,12 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
                              │ HTTPS + JWT
 ┌────────────────────────────▼────────────────────────────────────┐
 │  Cloud（astra-server）— SaaS 核心价值所在                         │
-│  认证/RBAC · /chat/turn · 上下文组装 · LLM（Key 不出云）          │
+│  认证/RBAC · /chat/stream · 上下文组装 · LLM（Key 不出云）         │
 │  记忆代理 · 模型路由 · 预算/限流 · 审计 · 持久化（MatrixOne）      │
 │  资源治理 · Admin · 运行时存储维护 · 多 Agent Run / Lease       │
 └────────────────────────────┬────────────────────────────────────┘
                              │
-              MatrixOne · Redis · Memoria ·（可选 Skill Worker）
+              MatrixOne · Memoria ·（可选 Skill Worker）
 ```
 
 **SaaS 与单机/私有化部署的区别**（测试必须覆盖）：
@@ -50,7 +50,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 |----------|----------|--------------|
 | **接入与认证** | 注册/登录/刷新/登出；未授权 401/403 明确 | Auth E2E + 安全测试 |
 | **Thin Client 协议** | CLI、SDK、Web 共用同一 HTTP 协议，无 hidden state | SDK E2E + §4 场景 |
-| **Cloud 运行时** | `/chat/turn` enrichment、SSE、审计链完整 | Edge-Cloud E2E（system_matrix + bridge hooks） |
+| **Cloud 运行时** | `/chat/stream` server-owned loop、SSE、审计链完整 | Server/Edge callback E2E（system_matrix + legacy mock hook） |
 | **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory/Team | 隔离矩阵测试 |
 | **资源治理** | 超配额拒绝；Admin 可 override；计量准确 | ResourceGovernor + Admin API |
 | **Admin 运维** | 冷启动、模型加载、用户/Token/配置管理 | Admin smoke + 部署验收 |
@@ -71,7 +71,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 ├──────────────────────────────────────────────────────────────┤
 │  第二层：SaaS 平台能力（认证、治理、Admin、隔离、存储维护）        │
 ├──────────────────────────────────────────────────────────────┤
-│  第一层：Cloud 运行时协议（/chat/turn、回调、Run、Sync）        │
+│  第一层：Cloud 运行时协议（/chat/stream、回调、Run、Sync）       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -79,7 +79,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 - **第一层、第二层** 决定 SaaS 能否对外开服。
 - **第三层** 验证真实客户路径（CLI 开发者、SDK 集成方、Admin 运维）。
 - **第四层** 决定能否承载生产流量（Beta/GA 全量前必做）。
-- 测试环境：**类生产 SaaS 栈**（MatrixOne + Redis + Memoria + 多副本 API + 真实 LLM）。
+- 测试环境：**类生产 SaaS 栈**（MatrixOne + Memoria + 多副本 API + 真实 LLM）。
 
 ---
 
@@ -87,9 +87,9 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 
 > 本节强调 **SaaS 视角的 Cloud 运行时必过项**。
 
-### 4.1 `/chat/turn` — SaaS 价值载体
+### 4.1 `/chat/stream` — SaaS 价值载体
 
-Cloud 每一 Turn 必须完成（非简单 LLM 代理）：
+Cloud 每一 server-owned stream admission 必须完成（非简单 LLM 代理）：
 
 1. JWT 鉴权 + 限流
 2. 持久化 Edge 上报的 `tool_results`
@@ -103,18 +103,18 @@ Cloud 每一 Turn 必须完成（非简单 LLM 代理）：
 | 测试项 | 通过标准 |
 |--------|----------|
 | 首 Turn 含 `project_rules` | Cloud 缓存并按 Session 注入 |
-| 多轮 tool loop（≥3） | Edge↔Cloud 闭环；最终 `turn_complete` |
+| 多轮 tool loop（≥3） | Edge↔Cloud 闭环；同一 stream 消费 callback，最终恰好一个 `turn_complete` 且 `continuation_owner=server` |
 | 超 Token 日预算 | Cloud 拒绝；Edge 收到明确 `error`（非 silent 截断） |
 | 并发同 Session Turn | 无 SSE/状态串话 |
 | LLM 429/5xx | 重试 + fallback；SSE `error` 含 `retryable` |
 
 **自动化：**
 ```bash
-# Edge-Cloud 协议（bridge hooks，无真实 LLM）
-cargo test -p astra-runtime --test edge_cloud_round_trip_e2e --features bridge-e2e-hooks
+# CLI+Server / Server / Edge+Server（确定性 provider hooks，无真实 LLM）
+cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 
-# 在线 Matrix E2E（含 chat/turn、callback、并发隔离）
-ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- --ignored
+# 在线 Matrix E2E（含 server-owned chat/stream、callback、并发隔离）
+ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- --ignored
 ```
 
 ### 4.2 Edge 回调与 Agent 注册
@@ -126,7 +126,7 @@ ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --test system_matrix_http_e2e --f
 | `POST /agents/edge` | Edge Agent 注册到 `edge_agent_registry` |
 | Task Lease（claim/renew/release） | 多 Edge / 多副本下任务不重复执行 |
 
-**自动化：** `e2e_matrix_edge_callback_*`、`e2e_matrix_tasks_lease_and_db_assertions`、`GET /edges/status`（SDK `getEdgesStatus()`）
+**自动化：** `e2e_matrix_edge_callback_*`、`e2e_matrix_saas_edge_tool_result_success_path`、`e2e_matrix_saas_edges_status_smoke`（SDK `getEdgesStatus()`）；Task Lease 的 claim/renew/release 专项 E2E 尚未接入矩阵，且当前 runtime 不注册 legacy `/tasks/*/lease/*` 或 `/agent-jobs/*/lease/*` 路由，客户端 wiremock 不能视为能力证明。
 
 ### 4.3 Headless Cloud Run
 
@@ -149,7 +149,7 @@ SaaS 必须支持 **无终端后台任务**（Thin Client 只发 HTTP）：
 | 断网后重连 | 增量补齐；无 duplicate events |
 | 跨设备恢复 Session | Cloud 为 source of truth |
 
-详见 [sync_protocol.md](../sync_protocol.md)。
+详见 [Edge-Cloud 同步架构](../architecture/edge-cloud-sync-architecture.md)。
 
 ---
 
@@ -185,7 +185,7 @@ Admin 操作必须 **`astra_admin` 角色**，普通用户 403。
 | Admin 路由 | 验证内容 | E2E 覆盖 |
 |------------|----------|----------|
 | `POST /admin/init` | 冷启动 schema | 部署验收 |
-| `GET/POST /admin/tokens` | API Token 管理 | `e2e_matrix_admin_tokens_smoke` |
+| `GET/POST /admin/tokens` | API Token 管理 | `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | `POST/PUT/DELETE /models` | 模型 CRUD + Key 加密 | `e2e_matrix_models_admin_crud` |
 | `GET/PUT /admin/config/{key}` | 服务端配置 | contract + 手工 |
 | `PUT /admin/resources/limits/{user_id}` |  per-user 配额 override | §5.3 |
@@ -208,11 +208,11 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 
 | 限额项 | 默认值（参考） | 测试场景 |
 |--------|----------------|----------|
-| `max_sessions_per_day` | 5000 | 第 5001 个 Session → Denied |
-| `max_concurrent_sessions` | 100 | 第 101 个活跃 Session → Denied |
-| `max_tokens_per_day` | 10,000,000,000 | 达到每日预算后，后续 Turn → Denied；显式 `0` 仍表示不限量 |
-| `max_concurrent_bash` | 100 | 配置读写（执行侧并发限流尚未接入） |
-| `max_disk_bytes` | 10 GiB | 配置读写（执行侧磁盘限流尚未接入） |
+| `max_sessions_per_day` | unlimited (`0`) | 显式配置有限额度后，下一次超限 Session → Denied |
+| `max_concurrent_sessions` | unlimited (`0`) | 显式配置有限额度后，下一次超限活跃 Session → Denied |
+| `max_tokens_per_day` | unlimited (`0`) | 显式配置有限额度后，超限 Turn → Denied |
+| `max_concurrent_bash` | 3 | Edge 并发 bash 超限 |
+| `max_disk_bytes` | 1GB | 工作区/upload 超限 |
 
 | 测试项 | 通过标准 |
 |--------|----------|
@@ -270,7 +270,7 @@ C3 运行时诊断与 C1 历史分离：模型请求诊断（`model_request_cont
 
 ### 5.7 Memoria 代理（Cloud 侧）
 
-Edge **不直连** Memoria；Cloud 在 `/chat/turn` 内代理记忆检索与写入。
+Edge **不直连** Memoria；Cloud 在 server-owned `/chat/stream` 内代理记忆检索与写入。
 
 | 测试项 | 通过标准 |
 |--------|----------|
@@ -287,9 +287,11 @@ Edge **不直连** Memoria；Cloud 在 `/chat/turn` 内代理记忆检索与写�
 ```
 astra login
 astra chat "分析 src/main.rs"
-  → Cloud /chat/turn × N（含本地 read_file）
+  → Cloud /chat/stream ×1（同一 admission 内含 N 个 model rounds/callbacks，包括本地 read_file）
 astra session list          → GET /sessions
-astra replay <id>           → POST /sessions/{id}/replay
+Replay routes are reserved; an owned session currently receives HTTP 501
+from POST /sessions/{id}/replay and GET /sessions/{id}/replay/compare
+(foreign or missing sessions receive HTTP 404).
 ```
 
 **验收：** 全程无 `--local`；`~/.astra/credentials.json` 有效；审计链完整。
@@ -353,7 +355,7 @@ Token 消耗 → GET /resources/usage 准确
 | 拓扑 | 必测项 |
 |------|--------|
 | Docker Compose（all-in-one） | 一键启动；Init → API 健康 |
-| K8s + Helm | 2+ API 副本；外部 MatrixOne/Redis |
+| K8s + Helm | 2+ API 副本；外部 MatrixOne 与 Memoria |
 | HPA | CPU/RPS 触发扩容；扩容后 Session 粘性无要求（无状态） |
 | 滚动升级 | 零 downtime；进行中 Run 可恢复或失败可感知 |
 
@@ -371,7 +373,7 @@ helm install astra deployment/kubernetes/chart \
 | 场景 | 目标 |
 |------|------|
 | `/health`、`GET /sessions` | P95 < 500ms @ 100 并发 |
-| `/chat/turn` 首 token（TTFT） | P95 < 3s（视模型） |
+| `/chat/stream` 首 token（TTFT） | P95 < 3s（视模型） |
 | 长 Turn SSE | ping 保活；30s+ 不断连 |
 | 50 租户 × 5 并发 Session | 无串话、无死锁 |
 | 10 并行 Cloud Run | lease 不冲突 |
@@ -383,7 +385,6 @@ helm install astra deployment/kubernetes/chart \
 |------|---------------|
 | 单 API Pod 终止 | 其他副本接管；客户端重试成功 |
 | MatrixOne 30s 不可用 | `/health` unhealthy；恢复后 OK |
-| Redis 不可用 | 限流/cache 降级（按设计 fail-open/closed） |
 | Memoria 不可用 | 记忆跳过；Chat 可用 |
 | LLM 区域故障 | fallback_chain 切换模型 |
 
@@ -391,7 +392,7 @@ helm install astra deployment/kubernetes/chart \
 
 | 项 | 验证 |
 |----|------|
-| `/health` | DB + Redis + 依赖状态 |
+| `/health` | DB + 运行时依赖状态 |
 | Prometheus 指标 | RPS、延迟、错误率、Run 数 |
 | `GET /introspection/*` | context trend、memory recall、retrieval quality |
 | `GET /events` | Session 时间线可导出 |
@@ -404,7 +405,7 @@ helm install astra deployment/kubernetes/chart \
 | 项 | 要求 |
 |----|------|
 | TLS | 生产强制 HTTPS |
-| JWT Secret / Fernet Key | 非默认值；轮换流程文档化 |
+| JWT Secret / encryption secret | 非默认值；轮换流程文档化 |
 | LLM Key | 不出 Cloud；Edge 日志无 Key |
 | Edge 信任边界 | tool_result 标记 `source: edge` |
 | CORS / CSRF | Web 客户端策略正确 |
@@ -420,7 +421,6 @@ helm install astra deployment/kubernetes/chart \
 |------|------|
 | astra-server | ≥2 实例（第四层） |
 | MatrixOne | 独立测试 Account；可用 `ASTRA_DATABASE_PREFIX` 隔离 |
-| Redis | 与生产同 major 版本 |
 | Memoria | 真实实例或等价 test double |
 | LLM | GA 主模型 + fallback 模型各一 |
 
@@ -440,7 +440,7 @@ helm install astra deployment/kubernetes/chart \
 | 类别 | 自动化 | 手工 |
 |------|--------|------|
 | Auth / Session CRUD | `system_matrix_http_e2e` | — |
-| /chat/turn + callback | `edge_cloud_round_trip_e2e`、matrix E2E | 长 Turn 实网 |
+| /chat/stream + callback | `web_agent_e2e`、matrix E2E | 长 Turn 实网 |
 | Admin smoke | `e2e_matrix_admin_*`、`models_admin_crud` | init、audit 导出 |
 | ResourceGovernor | `e2e_matrix_saas_resource_*` | 配额边界 UX |
 | SDK | `ASTRA_SDK_E2E=1` | Web UI |
@@ -455,7 +455,7 @@ make test-offline                                      # 快速回归
 make test-online                                       # Matrix E2E 全矩阵
 make test-harness FORCE_MODEL=<主模型> PARALLEL=4    # Harness P0
 ASTRA_SDK_E2E=1 npm test --prefix packages/sdk       # SDK SaaS 客户端
-cargo test -p astra-runtime --test edge_cloud_round_trip_e2e --features bridge-e2e-hooks
+cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 cargo test -p astra-services --test services_db_integration -- --ignored  # 服务层 DB
 ```
 
@@ -481,7 +481,7 @@ cargo test -p astra-services --test services_db_integration -- --ignored  # 服�
 
 ```
 Cloud 协议（第一层）
-[ ] /chat/turn SSE 协议 + 多轮 tool loop 通过
+[ ] /chat/stream SSE 协议 + 多轮 server-owned tool loop 通过
 [ ] Edge 回调 + Lease + Run pause/resume 通过
 [ ] Cloud Sync push/pull 一致
 [ ] LLM Key 不出 Cloud；审计链 100% Turn 有 snapshot
@@ -534,15 +534,15 @@ Edge-Cloud 与 Engine 能力重叠部分只测一次。
 
 | SaaS 能力 | 设计文档 | 自动化 | 手工场景 |
 |-----------|----------|--------|----------|
-| Edge-Cloud 分执行 | edge-cloud-execution.md | edge_cloud_round_trip_e2e | §6.1 |
+| Edge-Cloud 分执行 | edge-cloud-execution.md | `web_agent_e2e` Edge journeys | §6.1 |
 | Thin Client / SDK | multi-agent-cloud-runtime §5.5 | `saas-remote.test.ts` + `test:integration:saas` | §6.2 |
 | JWT + RBAC | deployment-architecture §1.1 | product_matrix auth | §5.1 |
-| Admin 运维 | router_builder `/admin/*` | admin_smoke, models_admin_crud | §6.3 |
+| Admin 运维 | router_builder `/admin/*` | `e2e_matrix_saas_admin_tokens_rbac_smoke`, `e2e_matrix_models_admin_crud` | §6.3 |
 | 资源治理 | resource_governor.rs | `e2e_matrix_saas_resource_*` | §5.3, §6.6 |
 | 多租户 | trust-and-safety §10 | — | §5.4 Multi-Account |
 | 运行时存储维护 | runtime_maintenance.rs | 单元 + 集成 | §5.5 |
 | Headless Run | multi-agent-cloud-runtime §5.3 | chat_run_pause_resume | §4.3 |
-| Task Lease | sync_protocol / §9 | tasks_lease E2E | §6.4 |
+| Task Lease | sync_protocol / §9 | —（legacy lease routes are not registered by runtime; no live claim/renew/release E2E） | §6.4 |
 | Memoria 代理 | edge-cloud-execution | memory_full_lifecycle | §5.7 |
 | K8s 部署 | deployment-architecture §Topology 3 | — | §7.1 |
 | Gateway | astra-gateway README | — | §6.5 |

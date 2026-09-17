@@ -487,6 +487,8 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_empty_input_returns_empty() {
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "http://nonexistent:9999".into(),
             api_key: "key".into(),
             model_name: "model".into(),
@@ -504,6 +506,8 @@ mod tests {
     #[tokio::test]
     async fn filter_memories_unreachable_server_uses_lexical_fallback() {
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
             model_name: "model".into(),
@@ -561,6 +565,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "qwen3.5-flash".into(),
@@ -586,6 +592,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "gpt-4o-mini".into(),
@@ -611,6 +619,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>reasoning</think>[0, 2]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -631,6 +641,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "<think>[0, 1]</think>").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -657,6 +669,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[1]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -677,6 +691,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
@@ -700,6 +716,8 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let base = spawn_mock_completions(captured.clone(), "[0]").await;
         let params = DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),

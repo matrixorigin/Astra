@@ -477,6 +477,13 @@ pub(crate) fn rollback_database_snapshots(
     args: &Value,
     current_turn_index: u32,
 ) -> String {
+    if args.get("after_sequence").is_some() {
+        return json!({
+            "success": false,
+            "error": "unknown field 'after_sequence'; use 'database_after_sequence'",
+        })
+        .to_string();
+    }
     let scope = args
         .get("scope")
         .and_then(Value::as_str)
@@ -591,7 +598,6 @@ pub(crate) fn rollback_database_snapshots(
             };
             let checkpoint = args
                 .get("database_after_sequence")
-                .or_else(|| args.get("after_sequence"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let plan = if checkpoint > 0 {

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Development environment initialization script (Rust-only)
 
-set -e
+set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
+. "$PROJECT_ROOT/scripts/lib/env_file.sh"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "❌ .env file not found. Create one first."
@@ -17,39 +18,70 @@ echo ""
 update_or_add() {
     local key="$1"
     local value="$2"
-    if grep -q "^${key}=" "$ENV_FILE"; then
+    if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$ENV_FILE"; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' "s#^${key}=.*#${key}=${value}#" "$ENV_FILE"
+            sed -i '' "s#^[[:space:]]*${key}[[:space:]]*=.*#${key}=${value}#" "$ENV_FILE"
         else
-            sed -i "s#^${key}=.*#${key}=${value}#" "$ENV_FILE"
+            sed -i "s#^[[:space:]]*${key}[[:space:]]*=.*#${key}=${value}#" "$ENV_FILE"
         fi
     else
         echo "${key}=${value}" >> "$ENV_FILE"
     fi
 }
 
-if ! grep -q "^ASTRA_TOKEN_ENCRYPTION_KEY=" "$ENV_FILE" || grep -q "ASTRA_TOKEN_ENCRYPTION_KEY=.*CHANGE_ME" "$ENV_FILE"; then
-    KEY="$(openssl rand -base64 32 | tr -d '\n')"
+needs_generated_secret() {
+    local key="$1"
+    local value
+    value="$(env_file_read "$ENV_FILE" "$key" 2>/dev/null || true)"
+    env_value_is_placeholder "$value"
+}
+
+generate_secret() {
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "❌ openssl is required to generate local secrets" >&2
+        return 1
+    fi
+    openssl rand "$@"
+}
+
+if needs_generated_secret "ASTRA_TOKEN_ENCRYPTION_KEY"; then
+    KEY="$(generate_secret -base64 32)"
     update_or_add "ASTRA_TOKEN_ENCRYPTION_KEY" "$KEY"
     echo "✅ Generated ASTRA_TOKEN_ENCRYPTION_KEY"
 else
     echo "✅ ASTRA_TOKEN_ENCRYPTION_KEY already configured"
 fi
 
-if ! grep -q "^ASTRA_JWT_SECRET=" "$ENV_FILE" || grep -q "ASTRA_JWT_SECRET=.*CHANGE_ME" "$ENV_FILE"; then
-    JWT_KEY="$(openssl rand -hex 32)"
+if needs_generated_secret "ASTRA_JWT_SECRET"; then
+    JWT_KEY="$(generate_secret -hex 32)"
     update_or_add "ASTRA_JWT_SECRET" "$JWT_KEY"
     echo "✅ Generated ASTRA_JWT_SECRET"
 else
     echo "✅ ASTRA_JWT_SECRET already configured"
 fi
 
-if ! grep -q "^ASTRA_BRIDGE_SECRET=" "$ENV_FILE" || grep -Eq "^ASTRA_BRIDGE_SECRET=(|your-bridge-secret.*)$" "$ENV_FILE"; then
-    BRIDGE_KEY="$(openssl rand -hex 32)"
-    update_or_add "ASTRA_BRIDGE_SECRET" "$BRIDGE_KEY"
-    echo "✅ Generated ASTRA_BRIDGE_SECRET"
+if needs_generated_secret "ASTRA_RUNTIME_ROOT_SECRET"; then
+    RUNTIME_ROOT_KEY="$(generate_secret -hex 32)"
+    update_or_add "ASTRA_RUNTIME_ROOT_SECRET" "$RUNTIME_ROOT_KEY"
+    echo "✅ Generated ASTRA_RUNTIME_ROOT_SECRET"
 else
-    echo "✅ ASTRA_BRIDGE_SECRET already configured"
+    echo "✅ ASTRA_RUNTIME_ROOT_SECRET already configured"
+fi
+
+if needs_generated_secret "MEMORIA_MASTER_KEY"; then
+    MEMORIA_KEY="$(generate_secret -hex 32)"
+    update_or_add "MEMORIA_MASTER_KEY" "$MEMORIA_KEY"
+    echo "✅ Generated MEMORIA_MASTER_KEY"
+else
+    echo "✅ MEMORIA_MASTER_KEY already configured"
+fi
+
+# Existing configurations may predate the explicit local-memory permission.
+# Preserve an operator's setting and surface the missing prerequisite early.
+MEMORIA_LOCAL_ACCESS="$(env_file_read "$ENV_FILE" MEMORIA_SELF_HOSTED_MASTER_ACCESS 2>/dev/null || true)"
+MEMORIA_LOGIN_WEBSITE="$(env_file_read "$ENV_FILE" MEMORIA_WEB_URL 2>/dev/null || true)"
+if [[ -z "$MEMORIA_LOGIN_WEBSITE" && "$MEMORIA_LOCAL_ACCESS" != 1 ]]; then
+    echo "⚠️  Local user memory is disabled. For self-hosted Memoria 0.5.2+, set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in .env and restart the API."
 fi
 
 # ── Optional: fast linker (mold) ──
@@ -77,6 +109,7 @@ echo ""
 echo "✅ Development environment initialized!"
 echo ""
 echo "Next steps:"
-echo "  1. Start services:  make dev-start"
-echo "  2. Run setup:       make dev-setup-demo"
-echo "  3. Start chatting:  astra chat"
+echo "  1. Configure .env and copy .models.yaml.example to .models.yaml"
+echo "  2. Build the CLI:    make build-cli-debug"
+echo "  3. Start Server:     make dev-start"
+echo "  4. Bootstrap:        ./target/debug/astra admin register"

@@ -76,23 +76,7 @@ async fn hydrate_edge_registration_runtime_context(
     Ok(())
 }
 
-pub(crate) async fn inject_effective_runtime_context_body(
-    state: &AppState,
-    principal: &AuthPrincipal,
-    body: Bytes,
-) -> Result<Bytes, (StatusCode, Json<ErrorResponse>)> {
-    if principal.is_provider_authorized_request() {
-        if principal.is_edge_registration() {
-            return inject_edge_registration_runtime_context_body(state, principal, body).await;
-        }
-        return Ok(body);
-    }
-    if body_has_capability_descriptors(&body)? {
-        return Err(provider_runtime_authorization_required());
-    }
-    Ok(body)
-}
-
+#[cfg(test)]
 async fn inject_edge_registration_runtime_context_body(
     state: &AppState,
     principal: &AuthPrincipal,
@@ -229,6 +213,7 @@ async fn inject_edge_registration_runtime_context_body(
         .map_err(internal_error)
 }
 
+#[cfg(test)]
 fn effective_allowed_tool_ids<'a>(
     requested_tool_ids: &[String],
     provider_allowed_tool_ids: impl IntoIterator<Item = &'a str>,
@@ -243,6 +228,7 @@ fn effective_allowed_tool_ids<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn string_array_field(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -359,21 +345,6 @@ fn provider_runtime_authorization_required() -> (StatusCode, Json<ErrorResponse>
     )
 }
 
-fn body_has_capability_descriptors(
-    body: &Bytes,
-) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|error| {
-        error_response(
-            StatusCode::BAD_REQUEST,
-            format!("chat turn request body must be JSON: {error}"),
-        )
-    })?;
-    Ok(value
-        .as_object()
-        .and_then(|object| object.get("capability_descriptors"))
-        .is_some_and(|value| !value.is_null()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +428,7 @@ mod tests {
                             .to_string(),
                         protocol: "moi_edge_dispatch_authorization_v1".to_string(),
                         semantic_read: None,
+                        model_context_window: None,
                         metadata: serde_json::Map::from_iter([
                             ("contract_version".to_string(), serde_json::json!(1)),
                             ("task_id".to_string(), serde_json::json!("task-1")),
@@ -638,7 +610,8 @@ mod tests {
                     "type": "model_gateway",
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/model-gateway",
-                    "protocol": "openai_chat_completions"
+                    "protocol": "openai_chat_completions",
+                    "model_context_window": 128000
                 }
             }
         }))
@@ -663,28 +636,5 @@ mod tests {
             .expect("trusted resolution must survive wire mapping and provider injection");
         assert_eq!(resolved.offering_id, "model-requested");
         assert_eq!(resolved.model_name, "provider-model");
-    }
-
-    #[test]
-    fn provider_tool_grant_only_narrows_requested_tools() {
-        let requested = vec![
-            "bash".to_string(),
-            "read_file".to_string(),
-            "write_file".to_string(),
-        ];
-
-        let effective =
-            effective_allowed_tool_ids(&requested, ["read_file", "provider_only", "write_file"]);
-
-        assert_eq!(effective, vec!["read_file", "write_file"]);
-    }
-
-    #[test]
-    fn missing_provider_tool_grants_fail_closed() {
-        let requested = vec!["bash".to_string()];
-
-        let effective = effective_allowed_tool_ids(&requested, std::iter::empty());
-
-        assert!(effective.is_empty());
     }
 }

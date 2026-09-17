@@ -1,8 +1,8 @@
-//! Outbound `/chat/turn` payload preparation + fetch + SSE consume.
+//! Outbound `/chat/stream` payload preparation + fetch + SSE consume.
 //!
 //! The heavy orchestrator (`run_agentic_loop_iteration`) has been replaced by
 //! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
-//! `fetch_chat_turn_sse` for use by [`crate::cli_loop_host::CliAgenticLoopHost`].
+//! `fetch_chat_turn_sse` for use by the CLI Server-admission adapter.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    pipeline::step_recorder::StepRecorder,
     prompts,
     tool_registry::{self, ToolRegistry},
     turn::agentic_loop::host::{TurnInteractionMode, TurnInteractionPolicy, VolatileInjection},
@@ -28,15 +28,16 @@ use astra_runtime::{
     turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_input_budget,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS,
         EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        read_git_branch_abbrev,
+        deferred_provider_schemas_for_names, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_active_skills_into_edge_profile,
-        merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
+        ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
+        merge_active_skills_into_edge_profile, merge_edge_profile_extensions,
+        set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::restricted_tools_explain_text,
@@ -59,17 +60,20 @@ use crate::{
     edge_tools::ToolExecutor,
 };
 
-use crate::cli::chat_stream::edge_executor::edge_executor_instance_id;
+use crate::cli::chat_stream::edge_executor::{
+    edge_executor_instance_id, try_edge_executor_instance_id,
+};
 
-const BASH_BACKGROUND_TASK_CONTROL_TOOLS: &[&str] = &["task_output", "task_list", "task_stop"];
+/// Plan-mode escape hatches must remain callable while that policy overlay is
+/// active. Outside plan mode they remain deferred behind `tool_search`: making
+/// rare control transitions part of every coding request turns a workflow
+/// convenience into a fixed provider cost and expands the cacheable prefix.
+///
+/// Context compression is deliberately not included. It is pressure-triggered
+/// recovery, not an operation required to leave an active policy state.
+const PLAN_MODE_ESCAPE_HATCHES: &[&str] = &["exit_plan_mode"];
 
-/// Session-control tools injected unconditionally to prevent schema thrashing.
-/// Their combined cost is < 200 tokens but toggling them on/off breaks prompt
-/// caching at every plan-mode transition or tool surface variance.
-const CACHE_STABLE_SESSION_TOOLS: &[&str] =
-    &["enter_plan_mode", "exit_plan_mode", "compress_context"];
-
-/// Per-phase stderr timings for `/chat/turn`. Disabled — use `RUST_LOG=debug` instead.
+/// Per-phase stderr timings for `/chat/stream`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
     false
 }
@@ -130,9 +134,7 @@ fn message_has_tool_calls(m: &Value) -> bool {
 
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
     match messages.split_last() {
-        Some((last, history)) if last.get("role").and_then(Value::as_str) == Some("user") => {
-            history
-        }
+        Some((last, history)) if astra_turn_types::is_human_user_message(last) => history,
         _ => messages,
     }
 }
@@ -176,19 +178,38 @@ fn project_cross_session_memory_hits(
 fn build_retained_history_turns(
     messages: &[Value],
 ) -> Vec<astra_turn_core::context_assembly_trace::TurnRetention> {
-    let mut turns = Vec::new();
+    let mut turns: Vec<astra_turn_core::context_assembly_trace::TurnRetention> = Vec::new();
 
     for message in messages {
+        let content = msg_content(message);
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let tokens = prompts::estimate_str_tokens(&msg_content(message)) as u32;
+        let tokens = prompts::estimate_str_tokens(&content) as u32;
         let has_tool_calls = message_has_tool_calls(message);
-        let preview = retained_history_preview(&role, &msg_content(message));
+        if astra_turn_types::is_runtime_owned_message(message) {
+            // Provider occupancy still includes append-only authority, but
+            // user-facing history previews and semantic role summaries must
+            // never expose or attribute runtime control payloads to a human.
+            if let Some(turn) = turns.last_mut() {
+                turn.tokens = turn.tokens.saturating_add(tokens);
+                turn.has_tool_calls |= has_tool_calls;
+            } else {
+                turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
+                    turn_index: 0,
+                    role: "runtime".to_string(),
+                    tokens,
+                    has_tool_calls,
+                    content_preview: String::new(),
+                });
+            }
+            continue;
+        }
+        let preview = retained_history_preview(&role, &content);
 
-        if turns.is_empty() || role == "user" {
+        if turns.is_empty() || astra_turn_types::is_human_user_message(message) {
             turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
                 turn_index: turns.len() as u32,
                 role,
@@ -200,7 +221,7 @@ fn build_retained_history_turns(
         }
 
         if let Some(turn) = turns.last_mut() {
-            turn.tokens += tokens;
+            turn.tokens = turn.tokens.saturating_add(tokens);
             turn.has_tool_calls |= has_tool_calls;
             if retained_turn_role_priority(&role) > retained_turn_role_priority(&turn.role) {
                 turn.role = role;
@@ -325,7 +346,6 @@ struct PrepareChatTurnRequest<'a> {
     /// so the per-turn SelfModel ingest can read recent feedback signals.
     observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
-    plan_resume_hint: Option<&'a str>,
     /// Whether the current permission mode is `Plan`. When true the schema-
     /// preparation step adds every mutating tool to `restricted_tools` so the
     /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
@@ -349,6 +369,25 @@ pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Va
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+fn enabled_optional_tool_names_from_schemas<'a>(
+    schemas: impl IntoIterator<Item = &'a Value>,
+) -> Vec<String> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut names = schemas
+        .into_iter()
+        .filter_map(tool_schema_name)
+        .filter(|name| {
+            registry
+                .get(name)
+                .is_some_and(astra_runtime_env::ToolSpec::requires_explicit_user_enablement)
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn surface_report_from_visible_schemas(
@@ -460,6 +499,165 @@ impl Deref for PreparedChatTurnPayload {
     }
 }
 
+/// Project CLI-owned capability facts into the sole Server-loop admission
+/// contract. Conversation history, model rounds, tool results, and canonical
+/// turn identity deliberately do not cross this boundary: the Server restores
+/// and advances those authorities itself.
+pub(crate) fn server_loop_admission_payload(
+    prepared: &Value,
+    message: &str,
+    explain: bool,
+) -> Result<Value, &'static str> {
+    server_loop_admission_payload_with_execution_time_budget(prepared, message, explain, None)
+}
+
+fn server_loop_admission_payload_with_execution_time_budget(
+    prepared: &Value,
+    message: &str,
+    explain: bool,
+    execution_time_budget: Option<astra_services::runs::ExecutionTimeBudget>,
+) -> Result<Value, &'static str> {
+    let source = prepared
+        .as_object()
+        .ok_or("prepared developer loop payload must be an object")?;
+    let required = |field: &'static str| {
+        source
+            .get(field)
+            .cloned()
+            .ok_or("prepared developer loop payload is missing a required field")
+    };
+    let mut context = serde_json::Map::new();
+    if let Some(value) = source.get("edge_tools") {
+        context.insert("edge_tools".to_string(), value.clone());
+    }
+    if let Some(value) = source.get("edge_profile") {
+        context.insert("edge_profile".to_string(), value.clone());
+    }
+    if let Some(value) = source.get("edge_skills") {
+        context.insert("edge_skills".to_string(), value.clone());
+    }
+
+    // `/chat/stream` is an active CLI-to-Server execution channel, not an
+    // offline registration hint. Project that fact into the typed execution
+    // binding contract so prompt admission, dispatch, child inheritance, and
+    // observability all resolve the same provider.
+    let edge_executor_id = source
+        .get("edge_executor_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("prepared developer loop payload has no executable edge identity")?;
+    let edge_profile = source
+        .get("edge_profile")
+        .and_then(Value::as_object)
+        .ok_or("prepared developer loop payload has no edge workspace profile")?;
+    let workspace_root = edge_profile
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("prepared developer loop payload has no edge workspace root")?;
+    let workspace_display_name = edge_profile
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("CLI workspace");
+    let workspace_authority = match edge_profile.get("authority") {
+        None => "read_write",
+        Some(Value::String(authority)) if authority == "read_only" => "read_only",
+        Some(Value::String(authority)) if authority == "read_write" => "read_write",
+        Some(Value::String(authority)) if authority == "none" => "none",
+        Some(_) => return Err("prepared developer loop payload has invalid workspace authority"),
+    };
+    for field in [
+        "thinking",
+        "effort",
+        "agent_type",
+        "rollback_on_failure",
+        "rollback_boundary",
+    ] {
+        if let Some(value) = source.get(field) {
+            context.insert(field.to_string(), value.clone());
+        }
+    }
+
+    let mut request = serde_json::Map::from_iter([
+        ("message".to_string(), Value::String(message.to_string())),
+        ("model_selection".to_string(), required("model_selection")?),
+        (
+            "edge_executor_id".to_string(),
+            Value::String(edge_executor_id.to_string()),
+        ),
+        (
+            "workspace_binding".to_string(),
+            serde_json::json!({
+                "kind": "edge_workspace",
+                "display_name": workspace_display_name,
+                "root": workspace_root,
+                "source": {"kind": "edge_path", "path": workspace_root},
+                "authority": workspace_authority,
+            }),
+        ),
+        (
+            "executor_binding".to_string(),
+            serde_json::json!({
+                "kind": "edge_agent",
+                "executor_id": edge_executor_id,
+                "display_name": workspace_display_name,
+                "transport": "edge_ledger",
+                "status": "online",
+            }),
+        ),
+        ("capabilities".to_string(), required("capabilities")?),
+        ("explain".to_string(), Value::Bool(explain)),
+        ("interactive_client".to_string(), Value::Bool(true)),
+        (
+            "execution_policy".to_string(),
+            // Use one typed semantic admission at the start of an unbound
+            // conversation. The server skips it once Work is bound, so later
+            // rounds do not pay a second model request or churn the cache.
+            // The decision and initial graph remain LLM-driven; no client
+            // prompt matcher is used.
+            serde_json::json!({"turn_intent": "auto"}),
+        ),
+        ("context".to_string(), Value::Object(context)),
+    ]);
+    for field in [
+        "user_intent",
+        "runtime_system_prompt",
+        "session_id",
+        "agent_id",
+        "interaction_mode",
+        "enabled_tools",
+        "plan_subtask_id",
+        "is_plan_subtask",
+    ] {
+        if let Some(value) = source.get(field) {
+            request.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(execution_time_budget) = execution_time_budget {
+        request.insert(
+            "execution_time_budget".to_string(),
+            serde_json::to_value(execution_time_budget)
+                .expect("ExecutionTimeBudget must remain JSON serializable"),
+        );
+    }
+    Ok(Value::Object(request))
+}
+
+fn attach_typed_edge_skill_catalog(payload: &mut Value, listing: Option<&Value>) {
+    let Some(edge_skills) = listing
+        .and_then(|listing| listing.get("edge_skills"))
+        .and_then(Value::as_array)
+        .filter(|skills| !skills.is_empty())
+    else {
+        return;
+    };
+    payload["edge_skills"] = Value::Array(edge_skills.clone());
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedChatTurnPayload {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -510,6 +708,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         astra_core::history_work::HistoryWorkSite::CliPromptPayloadClone,
         &prompt_messages,
     );
+    let edge_executor_id = edge_executor_instance_id();
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: &prompt_messages,
         user_intent: Some(ctx.user_intent),
@@ -521,12 +720,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
-        edge_executor_id: edge_executor_instance_id(),
+        edge_executor_id,
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
         thinking: thinking_config,
     });
+
+    // Carry only typed routing metadata across the trust boundary. Full skill
+    // instructions remain client-owned and are returned only after the model
+    // selects one through the `skill` tool. The server renders this catalog
+    // with its canonical escaping/budget rules; raw client prompt fragments
+    // are not treated as catalog authority.
+    attach_typed_edge_skill_catalog(&mut payload, ctx.ephemeral_prefix);
 
     if ctx.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
         && ctx.semantic_query_override.is_some()
@@ -581,24 +787,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         );
     }
 
-    // Route skill listing through edge_profile → bridge volatile lane, so
-    // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
-    // leading role:system message that breaks the prefix cache on
-    // prefix-only providers (DeepSeek, GLM, Qwen).
-    if let Some(prefix) = ctx.ephemeral_prefix {
-        if let Some(content) = prefix.get("content").and_then(serde_json::Value::as_str)
-            && !content.is_empty()
-            && let Some(root) = payload.as_object_mut()
-            && let Some(ep) = root.get_mut("edge_profile")
-            && let Some(ep_obj) = ep.as_object_mut()
-        {
-            ep_obj.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT
-                    .to_string(),
-                json!(content),
-            );
-        }
-    }
+    // The rendered `ephemeral_prefix.content` remains local adapter state. It
+    // is intentionally not copied into the request; only its typed catalog
+    // projection above crosses the trust boundary.
     merge_active_skills_into_edge_profile(&mut payload, ctx.active_system_skills);
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Reading workspace…");
@@ -658,14 +849,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                         mem_latency_ms,
                     );
                 }
-
-                if !projection.contents.is_empty() {
-                    for repo in &projection.preferred_repos {
-                        ctx.executor.add_preferred_repo(repo);
-                    }
-                    // Send "useful" feedback for retrieved memories (fire-and-forget)
-                    ctx.executor.memory_feedback_useful(projection.feedback_ids);
-                }
             }
         }
     }
@@ -701,11 +884,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             .registry
             .build_turn_surface_with_report(ctx.turn_intent, budget);
         if typed_tool_surface_allowed && !ctx.tool_results.is_empty() {
+            let previous_visible_schemas = ctx.executor.current_visible_tool_schemas_snapshot();
             retain_invoked_tool_schemas(
                 &mut schemas,
                 &mut report,
                 ctx.tool_results,
-                ctx.all_schemas,
+                &previous_visible_schemas,
             );
         }
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
@@ -716,7 +900,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // Force-inject any skill allowed_tools that the assembled surface missed.
     let mut turn_schemas = turn_schemas;
     let mut surface_report = surface_report;
-    let mut activated_deferred_tool_names = Vec::new();
     if typed_tool_surface_allowed {
         if let Some(ref allowed) = ctx.skill_allowed_tools {
             astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
@@ -726,44 +909,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 ctx.all_schemas,
             );
         }
-        if !ctx.plan_mode_active {
-            if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
-                let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
-                astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                    &mut turn_schemas,
-                    &mut surface_report,
-                    &required_refs,
-                    ctx.all_schemas,
-                );
-            }
-            // Materialize deferred tools selected in retained conversation
-            // context. A successful call cannot revoke a schema that later turns
-            // may still need; only reset or a real surface change may remove it.
-            let activated = ctx
-                .executor
-                .activated_deferred_tool_names_for_schema_injection();
-            if !activated.is_empty() {
-                let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-                astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                    &mut turn_schemas,
-                    &mut surface_report,
-                    &refs,
-                    ctx.all_schemas,
-                );
-                activated_deferred_tool_names = activated;
-            }
-            if surface_report
-                .visible_tools
-                .iter()
-                .any(|name| name == "bash")
-            {
-                astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                    &mut turn_schemas,
-                    &mut surface_report,
-                    BASH_BACKGROUND_TASK_CONTROL_TOOLS,
-                    ctx.all_schemas,
-                );
-            }
+        if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
+            let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
+            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                &mut turn_schemas,
+                &mut surface_report,
+                &required_refs,
+                ctx.all_schemas,
+            );
         }
     }
     let had_tools_before_runtime_filter = runtime_filter_turn_schemas_and_report(
@@ -796,17 +949,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         inject_tools,
         "chat turn tool surface decision"
     );
-    if inject_tools {
-        // Keep session-control tools stable once a turn needs tools. An
-        // explicit empty tool surface stays tool-free unless pending
-        // activation, prior context, or structural selection pressure requires
-        // a recovery-capable tool surface.
+    // A plan-mode turn must be able to leave its active policy overlay without
+    // an additional discovery round trip. Keep this independent from the
+    // general tool-surface injection decision: the exit invariant is a policy
+    // requirement, not an incidental consequence of prior tool context.
+    // Ordinary turns keep these rare transitions deferred behind `tool_search`.
+    if ctx.plan_mode_active {
         astra_turn_core::tool_schema_prune::inject_required_tool_names(
             &mut turn_schemas,
             &mut surface_report,
-            CACHE_STABLE_SESSION_TOOLS,
+            PLAN_MODE_ESCAPE_HATCHES,
             ctx.all_schemas,
         );
+    }
+    if inject_tools {
         let has_tool_search = turn_schemas
             .iter()
             .filter_map(tool_schema_name)
@@ -835,6 +991,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         &mut surface_report,
     );
 
+    // `invoke_tool` is a runtime protocol, not an executor capability, so it
+    // is deliberately appended after capability filtering.  Its logical
+    // target is re-admitted by the shared carrier resolver before policy and
+    // execution.  Keeping this one small schema stable replaces the old
+    // selected-full-schema injection that churned `tools[]` across rounds.
+    if inject_tools {
+        turn_schemas.push(
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
+        );
+    }
+
     // Plan mode is enforced at permission/tool preflight time, not by
     // mutating `restricted_tools` here. Keeping schema filtering out of
     // payload assembly avoids plan/default prompt-cache churn and prevents
@@ -842,13 +1009,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     ctx.executor.set_budget_pressure(budget_pressure);
 
-    attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
-    // Sync the executor guard from the final payload, after capability
-    // restrictions and interaction-mode filtering have all been applied. The
-    // guard must mirror what the model actually saw.
-    let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
-    let final_visible_tool_names =
-        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
     let eligible_surface_schemas: Vec<Value> = ctx
         .registry
         .all_tool_schemas()
@@ -866,6 +1026,26 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let eligible_provider_schemas = ctx
         .executor
         .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
+    attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
+    // Sync the executor guard from the final payload, after capability
+    // restrictions and interaction-mode filtering have all been applied. The
+    // guard must mirror what the model actually saw.
+    let final_visible_schemas = final_visible_tool_schemas_from_payload(&payload);
+    let final_visible_tool_names =
+        astra_turn_core::tool::schema::tool_names_from_schemas(&final_visible_schemas);
+    // `enabled_tools` describes product capabilities already present on this
+    // request's executable edge/provider surface. It is not inferred from
+    // user prose and it does not approve an invocation: domain/effect
+    // permissions still run at the tool boundary. Publishing this fact keeps
+    // root, Work-item, and delegated child admission on one authority chain.
+    let enabled_optional_tools = enabled_optional_tool_names_from_schemas(
+        eligible_surface_schemas
+            .iter()
+            .chain(eligible_provider_schemas.iter()),
+    );
+    if let Some(root) = payload.as_object_mut() {
+        root.insert("enabled_tools".to_string(), json!(enabled_optional_tools));
+    }
     let tool_surface = tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
@@ -894,6 +1074,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     {
         omitted_deferred_tool_names = manifest.omitted_names.clone();
         activatable_tool_names = manifest.names.iter().cloned().collect();
+        // Keep the full contract in the edge→server control-plane lane for
+        // provider-owned deferred tools. The model only receives the compact
+        // manifest and the stable carrier schema; these full values are used
+        // later for typed admission/digest resolution and never enter
+        // `tools[]`.
+        let deferred_provider_names: HashSet<&str> =
+            manifest.names.iter().map(String::as_str).collect();
+        let deferred_provider_schemas = deferred_provider_schemas_for_names(
+            &eligible_provider_schemas,
+            &deferred_provider_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
         merge_edge_profile_extensions(
             &mut payload,
             &json!({
@@ -901,6 +1095,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: manifest.context_window,
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: manifest.names,
                 EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: manifest.omitted_names,
+                EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS: deferred_provider_schemas,
             }),
         );
     }
@@ -933,22 +1128,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // remains immutable after round zero. Step telemetry is round-level and
     // must use this round's actual final surface.
     let current_surface_report = final_surface_report.clone();
-    let final_visible_tool_names_for_trace = final_visible_tool_names.clone();
     *ctx.valid_tool_names = final_visible_tool_names;
 
     if let Some(collector) = ctx.telem.trace_collector {
-        let mut deferred_active_tools: Vec<String> = activated_deferred_tool_names
-            .into_iter()
-            .filter(|name| final_visible_tool_names_for_trace.contains(name))
-            .collect();
-        deferred_active_tools.sort();
         collector.record_tool_surface_with_deferred(
             astra_runtime::turn::turn_trace_collector::ToolSurfaceDeferredInput {
                 visible_tools: &final_surface_report.visible_tools,
                 per_tool_costs: &visible_tool_costs,
                 tools_available: final_visible_schemas.len() as u32,
                 latency_ms: surface_latency_ms,
-                deferred_active_tools: &deferred_active_tools,
+                // Selected targets are retained as typed activation evidence,
+                // not as additional provider schemas.
+                deferred_active_tools: &[],
                 deferred_available,
                 deferred_omitted_tools: &omitted_deferred_tool_names,
             },
@@ -988,20 +1179,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ctx.skill_effort.as_deref(),
         ctx.skill_agent_type.as_deref(),
     );
-    inject_bridge_turn_identity(
+    let _ = attach_turn_identity(
         &mut payload,
         ctx.session_turn,
         ctx.turn_chain_id,
         ctx.user_query_event_id,
     );
-    // The outer agentic loop is the single owner of aggregate turn journal
-    // rows for every LLM round. The bridge may still capture full request /
-    // response payloads for debugging, but it must not emit duplicate
-    // `llm_round` summaries for later rounds.
-    if let Some(root) = payload.as_object_mut() {
-        root.insert("root_turn_journal_owned".into(), json!(true));
-    }
-
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     // Publish fresh denial-pressure + per-tool outcome bias + recent
     // rejections to the observability session so SelfModel can render the
@@ -1053,8 +1236,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
             // Injection-freshness observation is deferred to after the
-            // turn's SSE stream finishes (see `post_turn_observe_bridge_injections`
-            // in `cli_loop_host.rs`). Observing here would fire before
+            // turn's SSE stream finishes (see `post_turn_observe_injections`
+            // in `server_admission_host.rs`). Observing here would fire before
             // the bridge has actually composed its bridge-generated
             // channels (memoria_prefetch, tool_round_guidance, volatile) and leave
             // them permanently `Untracked` in introspect's freshness
@@ -1098,36 +1281,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     {
         ep_obj.insert("lessons_text".to_string(), json!(lessons));
     }
-    // ─── Gateway context: inject as system message at start of conversation ───
+    // ─── Runtime context: keep it on the typed Server admission lane ───
     if let Some(extra) = ctx.append_system_prompt {
-        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            arr.insert(
-                0,
-                json!({
-                    "role": "system",
-                    "content": extra,
-                }),
-            );
-        }
-    }
-    // ─── Task context: inject through plan_resume_hint channel ───
-    if let Some(plan_hint) = ctx.plan_resume_hint {
-        // Route through edge_profile so the server bridge can merge into
-        // ExternalSources.plan_context (with proper token budgeting).
-        if let Some(root) = payload.as_object_mut()
-            && let Some(ep) = root.get_mut("edge_profile")
-            && let Some(ep_obj) = ep.as_object_mut()
-        {
-            ep_obj.insert("task_context_text".to_string(), json!(plan_hint));
+        if let Some(root) = payload.as_object_mut() {
+            root.insert("runtime_system_prompt".to_string(), json!(extra));
         }
     }
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
 
     // Injection-freshness observation happens AFTER the bridge's SSE
-    // stream completes (see `post_turn_observe_bridge_injections` in
-    // `cli_loop_host.rs`), so we can merge the 5 bridge-generated
+    // stream completes (see `post_turn_observe_injections` in
+    // `server_admission_host.rs`), so we can merge the 5 bridge-generated
     // channels (captured via the `injection_freshness` SSE event into
-    // `ChatTurnSseAccum.bridge_injection_fingerprints`) with the CLI-owned
+    // `ChatTurnSseAccum.injection_fingerprints`) with the CLI-owned
     // `lessons` snapshot.
 
     // ─── Context-window estimate / trace collection ───────────────────────
@@ -1241,27 +1407,6 @@ fn inject_runtime_turn_overrides(
     }
 }
 
-fn inject_bridge_turn_identity(
-    payload: &mut Value,
-    session_turn: u32,
-    turn_chain_id: Option<&str>,
-    user_query_event_id: Option<&str>,
-) {
-    let Some(root) = payload.as_object_mut() else {
-        return;
-    };
-    if session_turn > 0 {
-        root.insert("session_turn".into(), json!(session_turn));
-    }
-    if let Some(turn_chain_id) = turn_chain_id.filter(|value| !value.trim().is_empty()) {
-        root.insert("turn_chain_id".into(), json!(turn_chain_id));
-    }
-    if let Some(user_query_event_id) = user_query_event_id.filter(|value| !value.trim().is_empty())
-    {
-        root.insert("user_query_event_id".into(), json!(user_query_event_id));
-    }
-}
-
 // Skill activation goes through the `skill` tool in the agentic loop, not
 // hidden payload injection.
 
@@ -1352,7 +1497,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// When true, this is a continuation turn after a skill has already produced output.
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
-    /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
+    /// Cross-turn tool output cache retained by the CLI admission adapter.
     pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
     /// Fallback from previous turn's confidence diagnosis for broadening.
     pub previous_confidence_fallback:
@@ -1368,11 +1513,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// needing a global singleton.
     pub observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     pub incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+    pub request_session_execution_lease:
+        Option<Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>>,
     pub append_system_prompt: Option<&'a str>,
-    /// Task context injected through the standard plan_resume_hint →
-    /// ExternalSources.plan_context pipeline (with proper token accounting).
-    /// Separate from append_system_prompt (which is for user-provided overrides).
-    pub plan_resume_hint: Option<&'a str>,
+    pub execution_time_budget: Option<&'a crate::cli::chat_stream::ExecutionTimeBudgetClock>,
 }
 struct ChatTurnSseFetchUi {
     timing: bool,
@@ -1413,20 +1557,25 @@ fn chat_turn_sse_fetch_ui(
     }
 }
 
-/// Build JSON payload (with optional prep line), POST `/chat/turn`, return response + prep guard.
+/// Build a Server-loop admission (with optional prep line), POST `/chat/stream`,
+/// and return the response plus prep guard.
 ///
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
-async fn chat_turn_post_payload_after_prepare(
-    api: &astra_thin_client::ThinClient,
-    token: &str,
+struct ChatTurnPostPayloadRequest<'a> {
+    api: &'a astra_thin_client::ThinClient,
+    token: &'a str,
     quiet: bool,
-    ui: &ChatTurnSseFetchUi,
-    stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
-    stream_json_emitter: Option<
-        &std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>,
-    >,
-    prepare: PrepareChatTurnRequest<'_>,
+    ui: &'a ChatTurnSseFetchUi,
+    stream_event_tx: Option<&'a crate::cli::chat_stream::StreamEventTx>,
+    stream_json_emitter:
+        Option<&'a std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
+    execution_time_budget_clock: Option<&'a crate::cli::chat_stream::ExecutionTimeBudgetClock>,
+    prepare: PrepareChatTurnRequest<'a>,
+}
+
+async fn chat_turn_post_payload_after_prepare(
+    request: ChatTurnPostPayloadRequest<'_>,
 ) -> Result<
     (
         astra_thin_client::HttpResponse,
@@ -1436,13 +1585,37 @@ async fn chat_turn_post_payload_after_prepare(
     ),
     String,
 > {
+    let ChatTurnPostPayloadRequest {
+        api,
+        token,
+        quiet,
+        ui,
+        stream_event_tx,
+        stream_json_emitter,
+        execution_time_budget_clock,
+        prepare,
+    } = request;
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
+    // Resolve the executor identity before building or sending the admission
+    // request. A missing persisted materialization is an actionable local
+    // setup error; never silently replace it with a process-scoped identity.
+    try_edge_executor_instance_id()?;
     let (current_session_id, session_turn, round_index) = (
         prepare.current_session_id,
         prepare.session_turn,
         prepare.round_index,
     );
+    let server_message = prepare.message.to_string();
+    let server_explain = prepare.explain.explain_on || prepare.explain.explain_verbose;
     let prepared = prepare_chat_turn_payload(prepare).await;
+    let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
+    let server_payload = server_loop_admission_payload_with_execution_time_budget(
+        &prepared.payload,
+        &server_message,
+        server_explain,
+        execution_time_budget,
+    )
+    .map_err(str::to_string)?;
 
     if let Some(tx) = stream_event_tx {
         let _ = tx.try_send(
@@ -1453,7 +1626,7 @@ async fn chat_turn_post_payload_after_prepare(
     }
 
     touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");
-    // `exchange_started` is the logical `/chat/turn` request boundary. The
+    // `exchange_started` is the logical Server-loop request boundary. The
     // thin client may perform internal 429 transport retries, which are not
     // exposed as separate exchanges. If the request fails or returns a
     // non-success status, this observer is dropped without an
@@ -1466,7 +1639,7 @@ async fn chat_turn_post_payload_after_prepare(
     };
     let http_mark = Instant::now();
     let resp = api
-        .post_chat_turn_retry_429(token, &prepared.payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
+        .post_developer_loop_retry_429(token, &server_payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
         .await
         .map_err(|e| e.to_string())?;
     if ui.timing {
@@ -1553,8 +1726,9 @@ pub(crate) async fn fetch_chat_turn_sse(
         user_query_event_id,
         observability_hub,
         incremental_state,
+        request_session_execution_lease,
         append_system_prompt,
-        plan_resume_hint,
+        execution_time_budget,
         semantic_query_override,
         ..
     } = ctx;
@@ -1563,7 +1737,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     // Compute lessons text from Memoria-bootstrapped session lessons.
     // Format: "kind:trigger_signal:action" per lesson, pipe-joined.
-    // Mirrors the format used in cli_loop_host's observability path.
+    // Mirrors the format used in the Server-admission host's observability path.
     let lessons_text: Option<String> = {
         let lessons = executor.session_lessons_snapshot();
         if lessons.is_empty() {
@@ -1581,14 +1755,15 @@ pub(crate) async fn fetch_chat_turn_sse(
     let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
     let (resp, prep_line, prepared_schema_tokens, stream_json_exchange) =
-        chat_turn_post_payload_after_prepare(
+        chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
             api,
             token,
-            render_policy.is_silent(),
-            &ui,
-            stream_event_tx.as_ref(),
-            stream_json_emitter.as_ref(),
-            PrepareChatTurnRequest {
+            quiet: render_policy.is_silent(),
+            ui: &ui,
+            stream_event_tx: stream_event_tx.as_ref(),
+            stream_json_emitter: stream_json_emitter.as_ref(),
+            execution_time_budget_clock: execution_time_budget,
+            prepare: PrepareChatTurnRequest {
                 messages,
                 runtime_required_texts,
                 active_system_skills,
@@ -1642,12 +1817,11 @@ pub(crate) async fn fetch_chat_turn_sse(
                 recent_rejections: perm_manager.recent_rejections(),
                 observability_hub,
                 append_system_prompt,
-                plan_resume_hint,
                 plan_mode_active: perm_manager.mode()
                     == crate::cli::permission_manager::PermissionMode::Plan,
                 lessons_text: lessons_text_ref,
             },
-        )
+        })
         .await?;
 
     *pinned_tool_schema_tokens = prepared_schema_tokens;
@@ -1672,7 +1846,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     let edge_ctx = EdgeSseContext {
         api,
         token,
-        executor_id: edge_executor_instance_id(),
+        executor_id: try_edge_executor_instance_id()?,
         executor,
         render_policy,
         perm_manager: Some(perm_manager),
@@ -1687,6 +1861,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_cache,
         observability_hub: observability_hub.cloned(),
         incremental_state: incremental_state.clone(),
+        request_session_execution_lease,
     };
 
     let sse_mark = Instant::now();
@@ -1696,6 +1871,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_md,
         term_width,
         render_policy,
+        explain != crate::ExplainMode::Off,
         Some(edge_ctx),
         pre_clear_lines,
         auth_profile,
@@ -1723,10 +1899,12 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use super::{
-        PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
-        chat_turn_budget_pressure, inject_bridge_turn_identity, inject_runtime_turn_overrides,
+        PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
+        build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
         msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
-        retained_history_messages, thinking_complexity_signals,
+        retained_history_messages, runtime_filter_turn_schemas_and_report,
+        server_loop_admission_payload, server_loop_admission_payload_with_execution_time_budget,
+        surface_report_from_visible_schemas, thinking_complexity_signals,
     };
     use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
     use astra_runtime::turn::agentic_loop::host::{
@@ -1735,9 +1913,194 @@ mod tests {
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+        EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS,
+        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
+
+    #[test]
+    fn typed_edge_skill_catalog_crosses_without_raw_listing_content() {
+        let listing = json!({
+            "role": "system",
+            "content": "raw listing must stay client-local",
+            "edge_skills": [{
+                "name": "project-review",
+                "description": "Review project changes",
+                "aliases": ["review"]
+            }]
+        });
+        let mut payload = json!({"edge_profile": {}});
+
+        attach_typed_edge_skill_catalog(&mut payload, Some(&listing));
+
+        assert_eq!(payload["edge_skills"][0]["name"], "project-review");
+        assert!(
+            payload.to_string().contains("project-review")
+                && !payload
+                    .to_string()
+                    .contains("raw listing must stay client-local")
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_excludes_client_owned_conversation_authority() {
+        let prepared = json!({
+            "messages": [{"role": "user", "content": "stale client history"}],
+            "tool_results": [{"request_id": "call-1", "output": "already applied"}],
+            "session_turn": 9,
+            "turn_chain_id": "client-chain",
+            "user_query_event_id": "client-event",
+            "root_turn_journal_owned": true,
+            "session_id": "session-1",
+            "agent_id": "astra-cli",
+            "user_intent": "implement the change",
+            "model_selection": {"offering_id": "deepseek-flash"},
+            "interaction_mode": "interactive",
+            "edge_executor_id": "edge-1",
+            "capabilities": ["bash"],
+            "enabled_tools": ["web_fetch"],
+            "edge_tools": [{"type": "function", "function": {"name": "bash"}}],
+            "edge_profile": {"cwd": "/workspace"},
+            "edge_skills": [{
+                "name": "review-workspace",
+                "description": "Review the current workspace",
+                "aliases": ["review"]
+            }],
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+        });
+
+        let admitted = server_loop_admission_payload(&prepared, "current request", true)
+            .expect("Server loop admission");
+        assert_eq!(admitted["message"], "current request");
+        assert_eq!(
+            admitted["context"]["edge_tools"][0]["function"]["name"],
+            "bash"
+        );
+        assert_eq!(admitted["context"]["edge_profile"]["cwd"], "/workspace");
+        assert_eq!(
+            admitted["context"]["edge_skills"][0]["name"],
+            "review-workspace"
+        );
+        assert_eq!(admitted["workspace_binding"]["kind"], "edge_workspace");
+        assert_eq!(admitted["workspace_binding"]["root"], "/workspace");
+        assert_eq!(admitted["workspace_binding"]["authority"], "read_write");
+        assert_eq!(admitted["executor_binding"]["kind"], "edge_agent");
+        assert_eq!(admitted["executor_binding"]["executor_id"], "edge-1");
+        assert_eq!(admitted["executor_binding"]["transport"], "edge_ledger");
+        assert_eq!(admitted["executor_binding"]["status"], "online");
+        assert_eq!(admitted["enabled_tools"], json!(["web_fetch"]));
+        assert_eq!(admitted["explain"], true);
+        assert_eq!(admitted["execution_policy"]["turn_intent"], "auto");
+        assert!(
+            admitted.get("execution_time_budget").is_none(),
+            "an absent wall budget must not fabricate execution authority"
+        );
+        for forbidden in [
+            "messages",
+            "tool_results",
+            "session_turn",
+            "turn_chain_id",
+            "user_query_event_id",
+            "root_turn_journal_owned",
+            "conversation_authority",
+        ] {
+            assert!(
+                admitted.get(forbidden).is_none(),
+                "{forbidden} must remain Server-owned"
+            );
+        }
+    }
+
+    #[test]
+    fn server_loop_admission_carries_typed_time_budget_outside_prompt_context() {
+        let prepared = json!({
+            "model_selection": {"offering_id": "generic-offering"},
+            "edge_executor_id": "edge-1",
+            "capabilities": [],
+            "edge_profile": {
+                "cwd": "/workspace",
+                "system_prompt_override": "stable operator context"
+            },
+            "runtime_system_prompt": "stable runtime prompt"
+        });
+
+        let admitted = server_loop_admission_payload_with_execution_time_budget(
+            &prepared,
+            "request",
+            false,
+            Some(astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 37,
+            }),
+        )
+        .expect("typed time budget admission");
+
+        assert_eq!(admitted["execution_time_budget"]["remaining_seconds"], 37);
+        assert_eq!(admitted["runtime_system_prompt"], "stable runtime prompt");
+        assert!(
+            admitted["context"]["edge_profile"]
+                .get("execution_time_budget")
+                .is_none(),
+            "dynamic time must not enter the cache-stable edge profile"
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_fails_closed_without_execution_binding() {
+        let error = server_loop_admission_payload(
+            &json!({
+                "model_selection": {"offering_id": "deepseek-flash"},
+                "capabilities": []
+            }),
+            "request",
+            false,
+        )
+        .expect_err("missing edge executor must fail before transport");
+        assert_eq!(
+            error,
+            "prepared developer loop payload has no executable edge identity"
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_rejects_identity_without_workspace() {
+        let error = server_loop_admission_payload(
+            &json!({
+                "model_selection": {"offering_id": "deepseek-flash"},
+                "edge_executor_id": "edge-1",
+                "capabilities": [],
+                "edge_profile": {}
+            }),
+            "request",
+            false,
+        )
+        .expect_err("an executor identity without an executable workspace must fail closed");
+
+        assert_eq!(
+            error,
+            "prepared developer loop payload has no edge workspace root"
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_never_widens_invalid_workspace_authority() {
+        let error = server_loop_admission_payload(
+            &json!({
+                "model_selection": {"offering_id": "deepseek-flash"},
+                "edge_executor_id": "edge-1",
+                "capabilities": [],
+                "edge_profile": {"cwd": "/workspace", "authority": "owner"}
+            }),
+            "request",
+            false,
+        )
+        .expect_err("unknown authority must not silently become read-write");
+
+        assert_eq!(
+            error,
+            "prepared developer loop payload has invalid workspace authority"
+        );
+    }
+    use astra_turn_core::chat_turn_payload::attach_turn_identity;
     use serde_json::{Value, json};
 
     #[test]
@@ -1898,7 +2261,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -1998,6 +2360,7 @@ mod tests {
                 "advisories": [{"kind": "test_signal"}]
             }),
             round_index: 3,
+            attempt_leased: false,
         };
         let required: Vec<String> = Vec::new();
         let volatile_texts: Vec<String> = Vec::new();
@@ -2092,7 +2455,6 @@ mod tests {
                 recent_rejections: Vec::new(),
                 observability_hub: None,
                 append_system_prompt: None,
-                plan_resume_hint: None,
                 plan_mode_active: false,
                 lessons_text: None,
             })
@@ -2101,7 +2463,7 @@ mod tests {
 
         let lane = &payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS];
         assert_eq!(lane[0]["kind"], json!("policy_advisory"));
-        assert_eq!(lane[0]["delivery_class"], json!("advisory_evidence"));
+        assert_eq!(lane[0]["delivery_class"], json!("decision_feedback"));
         assert_eq!(lane[0]["round_index"], json!(3));
         assert_eq!(lane[0]["payload"]["schema"], "policy_advisory.v1");
         assert_eq!(lane[0]["payload"]["advisories"][0]["kind"], "test_signal");
@@ -2190,9 +2552,14 @@ mod tests {
     }
 
     #[test]
-    fn inject_bridge_turn_identity_adds_authoritative_ids() {
+    fn shared_turn_provenance_identity_adds_authoritative_ids() {
         let mut payload = json!({});
-        inject_bridge_turn_identity(&mut payload, 2, Some("root-chain"), Some("root-query"));
+        assert!(attach_turn_identity(
+            &mut payload,
+            2,
+            Some("root-chain"),
+            Some("root-query")
+        ));
         assert_eq!(payload["session_turn"], json!(2));
         assert_eq!(payload["turn_chain_id"], json!("root-chain"));
         assert_eq!(payload["user_query_event_id"], json!("root-query"));
@@ -2296,6 +2663,44 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "assistant");
         assert!(turns[0].has_tool_calls);
+    }
+
+    #[test]
+    fn retained_history_accounts_runtime_tokens_without_exposing_control_preview() {
+        use astra_runtime::prompts;
+
+        let mut authority = json!({
+            "role": "user",
+            "content": "<runtime-authority-frame>\ninternal Work settlement\n</runtime-authority-frame>"
+        });
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_work_synthesis",
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "real request"}),
+            authority,
+            json!({"role": "assistant", "content": "visible answer"}),
+        ];
+        let expected_tokens = messages
+            .iter()
+            .map(|message| prompts::estimate_str_tokens(&msg_content(message)) as u32)
+            .fold(0_u32, u32::saturating_add);
+
+        let turns = build_retained_history_turns(&messages);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tokens, expected_tokens);
+        assert_eq!(turns[0].role, "assistant");
+        assert!(turns[0].content_preview.contains("real request"));
+        assert!(turns[0].content_preview.contains("visible answer"));
+        assert!(!turns[0].content_preview.contains("runtime-authority-frame"));
+        assert!(
+            !turns[0]
+                .content_preview
+                .contains("internal Work settlement")
+        );
     }
 
     #[test]
@@ -2698,6 +3103,25 @@ mod tests {
         assert_eq!(turn_schemas.len(), 4);
     }
 
+    #[test]
+    fn enabled_optional_tools_are_derived_from_executable_schema_facts() {
+        let schemas = astra_tools::schemas::all_tool_schemas();
+        let enabled = super::enabled_optional_tool_names_from_schemas(schemas.iter());
+
+        assert!(enabled.contains(&"web_fetch".to_string()), "{enabled:?}");
+        assert!(enabled.contains(&"web_search".to_string()), "{enabled:?}");
+        assert!(!enabled.contains(&"read_file".to_string()), "{enabled:?}");
+        assert!(!enabled.contains(&"bash".to_string()), "{enabled:?}");
+    }
+
+    #[test]
+    fn enabled_optional_tools_do_not_reintroduce_absent_schemas() {
+        let filtered_surface = [schema("read_file"), schema("web_fetch")];
+        let enabled = super::enabled_optional_tool_names_from_schemas(filtered_surface.iter());
+
+        assert_eq!(enabled, vec!["web_fetch"]);
+    }
+
     #[tokio::test]
     async fn prepare_chat_turn_payload_includes_plan_mode_escape_hatches() {
         use crate::edge_tools::ToolExecutor;
@@ -2792,7 +3216,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: true,
             lessons_text: None,
         })
@@ -2848,16 +3271,10 @@ mod tests {
             Some(expected_visible_schema_tokens),
             "final surface telemetry schema_budget_used must use the same full visible-tool surface as visible_count"
         );
-        // Plan-mode escape hatches must be present exactly once each.
-        assert!(edge_tool_names.contains(&"enter_plan_mode"));
+        // An active overlay needs only the exit transition; re-entering the
+        // current mode is redundant schema surface.
+        assert!(!edge_tool_names.contains(&"enter_plan_mode"));
         assert!(edge_tool_names.contains(&"exit_plan_mode"));
-        assert_eq!(
-            edge_tool_names
-                .iter()
-                .filter(|name| **name == "enter_plan_mode")
-                .count(),
-            1
-        );
         assert_eq!(
             edge_tool_names
                 .iter()
@@ -2883,7 +3300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_keeps_plan_tools_when_plan_mode_inactive() {
+    async fn prepare_chat_turn_payload_defers_plan_tools_when_plan_mode_inactive() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -2897,12 +3314,13 @@ mod tests {
         let all_schemas = vec![
             schema("read_file"),
             schema("write_file"),
+            schema("tool_search"),
             schema("enter_plan_mode"),
             schema("exit_plan_mode"),
+            schema("compress_context"),
         ];
-        // Budget of 2 would normally expose only the 2 most relevant tools.
-        // Plan-control tools are injected regardless of active mode so the
-        // schema surface stays stable across plan/default transitions.
+        // Plan-control tools are available through the deferred manifest on
+        // ordinary turns; only an active plan overlay gets escape hatches.
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
@@ -2979,7 +3397,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -2991,15 +3408,36 @@ mod tests {
             .iter()
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
-        // Session-control tools are always injected for cache stability
-        // (prevents schema thrashing on plan-mode transitions).
         assert!(
-            edge_tool_names.contains(&"enter_plan_mode"),
-            "enter_plan_mode should always be injected for cache stability"
+            !edge_tool_names.contains(&"enter_plan_mode"),
+            "ordinary turns must not pay for an inactive plan-mode transition"
         );
         assert!(
-            edge_tool_names.contains(&"exit_plan_mode"),
-            "exit_plan_mode should always be injected for cache stability"
+            !edge_tool_names.contains(&"exit_plan_mode"),
+            "ordinary turns must not pay for an inactive plan-mode transition"
+        );
+        assert!(
+            !edge_tool_names.contains(&"compress_context"),
+            "ordinary turns must not pay for pressure-only context recovery"
+        );
+        let deferred_tool_names: HashSet<String> = payload["edge_profile"]
+            [EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+            .as_array()
+            .expect("tool-bearing turns must advertise deferred recovery tools")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+        for name in ["enter_plan_mode", "exit_plan_mode", "compress_context"] {
+            assert!(
+                deferred_tool_names.contains(name),
+                "ordinary-turn recovery tool {name} must remain discoverable"
+            );
+        }
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS],
+            json!([]),
+            "the control-plane schema lane is explicit even when this fixture has no provider-owned deferred tools"
         );
         assert_eq!(
             first_selection_report
@@ -3108,7 +3546,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3122,6 +3559,13 @@ mod tests {
                 .iter()
                 .filter_map(|schema| schema["function"]["name"].as_str())
                 .collect::<Vec<_>>()
+        );
+        let enabled_tools = payload["enabled_tools"]
+            .as_array()
+            .expect("CLI payload must publish its executable optional capability set");
+        assert!(
+            enabled_tools.iter().any(|name| name == "web_fetch"),
+            "deferred optional capabilities are request facts even when this turn is tool-free: {enabled_tools:?}"
         );
         assert!(
             payload["edge_profile"]
@@ -3140,24 +3584,21 @@ mod tests {
             Some(0),
             "surface telemetry must reflect the final no-tool surface"
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "no activation should be recorded before a select/direct-call intent"
-        );
 
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        // Use a capability classified as Deferred by the canonical ToolSpec
+        // registry. `memory` is intentionally AlwaysLoad, so using it here
+        // would test the resident-surface policy rather than activation.
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let selected = executor
-            .execute("tool_search", &json!({"query": "select:memory"}))
+            .execute("tool_search", &json!({"query": "select:web_fetch"}))
             .await;
         let selected_json: Value = serde_json::from_str(&selected).unwrap_or_else(|error| {
             panic!("tool_search select should return JSON, got {error}: {selected}")
         });
-        assert_eq!(selected_json["matches"][0]["name"].as_str(), Some("memory"));
         assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
+            selected_json["matches"][0]["name"].as_str(),
+            Some("web_fetch")
         );
 
         let mut restricted_tools = HashSet::new();
@@ -3232,7 +3673,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3245,23 +3685,16 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
         assert!(
-            edge_tool_names.contains(&"memory"),
-            "pending activation must surface the selected schema independent of the otherwise empty tool surface: {edge_tool_names:?}"
+            !edge_tool_names.contains(&"web_fetch"),
+            "pending selection must not surface a variable deferred schema: {edge_tool_names:?}"
         );
         assert!(
-            valid_tool_names.contains("memory"),
-            "executor admission must mirror the activated schema visible in the payload"
+            edge_tool_names.contains(&"invoke_tool"),
+            "the stable carrier must remain available for the selected target: {edge_tool_names:?}"
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "payload assembly must preserve retained deferred materialization"
-        );
-        let _ = executor.execute("memory", &json!({})).await;
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "a successful call must not revoke retained schema materialization"
+        assert!(
+            !valid_tool_names.contains("web_fetch"),
+            "direct target admission must not be inferred from selection evidence"
         );
         executor.clear_current_tool_surface_for_tests();
 
@@ -3335,7 +3768,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3361,7 +3793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_injects_background_controls_when_bash_selected() {
+    async fn prepare_chat_turn_payload_does_not_equate_bash_with_background_task_state() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -3380,7 +3812,10 @@ mod tests {
             schema("read_file"),
         ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
-        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let executor = Arc::new(
+            ToolExecutor::new(temp_dir.path())
+                .with_bg_task_commands(Arc::new(std::sync::Mutex::new(Vec::new()))),
+        );
         let messages = vec![json!({"role": "user", "content": "run make check"})];
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
@@ -3455,7 +3890,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3473,10 +3907,35 @@ mod tests {
         );
         for name in ["task_output", "task_list", "task_stop"] {
             assert!(
-                edge_tool_names.contains(&name),
-                "Bash selection must force-inject {name} for same-turn Ctrl+B follow-up: {edge_tool_names:?}"
+                !edge_tool_names.contains(&name),
+                "Selecting bash must not advertise inactive background control {name}: {edge_tool_names:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_filter_removes_background_controls_without_a_registry_binding() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+        ];
+        let mut report = surface_report_from_visible_schemas(&schemas, 4, 4);
+        let executor = crate::edge_tools::ToolExecutor::new(temp_dir.path());
+
+        assert!(runtime_filter_turn_schemas_and_report(
+            &executor,
+            &mut schemas,
+            &mut report,
+        ));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
+            std::collections::HashSet::from(["bash".to_string()])
+        );
+        assert_eq!(report.visible_tools, vec!["bash".to_string()]);
+        assert_eq!(report.visible_count, 1);
     }
 
     #[tokio::test]
@@ -3583,7 +4042,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3743,7 +4201,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -3764,7 +4221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_injects_activated_deferred_tools_into_edge_tools() {
+    async fn prepare_chat_turn_payload_keeps_deferred_selection_off_the_wire_surface() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -3775,13 +4232,17 @@ mod tests {
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let all_schemas = vec![schema("read_file"), schema("tool_search"), schema("memory")];
+        let all_schemas = vec![
+            schema("read_file"),
+            schema("tool_search"),
+            schema("web_fetch"),
+        ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
         let search = executor
-            .execute("tool_search", &json!({"query": "select:memory"}))
+            .execute("tool_search", &json!({"query": "select:web_fetch"}))
             .await;
         let search_json: Value = serde_json::from_str(&search)
             .unwrap_or_else(|error| panic!("tool_search must return JSON, got {error}: {search}"));
@@ -3791,14 +4252,10 @@ mod tests {
             .iter()
             .filter_map(|entry| entry["name"].as_str())
             .collect();
-        assert_eq!(search_match_names, vec!["memory"]);
+        assert_eq!(search_match_names, vec!["web_fetch"]);
         assert!(
             search_json["matches"][0].get("parameters").is_some(),
             "tool_search select must return callable parameter shape: {search_json}"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
         );
 
         let messages = vec![json!({"role": "user", "content": "remember this"})];
@@ -3875,8 +4332,7 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
-            plan_mode_active: false,
+            plan_mode_active: true,
             lessons_text: None,
         })
         .await;
@@ -3888,25 +4344,27 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .map(ToString::to_string)
             .collect();
-        assert!(edge_tool_names.contains("memory"), "{edge_tool_names:?}");
+        assert!(
+            !edge_tool_names.contains("web_fetch"),
+            "selection evidence must not reinsert the full deferred schema: {edge_tool_names:?}"
+        );
+        assert!(
+            edge_tool_names.contains("invoke_tool"),
+            "the stable carrier remains available for a selected deferred target: {edge_tool_names:?}"
+        );
         let expected_pinned_tokens: u64 = edge_tool_names
             .iter()
             .map(|name| u64::from(registry.token_cost(name)))
             .sum();
         assert_eq!(
             payload.pinned_tool_schema_tokens, expected_pinned_tokens,
-            "next-round compaction must account for the exact deferred schema materialized in this payload"
+            "next-round compaction must account only for schemas actually materialized in the payload"
         );
         assert!(
-            valid_tool_names.contains("memory"),
-            "activated deferred tool must be admitted only after it is injected"
+            !valid_tool_names.contains("web_fetch"),
+            "direct deferred calls remain absent; the carrier is the only callable wire tool"
         );
         assert_eq!(valid_tool_names, edge_tool_names);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "payload assembly must preserve retained deferred materialization"
-        );
     }
 
     #[tokio::test]
@@ -4001,7 +4459,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -4112,7 +4569,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -4231,7 +4687,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -4346,7 +4801,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -4418,7 +4872,6 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: None,
             plan_mode_active: false,
             lessons_text: None,
         })
@@ -4437,10 +4890,8 @@ mod tests {
         );
     }
 
-    // ── plan_resume_hint passthrough ───────────────────────────────────
-
     #[tokio::test]
-    async fn prepare_chat_turn_payload_injects_task_context_from_plan_resume_hint() {
+    async fn prepare_chat_turn_payload_excludes_legacy_task_context() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -4528,124 +4979,12 @@ mod tests {
             recent_rejections: Vec::new(),
             observability_hub: None,
             append_system_prompt: None,
-            plan_resume_hint: Some("## Active Task Board\n- 🔄 In progress: Refactor DB layer\nFocus on completing the in-progress task before starting new work.\n"),
             plan_mode_active: false,
             lessons_text: None,
         })
         .await;
 
-        // Verify task_context_text is injected into edge_profile
-        let task_ctx = payload["edge_profile"]["task_context_text"]
-            .as_str()
-            .expect("task_context_text must be present in edge_profile");
-        assert!(task_ctx.contains("Active Task Board"), "{task_ctx}");
-        assert!(
-            task_ctx.contains("🔄 In progress: Refactor DB layer"),
-            "{task_ctx}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_chat_turn_payload_no_task_context_when_plan_resume_hint_none() {
-        use crate::edge_tools::ToolExecutor;
-        use astra_pipeline::step_recorder::StepRecorder;
-        use astra_runtime::{
-            tool_registry::ToolRegistry,
-            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
-        };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
-        use std::{collections::HashSet, sync::Arc, time::Instant};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let all_schemas = vec![schema("bash")];
-        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
-        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let messages = vec![json!({"role": "user", "content": "hi"})];
-        let tool_results = Vec::new();
-        let history: Vec<(String, String)> = Vec::new();
-        let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
-        let mut restricted_tools = HashSet::new();
-        let mut valid_tool_names = HashSet::new();
-        let mut widen_selection_pending = false;
-        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
-        let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
-        let mut first_context_assembly_ms = None;
-        let mut all_selected_skills = Vec::new();
-
-        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            messages: &messages,
-            runtime_required_texts: &[],
-            active_system_skills: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-1"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: "hi",
-            user_intent: "hi",
-            semantic_query_override: None,
-            turn_intent: None,
-            history: &history,
-            recent_tools: &recent_tools,
-            executor,
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            widen_selection_pending: &mut widen_selection_pending,
-            step_recorder: &mut step_recorder,
-            file_context: &file_context,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::NonInteractive,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            previous_confidence_fallback: None,
-            round_index: 0,
-            session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_resume_hint: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        // task_context_text should NOT be present when plan_resume_hint is None
-        let task_ctx = payload["edge_profile"].get("task_context_text");
-        assert!(
-            task_ctx.is_none() || task_ctx.unwrap().as_str().unwrap_or("").is_empty(),
-            "task_context_text must be absent when plan_resume_hint is None"
-        );
+        assert!(payload["edge_profile"].get("task_context_text").is_none());
     }
 }
 

@@ -1,0 +1,97 @@
+name: work_same_turn_lifecycle_revision
+description: |
+  **What**: Exercise a complete same-turn Work lifecycle: execute one item, retire the next
+  assigned item before performing its domain action, add a replacement, execute it, and finish.
+  **Tests**: Full-goal admission coverage, revision-pinned graph mutation after settlement,
+  preservation of history, immediate continuation, and honest final synthesis.
+  **Why**: A graph that only tracks the easy domain actions can look complete while dropping
+  explicit lifecycle outcomes. Likewise, "no runnable item" is not proof that the user's full
+  intent was satisfied. This case requires durable mutation evidence rather than prose claims.
+  **Pass means**: One Work is created; the first item is delivered; the assigned obsolete item is
+  retired without doing its domain action; a fresh replacement is accepted and delivered; the
+  final answer reports the actual lifecycle outcome without asking the user to restart.
+  **Fail means**: Astra merely executes the original two items, describes how mutation could have
+  worked, hits a text-only boundary, creates a second Work, or leaves active work unsettled.
+prompt: |
+  Run this controlled durable-work lifecycle exercise now, in one uninterrupted turn.
+
+  Start with two serial outcomes:
+  1. read the root Cargo.toml and report the workspace/package name;
+  2. report the current git branch.
+
+  After outcome 1 is durably settled and outcome 2 has been assigned, retire outcome 2 before
+  executing its git-branch action. Add a fresh replacement outcome that reports the current
+  commit's short SHA, then execute and settle that replacement. The retirement and replacement
+  are required outcomes of this exercise, not optional narration. Keep the visible board current,
+  do not create another Work, and do not ask me for routine decisions.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_same_turn_lifecycle_revision"
+difficulty: 5
+weight: 4.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 4
+  - type: journal_work_graph_patch
+    require_addition: true
+    require_retired_revision: true
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  # Work graph control and local background-process control are different
+  # products. Advertising the latter on an ordinary Work turn caused models
+  # to spend a round probing an empty shell-task registry before durable
+  # admission could establish the graph.
+  - type: journal_tool_call_count
+    name: task_list
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: task_output
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: task_stop
+    min: 0
+    max: 0
+  - type: all_of
+    criteria:
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+  - type: tools_count_between
+    min: 6
+    max: 18
+  - type: turn_rounds_between
+    min: 5
+    max: 20
+  - type: judger
+    question: |
+      Score the run as a durable Work lifecycle journey. Give 1.0 only if journal evidence—not
+      assistant prose—shows exactly one Work initially containing exactly two items, delivery of
+      the Cargo outcome, retirement of the originally declared branch outcome before its domain
+      action, acceptance of exactly one fresh SHA replacement created by that later mutation,
+      delivery of that replacement, and a final response that accurately summarizes those facts
+      without asking the user to retry. Give 0.5 if the graph mutation is durable but one final
+      explanation is unclear. Give 0.0 if a SHA replacement is pre-created in the initial graph,
+      more than one SHA replacement exists, the original branch action is executed, mutation is
+      only described, a second Work is created, or the run ends with unsettled work.
+    threshold: 0.9

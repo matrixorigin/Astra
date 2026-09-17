@@ -51,16 +51,6 @@ function renderMenu(
           status: "ready",
         },
       }}
-      githubAccess={{
-        available: true,
-        description: "Run via Server",
-        provider: {
-          provider_id: "server-builtin",
-          kind: "server",
-          display_name: "Server",
-          status: "ready",
-        },
-      }}
       activeSkills={[]}
       onActiveSkillsChange={vi.fn()}
       {...props}
@@ -191,19 +181,12 @@ describe("ComposerPlusMenu connectors", () => {
     expect(screen.queryByText("Web search")).not.toBeInTheDocument();
   });
 
-  it("lets the user attach the GitHub connector for the next turn", async () => {
+  it("does not offer removed repository tools", async () => {
     const user = userEvent.setup();
-    const onActiveToolsChange = vi.fn();
-    renderMenu({ activeTools: [], onActiveToolsChange });
-
+    renderMenu();
     await user.click(screen.getByRole("button", { name: "Open add menu" }));
-    await user.click(screen.getByRole("button", { name: /Connectors/i }));
-    await user.click(screen.getByRole("button", { name: /GitHub/i }));
-
-    expect(onActiveToolsChange).toHaveBeenCalledWith(["github"]);
-    expect(
-      screen.getByText(/credentials configured on the selected server or edge/i),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /GitHub/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Connectors/i })).not.toBeInTheDocument();
   });
 });
 

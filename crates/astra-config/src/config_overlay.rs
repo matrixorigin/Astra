@@ -341,6 +341,17 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             },
             value: Value::from(config.runtime_limits.plan_subtask_max_turns),
         },
+        // ── Explain Analyze ──
+        SettingItem {
+            id: "explain.live_rows".to_string(),
+            label: "Live Explain Analyze rows (1–5)".to_string(),
+            kind: SettingKind::Number {
+                min: 1.0,
+                max: 5.0,
+                allow_fraction: false,
+            },
+            value: Value::from(config.explain.effective_live_rows()),
+        },
     ]
 }
 
@@ -705,6 +716,11 @@ pub fn apply_edit(
             ensure_range(n as f64, 0.0, 2000.0, id)?;
             config.runtime_limits.plan_subtask_max_turns = n;
         }
+        "explain.live_rows" => {
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 1.0, 5.0, id)?;
+            config.explain.live_rows = Some(n as u8);
+        }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),
     }
     Ok(config)
@@ -768,6 +784,20 @@ mod tests {
                 .enabled_categories
                 .contains(&TraceCategory::HarnessSnapshots)
         );
+    }
+
+    #[test]
+    fn explain_live_rows_is_catalogued_and_bounded() {
+        let config = RuntimeConfig::default();
+        let item = build_settings_catalog(&config)
+            .into_iter()
+            .find(|item| item.id == "explain.live_rows")
+            .expect("catalog must expose live Explain Analyze rows");
+        assert_eq!(item.value, Value::from(5));
+        let updated = apply_edit(config, "explain.live_rows", Value::from(3))
+            .expect("valid Explain Analyze row count should apply");
+        assert_eq!(updated.explain.live_rows, Some(3));
+        assert!(apply_edit(updated, "explain.live_rows", Value::from(6)).is_err());
     }
 
     #[test]

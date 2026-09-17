@@ -1,0 +1,41 @@
+queue_rules:
+  - name: main
+    # Keep checks in place so GitHub's strict up-to-date protection and the
+    # queue validate the same PR head. See docs/guides/repository-automation.md.
+    batch_size: 1
+    max_checks_retries: 0
+    update_method: merge
+    branch_protection_injection_mode: queue
+    merge_conditions: []
+    checks_timeout: 4h
+    merge_method: squash
+    commit_message_format:
+      title: pr-title
+      body: pr-body
+      trailers:
+        - approved-by
+
+pull_request_rules:
+  - name: Request XuPeng-SH review on every pull request
+    conditions:
+      - author!=XuPeng-SH
+      - -draft
+      - -approved-reviews-by=XuPeng-SH
+    actions:
+      request_reviews:
+        users:
+          - XuPeng-SH
+
+  - name: Automatic queue on approval for main
+    conditions:
+      - "#changes-requested-reviews-by<=0"
+      - label!=do-not-merge/wip
+      - base=main
+      - approved-reviews-by=XuPeng-SH
+    actions:
+      queue:
+        name: main
+
+merge_queue:
+  mode: serial
+  max_parallel_checks: 1

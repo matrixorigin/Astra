@@ -1,6 +1,6 @@
 //! Default tool executor — the shared implementation used by CLI, server, and edge.
 //!
-//! Routes tool calls to the appropriate module (fs_ops, shell_ops, git_gix, etc.)
+//! Routes tool calls to the appropriate module (fs_ops, shell_ops, etc.)
 //! and returns [`ToolResult`]. Consumers wrap this with their own context
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
@@ -14,8 +14,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::github::GitHubClient;
-use crate::task_mgmt::{InMemoryTaskStore, TaskManager, TaskStore};
 use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
 /// Tools the server runtime may safely route straight through the shared
@@ -32,8 +30,6 @@ pub const SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "grep",
     "glob",
     "symbols",
-    "git",
-    "github",
 ];
 
 pub fn is_server_direct_default_executor_tool(name: &str) -> bool {
@@ -84,15 +80,6 @@ fn structured_status_is_error(status: &str) -> bool {
     )
 }
 
-fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
-    ToolResult {
-        output: outcome.output,
-        metadata: outcome.tool_result_fields,
-        is_error: outcome.is_error,
-        exit_semantics: None,
-    }
-}
-
 // ─── DefaultToolExecutor ────────────────────────────────────────────────────
 
 /// Per-tool execution timeout. Prevents synchronous tools (tree-sitter, etc.)
@@ -105,22 +92,20 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 
 /// Default tool executor with the full shared tool set.
 ///
-/// Covers file ops, shell, git (via gix), GitHub API, code intelligence,
-/// task management, and utility tools. CLI-specific tools (ask_user, MCP,
+/// Covers file ops, shell, code intelligence,
+/// and utility tools. CLI-specific tools (ask_user, MCP,
 /// LSP subprocess, interactive shell) are handled by wrapping executors.
+#[derive(Clone)]
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
-    github_client: Option<GitHubClient>,
-    task_manager: Arc<TaskManager>,
+
     bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
+    convergence_tracker: crate::workspace_observation::DesiredStateConvergenceTracker,
+    convergence_authority: Arc<str>,
     bash_cache_ttl: std::time::Duration,
-    /// Tracks whether the HTTP client was successfully built.
-    /// When `false`, GitHub tools and other HTTP-dependent tools will report
-    /// a diagnostic error explaining why HTTP is unavailable.
-    http_client_available: bool,
     filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
 }
 
@@ -131,6 +116,9 @@ pub struct DefaultToolExecutor {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BashCacheKey {
     workspace_root: String,
+    /// Canonical call-scoped execution directory. The same read-only command
+    /// may produce different output in different workspace directories.
+    workdir: String,
     /// Monotonic counter bumped whenever a mutation tool succeeds. A
     /// newly-created key after `write_file` will miss the cache, so
     /// prior `ls` / `grep` results don't leak across edits made
@@ -205,28 +193,18 @@ pub fn poisoned_lock_recovery_count() -> u64 {
 
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
-        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
-        let task_manager = Arc::new(TaskManager::new(ctx.session_id.clone(), store));
         Self {
             ctx,
             approval_gate: None,
             progress_callback: None,
-            github_client: None,
-            task_manager,
+
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
+            convergence_tracker: Default::default(),
+            convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
-            http_client_available: true,
             filesystem_write_boundary: None,
         }
-    }
-
-    /// Reuse an externally supplied task store (required for MO-backed
-    /// cross-client task visibility; keeps `Self::new` ergonomic for tests
-    /// that just want a process-local store).
-    pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
-        self.task_manager = Arc::new(TaskManager::new(self.ctx.session_id.clone(), store));
-        self
     }
 
     /// Override the bash cache TTL. Intended for tests; production
@@ -239,11 +217,11 @@ impl DefaultToolExecutor {
 
     /// Build a ready-to-use executor from workspace parameters.
     ///
-    /// Handles the full setup recipe shared by edge and cloud:
-    /// HTTP client, `ToolContext`, sandbox, and optional GitHub integration.
+    /// Handles the local/edge setup recipe: HTTP client, `ToolContext`,
+    /// and sandbox.
     ///
     /// If the HTTP client cannot be built, a warning is logged and the
-    /// executor is created without HTTP support (GitHub tools etc. will
+    /// executor is created without HTTP support (HTTP-dependent tools will
     /// report errors rather than crashing the runtime).
     pub fn for_workspace(
         workspace: &Path,
@@ -252,19 +230,42 @@ impl DefaultToolExecutor {
         user_agent: &str,
         timeout: std::time::Duration,
     ) -> Self {
-        let (http_client, http_client_available) = match reqwest::Client::builder()
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
+    }
+
+    /// Build a multi-tenant Server executor without reading process-level or
+    /// host CLI credentials. Credential-backed tools must be installed later
+    /// from an authenticated, owner-scoped capability binding.
+    pub fn for_server_workspace(
+        workspace: &Path,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_agent: &str,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
+    }
+
+    fn for_workspace_inner(
+        workspace: &Path,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_agent: &str,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let http_client = match reqwest::Client::builder()
             .timeout(timeout)
             .user_agent(user_agent.to_string())
             .no_proxy()
             .build()
         {
-            Ok(client) => (client, true),
+            Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "failed to build HTTP client for tool executor — HTTP-dependent tools will be unavailable"
                 );
-                (reqwest::Client::new(), false)
+                None
             }
         };
 
@@ -274,27 +275,15 @@ impl DefaultToolExecutor {
             user_id: user_id.into(),
             session_id: session_id.into(),
             sandbox: crate::SandboxConfig::standard(workspace),
-            http_client: Some(http_client.clone()),
+            http_client,
             logger: Arc::new(crate::TracingLogger),
             cancel_token: None,
             detach_shell_handle: None,
         };
 
-        let mut executor = Self::new(ctx);
-        executor.http_client_available = http_client_available;
-        let tokens = crate::github::resolve_github_tokens();
-        if !tokens.is_empty() {
-            let preferred_repos = crate::github::detect_github_remote_repos(workspace);
-            let github = GitHubClient::from_tokens(http_client, tokens, preferred_repos);
-            executor = executor.with_github_client(github);
-        }
-        executor
+        Self::new(ctx)
     }
 
-    pub fn with_github_client(mut self, client: GitHubClient) -> Self {
-        self.github_client = Some(client);
-        self
-    }
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
@@ -381,7 +370,7 @@ impl ToolExecutor for DefaultToolExecutor {
             .as_ref()
             .is_some_and(|t| t.is_cancelled())
         {
-            return ToolResult::error(format!("Tool '{name}' not executed: run was cancelled"));
+            return crate::cancelled_tool_result(name, false);
         }
 
         if let Some(protected) = &self.filesystem_write_boundary
@@ -391,9 +380,25 @@ impl ToolExecutor for DefaultToolExecutor {
             return ToolResult::error(error);
         }
 
+        // Resolve once per invocation. The same canonical identity drives
+        // cache lookup, spawn, evidence, and cache insertion so a path alias
+        // cannot be retargeted between those phases.
+        let bash_workdir = if name == "bash" {
+            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args) {
+                Ok(workdir) => Some(workdir),
+                Err(error) => return ToolResult::error(error),
+            }
+        } else {
+            None
+        };
+
         if name == "bash"
+            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
-            && let Some(key) = self.bash_cache_key(args)
+            && let Some(key) = self.bash_cache_key(
+                args,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+            )
             && let Some(mut cached) = {
                 // Lookup + TTL check + stale eviction under one
                 // critical section. We clone the `ToolResult` out
@@ -421,6 +426,12 @@ impl ToolExecutor for DefaultToolExecutor {
             }
         {
             mark_result_cached(&mut cached);
+            crate::shell_ops::attach_bash_workdir_evidence(
+                &mut cached,
+                &self.ctx.workspace_root,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+                args,
+            );
             if let Some(cb) = &self.progress_callback {
                 cb.tool_completed(&call_id, &cached.output, !cached.is_error)
                     .await;
@@ -428,11 +439,98 @@ impl ToolExecutor for DefaultToolExecutor {
             return cached;
         }
 
-        let dispatch = self.dispatch(name, args);
-        let result = if let Some(token) = self.ctx.cancel_token.as_ref() {
+        // Direct workspace writers participate in the same per-root lease as
+        // Bash observation windows. This prevents a typed write in another
+        // concurrent caller from being mistaken for an opaque Bash delta.
+        let nested_run_script_callback = crate::rpc_bridge::is_run_script_rpc_dispatch();
+        if name == "run_script" && nested_run_script_callback {
+            return ToolResult::error(
+                "run_script cannot recursively start another opaque script writer".into(),
+            );
+        }
+        let targeted_observer = self.convergence_tracker.requires_snapshot_lease(
+            &self.convergence_authority,
+            name,
+            args,
+            &self.ctx.workspace_root,
+        );
+        let _workspace_mutation_lease = if name != "bash"
+            && name != "run_script"
+            && (is_workspace_mutation_tool(name, args) || targeted_observer)
+            && !nested_run_script_callback
+        {
+            // Typed writers must share the same per-workspace lease as
+            // opaque Bash observation windows.  Otherwise a direct write
+            // from another caller can land between Bash's pre/post
+            // fingerprints and be falsely attributed to Bash.  Bash is
+            // excluded because its own shell boundary acquires the lease.
+            match crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                &self.ctx.workspace_root,
+                self.ctx.cancel_token.as_deref(),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    if self
+                        .ctx
+                        .cancel_token
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        self.convergence_tracker
+                            .clear_authority(&self.convergence_authority);
+                        return crate::cancelled_tool_result(name, false);
+                    }
+                    return ToolResult::error(
+                        "workspace coordination lock was cancelled, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if self
+            .ctx
+            .cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.convergence_tracker
+                .clear_authority(&self.convergence_authority);
+            return crate::cancelled_tool_result(name, false);
+        }
+        let _recursive_writer_epoch = if name == "run_script" {
+            match crate::workspace_observation::begin_workspace_writer_with_options(
+                &self.ctx.workspace_root,
+                self.ctx.cancel_token.as_deref(),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    return ToolResult::error(
+                        "workspace writer coordination was cancelled, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
+        // Bash and run_script own their child timeout/cancellation paths. Do
+        // not wrap either in the generic 60s future timeout: dropping one can
+        // abandon the post-execution workspace receipt after a partial write.
+        let mut result = if name == "bash" || name == "run_script" {
+            dispatch.await
+        } else if let Some(token) = self.ctx.cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
-                    ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+                    crate::cancelled_tool_result(name, true)
                 }
                 result = tokio::time::timeout(TOOL_TIMEOUT, dispatch) => match result {
                     Ok(r) => r,
@@ -451,15 +549,140 @@ impl ToolExecutor for DefaultToolExecutor {
                 )),
             }
         };
+        let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
+            crate::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
+        ) && _recursive_writer_epoch.as_ref().is_none_or(
+            crate::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid,
+        );
+        let receipt_authority_valid = coordination_integrity_valid
+            && _workspace_mutation_lease.as_ref().is_none_or(
+                crate::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+            && _recursive_writer_epoch.as_ref().is_none_or(
+                crate::workspace_observation::WorkspaceWriterGuard::receipt_authority_valid,
+            );
+        if nested_run_script_callback && let Some(fields) = result.metadata.as_mut() {
+            // The callback is re-entrant under its opaque parent. It may
+            // return ordinary output to Python, but only the parent can check
+            // the binding generation after the complete script settles.
+            fields.remove("workspace_mutation_applied");
+            crate::workspace_observation::discard_workspace_desired_state_convergence_marker(
+                fields,
+            );
+            fields.remove(crate::workspace_observation::OBSERVED_FIELD);
+            fields.remove(crate::workspace_observation::SCOPE_FIELD);
+            fields.remove(crate::workspace_observation::RECEIPT_FIELD);
+        }
+        if !coordination_integrity_valid {
+            crate::workspace_observation::mark_workspace_observation_unsettled(
+                &self.ctx.workspace_root,
+            );
+            if let Some(fields) = result.metadata.as_mut() {
+                fields.remove("workspace_mutation_applied");
+                crate::workspace_observation::discard_workspace_desired_state_convergence_marker(
+                    fields,
+                );
+                fields.remove(crate::workspace_observation::OBSERVED_FIELD);
+                fields.remove(crate::workspace_observation::SCOPE_FIELD);
+                fields.remove(crate::workspace_observation::RECEIPT_FIELD);
+            }
+            result.is_error = true;
+            result.output.push_str(
+                "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+            );
+        }
+        let desired_state =
+            match crate::workspace_observation::consume_workspace_desired_state_convergence_marker(
+                &mut result.metadata,
+                args,
+                &self.ctx.workspace_root,
+            ) {
+                Ok(desired_state) => desired_state,
+                Err(error) => {
+                    result.is_error = true;
+                    result.output.push_str(&format!(
+                        "\n\nError: {error}; no convergence authority was issued."
+                    ));
+                    None
+                }
+            };
+        // A successful structured workspace writer already crossed the
+        // owner executor's path/permission boundary. Carry that typed fact
+        // through the server/edge result ledger instead of making a remote
+        // runtime guess the target against its own filesystem. This does not
+        // satisfy final verification; it only opens the normal post-mutation
+        // observation obligation.
+        if let Some(receipt) =
+            crate::workspace_observation::typed_workspace_tool_receipt_for_applied(
+                name,
+                args,
+                &self.ctx.workspace_root,
+                result.is_error,
+                receipt_authority_valid
+                    && !nested_run_script_callback
+                    && result
+                        .metadata
+                        .as_ref()
+                        .and_then(|fields| fields.get("workspace_mutation_applied"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
+            )
+        {
+            result
+                .metadata
+                .get_or_insert_with(Default::default)
+                .extend(receipt);
+        }
+        match crate::workspace_observation::project_typed_workspace_convergence(
+            &self.convergence_tracker,
+            Some(&self.convergence_authority),
+            name,
+            args,
+            &self.ctx.workspace_root,
+            result.is_error,
+            desired_state.as_ref(),
+            receipt_authority_valid && !nested_run_script_callback,
+            targeted_observer,
+            receipt_authority_valid && _workspace_mutation_lease.is_some(),
+        ) {
+            Ok(projection) => {
+                if let Some(receipt) = projection.convergence_receipt {
+                    result
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+                if let Some(receipt) = projection.observation_receipt {
+                    result
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+            }
+            Err(error) => {
+                result.is_error = true;
+                result.output.push_str(&format!(
+                    "\n\nError: {error}; no completion receipt was issued. Retry inside the active turn after cancelling or finishing abandoned work."
+                ));
+            }
+        }
+
+        // This generic dispatch boundary does not establish ownership of a
+        // source file. Preserve an existing source-owned marker, but use a
+        // display-only redaction for raw output so web/env/error/tool results
+        // cannot mint a blind edit capability.
+        let result = {
+            let (output, _) =
+                crate::credential_redaction::redact_credentials_for_display(&result.output);
+            ToolResult { output, ..result }
+        };
+
         // Truncate oversized output to prevent context window overflow.
         let result = if result.output.len() > MAX_TOOL_OUTPUT_BYTES {
-            let safe_len = result.output.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
             ToolResult {
-                output: format!(
-                    "{}\n[output truncated at {}KB — {} bytes omitted]",
-                    &result.output[..safe_len],
-                    MAX_TOOL_OUTPUT_BYTES / 1024,
-                    result.output.len() - safe_len,
+                output: crate::credential_redaction::truncate_redacted_output(
+                    result.output,
+                    MAX_TOOL_OUTPUT_BYTES,
                 ),
                 ..result
             }
@@ -468,8 +691,12 @@ impl ToolExecutor for DefaultToolExecutor {
         };
 
         if name == "bash"
+            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !result.is_error
-            && let Some(key) = self.bash_cache_key(args)
+            && let Some(key) = self.bash_cache_key(
+                args,
+                bash_workdir.as_ref().expect("bash workdir resolved above"),
+            )
         {
             self.bash_cache
                 .lock()
@@ -482,7 +709,48 @@ impl ToolExecutor for DefaultToolExecutor {
                     },
                 );
         }
-        if is_workspace_mutation_tool(name, args) && !result.is_error {
+        // A direct writer is known from its typed tool contract; even a
+        // failed attempt invalidates cached reads because a writer can
+        // partially apply before returning an error. Opaque Bash may only be
+        // classified after the executor's bounded pre/post observation. A
+        // changed receipt likewise invalidates the generation on failure.
+        let observed_bound_workspace_mutation = name == "bash"
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::SCOPE_FIELD))
+                .and_then(Value::as_str)
+                == Some(crate::workspace_observation::BOUND_WORKSPACE_SCOPE)
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
+                .is_some_and(crate::workspace_observation::is_changed_receipt);
+        // `run_script` is an opaque workspace writer even when its Python
+        // body returns an error or cancellation after a partial write.  It
+        // therefore participates in cache-generation invalidation whenever
+        // execution may have started.  The one explicit exception is the
+        // capability/admission failure which carries
+        // `execution_started=false`; that path guarantees no child was
+        // spawned and must not make unrelated read caches stale.
+        let exact_desired_state_noop = !result.is_error
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
+                .is_some_and(
+                    crate::workspace_observation::is_typed_workspace_desired_state_convergence_receipt,
+                );
+        if (is_workspace_mutation_tool(name, args) && !exact_desired_state_noop)
+            || observed_bound_workspace_mutation
+            || run_script_may_have_mutated(name, &result)
+        {
             self.workspace_generation.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -494,25 +762,80 @@ impl ToolExecutor for DefaultToolExecutor {
         result
     }
 
+    async fn execute_with_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        let Some(cancel_token) = cancel_token else {
+            return self.execute(name, args).await;
+        };
+        if cancel_token.is_cancelled() {
+            return crate::cancelled_tool_result(name, false);
+        }
+        // Execute against a shallow clone whose context carries the caller's
+        // token.  Shared caches and generation remain
+        // shared, while Bash/run_script and all generic dispatch paths now
+        // observe the actual caller-owned cancellation boundary rather than
+        // an unrelated context token (or no token at all).
+        let mut delegated = self.clone();
+        delegated.ctx.cancel_token = Some(Arc::new(cancel_token.clone()));
+        delegated.execute(name, args).await
+    }
+
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::schemas::all_tool_schemas()
+        let mut schemas = crate::schemas::all_tool_schemas();
+        if !astra_sandbox::process_scope_available() {
+            schemas.retain(|schema| {
+                astra_core::tool_schema::tool_schema_name(schema) != Some("run_script")
+            });
+        }
+        schemas
     }
 
     fn project_root(&self) -> &Path {
         &self.ctx.project_root
+    }
+
+    fn workspace_root(&self) -> &Path {
+        &self.ctx.workspace_root
     }
 }
 
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 impl DefaultToolExecutor {
-    fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
+    /// Execute through this workspace owner while binding convergence facts to
+    /// the caller's live run/turn authority. The shallow clone keeps the
+    /// executor's caches and generation counters shared; only the authority
+    /// envelope is request-scoped.
+    pub async fn execute_with_workspace_convergence_authority(
+        &self,
+        name: &str,
+        args: &Value,
+        convergence_tracker: &crate::workspace_observation::DesiredStateConvergenceTracker,
+        convergence_authority: &str,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        let mut delegated = self.clone();
+        delegated.convergence_tracker = convergence_tracker.clone();
+        delegated.convergence_authority = Arc::from(convergence_authority);
+        delegated
+            .execute_with_cancel(name, args, cancel_token)
+            .await
+    }
+
+    fn bash_cache_key(
+        &self,
+        args: &Value,
+        workdir: &crate::shell_ops::PreparedBashWorkdir,
+    ) -> Option<BashCacheKey> {
         use crate::bash_cache_safety::bash_command_is_cache_safe;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let command = args.get("command")?.as_str()?.to_string();
-
         // Readonly classifier: only commands whose output depends
         // solely on fs + env may hit the cache. Anything with side
         // effects (rm, cargo build, git commit, curl, …) or shell
@@ -558,6 +881,7 @@ impl DefaultToolExecutor {
 
         Some(BashCacheKey {
             workspace_root: self.ctx.workspace_root.display().to_string(),
+            workdir: workdir.identity().to_string(),
             workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
             command,
             env_fingerprint,
@@ -565,9 +889,13 @@ impl DefaultToolExecutor {
         })
     }
 
-    async fn dispatch(&self, name: &str, args: &Value) -> ToolResult {
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: &Value,
+        bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
+    ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
-        let pr = &self.ctx.project_root;
 
         match name {
             // ── File operations ──────────────────────────────────────
@@ -607,23 +935,31 @@ impl DefaultToolExecutor {
             // ── Shell operations ─────────────────────────────────────
             "bash" => match &self.filesystem_write_boundary {
                 Some(paths) => {
-                    crate::shell_ops::execute_bash_with_filesystem_boundary(&self.ctx, args, paths)
-                        .await
+                    crate::shell_ops::execute_bash_with_filesystem_boundary_at_workdir(
+                        &self.ctx,
+                        args,
+                        paths,
+                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                    )
+                    .await
                 }
-                None => crate::shell_ops::execute_bash(&self.ctx, args).await,
+                None => {
+                    crate::shell_ops::execute_bash_with_environment_at_workdir(
+                        &self.ctx,
+                        args,
+                        &[],
+                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                    )
+                    .await
+                }
             },
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
-            // ── Git operations (gix-based) ───────────────────────────
-            // Consolidated git tool — single entry point for all git operations.
-            "git" => outcome_to_result(crate::git_gix::git_dispatch(pr, args)),
 
-            // ── GitHub API ───────────────────────────────────────────
-            "github" => match crate::github_tool_contract::github_action_from_args(args) {
-                Ok(action) => self.dispatch_github_action(action, args).await,
-                Err(error) => ToolResult::error(format!("Error: {error}")),
-            },
+            "worktree" => ToolResult::error("Error: worktree lifecycle requires an explicitly bound CLI or User Runner session owner; no operation was run".to_string()),
+
+
 
             // ── Code intelligence (tree-sitter) ──────────────────────
             "symbols" => self.dispatch_symbols(args),
@@ -631,12 +967,7 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_search::perform_web_search(
-                    self.ctx.http_client.as_ref(),
-                    args,
-                    &cache_scope,
-                )
-                .await
+                crate::web_search::perform_web_search(args, &cache_scope).await
             }
 
             // ── Utility tools ────────────────────────────────────────
@@ -669,12 +1000,7 @@ impl DefaultToolExecutor {
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                let output = crate::web_fetch::fetch_with_cache_scope(
-                    self.ctx.http_client.as_ref(),
-                    args,
-                    &cache_scope,
-                )
-                .await;
+                let output = crate::web_fetch::fetch_with_cache_scope(args, &cache_scope).await;
                 string_to_result(output)
             }
 
@@ -728,7 +1054,13 @@ impl DefaultToolExecutor {
                 #[cfg(unix)]
                 {
                     let config = crate::run_script::RunScriptConfig::default();
-                    crate::run_script::handle_run_script(args, self, config).await
+                    crate::run_script::handle_run_script_with_cancel(
+                        args,
+                        self,
+                        config,
+                        self.ctx.cancel_token.as_deref(),
+                    )
+                    .await
                 }
                 #[cfg(not(unix))]
                 {
@@ -745,50 +1077,6 @@ impl DefaultToolExecutor {
                 "Error: Tool '{name}' not available in DefaultToolExecutor"
             )),
         }
-    }
-
-    /// Dispatch the consolidated GitHub tool via the optional GitHubClient.
-    async fn dispatch_github_action(
-        &self,
-        action: crate::github_tool_contract::GithubAction,
-        args: &Value,
-    ) -> ToolResult {
-        let client = match &self.github_client {
-            Some(c) => c,
-            None => {
-                if !self.http_client_available {
-                    return ToolResult::error(format!(
-                        "Error: github(action='{}') failed — HTTP client could not be built.\n\n\
-                         This is a system configuration issue (proxy, TLS, network). \
-                         Check server logs for 'failed to build HTTP client' errors.\n\n\
-                         GitHub integration requires a working HTTP client. \
-                         Once the infrastructure issue is resolved, this tool will function normally.",
-                        action.as_str()
-                    ));
-                }
-                return ToolResult::error(format!(
-                    "Error: github(action='{}') failed — no GitHub token is configured.\n\n\
-                     To fix, do ONE of:\n\
-                     1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
-                     2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
-                     If you are running in CI, ensure the token is injected into the runtime.\n\
-                     After authentication, restart the session to enable GitHub integration.",
-                    action.as_str()
-                ));
-            }
-        };
-        let output = match action {
-            crate::github_tool_contract::GithubAction::ListPrs => client.list_prs(args).await,
-            crate::github_tool_contract::GithubAction::GetPr => client.get_pr(args).await,
-            crate::github_tool_contract::GithubAction::CiStatus => client.ci_status(args).await,
-            crate::github_tool_contract::GithubAction::RepoStats => client.repo_stats(args).await,
-            crate::github_tool_contract::GithubAction::ListIssues => client.list_issues(args).await,
-            crate::github_tool_contract::GithubAction::GetIssue => client.get_issue(args).await,
-            crate::github_tool_contract::GithubAction::CreateIssue => {
-                client.create_issue(args).await
-            }
-        };
-        string_to_result(output)
     }
 
     /// Dispatch the `symbols` tool: read a file, detect language, extract symbols.
@@ -832,30 +1120,48 @@ fn mark_result_cached(result: &mut ToolResult) {
     metadata.insert("cached".to_string(), Value::Bool(true));
 }
 
-fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
+/// Whether a `run_script` result must conservatively advance the workspace
+/// cache generation.  `run_script` executes arbitrary Python, so a successful
+/// result is not the only mutation-bearing outcome: a timeout, cancellation,
+/// or child error may arrive after a partial write.  Only the explicit
+/// pre-admission contract (`execution_started=false`) proves that no process
+/// ran.  Missing or malformed metadata is intentionally treated as started;
+/// fail-closed cache invalidation is safer than serving a stale read.
+fn run_script_may_have_mutated(name: &str, result: &ToolResult) -> bool {
+    if name != "run_script" {
+        return false;
+    }
+    result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get("execution_started"))
+        .and_then(Value::as_bool)
+        != Some(false)
+}
+
+/// Return whether a typed tool invocation may mutate the bound workspace.
+///
+/// This is intentionally an admission/serialization predicate, not proof that
+/// a mutation happened. Callers that need completion evidence must use the
+/// executor-owned post-execution receipt (or the tool's typed success
+/// contract). Keeping the predicate shared prevents edge and server routes
+/// from acquiring different workspace observation windows.
+pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "str_replace" | "multi_edit" | "delete_file" => true,
-        "git" => crate::git_tool_contract::git_action_from_args(args)
-            .ok()
-            .is_some_and(|action| match action {
-                crate::git_tool_contract::GitAction::Commit
-                | crate::git_tool_contract::GitAction::RevertCommit
-                | crate::git_tool_contract::GitAction::Push => true,
-                crate::git_tool_contract::GitAction::Stash => args
-                    .get("sub_action")
-                    .and_then(Value::as_str)
-                    .is_some_and(git_stash_sub_action_mutates_workspace),
-                crate::git_tool_contract::GitAction::CheckoutFile
-                | crate::git_tool_contract::GitAction::Worktree => true,
-                crate::git_tool_contract::GitAction::Status
-                | crate::git_tool_contract::GitAction::Diff
-                | crate::git_tool_contract::GitAction::Log
-                | crate::git_tool_contract::GitAction::Show
-                | crate::git_tool_contract::GitAction::Blame
-                | crate::git_tool_contract::GitAction::FileHistory
-                | crate::git_tool_contract::GitAction::LogSearch
-                | crate::git_tool_contract::GitAction::Contributors => false,
-            }),
+        "write_file"
+        | "str_replace"
+        | "multi_edit"
+        | "edit_file"
+        | "apply_patch"
+        | "create_file"
+        | "delete_file"
+        | "notebook_edit"
+        | "rollback_file_edits"
+        | "rollback_git_worktrees"
+        | "worktree"
+        | "rename_symbol" => true,
+        "lsp" => args.get("dry_run").and_then(Value::as_bool) == Some(false),
+
         _ => false,
     }
 }
@@ -866,7 +1172,7 @@ fn validate_host_owned_write_boundary(
     workspace_root: &Path,
     protected: &[std::path::PathBuf],
 ) -> Result<(), String> {
-    if matches!(name, "run_script" | "git") {
+    if matches!(name, "run_script" | "worktree") {
         return Err(format!(
             "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
         ));
@@ -899,15 +1205,43 @@ fn validate_host_owned_write_boundary(
     Ok(())
 }
 
-fn git_stash_sub_action_mutates_workspace(action: &str) -> bool {
-    matches!(
-        action,
-        "push" | "save" | "apply" | "pop" | "drop" | "branch"
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn removed_repository_tools_are_unknown_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = DefaultToolExecutor::for_server_workspace(
+            dir.path(),
+            "test-user",
+            "test-session",
+            "test",
+            std::time::Duration::from_secs(1),
+        );
+        for name in ["git", "github"] {
+            assert!(
+                !crate::schemas::all_tool_schemas()
+                    .iter()
+                    .any(|s| s["function"]["name"] == name)
+            );
+            assert!(!SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES.contains(&name));
+            let result = executor
+                .execute(
+                    name,
+                    &serde_json::json!({"action":"commit", "message":"must not run"}),
+                )
+                .await;
+            assert!(result.is_error, "{name}: {result:?}");
+            assert!(
+                result
+                    .output
+                    .contains("not available in DefaultToolExecutor"),
+                "{name}: {}",
+                result.output
+            );
+        }
+        assert!(!dir.path().join(".git").exists());
+    }
+
     use std::path::Path;
     use std::sync::Arc;
 
@@ -975,41 +1309,55 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_boundary_rejects_git_hook_before_it_can_write() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let tmp = TempDir::new().unwrap();
-        init_git_repo(tmp.path());
-        let protected = tmp.path().join(".moi/runtime/task-1");
-        std::fs::create_dir_all(&protected).unwrap();
-        let sentinel = protected.join("owned.txt");
-        let hook = tmp.path().join(".git/hooks/pre-commit");
-        std::fs::write(
-            &hook,
-            format!("#!/bin/sh\nprintf owned > '{}'\n", sentinel.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(tmp.path().join("tracked.txt"), "content").unwrap();
-        let exec = DefaultToolExecutor::new(ToolContext::test(tmp.path()))
-            .with_filesystem_write_boundary(vec![protected]);
-
-        let result = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "must not run"}),
-            )
-            .await;
-
-        assert!(result.is_error, "structured git must fail closed");
-        assert!(
-            result.output.contains("managed filesystem boundary"),
-            "unexpected error: {}",
-            result.output
+    #[test]
+    fn run_script_schema_matches_process_scope_capability() {
+        let (_tmp, exec) = test_executor();
+        let visible = <DefaultToolExecutor as ToolExecutor>::tool_schemas(&exec)
+            .iter()
+            .any(|schema| astra_core::tool_schema::tool_schema_name(schema) == Some("run_script"));
+        assert_eq!(
+            visible,
+            astra_sandbox::process_scope_available(),
+            "run_script must not be advertised when its ownership capability is unavailable"
         );
-        assert!(!sentinel.exists(), "the pre-commit hook must not execute");
+    }
+
+    #[test]
+    fn run_script_generation_invalidation_is_conservative_after_dispatch() {
+        // Arbitrary Python can mutate the workspace on success, partial
+        // failure, or cancellation.  All of those outcomes must invalidate
+        // read caches once execution may have started.
+        assert!(run_script_may_have_mutated(
+            "run_script",
+            &ToolResult::text("ok".into())
+        ));
+        assert!(run_script_may_have_mutated(
+            "run_script",
+            &ToolResult::error("partial failure".into())
+        ));
+
+        let mut cancelled = crate::cancelled_tool_result("run_script", true);
+        assert!(run_script_may_have_mutated("run_script", &cancelled));
+
+        // OwnershipUnavailable is the one fail-closed admission result that
+        // proves no child was spawned, so it must not evict unrelated read
+        // caches.  Malformed metadata is not proof and remains conservative.
+        cancelled
+            .metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert("execution_started".into(), Value::Bool(false));
+        assert!(!run_script_may_have_mutated("run_script", &cancelled));
+
+        let mut malformed = ToolResult::error("unknown execution state".into());
+        malformed
+            .metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert("execution_started".into(), Value::String("false".into()));
+        assert!(run_script_may_have_mutated("run_script", &malformed));
+        assert!(!run_script_may_have_mutated(
+            "read_file",
+            &ToolResult::text("ok".into())
+        ));
     }
 
     #[test]
@@ -1025,7 +1373,6 @@ mod tests {
             "str_replace",
             "bash",
             "run_script",
-            "task_board",
             "session",
             "memory",
             "rollback_file_edits",
@@ -1035,81 +1382,6 @@ mod tests {
                 "server-specific tool `{wrapped}` must keep a dedicated handler"
             );
         }
-    }
-
-    fn init_git_repo(dir: &Path) {
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
-
-    struct DenyInvocationApprovalGate;
-
-    #[async_trait::async_trait]
-    impl ToolApprovalGate for DenyInvocationApprovalGate {
-        async fn request_approval(
-            &self,
-            _request_id: &str,
-            _tool_name: &str,
-            _args: &Value,
-        ) -> crate::ApprovalDecision {
-            crate::ApprovalDecision::Denied {
-                reason: Some("test denied".to_string()),
-            }
-        }
-
-        fn requires_approval(&self, _tool_name: &str) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_invocation_approval_blocks_git_mutating_action() {
-        let (_tmp, mut exec) = test_executor();
-        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
-
-        let result = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "ship"}),
-            )
-            .await;
-
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("The user REJECTED this tool call"),
-            "mutating git actions must ask approval before execution: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_invocation_approval_skips_git_read_only_action() {
-        let (tmp, mut exec) = test_executor();
-        init_git_repo(tmp.path());
-        exec.approval_gate = Some(Arc::new(DenyInvocationApprovalGate));
-
-        let result = exec
-            .execute("git", &serde_json::json!({"action": "diff"}))
-            .await;
-
-        assert!(
-            !result.output.contains("The user REJECTED this tool call"),
-            "read-only git actions must not request approval: {}",
-            result.output
-        );
     }
 
     #[tokio::test]
@@ -1171,6 +1443,99 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(tmp.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn exact_write_file_noop_emits_convergence_without_generation_or_cache_change() {
+        let (tmp, exec) = test_executor();
+        let args = serde_json::json!({"path": "answer.txt", "content": "stable\n"});
+        let changed = exec.execute("write_file", &args).await;
+        assert!(!changed.is_error, "{changed:?}");
+        assert!(changed.metadata.as_ref().is_some_and(|fields| {
+            fields
+                .get(crate::workspace_observation::RECEIPT_FIELD)
+                .is_some_and(crate::workspace_observation::is_typed_workspace_tool_receipt)
+        }));
+
+        let generation = exec.workspace_generation.load(Ordering::Relaxed);
+        let bash_args = serde_json::json!({"command": "pwd"});
+        let first_read = exec.execute("bash", &bash_args).await;
+        assert!(!first_read.is_error, "{first_read:?}");
+        let before = std::fs::metadata(tmp.path().join("answer.txt"))
+            .expect("target metadata")
+            .modified()
+            .expect("mtime");
+
+        let no_op = exec.execute("write_file", &args).await;
+        assert!(!no_op.is_error, "{no_op:?}");
+        let fields = no_op.metadata.as_ref().expect("convergence metadata");
+        let receipt = &fields[crate::workspace_observation::RECEIPT_FIELD];
+        assert!(
+            crate::workspace_observation::is_typed_workspace_desired_state_convergence_receipt(
+                receipt
+            )
+        );
+        assert!(!crate::workspace_observation::is_typed_workspace_tool_receipt(receipt));
+
+        std::fs::write(tmp.path().join("other.txt"), "other\n").expect("other target");
+        for read_args in [
+            serde_json::json!({"path": "other.txt"}),
+            serde_json::json!({"path": "answer.txt", "start_line": 1, "end_line": 1}),
+        ] {
+            let read = exec.execute("read_file", &read_args).await;
+            assert!(!read.is_error, "{read:?}");
+            let observation = read
+                .metadata
+                .as_ref()
+                .and_then(|fields| {
+                    fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                })
+                .expect("generic observation receipt");
+            assert!(
+                crate::workspace_observation::typed_workspace_observation_evidence(observation)
+                    .is_none(),
+                "wrong-target and partial reads must not consume strong convergence authority"
+            );
+        }
+        let full_read = exec
+            .execute("read_file", &serde_json::json!({"path": "answer.txt"}))
+            .await;
+        assert!(!full_read.is_error, "{full_read:?}");
+        let strong_observation = full_read
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD))
+            .and_then(crate::workspace_observation::typed_workspace_observation_evidence)
+            .expect("same-authority full read must carry a fresh state snapshot");
+        assert_eq!(strong_observation.target, "answer.txt");
+        assert_eq!(
+            strong_observation.observed_state,
+            crate::workspace_observation::workspace_file_state_identity(b"stable\n")
+        );
+        assert_eq!(
+            exec.workspace_generation.load(Ordering::Relaxed),
+            generation,
+            "an exact no-op must not advance the workspace generation"
+        );
+        assert_eq!(
+            std::fs::metadata(tmp.path().join("answer.txt"))
+                .expect("target metadata")
+                .modified()
+                .expect("mtime"),
+            before,
+            "an exact no-op must not rewrite the target"
+        );
+
+        let cached_read = exec.execute("bash", &bash_args).await;
+        assert_eq!(
+            cached_read
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "an exact no-op must not invalidate an existing read cache"
+        );
     }
 
     #[tokio::test]
@@ -1322,39 +1687,6 @@ mod tests {
     }
 
     #[test]
-    fn outcome_to_result_uses_explicit_error_flag_not_output_prefix() {
-        let outcome = crate::git_gix::ToolExecutionOutcome::error("fatal: git failed".to_string());
-
-        let result = outcome_to_result(outcome);
-
-        assert!(
-            result.is_error,
-            "non-Error-prefixed git outcome errors must stay errors"
-        );
-        assert_eq!(result.output, "fatal: git failed");
-    }
-
-    #[test]
-    fn ok_outcome_with_error_prefixed_output_is_not_misclassified() {
-        // Regression: a successful tool result whose output happens to begin
-        // with the literal text "Error" (e.g. log lines, diff hunks quoting a
-        // compiler error, or a benign status like "Error code 0 (no change)")
-        // MUST NOT be flagged as a failure. The error bit is load-bearing for
-        // retry logic, hallucination detection, and UI badging.
-        let outcome = crate::git_gix::ToolExecutionOutcome::ok(
-            "Error code 0 (no change)\nAll fine.".to_string(),
-        );
-
-        let result = outcome_to_result(outcome);
-
-        assert!(
-            !result.is_error,
-            "ok() outcomes must stay successful even when output starts with 'Error'"
-        );
-        assert!(result.output.starts_with("Error code 0"));
-    }
-
-    #[test]
     fn string_to_result_uses_structured_failure_status() {
         let result = string_to_result(
             serde_json::json!({
@@ -1451,6 +1783,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_bash_cache_separates_execution_directories() {
+        let (tmp, exec) = test_executor();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        std::fs::create_dir(tmp.path().join("b")).unwrap();
+
+        let in_a = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "a"}),
+            )
+            .await;
+        let in_b = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "b"}),
+            )
+            .await;
+        assert!(!in_a.is_error && !in_b.is_error);
+        assert_ne!(in_a.output, in_b.output);
+        assert_ne!(
+            in_b.metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "same command in another workdir must not reuse cached output"
+        );
+
+        let in_b_again = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "b"}),
+            )
+            .await;
+        assert_eq!(
+            in_b_again
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "same command in the same canonical workdir should remain cacheable"
+        );
+
+        let in_b_alias = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "pwd", "workdir": "a/../b"}),
+            )
+            .await;
+        assert_eq!(
+            in_b_alias.metadata.as_ref().unwrap()["bash_workdir"]["requested"],
+            "a/../b",
+            "a canonical cache hit must retain the current invocation's requested directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_bash_cache_identity_survives_workdir_alias_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, exec) = test_executor();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("input"), "from-a\n").unwrap();
+        std::fs::write(b.join("input"), "from-b\n").unwrap();
+        let alias = tmp.path().join("alias");
+        symlink("a", &alias).unwrap();
+
+        let first = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert!(!first.is_error, "first call failed: {}", first.output);
+        assert_eq!(first.output.trim(), "from-a");
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink("b", &alias).unwrap();
+
+        let from_b = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert_eq!(from_b.output.trim(), "from-b");
+        assert_ne!(
+            from_b
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "retargeting an alias must not relabel or reuse the old directory's cache entry"
+        );
+        let from_b_again = exec
+            .execute(
+                "bash",
+                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
+            )
+            .await;
+        assert!(
+            !from_b_again.is_error,
+            "cached call failed: {}",
+            from_b_again.output
+        );
+        assert_eq!(from_b_again.output.trim(), "from-b");
+        assert_eq!(
+            from_b_again
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "the new canonical workdir should be cached independently"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_verify_mode_is_never_served_from_cache() {
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({ "command": "pwd", "mode": "verify" });
+
+        let _first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "verify mode must establish a fresh observation window"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_bash_does_not_cache_unsafe_commands() {
         // Compound command: cache MUST NOT fire. The classifier
         // refuses any command containing shell metacharacters, so
@@ -1464,15 +1939,6 @@ mod tests {
         let second = exec.execute("bash", &args).await;
 
         assert!(!first.is_error, "first failed: {}", first.output);
-        assert!(!second.is_error, "second failed: {}", second.output);
-        // Counter file went to 2 — proof that the second call really
-        // re-executed. Before the classifier, the cache would return
-        // the first call's output and the file would stay at 1.
-        assert_eq!(
-            std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
-            "tick\ntick\n",
-            "compound command must re-execute both times — never cache shell pipelines"
-        );
         assert_ne!(
             second
                 .metadata
@@ -1482,6 +1948,25 @@ mod tests {
             Some(true),
             "second call must NOT be marked cached"
         );
+        let counter = std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap();
+        if second.is_error {
+            // A host with only weak process-group ownership must quarantine
+            // after the first opaque writer.  Refusing the second execution is
+            // the secure outcome and still proves no result was replayed.
+            assert!(
+                second.output.contains("workspace coordination lock"),
+                "unexpected second failure: {}",
+                second.output
+            );
+            assert_eq!(counter, "tick\n");
+        } else {
+            // With authoritative process ownership both calls may execute;
+            // the counter proves the unsafe command was never cached.
+            assert_eq!(
+                counter, "tick\ntick\n",
+                "compound command must re-execute both times when the host can prove ownership"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1689,117 +2174,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_bash_cache_invalidates_after_git_commit() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "initial\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(
-            !initial.is_error,
-            "initial commit failed: {}",
-            initial.output
-        );
-
-        let args = serde_json::json!({"command": "git log --oneline -1"});
-        let first = exec.execute("bash", &args).await;
-        assert!(!first.is_error, "first log failed: {}", first.output);
-        assert!(first.output.contains("initial"), "got: {}", first.output);
-
-        std::fs::write(&tracked, "changed\n").unwrap();
-        let change = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "change tracked"}),
-            )
-            .await;
-        assert!(!change.is_error, "change commit failed: {}", change.output);
-
-        let second = exec.execute("bash", &args).await;
-        assert!(!second.is_error, "second log failed: {}", second.output);
-        assert!(
-            second.output.contains("change tracked"),
-            "git commit must invalidate cached git log output: {}",
-            second.output
-        );
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_invalidates_after_git_stash_drop() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "initial\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(
-            !initial.is_error,
-            "initial commit failed: {}",
-            initial.output
-        );
-
-        std::fs::write(&tracked, "stashed\n").unwrap();
-        let push = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "stash", "sub_action": "push", "message": "save tracked"}),
-            )
-            .await;
-        assert!(!push.is_error, "stash push failed: {}", push.output);
-
-        let args = serde_json::json!({"command": "git stash list"});
-        let cached_source = exec.execute("bash", &args).await;
-        assert!(
-            cached_source.output.contains("save tracked"),
-            "expected stash list to include pushed stash: {}",
-            cached_source.output
-        );
-
-        let drop = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "stash", "sub_action": "drop"}),
-            )
-            .await;
-        assert!(!drop.is_error, "stash drop failed: {}", drop.output);
-
-        let after_drop = exec.execute("bash", &args).await;
-        assert_ne!(
-            after_drop
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "git stash drop changes refs/stash, so cached git stash list must be invalidated"
-        );
-        assert!(
-            !after_drop.output.contains("save tracked"),
-            "fresh stash list should not include dropped stash: {}",
-            after_drop.output
-        );
-    }
-
     /// Regression guard: a failed bash run (non-zero exit, sandbox
     /// block, permission denied, timeout, cancellation) MUST NOT be
     /// cached — otherwise after the user fixes the underlying
@@ -1910,6 +2284,14 @@ mod tests {
             )
             .await;
         assert!(!result.is_error);
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "new text here\n");
     }
@@ -1930,6 +2312,14 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "got: {}", result.output);
+        assert_ne!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(
             result.output.contains("[DRY RUN]"),
             "got: {}",
@@ -1952,7 +2342,10 @@ mod tests {
     async fn dispatch_tool_search() {
         let (_tmp, exec) = test_executor();
         let result = exec
-            .execute("tool_search", &serde_json::json!({"query": "file"}))
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:read_file"}),
+            )
             .await;
         assert!(!result.is_error);
     }
@@ -1973,45 +2366,6 @@ mod tests {
                 .and_then(|metadata| metadata.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_github_without_client_gives_actionable_guidance() {
-        let (_tmp, exec) = test_executor();
-        let result = exec
-            .execute("github", &serde_json::json!({"action": "list_prs"}))
-            .await;
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("github(action='list_prs')"),
-            "error should describe the consolidated action surface: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("github_"),
-            "error must not leak helper-style tool names: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("no GitHub token is configured"),
-            "error must describe the problem, not the internal API: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("gh auth login"),
-            "error must suggest a concrete fix action: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("restart the session"),
-            "error must explain how to enable the feature: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("Workaround"),
-            "error must not suggest bypassing the system architecture: {}",
-            result.output
         );
     }
 
@@ -2271,54 +2625,6 @@ mod tests {
         assert!(result.output.contains("Unsupported scheme"));
     }
 
-    #[tokio::test]
-    async fn dispatch_git_revert_commit() {
-        let (tmp, exec) = test_executor();
-        init_git_repo(tmp.path());
-
-        let tracked = tmp.path().join("tracked.txt");
-        std::fs::write(&tracked, "original\n").unwrap();
-        let initial = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "initial"}),
-            )
-            .await;
-        assert!(!initial.is_error, "got: {}", initial.output);
-
-        std::fs::write(&tracked, "changed\n").unwrap();
-        let committed = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "commit", "message": "change tracked"}),
-            )
-            .await;
-        assert!(!committed.is_error, "got: {}", committed.output);
-        let commit_sha = committed
-            .metadata
-            .as_ref()
-            .and_then(|fields| fields.get("commit_sha"))
-            .and_then(Value::as_str)
-            .expect("commit_sha metadata");
-
-        let reverted = exec
-            .execute(
-                "git",
-                &serde_json::json!({"action": "revert_commit", "commit_sha": commit_sha}),
-            )
-            .await;
-        assert!(!reverted.is_error, "got: {}", reverted.output);
-        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "original\n");
-        assert_eq!(
-            reverted
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("reverted_commit_sha"))
-                .and_then(Value::as_str),
-            Some(commit_sha)
-        );
-    }
-
     /// P1-J: execute() must truncate output exceeding MAX_TOOL_OUTPUT_BYTES.
     /// Uses read_file on a large synthetic file to trigger truncation.
     #[tokio::test]
@@ -2396,6 +2702,11 @@ mod tests {
             "error must mention cancellation, got: {}",
             result.output
         );
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("pre-execution cancellation must be a typed result");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
     }
 
     #[tokio::test]
@@ -2423,6 +2734,41 @@ mod tests {
             "error must mention cancellation, got: {}",
             result.output
         );
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("in-flight cancellation must be a typed result");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn caller_owned_token_interrupts_without_context_token() {
+        let (_tmp, exec) = test_executor();
+        let token = Arc::new(CancellationToken::new());
+        let trigger = Arc::clone(&token);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ToolExecutor::execute_with_cancel(
+                &exec,
+                "sleep",
+                &serde_json::json!({"seconds": 30}),
+                Some(token.as_ref()),
+            ),
+        )
+        .await
+        .expect("caller-owned cancellation should be observed");
+
+        assert!(result.is_error);
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("caller-owned cancellation must use the typed envelope");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
     }
 
     // ── run_script dispatch ──────────────────────────────────────────────
@@ -2430,7 +2776,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn dispatch_run_script_executes_python() {
-        if !crate::run_script::python3_available() {
+        if !crate::run_script::python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let (tmp, exec) = test_executor();

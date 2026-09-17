@@ -1,7 +1,7 @@
 //! Integration tests for inter-agent messaging.
 //!
 //! These tests verify end-to-end messaging flows that span multiple components:
-//! router + transport + delegation tracker + send_tool.
+//! router + transport + delegation tracker.
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +10,6 @@ mod tests {
     use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::{AgentMailbox, AgentMailboxRouter};
-    use astra_messaging::send_tool;
     use astra_messaging::types::*;
 
     fn tracker() -> Arc<DelegationTracker> {
@@ -246,96 +245,6 @@ mod tests {
         assert!(children[0].try_recv().is_none());
     }
 
-    // ─── send_message tool end-to-end ───────────────────────────────────────
-
-    #[tokio::test]
-    async fn send_tool_text_to_parent() {
-        let (_router, mut parent, children, _dt) = setup_delegation(1, "del-tool").await;
-
-        let args = serde_json::json!({
-            "target": "parent",
-            "content": "I finished the refactoring"
-        });
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(
-            result.display.starts_with("✓"),
-            "Expected success, got: {}",
-            result.display
-        );
-
-        let received = parent.try_recv().unwrap();
-        match &received.payload {
-            MessagePayload::Text { content, .. } => {
-                assert_eq!(content, "I finished the refactoring");
-            }
-            _ => panic!("expected Text payload"),
-        }
-    }
-
-    #[tokio::test]
-    async fn send_tool_broadcast_to_peers() {
-        let (_router, _parent, mut children, _dt) = setup_delegation(3, "del-tool-bcast").await;
-
-        let args = serde_json::json!({
-            "target": "broadcast",
-            "content": "ready for sync",
-            "message_type": "progress"
-        });
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(
-            result.display.starts_with("✓"),
-            "Expected success, got: {}",
-            result.display
-        );
-
-        // All children should receive the broadcast
-        for (i, child) in children.iter_mut().enumerate() {
-            let received = child.try_recv();
-            assert!(received.is_some(), "child-{i} should receive broadcast");
-        }
-    }
-
-    #[tokio::test]
-    async fn send_tool_direct_to_peer() {
-        let (_router, _parent, mut children, _dt) = setup_delegation(2, "del-tool-direct").await;
-
-        let args = serde_json::json!({
-            "target": "agent-1",
-            "content": "review my changes",
-            "message_type": "question"
-        });
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-
-        // Router resolves agent_id-only Direct targets via agent_id_index.
-        assert!(
-            result.display.starts_with("✓"),
-            "expected success, got: {}",
-            result.display
-        );
-        let received = children[1].try_recv();
-        assert!(received.is_some(), "peer should have received the message");
-    }
-
-    #[tokio::test]
-    async fn send_tool_missing_content_returns_error() {
-        let (_router, _parent, children, _dt) = setup_delegation(1, "del-tool-err").await;
-
-        let args = serde_json::json!({ "target": "parent" });
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.contains("Error"));
-        assert!(result.display.contains("content"));
-    }
-
-    #[tokio::test]
-    async fn send_tool_missing_target_returns_error() {
-        let (_router, _parent, children, _dt) = setup_delegation(1, "del-tool-err2").await;
-
-        let args = serde_json::json!({ "content": "hello" });
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.contains("Error"));
-        assert!(result.display.contains("target"));
-    }
-
     // ─── Multi-turn conversation simulation ─────────────────────────────────
 
     #[tokio::test]
@@ -488,46 +397,6 @@ mod tests {
             }
             other => panic!("expected Nack, got: {:?}", other),
         }
-    }
-
-    #[tokio::test]
-    async fn send_tool_with_requires_ack_returns_tracked_message() {
-        let (_router, _parent, children, _dt) = setup_delegation(2, "del-ack-tracked").await;
-
-        let args = serde_json::json!({
-            "target": "parent",
-            "content": "tracked message",
-            "requires_ack": true,
-        });
-
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(
-            result.display.starts_with("✓"),
-            "Expected success: {}",
-            result.display
-        );
-        assert!(
-            result.tracked_message.is_some(),
-            "Should return tracked message"
-        );
-        assert!(result.tracked_message.unwrap().requires_ack);
-    }
-
-    #[tokio::test]
-    async fn send_tool_without_ack_returns_no_tracked_message() {
-        let (_router, _parent, children, _dt) = setup_delegation(2, "del-no-ack").await;
-
-        let args = serde_json::json!({
-            "target": "parent",
-            "content": "regular message",
-        });
-
-        let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.starts_with("✓"));
-        assert!(
-            result.tracked_message.is_none(),
-            "Should NOT track when requires_ack is false"
-        );
     }
 
     #[tokio::test]

@@ -8,11 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 pub(crate) fn mock_model_catalog_json(names: &[&str]) -> serde_json::Value {
-    serde_json::Value::Array(
-        names
-            .iter()
-            .map(|name| {
-                serde_json::json!({
+    let items = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
                     "offering_id": format!("offer-{name}"),
                     "access_id": "self-hosted",
                     "access_kind": "self_hosted",
@@ -26,14 +25,23 @@ pub(crate) fn mock_model_catalog_json(names: &[&str]) -> serde_json::Value {
                     "max_completion_tokens": null,
                     "architecture": null,
                     "thinking_capability": null
-                })
             })
-            .collect(),
-    )
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "items": items,
+        "next_cursor": null,
+        "limit": 50,
+        "total": names.len(),
+        "catalog_revision": "sha256:test-catalog"
+    })
 }
 
 pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
-    let offerings = mock_model_catalog_json(names);
+    let offerings = mock_model_catalog_json(names)
+        .get("items")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let default_offering_id = offerings
         .as_array()
         .and_then(|items| items.first())
@@ -63,6 +71,9 @@ pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
         }],
         "offerings": offerings,
         "default_offering_id": default_offering_id,
+        "next_cursor": null,
+        "limit": 50,
+        "total": names.len(),
         "catalog_revision": "sha256:test-catalog",
         "observed_at": "2026-07-20T00:00:00Z"
     })

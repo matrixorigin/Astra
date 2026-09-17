@@ -8,9 +8,8 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "powershell" => "PowerShell",
         "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",
-        "git" => "Git",
-        "github" => "GitHub",
-        "tool_search" => "Searching tools",
+
+        "tool_search" => "Activating tools",
         "lsp" => "LSP",
         "web_search" => "Searching web",
         "web_fetch" => "Fetching",
@@ -26,7 +25,6 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "brief" => "Brief",
         "share_context" => "Sharing context",
         "query_context" => "Querying context",
-        "task_board" => "Task",
         "get_agent_info" => "Getting agent info",
         "reflect" => "Reflecting",
         "context_analysis" => "Analyzing context",
@@ -71,11 +69,6 @@ pub fn headless_stderr_unknown_tool_detail(err_msg: &str) -> String {
 #[must_use]
 pub fn headless_stderr_resource_limit_observed(tool: &str) -> String {
     format!("  ⚠ {tool}: resource limit detected — tool remains available")
-}
-
-#[must_use]
-pub fn headless_stderr_resource_limit_in_output(tool: &str) -> String {
-    format!("  ⚠ {tool}: resource limit detected in output — tool remains available")
 }
 
 /// Single-line tool success: `  ✓ Reading: path:1-20  46 lines (0ms)`
@@ -162,8 +155,8 @@ mod tests {
     #[test]
     fn ok_line_summary_only() {
         assert_eq!(
-            headless_stderr_tool_ok_line("git", "5ms", None, Some("3 files")),
-            "  ✓ Git  3 files (5ms)"
+            headless_stderr_tool_ok_line("glob", "5ms", None, Some("3 files")),
+            "  ✓ Globbing  3 files (5ms)"
         );
     }
 
@@ -219,21 +212,6 @@ mod tests {
         let s = headless_stderr_resource_limit_observed("read_file");
         assert!(s.contains("read_file"));
         assert!(s.contains("remains available"));
-    }
-
-    #[test]
-    fn resource_limit_in_output_keeps_tool_available() {
-        let s = headless_stderr_resource_limit_in_output("bash");
-        assert!(s.contains("bash"));
-        assert!(s.contains("remains available"));
-        assert!(!s.contains("blocked"));
-    }
-
-    #[test]
-    fn resource_limit_in_output() {
-        let s = headless_stderr_resource_limit_in_output("exec");
-        assert!(s.contains("exec"));
-        assert!(s.contains("resource limit"));
     }
 
     #[test]

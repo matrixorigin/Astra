@@ -13,7 +13,6 @@ use std::path::PathBuf;
 // 2. Large output remains intact until the session-aware runtime persistence boundary
 // 3. read_file auto-downgrades to outline under aggregate pressure
 // 4. Ranged reads always work regardless of aggregate pressure
-// 5. git(action=show/diff) respects aggregate-aware limits
 
 /// Helper: create a file with N lines of content in a temp dir.
 fn make_large_file(dir: &std::path::Path, name: &str, lines: usize) -> PathBuf {

@@ -80,7 +80,7 @@ pub(crate) enum SemanticReadBeforeDispatch {
         fill: Option<Box<SemanticReadFillClaim>>,
         evidence: Option<SemanticReadDecisionEvidence>,
     },
-    Return(astra_tools::ToolResult),
+    Return(crate::server::tool_invocation_runtime::FinishedToolInvocation),
 }
 
 pub(crate) struct SemanticReadDecisionEvidence {

@@ -1,0 +1,59 @@
+name: agent_child_bash_approval_context
+description: |
+  **What**: Delegate one bounded shell observation to a child and require its
+  inherited non-interactive approval context to remain valid at the edge tool
+  boundary.
+  **Tests**: Parent-to-child session/run identity, approval audit authority,
+  edge shell delivery, and terminal fanout truth.
+  **Why**: Permissions alone are insufficient when the child host loses the
+  durable audit context; the same admitted shell call is then rejected as
+  `approval requires session/run context`, causing fallback exploration and a
+  low-quality parent synthesis.
+  **Pass means**: The child executes exactly one harmless bash observation,
+  the fanout settles completely, and the parent returns its evidence.
+  **Fail means**: Approval identity is missing, the child retries through a
+  different tool, or partial execution is promoted to success.
+prompt: |
+  Use exactly one foreground `agent_fanout(action='start')` group with
+  target_count 1. Ask its only child to call `bash` exactly once with the
+  command `printf child-approval-ok`, then report only the command output.
+  Do not run bash in the parent and do not retry or replace the child.
+
+  After the canonical group settles, return exactly `child-approval-ok`.
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 3
+weight: 3.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_child_tool_call_count
+    parent: agent_fanout
+    child: bash
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /provenance/all_slots_delivered
+    equals: true
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /work_unit_observation/status
+    equals: completed
+  - type: text_equals
+    expected: child-approval-ok
+  - type: turn_rounds_between
+    min: 2
+    max: 6

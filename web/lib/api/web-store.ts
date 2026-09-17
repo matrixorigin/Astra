@@ -1,3 +1,5 @@
+import { isArtifactPublicationV1 } from "@astra/sdk";
+import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
   artifactsFromValues,
@@ -57,7 +59,6 @@ import {
   normalizeNextEventIndex,
   type ChatActiveRunRecord,
 } from "@/lib/api/active-run-merge";
-import { modelCache } from "@/lib/api/model-cache";
 import { settleRuntimeCancel } from "@/lib/api/runtime-cancel-settlement";
 
 type ChatRecord = ChatSummary & {
@@ -110,9 +111,7 @@ type StreamResult = {
 
 export type ModelOfferingSelectionErrorCode =
   | "invalid_selection"
-  | "authentication_required"
-  | "catalog_unavailable"
-  | "offering_unavailable";
+  | "authentication_required";
 
 export class ModelOfferingSelectionError extends Error {
   constructor(
@@ -1459,11 +1458,15 @@ export async function resumeActiveRun(ownerUserId: string, chatId: string) {
     operation: `resume active run ${chat.activeRun.runId}`,
   });
 
-  await client.sdk.resumeRun(chat.activeRun.runId);
+  const resumed = await client.sdk.resumeRun(chat.activeRun.runId);
+  if (isArtifactPublicationV1(resumed.artifact_publication)) {
+    const message = chat.messages.find((item) => item.id === chat.activeRun?.assistantMessageId);
+    if (message) message.artifactPublication = resumed.artifact_publication;
+  }
   chat.activeRun = makeActiveRunRecord(
     {
       runId: chat.activeRun.runId,
-      status: "running",
+      status: resumed.status,
       waitingFor: null,
       assistantMessageId: chat.activeRun.assistantMessageId ?? null,
       nextEventIndex: chat.activeRun.nextEventIndex ?? null,
@@ -1486,6 +1489,11 @@ export function updateStreamingAssistantMessage(
     reasoningStatus?: ChatMessage["reasoningStatus"];
     status?: ChatMessage["status"];
     artifacts?: ChatMessage["artifacts"];
+    artifactPublication?: ChatMessage["artifactPublication"];
+    explainAnalyzeEvent?: NonNullable<ChatMessage["explainAnalyzeEvents"]>[number];
+    explainAnalyzeDegraded?: boolean;
+    explainAnalyzeUnrecoverable?: boolean;
+    explainAnalyzeRepair?: { token: string; complete: boolean };
   },
 ) {
   const store = getStore(ownerUserId);
@@ -1518,9 +1526,23 @@ export function updateStreamingAssistantMessage(
       patch.artifacts,
     );
   }
-  chat.lastMessageAt = nowIso();
-  if (chat.projectId) {
-    touchProjectInStore(store, chat.projectId);
+  if (patch.artifactPublication !== undefined) message.artifactPublication = patch.artifactPublication;
+  if (patch.explainAnalyzeEvent !== undefined) {
+    Object.assign(message, appendExplainFact(message, patch.explainAnalyzeEvent));
+  }
+  if (patch.explainAnalyzeDegraded === true) {
+    Object.assign(message, markExplainGap(message, patch.explainAnalyzeUnrecoverable));
+  }
+  if (patch.explainAnalyzeRepair) {
+    const { token, complete } = patch.explainAnalyzeRepair;
+    Object.assign(message, complete ? finishExplainRepair(message, token) : beginExplainRepair(message, token));
+  }
+  // Observation repair must not reorder chats/projects or resemble new output.
+  if (patch.content !== undefined || patch.reasoning !== undefined ||
+    patch.reasoningStatus !== undefined || patch.status !== undefined ||
+    patch.artifacts !== undefined) {
+    chat.lastMessageAt = nowIso();
+    if (chat.projectId) touchProjectInStore(store, chat.projectId);
   }
   return message;
 }
@@ -2684,27 +2706,9 @@ export async function resolveModelOfferingSelection(
     );
   }
 
-  let modelsPromise = modelCache.get(accessToken);
-  if (!modelsPromise) {
-    modelsPromise = client.sdk.listModels();
-    modelCache.set(accessToken, modelsPromise);
-  }
-
-  const models = await modelsPromise.catch((error: unknown) => {
-    modelCache.invalidate(accessToken);
-    throw new ModelOfferingSelectionError(
-      "catalog_unavailable",
-      error instanceof Error ? error.message : "Model catalog is unavailable",
-    );
-  });
-  const matched = models.find(
-    (item) => item.offering_id === offeringId && item.is_active,
-  );
-  if (!matched) {
-    throw new ModelOfferingSelectionError(
-      "offering_unavailable",
-      `Model Offering '${offeringId}' is not available`,
-    );
-  }
+  // The server is the authority for Offering existence, activity, scope, and
+  // route revalidation at run admission. The SDK drains the complete
+  // paginated catalog for browsing, but this helper still never invents an
+  // admission allow-list: the exact Offering is revalidated at run admission.
   return { offeringId };
 }

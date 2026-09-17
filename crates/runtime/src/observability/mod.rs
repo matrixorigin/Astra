@@ -40,7 +40,7 @@ mod tests {
         session.recent_failing_tests = vec!["could not find Cargo.toml".to_string()];
         for t in 0..=58 {
             session.turn_number = t;
-            session.observe_bridge_injections_partial(BridgeInjectionPreviews::EMPTY, None);
+            session.observe_injections_partial(InjectionPreviews::EMPTY, None);
         }
         let report = freshness_report(&session.injection_history, session.turn_number);
         let failing = report

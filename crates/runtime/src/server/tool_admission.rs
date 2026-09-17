@@ -18,6 +18,9 @@ use super::tool_route_selection::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolOffer {
     pub tool_name: String,
+    /// Provider-native identity resolved by the capacity declaration. This is
+    /// deliberately separate from `tool_name`: public names may be aliases.
+    pub native_tool_id: String,
     pub offer_id: String,
     pub provider_type: CapacityProviderType,
     pub provider_id: String,
@@ -28,6 +31,22 @@ pub(crate) struct ToolOffer {
     pub authority: String,
     pub route: ToolExecutionRouteKind,
     pub readiness: CapacityProviderStatus,
+}
+
+impl ToolOffer {
+    pub(crate) fn descriptor_ref(&self) -> Option<astra_turn_types::ResolvedToolDescriptorRef> {
+        use astra_turn_types::{
+            NativeToolId, ProviderBindingRef, ResolvedToolDescriptorRef, ToolIdentity,
+        };
+        ResolvedToolDescriptorRef::new(
+            ToolIdentity::new(
+                ProviderBindingRef::new(self.provider_id.clone()).ok()?,
+                NativeToolId::new(self.native_tool_id.clone()).ok()?,
+            ),
+            self.schema_digest.clone(),
+        )
+        .ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +99,17 @@ pub(crate) struct ToolAdmissionContext {
     pub request_scoped_mcp_provider_ready: bool,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub runtime_declared_tool_names: Option<HashSet<String>>,
+    /// Schema-addressed contracts supplied by an explicitly bound runtime
+    /// provider. Names alone cannot admit an unknown provider tool.
+    pub runtime_declared_tool_schema_digests: HashMap<String, String>,
+    /// Provider-native identities for runtime-declared aliases. This is
+    /// supplied by the authenticated adapter/handshake; it is intentionally
+    /// not reconstructed from a public schema name.
+    pub runtime_declared_tool_native_ids: HashMap<String, String>,
+    /// Whether the host obtained one coherent policy/offer snapshot. A
+    /// contended snapshot is not equivalent to an empty policy; admission must
+    /// fail closed until the same generation can be read atomically.
+    pub policy_snapshot_available: bool,
     pub provider_capabilities: HashMap<String, HashSet<String>>,
     pub disabled_tool_offers: HashSet<String>,
     pub provider_allowed_tools: HashMap<String, HashSet<String>>,
@@ -93,6 +123,9 @@ impl Default for ToolAdmissionContext {
             request_scoped_mcp_provider_ready: false,
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             runtime_declared_tool_names: None,
+            runtime_declared_tool_schema_digests: HashMap::new(),
+            runtime_declared_tool_native_ids: HashMap::new(),
+            policy_snapshot_available: true,
             provider_capabilities: HashMap::new(),
             disabled_tool_offers: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
@@ -161,29 +194,70 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     registry: &astra_runtime_env::ToolRegistry,
     context: &ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
+    if !context.policy_snapshot_available {
+        return ToolAdmissionDecision {
+            tool_name: tool_name.to_string(),
+            visible: false,
+            selected_offer: None,
+            candidates: Vec::new(),
+            route: ToolExecutionRouteKind::Unsupported,
+            hidden_reason: Some(ToolHiddenReason::RuntimeSurfaceDenied),
+        };
+    }
     let class = tool_execution_class(tool_name, registry);
+    if registry.get(tool_name).is_none()
+        && context
+            .runtime_declared_tool_schema_digests
+            .contains_key(tool_name)
+        && !matches!(executor.transport, ToolTransportKind::EdgeLedger)
+    {
+        // Unknown provider contracts are executable only through the
+        // authenticated request-owned callback ledger. EdgeWs currently
+        // advertises and authorizes builtin registry tools only.
+        return ToolAdmissionDecision {
+            tool_name: tool_name.to_string(),
+            visible: false,
+            selected_offer: None,
+            candidates: Vec::new(),
+            route: ToolExecutionRouteKind::Unsupported,
+            hidden_reason: Some(ToolHiddenReason::RuntimeSurfaceDenied),
+        };
+    }
+    // A runtime provider may expose a scoped plugin contract that is not part
+    // of Astra's builtin registry. Only a schema-digest proof plus an active
+    // runtime provider declaration can turn that otherwise-unknown name into
+    // a runtime class; all other unknown names remain fail-closed.
+    let dynamic_runtime_tool =
+        runtime_provider_contract_is_bound(tool_name, class, executor, providers, context);
+    let effective_class = if dynamic_runtime_tool {
+        ToolExecutionClass::RuntimeExecutor
+    } else {
+        class
+    };
     let route = admission_route_for_binding_and_providers(
         tool_name, workspace, executor, providers, registry, context,
     );
 
-    let mut raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+    let mut raw_candidates = if matches!(effective_class, ToolExecutionClass::TurnPipelineIntercept)
+    {
         Vec::new()
     } else {
         candidate_offers_for_tool(tool_name, workspace, executor, providers)
     };
-    let selected_unready_offer = if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
-        selected_unready_offer_for_route(
-            tool_name,
-            workspace,
-            executor,
-            context.selected_runtime_platform,
-            route,
-            providers,
-            registry,
-        )
-    } else {
-        None
-    };
+    let selected_unready_offer =
+        if !matches!(effective_class, ToolExecutionClass::TurnPipelineIntercept) {
+            selected_unready_offer_for_route(
+                tool_name,
+                workspace,
+                executor,
+                context.selected_runtime_platform,
+                route,
+                providers,
+                registry,
+            )
+        } else {
+            None
+        };
     if let Some(offer) = selected_unready_offer.as_ref()
         && !raw_candidates
             .iter()
@@ -193,7 +267,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     }
 
     let selected_offer_before_policy =
-        if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+        if !matches!(effective_class, ToolExecutionClass::TurnPipelineIntercept) {
             provider_for_route(tool_name, workspace, route, providers).map(|provider| {
                 offer_for_provider(
                     tool_name,
@@ -215,8 +289,8 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         .is_some_and(|offer| !provider_allows_tool(context, &offer.provider_id, &offer.tool_name));
 
     let schema_conflict = has_schema_conflict_for_enabled_candidates(&raw_candidates, context);
-    let hidden_reason = hidden_reason_for(class, route).or_else(|| {
-        if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+    let hidden_reason = hidden_reason_for(effective_class, route).or_else(|| {
+        if matches!(effective_class, ToolExecutionClass::TurnPipelineIntercept) {
             return None;
         }
         if schema_conflict {
@@ -248,7 +322,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         hidden_reason,
         None | Some(ToolHiddenReason::DisabledOffer)
             | Some(ToolHiddenReason::ProviderToolNotAllowed)
-    ) && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
+    ) && !matches!(effective_class, ToolExecutionClass::TurnPipelineIntercept)
     {
         selected_offer_before_policy
     } else {
@@ -301,8 +375,13 @@ fn admission_route_for_binding_and_providers(
     context: &ToolAdmissionContext,
 ) -> ToolExecutionRouteKind {
     let class = tool_execution_class(tool_name, registry);
+    let dynamic_runtime_tool =
+        runtime_provider_contract_is_bound(tool_name, class, executor, providers, context);
     if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         return ToolExecutionRouteKind::Unsupported;
+    }
+    if dynamic_runtime_tool {
+        return runtime_provider_route_for_binding(workspace, executor);
     }
     if matches!(class, ToolExecutionClass::SharedServiceOrRuntime) {
         return shared_service_or_runtime_route_for_providers(
@@ -320,6 +399,48 @@ fn admission_route_for_binding_and_providers(
         return ToolExecutionRouteKind::RequestScopedMcp;
     }
     binding_route
+}
+
+fn runtime_provider_route_for_binding(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+) -> ToolExecutionRouteKind {
+    if matches!(executor.transport, ToolTransportKind::GatewayRelay) {
+        return ToolExecutionRouteKind::GatewayRelay;
+    }
+    if matches!(executor.transport, ToolTransportKind::SandboxResidentAgent) {
+        return ToolExecutionRouteKind::SandboxResidentAgent;
+    }
+    if matches!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace) {
+        return ToolExecutionRouteKind::EdgeBound;
+    }
+    ToolExecutionRouteKind::Unsupported
+}
+
+fn runtime_provider_contract_is_bound(
+    tool_name: &str,
+    class: ToolExecutionClass,
+    executor: &ExecutorBinding,
+    providers: &[CapacityProviderDeclaration],
+    context: &ToolAdmissionContext,
+) -> bool {
+    // MCP-qualified names normally belong to the request-scoped MCP route.
+    // An explicitly carried edge/runtime descriptor is a stronger, typed
+    // ownership fact for this binding (for example CLI-local MCP), so it may
+    // select the runtime executor route. Names without the descriptor proof
+    // retain the ordinary MCP/unknown behavior.
+    // The dynamic contract lane is currently closed over the authenticated
+    // request-owned callback ledger. EdgeWs advertisements intentionally
+    // remain builtin-registry-only until their handshake carries the same
+    // resolved descriptor and schema validator.
+    matches!(executor.transport, ToolTransportKind::EdgeLedger)
+        && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
+        && context
+            .runtime_declared_tool_schema_digests
+            .contains_key(tool_name)
+        && providers.iter().any(|provider| {
+            provider.provider_type.is_runtime_executor() && provider.declares_tool(tool_name)
+        })
 }
 
 fn shared_service_or_runtime_route_for_providers(
@@ -429,6 +550,25 @@ pub(crate) fn active_provider_declarations_for_binding(
             runtime_provider
                 .tool_schema_digests
                 .retain(|name, _| runtime_declared_tool_names.contains(name));
+        }
+        // Extend the builtin runtime declaration with explicitly carried
+        // provider contracts. This is the only path by which a non-builtin
+        // tool name can become an executable runtime offer.
+        for (tool_name, schema_digest) in &context.runtime_declared_tool_schema_digests {
+            if context
+                .runtime_declared_tool_names
+                .as_ref()
+                .is_none_or(|names| names.contains(tool_name))
+            {
+                runtime_provider = runtime_provider
+                    .with_tool_schema_digest(tool_name.clone(), schema_digest.clone());
+                if let Some(native_tool_id) =
+                    context.runtime_declared_tool_native_ids.get(tool_name)
+                {
+                    runtime_provider = runtime_provider
+                        .with_native_tool_id(tool_name.clone(), native_tool_id.clone());
+                }
+            }
         }
         providers.push(runtime_provider);
     }
@@ -541,6 +681,14 @@ fn offer_for_provider(
 ) -> ToolOffer {
     ToolOffer {
         tool_name: tool_name.to_string(),
+        // A declaration without an explicit native identity is not executable
+        // as a provider contract. Built-in adapters populate this map with
+        // their canonical identity; aliased adapters must supply the producer
+        // identity through `with_native_tool_id`.
+        native_tool_id: provider
+            .native_tool_id_for_tool(tool_name)
+            .unwrap_or_default()
+            .to_string(),
         offer_id: astra_runtime_env::tool_offer_id(tool_name, &provider.provider_id),
         provider_type: provider.provider_type,
         provider_id: provider.provider_id.clone(),
@@ -565,7 +713,9 @@ fn provider_for_route<'a>(
 ) -> Option<&'a CapacityProviderDeclaration> {
     let provider_type = provider_type_for_route(route, workspace.kind)?;
     providers.iter().find(|provider| {
-        provider.provider_type == provider_type && provider.declares_tool(tool_name)
+        provider.provider_type == provider_type
+            && provider.declares_tool(tool_name)
+            && provider.native_tool_id_for_tool(tool_name).is_some()
     })
 }
 
@@ -577,7 +727,10 @@ fn candidate_offers_for_tool(
 ) -> Vec<ToolOffer> {
     providers
         .iter()
-        .filter(|provider| provider.declares_tool(tool_name))
+        .filter(|provider| {
+            provider.declares_tool(tool_name)
+                && provider.native_tool_id_for_tool(tool_name).is_some()
+        })
         .map(|provider| {
             offer_for_provider(
                 tool_name,
@@ -613,7 +766,9 @@ fn selected_unready_offer_for_route(
         return None;
     }
     if ready_providers.iter().any(|provider| {
-        provider.provider_type == provider_type && provider.declares_tool(tool_name)
+        provider.provider_type == provider_type
+            && provider.declares_tool(tool_name)
+            && provider.native_tool_id_for_tool(tool_name).is_some()
     }) {
         return None;
     }
@@ -850,6 +1005,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context;
     use crate::server::tool_execution_binding::{
         ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolTransportKind,
         WorkspaceAuthority, WorkspaceBinding,
@@ -902,6 +1058,7 @@ mod tests {
         let offer = decision.selected_offer.as_ref().expect("selected offer");
         assert_eq!(offer.provider_type, CapacityProviderType::ServerService);
         assert_eq!(offer.provider_id, "server-builtin");
+        assert_eq!(offer.native_tool_id, "web_fetch");
         assert_eq!(
             decision.selected_offer_id(),
             Some("web_fetch@server-builtin")
@@ -944,6 +1101,7 @@ mod tests {
         let offer = decision.selected_offer.as_ref().expect("selected offer");
         assert_eq!(offer.provider_type, CapacityProviderType::EdgeCapacity);
         assert_eq!(offer.provider_id, "edge-macpro");
+        assert_eq!(offer.native_tool_id, "web_fetch");
         assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
         assert_eq!(decision.candidates.len(), 2);
         let edge_candidate = decision
@@ -963,6 +1121,37 @@ mod tests {
             server_candidate.reason,
             ToolOfferCandidateReason::CurrentProviderPreferred
         );
+    }
+
+    #[test]
+    fn offer_uses_provider_native_identity_instead_of_public_alias() {
+        let provider = astra_runtime_env::CapacityProviderDeclaration::new(
+            CapacityProviderType::EdgeCapacity,
+            "edge-alias",
+            ["public_search".to_string()],
+        )
+        .with_native_tool_id("public_search", "search.v2");
+        let workspace = WorkspaceBinding::edge_workspace(
+            "alias workspace",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let executor = ExecutorBinding::edge_agent(
+            "edge-alias",
+            "alias workspace",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        );
+        let offer = offer_for_provider(
+            "public_search",
+            &provider,
+            ToolExecutionRouteKind::EdgeBound,
+            CapacityProviderStatus::Ready,
+            &workspace,
+            &executor,
+        );
+        assert_eq!(offer.tool_name, "public_search");
+        assert_eq!(offer.native_tool_id, "search.v2");
     }
 
     #[test]
@@ -1132,6 +1321,173 @@ mod tests {
         assert_eq!(offer.scope, "request");
         assert_eq!(offer.authority, "none");
         assert!(offer.schema_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn explicitly_bound_unknown_edge_contract_is_admitted_by_schema_proof() {
+        let tool_name = "mcp__weather__forecast";
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "Get a forecast from the CLI-owned provider.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        let mut context = ToolAdmissionContext {
+            runtime_declared_tool_names: Some(HashSet::from([tool_name.to_string()])),
+            runtime_declared_tool_schema_digests: HashMap::from([(
+                tool_name.to_string(),
+                astra_runtime_env::canonical_tool_schema_digest(&schema),
+            )]),
+            runtime_declared_tool_native_ids: HashMap::from([(
+                tool_name.to_string(),
+                "weather.forecast".to_string(),
+            )]),
+            ..ToolAdmissionContext::default()
+        };
+        let workspace = WorkspaceBinding::edge_workspace(
+            "CLI workspace",
+            "/home/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let executor = ExecutorBinding::edge_agent(
+            "cli-edge",
+            "CLI workspace",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        );
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            tool_name,
+            std::slice::from_ref(&schema),
+            &workspace,
+            &executor,
+            None,
+            &registry(),
+            context.clone(),
+        );
+
+        assert!(
+            decision.visible,
+            "typed provider contract must be visible: {decision:?}"
+        );
+        assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
+        let offer = decision.selected_offer.expect("selected edge offer");
+        assert_eq!(offer.provider_id, "cli-edge");
+        assert_eq!(offer.provider_type, CapacityProviderType::EdgeCapacity);
+        assert_eq!(
+            offer.schema_digest,
+            context.runtime_declared_tool_schema_digests[tool_name]
+        );
+
+        context.runtime_declared_tool_schema_digests.insert(
+            tool_name.to_string(),
+            "sha256:stale-provider-contract".to_string(),
+        );
+        let stale = resolve_tool_visibility_for_binding_with_context(
+            tool_name,
+            std::slice::from_ref(&schema),
+            &workspace,
+            &executor,
+            None,
+            &registry(),
+            context,
+        );
+        assert!(!stale.visible, "stale schema proof must fail closed");
+        assert_eq!(
+            stale.hidden_reason,
+            Some(ToolHiddenReason::RuntimeSurfaceDenied)
+        );
+    }
+
+    #[test]
+    fn unknown_edge_contract_stays_hidden_on_edge_websocket_transport() {
+        let tool_name = "mcp__weather__forecast";
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        let context = ToolAdmissionContext {
+            runtime_declared_tool_names: Some(HashSet::from([tool_name.to_string()])),
+            runtime_declared_tool_schema_digests: HashMap::from([(
+                tool_name.to_string(),
+                astra_runtime_env::canonical_tool_schema_digest(&schema),
+            )]),
+            runtime_declared_tool_native_ids: HashMap::from([(
+                tool_name.to_string(),
+                "weather.forecast".to_string(),
+            )]),
+            ..ToolAdmissionContext::default()
+        };
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            tool_name,
+            std::slice::from_ref(&schema),
+            &WorkspaceBinding::edge_workspace(
+                "Browser workspace",
+                "/home/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-ws",
+                "Browser workspace",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            context,
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::RuntimeSurfaceDenied)
+        );
+        assert_eq!(decision.route, ToolExecutionRouteKind::Unsupported);
+    }
+
+    #[test]
+    fn unknown_mcp_name_without_explicit_runtime_contract_stays_request_scoped_or_hidden() {
+        let tool_name = "mcp__weather__forecast";
+        let schema = json!({
+            "type": "function",
+            "function": {"name": tool_name, "parameters": {"type": "object"}}
+        });
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            tool_name,
+            std::slice::from_ref(&schema),
+            &WorkspaceBinding::edge_workspace(
+                "CLI workspace",
+                "/home/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "cli-edge",
+                "CLI workspace",
+                ToolTransportKind::EdgeLedger,
+                ExecutorStatus::Online,
+            ),
+            None,
+            &registry(),
+            ToolAdmissionContext::default(),
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::UnsupportedRoute)
+        );
     }
 
     #[test]

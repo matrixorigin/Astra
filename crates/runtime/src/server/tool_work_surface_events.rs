@@ -35,10 +35,6 @@ impl WorkSurfaceEventEmitter {
         self.tx = Some(tx);
     }
 
-    pub(crate) fn is_configured(&self) -> bool {
-        self.tx.is_some()
-    }
-
     pub(crate) fn try_emit(
         &self,
         mut event: Map<String, Value>,
@@ -91,30 +87,6 @@ pub(crate) fn binding_snapshot_events(session_id: &str) -> [Map<String, Value>; 
         binding_snapshot_event("workspace_bound", session_id),
         binding_snapshot_event("executor_bound", session_id),
     ]
-}
-
-pub(crate) fn task_board_snapshot_event(
-    session_id: &str,
-    reason: &str,
-    trusted_run_id: Option<&str>,
-    args: &Value,
-    tasks: impl serde::Serialize,
-) -> Map<String, Value> {
-    let mut event = Map::new();
-    event.insert(
-        "type".to_string(),
-        Value::String("task_board_snapshot".to_string()),
-    );
-    event.insert(
-        "session_id".to_string(),
-        Value::String(session_id.to_string()),
-    );
-    if let Some(run_id) = trusted_run_id.or_else(|| run_id(args)) {
-        event.insert("run_id".to_string(), Value::String(run_id.to_string()));
-    }
-    event.insert("reason".to_string(), Value::String(reason.to_string()));
-    event.insert("tasks".to_string(), serde_json::json!(tasks));
-    event
 }
 
 fn binding_snapshot_event(event_type: &str, session_id: &str) -> Map<String, Value> {
@@ -270,9 +242,7 @@ mod tests {
     fn work_surface_event_emitter_try_emit_adds_binding_fields_without_overwrite() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut emitter = WorkSurfaceEventEmitter::new("session-1");
-        assert!(!emitter.is_configured());
         emitter.set_tx(tx);
-        assert!(emitter.is_configured());
 
         let mut event = Map::new();
         event.insert("type".to_string(), Value::String("event".to_string()));
@@ -293,22 +263,5 @@ mod tests {
         assert_eq!(emitted["type"], "event");
         assert_eq!(emitted["transport"], "preexisting");
         assert_eq!(emitted["workspace"]["kind"], "server_sandbox");
-    }
-
-    #[test]
-    fn task_board_snapshot_event_includes_run_reason_and_tasks() {
-        let event = task_board_snapshot_event(
-            "session-1",
-            "task-create",
-            None,
-            &json!({"_run_id": "run-1", "_tool_call_id": "call-1"}),
-            json!([{"id": "todo-1", "title": "Implement"}]),
-        );
-
-        assert_eq!(event["type"], "task_board_snapshot");
-        assert_eq!(event["session_id"], "session-1");
-        assert_eq!(event["run_id"], "run-1");
-        assert_eq!(event["reason"], "task-create");
-        assert_eq!(event["tasks"][0]["id"], "todo-1");
     }
 }

@@ -1,775 +1,505 @@
-#![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
-//! Pure-Rust git implementations using the `gix` crate.
-//!
-//! Replaces shell `git` subprocess calls with in-process operations for:
-//! - status, diff, log, show, blame, file_history
-//!
-//! Benefits: no subprocess overhead, no shell injection risk, no `git` binary dependency.
+//! Internal repository inspection and bounded Git subprocesses.
 
+use crate::execution_outcome::ToolExecutionOutcome;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::time::SystemTime;
 
-use gix::bstr::{BString, ByteSlice};
 use serde_json::Value;
-
-const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input for code review
-const SHOW_LIMIT: usize = 16_000;
 
 /// Maximum time to wait for a git subprocess to complete.
 /// Prevents 67s+ hangs on large merge commits (observed in session 0ac7696c).
 const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run a git command with a timeout, returning None if it times out or fails.
-/// Uses `try_wait` polling with explicit child-kill on timeout to avoid
-/// leaked threads / zombie processes.
-fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    // Drain stdout/stderr on background threads to prevent pipe deadlock:
-    // if the parent doesn't read, the pipe buffer fills and git blocks forever,
-    // causing the 60s timeout to fire even on fast commands with large output.
-    let stdout_handle = {
-        let mut stdout = child.stdout.take()?;
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    };
-    let stderr_handle = {
-        let mut stderr = child.stderr.take()?;
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
-    };
-
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().ok().flatten() {
-            let stdout = stdout_handle.join().unwrap_or_default();
-            let stderr = stderr_handle.join().unwrap_or_default();
-            return Some(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
-        }
-        if start.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            eprintln!(
-                "  ⚠️ git {} timed out after {}s",
-                args.first().unwrap_or(&""),
-                GIT_SUBPROCESS_TIMEOUT.as_secs()
-            );
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+#[derive(Debug)]
+pub enum GitProcessError {
+    RepositoryBinding(String),
+    Execution(astra_sandbox::SyncProcessError),
+    Exit(String),
 }
 
-/// Outcome of a tool execution with optional metadata fields.
-#[derive(Debug, Clone, Default)]
-pub struct ToolExecutionOutcome {
-    pub output: String,
-    pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
-    pub is_error: bool,
-}
-
-impl ToolExecutionOutcome {
-    /// Construct a successful outcome. `is_error` is ALWAYS `false`.
-    ///
-    /// Use this for any non-error output, even strings that happen to start
-    /// with "Error" (e.g. `"Error code 0 (no change)"`, diff hunks quoting
-    /// compiler errors, log lines, etc.). For error outcomes use [`Self::error`].
-    pub fn ok(output: String) -> Self {
-        Self {
-            output,
-            tool_result_fields: None,
-            is_error: false,
-        }
-    }
-
-    pub fn error(output: String) -> Self {
-        Self {
-            output,
-            tool_result_fields: None,
-            is_error: true,
-        }
-    }
-
-    pub fn error_with_evidence(output: String, evidence: astra_core::ToolFailureEvidence) -> Self {
-        let mut fields = serde_json::Map::new();
-        fields.insert(
-            "error_kind".to_string(),
-            serde_json::Value::String(evidence.kind.as_str().to_string()),
-        );
-        fields.insert(
-            "disposition".to_string(),
-            serde_json::Value::String("rejected".to_string()),
-        );
-        if let Ok(value) = serde_json::to_value(evidence) {
-            fields.insert("recovery_evidence".to_string(), value);
-        }
-        Self {
-            output,
-            tool_result_fields: Some(fields),
-            is_error: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitRequestValidationError {
-    pub message: String,
-    pub evidence: astra_core::ToolFailureEvidence,
-}
-
-impl GitRequestValidationError {
-    fn invalid_arguments(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            evidence: astra_core::ToolFailureEvidence::new(
-                astra_core::ErrorKind::ToolInvalidArgs,
-                astra_core::ToolFailureCause::InvalidArguments,
-                false,
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ),
-        }
-    }
-
-    fn missing_path(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            evidence: astra_core::ToolFailureEvidence::new(
-                astra_core::ErrorKind::ToolInvalidArgs,
-                astra_core::ToolFailureCause::ResourceMissing,
-                false,
-                vec![
-                    astra_core::ToolRecoveryAction::SearchBeforeRead,
-                    astra_core::ToolRecoveryAction::CorrectArguments,
-                ],
-            ),
-        }
-    }
-}
-
-/// Simple word tokenizer for search scoring.
-/// Splits on non-alphanumeric boundaries and lowercases.
-fn estimate_tokens(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase();
-    lower
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 2)
-        .map(|w| w.to_string())
-        .collect()
-}
-
-use crate::truncate_output;
-
-fn percent_decode_path_token(input: &str) -> Result<String, String> {
-    fn hex(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let Some(hi) = hex(bytes[i + 1]) else {
-                return Err("Error: invalid percent-encoding in path".to_string());
-            };
-            let Some(lo) = hex(bytes[i + 2]) else {
-                return Err("Error: invalid percent-encoding in path".to_string());
-            };
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| "Error: path is not valid UTF-8".to_string())
-}
-
-/// Reject unsafe file paths: traversal, absolute paths, glob/control chars, percent-encoded `..`,
-/// and (when paths exist) symlink escapes via `canonicalize`.
-fn reject_path_traversal(file: &str, project_root: &Path) -> Result<(), String> {
-    use std::path::Component;
-
-    if file.is_empty() {
-        return Err("Error: path must not be empty".to_string());
-    }
-    if file.contains('\0') {
-        return Err("Error: null bytes not allowed in path".to_string());
-    }
-    if file
-        .chars()
-        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '\t' | '\r'))
-    {
-        return Err("Error: glob or control characters not allowed in file parameter".to_string());
-    }
-    let mut decoded = percent_decode_path_token(file)?;
-    decoded = percent_decode_path_token(&decoded)?;
-    if decoded.contains("..") {
-        return Err("Error: path traversal ('..') not allowed in file parameter".to_string());
-    }
-    #[cfg(windows)]
-    {
-        let lower = decoded.to_ascii_lowercase();
-        if lower.starts_with("\\\\?\\")
-            || lower.starts_with("\\\\")
-            || (decoded.len() >= 2 && lower.as_bytes()[1] == b':')
-        {
-            return Err("Error: absolute Windows paths are not allowed".to_string());
-        }
-    }
-    let rel = Path::new(&decoded);
-    if rel.is_absolute() {
-        return Err("Error: absolute paths are not allowed in file parameter".to_string());
-    }
-    let mut resolved = project_root.to_path_buf();
-    for comp in rel.components() {
-        match comp {
-            Component::Normal(part) => resolved.push(part),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err("Error: path traversal via parent directory is not allowed".to_string());
+impl std::fmt::Display for GitProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RepositoryBinding(reason) => {
+                write!(f, "repository binding failed; no command was run: {reason}")
             }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err("Error: absolute path components are not allowed".to_string());
-            }
+            Self::Execution(error) => write!(f, "{error}"),
+            Self::Exit(error) => write!(f, "{error}"),
         }
     }
-    if let (Ok(root_canon), Ok(path_canon)) = (project_root.canonicalize(), resolved.canonicalize())
-    {
-        if !path_canon.starts_with(&root_canon) {
-            return Err("Error: resolved path escapes project root".to_string());
-        }
-    }
-    Ok(())
 }
 
-/// Reject git ref strings containing shell metacharacters.
-fn reject_shell_meta(ref_str: &str) -> Result<(), String> {
-    if ref_str.chars().any(|c| {
-        matches!(
-            c,
-            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '\n'
-        )
-    }) {
-        Err(format!(
-            "Error: git ref contains disallowed characters: {ref_str}"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn optional_exact_string<'a>(
-    args: &'a Value,
-    field: &str,
-) -> Result<Option<&'a str>, GitRequestValidationError> {
-    let Some(value) = args.get(field) else {
-        return Ok(None);
-    };
-    let Some(value) = value.as_str() else {
-        return Err(GitRequestValidationError::invalid_arguments(format!(
-            "Error: git field `{field}` must be a string"
-        )));
-    };
-    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
-        return Err(GitRequestValidationError::invalid_arguments(format!(
-            "Error: git field `{field}` must be a non-empty exact string"
-        )));
-    }
-    Ok(Some(value))
-}
-
-/// Parse the canonical multi-path filter shape without accepting shell-like
-/// whitespace splitting. A file name containing spaces remains one string;
-/// callers that need more than one filter must use the JSON array explicitly.
-fn optional_exact_string_array<'a>(
-    args: &'a Value,
-    field: &str,
-) -> Result<Option<Vec<&'a str>>, GitRequestValidationError> {
-    let Some(value) = args.get(field) else {
-        return Ok(None);
-    };
-    let Some(values) = value.as_array() else {
-        return Err(GitRequestValidationError::invalid_arguments(format!(
-            "Error: git field `{field}` must be a non-empty array of exact strings"
-        )));
-    };
-    if values.is_empty() {
-        return Err(GitRequestValidationError::invalid_arguments(format!(
-            "Error: git field `{field}` must be a non-empty array of exact strings"
-        )));
-    }
-
-    let mut parsed = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(value) = value.as_str() else {
-            return Err(GitRequestValidationError::invalid_arguments(format!(
-                "Error: git field `{field}` must be a non-empty array of exact strings"
-            )));
+impl GitProcessError {
+    pub fn into_outcome(self, context: &str) -> ToolExecutionOutcome {
+        use astra_core::ErrorKind;
+        let (kind, started, phase) = match &self {
+            Self::RepositoryBinding(_) => (ErrorKind::ToolBinding, false, "repository binding"),
+            Self::Execution(error) => (
+                match error.phase {
+                    "timeout" => ErrorKind::ToolTimeout,
+                    "output limit" => ErrorKind::ResourceLimit,
+                    "repository binding" => ErrorKind::ToolBinding,
+                    _ => ErrorKind::Unknown,
+                },
+                error.started,
+                error.phase,
+            ),
+            Self::Exit(_) => (ErrorKind::Unknown, true, "exit"),
         };
-        if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
-            return Err(GitRequestValidationError::invalid_arguments(format!(
-                "Error: git field `{field}` must be a non-empty array of exact strings"
-            )));
+        let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
+        if started {
+            evidence.retryable = false;
+            evidence.recovery_actions =
+                vec![astra_core::ToolRecoveryAction::InspectStructuredFailure];
         }
-        parsed.push(value);
-    }
-    Ok(Some(parsed))
-}
-
-/// Resolve and validate the one canonical diff filter shape. This is used by
-/// the executor too, because unit and embedded callers can bypass the tool
-/// registry's structural validation.
-fn diff_path_filters<'a>(args: &'a Value, project_root: &Path) -> Result<Vec<&'a str>, String> {
-    let path = optional_exact_string(args, "path").map_err(|error| error.message)?;
-    let paths = optional_exact_string_array(args, "paths").map_err(|error| error.message)?;
-    if path.is_some() && paths.is_some() {
-        return Err(
-            "Error: git(action=diff) accepts either `path` or `paths`, not both".to_string(),
+        let mut result = ToolExecutionOutcome::error_with_evidence(
+            format!("Error: {context}: {self}"),
+            evidence,
         );
+        let fields = result.tool_result_fields.as_mut().expect("failure fields");
+        fields.insert(
+            "disposition".into(),
+            Value::String(if started { "executed" } else { "rejected" }.into()),
+        );
+        fields.insert("process_started".into(), Value::Bool(started));
+        fields.insert("execution_phase".into(), Value::String(phase.into()));
+        result
     }
-    let filters = paths.unwrap_or_else(|| path.into_iter().collect());
-    for filter in &filters {
-        reject_path_traversal(filter, project_root)?;
-        validate_diff_path_exists(project_root, filter)?;
-    }
-    Ok(filters)
-}
-
-fn required_exact_string<'a>(
-    args: &'a Value,
-    field: &str,
-    action: crate::git_tool_contract::GitAction,
-) -> Result<&'a str, GitRequestValidationError> {
-    optional_exact_string(args, field)?.ok_or_else(|| {
-        GitRequestValidationError::invalid_arguments(format!(
-            "Error: git(action={}) requires `{field}`",
-            action.as_str()
-        ))
-    })
-}
-
-/// Structural validation shared by CLI/Edge and Server execution paths.
-///
-/// This validates request shape and repository-relative path safety before a
-/// git implementation emits plain text. Callers receive typed failure evidence
-/// and never need to classify error prose to decide whether an execution ran.
-pub fn validate_git_request(
-    project_root: &Path,
-    args: &Value,
-) -> Result<crate::git_tool_contract::GitAction, GitRequestValidationError> {
-    let action = crate::git_tool_contract::git_action_from_args(args)
-        .map_err(|error| GitRequestValidationError::invalid_arguments(format!("Error: {error}")))?;
-
-    let path = optional_exact_string(args, "path")?;
-    let paths = optional_exact_string_array(args, "paths")?;
-    let file = optional_exact_string(args, "file")?;
-    if path.is_some() && paths.is_some() {
-        return Err(GitRequestValidationError::invalid_arguments(
-            "Error: git(action=diff) accepts either `path` or `paths`, not both",
-        ));
-    }
-    if paths.is_some() && action != crate::git_tool_contract::GitAction::Diff {
-        return Err(GitRequestValidationError::invalid_arguments(
-            "Error: git field `paths` is only valid for git(action=diff)",
-        ));
-    }
-    for candidate in [path, file]
-        .into_iter()
-        .flatten()
-        .chain(paths.iter().flatten().copied())
-    {
-        reject_path_traversal(candidate, project_root)
-            .map_err(GitRequestValidationError::invalid_arguments)?;
-    }
-
-    for field in [
-        "ref",
-        "base_ref",
-        "revision",
-        "commit_sha",
-        "remote",
-        "branch",
-    ] {
-        if let Some(value) = optional_exact_string(args, field)? {
-            reject_shell_meta(value).map_err(GitRequestValidationError::invalid_arguments)?;
-        }
-    }
-
-    match action {
-        crate::git_tool_contract::GitAction::Diff => {
-            if args.get("staged").and_then(Value::as_bool) == Some(true)
-                && args.get("ref").is_some()
-            {
-                return Err(GitRequestValidationError::invalid_arguments(
-                    "Error: git(action=diff) accepts either `staged=true` or `ref`, not both",
-                ));
-            }
-            for path in path.into_iter().chain(paths.into_iter().flatten()) {
-                validate_diff_path_exists(project_root, path)
-                    .map_err(GitRequestValidationError::missing_path)?;
-            }
-        }
-        crate::git_tool_contract::GitAction::Blame => {
-            let path = required_exact_string(args, "path", action)?;
-            if !project_root.join(path).is_file() {
-                return Err(GitRequestValidationError::missing_path(format!(
-                    "Error: git(action=blame) path `{path}` is not a readable file in the repository"
-                )));
-            }
-        }
-        crate::git_tool_contract::GitAction::FileHistory => {
-            required_exact_string(args, "file", action)?;
-        }
-        crate::git_tool_contract::GitAction::Commit => {
-            required_exact_string(args, "message", action)?;
-        }
-        crate::git_tool_contract::GitAction::RevertCommit => {
-            required_exact_string(args, "commit_sha", action)?;
-        }
-        crate::git_tool_contract::GitAction::LogSearch => {
-            required_exact_string(args, "query", action)?;
-        }
-        crate::git_tool_contract::GitAction::Stash
-        | crate::git_tool_contract::GitAction::Worktree => {
-            required_exact_string(args, "sub_action", action)?;
-        }
-        crate::git_tool_contract::GitAction::CheckoutFile => {
-            required_exact_string(args, "path", action)?;
-            required_exact_string(args, "ref", action)?;
-        }
-        crate::git_tool_contract::GitAction::Push => {
-            required_exact_string(args, "remote", action)?;
-            required_exact_string(args, "branch", action)?;
-        }
-        crate::git_tool_contract::GitAction::Status
-        | crate::git_tool_contract::GitAction::Log
-        | crate::git_tool_contract::GitAction::Show
-        | crate::git_tool_contract::GitAction::Contributors => {}
-    }
-    Ok(action)
-}
-
-fn reject_stash_selector(selector: &str) -> Result<(), String> {
-    let trimmed = selector.trim();
-    if trimmed.is_empty() {
-        return Err("Error: stash_ref must not be empty".to_string());
-    }
-    if trimmed.chars().any(|c| {
-        matches!(
-            c,
-            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '\n'
-        )
-    }) {
-        Err(format!(
-            "Error: stash selector contains disallowed characters: {selector}"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_commit_ref(commit_ref: &str, param_name: &str) -> Result<String, String> {
-    let trimmed = commit_ref.trim();
-    if trimmed.is_empty() {
-        return Err(format!("Error: {param_name} must not be empty"));
-    }
-    if trimmed.starts_with('-') {
-        return Err(format!("Error: {param_name} must not start with '-'"));
-    }
-    reject_shell_meta(trimmed)?;
-    Ok(trimmed.to_string())
-}
-
-fn validate_push_target(value: Option<&str>, param_name: &str) -> Result<String, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Err(format!("Error: missing required parameter '{param_name}'"));
-    };
-    if value.starts_with('-') {
-        return Err(format!("Error: {param_name} must not start with '-'"));
-    }
-    if value.contains('\0') || value.chars().any(char::is_control) {
-        return Err(format!("Error: {param_name} contains control characters"));
-    }
-    if value.chars().any(char::is_whitespace) {
-        return Err(format!("Error: {param_name} must not contain whitespace"));
-    }
-    reject_shell_meta(value)?;
-    Ok(value.to_string())
-}
-
-fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--verify", commit_ref])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-pub fn short_commit_sha(commit_sha: &str) -> String {
-    commit_sha[..7.min(commit_sha.len())].to_string()
-}
-
-pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
-    if count == 0 {
-        return Some(Vec::new());
-    }
-    std::process::Command::new("git")
-        .args([
-            "rev-list",
-            "--first-parent",
-            "--max-count",
-            &count.to_string(),
-            "HEAD",
-        ])
-        .current_dir(project_root)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-}
-
-pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(project_root)
-        .output()
-        .map_err(|error| format!("Error: git status failed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Error: git status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
-fn abort_git_revert(project_root: &Path) -> Result<bool, String> {
-    let output = std::process::Command::new("git")
-        .args(["revert", "--abort"])
-        .current_dir(project_root)
-        .output()
-        .map_err(|error| format!("Error: git revert --abort failed: {error}"))?;
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no cherry-pick or revert in progress") {
-            Ok(false)
-        } else {
-            Err(format!(
-                "Error: git revert --abort failed: {}",
-                stderr.trim()
-            ))
-        }
-    }
-}
-
-fn apply_stash_selector(args: &Value) -> Result<String, String> {
-    if let Some(selector) = args.get("stash_ref").and_then(Value::as_str) {
-        reject_stash_selector(selector)?;
-        return Ok(selector.trim().to_string());
-    }
-    Ok(stash_index_selector(args))
-}
-
-fn stash_index_selector(args: &Value) -> String {
-    let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
-    format!("stash@{{{idx}}}")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitStashRollbackEntry {
-    sequence: u64,
-    pub stash_ref: String,
-    pub turn_index: u32,
-    pub timestamp: SystemTime,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct GitStashRollbackJournal {
-    entries: Vec<GitStashRollbackEntry>,
-    next_sequence: u64,
-}
-
-impl GitStashRollbackJournal {
-    pub fn record(
-        &mut self,
-        stash_ref: impl Into<String>,
-        turn_index: u32,
-        message: Option<String>,
-    ) {
-        self.entries.push(GitStashRollbackEntry {
-            sequence: self.next_sequence,
-            stash_ref: stash_ref.into(),
-            turn_index,
-            timestamp: SystemTime::now(),
-            message,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    pub fn list(&self) -> Vec<GitStashRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    pub fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<GitStashRollbackEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-            .cloned()
-            .into_iter()
-            .collect()
-    }
-
-    pub fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
-    pub fn remove_stash(&mut self, stash_ref: &str) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.stash_ref == stash_ref)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitCommitRollbackEntry {
-    sequence: u64,
-    pub commit_sha: String,
-    pub turn_index: u32,
-    pub timestamp: SystemTime,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct GitCommitRollbackJournal {
-    entries: Vec<GitCommitRollbackEntry>,
-    next_sequence: u64,
-}
-
-impl GitCommitRollbackJournal {
-    pub fn record(
-        &mut self,
-        commit_sha: impl Into<String>,
-        turn_index: u32,
-        message: Option<String>,
-    ) {
-        self.entries.push(GitCommitRollbackEntry {
-            sequence: self.next_sequence,
-            commit_sha: commit_sha.into(),
-            turn_index,
-            timestamp: SystemTime::now(),
-            message,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    pub fn list(&self) -> Vec<GitCommitRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    pub fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<GitCommitRollbackEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-            .cloned()
-            .collect()
-    }
-
-    pub fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
-    pub fn remove_commit(&mut self, commit_sha: &str) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.commit_sha == commit_sha)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn tool_output_limit() -> usize {
-    super::tool_output_limit()
-}
-
-/// Scale a base output limit by budget pressure.
-/// pressure=0.0 → 100% of base, pressure=0.6 → 70%, pressure=0.9 → 46%.
-/// Never goes below 40% of base — aggressive truncation on git diffs
-/// forces bash fallbacks which waste a tool round.
-fn pressure_scaled_limit(base: usize, pressure: f64) -> usize {
-    let scale = (1.0 - pressure * 0.6).max(0.4);
-    (base as f64 * scale) as usize
 }
 
 fn open_repo(project_root: &Path) -> Result<gix::Repository, String> {
-    gix::discover(project_root).map_err(|e| format!("Error: cannot open git repo: {e}"))
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("Error: cannot resolve bound git repo: {error}"))?;
+    let repo = gix::open(&canonical_root)
+        .map_err(|e| format!("Error: cannot open bound git repo: {e}"))?;
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| "Error: bound git repository has no working tree".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("Error: cannot resolve bound git working tree: {error}"))?;
+    if work_dir != canonical_root {
+        return Err(format!(
+            "Error: bound git working tree escapes the selected project root ({})",
+            work_dir.display()
+        ));
+    }
+    Ok(repo)
+}
+
+/// Git command bound to identities acquired and revalidated before launch.
+///
+/// This is a startup check, not an immutable filesystem view: Git opens real
+/// metadata paths after exec. Concurrent replacement in that window is governed
+/// by the selected provider's isolation. A detected post-start change is an
+/// error with possible effects, never evidence of a successful mutation.
+pub struct BoundGitCommand {
+    #[cfg(not(unix))]
+    root: std::path::PathBuf,
+    git_path: std::path::PathBuf,
+    args: Vec<String>,
+    observation: Option<crate::workspace_observation::WorkspaceAttributionState>,
+    #[cfg(unix)]
+    binding: std::sync::Arc<GitBinding>,
+}
+
+pub struct BoundTokioGitCommand {
+    command: tokio::process::Command,
+    #[cfg(unix)]
+    _binding: std::sync::Arc<GitBinding>,
+}
+
+#[cfg(unix)]
+struct GitIdentity {
+    path: std::ffi::CString,
+    file: std::fs::File,
+    stat: libc::stat,
+}
+#[cfg(unix)]
+struct GitBinding {
+    identities: Vec<GitIdentity>,
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let root = std::fs::File::open("/")?;
+    astra_sandbox::open_directory_beneath(
+        &root,
+        path.strip_prefix("/").map_err(std::io::Error::other)?,
+    )
+}
+
+#[cfg(unix)]
+fn open_git_entry(
+    worktree: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            worktree.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(std::io::Error::other(
+            ".git must be a regular file or directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn parse_linked_git_dir(
+    dot_git: &std::fs::File,
+    worktree_path: &Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStringExt;
+    let mut bytes = Vec::new();
+    dot_git
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read .git: {e}"))?;
+    if bytes.len() > 65536 {
+        return Err("bound .git file exceeds 64 KiB".into());
+    }
+    let path = bytes
+        .strip_prefix(b"gitdir: ")
+        .ok_or("bound .git file has no gitdir directive")?;
+    let path = path.strip_suffix(b"\n").unwrap_or(path);
+    let path = path.strip_suffix(b"\r").unwrap_or(path);
+    if path.is_empty() || path.iter().any(|c| matches!(c, 0 | b'\n' | b'\r')) {
+        return Err("invalid gitdir path".into());
+    }
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
+    // Canonicalization is a label-resolution step; acquisition below walks all
+    // resulting directory components without following symbolic links.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        worktree_path.join(path)
+    };
+    path.canonicalize()
+        .map_err(|e| format!("cannot resolve linked git metadata: {e}"))
+}
+
+#[cfg(unix)]
+impl GitIdentity {
+    fn new(path: &Path, file: std::fs::File) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            path,
+            file,
+            stat: unsafe { stat.assume_init() },
+        })
+    }
+    // Async-signal-safe: no allocation, locks or Rust filesystem wrappers.
+    fn unchanged(&self) -> bool {
+        let mut current = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::lstat(self.path.as_ptr(), current.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let current = unsafe { current.assume_init() };
+        current.st_dev == self.stat.st_dev
+            && current.st_ino == self.stat.st_ino
+            && current.st_mode == self.stat.st_mode
+            && (current.st_mode & libc::S_IFMT != libc::S_IFREG
+                || (current.st_size == self.stat.st_size
+                    && current.st_mtime == self.stat.st_mtime
+                    && current.st_mtime_nsec == self.stat.st_mtime_nsec))
+    }
+}
+#[cfg(unix)]
+impl GitBinding {
+    fn unchanged(&self) -> bool {
+        self.identities.iter().all(GitIdentity::unchanged)
+    }
+}
+
+fn clear_git_location(command: &mut std::process::Command) {
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_CEILING_DIRECTORIES",
+    ] {
+        command.env_remove(variable);
+    }
+    command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0");
+}
+
+impl BoundGitCommand {
+    pub fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        // All existing tool argument contracts are UTF-8. Preserve invalid OS
+        // paths as a rejected command, never silently execute a lossy spelling.
+        self.args
+            .push(arg.as_ref().to_str().unwrap_or("\0").to_owned());
+        self
+    }
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        for arg in args {
+            self.arg(arg);
+        }
+        self
+    }
+    fn configure(
+        &self,
+        command: &mut std::process::Command,
+        force_worktree: bool,
+    ) -> std::io::Result<()> {
+        clear_git_location(command);
+        command.env("GIT_DIR", &self.git_path);
+        if force_worktree {
+            command.env("GIT_WORK_TREE", ".");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let binding = self.binding.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    if !binding.unchanged() {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    if libc::fchdir(binding.identities[0].file.as_raw_fd()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        command.current_dir(&self.root);
+        Ok(())
+    }
+    pub fn output(&mut self) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
+        let result = astra_sandbox::run_sync_process(
+            "git",
+            &self.args,
+            GIT_SUBPROCESS_TIMEOUT,
+            16 * 1024 * 1024,
+            |cmd| self.configure(cmd, true),
+        );
+        let (started, ownership) = match &result {
+            Ok(out) => (true, out.ownership),
+            Err(err) => (err.started, err.ownership),
+        };
+        if started && let Some(observation) = &self.observation {
+            #[cfg(unix)]
+            if ownership.is_none() {
+                observation.mark_unsettled();
+            }
+            if !ownership.is_some_and(|owner| owner.is_authoritative()) {
+                observation.quarantine();
+            }
+        }
+        #[cfg(unix)]
+        if started && !self.binding.unchanged() {
+            if let Some(observation) = &self.observation {
+                observation.quarantine();
+            }
+            return Err(astra_sandbox::SyncProcessError { phase: "repository binding", detail: "repository identity changed during execution; effects may have occurred; no mutation receipt is valid".into(), started: true, ownership });
+        }
+        result.map(|out| out.output)
+    }
+    pub fn status(&mut self) -> Result<std::process::ExitStatus, astra_sandbox::SyncProcessError> {
+        self.output().map(|out| out.status)
+    }
+    /// Retains startup binding checks only. The optional ignore-query caller
+    /// owns concurrent IO, timeout and cancellation; this adapter does not
+    /// inherit synchronous invocation ownership or post-execution validation.
+    pub fn into_tokio(self) -> BoundTokioGitCommand {
+        let mut command = std::process::Command::new("git");
+        command.args(&self.args);
+        // Configuration only installs inherited settings and pre-exec checks.
+        self.configure(&mut command, true)
+            .expect("Git command configuration is infallible");
+        BoundTokioGitCommand {
+            command: command.into(),
+            #[cfg(unix)]
+            _binding: self.binding,
+        }
+    }
+}
+impl Deref for BoundTokioGitCommand {
+    type Target = tokio::process::Command;
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+impl DerefMut for BoundTokioGitCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+#[cfg(unix)]
+fn prepare_bound_git_command_with_pin_hook(
+    project_root: &Path,
+    after_pin_before_validation: impl FnOnce(),
+) -> Result<BoundGitCommand, String> {
+    let root = project_root
+        .canonicalize()
+        .map_err(|e| format!("Error: cannot resolve bound git repo: {e}"))?;
+    let worktree = open_directory_no_follow(&root)
+        .map_err(|e| format!("Error: cannot acquire bound git working tree: {e}"))?;
+    let dot_git = open_git_entry(&worktree, c".git")
+        .map_err(|e| format!("Error: bound project root has no exact .git authority: {e}"))?;
+    let git_path = if dot_git.metadata().map_err(|e| e.to_string())?.is_dir() {
+        root.join(".git")
+    } else {
+        parse_linked_git_dir(&dot_git, &root)?
+    };
+    let git_dir = open_directory_no_follow(&git_path)
+        .map_err(|e| format!("Error: cannot acquire git metadata: {e}"))?;
+    let mut identities = vec![
+        GitIdentity::new(&root, worktree),
+        GitIdentity::new(&root.join(".git"), dot_git),
+        GitIdentity::new(&git_path, git_dir),
+    ]
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("Error: cannot record git identities: {e}"))?;
+    // Linked repositories also rely on a shared metadata directory. Acquire
+    // its canonical identity before validating Git's original configuration.
+    match open_git_entry(&identities[2].file, c"commondir") {
+        Ok(file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            (&file)
+                .take(65537)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("Error: cannot read common git directory: {e}"))?;
+            if bytes.len() > 65536 {
+                return Err("Error: common git directory file exceeds 64 KiB".into());
+            }
+            let common = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+            let common = git_path
+                .join(common.trim())
+                .canonicalize()
+                .map_err(|e| format!("Error: cannot resolve common git directory: {e}"))?;
+            identities.push(
+                GitIdentity::new(&git_path.join("commondir"), file).map_err(|e| e.to_string())?,
+            );
+            identities.push(
+                GitIdentity::new(
+                    &common,
+                    open_directory_no_follow(&common).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Error: cannot acquire common git directory: {error}"
+            ));
+        }
+    }
+    let observation = crate::workspace_observation::WorkspaceAttributionState::capture(&root);
+    let command = BoundGitCommand {
+        #[cfg(not(unix))]
+        root,
+        git_path,
+        args: Vec::new(),
+        observation,
+        binding: std::sync::Arc::new(GitBinding { identities }),
+    };
+    after_pin_before_validation();
+    if !command.binding.unchanged() {
+        return Err("Error: repository binding changed before launch; no command was run".into());
+    }
+    // Preserve core.worktree/bare validation before forcing GIT_WORK_TREE.
+    let args = [
+        "rev-parse",
+        "--is-inside-work-tree",
+        "--is-bare-repository",
+        "--show-toplevel",
+    ]
+    .map(str::to_owned);
+    let output =
+        astra_sandbox::run_sync_process("git", &args, GIT_SUBPROCESS_TIMEOUT, 65536, |cmd| {
+            command.configure(cmd, false)
+        })
+        .map_err(|e| format!("Error: cannot validate bound git repository: {e}"))?
+        .output;
+    if !output.status.success() {
+        return Err(format!(
+            "Error: bound git repository validation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(top) = text
+        .strip_prefix("true\nfalse\n")
+        .and_then(|s| s.strip_suffix('\n'))
+    else {
+        return Err("Error: bound git metadata does not describe a working-tree repository".into());
+    };
+    let reported = open_directory_no_follow(Path::new(top))
+        .map_err(|e| format!("Error: cannot acquire repository-reported working tree: {e}"))?;
+    use std::os::unix::fs::MetadataExt;
+    let expected = command.binding.identities[0]
+        .file
+        .metadata()
+        .map_err(|e| e.to_string())?;
+    let reported = reported.metadata().map_err(|e| e.to_string())?;
+    if reported.dev() != expected.dev()
+        || reported.ino() != expected.ino()
+        || !command.binding.unchanged()
+    {
+        return Err(
+            "Error: bound git working tree escapes or changed from selected project root".into(),
+        );
+    }
+    Ok(command)
+}
+
+pub fn prepare_bound_git_command(project_root: &Path) -> Result<BoundGitCommand, String> {
+    #[cfg(unix)]
+    {
+        prepare_bound_git_command_with_pin_hook(project_root, || {})
+    }
+    #[cfg(not(unix))]
+    {
+        let root = project_root
+            .canonicalize()
+            .map_err(|e| format!("Error: cannot resolve bound git repo: {e}"))?;
+        let repo = open_repo(&root)?;
+        let git_path = repo
+            .path()
+            .canonicalize()
+            .map_err(|e| format!("Error: cannot resolve bound git metadata: {e}"))?;
+        Ok(BoundGitCommand {
+            observation: crate::workspace_observation::WorkspaceAttributionState::capture(&root),
+            #[cfg(not(unix))]
+            root,
+            git_path,
+            args: Vec::new(),
+        })
+    }
 }
 
 /// Return the current branch name (like `git branch --show-current`).
@@ -796,2256 +526,39 @@ pub fn head_short(project_root: &Path) -> String {
     }
 }
 
-/// Format author time as YYYY-MM-DD from a SignatureRef.
-fn format_author_date(sig: &gix::actor::SignatureRef<'_>) -> String {
-    sig.time()
-        .ok()
-        .and_then(|t| t.format(gix::date::time::format::SHORT).ok())
-        .unwrap_or_else(|| "?".to_string())
-}
-
-// ─── status ─────────────────────────────────────────────────────────────
-
-pub fn status(project_root: &Path, args: &Value) -> String {
-    // staged=true shows staged diff (index vs HEAD) instead of porcelain status
-    if let Some(true) = args.get("staged").and_then(Value::as_bool) {
-        let stat_only = args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if stat_only {
-            return diff_stat_cli(project_root, args, SHOW_LIMIT);
-        }
-        return diff(project_root, args, 0.0, 0);
-    }
-
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let mut out = String::new();
-
-    // Branch info
-    if let Ok(head_ref) = repo.head_ref() {
-        if let Some(r) = head_ref {
-            let name = r.name().shorten().to_string();
-            out.push_str(&format!("## {name}\n"));
-        } else if let Ok(head) = repo.head_id() {
-            out.push_str(&format!(
-                "## HEAD detached at {}\n",
-                head.to_hex_with_len(8)
-            ));
-        }
-    }
-
-    // Status entries
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(e) => return format!("{out}Error getting status: {e}"),
-    };
-
-    let iter = match platform.into_index_worktree_iter(Vec::<BString>::new()) {
-        Ok(i) => i,
-        Err(e) => return format!("{out}Error iterating status: {e}"),
-    };
-
-    use gix::status::index_worktree::iter::Summary;
-    let mut count = 0;
-    for entry in iter {
-        match entry {
-            Ok(item) => {
-                let path = item.rela_path().to_string();
-                let status_char = match item.summary() {
-                    Some(Summary::Removed) => "D ",
-                    Some(Summary::Added) => "? ",
-                    Some(Summary::Modified) => "M ",
-                    Some(Summary::TypeChange) => "T ",
-                    Some(Summary::Renamed) => "R ",
-                    Some(Summary::Copied) => "C ",
-                    Some(Summary::IntentToAdd) => "A ",
-                    Some(Summary::Conflict) => "U ",
-                    None => "? ",
-                };
-                out.push_str(&format!("{status_char}{path}\n"));
-                count += 1;
-                if count >= 200 {
-                    out.push_str("[truncated — 200+ changes]\n");
-                    break;
-                }
-            }
-            Err(e) => {
-                out.push_str(&format!("Error: {e}\n"));
-                break;
-            }
-        }
-    }
-
-    if out.trim().is_empty() {
-        "nothing to commit, working tree clean".to_string()
-    } else {
-        truncate_output(out, tool_output_limit())
-    }
-}
-
-// ─── log ────────────────────────────────────────────────────────────────
-
-pub fn log(project_root: &Path, args: &Value) -> String {
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let n = args.get("n").and_then(Value::as_u64).unwrap_or(10).min(500) as usize;
-
-    let head = match repo.head_id() {
-        Ok(h) => h,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let walk = match head
-        .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-        ))
-        .all()
-    {
-        Ok(w) => w,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let mut out = String::new();
-    let mut count = 0;
-    for info in walk {
-        if count >= n {
-            break;
-        }
-        match info {
-            Ok(info) => {
-                let id = info.id.to_string();
-                let short = &id[..7.min(id.len())];
-                match info.object() {
-                    Ok(commit) => {
-                        let raw = commit.message_raw_sloppy();
-                        let summary = raw
-                            .lines()
-                            .next()
-                            .map(|l| String::from_utf8_lossy(l).into_owned())
-                            .unwrap_or_default();
-                        out.push_str(&format!("{short} {summary}\n"));
-                    }
-                    Err(_) => out.push_str(&format!("{short} <object error>\n")),
-                }
-                count += 1;
-            }
-            Err(e) => {
-                out.push_str(&format!("Error walking commits: {e}\n"));
-                break;
-            }
-        }
-    }
-
-    if out.is_empty() {
-        "No commits found".to_string()
-    } else {
-        truncate_output(out, tool_output_limit())
-    }
-}
-
-// ─── show ───────────────────────────────────────────────────────────────
-
-/// Show a single commit.
-///
-/// Accepts `revision`. When it is not
-/// provided, defaults to `HEAD` — this is intentional UX for interactive
-/// callers ("show me the last commit"). Callers that require the caller
-/// to always pass an explicit ref must validate the args themselves
-/// *before* reaching this function; show treats missing revision as a
-/// successful request for `HEAD`, not as an error.
-///
-/// Range syntax (`A..B`) is rejected with a helpful error suggesting
-/// `git(action=diff)` instead.
-pub fn show(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
-    let mut limit = pressure_scaled_limit(SHOW_LIMIT, pressure);
-    // Further reduce limit when aggregate output is already high
-    if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
-        let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(aggregate_bytes);
-        limit = limit.min(remaining).max(2048);
-    }
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let commit_ref = args
-        .get("revision")
-        .and_then(Value::as_str)
-        .unwrap_or("HEAD");
-
-    // Reject range syntax — show is for a single commit, suggest git diff
-    if commit_ref.contains("..") {
-        return "Error: git show expects a single commit reference, not a range. Use git diff for 'A..B' ranges.".to_string();
-    }
-
-    // Allow valid git ref characters including reflog (@{}) and tree-object (:)
-    if commit_ref.contains(|c: char| {
-        !c.is_alphanumeric()
-            && c != '-'
-            && c != '_'
-            && c != '.'
-            && c != '/'
-            && c != '~'
-            && c != '^'
-            && c != '@'
-            && c != ':'
-            && c != '{'
-            && c != '}'
-    }) {
-        return "Error: invalid commit reference".to_string();
-    }
-
-    let stat_only = args
-        .get("stat_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let file_filter = args.get("file").and_then(Value::as_str);
-
-    // Resolve reference to commit
-    let id = match repo.rev_parse_single(commit_ref) {
-        Ok(id) => id,
-        Err(e) => return format!("Error: cannot resolve '{commit_ref}': {e}"),
-    };
-
-    let commit = match id.object() {
-        Ok(o) => match o.try_into_commit() {
-            Ok(c) => c,
-            Err(_) => return format!("Error: '{commit_ref}' is not a commit"),
-        },
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let mut out = String::new();
-
-    // Header
-    out.push_str(&format!("commit {}\n", commit.id));
-    if let Ok(author) = commit.author() {
-        let name = String::from_utf8_lossy(author.name).into_owned();
-        let email = String::from_utf8_lossy(author.email).into_owned();
-        let date = format_author_date(&author);
-        out.push_str(&format!("Author: {name} <{email}>\nDate:   {date}\n"));
-    }
-
-    let message = String::from_utf8_lossy(commit.message_raw_sloppy()).into_owned();
-    out.push_str(&format!("\n    {}\n", message.trim()));
-
-    // Merge commits: gix first-parent diff produces useless tree-level output,
-    // and `git show --first-parent` can legitimately return only the commit
-    // header when the merge tree matches the first parent. Ask git for the
-    // per-parent tree diff instead so merge commits still show meaningful
-    // stats/patches.
-    let is_merge = commit.parent_ids().count() > 1;
-    if is_merge {
-        let mut cli_args = vec![
-            "diff-tree",
-            "-m",
-            "-r",
-            "--no-commit-id",
-            "--no-ext-diff",
-            "--no-color",
-        ];
-        if stat_only {
-            cli_args.push("--stat");
-        } else {
-            cli_args.push("-p");
-        }
-        cli_args.push(commit_ref);
-        if let Some(f) = file_filter {
-            cli_args.push("--");
-            cli_args.push(f);
-        }
-        // Use timeout to prevent 67s+ hangs on large merge commits
-        let cli_out = run_git_with_timeout(project_root, &cli_args);
-        if let Some(output) = cli_out {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !stdout.is_empty() {
-                    out.push('\n');
-                    out.push_str(&stdout);
-                    out.push('\n');
-                    return truncate_show_at(out, limit);
-                }
-                // Empty output with file filter means the file wasn't changed.
-                // Fall through to gix to at least show the commit header.
-            }
-        }
-        // CLI failed, timed out, or empty — fall through to gix (best effort)
-    }
-
-    // Diff: use tree changes API
-    let new_tree = match commit.tree() {
-        Ok(t) => t,
-        Err(_) => return out,
-    };
-
-    let parent_tree = commit
-        .parent_ids()
-        .next()
-        .and_then(|pid| pid.object().ok())
-        .and_then(|o| o.try_into_commit().ok())
-        .and_then(|pc| pc.tree().ok());
-
-    let old_tree = match parent_tree {
-        Some(t) => t,
-        None => {
-            // Root commit — show added files recursively
-            out.push_str("\n[root commit]\n");
-            fn list_tree_entries(tree: &gix::Tree<'_>, prefix: &str, out: &mut String) {
-                for e in tree.iter().flatten() {
-                    let name = e.filename().to_string();
-                    let full = if prefix.is_empty() {
-                        name
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    if e.mode().is_tree() {
-                        if let Ok(obj) = e.object()
-                            && let Ok(sub) = obj.try_into_tree()
-                        {
-                            list_tree_entries(&sub, &full, out);
-                        }
-                    } else {
-                        out.push_str(&format!("A {full}\n"));
-                    }
-                }
-            }
-            list_tree_entries(&new_tree, "", &mut out);
-            return truncate_show_at(out, limit);
-        }
-    };
-
-    if stat_only {
-        // stat_only: compute stats in a single pass
-        let mut changes_platform = match old_tree.changes() {
-            Ok(p) => p,
-            Err(e) => {
-                out.push_str(&format!("\n[diff error: {e}]\n"));
-                return truncate_show_at(out, limit);
-            }
-        };
-
-        if let Ok(stats) = changes_platform.stats(&new_tree) {
-            out.push_str(&format!(
-                "\n {} files changed, {} insertions(+), {} deletions(-)\n",
-                stats.files_changed, stats.lines_added, stats.lines_removed
-            ));
-        }
-
-        // Also list file names
-        let mut changes_platform2 = match old_tree.changes() {
-            Ok(p) => p,
-            Err(_) => return truncate_show_at(out, limit),
-        };
-        let _ = changes_platform2.for_each_to_obtain_tree(&new_tree, |change| {
-            use gix::object::tree::diff::Change;
-            let (location, ct) = match &change {
-                Change::Addition { location, .. } => (location.to_string(), "A"),
-                Change::Deletion { location, .. } => (location.to_string(), "D"),
-                Change::Modification { location, .. } => (location.to_string(), "M"),
-                Change::Rewrite { location, .. } => (location.to_string(), "R"),
-            };
-            if file_filter.is_none() || location.contains(file_filter.unwrap_or("")) {
-                out.push_str(&format!(" {ct} {location}\n"));
-            }
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
-        });
-    } else {
-        // Full diff with line content
-        let mut cache = match repo.diff_resource_cache_for_tree_diff() {
-            Ok(c) => c,
-            Err(e) => {
-                out.push_str(&format!("\n[diff cache error: {e}]\n"));
-                return truncate_show_at(out, limit);
-            }
-        };
-
-        let mut changes_platform = match old_tree.changes() {
-            Ok(p) => p,
-            Err(e) => {
-                out.push_str(&format!("\n[diff error: {e}]\n"));
-                return truncate_show_at(out, limit);
-            }
-        };
-
-        let _ = changes_platform.for_each_to_obtain_tree(&new_tree, |change| {
-            use gix::object::tree::diff::Change;
-            let location = match &change {
-                Change::Addition { location, .. }
-                | Change::Deletion { location, .. }
-                | Change::Modification { location, .. }
-                | Change::Rewrite { location, .. } => location.to_string(),
-            };
-
-            if let Some(filter) = file_filter
-                && !location.contains(filter)
-            {
-                return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()));
-            }
-
-            out.push_str(&format!("--- a/{location}\n+++ b/{location}\n"));
-
-            if let Ok(mut platform) = change.diff(&mut cache) {
-                let _ = platform.lines(|hunk| {
-                    use gix::object::blob::diff::lines::Change as HC;
-                    match hunk {
-                        HC::Addition { lines } => {
-                            for l in lines {
-                                out.push_str(&format!("+{}\n", l));
-                            }
-                        }
-                        HC::Deletion { lines } => {
-                            for l in lines {
-                                out.push_str(&format!("-{}\n", l));
-                            }
-                        }
-                        HC::Modification {
-                            lines_before,
-                            lines_after,
-                        } => {
-                            for l in lines_before {
-                                out.push_str(&format!("-{}\n", l));
-                            }
-                            for l in lines_after {
-                                out.push_str(&format!("+{}\n", l));
-                            }
-                        }
-                    }
-                    Ok::<_, std::convert::Infallible>(())
-                });
-            }
-
-            out.push('\n');
-
-            if out.len() > limit {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        });
-    }
-
-    let mut result = truncate_show_at(out, limit);
-
-    // When viewing many per-file diffs from the same commit, nudge the model
-    // to wrap up early rather than exhausting the aggregate budget.
-    if file_filter.is_some() && aggregate_bytes > super::AGGREGATE_HINT_THRESHOLD {
-        result.push_str(
-            "\n[hint: aggregate output is high — finish reviewing with the files \
-             already read, or use stat_only:true to prioritize remaining files]",
-        );
-    }
-
-    result
-}
-
-fn truncate_show_at(out: String, limit: usize) -> String {
-    if out.len() > limit {
-        let end = out.floor_char_boundary(limit);
-        let mut t = out[..end].to_string();
-        t.push_str("\n[truncated — use stat_only:true or file param to narrow]");
-        t
-    } else {
-        out
-    }
-}
-
-// ─── blame ──────────────────────────────────────────────────────────────
-
-pub fn blame(project_root: &Path, args: &Value) -> String {
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let file = match args.get("file").and_then(Value::as_str) {
-        Some(f) => f,
-        None => return "Error: missing 'file' parameter".to_string(),
-    };
-    if let Err(e) = reject_path_traversal(file, project_root) {
-        return e;
-    }
-
-    let line_start = args.get("line_start").and_then(Value::as_u64);
-    let line_end = args.get("line_end").and_then(Value::as_u64);
-
-    let head = match repo.head_id() {
-        Ok(h) => h,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    // Build blame options with optional line range
-    let mut options = gix::repository::blame_file::Options::default();
-    if let Some(start) = line_start {
-        let end = line_end.unwrap_or(start);
-        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![
-            (start as u32)..=(end as u32),
-        ]) {
-            Ok(ranges) => options.ranges = ranges,
-            Err(e) => return format!("Error: invalid line range: {e}"),
-        }
-    }
-
-    let file_bstr: &gix::bstr::BStr = file.as_bytes().as_ref();
-    let outcome = match repo.blame_file(file_bstr, head.detach(), options) {
-        Ok(o) => o,
-        Err(e) => return format!("Error: blame failed for '{file}': {e}"),
-    };
-
-    // Format using entries_with_lines for correct line content
-    let mut out = String::new();
-    let mut unique_authors = std::collections::HashSet::new();
-    let mut unique_commits = std::collections::HashSet::new();
-    let mut total_lines = 0u32;
-
-    for (entry, lines) in outcome.entries_with_lines() {
-        let commit_id_str = entry.commit_id.to_string();
-        let short_commit = &commit_id_str[..8.min(commit_id_str.len())];
-
-        // Look up author/date from commit
-        let (author_name, date_str): (String, String) = repo
-            .find_object(entry.commit_id)
-            .ok()
-            .and_then(|obj| obj.try_into_commit().ok())
-            .and_then(|c: gix::Commit<'_>| {
-                c.author().ok().map(|a| {
-                    let name = String::from_utf8_lossy(a.name).into_owned();
-                    let date = format_author_date(&a);
-                    (name, date)
-                })
-            })
-            .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
-
-        let start_line = entry.start_in_blamed_file as u64 + 1;
-
-        for (offset, line_content) in lines.iter().enumerate() {
-            let line_no = start_line + offset as u64;
-
-            // Apply line range filter (in case blame ranges weren't exact)
-            if let Some(s) = line_start
-                && line_no < s
-            {
-                continue;
-            }
-            if let Some(e) = line_end
-                && line_no > e
-            {
-                continue;
-            }
-
-            let content = String::from_utf8_lossy(line_content);
-            let content = content.trim_end();
-            out.push_str(&format!(
-                "L{line_no} {short_commit} {date_str} [{author_name}] {content}\n"
-            ));
-
-            unique_authors.insert(author_name.clone());
-            unique_commits.insert(short_commit.to_string());
-            total_lines += 1;
-        }
-    }
-
-    if total_lines == 0 {
-        return format!("No blame data for '{file}'");
-    }
-
-    out.push_str(&format!(
-        "\n--- {} lines, {} authors, {} commits ---",
-        total_lines,
-        unique_authors.len(),
-        unique_commits.len(),
-    ));
-
-    truncate_output(out, tool_output_limit())
-}
-
-// ─── diff ───────────────────────────────────────────────────────────────
-
-/// Check that `path_filter` refers to something git actually tracks or could track.
-/// Returns an explicit error (not empty output) when the path is unknown so callers
-/// can distinguish "path doesn't exist" from "path exists but has no changes".
-fn validate_diff_path_exists(project_root: &Path, path_filter: &str) -> Result<(), String> {
-    let rel = Path::new(path_filter);
-    let joined = project_root.join(rel);
-    if joined.exists() {
-        return Ok(());
-    }
-    // Path may have been deleted but still tracked — ask git's index.
-    if let Some(out) = run_git_with_timeout(
-        project_root,
-        &["ls-files", "--error-unmatch", "--", path_filter],
-    ) && out.status.success()
-    {
-        return Ok(());
-    }
-    Err(format!(
-        "Error: path '{path_filter}' does not exist in the working tree or the git index. \
-         Check the spelling (paths are relative to the repo root) or drop the `path` filter."
-    ))
-}
-
-/// Normalize the two supported range shapes at the tool boundary:
-/// `base_ref` + optional single `ref`, or one complete range supplied in
-/// `base_ref` by older callers. A complete range must never have `..HEAD`
-/// appended a second time.
-fn normalized_diff_range(base_ref: &str, tip_ref: Option<&str>) -> Result<String, String> {
-    reject_shell_meta(base_ref)?;
-    if base_ref.contains("..") {
-        if tip_ref.is_some() {
-            return Err(
-                "Error: git(action=diff): base_ref already contains a complete range; omit ref, or pass the complete range in ref and omit base_ref"
-                    .to_string(),
-            );
-        }
-        let separator = if base_ref.contains("...") {
-            "..."
-        } else {
-            ".."
-        };
-        let Some((base, tip)) = base_ref.split_once(separator) else {
-            return Err(format!(
-                "Error: malformed range '{base_ref}' — expected A..B or A...B"
-            ));
-        };
-        if base.is_empty() || tip.is_empty() {
-            return Err(format!(
-                "Error: malformed range '{base_ref}' — both endpoints are required"
-            ));
-        }
-        reject_shell_meta(base)?;
-        reject_shell_meta(tip)?;
-        return Ok(base_ref.to_string());
-    }
-
-    let tip = tip_ref.unwrap_or("HEAD");
-    reject_shell_meta(tip)?;
-    Ok(format!("{base_ref}..{tip}"))
-}
-
-/// `git diff … --stat` via the real `git` CLI (same sources as full diff, no bash).
-fn diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
-    let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let git_ref = args.get("ref").and_then(Value::as_str);
-    let base_ref = args.get("base_ref").and_then(Value::as_str);
-    let path_filters = match diff_path_filters(args, project_root) {
-        Ok(filters) => filters,
-        Err(error) => return error,
-    };
-
-    if staged && git_ref.is_some() {
-        return "Error: git(action=diff): use either staged:true or ref, not both".to_string();
-    }
-
-    let mut parts: Vec<String> = vec!["diff".into()];
-    if let Some(base) = base_ref {
-        let range = match normalized_diff_range(base, git_ref) {
-            Ok(range) => range,
-            Err(error) => return error,
-        };
-        parts.push(range);
-    } else if staged {
-        parts.push("--cached".into());
-    } else if let Some(r) = git_ref {
-        parts.push(r.to_string());
-        if path_filters.is_empty() {
-            parts.push("HEAD".into());
-        }
-    } else {
-        parts.push("HEAD".into());
-    }
-    parts.extend(["--stat".into(), "--no-color".into()]);
-    if !path_filters.is_empty() {
-        parts.push("--".into());
-        parts.extend(path_filters.iter().map(|path| (*path).to_string()));
-    }
-
-    let cmd_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-    diff_via_git_cli_or_error(project_root, &cmd_refs, limit)
-}
-
-pub fn diff(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: usize) -> String {
-    let mut limit = pressure_scaled_limit(DIFF_LIMIT, pressure);
-    // Further reduce limit when aggregate output is already high
-    if aggregate_bytes > super::AGGREGATE_SOFT_LIMIT {
-        let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(aggregate_bytes);
-        limit = limit.min(remaining).max(2048);
-    }
-    let stat_only = args
-        .get("stat_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if stat_only {
-        return diff_stat_cli(project_root, args, limit);
-    }
-
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let git_ref = args.get("ref").and_then(Value::as_str);
-    let base_ref = args.get("base_ref").and_then(Value::as_str);
-    let path_filters = match diff_path_filters(args, project_root) {
-        Ok(filters) => filters,
-        Err(error) => return error,
-    };
-
-    // Range diff: base_ref..ref (e.g., HEAD~5..HEAD)
-    if let Some(base) = base_ref {
-        let range = match normalized_diff_range(base, git_ref) {
-            Ok(range) => range,
-            Err(error) => return error,
-        };
-        let mut cli_args = vec!["diff", &range, "--no-ext-diff", "--no-color"];
-        if !path_filters.is_empty() {
-            cli_args.push("--");
-            cli_args.extend(path_filters.iter().copied());
-        }
-        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
-    }
-
-    // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
-    if let Some(ref_str) = git_ref {
-        // Handle "A..B" range syntax (e.g. "HEAD~8..HEAD") via CLI
-        if ref_str.contains("..") {
-            // Validate each part of the range against shell injection
-            let separator = if ref_str.contains("...") { "..." } else { ".." };
-            if let Some((base, tip)) = ref_str.split_once(separator) {
-                if let Err(e) = reject_shell_meta(base) {
-                    return format!("Error: invalid base ref in range: {e}");
-                }
-                if let Err(e) = reject_shell_meta(tip) {
-                    return format!("Error: invalid tip ref in range: {e}");
-                }
-            } else {
-                // Defensive: contains("..") was true but split_once failed.
-                // Should be unreachable, but must not silently pass a malformed
-                // ref to the CLI (defence-in-depth for shell-injection guard).
-                return format!(
-                    "Error: malformed range ref '{ref_str}' — expected 'A..B' or 'A...B'"
-                );
-            }
-            let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
-            if !path_filters.is_empty() {
-                cli_args.push("--");
-                cli_args.extend(path_filters.iter().copied());
-            }
-            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
-        }
-        // gix's tree fallback cannot apply pathspec filtering. Preserve the
-        // requested scope by using the CLI result directly whenever filters
-        // are present instead of silently widening the diff.
-        if !path_filters.is_empty() {
-            let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color", "--"];
-            cli_args.extend(path_filters.iter().copied());
-            return diff_via_git_cli_or_error(project_root, &cli_args, limit);
-        }
-        return diff_tree_to_tree_str(&repo, ref_str, limit);
-    }
-
-    // If staged, do index-to-HEAD diff
-    if staged {
-        let mut cli_args = vec!["diff", "--cached", "--no-ext-diff", "--no-color"];
-        if !path_filters.is_empty() {
-            cli_args.push("--");
-            cli_args.extend(path_filters.iter().copied());
-            let result = diff_via_git_cli_or_error(project_root, &cli_args, limit);
-            return if result == "No changes" {
-                "No staged changes".to_string()
-            } else {
-                result
-            };
-        }
-        let result = match diff_via_git_cli_result(project_root, &cli_args, limit)
-            .output_or_else(|| diff_index_to_head(&repo, limit))
-        {
-            Ok(r) => r,
-            Err(error) => return error,
-        };
-        if result == "No changes" {
-            return "No staged changes".to_string();
-        }
-        return result;
-    }
-
-    // Default: show full local patch vs HEAD so review flows don't need to fall
-    // back to bash just to recover actual diff hunks from summary-only output.
-    let mut cli_args = vec!["diff", "HEAD", "--no-ext-diff", "--no-color"];
-    if !path_filters.is_empty() {
-        cli_args.push("--");
-        cli_args.extend(path_filters.iter().copied());
-        return diff_via_git_cli_or_error(project_root, &cli_args, limit);
-    }
-    match diff_via_git_cli_result(project_root, &cli_args, limit)
-        .output_or_else(|| diff_worktree(&repo, limit))
-    {
-        Ok(result) => result,
-        Err(error) => error,
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GitCliDiffResult {
-    Output(String),
-    Failed(String),
-    Unavailable,
-}
-
-impl GitCliDiffResult {
-    /// Returns `Ok(output)` for `Output`, `Err(error)` for `Failed`.
-    /// For `Unavailable`, calls `fallback` and returns `Ok(fallback_result)`.
-    fn output_or_else<F: FnOnce() -> String>(self, fallback: F) -> Result<String, String> {
-        match self {
-            Self::Output(s) => Ok(s),
-            Self::Failed(e) => Err(e),
-            Self::Unavailable => Ok(fallback()),
-        }
-    }
-}
-
-fn diff_via_git_cli_or_error(project_root: &Path, args: &[&str], limit: usize) -> String {
-    match diff_via_git_cli_result(project_root, args, limit) {
-        GitCliDiffResult::Output(result) => result,
-        GitCliDiffResult::Failed(error) => error,
-        GitCliDiffResult::Unavailable => {
-            format!("Error: git {} failed to start or timed out", args.join(" "))
-        }
-    }
-}
-
-fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
-    match diff_via_git_cli_result(project_root, args, limit) {
-        GitCliDiffResult::Output(result) => Some(result),
-        GitCliDiffResult::Failed(_) | GitCliDiffResult::Unavailable => None,
-    }
-}
-
-fn diff_via_git_cli_result(project_root: &Path, args: &[&str], limit: usize) -> GitCliDiffResult {
-    // Use timeout to prevent hangs on large diffs
-    let Some(out) = run_git_with_timeout(project_root, args) else {
-        return GitCliDiffResult::Unavailable;
-    };
-    if !out.status.success() {
-        return GitCliDiffResult::Failed(format_git_cli_failure(args, &out));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if stdout.trim().is_empty() {
-        return GitCliDiffResult::Output("No changes".to_string());
-    }
-    GitCliDiffResult::Output(truncate_diff_at(stdout, limit.min(tool_output_limit())))
-}
-
-fn format_git_cli_failure(args: &[&str], out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("exit status {}", out.status)
-    };
-    format!("Error: git {} failed: {detail}", args.join(" "))
-}
-
-/// Diff between two tree-ish refs (e.g., HEAD vs a branch/commit).
-fn diff_tree_to_tree_str(repo: &gix::Repository, ref_str: &str, limit: usize) -> String {
-    let head_tree = match resolve_tree(repo, "HEAD") {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    let other_tree = match resolve_tree(repo, ref_str) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-
-    let mut cache = match repo.diff_resource_cache_for_tree_diff() {
-        Ok(c) => c,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let mut out = String::new();
-    let mut count = 0u32;
-
-    let mut changes_platform = match other_tree.changes() {
-        Ok(p) => p,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let result = changes_platform.for_each_to_obtain_tree(
-        &head_tree,
-        |change: gix::object::tree::diff::Change<'_, '_, '_>| {
-            use gix::object::tree::diff::Change;
-            let location = match &change {
-                Change::Addition { location, .. }
-                | Change::Deletion { location, .. }
-                | Change::Modification { location, .. }
-                | Change::Rewrite { location, .. } => location.to_string(),
-            };
-            let change_type = match &change {
-                Change::Addition { .. } => "new file",
-                Change::Deletion { .. } => "deleted",
-                Change::Modification { .. } => "modified",
-                Change::Rewrite { .. } => "renamed",
-            };
-
-            out.push_str(&format!(
-                "diff --git a/{location} b/{location}\n--- a/{location}\n+++ b/{location}\n"
-            ));
-
-            // Try to get line-level diff
-            if let Ok(mut platform) = change.diff(&mut cache) {
-                let _ = platform.lines(|hunk| {
-                    use gix::object::blob::diff::lines::Change as HC;
-                    match hunk {
-                        HC::Addition { lines } => {
-                            for l in lines {
-                                out.push_str(&format!("+{}\n", l));
-                            }
-                        }
-                        HC::Deletion { lines } => {
-                            for l in lines {
-                                out.push_str(&format!("-{}\n", l));
-                            }
-                        }
-                        HC::Modification {
-                            lines_before,
-                            lines_after,
-                        } => {
-                            for l in lines_before {
-                                out.push_str(&format!("-{}\n", l));
-                            }
-                            for l in lines_after {
-                                out.push_str(&format!("+{}\n", l));
-                            }
-                        }
-                    }
-                    Ok::<_, std::convert::Infallible>(())
-                });
-            } else {
-                out.push_str(&format!("# {change_type}: {location}\n"));
-            }
-            out.push('\n');
-            count += 1;
-
-            if out.len() > limit {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-            Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
-        },
-    );
-
-    if let Err(e) = result {
-        out.push_str(&format!("\n[diff error: {e}]\n"));
-    }
-
-    if out.is_empty() {
-        "No changes".to_string()
-    } else {
-        out.push_str(&format!(
-            "\n{count} file(s) changed (summary only — use `git diff` for full patch)"
-        ));
-        truncate_diff_at(out, limit)
-    }
-}
-
-/// Diff staged (index) changes against HEAD.
-fn diff_index_to_head(repo: &gix::Repository, limit: usize) -> String {
-    let head_tree = match resolve_tree(repo, "HEAD") {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-
-    // Get the index and convert to a tree for comparison
-    let index = match repo.index() {
-        Ok(i) => i,
-        Err(e) => return format!("Error reading index: {e}"),
-    };
-
-    // Build changes by comparing HEAD tree entries with index entries
-    let mut out = String::new();
-    let mut count = 0u32;
-
-    for entry in index.entries() {
-        let path = entry.path(&index);
-        let path_str = path.to_string();
-
-        // Check if HEAD has this file and whether it differs
-        let head_entry = head_tree.lookup_entry_by_path(&path_str);
-        let in_head: Option<gix::ObjectId> = match &head_entry {
-            Ok(Some(he)) => Some(he.object_id()),
-            _ => None,
-        };
-
-        let idx_oid = entry.id;
-
-        match in_head {
-            Some(head_oid) if head_oid == idx_oid => continue, // unchanged
-            Some(_head_oid) => {
-                out.push_str(&format!(
-                    "diff --git a/{path_str} b/{path_str}\n--- a/{path_str}\n+++ b/{path_str}\n"
-                ));
-                out.push_str("# modified (staged)\n\n");
-                count += 1;
-            }
-            None => {
-                out.push_str(&format!(
-                    "diff --git a/{path_str} b/{path_str}\n--- /dev/null\n+++ b/{path_str}\n"
-                ));
-                out.push_str("# new file (staged)\n\n");
-                count += 1;
-            }
-        }
-
-        if out.len() > limit {
-            out.push_str("[truncated]\n");
-            break;
-        }
-    }
-
-    // Detect staged deletions: files in HEAD tree but absent from index
-    {
-        fn collect_tree_paths(
-            tree: &gix::Tree<'_>,
-            prefix: &str,
-            paths: &mut std::collections::HashSet<String>,
-        ) {
-            for e in tree.iter().flatten() {
-                let name = e.filename().to_string();
-                let full = if prefix.is_empty() {
-                    name
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                if e.mode().is_tree() {
-                    if let Ok(obj) = e.object()
-                        && let Ok(sub) = obj.try_into_tree()
-                    {
-                        collect_tree_paths(&sub, &full, paths);
-                    }
-                } else {
-                    paths.insert(full);
-                }
-            }
-        }
-
-        let mut head_paths = std::collections::HashSet::new();
-        collect_tree_paths(&head_tree, "", &mut head_paths);
-
-        let index_paths: std::collections::HashSet<String> = index
-            .entries()
-            .iter()
-            .map(|e| e.path(&index).to_string())
-            .collect();
-
-        for deleted_path in head_paths.difference(&index_paths) {
-            out.push_str(&format!(
-                "diff --git a/{deleted_path} b/{deleted_path}\n--- a/{deleted_path}\n+++ /dev/null\n"
-            ));
-            out.push_str("# deleted (staged)\n\n");
-            count += 1;
-            if out.len() > limit {
-                out.push_str("[truncated]\n");
-                break;
-            }
-        }
-    }
-
-    if out.is_empty() {
-        "No staged changes".to_string()
-    } else {
-        out.push_str(&format!("\n{count} file(s) staged"));
-        truncate_diff_at(out, limit)
-    }
-}
-
-/// Diff worktree (unstaged) changes.
-fn diff_worktree(repo: &gix::Repository, limit: usize) -> String {
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let iter = match platform.into_index_worktree_iter(Vec::<BString>::new()) {
-        Ok(i) => i,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    use gix::status::index_worktree::iter::Summary;
-    let mut out = String::new();
-    let mut count = 0;
-
-    for entry in iter {
-        match entry {
-            Ok(item) => {
-                let path = item.rela_path().to_string();
-                let summary = match item.summary() {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                let status_str = match summary {
-                    Summary::Modified => "modified",
-                    Summary::Added | Summary::IntentToAdd => "new file",
-                    Summary::Removed => "deleted",
-                    Summary::Renamed => "renamed",
-                    Summary::TypeChange => "typechange",
-                    _ => "changed",
-                };
-
-                out.push_str(&format!(
-                    "diff --git a/{path} b/{path}\n# {status_str}: {path}\n\n"
-                ));
-                count += 1;
-
-                if out.len() > limit {
-                    out.push_str("[truncated]\n");
-                    break;
-                }
-            }
-            Err(e) => {
-                out.push_str(&format!("Error: {e}\n"));
-                break;
-            }
-        }
-    }
-
-    if out.is_empty() {
-        "No changes".to_string()
-    } else {
-        out.push_str(&format!(
-            "\n{count} file(s) changed (summary only — use `git diff` for full patch)"
-        ));
-        truncate_diff_at(out, limit)
-    }
-}
-
-fn resolve_tree<'r>(repo: &'r gix::Repository, ref_str: &str) -> Result<gix::Tree<'r>, String> {
-    let id = repo
-        .rev_parse_single(ref_str)
-        .map_err(|e| format!("Error: cannot resolve '{ref_str}': {e}"))?;
-    let obj = id.object().map_err(|e| format!("Error: {e}"))?;
-    let commit = obj
-        .try_into_commit()
-        .map_err(|_| format!("Error: '{ref_str}' is not a commit"))?;
-    commit
-        .tree()
-        .map_err(|e| format!("Error: cannot get tree: {e}"))
-}
-
-fn truncate_diff_at(out: String, limit: usize) -> String {
-    if out.len() > limit {
-        let end = out.floor_char_boundary(limit);
-        let mut t = out[..end].to_string();
-        t.push_str("\n[truncated]");
-        t
-    } else {
-        out
-    }
-}
-
-// ─── file_history ───────────────────────────────────────────────────────
-
-pub fn file_history(project_root: &Path, args: &Value) -> String {
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let file = match args.get("file").and_then(Value::as_str) {
-        Some(f) => f,
-        None => return "Error: missing 'file' parameter".to_string(),
-    };
-    if let Err(e) = reject_path_traversal(file, project_root) {
-        return e;
-    }
-
-    let n = args.get("n").and_then(Value::as_u64).unwrap_or(10) as usize;
-
-    let head = match repo.head_id() {
-        Ok(h) => h,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let walk = match head
-        .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-        ))
-        .all()
-    {
-        Ok(w) => w,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let mut lines = Vec::new();
-    const MAX_WALK: usize = 50_000;
-    for (walked, info) in walk.enumerate() {
-        if lines.len() >= n || walked >= MAX_WALK {
-            break;
-        }
-        let info = match info {
-            Ok(i) => i,
-            Err(_) => break,
-        };
-
-        let commit = match info.object() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // Check if this commit touches our file by comparing tree entries
-        let tree = match commit.tree() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        // Check if file exists in this commit's tree
-        let cur_entry = match tree.lookup_entry_by_path(file) {
-            Ok(Some(e)) => e,
-            _ => continue,
-        };
-
-        // Check if parent had different content (file actually changed)
-        let parent_has_same = commit.parent_ids().next().is_some_and(|pid| {
-            pid.object()
-                .ok()
-                .and_then(|o| o.try_into_commit().ok())
-                .and_then(|pc| pc.tree().ok())
-                .map(|pt| match pt.lookup_entry_by_path(file) {
-                    Ok(Some(parent_entry)) => parent_entry.object_id() == cur_entry.object_id(),
-                    _ => false,
-                })
-                .unwrap_or(false)
-        });
-
-        if parent_has_same {
-            continue;
-        }
-
-        let id = info.id.to_string();
-        let short = &id[..8.min(id.len())];
-        let author = commit
-            .author()
-            .ok()
-            .map(|a| String::from_utf8_lossy(a.name).into_owned())
-            .unwrap_or_else(|| "?".to_string());
-        let date = commit
-            .author()
-            .ok()
-            .map(|a| format_author_date(&a))
-            .unwrap_or_else(|| "?".to_string());
-        let summary = {
-            let raw = commit.message_raw_sloppy();
-            raw.lines()
-                .next()
-                .map(|l| String::from_utf8_lossy(l).into_owned())
-                .unwrap_or_default()
-        };
-
-        lines.push(format!("{short} {date} [{author}] {summary}"));
-    }
-
-    if lines.is_empty() {
-        return format!("No history found for '{file}'");
-    }
-
-    truncate_output(
-        format!(
-            "File: {file}\nCommits: {}\n\n{}",
-            lines.len(),
-            lines.join("\n")
-        ),
-        tool_output_limit(),
-    )
-}
-
-// ─── log_search (lexical commit-message search) ─────────────────────────
-
-/// A parsed commit with pre-computed tokens for lexical scoring.
-struct CommitDoc {
-    hash: String,
-    author: String,
-    date: String,
-    message: String,
-    tokens: Vec<String>,
-}
-
-/// Score commit messages against a query using explicit token overlap.
-fn score_commits(query: &str, commits: &[CommitDoc]) -> Vec<(usize, f64)> {
-    let query_tokens = estimate_tokens(query);
-    if query_tokens.is_empty() || commits.is_empty() {
-        return Vec::new();
-    }
-
-    let query_set = query_tokens
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let query_phrase = query.trim().to_lowercase();
-
-    let mut scores: Vec<(usize, f64)> = commits
-        .iter()
-        .enumerate()
-        .filter_map(|(i, doc)| {
-            let doc_set = doc
-                .tokens
-                .iter()
-                .map(String::as_str)
-                .collect::<std::collections::HashSet<_>>();
-            let matched_terms = query_set
-                .iter()
-                .filter(|term| doc_set.contains(**term))
-                .count();
-            if matched_terms == 0 {
-                return None;
-            }
-
-            let repeated_hits = doc
-                .tokens
-                .iter()
-                .filter(|token| query_set.contains(token.as_str()))
-                .count();
-            let coverage = matched_terms as f64 / query_set.len().max(1) as f64;
-            let density = repeated_hits as f64 / doc.tokens.len().max(1) as f64;
-            let phrase_bonus =
-                if query_phrase.len() > 1 && doc.message.to_lowercase().contains(&query_phrase) {
-                    1.0
-                } else {
-                    0.0
-                };
-            let score =
-                (coverage * 0.70 + density.min(1.0) * 0.20 + phrase_bonus * 0.10).clamp(0.0, 1.0);
-            Some((i, score))
-        })
-        .collect();
-
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scores
-}
-
-pub fn log_search(project_root: &Path, args: &Value) -> String {
-    let query = match args.get("query").and_then(Value::as_str) {
-        Some(q) if !q.trim().is_empty() => q,
-        _ => return "Error: missing or empty 'query' parameter".to_string(),
-    };
-
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let n = args.get("n").and_then(Value::as_u64).unwrap_or(200) as usize;
-
-    let head = match repo.head_id() {
-        Ok(h) => h,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let walk = match head
-        .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-        ))
-        .all()
-    {
-        Ok(w) => w,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    // Collect commits
-    let mut commits = Vec::new();
-    for info in walk {
-        if commits.len() >= n {
-            break;
-        }
-        let info = match info {
-            Ok(i) => i,
-            Err(_) => break,
-        };
-        let commit = match info.object() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let hash = info.id.to_string();
-        let author = commit
-            .author()
-            .ok()
-            .map(|a| String::from_utf8_lossy(a.name).into_owned())
-            .unwrap_or_else(|| "?".to_string());
-        let date = commit
-            .author()
-            .ok()
-            .map(|a| format_author_date(&a))
-            .unwrap_or_else(|| "?".to_string());
-        let message = {
-            let raw = commit.message_raw_sloppy();
-            raw.lines()
-                .next()
-                .map(|l| String::from_utf8_lossy(l).into_owned())
-                .unwrap_or_default()
-        };
-        let tokens = estimate_tokens(&message);
-
-        commits.push(CommitDoc {
-            hash,
-            author,
-            date,
-            message,
-            tokens,
-        });
-    }
-
-    if commits.is_empty() {
-        return "No commits found".to_string();
-    }
-
-    let ranked = score_commits(query, &commits);
-    if ranked.is_empty() {
-        return format!(
-            "No commits matching '{}' found in last {} commits",
-            query,
-            commits.len()
-        );
-    }
-
-    let top_k = 10.min(ranked.len());
-    let mut result = format!(
-        "Search: '{}' ({} commits searched, {} matches)\n\n",
-        query,
-        commits.len(),
-        ranked.len()
-    );
-    for (i, &(idx, score)) in ranked.iter().take(top_k).enumerate() {
-        let c = &commits[idx];
-        result.push_str(&format!(
-            "{}. [score:{:.2}] {} {} [{}] {}\n",
-            i + 1,
-            score,
-            &c.hash[..8.min(c.hash.len())],
-            c.date,
-            c.author,
-            c.message,
-        ));
-    }
-
-    truncate_output(result, tool_output_limit())
-}
-
-// ─── contributors ───────────────────────────────────────────────────────
-
-pub fn contributors(project_root: &Path, args: &Value) -> String {
-    let repo = match open_repo(project_root) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    let path_filter = args.get("path").and_then(Value::as_str);
-    if let Some(p) = path_filter {
-        if let Err(e) = reject_path_traversal(p, project_root) {
-            return e;
-        }
-    }
-    let since_str = args.get("since").and_then(Value::as_str);
-
-    // Parse --since into a unix timestamp cutoff
-    let since_cutoff: Option<i64> = since_str.and_then(parse_since_to_epoch);
-
-    let head = match repo.head_id() {
-        Ok(h) => h,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let walk = match head
-        .ancestors()
-        .sorting(gix::revision::walk::Sorting::ByCommitTime(
-            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-        ))
-        .all()
-    {
-        Ok(w) => w,
-        Err(e) => return format!("Error: {e}"),
-    };
-
-    let mut author_counts: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    let mut file_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut recent_lines: Vec<String> = Vec::new();
-    let mut total_commits = 0u32;
-    const MAX_WALK: u32 = 50_000;
-
-    for (walked, info) in walk.enumerate() {
-        if walked as u32 >= MAX_WALK {
-            break;
-        }
-        let info = match info {
-            Ok(i) => i,
-            Err(_) => break,
-        };
-
-        let commit = match info.object() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // Date cutoff
-        if let Some(cutoff) = since_cutoff
-            && let Ok(author) = commit.author()
-            && let Ok(time) = author.time()
-            && time.seconds < cutoff
-        {
-            break; // Commits are sorted newest-first, so stop early
-        }
-
-        // Skip merges (2+ parents)
-        if commit.parent_ids().count() > 1 {
-            continue;
-        }
-
-        let author_name = commit
-            .author()
-            .ok()
-            .map(|a| String::from_utf8_lossy(a.name).into_owned())
-            .unwrap_or_else(|| "?".to_string());
-
-        // Path filter: check if commit touches the target path
-        if let Some(path) = path_filter {
-            let tree = match commit.tree() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let cur_entry = match tree.lookup_entry_by_path(path) {
-                Ok(Some(e)) => e,
-                _ => continue,
-            };
-            // Check parent differs
-            let parent_same = commit.parent_ids().next().is_some_and(|pid| {
-                pid.object()
-                    .ok()
-                    .and_then(|o| o.try_into_commit().ok())
-                    .and_then(|pc| pc.tree().ok())
-                    .map(|pt| match pt.lookup_entry_by_path(path) {
-                        Ok(Some(pe)) => pe.object_id() == cur_entry.object_id(),
-                        _ => false,
-                    })
-                    .unwrap_or(false)
-            });
-            if parent_same {
-                continue;
-            }
-        }
-
-        *author_counts.entry(author_name).or_default() += 1;
-
-        // Collect changed files for hot-files (up to 500 commits)
-        if total_commits < 500 {
-            let tree = commit.tree().ok();
-            let parent_tree = commit
-                .parent_ids()
-                .next()
-                .and_then(|pid| pid.object().ok())
-                .and_then(|o| o.try_into_commit().ok())
-                .and_then(|pc| pc.tree().ok());
-
-            if let (Some(new_tree), Some(old_tree)) = (tree, parent_tree)
-                && let Ok(mut changes) = old_tree.changes()
-            {
-                let _ = changes.for_each_to_obtain_tree(&new_tree, |change| {
-                    use gix::object::tree::diff::Change;
-                    let location = match &change {
-                        Change::Addition { location, .. }
-                        | Change::Deletion { location, .. }
-                        | Change::Modification { location, .. }
-                        | Change::Rewrite { location, .. } => location.to_string(),
-                    };
-
-                    if let Some(pf) = path_filter
-                        && !location.starts_with(pf)
-                    {
-                        return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(
-                            (),
-                        ));
-                    }
-
-                    *file_freq.entry(location).or_default() += 1;
-                    Ok(std::ops::ControlFlow::Continue(()))
-                });
-            }
-        }
-
-        // Recent activity (first 5)
-        if recent_lines.len() < 5 {
-            let id_str = info.id.to_string();
-            let short = &id_str[..7.min(id_str.len())];
-            let msg = {
-                let raw = commit.message_raw_sloppy();
-                raw.lines()
-                    .next()
-                    .map(|l| String::from_utf8_lossy(l).into_owned())
-                    .unwrap_or_default()
-            };
-            recent_lines.push(format!("{short} {msg}"));
-        }
-
-        total_commits += 1;
-
-        // Safety cap
-        if total_commits >= 10_000 {
-            break;
-        }
-    }
-
-    // Format output
-    let mut parts = Vec::new();
-
-    // Top contributors
-    if !author_counts.is_empty() {
-        let mut sorted: Vec<_> = author_counts.into_iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
-        let top: Vec<String> = sorted
-            .iter()
-            .take(10)
-            .map(|(name, count)| format!("  {:>4}  {}", count, name))
-            .collect();
-        parts.push(format!("## Top Contributors\n{}", top.join("\n")));
-    }
-
-    // Hot files
-    if !file_freq.is_empty() {
-        let mut sorted: Vec<_> = file_freq.into_iter().collect();
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
-        let top_files: Vec<String> = sorted
-            .iter()
-            .take(10)
-            .map(|(f, c)| format!("  {:>3}× {}", c, f))
-            .collect();
-        parts.push(format!(
-            "## Hot Files (most changed)\n{}",
-            top_files.join("\n")
-        ));
-    }
-
-    // Recent activity
-    if !recent_lines.is_empty() {
-        parts.push(format!("## Recent Activity\n{}", recent_lines.join("\n")));
-    }
-
-    if parts.is_empty() {
-        "No git history found".to_string()
-    } else {
-        truncate_output(parts.join("\n\n"), tool_output_limit())
-    }
-}
-
-/// Parse a "since" string into a unix epoch timestamp.
-/// Supports ISO dates like "2024-01-01" and relative like "2 weeks ago".
-fn parse_since_to_epoch(since: &str) -> Option<i64> {
-    // Try ISO date (YYYY-MM-DD)
-    if since.len() == 10 && since.chars().nth(4) == Some('-') {
-        let parts: Vec<&str> = since.split('-').collect();
-        if parts.len() == 3 {
-            let y: i64 = parts[0].parse().ok()?;
-            let m: i64 = parts[1].parse().ok()?;
-            let d: i64 = parts[2].parse().ok()?;
-            if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-                return None;
-            }
-            // Rough epoch calculation (not leap-second accurate, good enough for filtering)
-            let days_since_epoch = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100
-                + (y - 1601) / 400
-                + [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334][(m - 1) as usize]
-                + d
-                - 1;
-            return Some(days_since_epoch * 86400);
-        }
-    }
-    // Relative dates: just skip filtering for unsupported formats
-    None
-}
-
-// ─── Git Mutation Tools ─────────────────────────────────────────────────────
-// These use git subprocess (not gix) because gix's write operations are
-// complex and the git binary is universally available. Read tools stay pure-Rust.
-
-/// Stage files and create a commit.
-///
-/// Parameters:
-/// - `message` (required): commit message
-/// - `files` (optional): list of file paths to stage; if omitted, stages all changes
-/// - `all` (optional): if true, stages all tracked changes (like `git commit -a`)
-pub fn commit(project_root: &Path, args: &Value) -> String {
-    commit_with_metadata(project_root, args).output
-}
-
-pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let message = match args.get("message").and_then(Value::as_str) {
-        Some(m) if !m.trim().is_empty() => m.trim(),
-        _ => {
-            return ToolExecutionOutcome::error(
-                "Error: 'message' is required and must not be empty".to_string(),
-            );
-        }
-    };
-
-    // Validate message length (prevent absurdly long messages)
-    if message.len() > 5000 {
-        return ToolExecutionOutcome::error(
-            "Error: commit message too long (max 5000 chars)".to_string(),
-        );
-    }
-
-    // Stage files
-    let files: Vec<&str> = args
-        .get("files")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let stage_all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-
-    if files.is_empty() && !stage_all {
-        // Default: stage all changes
-        let add_out = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(project_root)
-            .output();
-        match add_out {
-            Err(e) => {
-                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
-            }
-            Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: git add -A failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            Ok(_) => {}
-        }
-    } else if !files.is_empty() {
-        // Stage specific files
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("add").args(&files).current_dir(project_root);
-        let add_out = cmd.output();
-        match add_out {
-            Err(e) => {
-                return ToolExecutionOutcome::error(format!("Error: git add failed: {e}"));
-            }
-            Ok(ref out) if !out.status.success() => {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: git add failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            Ok(_) => {}
-        }
-    }
-
-    // Commit
-    let mut commit_args = vec!["commit", "-m", message];
-    if stage_all && files.is_empty() {
-        commit_args.insert(1, "-a");
-    }
-    let commit_out = std::process::Command::new("git")
-        .args(&commit_args)
-        .current_dir(project_root)
-        .output();
-
-    match commit_out {
-        Ok(out) if out.status.success() => {
-            let commit_sha = resolve_commit_ref(project_root, "HEAD");
-            let short_hash = commit_sha
-                .as_deref()
-                .map(short_commit_sha)
-                .unwrap_or_else(|| {
-                    String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("???")
-                        .to_string()
-                });
-            let tool_result_fields = commit_sha.map(|commit_sha| {
-                serde_json::Map::from_iter([
-                    ("commit_sha".to_string(), Value::String(commit_sha.clone())),
-                    (
-                        "commit_short_sha".to_string(),
-                        Value::String(short_commit_sha(&commit_sha)),
-                    ),
-                ])
-            });
-            ToolExecutionOutcome {
-                output: format!("✓ Committed: {short_hash} {message}"),
-                tool_result_fields,
-                is_error: false,
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("nothing to commit") {
-                ToolExecutionOutcome::ok("Nothing to commit — working tree clean".to_string())
-            } else {
-                ToolExecutionOutcome::error(format!("Error: git commit failed: {}", stderr.trim()))
-            }
-        }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git commit failed: {e}")),
-    }
-}
-
-/// Create a compensating revert commit for an earlier git commit.
-///
-/// Parameters:
-/// - `commit_sha` (required): full commit SHA or git revision to revert
-pub fn revert_commit(project_root: &Path, args: &Value) -> String {
-    revert_commit_with_metadata(project_root, args).output
-}
-
-pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let commit_ref = match args.get("commit_sha").and_then(Value::as_str) {
-        Some(commit_ref) => match validate_commit_ref(commit_ref, "commit_sha") {
-            Ok(commit_ref) => commit_ref,
-            Err(error) => return ToolExecutionOutcome::error(error),
-        },
-        None => {
-            return ToolExecutionOutcome::error("Error: 'commit_sha' is required".to_string());
-        }
-    };
-    let target_commit_sha = match resolve_commit_ref(project_root, &commit_ref) {
-        Some(commit_sha) => commit_sha,
-        None => {
-            return ToolExecutionOutcome::error(format!("Error: unknown commit '{commit_ref}'"));
-        }
-    };
-
-    match std::process::Command::new("git")
-        .args(["revert", "--no-edit", target_commit_sha.as_str()])
-        .current_dir(project_root)
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let revert_commit_sha = resolve_commit_ref(project_root, "HEAD");
-            let revert_short_sha = revert_commit_sha
-                .as_deref()
-                .map(short_commit_sha)
-                .unwrap_or_else(|| "???".to_string());
-            let tool_result_fields = revert_commit_sha.map(|revert_commit_sha| {
-                serde_json::Map::from_iter([
-                    (
-                        "reverted_commit_sha".to_string(),
-                        Value::String(target_commit_sha.clone()),
-                    ),
-                    (
-                        "reverted_commit_short_sha".to_string(),
-                        Value::String(short_commit_sha(&target_commit_sha)),
-                    ),
-                    (
-                        "revert_commit_sha".to_string(),
-                        Value::String(revert_commit_sha.clone()),
-                    ),
-                    (
-                        "revert_commit_short_sha".to_string(),
-                        Value::String(short_commit_sha(&revert_commit_sha)),
-                    ),
-                ])
-            });
-            ToolExecutionOutcome {
-                output: format!(
-                    "✓ Reverted commit: {} via {}",
-                    short_commit_sha(&target_commit_sha),
-                    revert_short_sha
-                ),
-                tool_result_fields,
-                is_error: false,
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let mut message = format!("Error: git revert failed: {}", stderr.trim());
-            match abort_git_revert(project_root) {
-                Ok(true) => {
-                    message.push_str(" (aborted in-progress revert)");
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    message.push_str(&format!(" ({error})"));
-                }
-            }
-            ToolExecutionOutcome::error(message)
-        }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git revert failed: {e}")),
-    }
-}
-
-/// Stash working tree changes.
-///
-/// Parameters:
-/// - `action` (required): "push" (save), "apply", "pop" (restore + drop), "list", "drop"
-/// - `message` (optional): description for push
-/// - `index` (optional): stash index for apply/pop/drop (default 0)
-/// - `stash_ref` (optional): exact stash selector or OID for apply
-pub fn stash(project_root: &Path, args: &Value) -> String {
-    stash_with_metadata(project_root, args).output
-}
-
-pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let action = match args.get("action").and_then(Value::as_str) {
-        Some(a) => a,
-        None => {
-            return ToolExecutionOutcome::error(
-                "Error: 'action' is required (push, apply, pop, list, drop)".to_string(),
-            );
-        }
-    };
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root);
-    let before_stash_oid = matches!(action, "push" | "save")
-        .then(|| {
-            std::process::Command::new("git")
-                .args(["rev-parse", "--verify", "refs/stash"])
-                .current_dir(project_root)
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        })
-        .flatten();
-
-    match action {
-        "push" | "save" => {
-            cmd.arg("stash").arg("push");
-            if let Some(msg) = args.get("message").and_then(Value::as_str) {
-                cmd.arg("-m").arg(msg);
-            }
-        }
-        "apply" => {
-            let selector = match apply_stash_selector(args) {
-                Ok(selector) => selector,
-                Err(error) => return ToolExecutionOutcome::error(error),
-            };
-            cmd.arg("stash").arg("apply").arg(selector);
-        }
-        "pop" => {
-            let selector = stash_index_selector(args);
-            cmd.arg("stash").arg("pop").arg(selector);
-        }
-        "list" => {
-            cmd.arg("stash").arg("list");
-        }
-        "drop" => {
-            let selector = stash_index_selector(args);
-            cmd.arg("stash").arg("drop").arg(selector);
-        }
-        _ => {
-            return ToolExecutionOutcome::error(format!(
-                "Error: unknown stash action '{action}'. Use: push, apply, pop, list, drop"
-            ));
-        }
-    }
-
-    match cmd.output() {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if out.status.success() {
-                let result = stdout.trim();
-                let output = if result.is_empty() {
-                    match action {
-                        "push" | "save" => "✓ Changes stashed".to_string(),
-                        "list" => "No stashes found".to_string(),
-                        _ => format!("✓ Stash {action} done"),
-                    }
-                } else {
-                    result.to_string()
-                };
-                let mut tool_result_fields = None;
-                if matches!(action, "push" | "save") {
-                    let after_stash_oid = std::process::Command::new("git")
-                        .args(["rev-parse", "--verify", "refs/stash"])
-                        .current_dir(project_root)
-                        .output()
-                        .ok()
-                        .filter(|out| out.status.success())
-                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
-                    if let Some(stash_ref) = after_stash_oid
-                        && before_stash_oid.as_deref() != Some(stash_ref.as_str())
-                    {
-                        tool_result_fields = Some(serde_json::Map::from_iter([(
-                            "stash_ref".to_string(),
-                            Value::String(stash_ref),
-                        )]));
-                    }
-                }
-                ToolExecutionOutcome {
-                    output,
-                    tool_result_fields,
-                    is_error: false,
-                }
-            } else {
-                let err = stderr.trim();
-                if err.contains("No local changes") || err.contains("No stash entries") {
-                    // `err.to_string()` may or may not begin with "Error"; pass through
-                    // the gix error verbatim and flag as failure explicitly.
-                    ToolExecutionOutcome::error(err.to_string())
-                } else {
-                    ToolExecutionOutcome::error(format!("Error: git stash {action} failed: {err}"))
-                }
-            }
-        }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git stash failed: {e}")),
-    }
-}
-
-/// git push — push commits to a remote.
-///
-/// Parameters:
-/// - `remote` (string): remote name (required)
-/// - `branch` (string): branch to push (required)
-/// - `force_with_lease` (bool, default false): use --force-with-lease
-/// - `set_upstream` (bool, default false): set upstream tracking with -u
-pub fn push_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let remote = match validate_push_target(args.get("remote").and_then(Value::as_str), "remote") {
-        Ok(remote) => remote,
-        Err(error) => return ToolExecutionOutcome::error(error),
-    };
-    let branch = match validate_push_target(args.get("branch").and_then(Value::as_str), "branch") {
-        Ok(branch) => branch,
-        Err(error) => return ToolExecutionOutcome::error(error),
-    };
-
-    let force_with_lease = args
-        .get("force_with_lease")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let set_upstream = args
-        .get("set_upstream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(project_root);
-    cmd.arg("push");
-
-    if force_with_lease {
-        cmd.arg("--force-with-lease");
-    }
-    if set_upstream {
-        cmd.arg("--set-upstream");
-    }
-
-    cmd.arg(remote);
-    cmd.arg(branch);
-
-    match cmd.output() {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if out.status.success() {
-                let result = stdout.trim();
-                let output = if result.is_empty() {
-                    "✓ Push successful".to_string()
-                } else {
-                    result.to_string()
-                };
-                ToolExecutionOutcome {
-                    output,
-                    tool_result_fields: None,
-                    is_error: false,
-                }
-            } else {
-                let err = stderr.trim();
-                ToolExecutionOutcome::error(format!("Error: git push failed: {err}"))
-            }
-        }
-        Err(e) => ToolExecutionOutcome::error(format!("Error: git push failed: {e}")),
-    }
-}
-
-/// Plain-text wrapper for push (used by tests and simple callers).
-pub fn push(project_root: &Path, args: &Value) -> String {
-    push_with_metadata(project_root, args).output
-}
-
-/// Consolidated `git` tool dispatcher. Routes `args.action` to the
-/// appropriate git sub-operation. Replaces 11 separate git_* tools with
-/// a single `git { action: "...", ...params }` interface.
-///
-/// For `action: "stash"`, the sub-action is read from `sub_action`
-/// (push, apply, pop, list, drop) to avoid collision with the top-level
-/// `action` field.
-pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let action = match validate_git_request(project_root, args) {
-        Ok(action) => action,
-        Err(error) => {
-            return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
-        }
-    };
-    match action {
-        crate::git_tool_contract::GitAction::Status => {
-            ToolExecutionOutcome::ok(status(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Diff => {
-            ToolExecutionOutcome::ok(diff(project_root, args, 0.0, 0))
-        }
-        crate::git_tool_contract::GitAction::Log => {
-            ToolExecutionOutcome::ok(log(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Show => {
-            ToolExecutionOutcome::ok(show(project_root, args, 0.0, 0))
-        }
-        crate::git_tool_contract::GitAction::Blame => {
-            ToolExecutionOutcome::ok(blame(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::FileHistory => {
-            ToolExecutionOutcome::ok(file_history(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::LogSearch => {
-            ToolExecutionOutcome::ok(log_search(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Contributors => {
-            ToolExecutionOutcome::ok(contributors(project_root, args))
-        }
-        crate::git_tool_contract::GitAction::Commit => commit_with_metadata(project_root, args),
-        crate::git_tool_contract::GitAction::RevertCommit => {
-            revert_commit_with_metadata(project_root, args)
-        }
-        crate::git_tool_contract::GitAction::Stash => {
-            // Remap: read `sub_action` and set it as `action` for the
-            // inner stash function which expects action ∈ {push,apply,pop,list,drop}.
-            let stash_sub_action = args.get("sub_action").and_then(Value::as_str);
-            let remapped_args = if let Some(sa) = stash_sub_action {
-                let mut map = args.as_object().cloned().unwrap_or_default();
-                map.insert("action".to_string(), Value::String(sa.to_string()));
-                Value::Object(map)
-            } else {
-                args.clone()
-            };
-            stash_with_metadata(project_root, &remapped_args)
-        }
-        crate::git_tool_contract::GitAction::CheckoutFile => ToolExecutionOutcome::error(
-            "Error: git.checkout_file requires a CLI/edge executor with checkout_file support."
-                .to_string(),
-        ),
-        crate::git_tool_contract::GitAction::Worktree => ToolExecutionOutcome::error(
-            "Error: git.worktree requires a CLI/edge executor with worktree support.".to_string(),
-        ),
-        crate::git_tool_contract::GitAction::Push => push_with_metadata(project_root, args),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Take first n chars from a string.
-    fn prefix_chars(s: &str, n: usize) -> String {
-        s.chars().take(n).collect()
-    }
-    use serde_json::json;
+
     use tempfile::TempDir;
 
     #[test]
-    fn reject_path_traversal_blocks_empty_and_parent_walk() {
-        let dir = TempDir::new().expect("tempdir");
-        let root = dir.path();
-        assert!(reject_path_traversal("", root).is_err());
-        assert!(reject_path_traversal("../outside", root).is_err());
-        assert!(reject_path_traversal("foo/../../etc/passwd", root).is_err());
-    }
-
-    #[test]
-    fn git_request_validation_classifies_missing_path_as_typed_invalid_arguments() {
-        let dir = TempDir::new().expect("tempdir");
-        let error =
-            validate_git_request(dir.path(), &json!({"action": "diff", "path": "missing.rs"}))
-                .expect_err("missing diff path must fail before execution");
-
-        assert_eq!(error.evidence.kind, astra_core::ErrorKind::ToolInvalidArgs);
+    fn process_failure_metadata_keeps_local_phase_and_possible_effects() {
+        for (phase, kind) in [
+            ("timeout", "tool_timeout"),
+            ("output limit", "resource_limit"),
+            ("repository binding", "tool_binding"),
+        ] {
+            let outcome = GitProcessError::Execution(astra_sandbox::SyncProcessError {
+                phase,
+                detail: "fixture".into(),
+                started: true,
+                ownership: None,
+            })
+            .into_outcome("git");
+            assert!(outcome.is_error);
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], kind);
+            assert_eq!(fields["disposition"], "executed");
+            assert_eq!(fields["process_started"], true);
+            assert_eq!(fields["recovery_evidence"]["retryable"], false);
+        }
+        let outcome =
+            GitProcessError::RepositoryBinding("missing metadata".into()).into_outcome("git");
         assert_eq!(
-            error.evidence.cause,
-            astra_core::ToolFailureCause::ResourceMissing
+            outcome.tool_result_fields.unwrap()["disposition"],
+            "rejected"
         );
-        assert!(!error.evidence.retryable);
-        assert_eq!(
-            error.evidence.recovery_actions,
-            vec![
-                astra_core::ToolRecoveryAction::SearchBeforeRead,
-                astra_core::ToolRecoveryAction::CorrectArguments,
-            ]
-        );
-    }
-
-    #[test]
-    fn git_dispatch_preserves_validation_evidence_without_running_git() {
-        let dir = TempDir::new().expect("tempdir");
-        let outcome = git_dispatch(
-            dir.path(),
-            &json!({"action": "blame", "path": "../outside.rs"}),
-        );
-
-        assert!(outcome.is_error);
-        let fields = outcome.tool_result_fields.expect("structured evidence");
-        assert_eq!(fields["error_kind"], "tool_invalid_args");
-        assert_eq!(fields["recovery_evidence"]["cause"], "invalid_arguments");
-        assert_eq!(fields["recovery_evidence"]["retryable"], false);
-    }
-
-    #[test]
-    fn git_request_validation_accepts_existing_repo_relative_diff_path() {
-        let dir = TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("tracked.rs"), "fn main() {}\n").unwrap();
-
-        let action =
-            validate_git_request(dir.path(), &json!({"action": "diff", "path": "tracked.rs"}))
-                .unwrap();
-
-        assert_eq!(action, crate::git_tool_contract::GitAction::Diff);
-    }
-
-    #[test]
-    fn git_request_validation_rejects_ambiguous_single_and_multiple_diff_paths() {
-        let dir = TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("one.rs"), "one\n").unwrap();
-        std::fs::write(dir.path().join("two.rs"), "two\n").unwrap();
-
-        let error = validate_git_request(
-            dir.path(),
-            &json!({"action": "diff", "path": "one.rs", "paths": ["two.rs"]}),
-        )
-        .expect_err("one canonical path field must be selected");
-
-        assert_eq!(error.evidence.kind, astra_core::ErrorKind::ToolInvalidArgs);
-        assert!(error.message.contains("either `path` or `paths`"));
-    }
-
-    #[test]
-    fn reject_path_traversal_allows_plain_relative_under_root() {
-        let dir = TempDir::new().expect("tempdir");
-        let root = dir.path();
-        assert!(reject_path_traversal("src/main.rs", root).is_ok());
-        assert!(reject_path_traversal("README.md", root).is_ok());
-    }
-
-    #[test]
-    fn reject_path_traversal_rejects_percent_encoded_dot_dot() {
-        let dir = TempDir::new().expect("tempdir");
-        let root = dir.path();
-        assert!(reject_path_traversal("%2e%2e%2fsecret", root).is_err());
-    }
-
-    #[test]
-    fn reject_path_traversal_rejects_glob_metacharacters() {
-        let dir = TempDir::new().expect("tempdir");
-        assert!(reject_path_traversal("*.rs", dir.path()).is_err());
-        assert!(reject_path_traversal("file?.txt", dir.path()).is_err());
     }
 
     fn repo_root() -> std::path::PathBuf {
@@ -3081,1073 +594,62 @@ mod tests {
         );
     }
 
-    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
+    #[cfg(unix)]
+    #[test]
+    fn bound_git_command_rejects_observed_metadata_replacement_before_launch() {
+        let repo = init_temp_repo();
+        let result = prepare_bound_git_command_with_pin_hook(repo.path(), || {
+            std::fs::rename(repo.path().join(".git"), repo.path().join(".git-original")).unwrap();
+            run_git(repo.path(), &["init"]);
+        });
+        assert!(result.is_err());
+        let mut command = prepare_bound_git_command(repo.path()).unwrap();
+        std::fs::rename(repo.path().join(".git"), repo.path().join(".git-replaced")).unwrap();
+        run_git(repo.path(), &["init"]);
+        let error = command
+            .args(["status", "--porcelain"])
             .output()
-            .expect("git command");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+            .unwrap_err();
+        assert!(!error.started);
     }
 
-    fn init_temp_repo_with_ours_merge() -> TempDir {
-        let dir = init_temp_repo();
-        let root = dir.path();
-        let default_branch = git_stdout(root, &["branch", "--show-current"]);
-        run_git(root, &["checkout", "-b", "feature"]);
-        std::fs::write(root.join("tracked.txt"), "feature branch change\n").expect("write feature");
-        run_git(root, &["add", "tracked.txt"]);
-        run_git(root, &["commit", "-m", "feature change"]);
-        run_git(root, &["checkout", &default_branch]);
-        run_git(
-            root,
-            &[
-                "merge",
-                "--no-ff",
-                "-s",
-                "ours",
-                "feature",
-                "-m",
-                "merge feature",
-            ],
-        );
-        dir
-    }
-
-    fn init_temp_repo_with_followup_change() -> TempDir {
-        let dir = init_temp_repo();
-        let root = dir.path();
-        std::fs::write(root.join("tracked.txt"), "two\n").expect("write tracked file");
-        run_git(root, &["add", "tracked.txt"]);
-        run_git(root, &["commit", "-m", "update tracked"]);
-        dir
-    }
-
-    fn init_temp_repo_with_linear_diff_history(total_commits: usize) -> TempDir {
-        assert!(total_commits >= 1);
-        let dir = init_temp_repo();
-        let root = dir.path();
-        for commit_index in 2..=total_commits {
-            std::fs::write(root.join("tracked.txt"), format!("commit {commit_index}\n"))
-                .expect("write tracked file");
-            run_git(root, &["add", "tracked.txt"]);
-            let message = format!("update tracked {commit_index}");
-            run_git(root, &["commit", "-m", &message]);
-        }
-        let actual_commits: usize = git_stdout(root, &["rev-list", "--count", "HEAD"])
-            .parse()
-            .expect("commit count");
+    #[cfg(unix)]
+    #[test]
+    fn bound_git_runtime_replacement_reports_possible_effects_without_receipt() {
+        let repo = init_temp_repo();
+        let mut command = prepare_bound_git_command(repo.path()).unwrap();
+        let failure = command
+            .args([
+                "-c",
+                "alias.astra-test-rebind=!mv .git .git-moved",
+                "astra-test-rebind",
+            ])
+            .output()
+            .unwrap_err();
+        assert!(failure.started);
+        assert_eq!(failure.phase, "repository binding");
+        assert!(repo.path().join(".git-moved").exists());
         assert_eq!(
-            actual_commits, total_commits,
-            "linear diff history must create exactly the requested number of commits"
-        );
-        dir
-    }
-
-    #[test]
-    fn git_action_status_returns_output() {
-        let root = repo_root();
-        let result = status(&root, &json!({}));
-        assert!(
-            result.contains("##")
-                || result.contains("nothing to commit")
-                || result.contains("Error"),
-            "unexpected status: {result}"
-        );
-    }
-
-    #[test]
-    fn git_push_missing_remote_reports_error() {
-        let dir = init_temp_repo();
-        let result = push(dir.path(), &json!({"remote": "origin", "branch": "main"}));
-        // Should fail (no remote configured) but not crash
-        assert!(
-            result.contains("Error") || result.contains("fatal"),
-            "push without remote should report error: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn git_push_requires_explicit_remote_and_branch() {
-        let dir = init_temp_repo();
-
-        let missing_remote = push(dir.path(), &json!({"branch": "main"}));
-        assert!(
-            missing_remote.contains("missing required parameter 'remote'"),
-            "{missing_remote}"
-        );
-
-        let missing_branch = push(dir.path(), &json!({"remote": "origin"}));
-        assert!(
-            missing_branch.contains("missing required parameter 'branch'"),
-            "{missing_branch}"
-        );
-    }
-
-    #[test]
-    fn git_push_rejects_option_like_and_shell_meta_targets() {
-        let dir = init_temp_repo();
-
-        let option_remote = push(
-            dir.path(),
-            &json!({"remote": "--receive-pack=sh", "branch": "main"}),
-        );
-        assert!(
-            option_remote.contains("remote must not start with '-'"),
-            "{option_remote}"
-        );
-
-        let injected_branch = push(
-            dir.path(),
-            &json!({"remote": "origin", "branch": "main;echo-pwned"}),
-        );
-        assert!(
-            injected_branch.contains("disallowed characters"),
-            "{injected_branch}"
-        );
-    }
-
-    #[test]
-    fn git_action_log_returns_commits() {
-        let root = repo_root();
-        let result = log(&root, &json!({"n": 5}));
-        let lines: Vec<&str> = result.lines().collect();
-        assert!(!lines.is_empty(), "log should return commits");
-        let first = lines[0];
-        let hash_prefix = prefix_chars(first, 7);
-        assert!(
-            hash_prefix.chars().count() == 7 && hash_prefix.chars().all(|c| c.is_ascii_hexdigit()),
-            "first log line should start with hash: {first}"
-        );
-    }
-
-    #[test]
-    fn git_action_log_default_n() {
-        let root = repo_root();
-        let result = log(&root, &json!({}));
-        let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
-        assert!(lines.len() <= 10, "default should be at most 10 commits");
-    }
-
-    #[test]
-    fn git_action_show_missing_revision_defaults_to_head() {
-        let root = repo_root();
-        let result = show(&root, &json!({}), 0.0, 0);
-        // Without explicit commit/ref, defaults to HEAD (same as `git show`)
-        assert!(
-            result.contains("commit ") || result.contains("Author:"),
-            "empty args should default to HEAD, got: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_invalid_ref() {
-        let root = repo_root();
-        let result = show(&root, &json!({"revision": "abc;rm -rf /"}), 0.0, 0);
-        assert!(result.contains("Error: invalid commit reference"));
-    }
-
-    #[test]
-    fn git_action_show_head() {
-        let root = repo_root();
-        let result = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
-        assert!(result.contains("commit "), "should show commit: {result}");
-        assert!(result.contains("Author:"), "should show author");
-    }
-
-    #[test]
-    fn git_action_show_stat_only() {
-        let root = repo_root();
-        let result = show(
-            &root,
-            &json!({"revision": "HEAD", "stat_only": true}),
-            0.0,
-            0,
-        );
-        assert!(result.contains("commit "));
-        assert!(
-            result.contains("files changed") || result.contains("root commit"),
-            "should show stats: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_blame_missing_file_param() {
-        let root = repo_root();
-        let result = blame(&root, &json!({}));
-        assert!(result.contains("Error: missing 'file'"));
-    }
-
-    #[test]
-    fn git_action_blame_known_file() {
-        let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
-        assert!(
-            result.contains("L1") || result.contains("Error") || result.contains("No blame"),
-            "unexpected blame: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_blame_with_line_range() {
-        let root = repo_root();
-        let result = blame(
-            &root,
-            &json!({"file": "README.md", "line_start": 1, "line_end": 3}),
-        );
-        if result.contains("L1") {
-            let blame_lines: Vec<&str> = result.lines().filter(|l| l.starts_with('L')).collect();
-            assert!(
-                blame_lines.len() <= 3,
-                "should have at most 3 lines: {blame_lines:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_action_diff_no_crash() {
-        let root = repo_root();
-        let result = diff(&root, &json!({}), 0.0, 0);
-        assert!(
-            !result.contains("Error: cannot open"),
-            "should open repo: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_file_history_missing_file() {
-        let root = repo_root();
-        let result = file_history(&root, &json!({}));
-        assert!(result.contains("Error: missing 'file'"));
-    }
-
-    #[test]
-    fn git_action_file_history_known_file() {
-        let root = repo_root();
-        let result = file_history(&root, &json!({"file": "README.md"}));
-        assert!(
-            result.contains("File: README.md") || result.contains("No history"),
-            "unexpected: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_file_history_limits_n() {
-        let root = repo_root();
-        let result = file_history(&root, &json!({"file": "README.md", "n": 3}));
-        if result.contains("Commits:")
-            && let Some(line) = result.lines().find(|l| l.starts_with("Commits:"))
-        {
-            let count: usize = line
-                .trim_start_matches("Commits: ")
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            assert!(count <= 3, "should respect n limit: {count}");
-        }
-    }
-
-    // ─── diff enhanced tests ────────────────────────────────────────────
-
-    #[test]
-    fn git_action_diff_staged_param_accepted() {
-        let root = repo_root();
-        // staged=true should not crash (may return "No staged changes" or file list)
-        let result = diff(&root, &json!({"staged": true}), 0.0, 0);
-        assert!(
-            !result.contains("Error: cannot open"),
-            "staged diff should not fail to open repo: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_ref_param_uses_tree_diff() {
-        let root = repo_root();
-        // Diff HEAD against HEAD~1 should produce actual file changes
-        let result = diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
-        assert!(
-            result.contains("diff --git")
-                || result.contains("No changes")
-                || result.contains("Error: cannot resolve"),
-            "ref diff should produce diff output or error: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_ref_range_with_dotdot() {
-        let dir = init_temp_repo_with_linear_diff_history(3);
-        // "HEAD~2..HEAD" range syntax in ref param must not error
-        let result = diff(dir.path(), &json!({"ref": "HEAD~2..HEAD"}), 0.0, 0);
-        assert!(
-            !result.starts_with("Error:"),
-            "ref with range A..B should not error: {result}"
-        );
-        // Should produce diff output or "No changes"
-        assert!(
-            result.contains("diff --git") || result.contains("No changes"),
-            "ref range should produce diff output: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_invalid_range_ref_returns_error_not_no_changes() {
-        let root = repo_root();
-        let result = diff(
-            &root,
-            &json!({"ref": "__astra_missing_ref__..HEAD"}),
-            0.0,
-            0,
-        );
-        assert!(
-            result.starts_with("Error: git diff "),
-            "invalid range refs must surface git failure instead of pretending the diff is empty: {result}"
-        );
-        assert!(
-            !result.contains("No changes"),
-            "invalid range refs are not an empty diff: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_default_shows_worktree() {
-        let root = repo_root();
-        let result = diff(&root, &json!({}), 0.0, 0);
-        // Should not error — either shows changes or "No changes"
-        assert!(
-            !result.starts_with("Error:"),
-            "default diff should work: {result}"
-        );
-    }
-
-    #[test]
-    fn git_dispatch_diff_limits_output_to_all_requested_paths() {
-        let dir = init_temp_repo();
-        let root = dir.path();
-        for name in ["first.txt", "second.txt", "excluded.txt"] {
-            std::fs::write(root.join(name), format!("initial {name}\n")).unwrap();
-        }
-        run_git(root, &["add", "first.txt", "second.txt", "excluded.txt"]);
-        run_git(root, &["commit", "-m", "add diff filter fixtures"]);
-        for name in ["first.txt", "second.txt", "excluded.txt"] {
-            std::fs::write(root.join(name), format!("changed {name}\n")).unwrap();
-        }
-
-        let outcome = git_dispatch(
-            root,
-            &json!({"action": "diff", "paths": ["first.txt", "second.txt"]}),
-        );
-        assert!(!outcome.is_error, "{}", outcome.output);
-        let result = outcome.output;
-
-        assert!(result.contains("a/first.txt"), "{result}");
-        assert!(result.contains("a/second.txt"), "{result}");
-        assert!(
-            !result.contains("excluded.txt"),
-            "multi-path diff must not widen to unrequested files: {result}"
-        );
-
-        let stat_outcome = git_dispatch(
-            root,
-            &json!({
-                "action": "diff",
-                "stat_only": true,
-                "paths": ["first.txt", "second.txt"]
-            }),
-        );
-        assert!(!stat_outcome.is_error, "{}", stat_outcome.output);
-        assert!(
-            stat_outcome.output.contains("first.txt"),
-            "{}",
-            stat_outcome.output
-        );
-        assert!(
-            stat_outcome.output.contains("second.txt"),
-            "{}",
-            stat_outcome.output
-        );
-        assert!(
-            !stat_outcome.output.contains("excluded.txt"),
-            "multi-path diff stat must not widen to unrequested files: {}",
-            stat_outcome.output
-        );
-    }
-
-    #[test]
-    fn git_action_diff_stat_only_smoke() {
-        let root = repo_root();
-        let result = diff(&root, &json!({"stat_only": true}), 0.0, 0);
-        assert!(
-            !result.starts_with("Error:"),
-            "stat_only should use git CLI without repo open errors: {result}"
-        );
-        assert!(
-            result.contains('|')
-                || result.to_lowercase().contains("file")
-                || result == "No changes",
-            "expected stat-style summary: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_stat_only_rejects_staged_with_ref() {
-        let root = repo_root();
-        let result = diff(
-            &root,
-            &json!({"stat_only": true, "staged": true, "ref": "HEAD~1"}),
-            0.0,
-            0,
-        );
-        assert!(result.contains("not both"), "{result}");
-    }
-
-    #[test]
-    fn git_action_diff_stat_only_invalid_ref_returns_error_not_no_changes() {
-        let root = repo_root();
-        let result = diff(
-            &root,
-            &json!({"stat_only": true, "ref": "__astra_missing_ref__..HEAD"}),
-            0.0,
-            0,
-        );
-        assert!(
-            result.starts_with("Error: git diff "),
-            "stat_only invalid refs must surface git failure: {result}"
-        );
-        assert!(
-            !result.contains("No changes"),
-            "stat_only invalid refs are not an empty diff: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_base_ref_range() {
-        let dir = init_temp_repo_with_linear_diff_history(4);
-        let result = diff(
-            dir.path(),
-            &json!({"base_ref": "HEAD~3", "ref": "HEAD"}),
-            0.0,
-            0,
-        );
-        assert!(
-            result.contains("diff --git") || result == "No changes",
-            "range diff should produce output: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_base_ref_defaults_tip_to_head() {
-        let dir = init_temp_repo_with_linear_diff_history(2);
-        let result = diff(dir.path(), &json!({"base_ref": "HEAD~1"}), 0.0, 0);
-        assert!(
-            !result.starts_with("Error:"),
-            "base_ref without ref should default tip to HEAD: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_complete_range_is_not_appended_twice() {
-        assert_eq!(
-            normalized_diff_range("HEAD~1...HEAD", None).unwrap(),
-            "HEAD~1...HEAD"
-        );
-        let dir = init_temp_repo_with_linear_diff_history(2);
-        let result = diff(dir.path(), &json!({"base_ref": "HEAD~1...HEAD"}), 0.0, 0);
-        assert!(
-            !result.starts_with("Error:"),
-            "a complete compatibility range must execute once, not be composed with another tip: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_complete_base_range_rejects_conflicting_ref() {
-        let dir = init_temp_repo_with_linear_diff_history(2);
-        let result = diff(
-            dir.path(),
-            &json!({"base_ref": "HEAD~1..HEAD", "ref": "HEAD"}),
-            0.0,
-            0,
-        );
-        assert!(
-            result.contains("already contains a complete range"),
-            "{result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_base_ref_with_path() {
-        let dir = init_temp_repo_with_linear_diff_history(3);
-        let result = diff(
-            dir.path(),
-            &json!({"base_ref": "HEAD~2", "ref": "HEAD", "path": "tracked.txt"}),
-            0.0,
-            0,
-        );
-        assert!(
-            !result.starts_with("Error:"),
-            "range diff with path filter should work: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_base_ref_stat_only() {
-        let dir = init_temp_repo_with_linear_diff_history(4);
-        let result = diff(
-            dir.path(),
-            &json!({"base_ref": "HEAD~3", "ref": "HEAD", "stat_only": true}),
-            0.0,
-            0,
-        );
-        assert!(
-            !result.starts_with("Error:"),
-            "range stat diff should work: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_base_ref_rejects_shell_injection() {
-        let root = repo_root();
-        let result = diff(&root, &json!({"base_ref": "HEAD; rm -rf /"}), 0.0, 0);
-        assert!(
-            result.contains("disallowed"),
-            "shell meta in base_ref should be rejected: {result}"
+            crate::workspace_observation::workspace_observation_is_quarantined(repo.path()),
+            Some(true)
         );
     }
 
     // --- Bug #3: show should reject range syntax with helpful message ---
-    #[test]
-    fn git_action_show_rejects_range_syntax() {
-        let dir = init_temp_repo();
-        // Create a second commit so HEAD~1 exists
-        std::fs::write(dir.path().join("second.txt"), "2").unwrap();
-        run_git(dir.path(), &["add", "."]);
-        run_git(dir.path(), &["commit", "-m", "second"]);
-
-        let result = show(dir.path(), &json!({"revision": "HEAD~1..HEAD"}), 0.0, 0);
-        assert!(
-            result.contains("single commit") || result.contains("git diff"),
-            "Should suggest using git diff for ranges, got: {result}"
-        );
-    }
 
     // --- Bug #5: diff .. branch must validate with reject_shell_meta ---
-    #[test]
-    fn git_action_diff_range_rejects_shell_meta() {
-        let dir = init_temp_repo();
-
-        let result = diff(dir.path(), &json!({"ref": "HEAD;echo pwned..HEAD"}), 0.0, 0);
-        assert!(
-            result.contains("Error") || result.contains("invalid"),
-            "Should reject shell meta in range ref, got: {result}"
-        );
-
-        let result2 = diff(dir.path(), &json!({"ref": "$(whoami)..HEAD"}), 0.0, 0);
-        assert!(
-            result2.contains("Error") || result2.contains("invalid"),
-            "Should reject shell meta in range ref, got: {result2}"
-        );
-    }
 
     // Supplementary: tip contains shell meta (not just base)
-    #[test]
-    fn git_action_diff_range_rejects_shell_meta_in_tip() {
-        let dir = init_temp_repo();
-
-        let result = diff(dir.path(), &json!({"ref": "HEAD..$(whoami)"}), 0.0, 0);
-        assert!(
-            result.contains("Error") || result.contains("invalid"),
-            "Should reject shell meta in tip, got: {result}"
-        );
-
-        let result2 = diff(dir.path(), &json!({"ref": "HEAD..HEAD|cat"}), 0.0, 0);
-        assert!(
-            result2.contains("Error") || result2.contains("invalid"),
-            "Should reject shell meta in tip, got: {result2}"
-        );
-    }
 
     // Supplementary: triple-dot range works
-    #[test]
-    fn git_action_diff_triple_dot_range_works() {
-        let dir = init_temp_repo();
-        std::fs::write(dir.path().join("b.txt"), "new content").unwrap();
-        run_git(dir.path(), &["add", "."]);
-        run_git(dir.path(), &["commit", "-m", "second commit"]);
-
-        let result = diff(dir.path(), &json!({"ref": "HEAD~1...HEAD"}), 0.0, 0);
-        assert!(
-            !result.contains("Error") && !result.contains("cannot resolve"),
-            "Triple-dot range should work, got: {result}"
-        );
-    }
-
-    #[test]
-    fn reject_shell_meta_allows_valid_refs() {
-        assert!(super::reject_shell_meta("HEAD~5").is_ok());
-        assert!(super::reject_shell_meta("main").is_ok());
-        assert!(super::reject_shell_meta("v1.0.0").is_ok());
-        assert!(super::reject_shell_meta("feature/my-branch").is_ok());
-        assert!(super::reject_shell_meta("HEAD^2").is_ok());
-    }
-
-    #[test]
-    fn reject_shell_meta_blocks_injection() {
-        assert!(super::reject_shell_meta("HEAD; echo pwned").is_err());
-        assert!(super::reject_shell_meta("HEAD|cat /etc/passwd").is_err());
-        assert!(super::reject_shell_meta("$(whoami)").is_err());
-        assert!(super::reject_shell_meta("HEAD`id`").is_err());
-    }
-
-    // ─── show enhanced tests ────────────────────────────────────────────
-
-    #[test]
-    fn git_action_show_allows_reflog_syntax() {
-        let root = repo_root();
-        // HEAD@{0} should not be rejected by validation — it should reach rev_parse
-        let result = show(&root, &json!({"revision": "HEAD@{0}"}), 0.0, 0);
-        // Should show a commit (passes validation), not be rejected outright
-        assert!(
-            result.starts_with("commit ") || result.starts_with("Error: cannot resolve"),
-            "HEAD@{{0}} should pass validation and reach parsing: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_rejects_shell_metachar() {
-        let root = repo_root();
-        let result = show(&root, &json!({"revision": "HEAD;rm -rf /"}), 0.0, 0);
-        assert!(result.contains("Error: invalid commit reference"));
-    }
-
-    #[test]
-    fn git_action_show_head_has_diff_content() {
-        let root = repo_root();
-        let result = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
-        assert!(result.contains("commit "), "should show commit header");
-        assert!(result.contains("Author:"), "should show author");
-        // Should contain actual diff markers or root commit marker
-        assert!(
-            result.contains("---") || result.contains("[root commit]") || result.contains("+"),
-            "should contain diff content: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_stat_only_has_stats() {
-        let root = repo_root();
-        let result = show(
-            &root,
-            &json!({"revision": "HEAD", "stat_only": true}),
-            0.0,
-            0,
-        );
-        assert!(result.contains("commit "));
-        assert!(
-            result.contains("files changed") || result.contains("[root commit]"),
-            "should show stats or root: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_merge_commit_stat_only_has_stats() {
-        let dir = init_temp_repo_with_ours_merge();
-        let result = show(
-            dir.path(),
-            &json!({"revision": "HEAD", "stat_only": true}),
-            0.0,
-            0,
-        );
-        assert!(
-            result.contains("commit "),
-            "should show commit header: {result}"
-        );
-        assert!(
-            result.contains(" file changed") || result.contains(" files changed"),
-            "merge commit stat_only should show stats: {result}"
-        );
-        assert!(
-            result.contains("tracked.txt"),
-            "merge commit stat_only should mention changed file: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_merge_commit_has_diff_content() {
-        let dir = init_temp_repo_with_ours_merge();
-        let result = show(dir.path(), &json!({"revision": "HEAD"}), 0.0, 0);
-        assert!(
-            result.contains("commit "),
-            "should show commit header: {result}"
-        );
-        assert!(
-            result.contains("diff --git") || result.contains("--- a/tracked.txt"),
-            "merge commit should include diff output: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_file_filter() {
-        let dir = init_temp_repo_with_followup_change();
-        let result = show(
-            dir.path(),
-            &json!({"revision": "HEAD", "file": "tracked.txt"}),
-            0.0,
-            0,
-        );
-        assert!(result.contains("commit "), "should show header: {result}");
-        assert!(
-            result.contains("--- a/tracked.txt") || result.contains("+++ b/tracked.txt"),
-            "file filter should keep the requested path: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_with_file_appends_hint_when_aggregate_high() {
-        let dir = init_temp_repo_with_followup_change();
-        // aggregate_bytes above AGGREGATE_SOFT_LIMIT / 2 (60_000) with file filter
-        let result = show(
-            dir.path(),
-            &json!({"revision": "HEAD", "file": "tracked.txt"}),
-            0.0,
-            65_000,
-        );
-        assert!(
-            result.contains("[hint: aggregate output is high"),
-            "should append aggregate hint when file filter + high aggregate: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_without_file_no_hint_even_when_aggregate_high() {
-        let dir = init_temp_repo_with_followup_change();
-        let result = show(dir.path(), &json!({"revision": "HEAD"}), 0.0, 65_000);
-        assert!(
-            !result.contains("[hint: aggregate output is high"),
-            "should NOT append hint without file filter: {}",
-            &result[..result.len().min(500)]
-        );
-    }
-
-    // ─── blame enhanced tests ───────────────────────────────────────────
-
-    #[test]
-    fn git_action_blame_nonexistent_file() {
-        let root = repo_root();
-        let result = blame(&root, &json!({"file": "nonexistent_file_xyz.rs"}));
-        assert!(
-            result.contains("Error"),
-            "should error on nonexistent file: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_blame_output_format() {
-        let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
-        if result.contains("L1") {
-            // Should have structured format: L<n> <commit> <date> [<author>] <content>
-            let first_line = result.lines().next().unwrap_or("");
-            assert!(
-                first_line.starts_with("L1 "),
-                "blame line should start with L1: {first_line}"
-            );
-            assert!(
-                first_line.contains('[') && first_line.contains(']'),
-                "blame line should have [author]: {first_line}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_action_blame_summary_footer() {
-        let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
-        if !result.contains("Error") && !result.contains("No blame") {
-            assert!(
-                result.contains("lines,")
-                    && result.contains("authors,")
-                    && result.contains("commits"),
-                "should have summary footer: {result}"
-            );
-        }
-    }
-
-    // ─── status enhanced tests ──────────────────────────────────────────
-
-    #[test]
-    fn git_action_status_shows_branch() {
-        let root = repo_root();
-        let result = status(&root, &json!({}));
-        // Should show branch info or be clean
-        assert!(
-            result.contains("##")
-                || result.contains("nothing to commit")
-                || result.contains("HEAD detached"),
-            "status should show branch: {result}"
-        );
-    }
-
-    // ─── log enhanced tests ─────────────────────────────────────────────
-
-    #[test]
-    fn git_action_log_custom_n() {
-        let root = repo_root();
-        let result = log(&root, &json!({"n": 3}));
-        let lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
-        assert!(
-            lines.len() <= 3,
-            "should respect n=3: got {} lines",
-            lines.len()
-        );
-        assert!(!lines.is_empty(), "should have at least 1 commit");
-    }
-
-    #[test]
-    fn git_action_log_format_consistent() {
-        let root = repo_root();
-        let result = log(&root, &json!({"n": 5}));
-        for line in result.lines().filter(|l| !l.is_empty()) {
-            // Each line should start with a 7-char hex hash
-            let hash_prefix = prefix_chars(line, 7);
-            assert!(
-                hash_prefix.chars().count() == 7
-                    && hash_prefix.chars().all(|c| c.is_ascii_hexdigit()),
-                "log line should start with hash: {line}"
-            );
-            // Should have a space after the hash
-            assert!(
-                line.chars().nth(7) == Some(' '),
-                "log line should have space after hash: {line}"
-            );
-        }
-    }
 
     // ─── Diff with actual content verification ──────────────────────────────
 
-    #[test]
-    fn git_action_diff_ref_produces_line_content() {
-        let root = repo_root();
-        let result = diff(&root, &json!({"ref": "HEAD~1"}), 0.0, 0);
-        if result.contains("diff --git") {
-            // If there are changes, we should see actual +/- lines
-            assert!(
-                result.contains('+') || result.contains('-') || result.contains("# "),
-                "ref diff should have content markers: {result}"
-            );
-        }
-    }
-
     // ─── Edge cases ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn git_action_file_history_nonexistent_file() {
-        let root = repo_root();
-        let result = file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
-        assert!(
-            result.contains("No history"),
-            "should say no history: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_parent_ref() {
-        let root = repo_root();
-        let result = show(&root, &json!({"revision": "HEAD~1"}), 0.0, 0);
-        assert!(
-            result.contains("commit ") || result.contains("Error: cannot resolve"),
-            "HEAD~1 should work: {result}"
-        );
-    }
-
-    // ─── log_search tests ───────────────────────────────────────────────
-
-    #[test]
-    fn git_action_log_search_missing_query() {
-        let root = repo_root();
-        let result = log_search(&root, &json!({}));
-        assert!(result.contains("Error: missing or empty"));
-    }
-
-    #[test]
-    fn git_action_log_search_empty_query() {
-        let root = repo_root();
-        let result = log_search(&root, &json!({"query": "  "}));
-        assert!(result.contains("Error: missing or empty"));
-    }
-
-    #[test]
-    fn git_action_log_search_finds_commits() {
-        let root = repo_root();
-        let result = log_search(&root, &json!({"query": "fix"}));
-        // Should find some commits with "fix" in the message
-        assert!(
-            result.contains("Search:") || result.contains("No commits matching"),
-            "should produce search result: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_log_search_respects_n() {
-        let root = repo_root();
-        let result = log_search(&root, &json!({"query": "fix", "n": 10}));
-        if result.contains("commits searched") {
-            // Extract the number of commits searched
-            if let Some(start) = result.find('(')
-                && let Some(end) = result.find(" commits searched")
-            {
-                let num_str = &result[start + 1..end];
-                let count: usize = num_str.parse().unwrap_or(0);
-                assert!(count <= 10, "should search at most 10: {count}");
-            }
-        }
-    }
-
-    #[test]
-    fn git_action_log_search_score_format() {
-        let root = repo_root();
-        let result = log_search(&root, &json!({"query": "feat"}));
-        if result.contains("[score:") {
-            // Scores should be between 0 and 1
-            for line in result.lines() {
-                if let Some(start) = line.find("[score:")
-                    && let Some(end) = line[start..].find(']')
-                {
-                    let score_str = &line[start + 7..start + end];
-                    let score: f64 = score_str.parse().unwrap_or(0.0);
-                    assert!(score > 0.0 && score <= 1.0, "score should be 0-1: {score}");
-                }
-            }
-        }
-    }
-
-    // ─── contributors tests ─────────────────────────────────────────────
-
-    #[test]
-    fn git_action_contributors_shows_authors() {
-        let root = repo_root();
-        let result = contributors(&root, &json!({}));
-        assert!(
-            result.contains("## Top Contributors") || result.contains("No git history"),
-            "should show contributors: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_contributors_shows_hot_files() {
-        let root = repo_root();
-        let result = contributors(&root, &json!({}));
-        if result.contains("## Top Contributors") {
-            assert!(
-                result.contains("## Hot Files") || result.contains("## Recent"),
-                "should have hot files or recent activity: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_action_contributors_shows_recent() {
-        let root = repo_root();
-        let result = contributors(&root, &json!({}));
-        if !result.contains("No git history") {
-            assert!(
-                result.contains("## Recent Activity"),
-                "should show recent activity: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn git_action_contributors_with_path_filter() {
-        let root = repo_root();
-        let result = contributors(&root, &json!({"path": "README.md"}));
-        // Either shows filtered results or no history
-        assert!(
-            result.contains("## Top Contributors") || result.contains("No git history"),
-            "path filter should work: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_contributors_with_since() {
-        let root = repo_root();
-        let result = contributors(&root, &json!({"since": "2020-01-01"}));
-        assert!(
-            result.contains("## Top Contributors") || result.contains("No git history"),
-            "since filter should work: {result}"
-        );
-    }
 
     // ─── Score function unit tests ──────────────────────────────────────────
 
-    #[test]
-    fn score_commits_empty_corpus() {
-        let result = score_commits("test", &[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn score_commits_empty_query() {
-        let commits = vec![CommitDoc {
-            hash: "abc".into(),
-            author: "test".into(),
-            date: "2024".into(),
-            message: "hello".into(),
-            tokens: vec!["hello".into()],
-        }];
-        let result = score_commits("", &commits);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn score_commits_normalizes_exact_match_to_unit_interval() {
-        let commits = vec![CommitDoc {
-            hash: "abc".into(),
-            author: "test".into(),
-            date: "2024".into(),
-            message: "feat".into(),
-            tokens: vec!["feat".into()],
-        }];
-        let result = score_commits("feat", &commits);
-        assert_eq!(result.len(), 1);
-        assert!(
-            result[0].1 > 0.0 && result[0].1 <= 1.0,
-            "score must stay in the documented 0..1 range: {}",
-            result[0].1
-        );
-    }
-
     // ─── parse_since_to_epoch tests ─────────────────────────────────────────
-
-    #[test]
-    fn parse_since_iso_date() {
-        let epoch = parse_since_to_epoch("2024-01-01");
-        assert!(epoch.is_some());
-        let ts = epoch.unwrap();
-        // 2024-01-01 should be > 2023 in epoch seconds
-        assert!(ts > 1_672_000_000, "should be a valid epoch: {ts}");
-    }
-
-    #[test]
-    fn parse_since_invalid() {
-        assert!(parse_since_to_epoch("not a date").is_none());
-        assert!(parse_since_to_epoch("").is_none());
-    }
-
-    #[test]
-    fn parse_since_invalid_month_day() {
-        // Month 0 and 13 must not panic (was an array OOB bug)
-        assert!(parse_since_to_epoch("2024-00-15").is_none());
-        assert!(parse_since_to_epoch("2024-13-01").is_none());
-        // Day 0 and 32
-        assert!(parse_since_to_epoch("2024-01-00").is_none());
-        assert!(parse_since_to_epoch("2024-01-32").is_none());
-    }
 
     // ─── current_branch / head_short tests ──────────────────────────────────
 
@@ -4190,591 +692,15 @@ mod tests {
 
     // ─── Robustness regression tests ────────────────────────────────────────
 
-    #[test]
-    fn git_action_diff_staged_detects_no_staged() {
-        // In a clean repo, staged diff should say "No staged changes"
-        let root = repo_root();
-        let result = diff(&root, &json!({"staged": true}), 0.0, 0);
-        // Either "No staged changes" or actual staged content — no panic/error
-        assert!(
-            result.contains("staged") || result.contains("diff --git"),
-            "should handle staged query: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_log_n_capped_at_500() {
-        // Even with n=99999, should not produce huge output
-        let root = repo_root();
-        let result = log(&root, &json!({"n": 99999}));
-        let line_count = result.lines().count();
-        assert!(
-            line_count <= 501,
-            "n should be capped at 500: got {line_count} lines"
-        );
-    }
-
-    #[test]
-    fn git_action_log_output_truncated() {
-        // log should apply truncation
-        let root = repo_root();
-        let result = log(&root, &json!({"n": 500}));
-        // Just verify it doesn't panic and produces output
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn git_action_file_history_nonexistent_file_bounded() {
-        // For a nonexistent file, the walk should be bounded (not traverse all history)
-        let root = repo_root();
-        let start = std::time::Instant::now();
-        let result = file_history(&root, &json!({"file": "this/does/not/exist.xyz"}));
-        let elapsed = start.elapsed();
-        assert!(
-            result.contains("No history"),
-            "should say no history: {result}"
-        );
-        // Walk cap should prevent this from taking too long (50K cap)
-        // In a typical dev repo this should be well under 5 seconds
-        assert!(
-            elapsed.as_secs() < 30,
-            "walk should be bounded, took: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn git_action_contributors_bounded_walk() {
-        // Even without path filter, walk should complete in bounded time
-        let root = repo_root();
-        let start = std::time::Instant::now();
-        let result = contributors(&root, &json!({}));
-        let elapsed = start.elapsed();
-        assert!(
-            !result.contains("Error: cannot open"),
-            "should open repo: {result}"
-        );
-        assert!(
-            elapsed.as_secs() < 30,
-            "walk should be bounded, took: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn git_action_contributors_path_filter_bounded() {
-        // Path filter with nonexistent file should still be bounded
-        let root = repo_root();
-        let start = std::time::Instant::now();
-        let _result = contributors(
-            &root,
-            &json!({"path": "nonexistent/deeply/nested/file.xyz"}),
-        );
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_secs() < 30,
-            "path-filtered walk should be bounded, took: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn git_action_show_root_commit_lists_files() {
-        // Find the root commit and verify it lists actual file paths
-        let root = repo_root();
-        let repo = gix::discover(&root).unwrap();
-        // Walk to find root commit (no parents)
-        let head = repo.head_id().unwrap();
-        let mut root_oid = None;
-        if let Ok(walk) = head.ancestors().all() {
-            for info in walk.flatten() {
-                if let Ok(c) = info.object()
-                    && c.parent_ids().count() == 0
-                {
-                    root_oid = Some(info.id.to_string());
-                    break;
-                }
-            }
-        }
-        if let Some(oid) = root_oid {
-            let result = show(&root, &json!({"revision": oid}), 0.0, 0);
-            assert!(
-                result.contains("[root commit]"),
-                "should mark as root: {result}"
-            );
-            // Should list files with full paths, not just top-level dirs
-            // (regression: previously only listed directory names)
-            assert!(
-                result.contains('/') || result.lines().filter(|l| l.starts_with("A ")).count() > 0,
-                "root commit should list files: {result}"
-            );
-        }
-    }
-
     // ── Pressure-aware output limit tests ──
-
-    #[test]
-    fn pressure_scaled_limit_zero_pressure_returns_base() {
-        assert_eq!(super::pressure_scaled_limit(12_000, 0.0), 12_000);
-        assert_eq!(super::pressure_scaled_limit(16_000, 0.0), 16_000);
-    }
-
-    #[test]
-    fn pressure_scaled_limit_moderate_pressure_reduces() {
-        let limit = super::pressure_scaled_limit(12_000, 0.6);
-        assert!(limit < 12_000, "moderate pressure should reduce limit");
-        assert!(limit > 4_800, "should stay above 40% minimum");
-        // scale = 1.0 - 0.6*0.6 = 0.64 → 12000 * 0.64 = 7680
-        assert_eq!(limit, 7_680);
-    }
-
-    #[test]
-    fn pressure_scaled_limit_max_pressure_reaches_floor() {
-        let limit = super::pressure_scaled_limit(12_000, 1.0);
-        // scale = 1.0 - 1.0*0.6 = 0.4 → 12000 * 0.4 = 4800
-        assert_eq!(limit, 4_800);
-    }
-
-    #[test]
-    fn pressure_scaled_limit_never_goes_below_forty_percent() {
-        let limit = super::pressure_scaled_limit(10_000, 1.5);
-        // scale = max(1.0 - 1.5*0.6, 0.4) = max(0.1, 0.4) = 0.4 → 4000
-        assert_eq!(limit, 4_000);
-    }
-
-    #[test]
-    fn git_action_show_under_pressure_truncates_earlier() {
-        let root = std::env::current_dir().unwrap();
-        let normal = show(&root, &json!({"revision": "HEAD"}), 0.0, 0);
-        let pressed = show(&root, &json!({"revision": "HEAD"}), 0.9, 0);
-        assert!(
-            pressed.len() <= normal.len(),
-            "high-pressure output ({}) should not exceed normal ({})",
-            pressed.len(),
-            normal.len()
-        );
-    }
-
-    #[test]
-    fn git_action_diff_under_pressure_truncates_earlier() {
-        let root = std::env::current_dir().unwrap();
-        let normal = diff(&root, &json!({}), 0.0, 0);
-        let pressed = diff(&root, &json!({}), 0.9, 0);
-        assert!(
-            pressed.len() <= normal.len(),
-            "high-pressure diff ({}) should not exceed normal ({})",
-            pressed.len(),
-            normal.len()
-        );
-    }
 
     // ─── commit tests ───────────────────────────────────────────────────
 
-    #[test]
-    fn git_action_commit_rejects_empty_message() {
-        let root = repo_root();
-        let result = commit(&root, &json!({}));
-        assert!(
-            result.starts_with("Error:"),
-            "should reject missing message: {result}"
-        );
-
-        let result2 = commit(&root, &json!({"message": "  "}));
-        assert!(
-            result2.starts_with("Error:"),
-            "should reject blank message: {result2}"
-        );
-    }
-
-    #[test]
-    fn git_action_commit_rejects_long_message() {
-        let root = repo_root();
-        let long_msg = "x".repeat(5001);
-        let result = commit(&root, &json!({"message": long_msg}));
-        assert!(
-            result.contains("too long"),
-            "should reject over-long message: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_commit_clean_tree_says_nothing() {
-        // In a clean repo with nothing staged, commit should say "Nothing to commit"
-        // or succeed if there are pending changes — either is fine, just no panic
-        let root = repo_root();
-        let result = commit(
-            &root,
-            &json!({"message": "test commit", "files": ["nonexistent_file_xyz.txt"]}),
-        );
-        // Should either succeed or report a meaningful error
-        assert!(!result.is_empty(), "should return some output");
-    }
-
-    #[test]
-    fn git_action_commit_with_metadata_returns_commit_sha_and_revert_tool_restores_state() {
-        let repo = init_temp_repo();
-        let tracked_path = repo.path().join("tracked.txt");
-        std::fs::write(&tracked_path, "two\n").expect("update tracked file");
-
-        let outcome = commit_with_metadata(repo.path(), &json!({"message": "update tracked"}));
-        assert!(
-            !outcome.output.starts_with("Error:"),
-            "commit should succeed: {}",
-            outcome.output
-        );
-        let commit_fields = outcome
-            .tool_result_fields
-            .as_ref()
-            .expect("commit should return commit metadata");
-        let commit_sha = commit_fields
-            .get("commit_sha")
-            .and_then(Value::as_str)
-            .expect("commit_sha");
-        let commit_short_sha = commit_fields
-            .get("commit_short_sha")
-            .and_then(Value::as_str)
-            .expect("commit_short_sha");
-        assert_eq!(commit_short_sha, short_commit_sha(commit_sha));
-        assert_eq!(
-            std::fs::read_to_string(&tracked_path).expect("read committed file"),
-            "two\n"
-        );
-
-        let revert_outcome =
-            revert_commit_with_metadata(repo.path(), &json!({"commit_sha": commit_sha}));
-        assert!(
-            !revert_outcome.output.starts_with("Error:"),
-            "revert should succeed: {}",
-            revert_outcome.output
-        );
-        let revert_fields = revert_outcome
-            .tool_result_fields
-            .as_ref()
-            .expect("revert_commit should return metadata");
-        assert_eq!(
-            revert_fields
-                .get("reverted_commit_sha")
-                .and_then(Value::as_str),
-            Some(commit_sha)
-        );
-        assert!(
-            revert_fields
-                .get("revert_commit_sha")
-                .and_then(Value::as_str)
-                .is_some(),
-            "revert should report the compensating commit"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&tracked_path).expect("read reverted file"),
-            "one\n"
-        );
-    }
-
-    #[test]
-    fn git_action_revert_commit_conflict_is_aborted() {
-        let repo = init_temp_repo();
-        let tracked_path = repo.path().join("tracked.txt");
-        std::fs::write(&tracked_path, "two\n").expect("write second version");
-        let second = commit_with_metadata(repo.path(), &json!({"message": "second"}));
-        let second_sha = second
-            .tool_result_fields
-            .as_ref()
-            .and_then(|fields| fields.get("commit_sha"))
-            .and_then(Value::as_str)
-            .expect("second commit sha")
-            .to_string();
-
-        std::fs::write(&tracked_path, "three\n").expect("write third version");
-        let third = commit_with_metadata(repo.path(), &json!({"message": "third"}));
-        assert!(
-            !third.output.starts_with("Error:"),
-            "third commit should succeed: {}",
-            third.output
-        );
-
-        let revert = revert_commit_with_metadata(repo.path(), &json!({"commit_sha": second_sha}));
-        assert!(
-            revert.output.starts_with("Error:"),
-            "reverting a non-HEAD conflicting commit should fail: {}",
-            revert.output
-        );
-        assert!(
-            revert.output.contains("aborted in-progress revert"),
-            "failure should clean up revert state: {}",
-            revert.output
-        );
-        assert_eq!(
-            std::fs::read_to_string(&tracked_path).expect("read file after aborted revert"),
-            "three\n"
-        );
-        assert!(
-            !repo.path().join(".git/REVERT_HEAD").exists(),
-            "revert conflict should not leave REVERT_HEAD behind"
-        );
-    }
-
     // ─── stash tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn git_action_stash_requires_action() {
-        let root = repo_root();
-        let result = stash(&root, &json!({}));
-        assert!(
-            result.starts_with("Error:"),
-            "should require action: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_stash_rejects_unknown_action() {
-        let root = repo_root();
-        let result = stash(&root, &json!({"action": "fly"}));
-        assert!(
-            result.contains("unknown stash action"),
-            "should reject unknown: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_stash_list_works() {
-        let root = repo_root();
-        let result = stash(&root, &json!({"action": "list"}));
-        // Should return stash list or "No stashes found"
-        assert!(
-            result.contains("stash@") || result.contains("No stashes") || result.is_empty(),
-            "unexpected stash list output: {result}"
-        );
-    }
 
     // ─── git action checkout_file tests ────────────────────────────────────────────
 
     // ─── git CLI fallback behavior tests ────────────────────────────────────
 
-    #[test]
-    fn diff_via_git_cli_returns_none_for_bad_args() {
-        let root = repo_root();
-        // Invalid ref should make git fail → returns None
-        let result = diff_via_git_cli(
-            &root,
-            &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"],
-            8000,
-        );
-        assert!(result.is_none(), "bad ref should return None for fallback");
-    }
-
-    #[test]
-    fn diff_via_git_cli_result_exposes_bad_args_error() {
-        let root = repo_root();
-        let result = diff_via_git_cli_result(
-            &root,
-            &["diff", "not_a_valid_ref_xyzzy", "--no-ext-diff"],
-            8000,
-        );
-        match result {
-            GitCliDiffResult::Failed(error) => {
-                assert!(error.starts_with("Error: git diff "), "{error}");
-                assert!(
-                    error.contains("not_a_valid_ref_xyzzy"),
-                    "error should preserve the bad ref: {error}"
-                );
-            }
-            other => panic!("bad ref must be structured as git CLI failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn diff_via_git_cli_returns_no_changes_for_empty_diff() {
-        let root = repo_root();
-        // HEAD vs HEAD has no diff
-        let result = diff_via_git_cli(
-            &root,
-            &["diff", "HEAD", "HEAD", "--no-ext-diff", "--no-color"],
-            8000,
-        );
-        assert_eq!(
-            result,
-            Some("No changes".to_string()),
-            "HEAD vs HEAD should be empty diff"
-        );
-    }
-
-    #[test]
-    fn gix_worktree_fallback_annotates_summary_only() {
-        // diff_worktree output (when it has entries) should tell the user
-        // that it's summary-only so the LLM knows to call bash git diff.
-        let root = repo_root();
-        let repo = open_repo(&root).expect("repo should open");
-        let result = diff_worktree(&repo, 100_000);
-        if result != "No changes" {
-            assert!(
-                result.contains("summary only"),
-                "gix fallback should annotate summary-only output: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn diff_via_git_cli_returns_none_for_nonexistent_dir() {
-        let result = diff_via_git_cli(
-            Path::new("/nonexistent_dir_xyz"),
-            &["diff", "--no-ext-diff"],
-            8000,
-        );
-        assert!(
-            result.is_none(),
-            "nonexistent dir should return None for fallback"
-        );
-    }
-
     // ── Git Worktree Tests ──────────────────────────────────────────────
-
-    // ── Consolidated `git` tool tests ──────────────────────────────────
-    #[test]
-    fn consolidated_git_dispatches_status() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "status"}));
-        let output = &result.output;
-        assert!(
-            output.contains("##")
-                || output.contains("nothing to commit")
-                || output.contains("On branch"),
-            "git status action should return valid status: {output}"
-        );
-    }
-
-    #[test]
-    fn consolidated_git_dispatches_log() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "log", "n": 3}));
-        assert!(!result.output.is_empty(), "git log should return commits");
-    }
-
-    #[test]
-    fn consolidated_git_dispatches_diff() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "diff"}));
-        assert!(
-            !result.output.contains("unknown `git` action")
-                && !result
-                    .output
-                    .contains("missing required parameter `action` for `git`"),
-            "diff must be recognized as valid action"
-        );
-    }
-
-    #[test]
-    fn consolidated_git_unknown_action_returns_error() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "nonexistent"}));
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("unknown `git` action 'nonexistent'"),
-            "unknown action must produce error: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn consolidated_git_show_without_revision_defaults_to_head() {
-        // Regression: LLM calls `git(action="show")` without revision param.
-        // Before fix: "Error: missing revision"
-        // After fix: shows HEAD commit (same as CLI `git show`).
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "show"}));
-        let output = &result.output;
-        assert!(
-            output.contains("commit ") && output.contains("Author:"),
-            "git show without revision must default to HEAD, got: {output}"
-        );
-        // Must not be an error
-        assert!(
-            !result.is_error,
-            "must not return error when ref omitted, got: {output}"
-        );
-    }
-
-    #[test]
-    fn consolidated_git_show_with_revision_works() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "show", "revision": "HEAD"}));
-        let output = &result.output;
-        assert!(
-            output.contains("commit ") && output.contains("Author:"),
-            "git show with ref=HEAD must work, got: {output}"
-        );
-    }
-
-    #[test]
-    fn consolidated_git_missing_action_returns_error() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"file": "foo.rs"}));
-        assert!(result.is_error);
-        assert!(
-            result
-                .output
-                .contains("missing required parameter `action` for `git`"),
-            "missing action must produce helpful error: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn consolidated_git_stash_uses_schema_sub_action() {
-        let root = repo_root();
-        let result = super::git_dispatch(&root, &json!({"action": "stash", "sub_action": "list"}));
-        assert!(
-            !result.is_error,
-            "schema-public sub_action must drive stash dispatch: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn consolidated_git_edge_only_actions_return_executor_requirement() {
-        let root = repo_root();
-        for (action, args) in [
-            (
-                "checkout_file",
-                json!({"action": "checkout_file", "path": "Cargo.toml", "ref": "HEAD"}),
-            ),
-            (
-                "worktree",
-                json!({"action": "worktree", "sub_action": "list"}),
-            ),
-        ] {
-            let result = super::git_dispatch(&root, &args);
-            assert!(result.is_error);
-            assert!(
-                result.output.contains("requires a CLI/edge executor"),
-                "{action} must fail as unavailable in default executor, got: {}",
-                result.output
-            );
-        }
-    }
-
-    #[test]
-    fn git_action_diff_rejects_nonexistent_path_instead_of_silent_empty() {
-        // Regression: previously, `git diff -- <missing-path>` produced empty
-        // output indistinguishable from "no changes". Now it returns an
-        // explicit error so callers know the filter itself was wrong.
-        let dir = init_temp_repo();
-        let result = super::diff(
-            dir.path(),
-            &json!({ "path": "totally/missing/path.rs" }),
-            0.0,
-            0,
-        );
-        assert!(
-            result.contains("does not exist"),
-            "missing path must produce explicit error, got: {result}"
-        );
-    }
-
-    #[test]
-    fn git_action_diff_accepts_tracked_path_with_no_changes() {
-        // Tracked path with no modifications must still succeed (not error).
-        let dir = init_temp_repo();
-        let result = super::diff(dir.path(), &json!({ "path": "tracked.txt" }), 0.0, 0);
-        assert!(
-            !result.contains("does not exist"),
-            "tracked path with no changes must not be rejected, got: {result}"
-        );
-    }
 }

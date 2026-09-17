@@ -5,14 +5,17 @@ use astra_services::SessionArtifactStore;
 use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 use serde_json::Value;
 
+use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+use astra_turn_core::tool::deferred_activation::{
+    CanonicalToolInvocation, DeferredToolActivation, RuntimeControlInvocationKind,
+};
 
 use super::super::agentic_loop::host::{
     AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult, RejectedToolCall, ToolCallAdmission,
 };
 
 pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
-    "task_board",
     "session",
     "introspect",
     "notify",
@@ -22,17 +25,139 @@ pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
 ];
 
 pub(crate) struct PreparedToolRound {
-    pub(crate) tool_calls: Vec<Value>,
-    pub(crate) pre_resolved_results: Vec<(String, String)>,
+    pub(crate) physical_tool_calls: Vec<Value>,
+    pub(crate) logical_tool_calls: Vec<Value>,
+    /// Schema-addressed evidence for logical targets transported by the stable
+    /// deferred carrier, keyed by their provider-owned call ID. This is not a
+    /// name allowlist: the proof binds this exact call to its selected schema.
+    pub(crate) deferred_activations_by_call_id: HashMap<String, DeferredToolActivation>,
+    /// Runtime-owned control calls retain typed provenance across the same
+    /// physical/logical projection. They are not provider deferred
+    /// activations and must not be admitted by a name-only exception.
+    pub(crate) runtime_control_calls_by_id: HashMap<String, RuntimeControlInvocationKind>,
+    pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
+}
+
+/// Persist pre-execution admission rejections as exact terminal outcomes.
+///
+/// This is deliberately independent from the executor path: a runtime policy
+/// rejection is still one provider-owned attempt with one canonical terminal
+/// disposition.  Callers that stop or continue before an ordinary tool round
+/// must use this helper before returning so the durable ledger cannot retain
+/// an open call ID.
+pub(crate) fn record_pre_execution_rejections(
+    state: &mut AgenticLoopState,
+    rejected_tool_calls: Vec<RejectedToolCall>,
+) -> (Vec<Value>, Vec<HeadlessPreResolvedToolResult>) {
+    let mut tool_calls = Vec::with_capacity(rejected_tool_calls.len());
+    let mut pre_resolved_results = Vec::with_capacity(rejected_tool_calls.len());
+
+    for rejected in rejected_tool_calls {
+        tool_calls.push(rejected.invocation.physical_provider_call().clone());
+        let call_id = rejected.provider_call_id().to_string();
+        let logical_name = rejected.logical_name().to_string();
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            call_id.clone(),
+            rejected.result.clone(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        ));
+        let structured_result = serde_json::from_str::<Value>(&rejected.result).ok();
+        let rejection_detail = structured_result
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool call rejected before execution")
+            .to_string();
+        let parsed_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+            rejected.invocation.logical_target_call(),
+        )
+        .ok()
+        .unwrap_or(Value::Null);
+        let (args_full, args_preview, _) =
+            crate::turn::headless_tool_pipeline::record::safe_tool_arguments_for_record(
+                &logical_name,
+                &parsed_args,
+            );
+        state.step_recorder.begin_tool_with_key_and_args_preview(
+            &logical_name,
+            &call_id,
+            None,
+            args_full.as_deref(),
+        );
+        state.step_recorder.complete_tool_with_result_and_metadata(
+            &logical_name,
+            &call_id,
+            args_full.as_deref(),
+            true,
+            0,
+            false,
+            &rejected.result,
+        );
+        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
+            Some(buffer) => (Some(buffer.current_round()), Some(buffer.offset_ms())),
+            None => (None, None),
+        };
+        state.stall.tool_call_records.push(ToolCallRecord {
+            tool_call_id: Some(call_id),
+            name: logical_name,
+            ok: false,
+            ms: 0,
+            error: Some(rejection_detail),
+            input_bytes: None,
+            output_bytes: Some(rejected.result.len() as u32),
+            args_preview,
+            result_preview: Some(rejected.result.chars().take(500).collect()),
+            file_path: None,
+            args_full,
+            result_full: Some(rejected.result),
+            round,
+            start_offset_ms,
+            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        });
+    }
+
+    (tool_calls, pre_resolved_results)
 }
 
 pub(crate) fn admit_tool_calls(
     tool_calls: &[Value],
     finish_reason: Option<&str>,
 ) -> ToolCallAdmission {
-    let tool_calls = astra_turn_core::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
+    if let Err(identity_error) = validate_provider_tool_call_identities(tool_calls) {
+        let rejected = tool_calls
+            .iter()
+            .map(|tool_call| {
+                let id = tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let canonical_call = canonical_rejection_placeholder(tool_call, &id, &name);
+                RejectedToolCall::ordinary(
+                    canonical_call,
+                    serde_json::json!({
+                        "status": "rejected",
+                        "error_kind": "provider_tool_identity_invalid",
+                        "retryable": false,
+                        "error": identity_error.as_str(),
+                    })
+                    .to_string(),
+                )
+            })
+            .collect();
+        return ToolCallAdmission {
+            admitted: Vec::new(),
+            rejected,
+            completion_action_applied: false,
+        };
+    }
     let output_was_truncated = matches!(
         finish_reason,
         Some("length" | "max_tokens" | "max_output_tokens")
@@ -40,9 +165,13 @@ pub(crate) fn admit_tool_calls(
     let mut malformed = Vec::new();
     let mut executable = Vec::new();
 
-    for tool_call in tool_calls.iter() {
+    for tool_call in tool_calls {
         match astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call) {
-            Ok(canonical) => executable.push(canonical),
+            Ok(canonical) => executable.push(
+                astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
+                    canonical,
+                ),
+            ),
             Err(detail) => {
                 let id = tool_call
                     .get("id")
@@ -63,32 +192,17 @@ pub(crate) fn admit_tool_calls(
                         "The {name} tool call was not executed because {detail}. Emit one complete JSON argument object, then try again."
                     )
                 };
-                let canonical_call = serde_json::json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": "{}",
-                    },
-                });
-                malformed.push(RejectedToolCall {
-                    id: canonical_call["id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: canonical_call["function"]["name"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string(),
+                let canonical_call = canonical_rejection_placeholder(tool_call, &id, &name);
+                malformed.push(RejectedToolCall::ordinary(
                     canonical_call,
-                    result: serde_json::json!({
-                        "status": "failed",
+                    serde_json::json!({
+                        "status": "rejected",
                         "error_kind": "tool_call_arguments_invalid",
                         "retryable": true,
                         "error": message,
                     })
                     .to_string(),
-                });
+                ));
             }
         }
     }
@@ -96,6 +210,275 @@ pub(crate) fn admit_tool_calls(
     ToolCallAdmission {
         admitted: executable,
         rejected: malformed,
+        completion_action_applied: false,
+    }
+}
+
+/// Keep malformed provider calls in a deterministic, structured rejection
+/// shape. The original request remains the source of the provider id and is
+/// never guessed from prose; this placeholder only gives downstream journal
+/// and partition code a canonical value to carry for a call that cannot be
+/// executed.
+fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
+    // A call that can be normalized keeps its exact canonical representation.
+    // Only malformed/legacy-shaped calls use the typed empty-arguments
+    // placeholder below.
+    astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call)
+        .unwrap_or_else(|_| {
+            serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            })
+        })
+}
+
+/// Resolve carrier calls after provider identity admission and before any
+/// semantic policy reads the batch. The returned admission preserves the
+/// exact provider call for history while exposing only the logical target to
+/// policy and execution. Callers supply durable selection evidence and the
+/// current catalog digest; a name-only or descriptor-less activation can
+/// never pass this gate.
+pub(crate) fn resolve_deferred_tool_admission<F>(
+    admission: ToolCallAdmission,
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+) -> ToolCallAdmission
+where
+    F: Fn(&str) -> Option<String>,
+{
+    resolve_deferred_tool_admission_with_identity(
+        admission,
+        activations,
+        current_schema_digest,
+        |activation| activation.descriptor.is_some(),
+    )
+}
+
+/// Resolve deferred carriers while requiring an additional host-owned
+/// descriptor identity proof. The ordinary resolver requires a bound
+/// descriptor; authenticated edge/server hosts use this variant to also
+/// compare that descriptor with the current offer so a same-name,
+/// same-schema tool cannot cross a sequential provider rebind.
+pub(crate) fn resolve_deferred_tool_admission_with_identity<F, G>(
+    mut admission: ToolCallAdmission,
+    activations: &[DeferredToolActivation],
+    current_schema_digest: F,
+    descriptor_is_current: G,
+) -> ToolCallAdmission
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&DeferredToolActivation) -> bool,
+{
+    let mut retained = Vec::with_capacity(admission.admitted.len());
+    for invocation in admission.admitted.drain(..) {
+        if invocation.runtime_control_kind().is_some() {
+            retained.push(invocation);
+            continue;
+        }
+        match astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
+            invocation.physical_provider_call(),
+            activations,
+            &current_schema_digest,
+        ) {
+            Ok(Some(resolved)) if resolved.activation().is_some_and(&descriptor_is_current) => {
+                retained.push(resolved)
+            }
+            Ok(Some(invocation)) => admission.rejected.push(RejectedToolCall {
+                invocation,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "deferred_tool_descriptor_stale",
+                    "retryable": true,
+                    "error": "The selected deferred tool is no longer bound to the same provider descriptor; select it again before invoking it.",
+                })
+                .to_string(),
+            }),
+            Ok(None) => retained.push(invocation),
+            Err(error) => admission.rejected.push(RejectedToolCall {
+                invocation,
+                result: serde_json::json!({
+                    "status": "rejected",
+                    "error_kind": "deferred_tool_activation_invalid",
+                    "retryable": true,
+                    "error": error.as_str(),
+                })
+                .to_string(),
+            }),
+        }
+    }
+    admission.admitted = retained;
+    admission
+}
+
+/// Validate the provider-owned identity carrier before any admission policy or
+/// executor can observe the batch. Representation normalization is allowed at
+/// the provider boundary; identity synthesis is not.
+pub(crate) fn validate_provider_tool_call_identities(tool_calls: &[Value]) -> Result<(), String> {
+    let mut seen = HashSet::with_capacity(tool_calls.len());
+    for tool_call in tool_calls {
+        let id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 512
+                    && id.trim() == *id
+                    && !id.chars().any(char::is_control)
+            })
+            .ok_or_else(|| {
+                "provider tool-call identity is missing or malformed; refusing to mint execution identity"
+                    .to_string()
+            })?;
+        if !seen.insert(id) {
+            return Err(format!(
+                "provider tool-call identity '{id}' is duplicated; refusing ambiguous execution"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every provider call must have exactly one terminal admission disposition.
+/// This guards against lossy normalization and policy filters that silently
+/// remove calls before execution or rejection evidence is produced.
+pub(crate) fn validate_tool_call_admission_partition(
+    requested: &[Value],
+    admission: &ToolCallAdmission,
+) -> Result<(), String> {
+    validate_provider_tool_call_identities(requested)?;
+    let requested_by_id = requested
+        .iter()
+        .map(|requested| {
+            let id = requested
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("validated provider call has an id");
+            let name =
+                astra_turn_core::tool::args::shape::tool_call_name(requested).unwrap_or("unknown");
+            let strict =
+                astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(requested)
+                    .ok();
+            Ok((
+                id.to_string(),
+                (
+                    strict.clone(),
+                    strict.unwrap_or_else(|| canonical_rejection_placeholder(requested, id, name)),
+                ),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    for call in &admission.admitted {
+        let canonical =
+            astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(call)
+                .map_err(|detail| format!("admitted tool call is not executable: {detail}"))?;
+        let physical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
+            call.physical_provider_call(),
+        )
+        .map_err(|detail| format!("admitted provider carrier is not canonical: {detail}"))?;
+        let id = call
+            .provider_call_id()
+            .ok_or_else(|| "admitted provider carrier is missing an id".to_string())?;
+        if canonical != **call
+            || physical != *call.physical_provider_call()
+            || canonical.get("id").and_then(Value::as_str) != Some(id)
+            || requested_by_id
+                .get(id)
+                .and_then(|(strict, _)| strict.as_ref())
+                != Some(&physical)
+        {
+            return Err("admitted tool call is not in exact canonical shape".to_string());
+        }
+    }
+    for call in &admission.rejected {
+        let canonical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
+            call.invocation.physical_provider_call(),
+        )
+        .map_err(|detail| format!("rejected tool carrier is not canonical: {detail}"))?;
+        let canonical_id = canonical.get("id").and_then(Value::as_str);
+        let logical = astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(
+            call.invocation.logical_target_call(),
+        )
+        .map_err(|detail| format!("rejected logical target is not canonical: {detail}"))?;
+        let Some((_, requested_canonical)) = requested_by_id.get(call.provider_call_id()) else {
+            return Err(
+                "rejected tool carrier identity or name does not match its disposition".to_string(),
+            );
+        };
+        if canonical != *call.invocation.physical_provider_call()
+            || logical != *call.invocation.logical_target_call()
+            || canonical_id != Some(call.provider_call_id())
+            || logical.get("id").and_then(Value::as_str) != Some(call.provider_call_id())
+            || requested_canonical != &canonical
+        {
+            return Err(
+                "rejected tool carrier identity or name does not match its disposition".to_string(),
+            );
+        }
+    }
+    let requested_ids = requested
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let admitted_ids = admission
+        .admitted
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let rejected_ids = admission
+        .rejected
+        .iter()
+        .map(RejectedToolCall::provider_call_id)
+        .collect::<HashSet<_>>();
+    if admitted_ids.intersection(&rejected_ids).next().is_some()
+        || requested_ids.len() != admission.admitted.len() + admission.rejected.len()
+        || requested_ids.len() != admitted_ids.len() + rejected_ids.len()
+        || requested_ids
+            != admitted_ids
+                .union(&rejected_ids)
+                .copied()
+                .collect::<HashSet<_>>()
+    {
+        return Err(format!(
+            "tool admission did not exhaustively partition provider batch: requested={}, admitted={}, rejected={}",
+            requested.len(),
+            admission.admitted.len(),
+            admission.rejected.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a provider's tool batch at a typed text-only settlement boundary.
+///
+/// The boundary is selected by the lifecycle (`completion_settlement`), never
+/// by inspecting user text or a tool name.  We still run the ordinary
+/// canonicalization first so malformed calls retain the same stable
+/// pre-resolved evidence as every other admission path; valid calls are then
+/// converted into structured, non-retryable results without reaching an
+/// executor.
+pub(crate) fn reject_tool_calls_at_text_only_boundary(
+    tool_calls: &[Value],
+    finish_reason: Option<&str>,
+) -> ToolCallAdmission {
+    let admitted = admit_tool_calls(tool_calls, finish_reason);
+    let mut rejected = admitted.rejected;
+    for canonical_call in admitted.admitted {
+        rejected.push(RejectedToolCall {
+            invocation: canonical_call,
+            result: serde_json::json!({
+                "status": "rejected",
+                "error_kind": "text_only_settlement_tool_call",
+                "retryable": false,
+                "error": "The terminal response boundary is text-only. Produce the final answer without requesting another tool call."
+            })
+            .to_string(),
+        });
+    }
+    ToolCallAdmission {
+        admitted: Vec::new(),
+        rejected,
+        completion_action_applied: false,
     }
 }
 
@@ -161,6 +544,21 @@ pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Optio
 }
 
 pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
+    if tool_name == "submit_task_resolution"
+        && !state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .is_some_and(|window| {
+                matches!(
+                    window.action,
+                    super::super::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
+                )
+            })
+    {
+        return false;
+    }
     if !optional_tool_is_enabled(state, tool_name) {
         return false;
     }
@@ -195,16 +593,16 @@ pub(crate) fn runtime_tool_allowlist_notice(state: &AgenticLoopState) -> Option<
         String::new()
     } else {
         format!(
-            " Control-plane tools {exempt_control_tools_display} also remain callable while the skill allowlist is active."
+            " Control-plane tools {exempt_control_tools_display} also remain policy-permitted while the skill allowlist is active."
         )
     };
     if allowed_display.is_empty() {
         Some(format!(
-            "Runtime tool policy: no allowlist-governed non-skill tools are currently callable because the active request policy excludes them all. Only `skill` and `discover_skills` remain callable until the request policy changes.{control_plane_notice}"
+            "Runtime tool authorization: the active request policy permits no allowlist-governed non-skill tools. `skill` and `discover_skills` remain policy-permitted until the request policy changes. Authorization is only an upper bound; the current tool surface is authoritative for availability.{control_plane_notice}"
         ))
     } else {
         Some(format!(
-            "Runtime tool policy: only these request-allowlisted non-skill tools are callable: {}. Skill `allowed_tools` stays a prompt hint and does not hard-block additional tools.{control_plane_notice}",
+            "Runtime tool authorization: the request policy permits at most these non-skill tools: {}. This allowlist does not assert provider availability; the current tool surface is authoritative. Skill `allowed_tools` stays a prompt hint and does not hard-block additional tools.{control_plane_notice}",
             allowed_display.join(", "),
         ))
     }
@@ -281,69 +679,132 @@ fn intercept_disallowed_tool_calls(
     (blocked, remaining)
 }
 
-pub(crate) async fn prepare_intercepted_tool_round(
+pub(crate) async fn try_prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
+    admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
     delegation_intercepted: bool,
-    valid_tool_names: &HashSet<String>,
-) -> PreparedToolRound {
-    let mut tool_calls = effective_tool_calls.to_vec();
+    _valid_tool_names: &HashSet<String>,
+) -> Result<PreparedToolRound, String> {
+    let mut deferred_activations_by_call_id = admitted_tool_calls
+        .iter()
+        .filter_map(|call| {
+            Some((
+                call.provider_call_id()?.to_string(),
+                call.activation()?.clone(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let runtime_control_calls_by_id = admitted_tool_calls
+        .iter()
+        .filter_map(|call| {
+            Some((
+                call.provider_call_id()?.to_string(),
+                call.runtime_control_kind()?,
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let rejected_logical_tool_calls = rejected_tool_calls
+        .iter()
+        .map(|rejected| rejected.invocation.logical_target_call().clone())
+        .collect::<Vec<_>>();
+    let (rejected_calls, mut pre_resolved_results) =
+        record_pre_execution_rejections(state, rejected_tool_calls);
+    // Rejoin admission dispositions to the original provider order. History
+    // and prompt-cache identity are ordered evidence, not an admitted/rejected
+    // partition. Each entry has both a physical provider call and its logical
+    // target; later interceptors resolve by call id without changing either
+    // view's sequence.
+    let mut physical_by_id = HashMap::<&str, Value>::new();
+    let mut logical_by_id = HashMap::<&str, Value>::new();
+    for call in admitted_tool_calls {
+        if let Some(id) = call.provider_call_id() {
+            physical_by_id.insert(id, call.physical_provider_call().clone());
+            logical_by_id.insert(id, call.logical_target_call().clone());
+        }
+    }
+    for (physical, logical) in rejected_calls.iter().zip(&rejected_logical_tool_calls) {
+        if let Some(id) = physical.get("id").and_then(Value::as_str) {
+            physical_by_id.insert(id, physical.clone());
+            logical_by_id.insert(id, logical.clone());
+        }
+    }
+    let provider_order = turn_result
+        .accum
+        .tool_calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str));
+    let mut physical_tool_calls = Vec::new();
+    let mut logical_tool_calls = Vec::new();
+    for id in provider_order {
+        if let (Some(physical), Some(logical)) =
+            (physical_by_id.remove(id), logical_by_id.remove(id))
+        {
+            physical_tool_calls.push(physical);
+            logical_tool_calls.push(logical);
+        }
+    }
+    if !turn_result.accum.tool_calls.is_empty()
+        && (!physical_by_id.is_empty() || !logical_by_id.is_empty())
+    {
+        return Err(format!(
+            "intercepted tool round lost provider identities while restoring provider order: physical_leftovers={:?}, logical_leftovers={:?}",
+            physical_by_id.keys().collect::<Vec<_>>(),
+            logical_by_id.keys().collect::<Vec<_>>(),
+        ));
+    }
+    // Unit-level callers without a provider transcript still exercise the
+    // interception layer. Production always has the provider order above;
+    // this fallback is deliberately confined to an absent transcript and
+    // preserves the caller's explicit disposition ordering.
+    if physical_tool_calls.is_empty() && !physical_by_id.is_empty() {
+        for call in admitted_tool_calls {
+            if let Some(id) = call.provider_call_id()
+                && let (Some(physical), Some(logical)) =
+                    (physical_by_id.remove(id), logical_by_id.remove(id))
+            {
+                physical_tool_calls.push(physical);
+                logical_tool_calls.push(logical);
+            }
+        }
+        for physical in &rejected_calls {
+            if let Some(id) = physical.get("id").and_then(Value::as_str)
+                && let (Some(physical), Some(logical)) =
+                    (physical_by_id.remove(id), logical_by_id.remove(id))
+            {
+                physical_tool_calls.push(physical);
+                logical_tool_calls.push(logical);
+            }
+        }
+    }
+    // Invalid provider identities cannot be matched to source order; their
+    // canonical rejection still gets a terminal tool result, but never an
+    // executable slot. Valid provider batches (including carriers) must be
+    // fully represented in the ordered views above.
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
-    let (mut pre_resolved_results, post_send_tool_calls, communication_events) =
-        intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;
+    let communication_events = Vec::new();
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
         short_circuit_meta,
-    } = intercept_skill_calls(state, &post_send_tool_calls).await;
-
-    for malformed in rejected_tool_calls {
-        tool_calls.push(malformed.canonical_call);
-        pre_resolved_results.push((malformed.id.clone(), malformed.result.clone()));
-        let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
-            Some(buffer) => (Some(buffer.current_round()), Some(buffer.offset_ms())),
-            None => (None, None),
-        };
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: malformed.name,
-            ok: false,
-            ms: 0,
-            error: Some("tool-call arguments were incomplete or invalid JSON".to_string()),
-            input_bytes: None,
-            output_bytes: Some(malformed.result.len() as u32),
-            args_preview: None,
-            result_preview: Some(malformed.result.chars().take(500).collect()),
-            file_path: None,
-            args_full: None,
-            result_full: Some(malformed.result),
-            round,
-            start_offset_ms,
-            error_kind: Some(astra_core::ErrorKind::ContractViolation),
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
-            ..Default::default()
-        });
-    }
+    } = intercept_skill_calls(state, &allowed_tool_calls).await;
 
     // Build the id→args lookup once. Without it, the per-result `find` below
     // is O(N²) over `tool_calls`, which a model emitting many simultaneous
     // disallowed calls would exercise.
-    let args_preview_by_id: HashMap<&str, String> = tool_calls
+    let args_preview_by_id: HashMap<&str, String> = logical_tool_calls
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
+            let name = astra_turn_core::tool::args::shape::tool_call_name(tc)?;
             let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(tc).ok()?;
-            Some((
-                id,
-                serde_json::to_string(&args)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(200)
-                    .collect::<String>(),
-            ))
+            let preview =
+                crate::turn::headless_tool_pipeline::record::safe_args_preview(name, &args)?;
+            Some((id, preview))
         })
         .collect();
 
@@ -351,12 +812,17 @@ pub(crate) async fn prepare_intercepted_tool_round(
         let args_preview = args_preview_by_id
             .get(result.tool_call_id.as_str())
             .cloned();
-        pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            result.tool_call_id.clone(),
+            result.result.clone(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        ));
         let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
             Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
             None => (None, None),
         };
         state.stall.tool_call_records.push(ToolCallRecord {
+            tool_call_id: Some(result.tool_call_id.clone()),
             name: result.tool_name.clone(),
             ok: false,
             ms: 0,
@@ -379,7 +845,15 @@ pub(crate) async fn prepare_intercepted_tool_round(
     }
 
     for result in &skill_results {
-        pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
+            result.tool_call_id.clone(),
+            result.result.clone(),
+            if result.ok {
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+            } else {
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
+            },
+        ));
 
         let (round, start_offset_ms) = match state.turn_event_buffer.as_ref() {
             Some(buf) => (Some(buf.current_round()), Some(buf.offset_ms())),
@@ -400,6 +874,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             astra_services::session_journal::ToolCallDisposition::Executed
         };
         state.stall.tool_call_records.push(ToolCallRecord {
+            tool_call_id: Some(result.tool_call_id.clone()),
             name: result.tool_name.clone(),
             ok: result.ok,
             ms: 0,
@@ -433,7 +908,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
     // attempts either, matching the existing skipped/deferred behavior.
 
     // Build id→name lookup so we can preserve the original tool name.
-    let tool_name_by_id: HashMap<&str, &str> = tool_calls
+    let tool_name_by_id: HashMap<&str, &str> = logical_tool_calls
         .iter()
         .filter_map(|tc| {
             let id = tc.get("id").and_then(Value::as_str)?;
@@ -450,6 +925,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             None => (None, None),
         };
         state.stall.tool_call_records.push(ToolCallRecord {
+            tool_call_id: Some(id.clone()),
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
             ms: 0,
@@ -474,17 +950,29 @@ pub(crate) async fn prepare_intercepted_tool_round(
 
     // Surgery: strip tool_calls whose IDs are in surgically_removed_ids.
     // These calls will NOT appear in the assistant message or need tool results.
-    let tool_calls = if surgically_removed_ids.is_empty() {
-        tool_calls
+    let (physical_tool_calls, logical_tool_calls) = if surgically_removed_ids.is_empty() {
+        (physical_tool_calls, logical_tool_calls)
     } else {
-        tool_calls
-            .into_iter()
-            .filter(|tc| {
-                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                !surgically_removed_ids.contains(id)
-            })
-            .collect()
+        (
+            physical_tool_calls
+                .into_iter()
+                .filter(|tc| {
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    !surgically_removed_ids.contains(id)
+                })
+                .collect(),
+            logical_tool_calls
+                .into_iter()
+                .filter(|tc| {
+                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                    !surgically_removed_ids.contains(id)
+                })
+                .collect(),
+        )
     };
+    deferred_activations_by_call_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
+    let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
+    runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
     let edge_tool_round = if delegation_intercepted {
         turn_result
@@ -497,78 +985,38 @@ pub(crate) async fn prepare_intercepted_tool_round(
         turn_result.edge_tool_round.clone()
     };
 
-    PreparedToolRound {
-        tool_calls,
+    Ok(PreparedToolRound {
+        physical_tool_calls,
+        logical_tool_calls,
+        deferred_activations_by_call_id,
+        runtime_control_calls_by_id,
         pre_resolved_results,
         edge_tool_round,
         communication_events,
-    }
+    })
 }
 
-async fn intercept_send_message_calls(
+#[cfg(test)]
+async fn prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
-    tool_calls: &[Value],
+    turn_result: &HostTurnResult,
+    admitted_tool_calls: &[CanonicalToolInvocation],
+    effective_tool_calls: &[Value],
+    rejected_tool_calls: Vec<RejectedToolCall>,
+    delegation_intercepted: bool,
     valid_tool_names: &HashSet<String>,
-) -> (
-    Vec<(String, String)>,
-    Vec<Value>,
-    Vec<astra_messaging::AgentCommunicationEvent>,
-) {
-    let Some(mailbox) = state.messaging.mailbox.as_ref() else {
-        return (Vec::new(), tool_calls.to_vec(), Vec::new());
-    };
-
-    let mut msg_results = Vec::new();
-    let mut remaining = Vec::new();
-    let mut communication_events = Vec::new();
-    for tc in tool_calls {
-        if astra_messaging::send_tool::is_send_message_call(tc)
-            && valid_tool_names.contains(astra_messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
-        {
-            if let Some((call_id, args)) = astra_messaging::send_tool::parse_send_message_call(tc) {
-                let send_result =
-                    astra_messaging::send_tool::execute_send_message(mailbox, &args).await;
-                if let Some(message) = send_result.sent_message.as_ref() {
-                    communication_events.push(astra_messaging::agent_communication_event(
-                        &mailbox.address,
-                        astra_messaging::AgentCommunicationDirection::Sent,
-                        message,
-                    ));
-                    if let Some(ref metrics) = state.messaging.metrics {
-                        metrics
-                            .messages_sent
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                if let Some(tracked_msg) = send_result.tracked_message {
-                    if let Some(ref tracker) = state.messaging.ack_tracker {
-                        if state.messaging.ack_sweep_task.is_none() {
-                            if let Some(ref mailbox) = state.messaging.mailbox {
-                                state.messaging.ack_sweep_task =
-                                    Some(astra_messaging::ack_tracker::start_sweep_task(
-                                        Arc::clone(tracker),
-                                        mailbox.router(),
-                                        state.messaging.dead_letter_queue.clone(),
-                                        state.messaging.metrics.clone(),
-                                    ));
-                            }
-                        }
-                        tracker.track(tracked_msg).await;
-                    }
-                }
-                msg_results.push((call_id, send_result.display));
-            } else if let Some(call_id) = tc.get("id").and_then(Value::as_str) {
-                msg_results.push((
-                    call_id.to_string(),
-                    "Error: could not parse send_message arguments. Expected JSON with 'target' and 'content' fields.".to_string(),
-                ));
-            }
-        } else {
-            remaining.push(tc.clone());
-        }
-    }
-
-    (msg_results, remaining, communication_events)
+) -> PreparedToolRound {
+    try_prepare_intercepted_tool_round(
+        state,
+        turn_result,
+        admitted_tool_calls,
+        effective_tool_calls,
+        rejected_tool_calls,
+        delegation_intercepted,
+        valid_tool_names,
+    )
+    .await
+    .expect("test tool round has an exhaustive provider identity partition")
 }
 
 /// Result of skill interception. `results` are pre-resolved tool results to
@@ -616,7 +1064,7 @@ pub(crate) fn dedup_skill_calls(
         if crate::turn::skill_tool::is_skill_call(tc) {
             let skill_name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(ref name) = skill_name
-                && let Some(prev) = state.skills.invoked.get_mut(name.as_str())
+                && let Some(prev) = state.skills.execution.invoked.get_mut(name.as_str())
             {
                 let call_id = tc
                     .get("id")
@@ -699,11 +1147,40 @@ async fn intercept_skill_calls(
     let skill_ctx = build_skill_context(state);
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let full_catalog = resolver.available_skills();
-    let visible_for_mask =
-        crate::turn::skill_tool::visible_skills_for_host_turn(&full_catalog, &state.skills.invoked);
+    let is_client_owned = |tool_call: &Value| {
+        if crate::turn::skill_tool::is_discover_skills_call(tool_call) {
+            return !state.skills.client_pipeline_skill_names.is_empty();
+        }
+        let Some(target) = crate::turn::skill_tool::extract_skill_name(tool_call) else {
+            return false;
+        };
+        state
+            .skills
+            .client_pipeline_skill_names
+            .contains(&target.trim().to_ascii_lowercase())
+    };
+    let server_interceptable_calls = tool_calls
+        .iter()
+        .filter(|tool_call| !is_client_owned(tool_call))
+        .cloned()
+        .collect::<Vec<_>>();
+    state.telemetry.all_selected_skills.extend(
+        crate::turn::skill_tool::selected_skill_names_from_tool_calls(tool_calls)
+            .into_iter()
+            .filter(|selected| {
+                state
+                    .skills
+                    .client_pipeline_skill_names
+                    .contains(&selected.trim().to_ascii_lowercase())
+            }),
+    );
+    let visible_for_mask = crate::turn::skill_tool::visible_skills_for_host_turn(
+        &full_catalog,
+        &state.skills.execution.invoked,
+    );
     let discover_exclude = crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 
-    let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, tool_calls);
+    let (dedup_pairs, fresh_tool_calls) = dedup_skill_calls(state, &server_interceptable_calls);
     state
         .telemetry
         .all_selected_skills
@@ -721,7 +1198,7 @@ async fn intercept_skill_calls(
             resolver.as_ref(),
             &full_catalog,
             &discover_exclude,
-            &mut state.skills.discovered,
+            &mut state.skills.execution.discovered,
             state.skills.executor.as_ref(),
             Some(&mut state.skills.quality_tracker),
             Some(&composition_ctx),
@@ -754,14 +1231,19 @@ async fn intercept_skill_calls(
         {
             let name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(name) = name {
-                if crate::turn::skill_tool::is_skill_call(tc) {
-                    state.skills.invoked.insert(
+                if result.ok && crate::turn::skill_tool::is_skill_call(tc) {
+                    let execution_topology = crate::turn::skill_tool::declared_execution_topology(
+                        resolver.as_ref(),
+                        &name,
+                    );
+                    state.skills.execution.invoked.insert(
                         name.clone(),
                         crate::turn::skill_tool::InvokedSkill {
                             name,
                             content: result.result.clone(),
                             invoked_at_turn: current_turn,
                             reentry_count: 0,
+                            execution_topology,
                         },
                     );
                 }
@@ -867,6 +1349,7 @@ pub(crate) fn build_skill_context(
         session_id: state.current_session_id.clone(),
         session_dir,
         work_dir: state.hooks.workspace_root_hint.clone(),
+        current_task: (!state.user_intent.trim().is_empty()).then(|| state.user_intent.clone()),
         available_tools: state.telemetry.all_tools_used.iter().cloned().collect(),
         recursion_depth: state.recursion_depth,
         forward_headers: state.hooks.forward_headers.clone(),
@@ -880,18 +1363,31 @@ pub(crate) fn apply_skill_activation(
 ) {
     let normalized_allowed_tools =
         astra_turn_core::tool_allowlist::normalize_tool_names(&act.allowed_tools);
-    state.skills.allowed_tools = if normalized_allowed_tools.is_empty() {
+    state.skills.execution.allowed_tools = if normalized_allowed_tools.is_empty() {
         None
     } else {
         Some(normalized_allowed_tools)
     };
-    state.skills.effort = act.effort;
-    state.skills.agent_type = act.agent_type;
-    state.skills.sandbox_policy = act.sandbox_policy;
+    state.skills.execution.effort = act.effort;
+    state.skills.execution.agent_type = act.agent_type;
+    state.skills.execution.sandbox_policy = act.sandbox_policy;
 }
 
 fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
     let mut extra = HashMap::new();
+
+    extra.insert(
+        "__astra_expected_control_epoch".to_string(),
+        i64::try_from(state.user_intents.user_intent_cursor())
+            .unwrap_or(i64::MAX)
+            .to_string(),
+    );
+    if let Some(turn_chain_id) = state.canonical_turn_chain_id.as_deref() {
+        extra.insert(
+            "__astra_parent_turn_chain_id".to_string(),
+            turn_chain_id.to_string(),
+        );
+    }
 
     if let Some(ref root) = state.hooks.workspace_root_hint {
         let root_path = std::path::Path::new(root.as_str());
@@ -932,7 +1428,6 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
 
     let turns_used = state.current_session_turn_number();
     extra.insert("turn_number".into(), turns_used.to_string());
-    extra.insert("turns_remaining".into(), state.remaining_turns.to_string());
     extra.insert("total_prompt_tokens".into(), state.total_prompt.to_string());
     extra.insert(
         "total_completion_tokens".into(),
@@ -1038,46 +1533,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic_loop::host::tests::make_state;
-    use astra_messaging::in_process::InProcessTransport;
-    use astra_messaging::router::AgentMailboxRouter;
-    use astra_messaging::types::AgentAddress;
 
-    async fn setup_mailboxes() -> (
-        astra_messaging::router::AgentMailbox,
-        astra_messaging::router::AgentMailbox,
-    ) {
-        let transport = Arc::new(InProcessTransport::new());
-        let tracker = Arc::new(DelegationTracker::new());
-        let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
-
-        let parent = router
-            .register(AgentAddress::new("run-parent", "orchestrator"), None)
-            .await
-            .expect("parent mailbox should register");
-
-        tracker
-            .record_sub_run(SubRunRecord {
-                run_id: "run-child".into(),
-                parent_run_id: "run-parent".into(),
-                delegation_id: "del-1".into(),
-                agent_id: "worker".into(),
-                depth: 1,
-                state: SubRunState::Created,
-                retry_of: None,
-            })
-            .await;
-
-        let child = router
-            .register(
-                AgentAddress::new("run-child", "worker"),
-                Some("del-1".into()),
-            )
-            .await
-            .expect("child mailbox should register");
-
-        (parent, child)
+    fn ordinary_calls(calls: &[Value]) -> Vec<CanonicalToolInvocation> {
+        calls
+            .iter()
+            .cloned()
+            .map(CanonicalToolInvocation::ordinary)
+            .collect()
     }
 
     #[test]
@@ -1095,9 +1558,10 @@ mod tests {
 
         assert!(admission.admitted.is_empty());
         assert_eq!(admission.rejected.len(), 1);
-        assert_eq!(admission.rejected[0].id, "call-python");
-        assert_eq!(admission.rejected[0].name, "python");
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-python");
+        assert_eq!(admission.rejected[0].logical_name(), "python");
         let result: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+        assert_eq!(result["status"], "rejected");
         assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
         assert_eq!(result["retryable"], true);
         assert!(
@@ -1123,53 +1587,174 @@ mod tests {
 
         assert!(admission.rejected.is_empty());
         assert_eq!(
-            admission.admitted,
-            vec![json!({
+            admission.admitted[0].logical_target_call(),
+            &json!({
                 "id": "call-bash",
                 "type": "function",
                 "function": {
                     "name": "bash",
                     "arguments": "{\"command\":\"ls\"}"
                 }
-            })]
+            })
         );
     }
 
     #[test]
-    fn admission_canonicalizes_equivalent_shapes_and_rejects_name_conflicts() {
-        let equivalent = vec![
-            json!({
-                "id": "call-flat",
+    fn text_only_settlement_rejects_valid_calls_without_admitting_execution() {
+        let calls = vec![json!({
+            "id": "call-bash",
+            "type": "function",
+            "function": {
                 "name": "bash",
-                "arguments": {"command": "ls"}
+                "arguments": "{\"command\":\"touch should-not-run\"}"
+            }
+        })];
+
+        let admission = reject_tool_calls_at_text_only_boundary(&calls, Some("tool_calls"));
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-bash");
+        let result: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+        assert_eq!(result["error_kind"], "text_only_settlement_tool_call");
+        assert_eq!(result["retryable"], false);
+        assert_eq!(
+            admission.rejected[0].invocation.physical_provider_call()["function"]["name"],
+            "bash"
+        );
+    }
+
+    #[test]
+    fn admission_canonicalizes_provider_representation_without_legacy_shapes() {
+        let provider_calls = vec![
+            json!({
+                "id": "call-read",
+                "function": {"name": "read_file", "arguments": "{ \"path\": \"README.md\", \"line_end\": 2 }"}
             }),
             json!({
-                "id": "call-nested",
+                "id": "call-bash",
                 "type": "function",
-                "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+                "function": {"name": "bash", "arguments": "{\n \"command\": \"ls\"\n}"}
             }),
         ];
-        let admitted = admit_tool_calls(&equivalent, None);
+        let admitted = admit_tool_calls(&provider_calls, None);
         assert!(admitted.rejected.is_empty());
-        assert_eq!(
-            admitted.admitted[0]["function"],
-            admitted.admitted[1]["function"]
-        );
+        assert_eq!(admitted.admitted.len(), 2);
+        assert_eq!(admitted.admitted[0]["type"], "function");
+        validate_tool_call_admission_partition(&provider_calls, &admitted).unwrap();
 
-        let conflicting = vec![json!({
-            "id": "call-conflict",
+        let legacy_flat = vec![json!({
+            "id": "call-flat",
             "name": "bash",
-            "arguments": {"command": "ls"},
-            "function": {"name": "python", "arguments": "{\"command\":\"ls\"}"}
+            "arguments": {"command": "ls"}
         })];
-        let rejected = admit_tool_calls(&conflicting, None);
+        let rejected = admit_tool_calls(&legacy_flat, None);
         assert!(rejected.admitted.is_empty());
         assert_eq!(rejected.rejected.len(), 1);
         assert!(
             rejected.rejected[0]
                 .result
-                .contains("top-level and function names conflict")
+                .contains("top-level tool name or arguments are not supported")
         );
+        validate_tool_call_admission_partition(&legacy_flat, &rejected).unwrap();
+    }
+
+    #[test]
+    fn admission_exhaustively_partitions_mixed_valid_and_malformed_calls() {
+        let calls = vec![
+            json!({
+                "id": "call-valid",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"pwd\"}"}
+            }),
+            json!({
+                "id": "call-broken",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":"}
+            }),
+        ];
+
+        let admission = admit_tool_calls(&calls, None);
+
+        assert_eq!(admission.admitted.len(), 1);
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(admission.admitted[0]["id"], "call-valid");
+        assert_eq!(admission.rejected[0].provider_call_id(), "call-broken");
+        validate_tool_call_admission_partition(&calls, &admission).unwrap();
+    }
+
+    #[test]
+    fn provider_identity_errors_never_mint_or_partially_admit_calls() {
+        for calls in [
+            vec![json!({
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            })],
+            vec![
+                json!({
+                    "id": "duplicate",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }),
+                json!({
+                    "id": "duplicate",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+                }),
+            ],
+        ] {
+            assert!(validate_provider_tool_call_identities(&calls).is_err());
+            let admission = admit_tool_calls(&calls, None);
+            assert!(admission.admitted.is_empty());
+            assert_eq!(admission.rejected.len(), calls.len());
+            assert!(admission.rejected.iter().all(|call| {
+                serde_json::from_str::<Value>(&call.result).unwrap()["error_kind"]
+                    == "provider_tool_identity_invalid"
+            }));
+        }
+    }
+
+    #[test]
+    fn admission_partition_validator_detects_silently_dropped_calls() {
+        let calls = vec![
+            json!({
+                "id": "call-a",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }),
+            json!({
+                "id": "call-b",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+            }),
+        ];
+        let mut admission = admit_tool_calls(&calls, None);
+        admission.admitted.pop();
+
+        assert!(validate_tool_call_admission_partition(&calls, &admission).is_err());
+    }
+
+    #[test]
+    fn admission_partition_validator_rejects_tampered_carriers() {
+        let calls = vec![json!({
+            "id": "call-a",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let mut admitted = admit_tool_calls(&calls, None);
+        admitted.admitted[0] = CanonicalToolInvocation::ordinary(json!({
+            "id": "call-a",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "not-json"}
+        }));
+        assert!(validate_tool_call_admission_partition(&calls, &admitted).is_err());
+
+        let mut rejected = reject_tool_calls_at_text_only_boundary(&calls, None);
+        rejected.rejected[0] = RejectedToolCall::ordinary(
+            json!({"id":"other","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            rejected.rejected[0].result.clone(),
+        );
+        assert!(validate_tool_call_admission_partition(&calls, &rejected).is_err());
     }
 
     #[tokio::test]
@@ -1192,21 +1777,24 @@ mod tests {
             &mut state,
             &turn_result,
             &admission.admitted,
+            &[],
             admission.rejected,
             false,
             &valid_tool_names,
         )
         .await;
 
-        assert_eq!(prepared.tool_calls.len(), 1);
-        assert_eq!(prepared.tool_calls[0]["id"], "call-python");
+        assert_eq!(prepared.physical_tool_calls.len(), 1);
+        assert_eq!(prepared.physical_tool_calls[0]["id"], "call-python");
         assert_eq!(
-            prepared.tool_calls[0]["function"]["arguments"],
+            prepared.physical_tool_calls[0]["function"]["arguments"],
             serde_json::Value::String("{}".to_string())
         );
         assert_eq!(prepared.pre_resolved_results.len(), 1);
-        assert_eq!(prepared.pre_resolved_results[0].0, "call-python");
-        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].1).unwrap();
+        assert_eq!(prepared.pre_resolved_results[0].call_id, "call-python");
+        let result: Value =
+            serde_json::from_str(&prepared.pre_resolved_results[0].content).unwrap();
+        assert_eq!(result["status"], "rejected");
         assert_eq!(result["error_kind"], "tool_call_arguments_invalid");
         assert!(
             result["error"]
@@ -1219,6 +1807,237 @@ mod tests {
             state.stall.tool_call_records[0].disposition,
             Some(astra_services::session_journal::ToolCallDisposition::Rejected)
         );
+        assert!(
+            state.stall.tool_call_records[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cut off at the model output limit")),
+            "the audit record must preserve the actual structured rejection cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_round_retains_runtime_control_provenance_by_call_id() {
+        let mut state = make_state();
+        let call = json!({
+            "id": "server-work-admission-t1-r0",
+            "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        });
+        let mut turn_result = empty_host_turn_result();
+        turn_result.accum.tool_calls = vec![call.clone()];
+        let invocation = CanonicalToolInvocation::runtime_control(
+            call.clone(),
+            RuntimeControlInvocationKind::WorkEstablishment,
+        )
+        .expect("host-created lifecycle call has matching typed operation");
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &[invocation],
+            std::slice::from_ref(&call),
+            Vec::new(),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(
+            prepared
+                .runtime_control_calls_by_id
+                .get(call["id"].as_str().unwrap()),
+            Some(&RuntimeControlInvocationKind::WorkEstablishment)
+        );
+        assert!(prepared.deferred_activations_by_call_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paired_round_keeps_carrier_in_history_and_logical_target_in_execution_view() {
+        let carrier = json!({
+            "id": "deferred-first",
+            "type": "function",
+            "function": {
+                "name": "invoke_tool",
+                "arguments": "{\"name\":\"web_fetch\",\"arguments\":{\"url\":\"https://example.test\"}}"
+            }
+        });
+        let direct = json!({
+            "id": "direct-second",
+            "type": "function",
+            "function": {"name":"read_file","arguments":"{\"path\":\"README.md\"}"}
+        });
+        let activation = astra_turn_types::DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: "sha256:current".to_string(),
+            descriptor: None,
+        };
+        let deferred =
+            astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
+                &carrier,
+                &[activation],
+                |name| (name == "web_fetch").then_some("sha256:current".to_string()),
+            )
+            .expect("valid carrier protocol")
+            .expect("carrier must resolve");
+        let direct = CanonicalToolInvocation::ordinary(direct);
+        let logical = vec![
+            deferred.logical_target_call().clone(),
+            direct.logical_target_call().clone(),
+        ];
+        let mut turn_result = empty_host_turn_result();
+        turn_result.accum.tool_calls = vec![
+            deferred.physical_provider_call().clone(),
+            direct.physical_provider_call().clone(),
+        ];
+        let mut state = make_state();
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &[deferred, direct],
+            &logical,
+            Vec::new(),
+            false,
+            &HashSet::from(["web_fetch".to_string(), "read_file".to_string()]),
+        )
+        .await;
+
+        assert_eq!(
+            prepared
+                .physical_tool_calls
+                .iter()
+                .map(|call| astra_turn_core::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec![Some("invoke_tool"), Some("read_file")]
+        );
+        assert_eq!(
+            prepared
+                .logical_tool_calls
+                .iter()
+                .map(|call| astra_turn_core::tool::args::shape::tool_call_name(call))
+                .collect::<Vec<_>>(),
+            vec![Some("web_fetch"), Some("read_file")]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_rejection_preserves_canonical_cause_and_arguments() {
+        let mut state = make_state();
+        state.step_recorder.begin_turn(1);
+        let turn_result = empty_host_turn_result();
+        let rejected = RejectedToolCall::ordinary(
+            json!({
+                "id": "call-web",
+                "type": "function",
+                "function": {
+                    "name": "web_fetch",
+                    "arguments": "{\"url\":\"https://example.test\"}"
+                }
+            }),
+            json!({
+                "status": "rejected",
+                "error_kind": "typed_policy_rejection",
+                "retryable": false,
+                "error": "typed policy denied this execution role"
+            })
+            .to_string(),
+        );
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &[],
+            &[],
+            vec![rejected],
+            false,
+            &HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(prepared.pre_resolved_results.len(), 1);
+        let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].content)
+            .expect("structured policy rejection result");
+        assert_eq!(result["status"], "rejected");
+        let record = &state.stall.tool_call_records[0];
+        assert_eq!(record.tool_call_id.as_deref(), Some("call-web"));
+        assert_eq!(
+            record.error.as_deref(),
+            Some("typed policy denied this execution role")
+        );
+        assert_eq!(
+            record.args_full.as_deref(),
+            Some("{\"url\":\"https://example.test\"}")
+        );
+        assert_eq!(
+            record.disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+        let tool_events = state
+            .step_recorder
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+                        | astra_pipeline::step_protocol::StepEventType::ToolCallFailed
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_events.len(), 2);
+        assert_eq!(
+            tool_events[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["call_id"].as_str()),
+            Some("call-web")
+        );
+        assert_eq!(
+            tool_events[1]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["is_error"].as_bool()),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_argument_records_are_display_safe() {
+        let mut state = make_state();
+        state.step_recorder.begin_turn(1);
+        let rejected = RejectedToolCall::ordinary(
+            json!({
+                "id": "call-bash-secret",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"tool --token hf_abcdefghijklmnopqrstuvwxyz123456\"}"
+                }
+            }),
+            json!({
+                "status": "rejected",
+                "error_kind": "typed_policy_rejection",
+                "error": "typed policy denied this execution role"
+            })
+            .to_string(),
+        );
+
+        prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &[],
+            &[],
+            vec![rejected],
+            false,
+            &HashSet::new(),
+        )
+        .await;
+
+        let record = &state.stall.tool_call_records[0];
+        let args_full = record.args_full.as_deref().expect("record arguments");
+        assert!(!args_full.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(args_full.contains("[REDACTED:TOKEN_ARGUMENT]"));
     }
 
     fn empty_host_turn_result() -> HostTurnResult {
@@ -1251,7 +2070,10 @@ mod tests {
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
         assert!(notice.contains("read_file"));
+        assert!(notice.contains("permits at most"));
+        assert!(notice.contains("current tool surface is authoritative"));
         assert!(notice.contains("Skill `allowed_tools` stays a prompt hint"));
+        assert!(!notice.contains("tools are callable"));
     }
 
     #[test]
@@ -1264,6 +2086,10 @@ mod tests {
         let ctx = build_skill_context(&state);
 
         assert_eq!(ctx.extra.get("turn_number").map(String::as_str), Some("12"));
+        assert!(
+            !ctx.extra.contains_key("turns_remaining"),
+            "skill prompts must not gain completion authority from runtime budget telemetry"
+        );
     }
 
     #[test]
@@ -1274,14 +2100,16 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        state.skills.allowed_tools = Some(["read_file".to_string()].into_iter().collect());
-        state.skills.invoked.insert(
+        state.skills.execution.allowed_tools =
+            Some(["read_file".to_string()].into_iter().collect());
+        state.skills.execution.invoked.insert(
             "old-skill".into(),
             crate::turn::skill_tool::InvokedSkill {
                 name: "old-skill".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -1310,14 +2138,15 @@ mod tests {
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
-        assert!(notice.contains("no allowlist-governed non-skill tools are currently callable"));
+        assert!(notice.contains("permits no allowlist-governed non-skill tools"));
+        assert!(notice.contains("Authorization is only an upper bound"));
     }
 
     #[test]
     fn runtime_tool_allowlist_notice_lists_all_request_permitted_tools() {
         let mut state = make_state();
         state.skills.request_constraints.allowed_tools = Some(
-            ["read_file", "task_board", "notify", "ask_user"]
+            ["read_file", "session", "notify", "ask_user"]
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -1325,11 +2154,14 @@ mod tests {
 
         let notice = runtime_tool_allowlist_notice(&state).expect("notice should be emitted");
 
-        // All requested tools appear in the callable list.
+        // All requested tools appear in the authorization upper bound. The
+        // notice must not turn that policy fact into a provider-readiness claim.
         assert!(notice.contains("read_file"));
-        assert!(notice.contains("task_board"));
+        assert!(notice.contains("session"));
         assert!(notice.contains("notify"));
         assert!(notice.contains("ask_user"));
+        assert!(notice.contains("does not assert provider availability"));
+        assert!(!notice.contains("tools are callable"));
         // No separate control-plane exemption clause needed — they are
         // listed inline when permitted by the request policy.
     }
@@ -1362,7 +2194,7 @@ mod tests {
         assert!(!runtime_allows_tool(&state, "web_search"));
         assert!(!runtime_allows_tool(&state, "web_fetch"));
         assert!(runtime_allows_tool(&state, "memory"));
-        assert!(runtime_allows_tool(&state, "task_board"));
+        assert!(runtime_allows_tool(&state, "session"));
 
         state
             .skills
@@ -1376,54 +2208,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_interception_respects_valid_tool_names() {
-        let (mut parent, child) = setup_mailboxes().await;
-        let mut state = make_state();
-        state.messaging.mailbox = Some(child);
-
-        let tool_calls = vec![json!({
-            "id": "call-send-1",
-            "type": "function",
-            "function": {
-                "name": "send_message",
-                "arguments": r#"{"target":"parent","content":"blocked","message_type":"text"}"#
-            }
-        })];
-
-        let (results, remaining, communication_events) =
-            intercept_send_message_calls(&mut state, &tool_calls, &HashSet::new()).await;
-
-        assert!(
-            results.is_empty(),
-            "disallowed send_message should not be intercepted"
-        );
-        assert_eq!(
-            remaining, tool_calls,
-            "tool call should remain for unknown-tool handling"
-        );
-        assert!(communication_events.is_empty());
-        assert!(
-            parent.try_recv().is_none(),
-            "no message should be delivered when send_message is disallowed"
-        );
-    }
-
-    #[tokio::test]
     async fn prepare_intercepted_tool_round_does_not_block_tools_just_because_skill_hint_omits_them()
      {
         let mut state = make_state();
-        state.skills.allowed_tools = Some(
+        state.skills.execution.allowed_tools = Some(
             [" Bash ".to_string(), "READ_FILE".to_string()]
                 .into_iter()
                 .collect(),
         );
-        state.skills.invoked.insert(
+        state.skills.execution.invoked.insert(
             "review-changes".into(),
             crate::turn::skill_tool::InvokedSkill {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -1442,6 +2242,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1450,7 +2251,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            prepared.tool_calls.len(),
+            prepared.physical_tool_calls.len(),
             2,
             "assistant tool calls stay intact"
         );
@@ -1463,22 +2264,23 @@ mod tests {
     #[tokio::test]
     async fn prepare_intercepted_tool_round_keeps_all_tools_when_only_skill_hint_is_present() {
         let mut state = make_state();
-        state.skills.allowed_tools = Some(["bash".to_string()].into_iter().collect());
-        state.skills.invoked.insert(
+        state.skills.execution.allowed_tools = Some(["bash".to_string()].into_iter().collect());
+        state.skills.execution.invoked.insert(
             "review-changes".into(),
             crate::turn::skill_tool::InvokedSkill {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
         let tool_calls = vec![
             json!({
-                "id": "call-task",
+                "id": "call-session",
                 "type": "function",
-                "function": { "name": "task_board", "arguments": r#"{"action":"list"}"# }
+                "function": { "name": "session", "arguments": r#"{"action":"info"}"# }
             }),
             json!({
                 "id": "call-notify",
@@ -1499,11 +2301,12 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
             &HashSet::from([
-                "task_board".to_string(),
+                "session".to_string(),
                 "notify".to_string(),
                 "ask_user".to_string(),
                 "str_replace".to_string(),
@@ -1518,42 +2321,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_intercepted_tool_round_still_blocks_task_when_request_allowlist_excludes_it() {
+    async fn prepare_intercepted_tool_round_blocks_control_tool_excluded_by_request_allowlist() {
         let mut state = make_state();
         state.skills.request_constraints.allowed_tools =
             Some(["bash".to_string()].into_iter().collect());
-        state.skills.allowed_tools = Some(["bash".to_string()].into_iter().collect());
-        state.skills.invoked.insert(
+        state.skills.execution.allowed_tools = Some(["bash".to_string()].into_iter().collect());
+        state.skills.execution.invoked.insert(
             "review-changes".into(),
             crate::turn::skill_tool::InvokedSkill {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
         let tool_calls = vec![json!({
-            "id": "call-task",
+            "id": "call-session",
             "type": "function",
-            "function": { "name": "task_board", "arguments": r#"{"action":"list"}"# }
+            "function": { "name": "session", "arguments": r#"{"action":"info"}"# }
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
-            &HashSet::from(["task_board".to_string(), "bash".to_string()]),
+            &HashSet::from(["session".to_string(), "bash".to_string()]),
         )
         .await;
 
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| { call_id == "call-task" && result.contains("BLOCKED:") }),
-            "request allowlists should still be able to suppress task"
+            prepared.pre_resolved_results.iter().any(|result| {
+                result.call_id == "call-session" && result.content.contains("BLOCKED:")
+            }),
+            "request allowlists must still suppress excluded control-plane tools"
         );
     }
 
@@ -1584,6 +2388,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1591,14 +2396,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-bash" && result.contains("Allowed tools: none")
-                })
-        );
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-bash" && result.content.contains("Allowed tools: none")
+        }));
     }
 
     #[tokio::test]
@@ -1625,6 +2425,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1633,19 +2434,58 @@ mod tests {
         .await;
 
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(id, msg)| id == "call-rf" && msg.contains("BLOCKED:")),
+            prepared.pre_resolved_results.iter().any(|result| {
+                result.call_id == "call-rf" && result.content.contains("BLOCKED:")
+            }),
             "request-only allowlist should block read_file"
         );
         assert!(
             prepared
                 .pre_resolved_results
                 .iter()
-                .all(|(id, _)| id != "call-bash"),
+                .all(|result| result.call_id != "call-bash"),
             "request-only allowlist should leave allowed bash alone"
         );
+    }
+
+    #[tokio::test]
+    async fn allowlist_blocked_tool_preview_is_display_safe() {
+        let mut state = make_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["read_file".to_string()].into_iter().collect());
+        let raw_token = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let tool_calls = vec![json!({
+            "id": "call-blocked-secret",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": format!("{{\"command\":\"tool --token {raw_token}\"}}")
+            }
+        })];
+
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
+            &tool_calls,
+            Vec::new(),
+            false,
+            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
+        )
+        .await;
+
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-blocked-secret" && result.content.contains("BLOCKED:")
+        }));
+        let record = state
+            .stall
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("call-blocked-secret"))
+            .expect("blocked call should be recorded");
+        let preview = record.args_preview.as_deref().unwrap_or_default();
+        assert!(!preview.contains(raw_token));
+        assert!(preview.contains("[REDACTED:TOKEN_ARGUMENT]"));
     }
 
     #[tokio::test]
@@ -1670,6 +2510,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1683,10 +2524,9 @@ mod tests {
         // is fine — the assertion is purely "the allowlist gate didn't
         // mistake it for a denied tool".)
         assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .all(|(id, msg)| id != "call-skill-mixed" || !msg.contains("BLOCKED:")),
+            prepared.pre_resolved_results.iter().all(|result| {
+                result.call_id != "call-skill-mixed" || !result.content.contains("BLOCKED:")
+            }),
             "mixed-case Skill must not be blocked by the allowlist gate"
         );
     }
@@ -1705,6 +2545,7 @@ mod tests {
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
+            &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
             false,
@@ -1712,14 +2553,10 @@ mod tests {
         )
         .await;
 
-        assert!(
-            prepared
-                .pre_resolved_results
-                .iter()
-                .any(|(call_id, result)| {
-                    call_id == "call-empty" && result.contains("Tool name is missing or empty")
-                })
-        );
+        assert!(prepared.pre_resolved_results.iter().any(|result| {
+            result.call_id == "call-empty"
+                && result.content.contains("Tool name is missing or empty")
+        }));
     }
 
     /// Verify that surgical removal stubs and skill result records preserve
@@ -1818,13 +2655,14 @@ mod tests {
         use crate::turn::skill_tool::{InvokedSkill, SKILL_TOOL_NAME};
 
         let mut state = make_state();
-        state.skills.invoked.insert(
+        state.skills.execution.invoked.insert(
             "review-changes".into(),
             InvokedSkill {
                 name: "review-changes".into(),
                 content: "# Skill: review-changes".into(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -1863,7 +2701,10 @@ mod tests {
         );
         assert_eq!(meta1.reentry_count, 1);
         assert!(!meta1.locked_out);
-        assert_eq!(state.skills.invoked["review-changes"].reentry_count, 1);
+        assert_eq!(
+            state.skills.execution.invoked["review-changes"].reentry_count,
+            1
+        );
 
         // 2nd re-entry: escalates to STOP.
         let (dedup2, _) = super::dedup_skill_calls(&mut state, &[make_call("c2")]);
@@ -1884,7 +2725,10 @@ mod tests {
             !meta2.locked_out,
             "reentry=2 is STOP but not yet locked out"
         );
-        assert_eq!(state.skills.invoked["review-changes"].reentry_count, 2);
+        assert_eq!(
+            state.skills.execution.invoked["review-changes"].reentry_count,
+            2
+        );
 
         // 3rd re-entry: hard lockout — BLOCKED + locked_out=true.
         let (dedup3, _) = super::dedup_skill_calls(&mut state, &[make_call("c3")]);
@@ -1896,7 +2740,10 @@ mod tests {
         );
         assert!(meta3.locked_out);
         assert_eq!(meta3.reentry_count, 3);
-        assert_eq!(state.skills.invoked["review-changes"].reentry_count, 3);
+        assert_eq!(
+            state.skills.execution.invoked["review-changes"].reentry_count,
+            3
+        );
         assert_eq!(
             state.stall.events.len(),
             1,
@@ -1914,6 +2761,212 @@ mod tests {
             state.stall.events.len(),
             2,
             "every locked-out call pushes a fresh stall signal"
+        );
+    }
+
+    #[test]
+    fn shared_deferred_resolver_keeps_physical_identity_and_fails_closed() {
+        let carrier = json!({
+            "id": "carrier-1",
+            "type": "function",
+            "function": {
+                "name": "invoke_tool",
+                "arguments": r#"{"name":"web_fetch","arguments":{"url":"https://example.test"}}"#
+            }
+        });
+        let activation = DeferredToolActivation {
+            name: "web_fetch".to_string(),
+            schema_digest: "sha256:current".to_string(),
+            descriptor: Some(
+                astra_turn_types::ResolvedToolDescriptorRef::new(
+                    astra_turn_types::ToolIdentity::new(
+                        astra_turn_types::ProviderBindingRef::new("test-provider").unwrap(),
+                        astra_turn_types::NativeToolId::new("web_fetch").unwrap(),
+                    ),
+                    "sha256:provider-schema".to_string(),
+                )
+                .unwrap(),
+            ),
+        };
+        let admitted = super::admit_tool_calls(std::slice::from_ref(&carrier), Some("tool_calls"));
+        let resolved = super::resolve_deferred_tool_admission(admitted, &[activation], |name| {
+            (name == "web_fetch").then_some("sha256:current".to_string())
+        });
+
+        assert!(resolved.rejected.is_empty());
+        assert_eq!(resolved.admitted.len(), 1);
+        assert_eq!(resolved.admitted[0].provider_call_id(), Some("carrier-1"));
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resolved.admitted[0].physical_provider_call()
+            ),
+            Some("invoke_tool")
+        );
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resolved.admitted[0].logical_target_call()
+            ),
+            Some("web_fetch")
+        );
+
+        // A matching compact digest is not an execution identity.  The
+        // provider-owned descriptor must be present even when the schema has
+        // not changed; otherwise a resumed/name-only projection could cross
+        // a provider rebind merely because its public schema still hashes the
+        // same way.
+        let descriptorless_same_digest = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "carrier-descriptorless",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:current".to_string(),
+                descriptor: None,
+            }],
+            |_| Some("sha256:current".to_string()),
+        );
+        assert!(descriptorless_same_digest.admitted.is_empty());
+        assert_eq!(descriptorless_same_digest.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&descriptorless_same_digest.rejected[0].result,)
+                .expect("structured descriptor rejection")["error_kind"],
+            "deferred_tool_descriptor_stale",
+            "a digest-only activation must never become a dispatch grant"
+        );
+
+        let stale = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "carrier-2",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:selected".to_string(),
+                descriptor: None,
+            }],
+            |_| Some("sha256:changed".to_string()),
+        );
+        assert!(stale.admitted.is_empty());
+        assert_eq!(stale.rejected.len(), 1);
+        assert_eq!(stale.rejected[0].provider_call_id(), "carrier-2");
+        assert_eq!(
+            serde_json::from_str::<Value>(&stale.rejected[0].result).expect("structured rejection")
+                ["error_kind"],
+            "deferred_tool_activation_invalid"
+        );
+
+        let capability_removed = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(&[carrier], Some("tool_calls")),
+            &[DeferredToolActivation {
+                name: "web_fetch".to_string(),
+                schema_digest: "sha256:current".to_string(),
+                descriptor: None,
+            }],
+            |_| None,
+        );
+        assert!(capability_removed.admitted.is_empty());
+        assert_eq!(capability_removed.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&capability_removed.rejected[0].result)
+                .expect("structured rejection")["error_kind"],
+            "deferred_tool_activation_invalid",
+            "historical evidence must not revive a capability absent from the current surface"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_parallel_skill_never_enters_trusted_invocation_ledger() {
+        struct FailingParallelResolver;
+
+        impl astra_skills::traits::SkillResolver for FailingParallelResolver {
+            fn resolve(
+                &self,
+                name: &str,
+            ) -> Result<astra_skills::traits::ResolvedSkill, astra_skills::SkillError> {
+                Ok(astra_skills::traits::ResolvedSkill {
+                    name: name.to_string(),
+                    instructions: "Parallel workflow".to_string(),
+                    max_tokens: None,
+                    allowed_tools: Vec::new(),
+                    execution_context: astra_skills::manifest::ExecutionContext::Inline,
+                    hooks: astra_skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: astra_skills::manifest::SkillSourceKind::Local,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: Some(json!({
+                        "properties": {"target_path": {"type": "string"}},
+                        "required": ["target_path"]
+                    })),
+                    output_schema: None,
+                    remote_url: None,
+                    forward_headers: Vec::new(),
+                    required_headers: Vec::new(),
+                    aliases: Vec::new(),
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: astra_skills::manifest::TrustTier::Bundled,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<astra_skills::traits::SkillToolInfo> {
+                vec![astra_skills::traits::SkillToolInfo {
+                    name: "parallel-review".to_string(),
+                    description: "parallel review".to_string(),
+                    source: astra_skills::manifest::SkillSourceKind::Local,
+                    ..Default::default()
+                }]
+            }
+
+            fn execution_topology(
+                &self,
+                name: &str,
+            ) -> Option<astra_skills::manifest::SkillExecutionTopology> {
+                (name == "parallel-review")
+                    .then_some(astra_skills::manifest::SkillExecutionTopology::ParallelSubruns)
+            }
+        }
+
+        let mut state = make_state();
+        state.skills.resolver = Some(Arc::new(FailingParallelResolver));
+        let intercepted = super::intercept_skill_calls(
+            &mut state,
+            &[json!({
+                "id": "failed-parallel-skill",
+                "type": "function",
+                "function": {
+                    "name": "skill",
+                    "arguments": r#"{"skill_name":"parallel-review"}"#
+                }
+            })],
+        )
+        .await;
+
+        assert_eq!(intercepted.results.len(), 1);
+        assert!(!intercepted.results[0].ok);
+        assert!(!intercepted.results[0].result.contains("<skill-loaded"));
+        assert!(
+            !state
+                .skills
+                .execution
+                .invoked
+                .contains_key("parallel-review"),
+            "a failed skill must not grant typed parallel topology authority"
         );
     }
 }

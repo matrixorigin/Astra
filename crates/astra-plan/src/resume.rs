@@ -1,11 +1,9 @@
 //! Compact plan-resume summaries and prompt hints.
 
-use astra_services::task_orchestrator::TaskStatus;
-
 use crate::{repository::PlanRepository, state::PlanModeState};
 
 const MAX_PLAN_RESUME_GOAL_CHARS: usize = 160;
-const MAX_PLAN_RESUME_SUBTASK_CHARS: usize = 80;
+const MAX_PLAN_RESUME_DRAFT_CHARS: usize = 320;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanResumeSnapshot {
@@ -27,24 +25,14 @@ fn truncate_plan_resume_text(text: &str, max_chars: usize) -> String {
 
 pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
     let goal = state.goal.trim();
-    let subtasks = &state.plan.subtasks;
-    if goal.is_empty() && subtasks.is_empty() {
+    let draft = state
+        .plan_md
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if goal.is_empty() && draft.is_none() {
         return None;
     }
-
-    let total = subtasks.len();
-    let done = subtasks
-        .iter()
-        .filter(|subtask| subtask.status == TaskStatus::Completed)
-        .count();
-    let open = subtasks
-        .iter()
-        .filter(|subtask| !subtask.status.is_terminal() && subtask.status != TaskStatus::InProgress)
-        .count();
-    let in_progress_title = subtasks
-        .iter()
-        .find(|subtask| subtask.status == TaskStatus::InProgress)
-        .map(|subtask| truncate_plan_resume_text(&subtask.title, MAX_PLAN_RESUME_SUBTASK_CHARS));
 
     let mut out = String::from("[plan-resume]");
     if !goal.is_empty() {
@@ -53,41 +41,31 @@ pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
             truncate_plan_resume_text(goal, MAX_PLAN_RESUME_GOAL_CHARS)
         ));
     }
-    if let Some(title) = in_progress_title {
-        out.push_str(&format!(" · in_progress=\"{title}\""));
-    }
-    if total > 0 {
-        out.push_str(&format!(" · open={open} · done={done}/{total}"));
+    if let Some(draft) = draft {
+        out.push_str(&format!(
+            " · draft=\"{}\"",
+            truncate_plan_resume_text(draft, MAX_PLAN_RESUME_DRAFT_CHARS)
+        ));
     }
     Some(out)
 }
 
 pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
     let digest = plan_resume_digest(state)?;
-    let guidance = if state.plan.subtasks.is_empty() {
-        "A plan draft is currently attached to this session, but it has no executable \
-         subtasks yet. Stay in planning/decomposition mode until the work is broken \
-         down, and only call `exit_plan_mode` once the draft is either approved or \
-         intentionally abandoned."
-    } else {
-        "A plan is currently in-flight for this session. Treat the next turn as a \
-         continuation — resume from the in-progress subtask, respect the approved \
-         plan structure, and call `exit_plan_mode` only if the plan needs to be \
-         abandoned before completion."
-    };
+    let guidance = "A plan draft is awaiting trusted user review for this session. \
+        Stay in read-only planning mode, refine the proposal, and call \
+        `exit_plan_mode(plan='...')` to submit the current draft. Do not treat \
+        task or Work execution progress as approval.";
     Some(format!("\n\n## Active Plan\n{digest}\n\n{guidance}"))
 }
 
-pub fn plan_mode_authoring_active(state: &PlanModeState) -> bool {
-    let has_subtasks = !state.plan.subtasks.is_empty();
-    let any_in_progress = state
-        .plan
-        .subtasks
-        .iter()
-        .any(|subtask| subtask.status == TaskStatus::InProgress);
-    let items_done = state.plan.items_done() > 0;
-    let progress_complete = state.plan.progress_pct() == 100;
-    !has_subtasks || (!any_in_progress && !items_done && !progress_complete)
+/// A loaded plan reached through the session's `active_plan_id` is authoring.
+///
+/// Approval is an explicit control-plane transition that clears the active
+/// binding. Inferring approval from embedded task/subtask progress creates a
+/// second authority and can silently release the write guard.
+pub fn plan_mode_authoring_active(_state: &PlanModeState) -> bool {
+    true
 }
 
 /// Build a plan-resume snapshot for the session's active plan, if any.
@@ -124,9 +102,12 @@ pub async fn plan_resume_snapshot_for_session(
                 %session_id,
                 %plan_id,
                 error = %err,
-                "plan resume: active plan exists but load failed; skipping hint"
+                "plan resume: active plan exists but draft load failed; retaining write guard without hint"
             );
-            PlanResumeSnapshot::default()
+            PlanResumeSnapshot {
+                authoring_active: true,
+                prompt_hint: None,
+            }
         }
     }
 }
@@ -147,7 +128,7 @@ pub async fn plan_resume_hint_for_session(
 
 #[cfg(test)]
 mod tests {
-    use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+    use crate::{SubtaskPlan, TaskStatus};
 
     use super::*;
 
@@ -157,36 +138,15 @@ mod tests {
     }
 
     #[test]
-    fn plan_resume_prompt_hint_formats_goal_and_active_subtask() {
+    fn plan_resume_prompt_hint_formats_goal_and_draft_without_task_progress() {
         let mut state = PlanModeState::new("Ship auth overhaul".into());
-        state.plan.subtasks = vec![
-            SubtaskPlan {
-                id: "a".into(),
-                title: "schema".into(),
-                status: TaskStatus::Completed,
-                ..Default::default()
-            },
-            SubtaskPlan {
-                id: "b".into(),
-                title: "middleware refactor".into(),
-                status: TaskStatus::InProgress,
-                ..Default::default()
-            },
-            SubtaskPlan {
-                id: "c".into(),
-                title: "tests".into(),
-                status: TaskStatus::Pending,
-                ..Default::default()
-            },
-        ];
+        state.plan_md = Some("1. Inspect schema\n2. Refactor middleware".into());
 
         let hint = plan_resume_prompt_hint(&state).expect("hint");
         assert!(hint.contains("## Active Plan"), "{hint}");
         assert!(hint.contains("goal=\"Ship auth overhaul\""), "{hint}");
-        assert!(
-            hint.contains("in_progress=\"middleware refactor\""),
-            "{hint}"
-        );
+        assert!(hint.contains("draft=\"1. Inspect schema"), "{hint}");
+        assert!(!hint.contains("in_progress"), "{hint}");
     }
 
     #[test]
@@ -194,15 +154,11 @@ mod tests {
         let state = PlanModeState::new("Design slash commands".into());
         let hint = plan_resume_prompt_hint(&state).expect("hint");
         assert!(hint.contains("goal=\"Design slash commands\""), "{hint}");
-        assert!(hint.contains("no executable subtasks yet"), "{hint}");
-        assert!(
-            !hint.contains("resume from the in-progress subtask"),
-            "{hint}"
-        );
+        assert!(hint.contains("awaiting trusted user review"), "{hint}");
     }
 
     #[test]
-    fn plan_mode_authoring_active_tracks_authoring_not_prompt_presence() {
+    fn active_plan_binding_remains_authoring_regardless_of_task_progress() {
         let empty_draft = PlanModeState::new("Draft provider model".into());
         assert!(plan_mode_authoring_active(&empty_draft));
         assert!(plan_resume_prompt_hint(&empty_draft).is_some());
@@ -218,12 +174,12 @@ mod tests {
 
         let mut executing_plan = pending_draft.clone();
         executing_plan.plan.subtasks[0].status = TaskStatus::InProgress;
-        assert!(!plan_mode_authoring_active(&executing_plan));
+        assert!(plan_mode_authoring_active(&executing_plan));
         assert!(plan_resume_prompt_hint(&executing_plan).is_some());
 
         let mut completed_plan = pending_draft;
         completed_plan.plan.subtasks[0].status = TaskStatus::Completed;
-        assert!(!plan_mode_authoring_active(&completed_plan));
+        assert!(plan_mode_authoring_active(&completed_plan));
         assert!(plan_resume_prompt_hint(&completed_plan).is_some());
     }
 }

@@ -59,7 +59,7 @@ pub struct SelfModel {
     /// P3.1: most recent applied strategy-delta rendered as a structured
     /// before/after diff. `None` when the last reflection was a noop.
     #[serde(default)]
-    pub skill_diff: Option<crate::turn::agentic::stage_bridge::SkillDiffEntry>,
+    pub skill_diff: Option<crate::turn::agentic::strategy_application::SkillDiffEntry>,
     /// Cumulative permission-denial pressure for the current session.
     /// `None` when the permission layer is not wired up (unit tests / headless).
     /// Surfaced back into the system prompt so the agent can self-regulate
@@ -370,7 +370,7 @@ impl SelfModel {
         plan_goal: Option<&str>,
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
-        last_strategy: Option<&crate::turn::agentic::stage_bridge::StrategyApplication>,
+        last_strategy: Option<&crate::turn::agentic::strategy_application::StrategyApplication>,
     ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
@@ -410,7 +410,7 @@ impl SelfModel {
                 .into_iter()
                 .map(|hint| OutcomeMemoryHint {
                     tool_name: hint.tool_name,
-                    signature: hint.signature,
+                    signature: hint.identity.display_hint(),
                     success: hint.success,
                     failure_category: hint
                         .failure_category
@@ -580,7 +580,7 @@ impl SelfModel {
     /// that want to inject a diff independently of `last_strategy`.
     pub fn with_skill_diff(
         mut self,
-        diff: crate::turn::agentic::stage_bridge::SkillDiffEntry,
+        diff: crate::turn::agentic::strategy_application::SkillDiffEntry,
     ) -> Self {
         self.skill_diff = Some(diff);
         self
@@ -1464,7 +1464,7 @@ mod tests {
         let config = RuntimeConfig::default();
         let mut health = ToolHealthTracker::new();
         health.record_outcome(
-            r#"bash:{"command":"pwd"}"#,
+            &astra_pipeline::ToolHealthIdentity::new("bash".into(), br#"{"command":"pwd"}"#),
             astra_turn_core::tool_health::ToolOutcome {
                 success: true,
                 latency_ms: 9,
@@ -1474,7 +1474,7 @@ mod tests {
             },
         );
         health.record_outcome(
-            r#"grep:{"pattern":"TODO"}"#,
+            &astra_pipeline::ToolHealthIdentity::new("grep".into(), br#"{"pattern":"TODO"}"#),
             astra_turn_core::tool_health::ToolOutcome {
                 success: false,
                 latency_ms: 12,
@@ -1513,17 +1513,25 @@ mod tests {
             "got: {section}"
         );
         assert!(
-            section.contains(r#"grep:{"pattern":"TODO"}"#),
+            section.contains(
+                &astra_pipeline::ToolHealthIdentity::new("grep".into(), br#"{"pattern":"TODO"}"#)
+                    .display_hint()
+            ),
             "got: {section}"
         );
         assert!(
-            section.contains(r#"bash:{"command":"pwd"}"#),
+            section.contains(
+                &astra_pipeline::ToolHealthIdentity::new("bash".into(), br#"{"command":"pwd"}"#)
+                    .display_hint()
+            ),
             "got: {section}"
         );
         assert!(
             section.contains("fail[timeout]"),
             "failure category tag should be rendered alongside signature, got: {section}"
         );
+        assert!(!section.contains("TODO"));
+        assert!(!section.contains("pwd"));
     }
 
     #[test]
@@ -1693,7 +1701,7 @@ mod tests {
     #[test]
     fn snapshot_with_strategy_renders_boosted_and_widen() {
         let config = RuntimeConfig::default();
-        let app = crate::turn::agentic::stage_bridge::StrategyApplication {
+        let app = crate::turn::agentic::strategy_application::StrategyApplication {
             newly_blocked: vec![],
             already_blocked: vec![],
             widen_requested: true,
@@ -1735,7 +1743,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_skill_diff_renders_strategy_diff_line() {
-        use crate::turn::agentic::stage_bridge::{DiffSnapshot, SkillDiffEntry};
+        use crate::turn::agentic::strategy_application::{DiffSnapshot, SkillDiffEntry};
         let config = RuntimeConfig::default();
         let diff = SkillDiffEntry {
             skill: "pipeline.tool_surface_policy".to_string(),

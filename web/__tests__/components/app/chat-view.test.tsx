@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
+import type { WorkTaskGraphPageV2 } from "@astra/sdk";
 import { ChatView } from "@/components/app/chat-view";
 import { ToastProvider } from "@/components/ui/toast";
 import { WebApiError } from "@/lib/api/errors";
@@ -30,6 +31,36 @@ import {
 const pushMock = vi.fn();
 const replaceMock = vi.fn();
 const refreshMock = vi.fn();
+
+function canonicalTaskGraph(): WorkTaskGraphPageV2 {
+  return {
+    schema_version: 2,
+    scope: "declared_work",
+    basis: {
+      work_id: "work-1", work_revision: 1, goal_revision: 1, goal: "Review branch",
+      criteria_set_revision: 1, criteria_member_count: 0,
+      criteria_manifest_hash: `sha256:${"a".repeat(64)}`,
+      branch_id: "branch-1", branch_revision: 1, branch_goal_revision: 1,
+      branch_criteria_set_revision: 1, branch_basis_graph_revision: 1,
+      graph_revision: 1, graph_item_count: 1, graph_edge_count: 0,
+      graph_manifest_hash: `sha256:${"b".repeat(64)}`,
+    },
+    cursor: { graph_revision: 1, item_offset: 0, dependency_offset: 0 },
+    next_cursor: null,
+    items: {
+      offset: 0, limit: 8, total: 1,
+      entries: [{
+        item_id: "root", revision: 1, kind: "milestone",
+        objective: "Review branch", expected_result: "A reviewable branch",
+        declaration_state: "active",
+        execution: { status: "not_started", terminal: false, run: null },
+        delivery: { status: "unreported", summary: null, blocker_kind: null, unavailable_capabilities: [] },
+        verification: { status: "unknown", latest_check: null },
+      }],
+    },
+    dependencies: { offset: 0, limit: 128, total: 0, entries: [] },
+  };
+}
 
 let composerPayload: {
   text: string;
@@ -805,15 +836,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
       runId: "run-123",
-      tasks: [
-        {
-          id: "task-1",
-          title: "Review branch",
-          status: "pending",
-          created_at: "2026-06-07T00:00:00.000Z",
-          updated_at: "2026-06-07T00:00:00.000Z",
-        },
-      ],
+      taskGraph: canonicalTaskGraph(),
       events: [
         {
           type: "agent_spawned",
@@ -863,7 +886,8 @@ describe("ChatView deferred-input unhappy paths", () => {
 
     render(<ChatView initial={makeDetail()} />);
 
-    expect(await screen.findByLabelText("Background work")).toBeInTheDocument();
+    const backgroundWork = await screen.findByLabelText("Background work");
+    expect(within(backgroundWork).getAllByText("Needs attention").length).toBeGreaterThan(0);
     expect(
       screen.getByRole("button", { name: /Open tasks activity/i }),
     ).toBeInTheDocument();
@@ -914,11 +938,53 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
   });
 
+  it("keeps a terminal blocked task visible after the run has left the chat header", async () => {
+    const user = userEvent.setup();
+    const taskGraph = canonicalTaskGraph();
+    taskGraph.items.entries[0] = {
+      ...taskGraph.items.entries[0]!,
+      execution: {
+        status: "completed",
+        terminal: true,
+        run: {
+          run_id: "run-123",
+          attempt_id: "run-123",
+          graph_revision: 1,
+          run_generation: 1,
+          last_event_idx: 7,
+          updated_at: "2026-08-04T00:00:00Z",
+        },
+      },
+      delivery: {
+        status: "blocked",
+        summary: "The web capability is unavailable.",
+        blocker_kind: "capability_unavailable",
+        unavailable_capabilities: ["web_fetch"],
+      },
+    };
+    mockGetChatWorkSurface.mockResolvedValue({
+      sessionId: "chat-123",
+      runId: "run-123",
+      taskGraph,
+      events: [],
+      generatedAt: "2026-08-04T00:00:01Z",
+    });
+
+    render(<ChatView initial={makeDetail(null)} />);
+
+    const backgroundWork = await screen.findByLabelText("Background work");
+    expect(within(backgroundWork).getByText("Needs attention")).toBeInTheDocument();
+    expect(screen.getAllByText("Blocked").length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: /Open tasks activity/i }));
+    expect(screen.getAllByText("Blocked").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Needs attention 1" })).toBeInTheDocument();
+  });
+
   it("shows parent-paused subagent work as waiting in the chat timeline", async () => {
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
       runId: "run-123",
-      tasks: [],
+      taskGraph: null,
       events: [
         {
           type: "agent_spawned",
@@ -953,7 +1019,7 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockGetChatWorkSurface.mockResolvedValue({
       sessionId: "chat-123",
       runId: "run-123",
-      tasks: [],
+      taskGraph: null,
       events: [
         {
           type: "agent_spawned",

@@ -8,7 +8,7 @@
 //!
 //! **Client → Server** (JSON text frames):
 //! ```text
-//! {"type": "auth", "token": "Bearer ..."}
+//! {"type": "auth", "token": "Bearer ...", "interaction_api_major": "3"}
 //! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model_selection": {"offering_id": "..."}, "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
@@ -19,7 +19,7 @@
 //!
 //! **Server → Client** (JSON text frames):
 //! ```text
-//! {"type": "auth_ok", "user_id": "...", "username": "..."}
+//! {"type": "auth_ok", "user_id": "...", "username": "...", "interaction_api_major": "3"}
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}
 //! {"type": "run_started", "run_id": "...", "session_id": "...", "explain": {...}}
@@ -130,6 +130,10 @@ fn should_echo_close_frame(message: Option<&Result<Message, axum::Error>>) -> bo
     matches!(message, Some(Ok(Message::Close(_))) | None)
 }
 
+fn interaction_contract_matches(actual: Option<&str>) -> bool {
+    actual == Some(astra_server_types::AGENT_INTERACTION_API_MAJOR)
+}
+
 // ─── Client Message Types ────────────────────────────────────────────────────
 
 /// WebSocket chat message payload.
@@ -174,7 +178,10 @@ pub(super) struct WsChatMessage {
 pub(super) enum WsClientMessage {
     /// Authenticate with a Bearer token (must be first message).
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth {
+        token: String,
+        interaction_api_major: String,
+    },
 
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
@@ -224,7 +231,11 @@ pub(super) enum WsClientMessage {
 pub(super) enum WsServerMessage {
     /// Authentication succeeded.
     #[serde(rename = "auth_ok")]
-    AuthOk { user_id: String, username: String },
+    AuthOk {
+        user_id: String,
+        username: String,
+        interaction_api_major: &'static str,
+    },
 
     /// Authentication failed.
     #[serde(rename = "auth_error")]
@@ -259,6 +270,10 @@ pub(super) enum WsServerMessage {
     /// Run was cancelled by client request.
     #[serde(rename = "run_cancelled")]
     RunCancelled { run_id: String },
+
+    /// Cancellation was durably accepted; the executor has not settled yet.
+    #[serde(rename = "run_cancellation_requested")]
+    RunCancellationRequested { run_id: String },
 
     /// Run was paused.
     #[serde(rename = "run_paused")]
@@ -335,7 +350,7 @@ struct WsConnection {
     /// external-session origin so WS chat can use the same provider
     /// runtime-context injection path as HTTP `/chat` and `/chat/stream`.
     principal: AuthPrincipal,
-    /// Normalized bearer header captured during WS auth and replayed on bridge fallback.
+    /// Normalized bearer header captured during WS auth and reused for server requests.
     authorization: String,
     /// Inbound handshake headers eligible for remote skill forwarding.
     /// Header names are normalized to lowercase.
@@ -347,26 +362,22 @@ struct WsConnection {
     pending_session_id: Option<String>,
     /// Active run ID (if any). Used for cancel/approval routing.
     active_run_id: Option<String>,
-    /// Prepared bridge-local run ID used before the upstream stream reports a real one.
-    #[cfg_attr(not(test), allow(dead_code))]
-    bridge_prepared_run_id: Option<String>,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-/// Query params for WebSocket upgrade — allows token in URL for browser compat.
+/// Query params for WebSocket upgrade. Authentication is accepted only in
+/// the typed first WebSocket frame so bearer secrets never enter URLs.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(super) struct WsUpgradeQuery {
-    /// Optional Bearer token (alternative to sending auth message).
-    pub token: Option<String>,
     /// Optional session ID to request on the first chat turn.
     pub session_id: Option<String>,
 }
 
 /// WebSocket upgrade handler.
 ///
-/// Browser connects to `GET /chat/ws?token=...&session_id=...` or sends
-/// an `auth` message as the first frame after upgrade.
+/// The client must send an `auth` message as the first frame after upgrade.
 pub(super) async fn ws_chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -382,26 +393,22 @@ pub(super) async fn ws_chat_handler(
             .into_response();
     }
 
-    let token = query.token.clone();
     let session_id = query.session_id.clone();
     let forward_headers = collect_forward_headers(&headers);
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| {
-            ws_connection_loop(socket, state, token, session_id, forward_headers)
-        })
+        .on_upgrade(move |socket| ws_connection_loop(socket, state, session_id, forward_headers))
         .into_response()
 }
 
 /// Main WebSocket connection loop.
 ///
-/// 1. Authenticate (from query param or first message)
+/// 1. Authenticate from the typed first message
 /// 2. Enter message loop: receive client messages, stream responses
 /// 3. Handle errors and graceful close
 async fn ws_connection_loop(
     mut socket: WebSocket,
     state: AppState,
-    initial_token: Option<String>,
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) {
@@ -415,15 +422,7 @@ async fn ws_connection_loop(
     let _guard = WsGuard;
 
     // Phase 1: Authenticate
-    let conn = match authenticate(
-        &mut socket,
-        &state,
-        initial_token,
-        initial_session_id,
-        forward_headers,
-    )
-    .await
-    {
+    let conn = match authenticate(&mut socket, &state, initial_session_id, forward_headers).await {
         Ok(conn) => conn,
         Err(_) => return, // Error already sent to client
     };
@@ -434,24 +433,34 @@ async fn ws_connection_loop(
 
 /// Authenticate the WebSocket connection.
 ///
-/// Tries query-param token first, then waits for an `auth` message.
+/// Waits for a typed `auth` message as the first frame.
 async fn authenticate(
     socket: &mut WebSocket,
     state: &AppState,
-    initial_token: Option<String>,
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) -> Result<WsConnection, ()> {
-    // Try query-param token first
-    if let Some(token) = initial_token {
-        return authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
-            .await;
-    }
-
-    // Wait for auth message
+    // Wait for auth message.
     match timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<WsClientMessage>(&text) {
-            Ok(WsClientMessage::Auth { token }) => {
+            Ok(WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            }) => {
+                if !interaction_contract_matches(Some(&interaction_api_major)) {
+                    send_msg(
+                        socket,
+                        &WsServerMessage::AuthError {
+                            message: format!(
+                                "incompatible interaction contract: expected {}, received {}",
+                                astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                                interaction_api_major,
+                            ),
+                        },
+                    )
+                    .await;
+                    return Err(());
+                }
                 authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
                     .await
             }
@@ -555,6 +564,7 @@ async fn authenticate_with_token(
                 &WsServerMessage::AuthOk {
                     user_id: principal.user.user_id.clone(),
                     username: principal.user.username.clone(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
                 },
             )
             .await;
@@ -565,7 +575,6 @@ async fn authenticate_with_token(
                 session_id: None,
                 pending_session_id: session_id,
                 active_run_id: None,
-                bridge_prepared_run_id: None,
             })
         }
         Err((_status, error)) => {
@@ -729,8 +738,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
 /// Handle a chat message: run agentic loop via RunLifecycleService and stream
 /// events back as WS frames.
 ///
-/// Prefers RunLifecycleService (server-side agentic loop). Falls back to bridge
-/// if the lifecycle service returns NOT_IMPLEMENTED (unconfigured).
+/// Runs the single server-owned agentic lifecycle and streams its typed events.
 async fn handle_chat_message(
     socket: &mut WebSocket,
     state: &AppState,
@@ -785,6 +793,10 @@ async fn handle_chat_message(
         request.session_id.take(),
         request.agent_id.clone(),
         request_session_id_is_trusted,
+        matches!(
+            &conn.principal.origin,
+            astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+        ),
     )
     .await
     {
@@ -1030,6 +1042,7 @@ async fn handle_shared_tool_approval(
         .resolve_run_interaction(
             run_id.to_string(),
             user_id.clone(),
+            session_id.to_string(),
             request_id.to_string(),
             astra_services::runs::DurableRunInteractionKind::Approval,
             response,
@@ -1038,6 +1051,13 @@ async fn handle_shared_tool_approval(
     {
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => {
+            tracing::debug!(
+                run_id,
+                request_id,
+                "approval response queued until its exact execution frontier opens"
+            );
+        }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
             tracing::warn!(run_id, request_id, "conflicting approval response ignored");
         }
@@ -1050,6 +1070,28 @@ async fn handle_shared_tool_approval(
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
             tracing::warn!(run_id, request_id, "late approval response ignored");
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+            reason,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                ?reason,
+                "approval response was recorded but cannot resume a run whose execution authority changed"
+            );
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                user_intent_event_index,
+                "approval response was recorded but newer user guidance superseded its execution frontier"
+            );
         }
         Err((_, error)) => {
             tracing::warn!(run_id, request_id, error = %error.0.detail, "approval resolution failed");
@@ -1153,6 +1195,7 @@ async fn handle_shared_user_prompt_response(
         .resolve_run_interaction(
             run_id.to_string(),
             user_id.clone(),
+            session_id.to_string(),
             request_id.to_string(),
             astra_services::runs::DurableRunInteractionKind::AskUser,
             response,
@@ -1161,6 +1204,13 @@ async fn handle_shared_user_prompt_response(
     {
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                "ask_user response unexpectedly queued without an exact prompt frontier"
+            );
+        }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
             tracing::warn!(run_id, request_id, "conflicting ask_user response ignored");
         }
@@ -1168,59 +1218,33 @@ async fn handle_shared_user_prompt_response(
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
             tracing::warn!(run_id, request_id, "late ask_user response ignored");
         }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+            reason,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                ?reason,
+                "ask_user response was recorded but cannot resume a run whose execution authority changed"
+            );
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                user_intent_event_index,
+                "ask_user response was recorded but newer user guidance superseded its execution frontier"
+            );
+        }
         Err((_, error)) => {
             tracing::warn!(run_id, request_id, error = %error.0.detail, "ask_user resolution failed");
         }
     }
 }
-#[cfg(test)]
-fn build_bridge_chat_payload(
-    session_id: Option<String>,
-    content: &str,
-    agent_id: Option<String>,
-    model: Option<String>,
-    skill_search: Option<astra_core::SkillSearchSettings>,
-    allow_skills: Option<Vec<String>>,
-    allow_skill_sources: Option<Vec<String>>,
-    allow_tools: Option<Vec<String>>,
-    context: Option<serde_json::Map<String, serde_json::Value>>,
-    execution_budget: Option<astra_services::runs::ExecutionBudget>,
-    explain: bool,
-    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
-) -> Value {
-    let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
-    let allow_skill_sources = normalize_bridge_allowlist(allow_skill_sources.as_deref());
-    let allow_tools = normalize_bridge_allowlist(allow_tools.as_deref());
-    serde_json::json!({
-        "session_id": session_id,
-        "agent_id": agent_id,
-        "model": model,
-        "skill_search": skill_search,
-        "allow_skills": allow_skills,
-        "allow_skill_sources": allow_skill_sources,
-        "allow_tools": allow_tools,
-        "context": context,
-        "execution_budget": execution_budget,
-        "explain": explain,
-        "interaction_mode": interaction_mode,
-        "messages": [{
-            "role": "user",
-            "content": content
-        }]
-    })
-}
-
-#[cfg(test)]
-fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
-    entries.map(|entries| {
-        let mut normalized = std::collections::BTreeSet::new();
-        for entry in entries {
-            normalized.insert(entry.trim().to_ascii_lowercase());
-        }
-        normalized.into_iter().collect()
-    })
-}
-
 fn build_ws_chat_request(
     content: &str,
     user_intent: Option<String>,
@@ -1247,9 +1271,12 @@ fn build_ws_chat_request(
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id,
+        work_binding: None,
+        run_start_idempotency: None,
         full_llm_capture: false,
         agent_id,
         model: None,
+        model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: Some(model_selection),
         resolved_model_selection: None,
         admitted_model_execution: None,
@@ -1267,14 +1294,17 @@ fn build_ws_chat_request(
         enabled_tools,
         workspace_binding: None,
         executor_binding: None,
+        execution_binding_generation: None,
         runtime_mcp_bindings: Vec::new(),
-        mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         edge_executor_id: None,
         capabilities: Vec::new(),
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
+        provider_workspace_id: None,
         execution_budget,
+        execution_time_budget: None,
+        admitted_execution_deadline: None,
         conversation_authority: None,
         execution_policy: Default::default(),
         explain,
@@ -1287,58 +1317,6 @@ fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, 
     let mut headers = conn.forward_headers.clone();
     headers.insert("authorization".to_string(), conn.authorization.clone());
     headers
-}
-
-#[cfg(test)]
-fn build_ws_bridge_headers(
-    state: &AppState,
-    conn: &WsConnection,
-) -> Result<HeaderMap, &'static str> {
-    let mut bridge_headers = HeaderMap::new();
-    let secret_hv = HeaderValue::from_str(&state.chat_turn_bridge_secret)
-        .map_err(|_| "Invalid bridge secret for headers")?;
-    bridge_headers.insert(HeaderName::from_static("x-mo-bridge-secret"), secret_hv);
-    let user_id_hv = HeaderValue::from_str(&conn.principal.user.user_id)
-        .map_err(|_| "Invalid user_id for headers")?;
-    bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
-    let authorization_hv =
-        HeaderValue::from_str(&conn.authorization).map_err(|_| "Invalid authorization header")?;
-    bridge_headers.insert(HeaderName::from_static("authorization"), authorization_hv);
-    let username_b64 = URL_SAFE.encode(conn.principal.user.username.as_bytes());
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-username-b64"),
-        HeaderValue::from_str(&username_b64)
-            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-    );
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-bridge-capabilities"),
-        HeaderValue::from_static("state-sync-v1"),
-    );
-    Ok(bridge_headers)
-}
-
-#[cfg(test)]
-async fn resolve_bridge_payload_session_id(
-    state: &AppState,
-    user: &AuthUserRecord,
-    request_session_id: Option<String>,
-    request_session_id_is_trusted: bool,
-) -> (Option<String>, Option<String>) {
-    let Some(session_id) = request_session_id else {
-        return (None, None);
-    };
-    if !request_session_id_is_trusted {
-        return (Some(session_id), None);
-    }
-
-    match state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await
-    {
-        Err(error) if is_session_service_unconfigured_error(&error) => (None, Some(session_id)),
-        _ => (Some(session_id), None),
-    }
 }
 
 fn chat_request_session_id(
@@ -1370,6 +1348,9 @@ fn ws_text_frame_exceeds_limit(text: &str) -> bool {
 
 fn cancel_run_outcome_message(record: &astra_services::runs::CancelRunRecord) -> WsServerMessage {
     match record.status.as_str() {
+        "cancellation_requested" => WsServerMessage::RunCancellationRequested {
+            run_id: record.run_id.clone(),
+        },
         STATUS_CANCELLED => WsServerMessage::RunCancelled {
             run_id: record.run_id.clone(),
         },
@@ -2097,284 +2078,10 @@ async fn stream_run_over_websocket(
     }
 }
 
-#[cfg(test)]
-fn should_adopt_stream_run_id(conn: &WsConnection, run_id: &str) -> bool {
-    conn.active_run_id.is_none()
-        || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
-            && conn.active_run_id.as_deref() != Some(run_id))
-}
-
-#[cfg(test)]
-fn sync_conn_state_from_stream_event(
-    conn: &mut WsConnection,
-    event: &Value,
-) -> Option<(String, bool)> {
-    let event_type = event
-        .get("type")
-        .or_else(|| event.get("event_type"))
-        .and_then(Value::as_str);
-
-    if event_type == Some("session_info") {
-        if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
-            conn.session_id = Some(session_id.to_string());
-            conn.pending_session_id = None;
-        }
-    }
-
-    if matches!(
-        event_type,
-        Some(
-            "session_info"
-                | "run_started"
-                | "run_paused"
-                | "run_waiting"
-                | "run_resumed"
-                | "run_cancelled"
-                | "run_finished"
-        )
-    ) && let Some(run_id) = event.get("run_id").and_then(Value::as_str)
-        && should_adopt_stream_run_id(conn, run_id)
-    {
-        conn.active_run_id = Some(run_id.to_string());
-        return Some((run_id.to_string(), event_type == Some("session_info")));
-    }
-    None
-}
-
-#[cfg(test)]
-fn synthetic_bridge_run_started(
-    conn: &WsConnection,
-    adopted_run_id: Option<(String, bool)>,
-    explain: Option<&Value>,
-) -> Option<WsServerMessage> {
-    // `sync_conn_state_from_stream_event` only returns an adopted session_info run_id
-    // for the first fresh bridge run or when an upstream run_id replaces the prepared
-    // placeholder, so emitting here preserves the one-shot run_started contract.
-    let (run_id, synthesize_run_started) = adopted_run_id?;
-    if !synthesize_run_started {
-        return None;
-    }
-    let session_id = conn.session_id.clone()?;
-    Some(WsServerMessage::RunStarted {
-        run_id,
-        session_id,
-        explain: explain.cloned(),
-    })
-}
-
-#[cfg(test)]
-fn bridge_run_started_explain(explain: bool) -> Option<Value> {
-    explain.then(|| serde_json::json!({"mode": "background"}))
-}
-
 fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerMessage {
     WsServerMessage::SessionInfo { session_id, run_id }
 }
 
-#[cfg(test)]
-fn bind_prepared_bridge_identity(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-) -> Option<(String, String)> {
-    let session_id = trusted_session_id?.to_string();
-    conn.session_id = Some(session_id.clone());
-    conn.pending_session_id = None;
-
-    let run_id = turn_chain_id?.to_string();
-    conn.active_run_id = Some(run_id.clone());
-    conn.bridge_prepared_run_id = Some(run_id.clone());
-    Some((session_id, run_id))
-}
-
-#[cfg(test)]
-fn bridge_run_started_message(
-    session_id: String,
-    run_id: String,
-    explain: Option<&Value>,
-) -> WsServerMessage {
-    WsServerMessage::RunStarted {
-        run_id,
-        session_id,
-        explain: explain.cloned(),
-    }
-}
-
-#[cfg(test)]
-fn bridge_success_preamble_messages(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-    explain: Option<&Value>,
-) -> Vec<WsServerMessage> {
-    if let Some((session_id, run_id)) =
-        bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
-    {
-        vec![
-            session_info_message(session_id.clone(), Some(run_id.clone())),
-            bridge_run_started_message(session_id, run_id, explain),
-        ]
-    } else {
-        Vec::new()
-    }
-}
-
-#[cfg(test)]
-fn bridge_forward_error_messages(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-    explain: Option<&Value>,
-    status: StatusCode,
-    error_message: String,
-) -> Vec<WsServerMessage> {
-    let mut messages =
-        bridge_success_preamble_messages(conn, trusted_session_id, turn_chain_id, explain);
-    if let Some(run_id) = conn.active_run_id.clone() {
-        messages.push(ws_error_from_status(status, error_message.clone()));
-        messages.push(WsServerMessage::RunFinished {
-            run_id,
-            status: STATUS_FAILED.to_string(),
-            error: Some(error_message),
-        });
-        messages
-    } else if let Some(session_id) = trusted_session_id {
-        conn.session_id = Some(session_id.to_string());
-        conn.pending_session_id = None;
-        vec![
-            session_info_message(session_id.to_string(), None),
-            ws_error_from_status(status, error_message),
-        ]
-    } else {
-        vec![ws_error_from_status(status, error_message)]
-    }
-}
-
-#[cfg(test)]
-fn should_suppress_initial_bridge_session_info(
-    suppress_session_info: &mut bool,
-    event: &Value,
-) -> bool {
-    if *suppress_session_info && event.get("type").and_then(Value::as_str) == Some("session_info") {
-        *suppress_session_info = false;
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BridgeWsTerminalStatus {
-    Completed,
-    #[allow(dead_code)] // reserved for future WS lifecycle tests
-    Cancelled,
-    Failed(Option<String>),
-    #[allow(dead_code)] // reserved for future WS lifecycle tests
-    Disconnected,
-}
-
-#[cfg(test)]
-fn bridge_ws_terminal_status(
-    saw_turn_complete: bool,
-    terminal_error: Option<String>,
-) -> BridgeWsTerminalStatus {
-    if terminal_error.is_some() {
-        BridgeWsTerminalStatus::Failed(terminal_error)
-    } else if saw_turn_complete {
-        BridgeWsTerminalStatus::Completed
-    } else {
-        BridgeWsTerminalStatus::Failed(Some("Bridge stream ended before turn_complete".to_string()))
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ProcessedBridgeStreamEvent {
-    pre_messages: Vec<WsServerMessage>,
-    raw_event: Option<Value>,
-}
-
-#[cfg(test)]
-fn process_bridge_stream_event(
-    conn: &mut WsConnection,
-    event: Value,
-    run_started_explain: Option<&Value>,
-    suppress_initial_session_info: &mut bool,
-    saw_turn_complete: &mut bool,
-    terminal_error: &mut Option<String>,
-) -> ProcessedBridgeStreamEvent {
-    if should_suppress_initial_bridge_session_info(suppress_initial_session_info, &event) {
-        return ProcessedBridgeStreamEvent {
-            pre_messages: Vec::new(),
-            raw_event: None,
-        };
-    }
-
-    let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
-    let mut pre_messages = Vec::new();
-    if let Some(run_started) =
-        synthetic_bridge_run_started(conn, adopted_run_id, run_started_explain)
-    {
-        pre_messages.push(run_started);
-    }
-
-    match event.get("type").and_then(Value::as_str) {
-        Some("turn_complete") => *saw_turn_complete = true,
-        Some("error") => {
-            *terminal_error = event
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some("Bridge returned error event".to_string()));
-        }
-        _ => {}
-    }
-
-    ProcessedBridgeStreamEvent {
-        pre_messages,
-        raw_event: Some(event),
-    }
-}
-
-/// Apply optional prepared headers to bridge request.
-#[cfg(test)]
-fn apply_prepared_headers(
-    headers: &mut HeaderMap,
-    prepared: &bridge_prep::PreparedChatTurnBridgeRequest,
-) {
-    macro_rules! set_header {
-        ($field:ident, $name:literal) => {
-            if let Some(ref val) = prepared.$field {
-                if let Ok(hv) = HeaderValue::from_str(val) {
-                    headers.insert(HeaderName::from_static($name), hv);
-                }
-            }
-        };
-    }
-    set_header!(trusted_session_id, "x-mo-session-id");
-    set_header!(session_turn, "x-mo-session-turn");
-    set_header!(turn_chain_id, "x-mo-turn-chain-id");
-    set_header!(user_query_event_id, "x-mo-user-query-event-id");
-    set_header!(user_query_b64, "x-mo-user-query-b64");
-    set_header!(routing_meta_b64, "x-mo-routing-meta-b64");
-    set_header!(execution_state_b64, "x-mo-execution-state-b64");
-    if prepared.full_llm_capture == Some(true) {
-        headers.insert(
-            HeaderName::from_static("x-mo-full-llm-capture"),
-            HeaderValue::from_static("1"),
-        );
-    }
-
-    if let Some(changed) = prepared.tools_changed {
-        headers.insert(
-            HeaderName::from_static("x-mo-tools-changed"),
-            HeaderValue::from_static(if changed { "1" } else { "0" }),
-        );
-    }
-}
-
-/// Send a typed server message as a WebSocket text frame.
 async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
         let _ = socket.send(Message::Text(json.into())).await;
@@ -2386,132 +2093,13 @@ async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use axum::{Json, http::StatusCode};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    use crate::{
-        AppState, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
-        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
-        SessionService, SessionUpdateRequestData,
-    };
     use astra_services::{
         AuthPrincipal, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord,
     };
     use astra_tools::{AskUserGate, ToolApprovalGate};
-
-    #[derive(Clone)]
-    struct StubHealthChecker;
-
-    #[async_trait]
-    impl HealthChecker for StubHealthChecker {
-        async fn database_healthy(&self) -> bool {
-            true
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingSessionService {
-        get_calls: Arc<Mutex<Vec<(String, String)>>>,
-    }
-
-    impl RecordingSessionService {
-        async fn get_calls(&self) -> Vec<(String, String)> {
-            self.get_calls.lock().await.clone()
-        }
-    }
-
-    #[async_trait]
-    impl SessionService for RecordingSessionService {
-        async fn create_session(
-            &self,
-            user_id: String,
-            request: SessionCreateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionRecord {
-                session_id: "created-session".to_string(),
-                user_id,
-                agent_id: request.agent_id,
-                title: None,
-                metadata: request.metadata.unwrap_or_default(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn list_sessions(
-            &self,
-            _filter: SessionListFilter,
-        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionListRecord {
-                sessions: Vec::new(),
-                total: Some(0),
-                limit: 20,
-                next_cursor: None,
-            })
-        }
-
-        async fn get_session(
-            &self,
-            session_id: String,
-            user_id: String,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_calls
-                .lock()
-                .await
-                .push((session_id.clone(), user_id.clone()));
-            Ok(SessionRecord {
-                session_id,
-                user_id,
-                agent_id: None,
-                title: Some("Existing".to_string()),
-                metadata: serde_json::Map::new(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn update_session(
-            &self,
-            session_id: String,
-            user_id: String,
-            _request: SessionUpdateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_session(session_id, user_id).await
-        }
-
-        async fn delete_session(
-            &self,
-            _session_id: String,
-            _user_id: String,
-        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            Ok(())
-        }
-
-        async fn get_session_activity(
-            &self,
-            _session_id: String,
-            _user_id: String,
-            _limit: u32,
-            _cursor: Option<astra_services::auth::SessionActivityCursor>,
-        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionActivityRecord {
-                session_id: String::new(),
-                activities: Vec::new(),
-                total: 0,
-                limit: 20,
-                next_cursor: None,
-            })
-        }
-    }
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
 
     fn test_user() -> AuthUserRecord {
         AuthUserRecord {
@@ -2524,12 +2112,32 @@ mod tests {
 
     #[test]
     fn parse_auth_message() {
-        let json = r#"{"type": "auth", "token": "Bearer abc123"}"#;
+        let json = r#"{"type":"auth","token":"Bearer abc123","interaction_api_major":"3"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Auth { token } => assert_eq!(token, "Bearer abc123"),
+            WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            } => {
+                assert_eq!(token, "Bearer abc123");
+                assert_eq!(interaction_api_major, "3");
+            }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn websocket_query_auth_fails_closed_on_missing_or_stale_contract() {
+        assert!(interaction_contract_matches(Some("3")));
+        assert!(!interaction_contract_matches(Some("2")));
+        assert!(!interaction_contract_matches(None));
+    }
+
+    #[test]
+    fn auth_message_requires_the_interaction_contract() {
+        assert!(
+            serde_json::from_str::<WsClientMessage>(r#"{"type":"auth","token":"abc123"}"#).is_err()
+        );
     }
 
     #[test]
@@ -2640,89 +2248,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_payload_preserves_runtime_request_fields() {
-        let mut context = serde_json::Map::new();
-        context.insert("edge_tools".into(), serde_json::json!([{"name": "bash"}]));
-        context.insert("mode".into(), serde_json::json!("headless"));
-
-        let payload = build_bridge_chat_payload(
-            Some("session-1".into()),
-            "hello",
-            Some("agent-1".into()),
-            Some("gpt-5.4".into()),
-            Some(astra_core::SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            }),
-            Some(vec!["plan".into()]),
-            Some(vec!["database".into()]),
-            Some(vec!["bash".into()]),
-            Some(context.clone()),
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(7),
-            }),
-            true,
-            Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
-        );
-
-        assert_eq!(payload["session_id"], "session-1");
-        assert_eq!(payload["agent_id"], "agent-1");
-        assert_eq!(payload["model"], "gpt-5.4");
-        assert_eq!(payload["skill_search"]["dynamic_surface"], false);
-        assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(payload["skill_search"]["surface_cap"], 20);
-        assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
-        assert_eq!(
-            payload["allow_skill_sources"],
-            serde_json::json!(["database"])
-        );
-        assert_eq!(payload["allow_tools"], serde_json::json!(["bash"]));
-        assert_eq!(payload["context"], serde_json::Value::Object(context));
-        assert_eq!(payload["execution_budget"]["initial_turns"], 3);
-        assert_eq!(payload["execution_budget"]["hard_turn_limit"], 7);
-        assert_eq!(payload["explain"], true);
-        assert_eq!(payload["interaction_mode"], "auto");
-        assert_eq!(payload["messages"][0]["role"], "user");
-        assert_eq!(payload["messages"][0]["content"], "hello");
-    }
-
-    #[test]
-    fn bridge_payload_normalizes_allowlists() {
-        let payload = build_bridge_chat_payload(
-            Some("session-1".into()),
-            "hello",
-            Some("agent-1".into()),
-            Some("gpt-5.4".into()),
-            None,
-            Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
-            Some(vec![" local ".into(), "MCP".into(), "local".into()]),
-            Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
-            None,
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(6),
-            }),
-            true,
-            None,
-        );
-
-        assert_eq!(
-            payload["allow_skills"],
-            serde_json::json!(["analyze", "plan"])
-        );
-        assert_eq!(
-            payload["allow_skill_sources"],
-            serde_json::json!(["local", "mcp"])
-        );
-        assert_eq!(
-            payload["allow_tools"],
-            serde_json::json!(["bash", "read_file"])
-        );
-    }
-
-    #[test]
     fn ws_chat_request_preserves_runtime_request_fields() {
         let request = build_ws_chat_request(
             "hello",
@@ -2808,27 +2333,6 @@ mod tests {
     }
 
     #[test]
-    fn ws_bridge_headers_forward_authorization() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_chat_turn_bridge_secret("bridge-secret");
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer good-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: None,
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let headers = build_ws_bridge_headers(&state, &conn).expect("headers should build");
-
-        assert_eq!(headers.get("x-mo-bridge-secret").unwrap(), "bridge-secret");
-        assert_eq!(headers.get("x-mo-user-id").unwrap(), "u1");
-        assert_eq!(headers.get("authorization").unwrap(), "Bearer good-token");
-    }
-
-    #[test]
     fn ws_forward_headers_preserve_handshake_headers() {
         let conn = WsConnection {
             principal: AuthPrincipal::internal(test_user()),
@@ -2840,7 +2344,6 @@ mod tests {
             session_id: None,
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let headers = ws_forward_headers(&conn);
@@ -2852,47 +2355,6 @@ mod tests {
         assert_eq!(headers.get("x-catalog-tenant"), Some(&"tenant-a".into()));
     }
 
-    #[tokio::test]
-    async fn resolve_bridge_payload_session_id_omits_trusted_session_when_service_unconfigured() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-
-        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
-            &state,
-            &test_user(),
-            Some("bound-session".into()),
-            true,
-        )
-        .await;
-
-        assert_eq!(payload_session_id, None);
-        assert_eq!(
-            trusted_session_id_override.as_deref(),
-            Some("bound-session")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_bridge_payload_session_id_keeps_trusted_session_when_service_configured() {
-        let session_service = RecordingSessionService::default();
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_session_service(Arc::new(session_service.clone()));
-
-        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
-            &state,
-            &test_user(),
-            Some("bound-session".into()),
-            true,
-        )
-        .await;
-
-        assert_eq!(payload_session_id.as_deref(), Some("bound-session"));
-        assert_eq!(trusted_session_id_override, None);
-        assert_eq!(
-            session_service.get_calls().await,
-            vec![("bound-session".to_string(), "u1".to_string())]
-        );
-    }
-
     #[test]
     fn chat_request_session_id_prefers_requested_value_without_mutating_connection() {
         let conn = WsConnection {
@@ -2902,7 +2364,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, Some("requested-session".into()));
@@ -2924,7 +2385,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -2941,7 +2401,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -2958,7 +2417,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
         let pending_conn = WsConnection {
             principal: AuthPrincipal::internal(test_user()),
@@ -2967,7 +2425,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         assert!(chat_request_session_id_is_trusted(&trusted_conn, &None));
@@ -2997,6 +2454,7 @@ mod tests {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
             status: STATUS_CANCELLED.into(),
+            execution_settled: true,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -3010,6 +2468,7 @@ mod tests {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
             status: STATUS_COMPLETED.into(),
+            execution_settled: true,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -3027,24 +2486,16 @@ mod tests {
     }
 
     #[test]
-    fn cancel_run_outcome_message_reports_non_terminal_noops() {
+    fn cancel_run_outcome_message_reports_accepted_cancellation_before_convergence() {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
-            status: STATUS_PAUSED.into(),
+            status: "cancellation_requested".into(),
+            execution_settled: false,
         };
 
         match cancel_run_outcome_message(&record) {
-            WsServerMessage::Error {
-                message,
-                code,
-                retryable,
-            } => {
-                assert!(message.contains("run-1"));
-                assert!(message.contains(STATUS_PAUSED));
-                assert_eq!(code, "CANCEL_NOOP");
-                assert!(!retryable);
-            }
-            other => panic!("expected Error, got {other:?}"),
+            WsServerMessage::RunCancellationRequested { run_id } => assert_eq!(run_id, "run-1"),
+            other => panic!("expected RunCancellationRequested, got {other:?}"),
         }
     }
 
@@ -3108,8 +2559,12 @@ mod tests {
             payloads[0],
             serde_json::json!({
                 "type": "usage",
-                "prompt_tokens": 7,
-                "completion_tokens": 3,
+                "input_tokens": 7,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "usage_scope": "run_total",
                 "tool_call_count": 2,
                 "index": 5
             })
@@ -3170,8 +2625,12 @@ mod tests {
             vec![
                 serde_json::json!({
                     "type": "usage",
-                    "prompt_tokens": 7,
-                    "completion_tokens": 3,
+                    "input_tokens": 7,
+                    "cached_input_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                    "usage_scope": "run_total",
                     "tool_call_count": 2,
                     "index": 3
                 }),
@@ -3236,597 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_ws_terminal_status_prefers_error_and_incomplete_failure() {
-        assert_eq!(
-            bridge_ws_terminal_status(true, None),
-            BridgeWsTerminalStatus::Completed
-        );
-        assert_eq!(
-            bridge_ws_terminal_status(true, Some("boom".into())),
-            BridgeWsTerminalStatus::Failed(Some("boom".into()))
-        );
-        assert_eq!(
-            bridge_ws_terminal_status(false, None),
-            BridgeWsTerminalStatus::Failed(Some("Bridge stream ended before turn_complete".into()))
-        );
-    }
-
-    #[test]
-    fn bridge_success_preamble_messages_emit_session_info_before_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let explain = bridge_run_started_explain(true);
-
-        let messages = bridge_success_preamble_messages(
-            &mut conn,
-            Some("sess-1"),
-            Some("run-1"),
-            explain.as_ref(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
-        assert_eq!(messages.len(), 2);
-        assert!(matches!(
-            &messages[0],
-            WsServerMessage::SessionInfo {
-                session_id,
-                run_id
-            } if session_id == "sess-1" && run_id.as_deref() == Some("run-1")
-        ));
-        assert!(matches!(
-            &messages[1],
-            WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain
-            } if run_id == "run-1"
-                && session_id == "sess-1"
-                && explain == &Some(serde_json::json!({"mode": "background"}))
-        ));
-    }
-
-    #[test]
-    fn bridge_forward_error_messages_preserve_trusted_run_identity() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let prepared = PreparedChatTurnBridgeRequest {
-            body: Bytes::new(),
-            trusted_session_id: Some("sess-1".into()),
-            full_llm_capture: None,
-            session_turn: Some("4".into()),
-            turn_chain_id: Some("run-1".into()),
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        };
-        let explain = bridge_run_started_explain(true);
-
-        let messages = bridge_forward_error_messages(
-            &mut conn,
-            prepared.trusted_session_id.as_deref(),
-            prepared.turn_chain_id.as_deref(),
-            explain.as_ref(),
-            StatusCode::BAD_GATEWAY,
-            "Bridge error: boom".into(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
-        assert_eq!(messages.len(), 4);
-        match &messages[0] {
-            WsServerMessage::SessionInfo { session_id, run_id } => {
-                assert_eq!(session_id, "sess-1");
-                assert_eq!(run_id.as_deref(), Some("run-1"));
-            }
-            other => panic!("expected SessionInfo, got {other:?}"),
-        }
-        match &messages[1] {
-            WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(session_id, "sess-1");
-                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected RunStarted, got {other:?}"),
-        }
-        match &messages[2] {
-            WsServerMessage::Error {
-                message,
-                code,
-                retryable,
-            } => {
-                assert_eq!(message, "Bridge error: boom");
-                assert_eq!(code, "INTERNAL_ERROR");
-                assert!(*retryable);
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match &messages[3] {
-            WsServerMessage::RunFinished {
-                run_id,
-                status,
-                error,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(status, STATUS_FAILED);
-                assert_eq!(error.as_deref(), Some("Bridge error: boom"));
-            }
-            other => panic!("expected RunFinished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bridge_forward_error_messages_without_run_id_only_emit_error() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let prepared = PreparedChatTurnBridgeRequest {
-            body: Bytes::new(),
-            trusted_session_id: Some("sess-1".into()),
-            full_llm_capture: None,
-            session_turn: Some("4".into()),
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        };
-
-        let messages = bridge_forward_error_messages(
-            &mut conn,
-            prepared.trusted_session_id.as_deref(),
-            prepared.turn_chain_id.as_deref(),
-            None,
-            StatusCode::BAD_GATEWAY,
-            "Bridge error: boom".into(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id, None);
-        assert_eq!(conn.bridge_prepared_run_id, None);
-        assert_eq!(messages.len(), 2);
-        match &messages[0] {
-            WsServerMessage::SessionInfo { session_id, run_id } => {
-                assert_eq!(session_id, "sess-1");
-                assert!(run_id.is_none());
-            }
-            other => panic!("expected SessionInfo, got {other:?}"),
-        }
-        assert!(matches!(messages[1], WsServerMessage::Error { .. }));
-    }
-
-    #[test]
-    fn suppress_initial_bridge_session_info_only_once() {
-        let mut suppress = true;
-        let session_info = serde_json::json!({
-            "type": "session_info",
-            "session_id": "sess-1",
-            "run_id": "run-1"
-        });
-        let text_delta = serde_json::json!({
-            "type": "text_delta",
-            "content": "hi"
-        });
-
-        assert!(should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &session_info,
-        ));
-        assert!(!suppress);
-        assert!(!should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &session_info,
-        ));
-        assert!(!should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &text_delta,
-        ));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_suppresses_initial_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-1".into()),
-            bridge_prepared_run_id: Some("run-1".into()),
-        };
-        let mut suppress = true;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "upstream-sess",
-                "run_id": "run-1"
-            }),
-            None,
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        assert!(processed.pre_messages.is_empty());
-        assert!(processed.raw_event.is_none());
-        assert!(!suppress);
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_synthesizes_run_started_for_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-        let explain = bridge_run_started_explain(true);
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-            explain.as_ref(),
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        match processed.pre_messages.as_slice() {
-            [
-                WsServerMessage::RunStarted {
-                    run_id,
-                    session_id,
-                    explain,
-                },
-            ] => {
-                assert_eq!(run_id, "run-9");
-                assert_eq!(session_id, "sess-42");
-                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected synthesized RunStarted, got {other:?}"),
-        }
-        assert_eq!(
-            processed.raw_event,
-            Some(serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }))
-        );
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_emits_run_started_before_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-        let explain = bridge_run_started_explain(true);
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-            explain.as_ref(),
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        let mut frames: Vec<serde_json::Value> = processed
-            .pre_messages
-            .iter()
-            .map(|message| serde_json::to_value(message).expect("server message should serialize"))
-            .collect();
-        if let Some(raw_event) = processed.raw_event {
-            frames.push(raw_event);
-        }
-
-        assert_eq!(
-            frames,
-            vec![
-                serde_json::json!({
-                    "type": "run_started",
-                    "run_id": "run-9",
-                    "session_id": "sess-42",
-                    "explain": {"mode": "background"}
-                }),
-                serde_json::json!({
-                    "type": "session_info",
-                    "session_id": "sess-42",
-                    "run_id": "run-9"
-                }),
-            ]
-        );
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-    }
-
-    #[test]
-    fn process_bridge_stream_event_preserves_turn_complete_assistant_text() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-42".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-9".into()),
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "turn_complete",
-                "assistant_text": "recovered final text",
-                "has_tool_calls": false
-            }),
-            None,
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        assert!(processed.pre_messages.is_empty());
-        assert_eq!(
-            processed.raw_event,
-            Some(serde_json::json!({
-                "type": "turn_complete",
-                "assistant_text": "recovered final text",
-                "has_tool_calls": false
-            }))
-        );
-        assert!(saw_turn_complete);
-        assert_eq!(terminal_error, None);
-    }
-
-    #[test]
-    fn session_info_stream_event_updates_connection_state() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-
-        assert_eq!(adopted, Some(("run-9".into(), true)));
-        assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
-    }
-
-    #[test]
-    fn session_info_stream_event_upgrades_prepared_bridge_run_id() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: Some("prepared-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-2",
-                "run_id": "upstream-run"
-            }),
-        );
-
-        assert_eq!(adopted, Some(("upstream-run".into(), true)));
-        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
-    }
-
-    #[test]
-    fn session_info_stream_event_without_prepared_run_id_synthesizes_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        match synthetic_bridge_run_started(&conn, adopted, explain.as_ref()) {
-            Some(WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain,
-            }) => {
-                assert_eq!(run_id, "run-9");
-                assert_eq!(session_id, "sess-42");
-                assert_eq!(explain, Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected synthesized RunStarted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn session_info_stream_event_does_not_override_real_active_run_id() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: Some("real-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-2",
-                "run_id": "upstream-run"
-            }),
-        );
-
-        assert_eq!(adopted, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("real-run"));
-    }
-
-    #[test]
-    fn repeated_session_info_without_prepared_run_id_does_not_resynthesize_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-42".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-9".into()),
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        assert_eq!(adopted, None);
-        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
-    }
-
-    #[test]
-    fn run_started_stream_event_upgrades_prepared_bridge_run_id_without_synthetic_start() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: None,
-            active_run_id: Some("prepared-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "run_started",
-                "run_id": "upstream-run"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        assert_eq!(adopted, Some(("upstream-run".into(), false)));
-        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
-        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
-    }
-
-    #[test]
-    fn bridge_run_started_explain_matches_lifecycle_shape() {
-        assert_eq!(
-            bridge_run_started_explain(true),
-            Some(serde_json::json!({"mode": "background"}))
-        );
-        assert_eq!(bridge_run_started_explain(false), None);
-    }
-
-    #[test]
     fn parse_ping_message() {
         let json = r#"{"type": "ping"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
@@ -3864,11 +2732,13 @@ mod tests {
         let msg = WsServerMessage::AuthOk {
             user_id: "u1".into(),
             username: "alice".into(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"auth_ok""#));
         assert!(json.contains(r#""user_id":"u1""#));
         assert!(json.contains(r#""username":"alice""#));
+        assert!(json.contains(r#""interaction_api_major":"3""#));
     }
 
     #[test]
@@ -3933,16 +2803,17 @@ mod tests {
     #[test]
     fn query_params_optional() {
         let q: WsUpgradeQuery = serde_json::from_str("{}").unwrap();
-        assert!(q.token.is_none());
         assert!(q.session_id.is_none());
     }
 
     #[test]
-    fn query_params_with_values() {
-        let q: WsUpgradeQuery =
-            serde_json::from_str(r#"{"token": "tok", "session_id": "s1"}"#).unwrap();
-        assert_eq!(q.token.as_deref(), Some("tok"));
+    fn query_params_accept_only_session_hint_and_reject_url_credentials() {
+        let q: WsUpgradeQuery = serde_json::from_str(r#"{"session_id": "s1"}"#).unwrap();
         assert_eq!(q.session_id.as_deref(), Some("s1"));
+        assert!(serde_json::from_str::<WsUpgradeQuery>(r#"{"token":"tok"}"#).is_err());
+        assert!(
+            serde_json::from_str::<WsUpgradeQuery>(r#"{"interaction_api_major":"2"}"#).is_err()
+        );
     }
 
     #[test]
@@ -4043,108 +2914,20 @@ mod tests {
         assert_eq!(result2, "Bearer abc123");
     }
 
-    // ─── apply_prepared_headers tests ────────────────────────────────────
-
-    use super::bridge_prep::PreparedChatTurnBridgeRequest;
-    use axum::body::Bytes;
-
-    fn make_prepared_all() -> PreparedChatTurnBridgeRequest {
-        PreparedChatTurnBridgeRequest {
-            body: Bytes::from("{}"),
-            trusted_session_id: Some("s1".into()),
-            full_llm_capture: Some(true),
-            session_turn: Some("4".into()),
-            turn_chain_id: Some("tc1".into()),
-            user_query_event_id: Some("uqe1".into()),
-            tools_changed: Some(true),
-            user_query_b64: Some("aGVsbG8=".into()),
-            routing_meta_b64: Some("cm91dGU=".into()),
-            execution_state_b64: Some("c3RhdGU=".into()),
-        }
-    }
-
-    fn make_prepared_none() -> PreparedChatTurnBridgeRequest {
-        PreparedChatTurnBridgeRequest {
-            body: Bytes::from("{}"),
-            trusted_session_id: None,
-            full_llm_capture: None,
-            session_turn: None,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        }
-    }
-
-    #[test]
-    fn apply_prepared_headers_all_fields() {
-        let mut headers = HeaderMap::new();
-        let prepared = make_prepared_all();
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
-        assert_eq!(headers.get("x-mo-full-llm-capture").unwrap(), "1");
-        assert_eq!(headers.get("x-mo-session-turn").unwrap(), "4");
-        assert_eq!(headers.get("x-mo-turn-chain-id").unwrap(), "tc1");
-        assert_eq!(headers.get("x-mo-user-query-event-id").unwrap(), "uqe1");
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
-        assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
-        assert_eq!(headers.get("x-mo-routing-meta-b64").unwrap(), "cm91dGU=");
-        assert_eq!(headers.get("x-mo-execution-state-b64").unwrap(), "c3RhdGU=");
-    }
-
-    #[test]
-    fn apply_prepared_headers_no_fields() {
-        let mut headers = HeaderMap::new();
-        let prepared = make_prepared_none();
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn apply_prepared_headers_partial_fields() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.trusted_session_id = Some("s1".into());
-        prepared.user_query_b64 = Some("aGVsbG8=".into());
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
-        assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
-    }
-
-    #[test]
-    fn apply_prepared_headers_tools_changed_true() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.tools_changed = Some(true);
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
-    }
-
-    #[test]
-    fn apply_prepared_headers_tools_changed_false() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.tools_changed = Some(false);
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "0");
-    }
-
     // ─── Additional protocol tests ──────────────────────────────────────
 
     #[test]
     fn auth_message_without_bearer_prefix() {
-        let json = r#"{"type":"auth","token":"abc123"}"#;
+        let json = r#"{"type":"auth","token":"abc123","interaction_api_major":"3"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Auth { token } => assert_eq!(token, "abc123"),
+            WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            } => {
+                assert_eq!(token, "abc123");
+                assert_eq!(interaction_api_major, "3");
+            }
             _ => panic!("expected Auth"),
         }
     }
@@ -4182,6 +2965,7 @@ mod tests {
             WsServerMessage::AuthOk {
                 user_id: "u1".into(),
                 username: "alice".into(),
+                interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
             },
             WsServerMessage::AuthError {
                 message: "bad".into(),
@@ -4522,6 +3306,16 @@ mod tests {
     }
 
     #[test]
+    fn serialize_run_cancellation_requested() {
+        let msg = WsServerMessage::RunCancellationRequested {
+            run_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_cancellation_requested""#));
+        assert!(json.contains(r#""run_id":"r1""#));
+    }
+
+    #[test]
     fn lifecycle_poll_error_policy_retries_transient_errors() {
         for status in [
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4664,6 +3458,7 @@ mod tests {
             WsServerMessage::AuthOk {
                 user_id: "u1".into(),
                 username: "alice".into(),
+                interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
             },
             WsServerMessage::AuthError {
                 message: "bad".into(),
@@ -4741,7 +3536,7 @@ mod tests {
     #[test]
     fn all_client_message_variants_parse() {
         let inputs = [
-            r#"{"type":"auth","token":"t1"}"#,
+            r#"{"type":"auth","token":"t1","interaction_api_major":"3"}"#,
             r#"{"type":"message","content":"hello","model_selection":{"offering_id":"offer-gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,

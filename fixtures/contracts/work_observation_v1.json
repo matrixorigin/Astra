@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "report_id": "work-observation:b4c17485a5448133fa14beb491f8a2aef07dc02b2dda0839c1111ea0da4a6a0b",
+  "content_hash": "sha256:b4c17485a5448133fa14beb491f8a2aef07dc02b2dda0839c1111ea0da4a6a0b",
+  "scope": "declared_work",
+  "as_of": {
+    "work_revision": 1,
+    "goal_revision": 1,
+    "criteria_set_revision": 1,
+    "delivery_branch_revision": 1,
+    "graph_revision": 1,
+    "event_head": 1
+  },
+  "source_revisions": [
+    {
+      "source": "work",
+      "revision": 1
+    },
+    {
+      "source": "goal",
+      "revision": 1
+    },
+    {
+      "source": "criterion_set",
+      "revision": 1,
+      "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "source": "delivery_branch",
+      "revision": 1
+    },
+    {
+      "source": "graph",
+      "revision": 1,
+      "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "source": "work_events",
+      "event_head": 1
+    }
+  ],
+  "coherence": "coherent",
+  "coverage_gaps": [],
+  "finding": {
+    "fact_code": "criteria_not_accepted",
+    "cause_code": "accepted_criteria_empty"
+  },
+  "satisfaction_evidence_refs": [],
+  "overview": {
+    "work_id": "work-1",
+    "work_revision": 1,
+    "project_id": null,
+    "original_intent_ref": "intent-1",
+    "goal": {
+      "revision": 1,
+      "goal": "Ship the typed Work read contract."
+    },
+    "criteria": {
+      "revision": 1,
+      "member_count": 0,
+      "manifest_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "delivery_branch": {
+      "work_id": "work-1",
+      "branch_id": "branch-1",
+      "branch_revision": 1,
+      "origin_branch_id": null,
+      "fork_cursor": null,
+      "goal_revision_ref": 1,
+      "goal_alignment": "current",
+      "criteria_set_revision_ref": 1,
+      "criteria_alignment": "current",
+      "basis_graph_revision": 1,
+      "current_graph_revision": 1,
+      "retention_state": "active",
+      "created_at": "2026-08-01T12:00:00Z",
+      "archived_at": null
+    },
+    "graph": {
+      "revision": 1,
+      "item_count": 1,
+      "edge_count": 0,
+      "manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "delivery": {
+      "status": "criteria_not_accepted",
+      "required_criterion_count": 0,
+      "satisfied_criterion_count": 0,
+      "fresh_check_count": 0,
+      "accepted_gap_count": 0,
+      "remaining_criterion_count": 0,
+      "subject_revision": null,
+      "freshness_valid_until": null
+    },
+    "event_head": 1,
+    "retention_state": "active",
+    "created_at": "2026-08-01T12:00:00Z",
+    "archived_at": null
+  }
+}

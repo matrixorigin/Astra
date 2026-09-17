@@ -42,7 +42,6 @@ async fn missing_identity_is_actionable_without_poisoning_live_memory_service_he
             &json!({
                 "content": content,
                 "memory_type": "semantic",
-                "skip_conflict_check": true,
             }),
         )
         .await;

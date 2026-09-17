@@ -133,7 +133,56 @@ pub fn build_recovery_message_with_evidence(
     evidence: Option<&astra_core::ToolFailureEvidence>,
 ) -> String {
     if let Some(evidence) = evidence {
+        if tool_name == "bash"
+            && evidence.cause == astra_core::ToolFailureCause::ScopeTooBroad
+            && !evidence.retryable
+            && evidence
+                .recovery_actions
+                .contains(&astra_core::ToolRecoveryAction::SelectAvailableCapability)
+        {
+            return "⚠ Bash workspace verification is unavailable for this workspace generation. Do NOT retry bash mode=verify or merely change its command: use a typed observer such as read_file or list_dir for the changed artifact instead.".to_string();
+        }
         match evidence.cause {
+            astra_core::ToolFailureCause::InvalidArguments => {
+                return format!(
+                    "⚠ {tool_name} rejected the structured arguments. Correct the named fields and make one new call; do not repeat the identical request."
+                );
+            }
+            astra_core::ToolFailureCause::PermissionBoundary => {
+                return format!(
+                    "⚠ {tool_name} was denied by the active permission policy. Do NOT retry the identical call; remove the restricted effect or use a capability that is explicitly available."
+                );
+            }
+            astra_core::ToolFailureCause::CapabilityUnavailable => {
+                return format!(
+                    "⚠ {tool_name} has no available executor/provider for this turn. Do NOT retry the identical call; reconnect or select an explicitly bound capability."
+                );
+            }
+            astra_core::ToolFailureCause::ResourceMissing => {
+                return format!(
+                    "⚠ {tool_name} could not find the requested resource. Verify the structured path/name before making one corrected call."
+                );
+            }
+            astra_core::ToolFailureCause::ResourceExhausted => {
+                return format!(
+                    "⚠ {tool_name} hit a system resource limit. Reduce scope or resource pressure before trying again; do not repeat the identical call."
+                );
+            }
+            astra_core::ToolFailureCause::TransientTransport => {
+                if evidence.retryable {
+                    return format!(
+                        "⚠ {tool_name} encountered a retryable transport failure. Wait for the provider/edge route to recover, then make at most one new call."
+                    );
+                }
+                return format!(
+                    "⚠ {tool_name} encountered a terminal transport failure for this turn. No automatic retry is permitted; select another bound route or report the degraded capability."
+                );
+            }
+            astra_core::ToolFailureCause::CommandFailed => {
+                return format!(
+                    "⚠ {tool_name} ran but its command exited unsuccessfully. This is not a tool-schema or credential error. Inspect the command's exit code and captured output, then correct the command, path, or operation before making one new call; do not repeat the identical command."
+                );
+            }
             astra_core::ToolFailureCause::InputTooLarge => {
                 return format!(
                     "⚠ {tool_name} rejected an oversized input. Use a targeted line/range read, narrow the path or query, or search for the relevant location before reading full content. This is structured recovery evidence; do not repeat the identical call."
@@ -162,12 +211,6 @@ pub fn build_recovery_message_with_evidence(
         category,
         ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
     );
-    let task_board_invalid_args = tool_name == "task_board"
-        && matches!(
-            category,
-            ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
-        );
-
     let mut msg = match category {
         ErrorCategory::Network
         | ErrorCategory::RateLimit
@@ -193,8 +236,6 @@ pub fn build_recovery_message_with_evidence(
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
             } else if write_file_invalid_args {
                 "⚠ write_file failed: invalid arguments or workspace safety precondition. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. For existing files, call read_file on the exact path in this session before editing it. Do NOT switch to bash or python just to write or delete this file.".to_string()
-            } else if task_board_invalid_args {
-                astra_tools::task_tool_contract::task_invalid_args_recovery_message()
             } else if file_edit_invalid_args {
                 format!(
                     "⚠ {} failed: invalid file-edit arguments or workspace safety precondition. \
@@ -398,6 +439,20 @@ pub fn build_escalation_message(level: EscalationLevel, avoid_tools: &[String]) 
 
 // ── Session Error Summary ────────────────────────────────────────────────────
 
+const RECENT_ERROR_WINDOW: usize = 16;
+
+/// Durable decision facts. Recent counters are derived from the bounded window
+/// on restore, not persisted as a second potentially inconsistent projection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionErrorContinuation {
+    total_errors: usize,
+    errors_by_category: HashMap<ErrorCategory, usize>,
+    retries_performed: usize,
+    retries_succeeded: usize,
+    recent_errors: VecDeque<ErrorCategory>,
+}
+
 /// Lightweight session-level error tracking for escalation decisions.
 #[derive(Debug, Clone, Default)]
 pub struct SessionErrorSummary {
@@ -412,14 +467,71 @@ pub struct SessionErrorSummary {
     recent_errors: VecDeque<ErrorCategory>,
 }
 
+impl serde::Serialize for SessionErrorSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&self.checkpoint(), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SessionErrorSummary {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let snapshot = <SessionErrorContinuation as serde::Deserialize>::deserialize(deserializer)?;
+        Self::restore(snapshot).map_err(serde::de::Error::custom)
+    }
+}
+
 impl SessionErrorSummary {
+    pub fn checkpoint(&self) -> SessionErrorContinuation {
+        SessionErrorContinuation {
+            total_errors: self.total_errors,
+            errors_by_category: self.errors_by_category.clone(),
+            retries_performed: self.retries_performed,
+            retries_succeeded: self.retries_succeeded,
+            recent_errors: self.recent_errors.clone(),
+        }
+    }
+
+    pub fn restore(snapshot: SessionErrorContinuation) -> Result<Self, &'static str> {
+        if snapshot.recent_errors.len() > RECENT_ERROR_WINDOW
+            || snapshot.retries_succeeded > snapshot.retries_performed
+            || snapshot
+                .errors_by_category
+                .values()
+                .try_fold(0usize, |sum, count| sum.checked_add(*count))
+                != Some(snapshot.total_errors)
+        {
+            return Err("inconsistent session error continuation");
+        }
+        let mut recent_errors_by_category = HashMap::new();
+        for category in &snapshot.recent_errors {
+            *recent_errors_by_category.entry(*category).or_insert(0usize) += 1;
+        }
+        if recent_errors_by_category.iter().any(|(category, count)| {
+            *count
+                > snapshot
+                    .errors_by_category
+                    .get(category)
+                    .copied()
+                    .unwrap_or(0)
+        }) {
+            return Err("recent error window exceeds lifetime facts");
+        }
+        Ok(Self {
+            total_errors: snapshot.total_errors,
+            errors_by_category: snapshot.errors_by_category,
+            retries_performed: snapshot.retries_performed,
+            retries_succeeded: snapshot.retries_succeeded,
+            recent_total_errors: snapshot.recent_errors.len(),
+            recent_errors_by_category,
+            recent_errors: snapshot.recent_errors,
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn record_error(&mut self, category: ErrorCategory) {
-        const RECENT_ERROR_WINDOW: usize = 16;
-
         self.total_errors += 1;
         *self.errors_by_category.entry(category).or_default() += 1;
         self.recent_total_errors += 1;
@@ -493,6 +605,86 @@ impl SessionErrorSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_error_continuation_matches_uninterrupted_execution() {
+        let mut continuous = SessionErrorSummary::new();
+        for step in 0..80 {
+            let wire = serde_json::to_value(continuous.checkpoint()).unwrap();
+            assert!(wire.get("recent_total_errors").is_none());
+            assert!(wire.get("recent_errors_by_category").is_none());
+            let mut restored =
+                SessionErrorSummary::restore(serde_json::from_value(wire).unwrap()).unwrap();
+            for state in [&mut continuous, &mut restored] {
+                state.record_error(if step % 3 == 0 {
+                    ErrorCategory::Auth
+                } else {
+                    ErrorCategory::Network
+                });
+                if step % 7 == 0 {
+                    state.record_retry(true);
+                }
+                if step % 19 == 0 {
+                    state.clear_recent_pressure();
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(continuous.checkpoint()).unwrap(),
+                serde_json::to_value(restored.checkpoint()).unwrap()
+            );
+            assert_eq!(
+                continuous.recent_error_pressure(),
+                restored.recent_error_pressure()
+            );
+            assert_eq!(
+                continuous.recent_errors_by_category,
+                restored.recent_errors_by_category
+            );
+        }
+        let valid = continuous.checkpoint();
+        let mut corrupt = valid.clone();
+        corrupt.total_errors += 1;
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+        let mut corrupt = valid.clone();
+        corrupt.recent_errors = std::iter::repeat_n(ErrorCategory::Network, 17).collect();
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+        let mut corrupt = valid;
+        corrupt.retries_succeeded = corrupt.retries_performed + 1;
+        assert!(SessionErrorSummary::restore(corrupt).is_err());
+    }
+
+    #[test]
+    fn session_error_continuation_rejects_missing_or_inconsistent_facts() {
+        let mut summary = SessionErrorSummary::new();
+        summary.record_error(ErrorCategory::Network);
+        let valid = summary.checkpoint();
+        let wire = serde_json::to_value(&valid).unwrap();
+        for field in wire.as_object().unwrap().keys() {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<SessionErrorContinuation>(missing).is_err());
+        }
+        let mut unknown = wire;
+        unknown["recent_total_errors"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<SessionErrorContinuation>(unknown).is_err());
+
+        let mut wrong_category = valid.clone();
+        wrong_category.recent_errors = VecDeque::from([ErrorCategory::Auth]);
+        assert!(
+            serde_json::from_value::<SessionErrorSummary>(
+                serde_json::to_value(&wrong_category).unwrap()
+            )
+            .is_err()
+        );
+        assert!(SessionErrorSummary::restore(wrong_category).is_err());
+
+        let mut overflow = valid;
+        overflow
+            .errors_by_category
+            .insert(ErrorCategory::Network, usize::MAX);
+        overflow.errors_by_category.insert(ErrorCategory::Auth, 1);
+        assert!(SessionErrorSummary::restore(overflow).is_err());
+    }
 
     // ── Classification: data-driven ──
 
@@ -718,6 +910,102 @@ mod tests {
     }
 
     #[test]
+    fn command_failure_evidence_never_becomes_a_tool_argument_or_auth_diagnosis() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::Unknown,
+            astra_core::ToolFailureCause::CommandFailed,
+            false,
+            vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "Error: bash execution failed (exit code 2)",
+            ErrorCategory::ToolInvalidArgs,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("command exited unsuccessfully"),
+            "{message}"
+        );
+        assert!(!message.contains("invalid arguments"), "{message}");
+        assert!(
+            message.contains("not a tool-schema or credential error"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn structured_capability_failure_does_not_invent_network_retry() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolUnavailable,
+            astra_core::ToolFailureCause::CapabilityUnavailable,
+            false,
+            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
+        );
+        let message = build_recovery_message_with_evidence(
+            "web_fetch",
+            "edge route unavailable",
+            ErrorCategory::Network,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("no available executor/provider"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("system retried automatically"),
+            "{message}"
+        );
+        assert!(message.contains("Do NOT retry"), "{message}");
+    }
+
+    #[test]
+    fn non_retryable_bash_scope_capability_directs_to_typed_observer() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolUnavailable,
+            astra_core::ToolFailureCause::ScopeTooBroad,
+            false,
+            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "verify unavailable",
+            ErrorCategory::ToolUnavailable,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("Do NOT retry bash mode=verify"),
+            "{message}"
+        );
+        assert!(message.contains("typed observer"), "{message}");
+    }
+
+    #[test]
+    fn structured_non_retryable_timeout_is_not_presented_as_an_automatic_retry() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolTimeout,
+            astra_core::ToolFailureCause::TransientTransport,
+            false,
+            vec![astra_core::ToolRecoveryAction::WaitAndRetry],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "approval wait expired",
+            ErrorCategory::Network,
+            &[],
+            Some(&evidence),
+        );
+        assert!(message.contains("terminal transport failure"), "{message}");
+        assert!(
+            !message.contains("system retried automatically"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn recovery_message_tool_specific() {
         // unavailable tool
         let msg = build_recovery_message(
@@ -741,30 +1029,6 @@ mod tests {
         assert!(
             !alts_section.to_lowercase().contains("bash"),
             "bash must not be an alternative"
-        );
-
-        // task missing/invalid action → retry the same structured tool with
-        // the shared action contract instead of switching tools or answering
-        // as if task management succeeded.
-        let err = "Error: missing required parameter `action` for `task_board`.";
-        let cat = classify_error(err);
-        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
-        let msg = build_recovery_message("task_board", err, cat, &[]);
-        assert!(msg.contains("Retry the same `task_board` tool"));
-        assert!(msg.contains(astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY));
-        assert!(msg.contains("use only fields allowed for that action"));
-
-        let err = astra_tools::task_tool_contract::unknown_task_field_message(
-            "create",
-            "new_status",
-            astra_tools::task_tool_contract::task_action_allowed_fields("create").unwrap(),
-        );
-        let cat = classify_error(&err);
-        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
-        let msg = build_recovery_message("task_board", &err, cat, &[]);
-        assert!(
-            msg.contains("action=update with task_id + new_status"),
-            "wrong-action field errors must recover through the task contract: {msg}"
         );
 
         // write_file missing content → editing alternatives

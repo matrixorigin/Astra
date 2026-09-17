@@ -115,7 +115,10 @@ impl ResourceLimits {
 
     pub fn long_session() -> Self {
         Self {
-            max_execution_secs: Some(300.0),
+            // Long-running user work such as dependency installation, builds,
+            // and CPU training must not be cancelled solely because an edge
+            // transport used the old five-minute interactive ceiling.
+            max_execution_secs: Some(1_800.0),
             max_output_bytes: Some(8_388_608),
             max_background_session_secs: Some(86_400.0),
         }

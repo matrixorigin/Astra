@@ -1,2 +1,8 @@
-blank_issues_enabled: true
-contact_links: []
+blank_issues_enabled: false
+contact_links:
+  - name: Support and troubleshooting
+    url: https://github.com/matrixorigin/Astra/blob/main/SUPPORT.md
+    about: Find the right support path and the diagnostic information to include.
+  - name: Documentation
+    url: https://github.com/matrixorigin/Astra/tree/main/docs
+    about: Browse setup, deployment, configuration, and troubleshooting guides.

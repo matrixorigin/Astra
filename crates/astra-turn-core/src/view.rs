@@ -9,7 +9,7 @@ pub fn extract_latest_user_query(messages: &[Value]) -> String {
         .rev()
         .find_map(|message| {
             let object = message.as_object()?;
-            if object.get("role").and_then(Value::as_str) == Some("user") {
+            if astra_turn_types::is_human_user_message(message) {
                 object
                     .get("content")
                     .and_then(Value::as_str)

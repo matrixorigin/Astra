@@ -8,16 +8,11 @@
 //! - what durable verification state exists,
 //! - and what the last lifecycle event was.
 //!
-//! Task-board context is injected through `TaskManager::build_active_task_context`
-//! into the runtime context pipeline. Keeping it out of this append prompt gives
-//! the model one authoritative task source per turn.
+//! Canonical Work state is observed through the typed Work projection and is
+//! deliberately absent from this append-only compatibility summary.
 
 use astra_runtime::plan::{PlanModeState, plan_resume_digest};
-use astra_services::{
-    durable_task::{SubtaskStage, TaskContract},
-    session_journal::{JournalEvent, JournalEventType},
-    task_orchestrator::{TaskPlan, TaskStatus},
-};
+use astra_services::session_journal::{JournalEvent, JournalEventType};
 
 pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub model: Option<&'a str>,
@@ -25,11 +20,6 @@ pub(crate) struct ExecutionStateSummaryInput<'a> {
     pub session_persistence_error: Option<&'a str>,
     pub plan_mode_active: bool,
     pub plan_mode: Option<&'a PlanModeState>,
-    pub executing_plan: Option<&'a TaskPlan>,
-    pub executing_plan_goal: Option<&'a str>,
-    pub plan_execution_rounds: usize,
-    pub plan_execution_corrections: &'a [String],
-    pub durable_contract: Option<&'a TaskContract>,
     pub last_turn_event: Option<&'a JournalEvent>,
 }
 
@@ -42,14 +32,6 @@ pub(crate) fn format_for_session_state(
         session_persistence_error: state.session_persistence_error.as_deref(),
         plan_mode_active: state.plan_mode_active(),
         plan_mode: state.cloud_plan_mirror.as_ref(),
-        executing_plan: state.executing_plan.as_ref(),
-        executing_plan_goal: state.executing_plan_goal.as_deref(),
-        plan_execution_rounds: state.plan_execution_rounds,
-        plan_execution_corrections: &state.plan_execution_corrections,
-        durable_contract: state
-            .durable_task_state
-            .as_ref()
-            .map(|state| &state.contract),
         last_turn_event: state.last_turn_event.as_ref(),
     })
 }
@@ -83,17 +65,6 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
         }
         lifecycle_lines.push(line);
     }
-    if let Some(plan) = input.executing_plan {
-        lifecycle_lines.push(render_executing_plan(
-            plan,
-            input.executing_plan_goal,
-            input.plan_execution_rounds,
-            input.plan_execution_corrections,
-        ));
-    }
-    if let Some(contract) = input.durable_contract {
-        lifecycle_lines.push(render_durable_contract(contract));
-    }
     if let Some(event_line) = input.last_turn_event.and_then(render_last_event) {
         lifecycle_lines.push(event_line);
     }
@@ -109,97 +80,6 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
     }
     block.extend(lifecycle_lines);
     Some(block.join("\n"))
-}
-
-fn render_executing_plan(
-    plan: &TaskPlan,
-    goal: Option<&str>,
-    rounds: usize,
-    corrections: &[String],
-) -> String {
-    let total = plan.subtasks.len();
-    let done = plan.items_done();
-    let open = plan
-        .subtasks
-        .iter()
-        .filter(|subtask| !subtask.status.is_terminal() && subtask.status != TaskStatus::InProgress)
-        .count();
-    let in_progress = plan
-        .subtasks
-        .iter()
-        .find(|subtask| subtask.status == TaskStatus::InProgress)
-        .map(|subtask| format!("in_progress=\"{}\"", preview(&subtask.title, 80)));
-    let next = if in_progress.is_none() {
-        plan.subtasks
-            .iter()
-            .find(|subtask| subtask.status == TaskStatus::Pending)
-            .map(|subtask| format!("next=\"{}\"", preview(&subtask.title, 80)))
-    } else {
-        None
-    };
-
-    let mut fields = Vec::new();
-    if let Some(goal) = goal.map(str::trim).filter(|goal| !goal.is_empty()) {
-        fields.push(format!("goal=\"{}\"", preview(goal, 160)));
-    }
-    if let Some(in_progress) = in_progress {
-        fields.push(in_progress);
-    } else if let Some(next) = next {
-        fields.push(next);
-    }
-    if total > 0 {
-        fields.push(format!("open={open}"));
-        fields.push(format!("done={done}/{total}"));
-        fields.push(format!("progress={}%", plan.progress_pct()));
-    }
-    if rounds > 0 {
-        fields.push(format!("rounds={rounds}"));
-    }
-    if !corrections.is_empty() {
-        fields.push(format!("corrections={}", corrections.len()));
-    }
-
-    format!("plan execution: {}", fields.join(" · "))
-}
-
-fn render_durable_contract(contract: &TaskContract) -> String {
-    let verified = contract
-        .subtasks
-        .iter()
-        .filter(|subtask| subtask.stage.is_success())
-        .count();
-    let total = contract.subtasks.len();
-    let current = contract
-        .subtasks
-        .iter()
-        .find(|subtask| {
-            matches!(
-                subtask.stage,
-                SubtaskStage::Executing
-                    | SubtaskStage::AwaitingVerification
-                    | SubtaskStage::Verifying
-                    | SubtaskStage::VerificationFailed { .. }
-                    | SubtaskStage::ExecutionFailed { .. }
-                    | SubtaskStage::Blocked { .. }
-            )
-        })
-        .or_else(|| {
-            contract
-                .subtasks
-                .iter()
-                .find(|subtask| matches!(subtask.stage, SubtaskStage::Pending))
-        });
-
-    let mut fields = vec![format!("status={}", contract.status.as_str())];
-    if total > 0 {
-        fields.push(format!("verified={verified}/{total}"));
-    }
-    if let Some(subtask) = current {
-        fields.push(format!("subtask=\"{}\"", preview(&subtask.title, 80)));
-        fields.push(format!("stage={}", subtask.stage.as_str()));
-    }
-
-    format!("durable verification: {}", fields.join(" · "))
 }
 
 fn render_last_event(event: &JournalEvent) -> Option<String> {
@@ -277,297 +157,30 @@ fn preview(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionStateSummaryInput, format_summary};
-    use astra_runtime::plan::PlanModeState;
-    use astra_services::durable_task::{
-        ContractStatus, DurableSubtask, SubtaskStage, TaskContract, TaskScope,
-    };
-    use astra_services::session_journal::JournalEvent;
-    use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
-    use astra_services::{VerificationCriterion, VerifierKind};
-    use astra_tools::task_mgmt::{SessionSubtask, SessionTask};
-
-    fn task(id: &str, title: &str, status: &str) -> SessionTask {
-        SessionTask {
-            archived_at: None,
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            status: status.into(),
-            subtasks: Vec::new(),
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            active_form: None,
-            owner: None,
-            metadata: None,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-        }
-    }
-
-    fn subtask(id: &str, title: &str, status: &str) -> SessionSubtask {
-        SessionSubtask {
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            status: status.into(),
-            depends_on: Vec::new(),
-            owner: None,
-            reason: None,
-        }
-    }
-
-    fn durable_contract() -> TaskContract {
-        TaskContract {
-            contract_id: "contract-12345678".into(),
-            task_id: "task-123".into(),
-            goal: "Ship auth flow".into(),
-            scope: TaskScope::default(),
-            subtasks: vec![
-                DurableSubtask {
-                    id: "sub-1".into(),
-                    title: "Model auth state".into(),
-                    stage: SubtaskStage::Completed,
-                    ..Default::default()
-                },
-                DurableSubtask {
-                    id: "sub-2".into(),
-                    title: "Verify auth API".into(),
-                    stage: SubtaskStage::AwaitingVerification,
-                    criteria: vec![VerificationCriterion {
-                        id: "criterion-1".into(),
-                        description: "auth API should pass".into(),
-                        verifier: VerifierKind::FileExists {
-                            paths: vec!["src/auth.rs".into()],
-                        },
-                        required: true,
-                        timeout_sec: 30,
-                        global_only: false,
-                    }],
-                    ..Default::default()
-                },
-            ],
-            global_verification: Vec::new(),
-            version: 1,
-            status: ContractStatus::Active,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        }
-    }
+    use super::{ExecutionStateSummaryInput, format_for_session_state, format_summary};
 
     #[test]
-    fn summary_includes_resume_authoring_execution_durable_and_last_event() {
-        let mut plan_mode = PlanModeState::new("Harden auth".into());
-        plan_mode.modified = true;
-        plan_mode
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "draft-1".into(),
-                title: "Write auth plan".into(),
-                status: TaskStatus::Pending,
-                ..Default::default()
-            });
-
-        let executing_plan = TaskPlan {
-            subtasks: vec![
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "exec-1".into(),
-                    title: "Model auth state".into(),
-                    status: TaskStatus::Completed,
-                    ..Default::default()
-                },
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "exec-2".into(),
-                    title: "Verify auth API".into(),
-                    status: TaskStatus::InProgress,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-
-        let event = JournalEvent::plan_progress(
-            Some("sess-1"),
-            7,
-            "exec-2",
-            "Verify auth API",
-            "started",
-            50,
-            2,
-            1,
-        );
-        let durable = durable_contract();
-
-        let out = format_summary(ExecutionStateSummaryInput {
-            model: Some("gpt-5.4"),
-            last_turn_interrupted: true,
+    fn summary_reports_plan_authoring_without_inventing_execution_state() {
+        let plan = astra_runtime::plan::PlanModeState::new("Ship auth".into());
+        let summary = format_summary(ExecutionStateSummaryInput {
+            model: Some("deepseek-v4-flash"),
+            last_turn_interrupted: false,
             session_persistence_error: None,
             plan_mode_active: true,
-            plan_mode: Some(&plan_mode),
-            executing_plan: Some(&executing_plan),
-            executing_plan_goal: Some("Ship auth flow"),
-            plan_execution_rounds: 4,
-            plan_execution_corrections: &["add regression coverage".into()],
-            durable_contract: Some(&durable),
-            last_turn_event: Some(&event),
-        })
-        .expect("summary");
-
-        assert!(
-            out.contains("### Turn-start session execution state"),
-            "{out}"
-        );
-        assert!(out.contains("model: gpt-5.4"), "{out}");
-        assert!(
-            out.contains("plan authoring: [plan-resume] goal=\"Harden auth\""),
-            "{out}"
-        );
-        assert!(out.contains("open=1"), "{out}");
-        assert!(out.contains("done=0/1"), "{out}");
-        assert!(out.contains("modified"), "{out}");
-        assert!(
-            out.contains("plan execution: goal=\"Ship auth flow\""),
-            "{out}"
-        );
-        assert!(out.contains("in_progress=\"Verify auth API\""), "{out}");
-        assert!(out.contains("rounds=4"), "{out}");
-        assert!(out.contains("corrections=1"), "{out}");
-        assert!(
-            out.contains("durable verification: status=active · verified=1/2"),
-            "{out}"
-        );
-        assert!(out.contains("stage=awaiting_verification"), "{out}");
-        assert!(
-            out.contains(
-                "last event: plan_progress · action=started · subtask=\"Verify auth API\""
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn summary_returns_none_when_no_lifecycle_state_exists() {
-        let out = format_summary(ExecutionStateSummaryInput {
-            model: Some("gpt-5.4"),
-            last_turn_interrupted: false,
-            session_persistence_error: None,
-            plan_mode_active: false,
-            plan_mode: None,
-            executing_plan: None,
-            executing_plan_goal: None,
-            plan_execution_rounds: 0,
-            plan_execution_corrections: &[],
-            durable_contract: None,
-            last_turn_event: None,
-        });
-
-        assert!(
-            out.is_none(),
-            "task board must not be injected through execution-state summary"
-        );
-    }
-
-    #[test]
-    fn summary_uses_next_subtask_when_plan_is_not_started() {
-        let executing_plan = TaskPlan {
-            subtasks: vec![
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "exec-1".into(),
-                    title: "Model auth state".into(),
-                    status: TaskStatus::Pending,
-                    ..Default::default()
-                },
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "exec-2".into(),
-                    title: "Verify auth API".into(),
-                    status: TaskStatus::Pending,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-
-        let out = format_summary(ExecutionStateSummaryInput {
-            model: None,
-            last_turn_interrupted: false,
-            session_persistence_error: None,
-            plan_mode_active: false,
-            plan_mode: None,
-            executing_plan: Some(&executing_plan),
-            executing_plan_goal: Some("Ship auth flow"),
-            plan_execution_rounds: 0,
-            plan_execution_corrections: &[],
-            durable_contract: None,
+            plan_mode: Some(&plan),
             last_turn_event: None,
         })
         .expect("summary");
 
-        assert!(out.contains("next=\"Model auth state\""), "{out}");
-        assert!(out.contains("done=0/2"), "{out}");
+        assert!(summary.contains("plan authoring"));
+        assert!(!summary.contains("plan execution"));
     }
 
     #[test]
-    fn summary_hides_stale_plan_authoring_when_plan_mode_is_inactive() {
-        let plan_mode = PlanModeState::new("Stale plan".into());
-        let executing_plan = TaskPlan {
-            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
-                id: "exec-1".into(),
-                title: "Verify stale plan is hidden".into(),
-                status: TaskStatus::InProgress,
-                ..Default::default()
-            }],
-            notes: None,
-        };
+    fn inactive_plan_mirror_is_not_an_execution_fact() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new("stale".into()));
 
-        let out = format_summary(ExecutionStateSummaryInput {
-            model: Some("gpt-5.4"),
-            last_turn_interrupted: false,
-            session_persistence_error: None,
-            plan_mode_active: false,
-            plan_mode: Some(&plan_mode),
-            executing_plan: Some(&executing_plan),
-            executing_plan_goal: Some("Keep executing plan visible"),
-            plan_execution_rounds: 2,
-            plan_execution_corrections: &[],
-            durable_contract: None,
-            last_turn_event: None,
-        })
-        .expect("summary");
-
-        assert!(
-            !out.contains("plan authoring:"),
-            "inactive plan mode must not leak stale plan-authoring summary: {out}"
-        );
-        assert!(
-            out.contains("plan execution: goal=\"Keep executing plan visible\""),
-            "executing-plan summary must remain visible when only plan authoring is stale: {out}"
-        );
-    }
-
-    #[test]
-    fn summary_surfaces_session_persistence_degradation() {
-        let out = format_summary(ExecutionStateSummaryInput {
-            model: Some("gpt-5.4"),
-            last_turn_interrupted: false,
-            session_persistence_error: Some(
-                "failed to append turn event: Is a directory (os error 21)",
-            ),
-            plan_mode_active: false,
-            plan_mode: None,
-            executing_plan: None,
-            executing_plan_goal: None,
-            plan_execution_rounds: 0,
-            plan_execution_corrections: &[],
-            durable_contract: None,
-            last_turn_event: None,
-        })
-        .expect("summary");
-
-        assert!(out.contains("session persistence: degraded"), "{out}");
-        assert!(out.contains("failed to append turn event"), "{out}");
+        assert!(format_for_session_state(&state).is_none());
     }
 }

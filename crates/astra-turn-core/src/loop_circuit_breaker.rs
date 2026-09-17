@@ -13,16 +13,10 @@ use std::collections::BTreeSet;
 /// Anomaly signals the circuit breaker observes each round.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoundSignal {
-    /// Tool call signatures this round (tool_name:canonical_args).
-    pub tool_signatures: BTreeSet<String>,
+    /// Opaque stall-equivalence signatures for this round; no raw arguments.
+    pub tool_signatures: BTreeSet<crate::stall::StallSignature>,
     /// Whether this round produced a mutation (file write, shell with side effects).
     pub produced_mutation: bool,
-    /// Whether this round produced strong evidence that the user task is complete.
-    ///
-    /// This is a positive completion signal, not an anomaly. Callers should set
-    /// it only from structured execution evidence (for example a successful
-    /// `git_commit` round), not from natural-language completion phrases.
-    pub task_completed: bool,
     /// Number of tool calls this round.
     pub tool_count: usize,
 }
@@ -63,9 +57,6 @@ pub enum BreakerAction {
     /// Periodic self-reflection evidence, emitted every N consecutive read-only
     /// rounds. Tools remain enabled and the model decides whether to continue.
     Introspect { consecutive_read_only: usize },
-    /// Suggest that the next model round should stop unless it can identify
-    /// concrete remaining work. Tools remain enabled.
-    CompletionObserved,
     /// A repeated behavior pattern was detected. Advisory only.
     PatternObserved,
     /// The observed behavior pattern persisted past its configured patience.
@@ -179,7 +170,11 @@ pub struct LoopCircuitBreaker {
     /// that got it killed?" Re-running the full window detectors during
     /// HalfOpen overweights pre-observation stale rounds and over-escalates agents
     /// that genuinely pivoted (root cause of session 3d5ded08 overkill).
-    trip_tail_signatures: BTreeSet<String>,
+    trip_tail_signatures: BTreeSet<crate::stall::StallSignature>,
+    /// One-shot latch for the stronger HalfOpen advisory. This is evidence,
+    /// not a transition or a lockout; repeating it on every unchanged round
+    /// only creates a prompt/retry storm.
+    advisory_threshold_emitted: bool,
 }
 
 impl LoopCircuitBreaker {
@@ -192,6 +187,7 @@ impl LoopCircuitBreaker {
             consecutive_read_only: 0,
             introspect_emissions_since_last_write: 0,
             trip_tail_signatures: BTreeSet::new(),
+            advisory_threshold_emitted: false,
         }
     }
 
@@ -235,6 +231,7 @@ impl LoopCircuitBreaker {
     fn reset_read_only_streak(&mut self) {
         self.consecutive_read_only = 0;
         self.introspect_emissions_since_last_write = 0;
+        self.advisory_threshold_emitted = false;
     }
 
     /// Override the read-only stall threshold (e.g., use a tighter threshold
@@ -280,13 +277,6 @@ impl LoopCircuitBreaker {
             };
         }
 
-        if self.rounds.last().is_some_and(|round| round.task_completed) {
-            self.state = BreakerState::Closed;
-            self.half_open_rounds = 0;
-            self.consecutive_read_only = 0;
-            return BreakerAction::CompletionObserved;
-        }
-
         match self.state {
             BreakerState::Closed => {
                 let action = self.evaluate_closed();
@@ -330,6 +320,7 @@ impl LoopCircuitBreaker {
         if self.state == BreakerState::Open {
             self.state = BreakerState::HalfOpen;
             self.half_open_rounds = 0;
+            self.advisory_threshold_emitted = false;
         }
     }
 
@@ -340,6 +331,7 @@ impl LoopCircuitBreaker {
         {
             self.state = BreakerState::Open;
             self.trip_tail_signatures = self.collect_trip_tail_signatures();
+            self.advisory_threshold_emitted = false;
             BreakerAction::PatternObserved
         } else {
             BreakerAction::Continue
@@ -349,7 +341,7 @@ impl LoopCircuitBreaker {
     /// Snapshot the union of tool signatures across the tail window that
     /// caused the trip. Used by HalfOpen to decide recovery without
     /// re-running window detectors over pre-observation stale rounds.
-    fn collect_trip_tail_signatures(&self) -> BTreeSet<String> {
+    fn collect_trip_tail_signatures(&self) -> BTreeSet<crate::stall::StallSignature> {
         // Use the widest detector window (read_only_stall_threshold) so we
         // capture every signature the agent was cycling through.
         let n = self
@@ -391,8 +383,12 @@ impl LoopCircuitBreaker {
             self.half_open_rounds = 0;
             self.consecutive_read_only = 0;
             self.trip_tail_signatures.clear();
+            self.advisory_threshold_emitted = false;
             BreakerAction::Continue
-        } else if self.half_open_rounds >= self.config.half_open_patience {
+        } else if self.half_open_rounds >= self.config.half_open_patience
+            && !self.advisory_threshold_emitted
+        {
+            self.advisory_threshold_emitted = true;
             BreakerAction::AdvisoryThresholdReached
         } else {
             BreakerAction::Continue
@@ -447,7 +443,7 @@ impl LoopCircuitBreaker {
         }
         // Progress check: does each round introduce at least one novel signature?
         // If yes, the agent is making progress — don't trip.
-        let mut seen: BTreeSet<&String> = BTreeSet::new();
+        let mut seen: BTreeSet<&crate::stall::StallSignature> = BTreeSet::new();
         let mut all_novel = true;
         for round in tail {
             let has_novel = round.tool_signatures.iter().any(|s| !seen.contains(s));
@@ -469,7 +465,7 @@ impl LoopCircuitBreaker {
         let split = self.rounds.len() - n;
         // Look back at most 2*N rounds before the tail as the comparison window.
         let window_start = split.saturating_sub(2 * n);
-        let prior_sigs: BTreeSet<&String> = self.rounds[window_start..split]
+        let prior_sigs: BTreeSet<&crate::stall::StallSignature> = self.rounds[window_start..split]
             .iter()
             .flat_map(|r| r.tool_signatures.iter())
             .collect();
@@ -477,7 +473,7 @@ impl LoopCircuitBreaker {
         if prior_sigs.is_empty() {
             return false;
         }
-        let tail_sigs: BTreeSet<&String> = self.rounds[split..]
+        let tail_sigs: BTreeSet<&crate::stall::StallSignature> = self.rounds[split..]
             .iter()
             .flat_map(|r| r.tool_signatures.iter())
             .collect();
@@ -497,25 +493,18 @@ mod tests {
     use super::*;
     use crate::chat_turn_heuristics::{TaskComplexity, TaskExecutionProfile};
 
-    fn sig(tools: &[&str]) -> BTreeSet<String> {
-        tools.iter().map(|s| s.to_string()).collect()
+    fn sig(tools: &[&str]) -> BTreeSet<crate::stall::StallSignature> {
+        tools
+            .iter()
+            .map(|s| crate::stall::StallSignature::new(s, b""))
+            .collect()
     }
 
     fn signal(tools: &[&str], mutation: bool) -> RoundSignal {
         RoundSignal {
             tool_signatures: sig(tools),
             produced_mutation: mutation,
-            task_completed: false,
             tool_count: tools.len(),
-        }
-    }
-
-    fn completion_signal() -> RoundSignal {
-        RoundSignal {
-            tool_signatures: sig(&["git_commit:{\"message\":\"finish\"}"]),
-            produced_mutation: true,
-            task_completed: true,
-            tool_count: 1,
         }
     }
 
@@ -555,36 +544,6 @@ mod tests {
             cb.observe(signal(&["write_file:a.rs"], true)),
             BreakerAction::Continue
         );
-        assert_eq!(cb.state(), BreakerState::Closed);
-    }
-
-    #[test]
-    fn completion_signal_emits_observation_without_opening_breaker() {
-        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
-
-        assert_eq!(
-            cb.observe(completion_signal()),
-            BreakerAction::CompletionObserved
-        );
-        assert_eq!(cb.state(), BreakerState::Closed);
-    }
-
-    #[test]
-    fn completion_signal_takes_precedence_over_repetition_observation() {
-        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
-
-        assert_eq!(
-            cb.observe(signal(&["read_file:same.rs"], false)),
-            BreakerAction::Continue
-        );
-        assert_eq!(
-            cb.observe(signal(&["read_file:same.rs"], false)),
-            BreakerAction::Continue
-        );
-        let mut done = completion_signal();
-        done.tool_signatures = sig(&["read_file:same.rs"]);
-
-        assert_eq!(cb.observe(done), BreakerAction::CompletionObserved);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
@@ -805,6 +764,45 @@ mod tests {
             cb.observe(signal(&["read_file:x"], false)),
             BreakerAction::AdvisoryThresholdReached
         );
+        assert_eq!(
+            cb.observe(signal(&["read_file:x"], false)),
+            BreakerAction::Continue,
+            "a persistent pattern gets one stronger advisory per episode, not a storm"
+        );
+    }
+
+    #[test]
+    fn half_open_advisory_latch_resets_after_recovery_and_new_trip() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            half_open_patience: 1,
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            cb.observe(signal(&["read_file:x"], false));
+        }
+        cb.acknowledge_pattern_observation();
+        assert_eq!(
+            cb.observe(signal(&["read_file:x"], false)),
+            BreakerAction::AdvisoryThresholdReached
+        );
+        assert_eq!(
+            cb.observe(signal(&["read_file:x"], false)),
+            BreakerAction::Continue
+        );
+        // A novel round closes the episode; a later independent trip may
+        // therefore emit its own single advisory.
+        assert_eq!(
+            cb.observe(signal(&["write_file:x"], true)),
+            BreakerAction::Continue
+        );
+        for _ in 0..3 {
+            cb.observe(signal(&["read_file:x"], false));
+        }
+        cb.acknowledge_pattern_observation();
+        assert_eq!(
+            cb.observe(signal(&["read_file:x"], false)),
+            BreakerAction::AdvisoryThresholdReached
+        );
     }
 
     // ─── Absolute max rounds (infrastructure guard) ─────────────────────
@@ -839,7 +837,6 @@ mod tests {
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
             produced_mutation: false,
-            task_completed: false,
             tool_count: 0,
         };
         // Empty rounds should not trigger repetition (they're text-only responses).
@@ -943,7 +940,6 @@ mod tests {
                 cb.observe(RoundSignal {
                     tool_signatures: BTreeSet::new(),
                     produced_mutation: false,
-                    task_completed: false,
                     tool_count: 0,
                 });
             }
@@ -975,7 +971,6 @@ mod tests {
             BreakerAction::Introspect {
                 consecutive_read_only: 12,
             },
-            BreakerAction::CompletionObserved,
             BreakerAction::PatternObserved,
             BreakerAction::AdvisoryThresholdReached,
             BreakerAction::HardRoundLimitReached {
@@ -988,7 +983,6 @@ mod tests {
                 BreakerAction::Continue => {}
                 BreakerAction::PatternObserved => {}
                 BreakerAction::Introspect { .. } => {}
-                BreakerAction::CompletionObserved => {}
                 BreakerAction::AdvisoryThresholdReached => {}
                 BreakerAction::HardRoundLimitReached { .. } => {}
             }
@@ -1314,7 +1308,6 @@ mod tests {
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
             produced_mutation: false,
-            task_completed: false,
             tool_count: 0,
         };
         assert_eq!(cb.observe(empty), BreakerAction::Continue);

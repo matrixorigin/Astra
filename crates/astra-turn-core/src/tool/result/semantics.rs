@@ -1,6 +1,6 @@
 //! Shared interpretation of edge tool outputs and stable tool-call keys (§5.5 dedup).
 //!
-//! Used by CLI `chat_stream` / `stream_render` and available for `bridge_inprocess` or server paths.
+//! Used by CLI `chat_stream` / `stream_render` and available for `server_loop` or server paths.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,67 +112,11 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     match classify_tool_result_status(output) {
         ToolResultStatus::Failed => "failed",
         ToolResultStatus::Completed => "completed",
-        ToolResultStatus::Skipped => "skipped",
+        // A suppressed invocation did not produce a successful tool outcome.
+        // Edge callbacks must fail closed unless they replay the original
+        // cached terminal result for the same durable invocation.
+        ToolResultStatus::Skipped => "failed",
     }
-}
-
-/// Stable success sentinel emitted by prose-style mutation tools.
-///
-/// Contract: file-mutation emitters that return human-readable prose
-/// (`str_replace`, `multi_edit`, `delete_file`) MUST append this token to a
-/// successful result body. Emitters that return structured JSON (e.g.
-/// `write_file` returns `{"success":true,...}`) are detected separately via
-/// the JSON branch of [`tool_output_has_explicit_success_signal`] and do not
-/// need the sentinel (appending it would break JSON parsing).
-///
-/// The body-wins reconciliation in
-/// [`execution_result_is_error`](crate::turn::headless_tool_pipeline::execute::execution_result_is_error)
-/// keys on this signal, so coupling matcher behavior to human-readable prose
-/// would silently regress when copy is tweaked. Read-only tools do not need to
-/// emit it: they are never reconciled against a failed edge-metadata status
-/// (transport failures on read-only tools are surfaced as errors, which is
-/// the desired behavior).
-pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
-
-/// True when the visible tool body carries an explicit success marker.
-///
-/// Priority order (stable first):
-/// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
-/// 2. Structured JSON success (`ok:true` / `success:true` /
-///    `status: completed`).
-///
-/// This is deliberately narrower than "not an error". It exists for transport
-/// reconciliation: if edge metadata says failure but the body says a mutation
-/// succeeded, the body must win so the journal does not turn a real edit into a
-/// false failed tool call.
-#[must_use]
-pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
-    let trimmed = output.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // 1. Stable sentinel — highest priority contract.
-    if output.contains(TOOL_SUCCESS_SENTINEL) {
-        return true;
-    }
-
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        if v.get("ok").and_then(Value::as_bool) == Some(true) {
-            return true;
-        }
-        if v.get("success").and_then(Value::as_bool) == Some(true) {
-            return true;
-        }
-        if let Some(status) = v.get("status").and_then(Value::as_str) {
-            let status = status.trim().to_ascii_lowercase();
-            if status == "completed" {
-                return true;
-            }
-        }
-    }
-
-    false
 }
 
 /// Canonical tri-state result of a tool execution.
@@ -190,6 +134,17 @@ pub enum ToolResultStatus {
     Failed,
     /// Execution was skipped (dedup / protective skip — not an error).
     Skipped,
+}
+
+impl ToolResultStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 /// Classify a tool's output text into [`ToolResultStatus`].
@@ -294,10 +249,12 @@ const TRANSIENT_ERROR_PATTERNS: &[&str] = &[
 
 /// Check whether a tool name refers to a mutation tool (may leave side effects).
 ///
-/// Uses the canonical [`crate::cloud::approval_policy::CLOUD_APPROVAL_REQUIRED_TOOLS`] list
+/// Uses canonical tool mutation categories and approval requirements
 /// plus MCP tools (`mcp_*` prefix) which run external server code with unknown side effects.
 fn is_mutation_tool(tool: &str) -> bool {
-    crate::cloud::approval_policy::is_cloud_approval_required(tool) || tool.starts_with("mcp_")
+    crate::tool::categories::registry().is_mutating_for(tool, None)
+        || crate::cloud::approval_policy::is_cloud_approval_required(tool)
+        || tool.starts_with("mcp_")
 }
 
 /// Well-known hard error patterns that SHOULD trigger rollback.
@@ -483,8 +440,7 @@ pub fn normalize_tool_arguments(val: &Value) -> Value {
 
 /// Stable key for deduplicating `tool_request` (SSE) vs `tool_call` (same turn).
 pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
-    let (name, normalized) = canonical_read_only_tool_signature(name, args)
-        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)));
+    let (name, normalized) = canonical_tool_identity_parts(name, args);
     format!(
         "{}:{}",
         name,
@@ -492,98 +448,28 @@ pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
     )
 }
 
+/// Health evidence uses the same alias/argument normalization as execution
+/// deduplication, but owns an opaque identity rather than the argument string.
+pub fn tool_health_identity(name: &str, args: &Value) -> astra_pipeline::ToolHealthIdentity {
+    scoped_tool_health_identity(name, args, None)
+}
+
+pub fn scoped_tool_health_identity(
+    name: &str,
+    args: &Value,
+    observation_epoch: Option<u64>,
+) -> astra_pipeline::ToolHealthIdentity {
+    let (name, normalized) = canonical_tool_identity_parts(name, args);
+    let canonical = serde_json::to_vec(&normalized).expect("JSON values serialize without failure");
+    astra_pipeline::ToolHealthIdentity::scoped(name, &canonical, observation_epoch)
+}
+
+pub(crate) fn canonical_tool_identity_parts(name: &str, args: &Value) -> (String, Value) {
+    canonical_read_only_tool_signature(name, args)
+        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)))
+}
+
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
-    if name == "git_diff" {
-        let mut canonical = serde_json::Map::new();
-        canonical.insert("action".to_string(), Value::String("diff".to_string()));
-        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
-            canonical.insert("staged".to_string(), Value::Bool(true));
-        }
-        if args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            canonical.insert("stat_only".to_string(), Value::Bool(true));
-        }
-        if let Some(base_ref) = args
-            .get("base_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
-        }
-        if let Some(git_ref) = args
-            .get("ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "HEAD")
-        {
-            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
-        }
-        if let Some(path) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| path.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("path".to_string(), Value::String(path));
-        }
-        return Some(("git".to_string(), Value::Object(canonical)));
-    }
-    if name == "git"
-        && args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "status")
-    {
-        return Some(("git".to_string(), serde_json::json!({"action": "status"})));
-    }
-    if name == "git"
-        && args
-            .get("action")
-            .and_then(Value::as_str)
-            .is_some_and(|action| action == "diff")
-    {
-        let mut canonical = serde_json::Map::new();
-        canonical.insert("action".to_string(), Value::String("diff".to_string()));
-        if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
-            canonical.insert("staged".to_string(), Value::Bool(true));
-        }
-        if args
-            .get("stat_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            canonical.insert("stat_only".to_string(), Value::Bool(true));
-        }
-        if let Some(base_ref) = args
-            .get("base_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("base_ref".to_string(), Value::String(base_ref.to_string()));
-        }
-        if let Some(git_ref) = args
-            .get("ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "HEAD")
-        {
-            canonical.insert("ref".to_string(), Value::String(git_ref.to_string()));
-        }
-        if let Some(path) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| path.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-        {
-            canonical.insert("path".to_string(), Value::String(path));
-        }
-        return Some(("git".to_string(), Value::Object(canonical)));
-    }
     if name != "bash" {
         return None;
     }
@@ -624,6 +510,30 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn health_identity_preserves_canonical_aliases_without_argument_strings() {
+        let alias = tool_health_identity("bash", &json!({"command":"git diff -- src/"}));
+        let canonical =
+            tool_health_identity("bash", &json!({"command":"git --no-pager diff -- src"}));
+        assert_eq!(alias, canonical);
+        assert_eq!(alias.tool_name(), "git");
+        let identity = tool_health_identity("bash", &json!({"command":"SECRET_ARGUMENT_SENTINEL"}));
+        let wire = serde_json::to_value(&identity).unwrap();
+        assert!(!wire.to_string().contains("SECRET_ARGUMENT_SENTINEL"));
+        assert_eq!(
+            serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(wire.clone()).unwrap(),
+            identity
+        );
+        let mut bad = wire.clone();
+        bad["digest"] = json!([0, 1]);
+        assert!(serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(bad).is_err());
+        for field in ["tool_name", "digest"] {
+            let mut bad = wire.clone();
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<astra_pipeline::ToolHealthIdentity>(bad).is_err());
+        }
+    }
 
     #[test]
     fn tool_error_success_with_null_error_is_not_error() {
@@ -694,36 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_success_signal_detects_str_replace_bodies() {
-        let body =
-            format!("Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body));
-        assert!(!tool_output_has_explicit_success_signal(
-            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>"
-        ));
-        assert!(tool_output_has_explicit_success_signal(
-            r#"{"ok":true,"status":"completed"}"#
-        ));
-        assert!(!tool_output_has_explicit_success_signal(
-            "permission denied"
-        ));
-        assert!(!tool_output_has_explicit_success_signal(
-            "Error: str_replace failed: old_str not found"
-        ));
-    }
-
-    #[test]
-    fn explicit_success_signal_rejects_noncanonical_status_aliases() {
-        for status in ["ok", "success", "succeeded", "complete", "passed"] {
-            let body = format!(r#"{{"status":"{status}"}}"#);
-            assert!(
-                !tool_output_has_explicit_success_signal(&body),
-                "noncanonical status alias {status:?} must not be an explicit success signal"
-            );
-        }
-    }
-
-    #[test]
     fn tool_error_empty_error_string_is_not_error() {
         let result = r#"{"error":""}"#;
         assert!(!is_tool_error(result));
@@ -739,20 +619,6 @@ mod tests {
     fn tool_error_nested_error_key_is_not_error() {
         let result = r#"{"ok":true,"data":{"error":"some inner issue"}}"#;
         assert!(!is_tool_error(result));
-    }
-
-    #[test]
-    fn sentinel_wins_over_failed_metadata() {
-        // Contract: mutation emitters append TOOL_SUCCESS_SENTINEL to successful
-        // bodies. The body-wins reconciliation must key on the sentinel, so a
-        // human-readable body coupled with a stale failed edge status still
-        // classifies as success.
-        let body = format!("Replaced successfully\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body));
-
-        // Sentinel must win even when the prose prefix is missing/unrecognized.
-        let body_minimal = format!("done\n{TOOL_SUCCESS_SENTINEL}");
-        assert!(tool_output_has_explicit_success_signal(&body_minimal));
     }
 
     #[test]
@@ -1011,40 +877,19 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_canonicalizes_simple_bash_git_diff_command() {
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff HEAD"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git --no-pager diff --stat"})),
-            tool_dedup_signature("git", &json!({"action": "diff", "stat_only": true}))
+            tool_dedup_signature("bash", &json!({"command": "git diff --stat"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff -- src/"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
-            )
-        );
-    }
-
-    #[test]
-    fn tool_dedup_signature_canonicalizes_structured_git_diff_tool() {
-        assert_eq!(
-            tool_dedup_signature("git_diff", &json!({"path": "src/", "ref": "HEAD"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
-            )
-        );
-        assert_eq!(
-            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "main"})),
-            tool_dedup_signature(
-                "git",
-                &json!({"action": "diff", "path": "src", "ref": "main"})
-            )
+            tool_dedup_signature("bash", &json!({"command": "git --no-pager diff -- src"}))
         );
     }
 
@@ -1052,7 +897,7 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_does_not_canonicalize_compound_bash_commands() {
         assert_ne!(
             tool_dedup_signature("bash", &json!({"command": "git diff | head"})),
-            tool_dedup_signature("git", &json!({"action": "diff"}))
+            tool_dedup_signature("bash", &json!({"command": "git diff"}))
         );
     }
 
@@ -1171,9 +1016,9 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::HardError
         );
 
-        // git action timeout
+        // worktree lifecycle timeout
         assert_eq!(
-            classify_tool_error("git", output),
+            classify_tool_error("worktree", output),
             ToolErrorSeverity::HardError
         );
 
@@ -1256,7 +1101,7 @@ if let Err(e) = writeln!(file, "{line}") {
         let output = "Error: connection refused";
         // Read-only → SoftError
         assert_eq!(
-            classify_tool_error("curl", output),
+            classify_tool_error("web_fetch", output),
             ToolErrorSeverity::SoftError
         );
         // Mutation → HardError

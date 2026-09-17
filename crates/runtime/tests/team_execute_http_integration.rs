@@ -32,8 +32,11 @@ use astra_runtime::server::delegation::engine::{
 use astra_runtime::server::run::engine::RunEngine;
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
+    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
+    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+    SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
+use astra_services::auth::SessionActivityCursor;
 use astra_services::coordination::{AgentProfile, AgentProfileRegistry, AgentResult, AgentTier};
 use astra_services::runs::InMemoryRunStateStore;
 use astra_services::team_persistence::{
@@ -54,6 +57,73 @@ impl HealthChecker for StubHealth {
 }
 
 struct StubAuth;
+
+struct StubSession;
+
+#[async_trait]
+impl SessionService for StubSession {
+    async fn create_session(
+        &self,
+        user_id: String,
+        _request: SessionCreateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        self.get_session("team-http-session".to_string(), user_id)
+            .await
+    }
+
+    async fn list_sessions(
+        &self,
+        _filter: SessionListFilter,
+    ) -> Result<SessionListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn get_session(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        Ok(SessionRecord {
+            session_id,
+            user_id,
+            agent_id: None,
+            title: None,
+            metadata: serde_json::Map::new(),
+            status: "active".to_string(),
+            event_count: 0,
+            created_at: String::new(),
+            updated_at: None,
+            ended_at: None,
+        })
+    }
+
+    async fn update_session(
+        &self,
+        _session_id: String,
+        _user_id: String,
+        _request: SessionUpdateRequestData,
+    ) -> Result<SessionRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn delete_session(
+        &self,
+        _session_id: String,
+        _user_id: String,
+    ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+
+    async fn get_session_activity(
+        &self,
+        _session_id: String,
+        _user_id: String,
+        _limit: u32,
+        _cursor: Option<SessionActivityCursor>,
+    ) -> Result<SessionActivityRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unimplemented!()
+    }
+}
 
 #[async_trait]
 impl AuthService for StubAuth {
@@ -107,7 +177,12 @@ fn auth(user: &str) -> Vec<(&str, String)> {
     vec![("authorization", format!("Bearer {user}"))]
 }
 
-async fn post_json(app: Router, path: &str, user: &str, payload: Value) -> (StatusCode, Value) {
+async fn post_json(app: Router, path: &str, user: &str, mut payload: Value) -> (StatusCode, Value) {
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("session_id")
+            .or_insert_with(|| Value::String("team-http-session".to_string()));
+    }
     let mut builder = Request::builder()
         .method("POST")
         .uri(path)
@@ -154,6 +229,7 @@ async fn build_app_with_delegation(
 
     let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
         .with_team_store(team_store as Arc<dyn TeamPersistenceService>)
         .with_delegation_engine(delegation);
 
@@ -163,6 +239,7 @@ async fn build_app_with_delegation(
 fn build_app_team_only(team_store: Arc<InMemoryTeamStore>) -> Router {
     let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession))
         .with_team_store(team_store as Arc<dyn TeamPersistenceService>);
     build_app(state)
 }
@@ -500,7 +577,9 @@ async fn http_execute_unauthorized_without_bearer() {
                 .method("POST")
                 .uri("/teams/research/execute")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"task":"x"}"#.to_string()))
+                .body(Body::from(
+                    r#"{"task":"x","session_id":"team-http-session"}"#.to_string(),
+                ))
                 .unwrap(),
         )
         .await

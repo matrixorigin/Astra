@@ -68,7 +68,7 @@ pub(crate) async fn run_local_tool_policy_preflight(
 }
 
 pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(
+    let mut result = astra_tools::ToolResult::error(
         json!({
             "status": "failed",
             "error": format!(
@@ -78,7 +78,16 @@ pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
             "retryable": false,
         })
         .to_string(),
-    )
+    );
+    result.metadata = Some(serde_json::Map::from_iter([
+        (
+            "error_kind".to_string(),
+            json!(astra_core::ErrorKind::ToolNotFound.as_str()),
+        ),
+        ("disposition".to_string(), json!("rejected")),
+        ("execution_started".to_string(), json!(false)),
+    ]));
+    result
 }
 
 pub(crate) fn spawn_resource_tool_call_recording(
@@ -178,10 +187,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     }
     let session_id = session_id.to_string();
     let context = format!("server-tool:{name}");
-    let client = astra_tools::memoria::MemoriaToolGateway::new(
-        memoria_client.cloud_base.clone(),
-        memoria_client.cloud_token.clone(),
-    );
+    let client = memoria_client.fork_transport();
     tokio::spawn(
         async move {
             let report = client
@@ -235,6 +241,13 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
         call_id: &str,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
+        // Progress callbacks are an earlier server event lane than runtime
+        // governance and durable recording. This lifecycle owns server-local
+        // tool execution, so it is the correct place to issue an edit-capable
+        // reference (the later central pass is only a display-only fallback).
+        let (redacted_output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&result.output);
+        result.output = redacted_output;
         normalize_local_tool_result_output(name, &mut result, self.aggregate_output_bytes);
         spawn_memory_recall_feedback_after_success(
             self.session_id,
@@ -276,6 +289,13 @@ mod tests {
         assert!(!result.output.contains("mo_query"));
         assert!(!result.output.contains("powershell"));
         assert!(error.contains("current runtime tool surface"));
+        let metadata = result.metadata.expect("typed rejection metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["execution_started"], false);
     }
 
     #[test]
@@ -379,6 +399,7 @@ mod tests {
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
+            Some("user-1"),
             "run-1",
             1,
             vec!["memory-1".into()],

@@ -128,7 +128,7 @@ pub enum AgentFanoutSlotStatus {
     Interrupted,
     Failed,
     CancelledByUser,
-    CancelledByParentBudget,
+    CancelledByRuntime,
     TimedOut,
 }
 
@@ -145,7 +145,7 @@ impl AgentFanoutSlotStatus {
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::CancelledByUser => "cancelled_by_user",
-            Self::CancelledByParentBudget => "cancelled_by_parent_budget",
+            Self::CancelledByRuntime => "cancelled_by_runtime",
             Self::TimedOut => "timed_out",
         }
     }
@@ -163,7 +163,7 @@ pub struct AgentFanoutSummary {
     pub interrupted: usize,
     pub failed: usize,
     pub cancelled_by_user: usize,
-    pub cancelled_by_parent_budget: usize,
+    pub cancelled_by_runtime: usize,
     pub timed_out: usize,
     pub spawn_rejected: usize,
     pub collected: usize,
@@ -307,6 +307,47 @@ impl AgentFanoutGroupProjection {
         Ok(())
     }
 
+    /// Terminalize a declared slot that never completed spawn ownership.
+    ///
+    /// Only the runtime's group deadline/cancellation owner may use this
+    /// transition. It closes the gap where a spawn future is dropped before
+    /// an agent identity is attached, without inventing a child identity.
+    pub fn record_unassigned_terminal(
+        &mut self,
+        slot_index: usize,
+        status: AgentFanoutSlotStatus,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        if !status.is_terminal() {
+            return Err("unassigned fanout settlement requires a terminal status".to_string());
+        }
+        let old_status = {
+            let slot = self.slot_mut(slot_index)?;
+            if slot.agent_id.is_some() {
+                return Err(format!(
+                    "fanout slot {slot_index} has an accepted agent and must settle by identity"
+                ));
+            }
+            if slot.status.is_terminal() {
+                if slot.status == status {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "fanout slot {slot_index} already recorded terminal status {:?}",
+                    slot.status
+                ));
+            }
+            let old_status = slot.status;
+            slot.status = status;
+            slot.terminal_reason = Some(reason.into());
+            old_status
+        };
+        self.apply_slot_status_transition(old_status, status, false, false);
+        self.recompute_status_from_cache();
+        self.revision = self.revision.saturating_add(1);
+        Ok(())
+    }
+
     pub fn record_spawn_accepted(
         &mut self,
         slot_index: usize,
@@ -384,6 +425,14 @@ impl AgentFanoutGroupProjection {
             return Err(format!("fanout agent {agent_id} is not assigned to a slot"));
         };
         if slot.status.is_terminal() {
+            // Terminal lifecycle delivery is at-least-once across the child
+            // executor, completion waiter, and durable reconciliation paths.
+            // An exact replay is a successful no-op; a conflicting terminal
+            // fact remains an invariant violation. This keeps summary counts
+            // monotonic without turning normal reconciliation into a warning.
+            if slot.status == status && slot.terminal_reason == reason {
+                return Ok(());
+            }
             return Err(format!(
                 "fanout agent {agent_id} already recorded terminal status {:?}",
                 slot.status
@@ -445,8 +494,8 @@ impl AgentFanoutGroupProjection {
         let summary = self.summary();
         let label = if summary.spawn_rejected > 0 {
             "fanout failed to start fully"
-        } else if summary.cancelled_by_parent_budget > 0 {
-            "fanout interrupted by budget"
+        } else if summary.cancelled_by_runtime > 0 {
+            "fanout interrupted by runtime cancellation"
         } else if (summary.active > 0 || summary.waiting_for_input > 0) && summary.terminal > 0 {
             "fanout incomplete"
         } else {
@@ -559,8 +608,8 @@ fn adjust_summary_for_status(
         AgentFanoutSlotStatus::CancelledByUser => {
             adjust_summary_value(&mut summary.cancelled_by_user, delta);
         }
-        AgentFanoutSlotStatus::CancelledByParentBudget => {
-            adjust_summary_value(&mut summary.cancelled_by_parent_budget, delta);
+        AgentFanoutSlotStatus::CancelledByRuntime => {
+            adjust_summary_value(&mut summary.cancelled_by_runtime, delta);
         }
         AgentFanoutSlotStatus::TimedOut => adjust_summary_value(&mut summary.timed_out, delta),
         AgentFanoutSlotStatus::SpawnRejected => {
@@ -581,7 +630,7 @@ impl AgentFanoutSlotStatus {
                 | Self::Interrupted
                 | Self::Failed
                 | Self::CancelledByUser
-                | Self::CancelledByParentBudget
+                | Self::CancelledByRuntime
                 | Self::TimedOut
                 | Self::SpawnRejected
         )
@@ -617,10 +666,10 @@ fn summary_sentence_parts(label: &str, summary: AgentFanoutSummary) -> Vec<Strin
     if summary.cancelled_by_user > 0 {
         parts.push(format_count(summary.cancelled_by_user, "stopped by user"));
     }
-    if summary.cancelled_by_parent_budget > 0 {
+    if summary.cancelled_by_runtime > 0 {
         parts.push(format_count(
-            summary.cancelled_by_parent_budget,
-            "cancelled by parent budget",
+            summary.cancelled_by_runtime,
+            "cancelled by runtime",
         ));
     }
     if summary.failed > 0 {
@@ -771,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_budget_cancel_is_distinct_from_user_cancel() {
+    fn runtime_cancel_is_distinct_from_user_cancel() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 3);
         group.record_spawn_accepted(0, "auth@aaa").unwrap();
         group.record_spawn_accepted(1, "storage@bbb").unwrap();
@@ -783,26 +832,23 @@ mod tests {
         group
             .record_terminal_by_agent(
                 "storage@bbb",
-                AgentFanoutSlotStatus::CancelledByParentBudget,
+                AgentFanoutSlotStatus::CancelledByRuntime,
                 Some("turn budget exhausted".to_string()),
             )
             .unwrap();
 
         let summary = group.summary();
         assert_eq!(summary.completed, 1);
-        assert_eq!(summary.cancelled_by_parent_budget, 1);
+        assert_eq!(summary.cancelled_by_runtime, 1);
         assert_eq!(summary.cancelled_by_user, 0);
         assert_eq!(summary.active, 1);
         let sentence = group.summary_sentence();
-        assert!(
-            sentence.contains("1 cancelled by parent budget"),
-            "{sentence}"
-        );
+        assert!(sentence.contains("1 cancelled by runtime"), "{sentence}");
         assert!(!sentence.contains("stopped by user"), "{sentence}");
     }
 
     #[test]
-    fn summary_sentence_names_parent_budget_interrupt() {
+    fn summary_sentence_names_runtime_cancellation() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 3);
         group.record_spawn_accepted(0, "auth@aaa").unwrap();
         group.record_spawn_accepted(1, "storage@bbb").unwrap();
@@ -814,21 +860,21 @@ mod tests {
         group
             .record_terminal_by_agent(
                 "storage@bbb",
-                AgentFanoutSlotStatus::CancelledByParentBudget,
+                AgentFanoutSlotStatus::CancelledByRuntime,
                 Some("turn budget exhausted".to_string()),
             )
             .unwrap();
         group
             .record_terminal_by_agent(
                 "api@ccc",
-                AgentFanoutSlotStatus::CancelledByParentBudget,
+                AgentFanoutSlotStatus::CancelledByRuntime,
                 Some("turn budget exhausted".to_string()),
             )
             .unwrap();
 
         assert_eq!(
             group.summary_sentence(),
-            "3-agent fanout interrupted by budget: 1 completed, 2 cancelled by parent budget, 3 uncollected."
+            "3-agent fanout interrupted by runtime cancellation: 1 completed, 2 cancelled by runtime, 3 uncollected."
         );
     }
 
@@ -873,7 +919,7 @@ mod tests {
             AgentFanoutSlotStatus::Interrupted,
             AgentFanoutSlotStatus::Failed,
             AgentFanoutSlotStatus::CancelledByUser,
-            AgentFanoutSlotStatus::CancelledByParentBudget,
+            AgentFanoutSlotStatus::CancelledByRuntime,
             AgentFanoutSlotStatus::TimedOut,
         ]
         .into_iter()
@@ -1030,6 +1076,11 @@ mod tests {
         group
             .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Completed, None)
             .unwrap();
+        let terminal_revision = group.revision;
+        group
+            .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Completed, None)
+            .expect("an exact at-least-once terminal replay is idempotent");
+        assert_eq!(group.revision, terminal_revision);
         assert!(
             group
                 .record_terminal_by_agent("auth@aaa", AgentFanoutSlotStatus::Failed, None)

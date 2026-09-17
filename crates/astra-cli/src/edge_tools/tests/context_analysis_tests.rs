@@ -56,6 +56,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
             tokens_after: history,
         },
         memory: MemoryRetrievalTrace {
+            outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
             query: "how to authenticate users".to_string(),
             candidates_considered: 10,
             memories_selected: vec![MemorySelection {

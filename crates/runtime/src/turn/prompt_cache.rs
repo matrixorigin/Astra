@@ -32,7 +32,7 @@
 //! | Scope | Meaning | Serialised positions |
 //! |---|---|---|
 //! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
-//! | `Session` | Stable within a session (version, cwd, date, user, branch, model identity) | Middle, before the breakpoint |
+//! | `Session` | Stable within a session (version, cwd, date, user, branch) | Middle, before the breakpoint |
 //! | `None` | Per-turn/non-cacheable runtime facts (memory, retrieval, runtime policy) | After the breakpoint |
 //!
 //! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
@@ -71,9 +71,10 @@
 //! [`provider_cache_policy_for`] determines the caching strategy from three sources in
 //! priority order:
 //!
-//! 1. **Explicit** `CacheCapability` marker (highest priority — overrides everything)
-//! 2. **Provider heuristics** (Anthropic direct, Bedrock Claude, other)
-//! 3. **Environment override** (`ASTRA_TEST_PROMPT_CACHE_DISABLED`)
+//! 1. **Explicit deployment metadata** (`CacheCapability`)
+//! 2. **Provider transport baseline** when metadata is absent (never a model-name guess)
+//! 3. **Environment enablement** (`ASTRA_TEST_PROMPT_CACHE_DISABLED`) controls whether
+//!    admitted annotations are emitted; it does not reclassify the protocol
 //!
 //! ## Public Interface
 //!
@@ -81,11 +82,10 @@
 //!
 //! | Function | Consumer | Purpose |
 //! |---|---|---|
-//! | [`assemble_bridge_pipeline_outcome`] | Bridge proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
-//! | [`assemble_system_message_via_pipeline`] | Bridge proxy | Build Anthropic multi-block or OpenAI split message |
+//! | [`assemble_ephemeral_pipeline_outcome`] | Ephemeral proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
+//! | [`assemble_system_message_via_pipeline`] | Ephemeral proxy | Build Anthropic multi-block or OpenAI split message |
 //! | [`annotate_tool_schemas_for_caching_with_always_load`] | Request build | Add `cache_control` to tool definitions |
-//! | [`add_message_cache_breakpoint`] | Request build | Insert breakpoint into final message array |
-//! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Emit Anthropic-specific cache metadata response fields |
+//! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Insert the final conversation cache breakpoint |
 //!
 //! ## Testing
 //!
@@ -124,35 +124,37 @@ pub(crate) fn model_identity_prompt_text(model_id: &str) -> String {
 }
 
 pub(crate) fn model_identity_prompt_section(model_id: &str) -> prompts::PromptSection {
-    prompts::PromptSection::stable(
+    prompts::PromptSection::dynamic(
         model_identity_prompt_text(model_id),
-        prompts::CacheScope::Session,
+        prompts::PromptTokenBucket::Environment,
     )
 }
 
+#[cfg(test)]
 fn saturating_usize_to_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
 
 impl PromptCacheConfig {
-    /// Latch config from environment and provider info. Call once at session start.
-    pub fn latch(provider: &str, model_name: &str) -> Self {
-        Self::from_cache_capability(None, provider, model_name)
+    /// Latch config from environment and provider transport. Call once at
+    /// session start.
+    pub fn latch(provider: &str) -> Self {
+        Self::from_cache_capability(None, provider)
     }
 
     pub fn from_cache_capability(
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         provider: &str,
-        model_name: &str,
     ) -> Self {
         let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let provider_strategy =
-            astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider_model(
+        let capability =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
                 cache_capability,
-                Some(provider),
-                Some(model_name),
+                provider,
             );
+        let provider_strategy =
+            astra_turn_core::microcompact::ProviderCacheStrategy::from_cache_capability(capability);
         let is_anthropic = provider_strategy.prompt_cache_protocol
             == astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl;
         Self {
@@ -183,14 +185,15 @@ impl Default for PromptCacheConfig {
 //   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
 //   without invalidating the cached prefix.
 
-/// Full pipeline output a bridge caller needs, in one place.
+/// Full pipeline output a ephemeral caller needs, in one place.
 ///
-/// Complements [`super::server_loop_host::PipelineTurnOutcome`]: the bridge
+/// Complements [`super::server_loop_host::PipelineTurnOutcome`]: the ephemeral
 /// has its own per-request lifecycle (no persistent `PipelineSession`) so
 /// it can't reuse the server struct, but the contract is the same — the
 /// pipeline is the sole source of truth for compaction tier + pruned tool
-/// schemas + system prompt, and the bridge consumes them verbatim.
-pub(crate) struct BridgePipelineOutcome {
+/// schemas + system prompt, and the ephemeral consumes them verbatim.
+#[cfg(test)]
+pub(crate) struct EphemeralPipelineOutcome {
     /// Primary system message (Anthropic multi-block or OpenAI stable text).
     pub primary_system: Value,
     /// Optional dynamic system message (OpenAI stable+dynamic split only).
@@ -199,7 +202,7 @@ pub(crate) struct BridgePipelineOutcome {
     pub messages: Vec<Value>,
     /// Trace-facing sections (original input form, for observability).
     pub prompt_sections: Vec<prompts::PromptSection>,
-    /// Compaction tier the planner selected this turn. Bridge must honour
+    /// Compaction tier the planner selected this turn. Ephemeral must honour
     /// this rather than re-deriving a tier downstream.
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
@@ -215,13 +218,12 @@ pub(crate) struct BridgePipelineOutcome {
 pub(crate) fn provider_cache_policy_for(
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     provider: &str,
-    model_name: &str,
 ) -> ProviderCachePolicy {
-    let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_name),
+        provider,
     );
+    let strategy = ProviderCacheStrategy::from_cache_capability(capability);
     if strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
         ProviderCachePolicy::anthropic()
     } else {
@@ -229,6 +231,7 @@ pub(crate) fn provider_cache_policy_for(
     }
 }
 
+#[cfg(test)]
 fn compact_cache_control_marker(cache_control: &Value) -> Value {
     let Some(object) = cache_control.as_object() else {
         return cache_control.clone();
@@ -252,18 +255,15 @@ fn compact_cache_control_marker(cache_control: &Value) -> Value {
     Value::Object(marker)
 }
 
-/// Assemble a system message via the context pipeline directly, without
-/// requiring a [`PipelineSession`]. Used by the HTTP bridge
-/// ([`InProcessChatTurnBridge`]) which has its own per-request lifecycle
-/// and doesn't carry a pipeline session across turns.
+/// Assemble a system message through an ephemeral context-pipeline session.
 ///
 /// Produces an Anthropic multi-block or OpenAI stable+dynamic split system
 /// message by driving the pipeline's planner → binder → serializer. The
-/// `PipelineSession` is ephemeral for this call (bridge lifecycle is
+/// `PipelineSession` is ephemeral for this call (ephemeral lifecycle is
 /// per-request), so stats/recovery/latches all start at default.
 ///
 /// The `extra_dynamic_sections` (passed via `ExternalSources`) are the
-/// bridge's pre-built per-turn fragments (session anchor, feedback rules,
+/// caller's pre-built per-turn fragments (session anchor, feedback rules,
 /// memoria insights, etc.) — they append after the runtime-identity block
 /// in the None-scoped post-cache segment, so dynamic churn doesn't
 /// invalidate the cached prefix.
@@ -276,13 +276,14 @@ pub(crate) fn assemble_system_message_via_pipeline(
     tool_names: &[&str],
     extra_dynamic_sections: &[prompts::PromptSection],
     cache_cfg: &PromptCacheConfig,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     session_id: &str,
     model_id: &str,
     provider: &str,
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
 ) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
-    let outcome = assemble_bridge_pipeline_outcome(
+    let outcome = assemble_ephemeral_pipeline_outcome(
         tool_names,
         &[],
         &[], // legacy wrapper: no stable sections — tests pre-date the split
@@ -291,7 +292,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         None,
         None,
         cache_cfg,
-        None,
+        cache_capability,
         session_id,
         model_id,
         None,
@@ -310,21 +311,21 @@ pub(crate) fn assemble_system_message_via_pipeline(
     )
 }
 
-/// Bridge-side equivalent of [`super::server_loop_host::run_turn_pipeline`]:
+/// Ephemeral equivalent of [`super::server_loop_host::run_turn_pipeline`]:
 /// drives the full context pipeline (Plan → Bind → Optimize → Serialize) for
 /// an ephemeral per-request session, and returns system message(s), trace
 /// sections, planner tier, and tier-pruned tool schemas.
 ///
-/// `tool_schemas` is the raw tool set the bridge wanted to expose; the
+/// `tool_schemas` is the raw tool set the caller requested to expose; the
 /// returned `tool_schemas` is the tier-pruned view from the pipeline's
 /// Optimize phase (mirrors `server_loop_host::PipelineTurnOutcome.tool_schemas`).
 ///
 /// Extra-sections are split into two lanes per cache strategy:
 ///
-/// * `extra_stable_sections` — session-stable bridge-composed content.
+/// * `extra_stable_sections` — session-stable caller-composed content.
 ///   Bound into RuntimeIdentity (Session scope) so it sits BEFORE the
 ///   Session→None cache marker.
-/// * `extra_volatile_sections` — per-turn bridge-composed content
+/// * `extra_volatile_sections` — per-turn caller-composed content
 ///   (session anchor, memoria insights, tool round guidance). Bound into
 ///   RuntimeVolatile (None scope) so churn does not invalidate the
 ///   cached session prefix.
@@ -335,9 +336,9 @@ pub(crate) fn assemble_system_message_via_pipeline(
 /// * `memory_entries` — per-turn Memoria retrieval results. Bound through
 ///   the Memory section (None scope), where the core binder applies rank,
 ///   deduplication, and token-budget trimming.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn assemble_bridge_pipeline_outcome(
+pub(crate) fn assemble_ephemeral_pipeline_outcome(
     tool_names: &[&str],
     tool_schemas: &[Value],
     extra_stable_sections: &[prompts::PromptSection],
@@ -357,8 +358,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     deferred_tools_block: &str,
     skill_listing_block: &str,
     current_date: &str,
-) -> BridgePipelineOutcome {
-    assemble_bridge_pipeline_outcome_with_messages(
+) -> EphemeralPipelineOutcome {
+    assemble_ephemeral_pipeline_outcome_with_messages(
         tool_names,
         tool_schemas,
         extra_stable_sections,
@@ -383,12 +384,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     )
 }
 
-/// Message-aware bridge entry point used by the production wire path.
+/// Message-aware ephemeral entry point used by the production wire path.
 ///
 /// The compatibility wrapper above deliberately supplies an empty history for
 /// older system-prompt-only callers and tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
+pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
     tool_names: &[&str],
     tool_schemas: &[Value],
     extra_stable_sections: &[prompts::PromptSection],
@@ -410,7 +412,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     skill_listing_block: &str,
     current_date: &str,
     conversation_messages: &[Value],
-) -> BridgePipelineOutcome {
+) -> EphemeralPipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
     };
@@ -426,28 +428,21 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         tool_schemas,
     );
 
-    // Build ExternalSources from bridge-side signals. Guidance derived from
-    // the exact visible surface is rebuilt every turn but remains cacheable
-    // until that surface changes.
-    let self_model_text = if tool_names.is_empty() {
-        None
-    } else {
-        Some(prompts::self_model_section(tool_names))
-    };
-    let profile_for_tc = edge_profile_cwd
-        .map(|cwd| format!("cwd: {cwd}"))
-        .unwrap_or_default();
+    // Build ExternalSources from ephemeral-side signals. Cross-tool guidance
+    // is keyed by typed capability classes rather than schema order. It stays
+    // in the stable lane because strict-history providers suppress ordinary
+    // volatile prose from their wire prompt.
     let tool_conditional = if tool_names.is_empty() {
         None
     } else {
-        let text = prompts::tool_conditional_section(tool_names, &profile_for_tc);
+        let text = prompts::tool_conditional_section(tool_names);
         if text.is_empty() { None } else { Some(text) }
     };
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
     let mut stable = extra_stable_sections.to_vec();
     let mut volatile = extra_volatile_sections.to_vec();
-    stable.push(model_identity_prompt_section(model_id));
+    volatile.push(model_identity_prompt_section(model_id));
     if let Some(style) = astra_text_utils::output_style::current_output_style()
         && !style.prompt.is_empty()
     {
@@ -473,12 +468,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
                 },
             )
     });
-    if let Some(ref text) = self_model_text {
-        volatile.push(prompts::PromptSection::dynamic(
-            text.clone(),
-            prompts::PromptTokenBucket::BasePersona,
-        ));
-    }
     if let Some(ref text) = tool_conditional {
         stable.push(prompts::PromptSection {
             text: text.clone(),
@@ -510,12 +499,12 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = provider_cache_policy_for(cache_capability, provider, model_id);
-    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    let provider_policy = provider_cache_policy_for(cache_capability, provider);
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_id),
+        provider,
     );
+    let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
@@ -542,11 +531,11 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     };
 
     astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        astra_core::history_work::HistoryWorkSite::EphemeralPipelineInputMaterialization,
         tool_schemas,
     );
     astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        astra_core::history_work::HistoryWorkSite::EphemeralPipelineInputMaterialization,
         conversation_messages,
     );
     let agent = AgentContext {
@@ -558,15 +547,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         tool_results: Vec::new(),
         tokens: Default::default(),
         active_skills: Vec::new(),
-        recent_file_reads: Default::default(),
-        remaining_turns: 20,
         turn_index: 0,
         recovery: Default::default(),
         last_user_message: String::new(),
     };
     let statics = prompts::build_pipeline_static_sections();
 
-    // Ephemeral per-request session. Bridge doesn't persist a session across
+    // Ephemeral per-request session. Ephemeral doesn't persist a session across
     // turns — its compaction lives elsewhere — so a fresh session per call
     // is the right lifecycle. Stats/recovery/latches all start at default.
     let mut session = PipelineSession::new(PipelineConfig {
@@ -579,7 +566,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         turn: &turn_state,
         external: &external,
         model_id,
-        query_source: "bridge",
+        query_source: "ephemeral",
     };
 
     let output = match session.run_turn_adaptive_with_history_owner(
@@ -590,7 +577,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         Err(abort) => {
             tracing::warn!(
                 error = ?abort,
-                "bridge pipeline abort during system assembly — returning empty system"
+                "ephemeral pipeline abort during system assembly — returning empty system"
             );
             astra_core::history_work::record_serialized_value(
                 astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
@@ -600,7 +587,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
                 astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
                 tool_schemas,
             );
-            return BridgePipelineOutcome {
+            return EphemeralPipelineOutcome {
                 primary_system: json!({"role": "system", "content": ""}),
                 dynamic_system: None,
                 messages: conversation_messages.to_vec(),
@@ -624,7 +611,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     // Append caller-supplied extras (and any we injected, like output style)
     // in their original form — trace_signals intact. Downstream
     // `build_system_prompt_trace` aggregates context_signals across every
-    // section, so this preserves the bridge's telemetry contract.
+    // section, so this preserves the ephemeral's telemetry contract.
     sections.extend(trace_extra_sections);
 
     let tier = output.plan.compact_tier;
@@ -707,10 +694,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         provider = %provider,
         model_id = %model_id,
         tier = ?tier,
-        "assembled bridge pipeline outcome with cache strategy",
+        "assembled ephemeral pipeline outcome with cache strategy",
     );
 
-    BridgePipelineOutcome {
+    EphemeralPipelineOutcome {
         primary_system,
         dynamic_system,
         messages: output.optimized.messages,
@@ -738,10 +725,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
 /// Annotate tool schemas using an explicit always_load set.
 ///
 /// Runtime-side adapter: decides whether to annotate (`cache_cfg.should_annotate`),
-/// logs the fallback path for triage, then delegates to the pure
+/// clears stale top-level markers, then delegates to the pure
 /// [`astra_turn_core::context_serializer::annotate_always_load_tool_schema`] for
-/// the actual wire mutation. The pure primitive lives in the pipeline so all
-/// provider-specific cache logic has exactly one implementation.
+/// the actual wire mutation. The core primitive owns fallback observability and
+/// all provider-specific cache annotation logic has exactly one implementation.
 pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
     tools: &mut [Value],
     cache_cfg: &PromptCacheConfig,
@@ -751,22 +738,7 @@ pub(crate) fn annotate_tool_schemas_for_caching_with_always_load(
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    let marker_idx = match always_load_prefix_marker_index(tools, always_load_names) {
-        Some(idx) => idx,
-        None => {
-            // Fallback path: no always_load prefix is present in this tool
-            // list. Legit for delegated sub-runs that pass a fully custom
-            // toolset, but a cache-hit regression triage needs to see it.
-            tracing::debug!(
-                tool_count = tools.len(),
-                "cache marker fallback: no always_load prefix present; placing on last tool. \
-                 Static-prefix caching unavailable for this request."
-            );
-            tools.len() - 1
-        }
-    };
-    tools[marker_idx]["cache_control"] =
-        astra_turn_core::context_serializer::anthropic_ephemeral_cache_control();
+    astra_turn_core::context_serializer::annotate_always_load_tool_schema(tools, always_load_names);
 }
 
 fn clear_tool_cache_controls(tools: &mut [Value]) {
@@ -775,31 +747,6 @@ fn clear_tool_cache_controls(tools: &mut [Value]) {
             object.remove("cache_control");
         }
     }
-}
-
-fn always_load_prefix_marker_index(
-    tools: &[Value],
-    always_load_names: &std::collections::HashSet<String>,
-) -> Option<usize> {
-    if always_load_names.is_empty() {
-        return None;
-    }
-
-    let mut last_prefix_idx = None;
-    for (idx, tool) in tools.iter().enumerate() {
-        let Some(name) = tool
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-        else {
-            break;
-        };
-        if !always_load_names.contains(name) {
-            break;
-        }
-        last_prefix_idx = Some(idx);
-    }
-    last_prefix_idx
 }
 
 /// Runtime-configured always_load tool names for fallback paths that do not receive
@@ -840,20 +787,6 @@ pub(crate) fn resolve_always_load_tool_names_for_config(
         .collect()
 }
 
-/// Add a cache breakpoint on the last conversation message for Anthropic.
-/// This enables turn-to-turn KV cache reuse for the conversation prefix.
-///
-/// Runtime adapter: gates on `cache_cfg.should_annotate` then delegates to
-/// the pure pipeline primitive. Only used by tests now that
-/// `apply_anthropic_cache_metadata` calls the pipeline primitive directly.
-#[cfg(test)]
-pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
-    if !cache_cfg.should_annotate() {
-        return;
-    }
-    astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
-}
-
 /// Add Anthropic protocol-level cache metadata for cached prompts.
 ///
 /// Places exactly one `cache_control` breakpoint on the last conversation
@@ -878,12 +811,26 @@ pub(crate) fn apply_anthropic_cache_metadata(
 /// Process-wide mutex guarding any test that mutates env vars read by the
 /// prompt-cache pipeline (`ASTRA_TEST_PROMPT_CACHE_DISABLED`,
 /// `ASTRA_OUTPUT_STYLE`, etc.). Exposed at module scope so sibling test
-/// modules (`bridge_inprocess::tests`) share the same lock — otherwise
+/// modules (`ephemeral_pipeline::tests`) share the same lock — otherwise
 /// two independent mutexes race to the same `std::env::set_var` and a
 /// panic in one poisons the other's tests. Recover from poison on lock
 /// acquire; test panics carry their own failure and should not cascade.
 #[cfg(test)]
 pub(crate) static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
+    resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
+}
+
+#[cfg(test)]
+fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+    annotate_tool_schemas_for_caching_with_always_load(
+        tools,
+        cache_cfg,
+        &default_test_always_load_tool_names(),
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -902,24 +849,21 @@ mod tests {
         unsafe { std::env::remove_var(key) }
     }
 
-    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
-        resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
-    }
-
-    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
-        annotate_tool_schemas_for_caching_with_always_load(
-            tools,
-            cache_cfg,
-            &default_test_always_load_tool_names(),
-        );
+    fn bedrock_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
     }
 
     #[test]
-    fn prompt_cache_latch_prefers_provider_over_claude_named_model() {
-        let openai_proxy = PromptCacheConfig::latch("openai", "claude-sonnet-4");
+    fn prompt_cache_latch_uses_provider_transport_only() {
+        let openai_proxy = PromptCacheConfig::latch("openai");
         assert!(!openai_proxy.is_anthropic);
 
-        let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
+        let anthropic_provider = PromptCacheConfig::latch("anthropic");
         assert!(anthropic_provider.is_anthropic);
     }
 
@@ -930,22 +874,23 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
             "openai",
-            "proxy-claude",
         );
         assert!(cfg.is_anthropic);
     }
 
     // ── always_load-tool audit ────────────────────────────────────────────────
     //
-    // The cache marker belongs at the end of the always_load/static prefix, not at
-    // the end of the whole tool list. Deferred/dynamic tools may become
-    // visible for a turn, but they should not silently enlarge the static
-    // cache prefix.
+    // The tool-schema cache marker belongs at the end of the always_load/static
+    // prefix, not at the end of the whole catalog. Deferred tool *schemas* may
+    // become callable for a turn, but they must not silently enlarge that
+    // repeated schema prefix. Their compact name manifest is separate
+    // capability-epoch metadata and is tested below.
     #[test]
     fn default_always_load_tool_names_tracks_runtime_surface_not_deferred_catalog() {
         let always_load = default_test_always_load_tool_names();
@@ -956,13 +901,18 @@ mod tests {
             );
         }
         for name in [
+            "agent",
+            "agent_fanout",
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
             "lsp",
-            "github",
+            "web_search",
             "web_fetch",
             "web_search",
             "session",
             "mo_query",
-            "agent",
             "symbols",
             "powershell",
             "run_script",
@@ -978,13 +928,13 @@ mod tests {
     #[test]
     fn cache_static_prefix_tool_names_follow_toml_surface_additions() {
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["github".into(), "not_a_real_tool".into()],
+            pinned_tools: vec!["web_search".into(), "not_a_real_tool".into()],
         };
         let always_load = resolve_always_load_tool_names_for_config(&cfg);
 
         assert!(
-            always_load.contains("github"),
-            "config-always_load github must be part of the cache static prefix"
+            always_load.contains("web_search"),
+            "config-always_load web_search must be part of the cache static prefix"
         );
         assert!(
             always_load.contains("grep"),
@@ -995,8 +945,8 @@ mod tests {
             "other default always_load tools must remain cache always_load"
         );
         assert!(
-            !always_load.contains("web_search"),
-            "deferred web_search must not become cache always_load without an explicit TOML always_load entry"
+            !always_load.contains("web_fetch"),
+            "deferred web_fetch must not become cache always_load without an explicit TOML always_load entry"
         );
     }
 
@@ -1040,7 +990,7 @@ mod tests {
             json!({"type": "function", "function": {"name": "bash"}}), // always_load
             json!({"type": "function", "function": {"name": "lsp"}}),  // dynamic
             json!({"type": "function", "function": {"name": "memory"}}), // always_load
-            json!({"type": "function", "function": {"name": "git"}}), // always_load name in dynamic tail
+            json!({"type": "function", "function": {"name": "worktree"}}), // always_load name in dynamic tail
         ];
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -1063,16 +1013,12 @@ mod tests {
         ];
         let prefix_len = tools.len();
         tools.push(json!({"type": "function", "function": {"name": "web_fetch"}}));
-        tools.push(json!({"type": "function", "function": {"name": "git"}}));
+        tools.push(json!({"type": "function", "function": {"name": "worktree"}}));
 
         let always_load = default_test_always_load_tool_names();
         assert!(always_load.contains("bash"));
         assert!(always_load.contains("read_file"));
         assert!(always_load.contains("skill"));
-        assert_eq!(
-            always_load_prefix_marker_index(&tools, &always_load),
-            Some(prefix_len - 1)
-        );
 
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -1109,11 +1055,11 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    // ── assemble_bridge_pipeline_outcome (Phase 1b contract) ─────────────
+    // ── assemble_ephemeral_pipeline_outcome (Phase 1b contract) ─────────────
 
     #[test]
-    fn bridge_pipeline_outcome_returns_tier_and_pruned_tool_schemas() {
-        // Phase 1b: the bridge consumes the pipeline's tier + pruned tool
+    fn ephemeral_pipeline_outcome_returns_tier_and_pruned_tool_schemas() {
+        // Phase 1b: the ephemeral consumes the pipeline's tier + pruned tool
         // schemas from a single helper call instead of re-deriving them via
         // `compaction_tier_calibrated` + `tool_schema_prune::prune_tool_schemas`
         // at two downstream sites. Lock that contract in.
@@ -1131,7 +1077,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })];
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &tool_schemas,
             &[], // stable
@@ -1141,7 +1087,7 @@ mod tests {
             None,
             &cache_cfg,
             None,
-            "sid-bridge",
+            "sid-ephemeral",
             "gpt-4o",
             None,
             "openai",
@@ -1157,7 +1103,7 @@ mod tests {
         assert_eq!(
             outcome.tier,
             astra_turn_core::compaction_types::CompactionTier::Normal,
-            "fresh bridge session with no PTL history must plan at Normal"
+            "fresh ephemeral session with no PTL history must plan at Normal"
         );
         assert_eq!(
             outcome.tool_schemas.len(),
@@ -1176,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_measures_working_set_but_defers_lossy_history_reduction() {
+    fn ephemeral_pipeline_measures_working_set_but_defers_lossy_history_reduction() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1192,9 +1138,13 @@ mod tests {
                 })
             })
             .collect();
-        let outcome = assemble_bridge_pipeline_outcome_with_messages(
-            &[],
-            &[],
+        let introspect = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "introspect")
+            .expect("canonical introspect schema must exist");
+        let outcome = assemble_ephemeral_pipeline_outcome_with_messages(
+            &["introspect"],
+            std::slice::from_ref(&introspect),
             &[],
             &[],
             &[],
@@ -1202,7 +1152,7 @@ mod tests {
             None,
             &cache_cfg,
             None,
-            "sid-long-running-bridge",
+            "sid-long-running-ephemeral",
             "model-with-explicit-window",
             Some(8_000),
             0,
@@ -1223,12 +1173,19 @@ mod tests {
         );
         assert_eq!(
             outcome.messages, messages,
-            "the bridge's downstream semantic compactor is the sole lossy history owner"
+            "the ephemeral's downstream semantic compactor is the sole lossy history owner"
         );
+        let pressured_properties = &outcome.tool_schemas[0]["function"]["parameters"]["properties"];
+        for field in ["artifact", "offset", "max_bytes"] {
+            assert!(
+                pressured_properties.get(field).is_some(),
+                "aggressive pipeline pressure must retain recovery field `{field}`"
+            );
+        }
     }
 
     #[test]
-    fn bridge_pipeline_outcome_preserves_many_extra_sections() {
+    fn ephemeral_pipeline_outcome_preserves_many_extra_sections() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1252,7 +1209,7 @@ mod tests {
             })
             .collect();
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &[],
             &[],
             &stable,
@@ -1281,11 +1238,11 @@ mod tests {
             .join("\n");
         assert!(
             trace_text.contains("[stable-extra-124]"),
-            "bridge extras must not be truncated by section count"
+            "ephemeral extras must not be truncated by section count"
         );
         assert!(
             trace_text.contains("[volatile-extra-124]"),
-            "bridge extras must not be truncated by section count"
+            "ephemeral extras must not be truncated by section count"
         );
         let primary_text = outcome.primary_system["content"]
             .as_str()
@@ -1300,13 +1257,13 @@ mod tests {
     }
 
     #[test]
-    fn bridge_model_limit_conversion_saturates() {
+    fn ephemeral_model_limit_conversion_saturates() {
         assert_eq!(saturating_usize_to_u32(200_000), 200_000);
         assert_eq!(saturating_usize_to_u32(u32::MAX as usize + 1), u32::MAX);
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_memory_entries_through_pipeline() {
+    fn ephemeral_pipeline_outcome_routes_memory_entries_through_pipeline() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1318,7 +1275,7 @@ mod tests {
             astra_turn_core::context_sources::MemoryEntry::scored("lower value memory", 1.0),
         ];
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1352,12 +1309,12 @@ mod tests {
         );
         assert!(
             dynamic_text.find("higher value memory") < dynamic_text.find("lower value memory"),
-            "binder ranking should be visible in production bridge output: {dynamic_text}"
+            "binder ranking should be visible in production ephemeral output: {dynamic_text}"
         );
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
+    fn ephemeral_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1368,7 +1325,7 @@ mod tests {
             "## Session State\nLatest state: keep refactoring the session-memory pipeline",
         );
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1408,7 +1365,7 @@ mod tests {
         );
         assert!(
             dynamic_text.contains("session-memory pipeline"),
-            "session memory content must survive bridge assembly: {dynamic_text}"
+            "session memory content must survive ephemeral assembly: {dynamic_text}"
         );
         assert!(
             !primary_text.contains("## Session State"),
@@ -1417,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_system_override_through_runtime_identity() {
+    fn ephemeral_pipeline_outcome_routes_system_override_through_runtime_identity() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1425,7 +1382,7 @@ mod tests {
             is_anthropic: false,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1473,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
+    fn ephemeral_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1484,7 +1441,7 @@ mod tests {
             "## Session State\nLatest state: volatile session memory update",
         );
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1545,7 +1502,7 @@ mod tests {
                     .with_memory_identity(memory_id, "semantic")
                     .with_source("memoria.prefetch"),
             ];
-            assemble_bridge_pipeline_outcome(
+            assemble_ephemeral_pipeline_outcome(
                 &["bash"],
                 &[],
                 &[],
@@ -1581,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
+    fn ephemeral_pipeline_outcome_keeps_deferred_tools_in_capability_cache_epoch() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1589,7 +1546,7 @@ mod tests {
             is_anthropic: false,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1624,11 +1581,112 @@ mod tests {
             .unwrap_or_default();
 
         assert!(primary_text.contains("<deferred-tools>"));
-        assert!(!dynamic_text.contains("<deferred-tools>"));
+        assert!(
+            !dynamic_text.contains("<deferred-tools>"),
+            "capability metadata must not be relegated to the per-turn volatile lane"
+        );
+
+        let changed = assemble_ephemeral_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-deferred-tools",
+            "gpt-4o",
+            None,
+            "openai",
+            None,
+            None,
+            None,
+            "<deferred-tools>\ngithub\nweb_fetch\n</deferred-tools>",
+            "",
+            "2026-05-25",
+        );
+        let changed_primary_text = changed
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let changed_dynamic_text = changed
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_ne!(
+            primary_text, changed_primary_text,
+            "a changed admission surface must start a new capability cache epoch"
+        );
+        assert_eq!(
+            dynamic_text, changed_dynamic_text,
+            "changing capability metadata must not churn unrelated turn-volatile context"
+        );
+
+        // The same contract must hold on the Anthropic/Bedrock block path,
+        // where cache_control is attached to a system block rather than a
+        // flattened OpenAI-style string.  A regression here would make the
+        // capability epoch look stable in the core planner while still
+        // pushing the manifest into the per-turn dynamic message.
+        let anthropic_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let anthropic = assemble_ephemeral_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &anthropic_cfg,
+            None,
+            "sid-deferred-tools-anthropic",
+            "claude-sonnet-4-6",
+            None,
+            "anthropic",
+            None,
+            None,
+            None,
+            "<deferred-tools>\ngithub\n</deferred-tools>",
+            "",
+            "2026-05-25",
+        );
+        let anthropic_primary = anthropic
+            .primary_system
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("anthropic primary system must use content blocks");
+        let anthropic_primary_text = anthropic_primary
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(anthropic_primary_text.contains("<deferred-tools>"));
+        assert!(
+            anthropic_primary
+                .iter()
+                .any(|block| block.get("cache_control").is_some()),
+            "the stable Anthropic system prefix must retain its cache marker"
+        );
+        let anthropic_dynamic_text = anthropic
+            .dynamic_system
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !anthropic_dynamic_text.contains("<deferred-tools>"),
+            "capability metadata must not move to the Anthropic volatile message"
+        );
     }
 
     #[test]
-    fn bridge_pipeline_keeps_model_visible_when_volatile_is_dynamic() {
+    fn ephemeral_pipeline_keeps_model_visible_when_volatile_is_dynamic() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1639,11 +1697,13 @@ mod tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
-            &["bash"],
+        let outcome = assemble_ephemeral_pipeline_outcome(
+            &["bash", "start_work"],
             &[],
             &[],
             &[prompts::PromptSection::dynamic(
@@ -1680,10 +1740,15 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            primary_text.contains("Model: deepseek-v4-pro"),
-            "stable model identity must remain visible without provider routing: {primary_text}"
+            !primary_text.contains("Model: deepseek-v4-pro"),
+            "runtime model identity must stay out of the reusable prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
+        let expected_tool_guidance = prompts::tool_conditional_section(&["bash", "start_work"]);
+        assert!(
+            primary_text.contains(&expected_tool_guidance),
+            "canonical tool guidance must remain visible in the strict-history prompt: {primary_text}"
+        );
         assert!(
             !primary_text.contains("must be suppressed"),
             "volatile sections must not leak into strict-history stable prompt: {primary_text}"
@@ -1693,8 +1758,12 @@ mod tests {
             "pipeline keeps volatile content in the dynamic lane until wire assembly: {dynamic_text}"
         );
         assert!(
-            !dynamic_text.contains("Model:"),
-            "model identity must not be duplicated into the dynamic prompt lane: {dynamic_text}"
+            dynamic_text.contains("Model: deepseek-v4-pro"),
+            "runtime model identity must remain visible in the dynamic lane: {dynamic_text}"
+        );
+        assert!(
+            !dynamic_text.contains("## Tool Availability Protocol"),
+            "cross-tool guidance must not be routed through suppressible volatile content: {dynamic_text}"
         );
     }
 
@@ -1712,6 +1781,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "test-session",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1730,22 +1800,22 @@ mod tests {
             .collect::<String>();
         assert!(
             primary_text.contains("Tool Availability Protocol"),
-            "surface-derived guidance should be in the reusable prefix: {primary_text}"
+            "surface-versioned guidance must be carried in the reusable prefix: {primary_text}"
         );
         assert!(
-            primary_text.contains("Model: claude-sonnet-4-6"),
-            "stable model identity must remain in the cacheable system prompt: {primary_text}"
+            !primary_text.contains("Model: claude-sonnet-4-6"),
+            "runtime model identity must stay outside the cacheable system prompt: {primary_text}"
         );
         assert!(!primary_text.contains("via bedrock"));
         assert!(
-            dynamic.as_ref().is_none_or(|message| {
-                !message
+            dynamic.as_ref().is_some_and(|message| {
+                message
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .contains("Model:")
+                    .contains("Model: claude-sonnet-4-6")
             }),
-            "model identity must not be duplicated into dynamic system context"
+            "runtime model identity must remain visible in dynamic system context"
         );
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),
@@ -1755,6 +1825,64 @@ mod tests {
             !sections.is_empty(),
             "sections vec must be populated for trace consumers"
         );
+    }
+
+    #[test]
+    fn real_tool_surface_transition_versions_cached_system_prefix() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let (primary_without, dynamic_without, _) = assemble_system_message_via_pipeline(
+            &["bash"],
+            &[],
+            &cache_cfg,
+            Some(bedrock_cache_capability()),
+            "session",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp/project"),
+            Some("main"),
+        );
+        let (primary_with, dynamic_with, _) = assemble_system_message_via_pipeline(
+            &["bash", "tool_search"],
+            &[],
+            &cache_cfg,
+            Some(bedrock_cache_capability()),
+            "session",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp/project"),
+            Some("main"),
+        );
+
+        assert_ne!(
+            primary_without, primary_with,
+            "a real capability transition must version the matching cross-tool contract"
+        );
+        let without_text = dynamic_without
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let with_text = dynamic_with
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            without_text, with_text,
+            "tool-surface guidance must not leak into the volatile lane"
+        );
+        let with_primary_text = primary_with["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(with_primary_text.contains("tool_search"));
     }
 
     #[test]
@@ -1769,6 +1897,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            None,
             "sid",
             "gpt-4o",
             "openai",
@@ -1785,23 +1914,22 @@ mod tests {
             "primary system message must be non-empty"
         );
         assert!(
-            primary_text.contains("Model: gpt-4o"),
-            "stable model identity must remain in the reusable prefix: {primary_text}"
+            !primary_text.contains("Model: gpt-4o"),
+            "runtime model identity must stay out of the reusable prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
-        // Dynamic may or may not be present depending on whether any None-scoped
-        // section was emitted. Model identity must remain stable either way.
-        if let Some(d) = dynamic {
-            let dtext = d.get("content").and_then(Value::as_str).unwrap_or_default();
-            assert!(!dtext.is_empty(), "if dynamic present, must be non-empty");
-            assert!(
-                !dtext.contains("Model:"),
-                "model identity must not enter the dynamic prompt lane: {dtext}"
-            );
-        }
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            dynamic_text.contains("Model: gpt-4o"),
+            "runtime model identity must remain visible in the dynamic prompt lane: {dynamic_text}"
+        );
     }
 
-    /// The bridge's escape-hatch use case: pre-built session anchor + feedback
+    /// The ephemeral's escape-hatch use case: pre-built session anchor + feedback
     /// rules flow through `extra_dynamic_sections` into the final system prompt.
     #[test]
     fn pipeline_assembly_carries_extra_dynamic_sections_through() {
@@ -1825,6 +1953,7 @@ mod tests {
             &["bash"],
             &extra,
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1885,6 +2014,7 @@ mod tests {
                     prompts::PromptTokenBucket::Environment,
                 )],
                 &cache_cfg,
+                Some(bedrock_cache_capability()),
                 "sid",
                 "claude-sonnet-4-6",
                 "bedrock",
@@ -1915,6 +2045,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1970,6 +2101,7 @@ mod tests {
                 cache_enabled: true,
                 is_anthropic: true,
             },
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -2014,6 +2146,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2028,6 +2161,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2057,6 +2191,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2076,6 +2211,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2093,79 +2229,37 @@ mod tests {
     }
 
     #[test]
-    fn message_breakpoint_skips_system_only() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages = vec![json!({"role": "system", "content": "system prompt"})];
-        let original = messages.clone();
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert_eq!(
-            messages, original,
-            "system-only messages should not be modified"
-        );
-    }
-
-    #[test]
-    fn message_breakpoint_empty_messages_noop() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages: Vec<Value> = vec![];
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert!(messages.is_empty());
-    }
-
-    #[test]
-    fn message_breakpoint_array_content_appends_to_last_block() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
-        ];
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        let content = messages[1].get("content").unwrap().as_array().unwrap();
-        assert!(content[0].get("cache_control").is_some());
-    }
-
-    #[test]
-    fn add_message_cache_breakpoint_noop_for_openai() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: false,
-        };
-        let mut messages = vec![json!({"role": "user", "content": "hello"})];
-        let original = messages.clone();
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert_eq!(messages, original, "OpenAI should not be annotated");
-    }
-
-    #[test]
-    fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
+    fn declared_capability_enables_anthropic_style_cache_for_bedrock() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+        let cfg = PromptCacheConfig::from_cache_capability(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "bedrock",
+        );
         assert!(cfg.cache_enabled);
         assert!(cfg.is_anthropic);
     }
 
     #[test]
-    fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
+    fn undeclared_bedrock_stays_on_unmarked_cache_path() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
+        let cfg = PromptCacheConfig::latch("bedrock");
         assert!(cfg.cache_enabled);
         assert!(!cfg.is_anthropic);
     }
 
     #[test]
-    fn bridge_provider_policy_keeps_non_claude_bedrock_prefix_only() {
-        let policy = provider_cache_policy_for(None, "bedrock", "us.amazon.nova-micro-v1:0");
+    fn ephemeral_provider_policy_keeps_non_claude_bedrock_prefix_only() {
+        let policy = provider_cache_policy_for(None, "bedrock");
 
         assert_eq!(
             policy.protocol,
@@ -2177,9 +2271,19 @@ mod tests {
     }
 
     #[test]
-    fn bridge_provider_policy_enables_anthropic_for_bedrock_claude() {
-        let policy =
-            provider_cache_policy_for(None, "bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+    fn ephemeral_provider_policy_honors_declared_bedrock_cachepoint() {
+        let policy = provider_cache_policy_for(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "bedrock",
+        );
 
         assert_eq!(
             policy.protocol,
@@ -2190,12 +2294,12 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_prefers_explicit_capability_over_provider_hint() {
+    fn ephemeral_pipeline_outcome_prefers_explicit_capability_over_provider_hint() {
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: false,
         };
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &[],
             &[],
             &[],
@@ -2208,6 +2312,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2233,7 +2338,7 @@ mod tests {
                 .get("content")
                 .and_then(Value::as_array)
                 .is_some(),
-            "explicit marker capability on bridge path must produce multi-block cache-control system content"
+            "explicit marker capability on ephemeral path must produce multi-block cache-control system content"
         );
     }
 
@@ -2244,12 +2349,12 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
             "openai",
-            "proxy-claude",
         );
         assert_eq!(
             policy.protocol,
@@ -2382,8 +2487,8 @@ mod cache_stability_regression {
             schema("list_dir"),
             schema("grep"),
             schema("glob"),
-            schema("git"),
-            schema("git"),
+            schema("worktree"),
+            schema("worktree"),
             schema("memory"),
             schema("memory"),
             schema("memory"),
@@ -2399,18 +2504,6 @@ mod cache_stability_regression {
         }
     }
 
-    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
-        resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
-    }
-
-    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
-        annotate_tool_schemas_for_caching_with_always_load(
-            tools,
-            cache_cfg,
-            &default_test_always_load_tool_names(),
-        );
-    }
-
     /// Core invariant: adding, removing, or reordering tools AFTER the always_load
     /// prefix must leave the always_load prefix bytes completely unchanged and keep
     /// the cache marker on the same always_load tool.
@@ -2418,12 +2511,12 @@ mod cache_stability_regression {
     /// The marker always lands on the LAST always_load tool — even if the always_load
     /// count shrinks or dynamic tools are interleaved by a buggy caller.
 
-    /// Default always_load set must contain the static-lib tools; losing one
-    /// drops cache hit rate proportional to its token cost.
+    /// The default cached prefix keeps ordinary first-request primitives and
+    /// hot Work transitions and the compact observation entrypoints while
+    /// excluding optional workflows whose full schemas load on demand.
     #[test]
-    fn default_always_load_set_contains_static_lib() {
+    fn default_always_load_set_contains_primitives_not_optional_workflows() {
         let always_load = default_test_always_load_tool_names();
-        // TOOL_CATALOG-declared always_load tools
         for name in [
             "bash",
             "read_file",
@@ -2431,15 +2524,26 @@ mod cache_stability_regression {
             "str_replace",
             "list_dir",
             "grep",
-            "glob",
-            "git",
-            "memory",
+            "tool_search",
             "introspect",
-            "reflect",
+            "memory",
+            "start_work",
+            "run_next_work_item",
+            "settle_work_item",
         ] {
             assert!(
                 always_load.contains(name),
-                "{name} must stay in default always_load set (static-lib guarantee)"
+                "{name} must stay in the default first-request prefix"
+            );
+        }
+        assert!(
+            !always_load.contains("glob"),
+            "specialized glob navigation must remain deferred from the default prefix"
+        );
+        for name in ["agent", "agent_fanout", "worktree"] {
+            assert!(
+                !always_load.contains(name),
+                "{name} must load on demand instead of extending the default cache prefix"
             );
         }
         // Runtime-injected, not in TOOL_CATALOG, but structurally part of the
@@ -2449,6 +2553,35 @@ mod cache_stability_regression {
             always_load.contains(name),
             "{name} is auto-always_load at runtime; default set must mirror that"
         );
+    }
+
+    #[test]
+    fn deferred_invocation_carrier_can_close_the_stable_tool_prefix() {
+        let carrier =
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema();
+        let carrier_name =
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER;
+        let mut tools = vec![
+            schema("bash"),
+            schema("tool_search"),
+            carrier,
+            schema("web_search"),
+        ];
+        let mut always_load = default_test_always_load_tool_names();
+        always_load.insert(carrier_name.to_string());
+
+        annotate_tool_schemas_for_caching_with_always_load(
+            &mut tools,
+            &cfg_anthropic(),
+            &always_load,
+        );
+
+        assert_eq!(
+            tools[2]["cache_control"],
+            astra_turn_core::context_serializer::anthropic_ephemeral_cache_control(),
+            "the stable carrier, not a dynamic deferred target, owns the breakpoint"
+        );
+        assert!(tools[3].get("cache_control").is_none());
     }
 
     /// `default_test_always_load_tool_names()` must return the same set across calls —
@@ -2480,7 +2613,7 @@ mod cache_stability_regression {
             let mut tools = always_load_prefix_fixture();
             // Deliberately DIFFERENT dynamic tools each call — the test
             // asserts the always_load portion is unaffected.
-            tools.extend([schema("mo_query"), schema("github")]);
+            tools.extend([schema("mo_query"), schema("web_search")]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2496,7 +2629,11 @@ mod cache_stability_regression {
         let a = build_once();
         let b_tools_churned = {
             let mut tools = always_load_prefix_fixture();
-            tools.extend([schema("web_fetch"), schema("github"), schema("mo_query")]);
+            tools.extend([
+                schema("web_fetch"),
+                schema("web_search"),
+                schema("mo_query"),
+            ]);
             annotate_test_tool_schemas_for_caching(&mut tools, &cfg_anthropic());
             build_provider_request_body(
                 &[json!({"role": "user", "content": "hi"})],
@@ -2550,7 +2687,7 @@ mod cache_stability_regression {
                 &ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         let a_tools = a["tools"].as_array().unwrap();
@@ -2645,7 +2782,7 @@ mod cache_stability_regression {
             )
         };
 
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
         (a, b, always_load_prefix_fixture().len())
     }
@@ -2698,7 +2835,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         // Static system + user message identical
@@ -2741,7 +2878,7 @@ mod cache_stability_regression {
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
             )
         };
-        let a = build(vec![schema("mo_query"), schema("github")]);
+        let a = build(vec![schema("mo_query"), schema("web_search")]);
         let b = build(vec![schema("web_fetch")]);
 
         assert_eq!(a["messages"], b["messages"]);

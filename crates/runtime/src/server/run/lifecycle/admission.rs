@@ -6,8 +6,7 @@
 //! - Post-loop memory cleanup concurrency control
 //! - Metrics registration for admission and cleanup subsystems
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Json;
@@ -38,11 +37,15 @@ pub(super) const METRIC_POST_LOOP_MEMORY_CLEANUP_WORKERS_TOTAL: &str =
 pub(super) const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
     "astra_session_memory_post_loop_drains_total";
 pub(super) const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
-pub(super) const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 1_000;
+/// The extraction worker has one bounded end-to-end deadline, including
+/// provider selection and durable snapshot I/O. Post-loop settlement runs
+/// outside the response stream, but must still outlive that contract instead
+/// of calling an in-flight memory operation failed or settled prematurely.
+pub(super) const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 45_000;
 /// Phase-0 observed behavior: run admission is count-based and every run
 /// consumes one unit regardless of prompt size.
 pub(super) const CURRENT_RUN_ADMISSION_WEIGHT_UNITS: u64 = 1;
-pub(super) static POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static POST_LOOP_MEMORY_CLEANUP_PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub(super) fn run_admission_timeout() -> Duration {
     Duration::from_secs(DEFAULT_RUN_ADMISSION_TIMEOUT_SECS)
@@ -52,6 +55,9 @@ pub(super) fn run_admission_timeout() -> Duration {
 pub(super) enum RunAdmissionError {
     Timeout,
     Closed,
+    /// The caller cancelled while it was waiting for capacity.  This is not a
+    /// capacity failure: the durable cancel transition remains authoritative.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,58 +82,20 @@ impl From<RunAdmissionError> for PreSpawnFailureCode {
         match value {
             RunAdmissionError::Timeout => Self::RunAdmissionTimeout,
             RunAdmissionError::Closed => Self::RunAdmissionClosed,
+            // A cancellation is normally handled without a failure
+            // transition.  Keep this conversion total so synchronous callers
+            // cannot accidentally panic if they opt into cancellable wait.
+            RunAdmissionError::Cancelled => Self::PreSpawnFailure,
         }
     }
 }
 
-pub(super) struct PostLoopMemoryCleanupPermit;
-
-impl Drop for PostLoopMemoryCleanupPermit {
-    fn drop(&mut self) {
-        POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pub(super) fn try_acquire_post_loop_memory_cleanup_permit(
-    limit: usize,
-) -> Option<PostLoopMemoryCleanupPermit> {
-    if limit == 0 {
-        return None;
-    }
-
-    let mut current = POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.load(Ordering::Acquire);
-    loop {
-        if current >= limit {
-            return None;
-        }
-        match POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(PostLoopMemoryCleanupPermit),
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-pub(super) fn run_admission_error_code(error: RunAdmissionError) -> &'static str {
-    match error {
-        RunAdmissionError::Timeout => "run_admission_timeout",
-        RunAdmissionError::Closed => "run_admission_closed",
-    }
-}
-
-pub(super) fn run_admission_capacity_response(
-    error: RunAdmissionError,
-) -> (StatusCode, Json<ErrorResponse>) {
-    let error_code = run_admission_error_code(error);
-    error_response_coded(
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!("server at capacity ({error_code}), please retry"),
-        error_code,
-    )
+pub(super) fn post_loop_memory_cleanup_permits() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(POST_LOOP_MEMORY_CLEANUP_PERMITS.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
+        ))
+    }))
 }
 
 pub(super) fn pre_spawn_failure_terminal_events(
@@ -202,6 +170,12 @@ pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError
         match details.get("source").and_then(Value::as_str) {
             Some("llm_provider_admission") => {
                 return "llm_provider_admission_rejected".to_string();
+            }
+            Some("work_admission")
+                if details.get("error_kind").and_then(Value::as_str)
+                    == Some("work_lifecycle_topology_conflict") =>
+            {
+                return "work_lifecycle_topology_conflict".to_string();
             }
             Some(crate::server::server_loop_host::HOST_EVENT_ROUTER_SOURCE)
                 if details.get("error_code").and_then(Value::as_str)

@@ -597,17 +597,6 @@ impl FingerprintedOverrides {
         false
     }
 
-    /// Export as legacy-compatible tool-name overrides for child inheritance.
-    #[must_use]
-    pub fn to_legacy_overrides(&self) -> HashMap<String, bool> {
-        let mut legacy = HashMap::new();
-        for (fp, allowed) in &self.rules {
-            // Legacy format: tool name → broadest decision.
-            legacy.entry(fp.tool_name.clone()).or_insert(*allowed);
-        }
-        legacy
-    }
-
     /// Number of stored overrides.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -696,9 +685,9 @@ mod tests {
     fn file_op_preserves_absolute_root_when_normalizing() {
         let fp = ApprovalFingerprint::file_op(
             "write_file",
-            Some("/home/xupeng/github/astra/src/turn/interruption.rs"),
+            Some("/workspace/astra/src/turn/interruption.rs"),
         );
-        assert_eq!(fp.path_pattern.as_deref(), Some("/home/xupeng/**"));
+        assert_eq!(fp.path_pattern.as_deref(), Some("/workspace/astra/**"));
     }
 
     #[test]
@@ -818,23 +807,6 @@ mod tests {
         // But if we add a broad bash override...
         overrides.insert(ApprovalFingerprint::bare("bash"), true);
         assert_eq!(overrides.check(&status_cmd), Some(true));
-    }
-
-    #[test]
-    fn fingerprinted_overrides_to_legacy() {
-        let mut overrides = FingerprintedOverrides::default();
-        overrides.insert(
-            ApprovalFingerprint::shell("bash", "git commit", false),
-            true,
-        );
-        overrides.insert(
-            ApprovalFingerprint::file_op("write_file", Some("src/main.rs")),
-            true,
-        );
-
-        let legacy = overrides.to_legacy_overrides();
-        assert_eq!(legacy.get("bash"), Some(&true));
-        assert_eq!(legacy.get("write_file"), Some(&true));
     }
 
     #[test]

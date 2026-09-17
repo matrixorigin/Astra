@@ -590,6 +590,26 @@ pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
 /// Error-code-aware hint. Human-readable detail is presentation and must not
 /// be parsed to recover a failure category.
 pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    if status == 403 {
+        match error_code {
+            Some("memory_self_hosted_access_disabled") => {
+                return Some(
+                    "Ask the administrator to check MEMORIA_SELF_HOSTED_MASTER_ACCESS=1, the Memoria master key, and support for Memoria-Owner authentication.",
+                );
+            }
+            Some("memory_consent_denied") => {
+                return Some(
+                    "Your memory-sharing permissions do not allow this operation. Review your sharing settings; deployment configuration does not override consent.",
+                );
+            }
+            Some("memory_access_disabled") => {
+                return Some(
+                    "Memory access is unavailable for this account. Check your account connection and memory-sharing permissions.",
+                );
+            }
+            _ => {}
+        }
+    }
     if (status == 500 || status == 503)
         && matches!(
             error_code,
@@ -644,6 +664,7 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::SseParse(error) => {
             format!("SSE parse error: {error}")
         }
+        error @ astra_thin_client::ThinClientError::IncompatibleRuntime { .. } => error.to_string(),
         astra_thin_client::ThinClientError::InvalidSseJson(value) => {
             format!("Invalid SSE JSON payload: {value}")
         }
@@ -721,12 +742,12 @@ pub(crate) fn compact_or_raw(body: &str) -> String {
 
 pub(crate) fn print_json_or_raw(body: &str) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        println!(
+        stdout_println!(
             "{}",
             serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
         );
     } else {
-        println!("{body}");
+        stdout_println!("{body}");
     }
 }
 
@@ -735,8 +756,8 @@ pub(crate) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
-    io::stdout().flush().map_err(|e| e.to_string())?;
+    stdout_print!("  {}: ", label.cyan().bold());
+    flush_prompt_stdout()?;
     let mut val = String::new();
     io::stdin().read_line(&mut val).map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
@@ -755,14 +776,23 @@ pub(crate) fn prompt_password_masked(
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
-    io::stdout().flush().map_err(|e| e.to_string())?;
+    stdout_print!("  {}: ", label.cyan().bold());
+    flush_prompt_stdout()?;
     let val = rpassword::read_password().map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
     if val.is_empty() {
         Err(format!("{label} cannot be empty"))
     } else {
         Ok(val)
+    }
+}
+
+fn flush_prompt_stdout() -> Result<(), String> {
+    match crate::cli::stream::output_sink::flush_stdout().map_err(|e| e.to_string())? {
+        crate::cli::stream::output_sink::OutputWriteStatus::Written => Ok(()),
+        crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
+            Err("stdout output transport closed by its consumer".to_string())
+        }
     }
 }
 
@@ -1315,6 +1345,60 @@ mod tests {
     // ── read_api_error ────────────────────────────────────────────────────────
 
     #[test]
+    fn memory_api_error_preserves_denial_and_conditional_deployment_guidance() {
+        let body = serde_json::json!({
+            "detail": "memory access is not enabled for this Astra account",
+            "request_id": "memory-request-123",
+            "error_code": "memory_self_hosted_access_disabled",
+        })
+        .to_string();
+        let error = read_api_error(403, &body);
+        assert!(error.contains("memory access is not enabled"));
+        assert!(error.contains("memory-request-123"));
+        assert!(error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS=1"));
+        assert!(!error.contains("Cloud:"));
+    }
+
+    #[test]
+    fn memory_api_error_retains_backend_incompatibility_without_403_advice() {
+        let body =
+            r#"{"detail":"Memoria-Owner authentication requires a compatible Memoria release"}"#;
+        let error = read_api_error(401, body);
+        assert!(error.contains("Memoria-Owner"));
+        assert!(!error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS=1"));
+    }
+
+    #[test]
+    fn memory_api_error_only_gives_deployment_advice_for_the_typed_local_denial() {
+        for code in [
+            Some("memory_consent_denied"),
+            Some("memory_access_disabled"),
+            None,
+            Some("unknown"),
+        ] {
+            let error = read_api_error(
+                403,
+                &serde_json::json!({
+                    // Even matching prose from an old server cannot select a deployment hint.
+                    "detail": "memory access is not enabled for this Astra account",
+                    "error_code": code,
+                })
+                .to_string(),
+            );
+            assert!(
+                !error.contains("MEMORIA_SELF_HOSTED_MASTER_ACCESS"),
+                "{error}"
+            );
+        }
+        let error = read_api_error(
+            403,
+            r#"{"detail":"translated message","error_code":"memory_consent_denied"}"#,
+        );
+        assert!(error.contains("Review your sharing settings"));
+        assert!(error.contains("translated message"));
+    }
+
+    #[test]
     fn read_api_error_includes_status() {
         let err = read_api_error(404, "not found");
         assert!(err.contains("404"), "got: {err}");
@@ -1744,9 +1828,11 @@ mod tests {
             ],
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -1757,6 +1843,7 @@ mod tests {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &cli_user_id(),

@@ -102,19 +102,6 @@ fn build_bug_report(state: &SessionState) -> String {
     // Redacted env vars — show presence but not values for sensitive ones.
     // LLM model / API key are stored server-side in infra_llm_models — inspect via
     // `astra admin model list` / `astra admin config list`.
-    let config_vars = [("ASTRA_CLI_MAX_TURNS", false)];
-    for (var, sensitive) in &config_vars {
-        match std::env::var(var) {
-            Ok(val) => {
-                if *sensitive {
-                    lines.push(format!("- `{var}`: [REDACTED, {} chars]", val.len()));
-                } else {
-                    lines.push(format!("- `{var}`: {val}"));
-                }
-            }
-            Err(_) => {}
-        }
-    }
     lines.push(String::new());
 
     // ── MCP servers ──

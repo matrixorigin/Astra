@@ -257,13 +257,13 @@ async fn orchestrator_empty_team_fails_validation() {
     assert_eq!(report.status, TeamExecutionStatus::Failed);
     assert!(report.error.as_ref().unwrap().contains("validation failed"));
 
-    // Parent run should be marked failed
+    // Structural validation is pre-admission: an empty team must not create a
+    // durable run that never had executable Work.
     let run = run_engine
         .load_run("test-user", &report.parent_run_id)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(run.status, "failed");
+    assert!(run.is_none());
 }
 
 /// Executor that always returns errors.

@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  resolveGitHubAccessAvailability,
   resolveWebAccessAvailability,
 } from '@/lib/runtime-capabilities';
 import type { RuntimeCapabilitiesResponse } from '@/lib/api/types';
@@ -58,24 +57,5 @@ describe('resolveWebAccessAvailability', () => {
     expect(
       resolveWebAccessAvailability(snapshot([server]), workspace).available,
     ).toBe(false);
-  });
-});
-
-describe('resolveGitHubAccessAvailability', () => {
-  it('uses the same selected-provider semantics as the web bundle', () => {
-    const capabilities: RuntimeCapabilitiesResponse = {
-      tools: [{ name: 'github', providers: [server, edge] }],
-    };
-    expect(resolveGitHubAccessAvailability(capabilities, null)).toMatchObject({
-      available: true,
-      provider: server,
-    });
-    expect(
-      resolveGitHubAccessAvailability(capabilities, {
-        kind: 'edge_workspace',
-        edgeAgentId: 'edge-1',
-        cwd: '/workspace',
-      }),
-    ).toMatchObject({ available: true, provider: edge });
   });
 });

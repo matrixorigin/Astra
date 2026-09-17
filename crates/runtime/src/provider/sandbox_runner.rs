@@ -255,7 +255,10 @@ mod tests {
         let caps = provider.capabilities().await;
         assert!(caps.contains(&ToolCapability::Named("bash".into())));
         assert!(caps.contains(&ToolCapability::Named("read_file".into())));
-        assert!(caps.contains(&ToolCapability::Named("git".into())));
+        assert!(caps.contains(&ToolCapability::Named("write_file".into())));
+        for removed in ["git", "github"] {
+            assert!(!caps.contains(&ToolCapability::Named(removed.into())));
+        }
         assert!(!caps.contains(&ToolCapability::Named("memory".into())));
     }
 

@@ -1,11 +1,16 @@
 # Context and prompt
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-02.
 
 Context and prompt owns context assembly, prompt-cache stability, dynamic state blocks, compaction, and memory injection boundaries. It does not own provider routing or tool execution.
 
 This document defines the target behavior that implementation should converge toward.
+
+The database-inspired foundation for this design is described in
+[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
+Agents](https://arxiv.org/abs/2609.00749), accepted at
+[ADS 2026](https://vldb-ads.top/#program), co-located with VLDB 2026.
 
 ## Principle
 
@@ -14,6 +19,13 @@ Prompt cache stability comes from stable structure, not from hiding runtime trut
 ```
 
 ## Context layers
+
+Auxiliary Work admission emits only fields consumed by the runtime. Ordinary
+(`not_required`) admission classifies lifecycle, explicit execution topology,
+mutation scope, domain, and required capabilities; it does not generate a second
+list of user deliverables. The primary conversation retains those requirements.
+Missing topology remains invalid and may receive only the existing bounded
+repair. Required Work still supplies its initial graph and lifecycle mutations.
 
 | Layer | Purpose |
 | --- | --- |
@@ -54,6 +66,45 @@ facts before rendering. User text and wrapper-like strings never grant authority
 Platform integrations must put invariant rules in `stable_runtime_system_prompt`
 and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
 change the system prefix; changing round facts must not.
+
+The explicitly selected append-only layout keeps its existing runtime-owned
+user frames, lifetimes, and durable history protocol. It is already a single-
+system wire shape and is not flattened into ordinary human messages. On other
+OpenAI-compatible layouts, typed policies join the leading system, while facts
+use the marked user-context projection. The invariant focus policy applies to
+all layouts; exact turn text stays outside the system prefix.
+
+Work start/retry/synthesis/mutation controls and deadline context contain both
+instructions and facts. Their producer-owned kind declares the structured
+instruction field: only that field joins the leading system; objectives,
+expected results, retry counts, mutations and deadlines stay in user context.
+Output-limit continuation is a producer-owned textual instruction. The same
+projection applies to a fresh retry, a volatile replay and re-homed authority;
+append-only frames retain their existing lifetime protocol.
+
+This consolidation means `TailSuffix` cannot promise an unchanged provider
+prefix when a new runtime instruction appears: entering settlement can change
+the leading system message even when the assembly's stable-section hash is
+unchanged. Diagnose this boundary using the provider-final request fingerprints.
+Deployments that support preserving appended message boundaries can explicitly
+select `AppendOnlyUserTail` to retain the stable authority policy and append
+runtime instructions with their existing lifetime and supersession semantics.
+Do not silently reinterpret an explicitly selected `TailSuffix` capability.
+
+Repeated states within one typed authority kind must not create a new system
+instruction for every changing value. The stable leading turn-focus policy
+defines how to interpret `boundary_instruction` in marked runtime-owned context.
+The exact boundary-specific instruction stays with its typed runtime facts, so
+entering a boundary or changing its stage leaves the cacheable system prefix
+unchanged. The runtime still enforces the active tool surface, boundary, and
+evidence checks; accepting a proposal is not an execution receipt.
+
+The bounded live-evidence recovery also separates its introspect instruction
+from its reason/schema facts. Typed control decoding accepts both direct JSON
+and the existing required-context envelope (including JSON-string contexts)
+so an unconsumed durable frame retains instruction authority after a provider
+switch. Envelope kind must match the runtime-owned kind; user-authored wrappers
+do not establish provenance.
 
 Dynamic state belongs in compact blocks with stable keys:
 

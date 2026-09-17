@@ -1,6 +1,6 @@
 ---
 name: verify-task
-description: "Verify completed Astra work with evidence. Uses durable task verification criteria when present; otherwise derives targeted gates from the diff and changed behavior."
+description: "Verify completed Astra work with evidence. Uses canonical Work criteria and checks when present; otherwise derives targeted gates from the diff and changed behavior."
 user_invocable: true
 when_to_use: "When the user wants to verify that a completed task actually works, run focused tests/lint/build checks, or produce a delivery report."
 arguments:
@@ -36,13 +36,14 @@ git diff --stat
 git diff --name-only
 ```
 
-2. If the task is durable/contract-backed, use the service types:
+2. If the change is backed by durable Work, use the canonical service types:
 
 | Concept | Source |
 | --- | --- |
-| Criteria schema | `crates/services/src/verification.rs` |
-| Durable task lifecycle | `crates/services/src/durable_task.rs` |
-| CLI display/report bridge | `crates/astra-cli/src/cli/durable_bridge.rs` |
+| Generic command verifier schema | `crates/services/src/verification.rs` |
+| Durable Work domain and lifecycle | `crates/services/src/work.rs` |
+| Work checks and acceptance | `crates/services/src/work/acceptance.rs`, `crates/services/src/work/repository.rs` |
+| CLI Work projection | `crates/astra-cli/src/cli/work_command.rs` |
 | Verification journal event | `crates/services/src/session_journal.rs` |
 
 Current verifier kinds are `command`, `command_output`, `file_exists`, `grep_check`,

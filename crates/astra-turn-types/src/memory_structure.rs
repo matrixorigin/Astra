@@ -263,8 +263,7 @@ mod tests {
 
     #[test]
     fn accepts_well_formed_fact() {
-        let content =
-            "[@fact/active] astra-engine uses Rust 2024 edition with clippy warnings as errors.";
+        let content = "[@fact/active] Astra uses Rust 2024 edition with clippy warnings as errors.";
         assert!(validate_persistent_memory_content(content).is_ok());
     }
 

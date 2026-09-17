@@ -66,10 +66,18 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             description: "Fast codebase exploration and research.".to_string(),
             system_prompt_addendum: EXPLORE_PROMPT.to_string(),
             max_turns: 20,
-            allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_tools: [
+                "bash",
+                "glob",
+                "grep",
+                "list_dir",
+                "read_file",
+                "web_fetch",
+                "web_search",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             read_only: true,
         },
         AgentTypeDefinition {
@@ -85,21 +93,14 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
         },
         AgentTypeDefinition {
             agent_type: "task".to_string(),
-            description: "Execute commands with verbose output tracking.".to_string(),
+            description: "Execute a bounded task with the parent's available capabilities."
+                .to_string(),
             system_prompt_addendum: TASK_PROMPT.to_string(),
             max_turns: 30,
-            allowed_tools: [
-                "bash",
-                "glob",
-                "grep",
-                "list_dir",
-                "read_file",
-                "write_file",
-                "str_replace",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            // Task is an execution shape, not a workspace-only capability
+            // boundary. Parent permissions, provider admission, policy, and
+            // an optional per-spawn allowlist remain authoritative.
+            allowed_tools: ["*"].into_iter().map(String::from).collect(),
             read_only: false,
         },
         AgentTypeDefinition {
@@ -125,6 +126,8 @@ You are a code review agent with high signal-to-noise ratio.
 - NEVER comment on style or formatting
 - Start from the requested scope and changed code; do not inventory the whole repository unless the task requires it
 - Batch independent searches and reads, avoid rereading known content, and stop exploring once each claim has sufficient evidence
+- For a fixed commit, establish the parent/commit and one bounded diff first, then inspect only the files needed for concrete findings; do not repeat identical `git show`/`git diff` commands
+- Use a small evidence budget (one overview, one focused diff per relevant file, and at most a few targeted context reads). If the diff is too large, report that limit instead of expanding into repository-wide archaeology
 - A failed optional probe is evidence, not a reason to repeat broad exploration; use another bounded check or disclose the limitation
 - Return prioritized findings with concrete file/line evidence, then stop
 - You are READ-ONLY: do not modify any files
@@ -180,15 +183,23 @@ mod tests {
     }
 
     #[test]
-    fn task_agent_uses_current_consolidated_edit_tools() {
+    fn task_agent_inherits_parent_capabilities_instead_of_assuming_workspace_only_work() {
         let task = get_builtin_agent_types()
             .into_iter()
             .find(|def| def.agent_type == "task")
             .expect("builtins must include task");
-        assert!(task.allowed_tools.contains("read_file"));
-        assert!(task.allowed_tools.contains("write_file"));
-        assert!(task.allowed_tools.contains("str_replace"));
-        assert!(!task.allowed_tools.contains("edit"));
-        assert!(!task.allowed_tools.contains("create"));
+        assert_eq!(task.allowed_tools, ["*".to_string()].into_iter().collect());
+        assert!(!task.read_only);
+    }
+
+    #[test]
+    fn explore_agent_can_use_parent_admitted_read_only_web_capabilities() {
+        let explore = get_builtin_agent_types()
+            .into_iter()
+            .find(|def| def.agent_type == "explore")
+            .expect("builtins must include explore");
+        assert!(explore.read_only);
+        assert!(explore.allowed_tools.contains("web_fetch"));
+        assert!(explore.allowed_tools.contains("web_search"));
     }
 }

@@ -2,15 +2,15 @@
 
 use super::*;
 use astra_services::{
-    ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
+    ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
     PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion,
 };
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ListUserSkillsQuery {
     prefix: Option<String>,
-    owner_user_id: Option<String>,
 }
 
 fn require_personal_skill_store(
@@ -25,28 +25,21 @@ fn require_personal_skill_store(
 
 fn map_personal_skill_error(error: PersonalSkillError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
-        PersonalSkillError::InvalidStatus { .. }
-        | PersonalSkillError::VersionQuarantined { .. } => {
+        PersonalSkillError::InvalidStatus { .. } => {
             error_response(StatusCode::BAD_REQUEST, error.to_string())
         }
-        PersonalSkillError::VersionNotFound { .. } => {
+        PersonalSkillError::VersionNotActivatable { .. } => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
+        PersonalSkillError::VersionNotFound { .. }
+        | PersonalSkillError::SessionNotActive { .. }
+        | PersonalSkillError::RunNotFound { .. } => {
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
+        PersonalSkillError::InvalidActiveProjection { .. } => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
         other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-    }
-}
-
-fn requested_owner(
-    authenticated_user_id: &str,
-    requested_owner_user_id: Option<&str>,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    match requested_owner_user_id {
-        Some(owner) if owner != authenticated_user_id => Err(error_response(
-            StatusCode::FORBIDDEN,
-            "cannot access another user's personal skills",
-        )),
-        Some(owner) => Ok(owner.to_string()),
-        None => Ok(authenticated_user_id.to_string()),
     }
 }
 
@@ -56,10 +49,9 @@ pub(super) async fn list_user_skills_handler(
     headers: HeaderMap,
 ) -> Result<Json<Vec<astra_services::UserSkillSourceRecord>>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let owner_user_id = requested_owner(&user.user_id, query.owner_user_id.as_deref())?;
     let store = require_personal_skill_store(&state)?;
     store
-        .list_sources(&owner_user_id, query.prefix.as_deref())
+        .list_sources(&user.user_id, query.prefix.as_deref())
         .await
         .map(Json)
         .map_err(map_personal_skill_error)
@@ -132,21 +124,6 @@ pub(super) async fn activate_user_skill_handler(
         .await
         .map(Json)
         .map_err(map_personal_skill_error)
-}
-
-pub(super) async fn install_user_skill_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<InstallUserSkill>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let store = require_personal_skill_store(&state)?;
-    store
-        .install_skill(&user.user_id, &skill_name, request)
-        .await
-        .map_err(map_personal_skill_error)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub(super) async fn record_user_skill_evaluation_handler(

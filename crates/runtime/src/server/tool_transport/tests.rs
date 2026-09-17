@@ -399,6 +399,19 @@ impl StaticEdgeDispatch {
     }
 
     fn terminal_admission(output: &str) -> Self {
+        let result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "session-1".to_string(),
+                run_id: "run-1".to_string(),
+                turn_chain_id: "turn-chain-1".to_string(),
+                request_id: "call-1".to_string(),
+                edge_agent_id: "edge-selected".to_string(),
+                status: "completed".to_string(),
+                output: output.to_string(),
+                duration_ms: 0,
+                tool_result_fields: None,
+            },
+        );
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             inserted_identities: Mutex::new(Vec::new()),
@@ -406,7 +419,7 @@ impl StaticEdgeDispatch {
             return_result: false,
             result_status: "completed",
             terminal_admission_result: Some(
-                serde_json::json!({"status":"completed","output":output}).to_string(),
+                serde_json::to_string(&result).expect("terminal result fixture must serialize"),
             ),
             admission_error: None,
             direct_claimed: AtomicBool::new(false),
@@ -833,6 +846,7 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         Ok(())
     }
@@ -889,6 +903,7 @@ fn edge_agent_record(edge_agent_id: &str) -> astra_services::multi_agent::EdgeAg
         worktree_path: Some("/Users/test/project".to_string()),
         capabilities: Some(edge_runtime_environment_advertisement(edge_agent_id)),
         workspace_id: None,
+        materialization_id: Some(format!("materialization-{edge_agent_id}")),
         registered_at: "2026-06-11T00:00:00Z".to_string(),
         last_heartbeat_at: "2026-06-11T00:00:00Z".to_string(),
     }
@@ -1279,10 +1294,15 @@ async fn unknown_tool_is_denied_before_local_transport() {
         .await;
 
     assert!(result.is_error, "{result:?}");
-    assert!(
-        result.metadata.is_none(),
-        "unknown tool is a schema/admission failure, not a runtime capability denial"
+    let metadata = result
+        .metadata
+        .expect("unknown tool must retain typed admission metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        astra_core::ErrorKind::ToolNotFound.as_str()
     );
+    assert_eq!(metadata["disposition"], "rejected");
+    assert_eq!(metadata["execution_started"], false);
     let body: Value = serde_json::from_str(&result.output).expect("json error body");
     assert_eq!(
         body["error_kind"],
@@ -1316,36 +1336,38 @@ async fn client_only_and_intercepted_tools_do_not_leak_to_server_local_transport
 
 #[tokio::test]
 async fn policy_allowed_tools_blocks_disallowed_tool_before_local_transport() {
-    let service = ToolExecutionService::new_for_test();
-    let local = CountingLocalTransport::new();
-    let mut request = request(
-        "bash",
-        WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
-        ExecutorBinding::server_local(),
-    );
-    request.policy.allowed_tools = vec!["read_file".to_string()];
+    for allowed in ["read_file", "glob"] {
+        let service = ToolExecutionService::new_for_test();
+        let local = CountingLocalTransport::new();
+        let mut request = request(
+            "bash",
+            WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+            ExecutorBinding::server_local(),
+        );
+        request.policy.allowed_tools = vec![allowed.to_string()];
 
-    let binding = request.runtime_environment_binding(service.tool_registry());
-    assert!(!binding.tool_surface.contains("bash"));
-    assert_eq!(
-        binding.tool_surface.denial_for("bash"),
-        Some(&astra_runtime_env::ToolUnavailableReason::PolicyDenied(
-            astra_runtime_env::PolicyIntent::disallowed_tool_reason("bash")
-        ))
-    );
+        let binding = request.runtime_environment_binding(service.tool_registry());
+        assert!(!binding.tool_surface.contains("bash"));
+        assert_eq!(
+            binding.tool_surface.denial_for("bash"),
+            Some(&astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                astra_runtime_env::PolicyIntent::disallowed_tool_reason("bash")
+            ))
+        );
 
-    let result = service.execute(request, &local).await;
+        let result = service.execute(request, &local).await;
 
-    assert!(result.is_error, "{result:?}");
-    let metadata = result.metadata.expect("policy denial metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
-    assert_eq!(
-        metadata["capability_denial"],
-        serde_json::json!({"PolicyDenied": "tool 'bash' is not in allowed_tools"})
-    );
-    assert_eq!(metadata["execution_started"], false);
-    assert_eq!(metadata["side_effects_maybe"], false);
-    assert_eq!(local.calls(), 0);
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("policy denial metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
+        assert_eq!(
+            metadata["capability_denial"],
+            serde_json::json!({"PolicyDenied": "tool 'bash' is not in allowed_tools"})
+        );
+        assert_eq!(metadata["execution_started"], false);
+        assert_eq!(metadata["side_effects_maybe"], false);
+        assert_eq!(local.calls(), 0);
+    }
 }
 
 #[test]
@@ -1372,7 +1394,7 @@ fn no_file_environment_binding_resolves_to_control_plane_tool_surface_only() {
         "bash",
         "read_file",
         "write_file",
-        "git",
+        "worktree",
         "git_clone",
         "find_definition",
     ] {
@@ -1497,7 +1519,7 @@ fn edge_workspace_binding_resolves_project_tools_to_edge_runtime() {
     assert!(binding.tool_surface.contains("bash"));
     assert!(binding.tool_surface.contains("read_file"));
     assert!(binding.tool_surface.contains("write_file"));
-    assert!(binding.tool_surface.contains("git"));
+    assert!(binding.tool_surface.contains("glob"));
 }
 
 #[test]
@@ -1653,6 +1675,43 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
 }
 
 #[test]
+fn edge_bound_execution_plan_clamps_invalid_or_excessive_policy_timeout() {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+
+    request.policy.max_execution_secs = Some(0.0);
+    let binding = request.runtime_environment_binding(&registry);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    assert_eq!(plan.execution_timeout_secs(), 1);
+    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(11));
+
+    request.policy.max_execution_secs = Some(9_999.0);
+    let binding = request.runtime_environment_binding(&registry);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    assert_eq!(
+        plan.execution_timeout_secs(),
+        astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS
+    );
+    assert_eq!(
+        plan.wait_timeout(),
+        std::time::Duration::from_secs(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10)
+    );
+}
+
+#[test]
 fn offline_edge_binding_hides_project_tools_even_with_workspace_metadata() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
@@ -1761,7 +1820,6 @@ fn orchestrator_managed_online_derives_provider_runtime_capabilities() {
         "bash",
         "run_script",
         "background_shell",
-        "git",
         "git_clone",
         "lsp",
     ] {
@@ -1935,7 +1993,7 @@ fn cloud_workspace_with_runtime_bound_orchestrator_exposes_read_write_project_to
     assert!(binding.tool_surface.contains("bash"));
     assert!(binding.tool_surface.contains("read_file"));
     assert!(binding.tool_surface.contains("write_file"));
-    assert!(binding.tool_surface.contains("git"));
+    assert!(binding.tool_surface.contains("glob"));
 }
 
 #[test]
@@ -2585,7 +2643,7 @@ async fn cloud_workspace_blocks_without_server_reroute() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let mut request = request(
-        "git",
+        "read_file",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::CloudWorkspace,
             display_name: "Cloud workspace".to_string(),
@@ -2594,7 +2652,7 @@ async fn cloud_workspace_blocks_without_server_reroute() {
         },
         ExecutorBinding::server_local(),
     );
-    request.args = serde_json::json!({"action": "status"});
+    request.args = serde_json::json!({"path": "README.md"});
 
     let result = service.execute(request, &local).await;
 
@@ -4466,7 +4524,7 @@ async fn provider_allowlist_blocks_selected_edge_offer_without_server_reroute() 
 #[tokio::test]
 async fn local_code_tool_remains_edge_bound_with_edge_binding() {
     let service = ToolExecutionService::new_for_test();
-    let local_code_tools = ["bash", "read_file", "list_dir", "grep", "glob", "git"];
+    let local_code_tools = ["bash", "read_file", "list_dir", "grep", "glob", "worktree"];
 
     for tool in local_code_tools {
         let edge_request = request(

@@ -59,8 +59,8 @@ pub(crate) const DEFAULT_DB_POOL_MAX_LIFETIME_SECS: u64 = 1800;
 
 use crate::runtime_limits::{
     DEFAULT_GLOBAL_OUTPUT_LIMIT, DEFAULT_MAX_RETRIEVED, DEFAULT_MAX_TOOL_RETRIES,
-    DEFAULT_MAX_TURN_INPUT_TOKENS, DEFAULT_MAX_TURNS, DEFAULT_PLAN_SUBTASK_MAX_TURNS,
-    DEFAULT_RETRY_BASE_MS, DEFAULT_TOOL_OUTPUT_LIMIT, DEFAULT_TURN_TIMEOUT_S,
+    DEFAULT_MAX_TURN_INPUT_TOKENS, DEFAULT_RETRY_BASE_MS, DEFAULT_TOOL_OUTPUT_LIMIT,
+    DEFAULT_TURN_TIMEOUT_S,
 };
 
 /// Read an env var and apply it to an `Option<T>` field if the value parses.
@@ -338,9 +338,9 @@ pub struct AuthConfig {
     pub access_ttl_minutes: Option<u64>,
     /// Refresh token TTL in days.
     pub refresh_ttl_days: Option<u64>,
-    /// Bridge HMAC secret (required in production).
-    pub bridge_secret: Option<String>,
-    /// Fernet key for encrypting LLM API keys.
+    /// Root secret for purpose-separated runtime signatures (required in production).
+    pub runtime_root_secret: Option<String>,
+    /// High-entropy secret used to derive a Fernet key for encrypting LLM API keys.
     pub token_encryption_key: Option<String>,
     /// Local authentication rules for provider-originated API calls.
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
@@ -443,8 +443,8 @@ impl fmt::Debug for AuthConfig {
             .field("access_ttl_minutes", &self.access_ttl_minutes)
             .field("refresh_ttl_days", &self.refresh_ttl_days)
             .field(
-                "bridge_secret",
-                &self.bridge_secret.as_ref().map(|_| "[REDACTED]"),
+                "runtime_root_secret",
+                &self.runtime_root_secret.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "token_encryption_key",
@@ -464,7 +464,7 @@ impl AuthConfig {
             other,
             jwt_secret,
             jwt_algorithm,
-            bridge_secret,
+            runtime_root_secret,
             token_encryption_key
         );
         merge_option_copy_fields!(self, other, access_ttl_minutes, refresh_ttl_days);
@@ -490,7 +490,7 @@ impl AuthConfig {
         apply_env_override_str(&mut self.jwt_algorithm, "ASTRA_JWT_ALGORITHM");
         apply_env_override(&mut self.access_ttl_minutes, "ASTRA_JWT_ACCESS_TTL_MINUTES");
         apply_env_override(&mut self.refresh_ttl_days, "ASTRA_JWT_REFRESH_TTL_DAYS");
-        apply_env_override_str(&mut self.bridge_secret, "ASTRA_BRIDGE_SECRET");
+        apply_env_override_str(&mut self.runtime_root_secret, "ASTRA_RUNTIME_ROOT_SECRET");
         apply_env_override_str(&mut self.token_encryption_key, "ASTRA_TOKEN_ENCRYPTION_KEY");
         for request_auth in &mut self.provider_request_auth {
             apply_env_override_placeholder(&mut request_auth.key);
@@ -667,7 +667,7 @@ pub struct ApiConfig {
 
 impl ApiConfig {
     pub fn host(&self) -> &str {
-        self.host.as_deref().unwrap_or("0.0.0.0")
+        self.host.as_deref().unwrap_or("127.0.0.1")
     }
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(DEFAULT_API_PORT)
@@ -717,13 +717,6 @@ pub struct ServerRuntimeConfig {
 }
 
 impl ServerRuntimeConfig {
-    pub(crate) fn max_turns(&self) -> usize {
-        self.max_turns.unwrap_or(DEFAULT_MAX_TURNS)
-    }
-    pub(crate) fn plan_subtask_max_turns(&self) -> usize {
-        self.plan_subtask_max_turns
-            .unwrap_or(DEFAULT_PLAN_SUBTASK_MAX_TURNS)
-    }
     pub(crate) fn turn_timeout_s(&self) -> u64 {
         self.turn_timeout_s.unwrap_or(DEFAULT_TURN_TIMEOUT_S)
     }
@@ -768,11 +761,10 @@ impl ServerRuntimeConfig {
         if self.retry_base_ms == Some(0) {
             return Err("runtime.retry_base_ms must be > 0 (or omit for default)".into());
         }
-        // Use resolved values so the check fires even when one field
-        // relies on its default (max_turns=None + plan=100 → 100 > 50).
-        let max_turns = self.max_turns();
-        let plan_turns = self.plan_subtask_max_turns();
-        if plan_turns > max_turns {
+        // Omission is not a hidden cap. Compare only explicit constraints.
+        if let (Some(max_turns), Some(plan_turns)) = (self.max_turns, self.plan_subtask_max_turns)
+            && plan_turns > max_turns
+        {
             return Err(format!(
                 "runtime.plan_subtask_max_turns ({plan_turns}) exceeds max_turns ({max_turns})"
             ));
@@ -966,7 +958,7 @@ pub struct AppSettings {
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
-    pub bridge_secret: String,
+    pub runtime_root_secret: String,
     pub token_encryption_key: Option<String>,
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
     pub edge_token_auth: EdgeTokenAuthConfig,
@@ -988,7 +980,7 @@ impl fmt::Debug for AppSettings {
             .field("jwt", &self.jwt)
             .field("api", &self.api)
             .field("memoria", &self.memoria)
-            .field("bridge_secret", &"[REDACTED]")
+            .field("runtime_root_secret", &"[REDACTED]")
             .field(
                 "token_encryption_key",
                 &self.token_encryption_key.as_ref().map(|_| "[REDACTED]"),
@@ -1030,7 +1022,7 @@ impl AppSettings {
                 "ASTRA_JWT_ALGORITHM" => sc.auth.jwt_algorithm.clone(),
                 "ASTRA_JWT_ACCESS_TTL_MINUTES" => sc.auth.access_ttl_minutes.map(|v| v.to_string()),
                 "ASTRA_JWT_REFRESH_TTL_DAYS" => sc.auth.refresh_ttl_days.map(|v| v.to_string()),
-                "ASTRA_BRIDGE_SECRET" => sc.auth.bridge_secret.clone(),
+                "ASTRA_RUNTIME_ROOT_SECRET" => sc.auth.runtime_root_secret.clone(),
                 "ASTRA_TOKEN_ENCRYPTION_KEY" => sc.auth.token_encryption_key.clone(),
                 // API
                 "ASTRA_API_HOST" => Some(sc.api.host().to_string()),
@@ -1126,18 +1118,23 @@ impl AppSettings {
             ),
             jwt: JwtSettings::from_lookup(&lookup)?,
             api: ApiSettings {
-                host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
+                host: value_or_default(&lookup, "ASTRA_API_HOST", "127.0.0.1"),
                 port: parse_or_default(&lookup, "ASTRA_API_PORT", DEFAULT_API_PORT)?,
                 cors_origins: lookup("ASTRA_CORS_ORIGINS"),
             },
             memoria: MemoriaSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: lookup("MEMORIA_MASTER_KEY"),
+                self_hosted_master_access: lookup("MEMORIA_SELF_HOSTED_MASTER_ACCESS")
+                    .is_some_and(|value| value == "1"),
+                issuer: lookup("MEMORIA_ISSUER"),
+                web_url: lookup("MEMORIA_WEB_URL"),
+                legacy_issuer: lookup("MEMORIA_LEGACY_ISSUER"),
             },
-            bridge_secret: required_value(
+            runtime_root_secret: required_value(
                 &lookup,
-                "ASTRA_BRIDGE_SECRET",
-                "dev-bridge-secret-change-me",
+                "ASTRA_RUNTIME_ROOT_SECRET",
+                "dev-runtime-root-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             provider_request_auth: Vec::new(),
@@ -1355,6 +1352,12 @@ impl MatrixOneSettings {
     /// - `min_connections` must be ≤ `max_connections`
     /// - acquire/idle/lifetime timeouts must be > 0
     pub fn validate(&self) -> Result<(), String> {
+        if self.database.is_empty() || self.database.len() > 64 {
+            return Err(format!(
+                "matrixone database identifier must be 1..=64 ASCII bytes (got {})",
+                self.database.len()
+            ));
+        }
         if self.db_pool_max_connections == 0 {
             return Err("db_pool_max_connections must be ≥ 1 (got 0)".into());
         }
@@ -1492,6 +1495,10 @@ impl fmt::Debug for ApiSettings {
 pub struct MemoriaSettings {
     pub base_url: String,
     pub master_key: Option<String>,
+    pub self_hosted_master_access: bool,
+    pub issuer: Option<String>,
+    pub web_url: Option<String>,
+    pub legacy_issuer: Option<String>,
 }
 
 impl MemoriaSettings {
@@ -1501,12 +1508,25 @@ impl MemoriaSettings {
             base_url: env::var("MEMORIA_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_MEMORIA_URL.to_string()),
             master_key: env::var("MEMORIA_MASTER_KEY").ok(),
+            self_hosted_master_access: env::var("MEMORIA_SELF_HOSTED_MASTER_ACCESS")
+                .is_ok_and(|value| value == "1"),
+            issuer: env::var("MEMORIA_ISSUER").ok(),
+            web_url: env::var("MEMORIA_WEB_URL").ok(),
+            legacy_issuer: env::var("MEMORIA_LEGACY_ISSUER").ok(),
         }
     }
 
     /// Returns `true` when a master key is configured (Memoria is usable).
     pub fn is_configured(&self) -> bool {
         self.master_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// Allow a trusted self-hosted master credential only as a per-user
+    /// fallback when no scoped credential exists. A configured website means
+    /// end-user scoped credentials own consent even if an operator also
+    /// configured a master key for administrative duties.
+    pub fn allows_self_hosted_master_fallback(&self) -> bool {
+        self.self_hosted_master_access && self.web_url.is_none() && self.is_configured()
     }
 
     /// `Authorization: Bearer <key>` header value, or `None` if unconfigured.
@@ -1652,6 +1672,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memoria_user_authority_distinguishes_self_hosted_from_scoped_login() {
+        let mut settings = MemoriaSettings {
+            base_url: "http://memoria.local".into(),
+            master_key: Some("configured".into()),
+            self_hosted_master_access: false,
+            issuer: None,
+            web_url: None,
+            legacy_issuer: None,
+        };
+        assert!(!settings.allows_self_hosted_master_fallback());
+
+        settings.self_hosted_master_access = true;
+        assert!(settings.allows_self_hosted_master_fallback());
+
+        settings.web_url = Some("https://accounts.example.test".into());
+        assert!(!settings.allows_self_hosted_master_fallback());
+
+        settings.web_url = None;
+        settings.master_key = None;
+        assert!(!settings.allows_self_hosted_master_fallback());
+    }
+
+    #[test]
+    fn self_hosted_master_access_requires_exact_explicit_env_opt_in() {
+        let mut values = HashMap::from([
+            ("ASTRA_ALLOW_INSECURE_DEFAULTS".to_string(), "1".to_string()),
+            (
+                "MEMORIA_MASTER_KEY".to_string(),
+                "configured-key".to_string(),
+            ),
+        ]);
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(!settings.memoria.allows_self_hosted_master_fallback());
+
+        values.insert(
+            "MEMORIA_SELF_HOSTED_MASTER_ACCESS".to_string(),
+            "true".to_string(),
+        );
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(!settings.memoria.allows_self_hosted_master_fallback());
+
+        values.insert(
+            "MEMORIA_SELF_HOSTED_MASTER_ACCESS".to_string(),
+            "1".to_string(),
+        );
+        let settings = AppSettings::from_map(&values).unwrap();
+        assert!(settings.memoria.allows_self_hosted_master_fallback());
+    }
+
+    #[test]
     fn explicit_env_config_source_is_exact_and_fail_closed() {
         assert!(!explicit_env_config_requested_from(None).unwrap());
         assert!(!explicit_env_config_requested_from(Some(OsStr::new(""))).unwrap());
@@ -1783,6 +1853,19 @@ mod tests {
     }
 
     #[test]
+    fn matrixone_settings_reject_database_identifiers_over_mysql_limit() {
+        let mut settings = MatrixOneSettings {
+            database: "a".repeat(64),
+            ..MatrixOneSettings::default()
+        };
+        assert!(settings.validate().is_ok());
+        settings.database = "select-db".into();
+        assert!(settings.validate().is_ok());
+        settings.database = "a".repeat(65);
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
     fn app_settings_debug_redacts_optional_secrets() {
         let mut m = HashMap::new();
         m.insert("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into());
@@ -1794,8 +1877,8 @@ mod tests {
             "memoria master_key should be redacted: {debug_str}"
         );
         assert!(
-            !debug_str.contains("dev-bridge-secret-change-me"),
-            "bridge_secret should be redacted: {debug_str}"
+            !debug_str.contains("dev-runtime-root-secret-change-me"),
+            "runtime_root_secret should be redacted: {debug_str}"
         );
     }
 
@@ -1856,7 +1939,10 @@ mod tests {
             "ASTRA_JWT_SECRET".into(),
             "my-test-jwt-secret-key-at-least-32-chars--".into(),
         );
-        m.insert("ASTRA_BRIDGE_SECRET".into(), "bridge-secret".into());
+        m.insert(
+            "ASTRA_RUNTIME_ROOT_SECRET".into(),
+            "runtime-root-secret".into(),
+        );
         let result = AppSettings::from_map(&m);
         assert!(result.is_ok(), "explicit values should parse: {:?}", result);
         let settings = result.unwrap();
@@ -1867,7 +1953,7 @@ mod tests {
                 .starts_with("my-test-jwt-secret-key-at-least")
         );
         assert_eq!(settings.matrixone.password, "testpw");
-        assert_eq!(settings.bridge_secret, "bridge-secret");
+        assert_eq!(settings.runtime_root_secret, "runtime-root-secret");
     }
 
     #[test]
@@ -1893,17 +1979,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_validate_plan_turns_exceeds_max_turns_with_defaults() {
+    fn runtime_config_allows_explicit_plan_limit_without_implicit_global_cap() {
         let config = ServerRuntimeConfig {
             max_turns: None,
             plan_subtask_max_turns: Some(400),
             ..Default::default()
         };
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.contains("plan_subtask_max_turns (400) exceeds max_turns (300)"),
-            "should reject when default max_turns=300 is exceeded: {err}"
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1960,7 +2042,7 @@ mod settings_contract_tests {
         matrixone_user: String,
         matrixone_password: String,
         matrixone_database: String,
-        bridge_secret: String,
+        runtime_root_secret: String,
     }
 
     fn load_contract() -> SettingsContract {
@@ -1978,7 +2060,7 @@ mod settings_contract_tests {
             matrixone_user: settings.matrixone.user,
             matrixone_password: settings.matrixone.password,
             matrixone_database: settings.matrixone.database,
-            bridge_secret: settings.bridge_secret,
+            runtime_root_secret: settings.runtime_root_secret,
         }
     }
 
@@ -2024,7 +2106,7 @@ port = 9000
             DEFAULT_DB_POOL_MIN_CONNECTIONS
         );
         assert_eq!(config.api.port, Some(9000));
-        assert_eq!(config.api.host(), "0.0.0.0");
+        assert_eq!(config.api.host(), "127.0.0.1");
     }
 
     #[test]
@@ -2042,7 +2124,7 @@ jwt_secret = "my-secret-key"
 jwt_algorithm = "HS512"
 access_ttl_minutes = 1440
 refresh_ttl_days = 7
-bridge_secret = "bridge-secret"
+runtime_root_secret = "runtime-root-secret"
 token_encryption_key = "fernet-key"
 
 [api]
@@ -2060,7 +2142,10 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
         assert_eq!(config.auth.jwt_algorithm.as_deref(), Some("HS512"));
         assert_eq!(config.auth.access_ttl_minutes, Some(1440));
         assert_eq!(config.auth.refresh_ttl_days, Some(7));
-        assert_eq!(config.auth.bridge_secret.as_deref(), Some("bridge-secret"));
+        assert_eq!(
+            config.auth.runtime_root_secret.as_deref(),
+            Some("runtime-root-secret")
+        );
         assert_eq!(
             config.auth.token_encryption_key.as_deref(),
             Some("fernet-key")
@@ -2223,15 +2308,15 @@ auth_mode = "legacy"
         temp_env::with_vars(
             [
                 ("ASTRA_JWT_SECRET", Some("env-jwt-secret")),
-                ("ASTRA_BRIDGE_SECRET", Some("env-bridge-secret")),
+                ("ASTRA_RUNTIME_ROOT_SECRET", Some("env-runtime-root-secret")),
             ],
             || {
                 let mut config = ServerConfig::default();
                 config.apply_env_overrides();
                 assert_eq!(config.auth.jwt_secret.as_deref(), Some("env-jwt-secret"));
                 assert_eq!(
-                    config.auth.bridge_secret.as_deref(),
-                    Some("env-bridge-secret")
+                    config.auth.runtime_root_secret.as_deref(),
+                    Some("env-runtime-root-secret")
                 );
             },
         );
@@ -2405,7 +2490,7 @@ auth_mode = "legacy"
             sc.api.host = Some("127.0.0.1".to_string());
             sc.api.port = Some(9000);
             sc.auth.jwt_secret = Some("toml-jwt-secret-which-is-long-enough-32".to_string());
-            sc.auth.bridge_secret = Some("toml-bridge-secret".to_string());
+            sc.auth.runtime_root_secret = Some("toml-runtime-root-secret".to_string());
 
             let settings = AppSettings::from_server_config(&sc).unwrap();
             assert_eq!(settings.matrixone.db_pool_max_connections, 30);
@@ -2470,7 +2555,7 @@ auth_mode = "legacy"
         let toml_str = r#"
             [auth]
             jwt_secret = "test-jwt-secret-that-is-long-enough-123456"
-            bridge_secret = "test-bridge-secret"
+            runtime_root_secret = "test-runtime-root-secret"
 
             [deployment]
             disabled_tool_offers = ["web_fetch@server-builtin"]
@@ -2616,8 +2701,8 @@ auth_mode = "legacy"
             "my-test-jwt-secret-key-at-least-32-chars--".to_string(),
         );
         values.insert(
-            "ASTRA_BRIDGE_SECRET".to_string(),
-            "bridge-secret".to_string(),
+            "ASTRA_RUNTIME_ROOT_SECRET".to_string(),
+            "runtime-root-secret".to_string(),
         );
         values.insert(
             "ASTRA_DISABLED_TOOL_OFFERS".to_string(),

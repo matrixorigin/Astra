@@ -349,6 +349,94 @@ describe("useAstraChat", () => {
     expect(result.current.usage.totalTokens).toBe(3);
   });
 
+  test("terminal run_total usage replaces live request deltas", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "usage",
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        cache_creation_tokens: 1,
+        cache_read_tokens: 3,
+        usage_scope: "request",
+      } as StreamEvent,
+      {
+        type: "usage",
+        prompt_tokens: 30,
+        completion_tokens: 5,
+        cache_creation_tokens: 4,
+        cache_read_tokens: 9,
+        usage_scope: "run_total",
+      } as StreamEvent,
+      { type: "turn_complete" } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+
+    act(() => {
+      result.current.sendMessage("report usage");
+    });
+
+    expect(result.current.usage).toEqual({
+      promptTokens: 30,
+      completionTokens: 5,
+      totalTokens: 35,
+      cacheCreationTokens: 4,
+      cacheReadTokens: 9,
+    });
+  });
+
+  test("run_total replacement preserves usage from earlier turns", () => {
+    const { client, streamChatMock } = createMockClient();
+    const streams: StreamEvent[][] = [
+      [
+        { type: "usage", prompt_tokens: 10, completion_tokens: 2 } as StreamEvent,
+        { type: "usage", prompt_tokens: 10, completion_tokens: 2, usage_scope: "run_total" } as StreamEvent,
+        { type: "turn_complete" } as StreamEvent,
+      ],
+      [
+        { type: "usage", prompt_tokens: 20, completion_tokens: 3 } as StreamEvent,
+        { type: "usage", prompt_tokens: 20, completion_tokens: 3, usage_scope: "run_total" } as StreamEvent,
+        { type: "turn_complete" } as StreamEvent,
+      ],
+    ];
+    streamChatMock.mockImplementation((_params: unknown, opts: { onEvent: (e: StreamEvent) => void }) => {
+      for (const event of streams.shift() ?? []) opts.onEvent(event);
+      return { close: vi.fn() } as unknown as SSEClient;
+    });
+
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+
+    act(() => result.current.sendMessage("first"));
+    act(() => result.current.sendMessage("second"));
+
+    expect(result.current.usage.totalTokens).toBe(35);
+    expect(result.current.usage.promptTokens).toBe(30);
+    expect(result.current.usage.completionTokens).toBe(5);
+  });
+
+  test("authoritative text_done and turn_complete replace a divergent retry prefix", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "text_delta", content: "old partial" } as StreamEvent,
+      { type: "text_done", full_text: "new complete" } as StreamEvent,
+      {
+        type: "turn_complete",
+        assistant_text: "new complete",
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+
+    act(() => {
+      result.current.sendMessage("finish the answer");
+    });
+
+    const assistant = result.current.messages.find((message) => message.role === "assistant");
+    expect(assistant?.content).toBe("new complete");
+    expect(assistant?.streaming).toBe(false);
+  });
+
   test("processes tool_call_start and tool_call_end", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
@@ -375,6 +463,45 @@ describe("useAstraChat", () => {
     expect(result.current.toolCalls[0].tool).toBe("bash");
     expect(result.current.toolCalls[0].status).toBe("done");
     expect(result.current.toolCalls[0].result).toBe("file1\nfile2");
+  });
+
+  test("terminal-only replay reconstructs a tool and sparse duplicates cannot erase it", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "tool_call_end",
+        call_id: "tc-terminal-only",
+        tool: "introspect",
+        arguments: { scope: "current_run" },
+        result: { snapshot: "available" },
+        status: "completed",
+        success: true,
+        duration_ms: 37,
+      } as StreamEvent,
+      {
+        type: "tool_call_end",
+        call_id: "tc-terminal-only",
+        tool: "introspect",
+        status: "completed",
+        success: true,
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() =>
+      useAstraChat({ client, offeringId: "offer-test-model" }),
+    );
+    act(() => {
+      result.current.sendMessage("inspect runtime");
+    });
+
+    expect(result.current.toolCalls).toHaveLength(1);
+    expect(result.current.toolCalls[0]).toMatchObject({
+      callId: "tc-terminal-only",
+      tool: "introspect",
+      arguments: '{"scope":"current_run"}',
+      result: '{"snapshot":"available"}',
+      status: "done",
+    });
   });
 
   test("preserves skipped tool_call_end status", () => {
@@ -544,6 +671,27 @@ describe("useAstraChat", () => {
     });
     expect(result.current.transport).toBe("edge_ws");
     expect(result.current.fallbackPolicy).toBe("disabled");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.connectionState).toBe("disconnected");
+    expect(result.current.messages.at(-1)?.streaming).toBe(false);
+  });
+
+  test("finalizes the UI on a paused lifecycle boundary", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_paused", run_id: "run-paused-1" } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+
+    act(() => {
+      result.current.sendMessage("review");
+    });
+
+    expect(result.current.runStatus).toBe("paused");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.connectionState).toBe("disconnected");
+    expect(result.current.messages.at(-1)?.streaming).toBe(false);
   });
 
   test("tracks run_error as a failed bound run", () => {
@@ -734,6 +882,25 @@ describe("useAstraChat", () => {
     });
 
     expect(result.current.error).toBe("Server error");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.runStatus).toBe("failed");
+  });
+
+  test("keeps a retryable transport error open for reconnect", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "error", message: "temporary disconnect", retryable: true } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+
+    act(() => {
+      result.current.sendMessage("Hi");
+    });
+
+    expect(result.current.error).toBe("temporary disconnect");
+    expect(result.current.isStreaming).toBe(true);
+    expect(result.current.runStatus).toBe("running");
   });
 
   test("run_finished finalizes assistant message", () => {

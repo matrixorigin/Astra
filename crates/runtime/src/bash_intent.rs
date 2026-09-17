@@ -32,15 +32,25 @@ pub struct BashIntent {
     pub read_targets: Vec<String>,
 }
 
-/// Split a compound command (using `|`, `;`, `\n`, `&&`, `||`) into
-/// individual segments suitable for per-segment intent analysis.
+/// Split a compound command at validated top-level control and pipeline
+/// operators.  Do not use string splitting here: review commands routinely
+/// contain `||`/`&&` inside `$(...)`, and treating those as outer operators
+/// turns a benign nested fd redirect such as `2>/dev/null` into a false write
+/// receipt.  The shared evaluator tracks quotes, substitutions, and malformed
+/// syntax consistently with the completion/observation consumers.
 fn split_segments(command: &str) -> Vec<String> {
-    let lower_friendly = command.trim();
-    lower_friendly
-        .split(['|', ';', '\n'])
-        .flat_map(|chunk| chunk.split("&&"))
-        .flat_map(|chunk| chunk.split("||"))
-        .map(|s| s.trim().to_string())
+    let Some(control_segments) = astra_turn_core::evaluation::split_shell_control_segments(command)
+    else {
+        return vec![command.trim().to_string()];
+    };
+    control_segments
+        .into_iter()
+        .flat_map(|control| {
+            astra_turn_core::evaluation::split_shell_pipeline_segments(control)
+                .unwrap_or_else(|| vec![control])
+        })
+        .map(str::trim)
+        .map(str::to_string)
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -84,10 +94,7 @@ fn segment_is_mutating(segment_lower: &str) -> bool {
         astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(segment_lower);
     let segment_lower = normalized.as_str();
     // `cmd > file` and `cmd >file` (no space). `>>` first to avoid double-count.
-    let has_redirect = segment_lower.contains(">>")
-        || segment_lower
-            .find('>')
-            .is_some_and(|i| i > 0 && segment_lower.as_bytes().get(i - 1) != Some(&b'-'));
+    let has_redirect = segment_lower.contains(">>") || contains_unquoted_redirect(segment_lower);
     if segment_lower.contains("apply_patch")
         || has_redirect
         || segment_lower.contains("sed -i")
@@ -111,8 +118,55 @@ fn segment_is_mutating(segment_lower: &str) -> bool {
         "yarn install",
         "cargo fix",
         "go mod tidy",
+        // Git commands that rewrite the working tree.  Read-only git
+        // inspection (status/log/diff/show) is intentionally absent.
+        "git add ",
+        "git checkout ",
+        "git clean",
+        "git commit",
+        "git merge",
+        "git mv ",
+        "git reset",
+        "git restore ",
+        "git rm ",
+        "git stash ",
     ];
     MUTATING_PREFIXES.iter().any(|p| head.starts_with(p))
+}
+
+/// Detect a real shell output redirect without treating comparison operators
+/// in quoted scripts (for example awk's `NR>=5380`) as writes.  The canonical
+/// approval parser remains authoritative for execution; this scanner is only
+/// the positive post-execution mutation-shape fallback and therefore keeps
+/// malformed/unquoted redirects conservative.
+fn contains_unquoted_redirect(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            continue;
+        }
+        if byte == b'>' && index > 0 && bytes.get(index - 1) != Some(&b'-') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Simple tokenizer for a single command segment. We don't implement full
@@ -252,11 +306,19 @@ fn extract_read_targets_from_segment(segment: &str) -> Vec<String> {
 /// Analyse a bash command end-to-end. Returns mutation verdict and any
 /// clearly-addressed read targets.
 pub fn analyze_bash_command(command: &str) -> BashIntent {
+    // A command which the canonical permission classifier proved read-only
+    // must not be reclassified as a mutation by this module's deliberately
+    // broader fallback substring heuristics. Besides avoiding cache churn,
+    // this preserves the security invariant that authorization and mutation
+    // receipts describe one semantic command rather than two parsers' views
+    // of its source spelling (for example `echo 'apply_patch'`).
+    let canonically_read_only =
+        astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command);
     let mut mutating = false;
     let mut read_targets: Vec<String> = Vec::new();
     for segment in split_segments(command) {
         let lower = segment.to_lowercase();
-        if segment_is_mutating(&lower) {
+        if !canonically_read_only && segment_is_mutating(&lower) {
             mutating = true;
             continue; // Don't harvest reads from a mutating segment.
         }
@@ -305,9 +367,34 @@ mod tests {
         assert!(intent("pnpm install").mutating);
     }
 
-    /// Regression: benign fd redirects must NOT be classified as mutating.
-    /// Covers every pattern stripped by `strip_benign_fd_redirects`. Keep in
-    /// sync with the twin guard in `astra_turn_core::cloud_approval_policy`.
+    #[test]
+    fn nested_shell_control_operators_do_not_forge_a_mutation() {
+        let review = r#"cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" && git show HEAD:src/lib.rs | sed -n '1,20p'"#;
+        assert!(!intent(review).mutating);
+
+        // A real mutating pipeline stage remains visible after top-level
+        // splitting; only operators nested inside substitutions are ignored.
+        assert!(intent("git show HEAD:src/lib.rs | sed -i 's/a/b/' src/lib.rs").mutating);
+    }
+
+    #[test]
+    fn quoted_literals_do_not_forge_workspace_mutations() {
+        for command in [
+            "echo '2>/dev/null'",
+            "echo '>'",
+            "echo 'apply_patch'",
+            "echo 'rm file; git commit is prose'",
+        ] {
+            assert!(
+                astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command),
+                "permission classifier rejected {command}"
+            );
+            assert!(!intent(command).mutating, "mutation drift for {command}");
+        }
+    }
+
+    /// Only fd forwarding and explicit /dev/null disposal are non-mutating.
+    /// Redirecting any fd into an ordinary file creates or truncates it.
     #[test]
     fn benign_fd_redirects_are_not_mutating() {
         assert!(!intent("cargo check 2>&1").mutating);
@@ -317,32 +404,23 @@ mod tests {
         assert!(!intent("cargo check >/dev/null").mutating);
         assert!(!intent("cargo check &>/dev/null").mutating);
         assert!(!intent("cargo check 2>&1 | head -50").mutating);
-        // Append-form combined redirect: `&>>` MUST still be stripped so the
-        // surviving `>>` in a literal filename doesn't false-positive.
-        assert!(!intent("cargo check &>> /tmp/unused_log").mutating);
+        assert!(intent("cargo check &>> /tmp/unused_log").mutating);
     }
 
-    /// Residual-risk guard: the target filename surviving after redirect-
-    /// stripping MUST NOT accidentally match any mutating-verb heuristic in
-    /// `segment_is_mutating`. Twin of
-    /// `astra_turn_core::cloud_approval_policy::benign_fd_redirect_target_filenames_are_inert`;
-    /// keep the two corpora aligned.
+    /// The filename is irrelevant to the effect: every ordinary redirect
+    /// target is a write and must invalidate read evidence.
     #[test]
-    fn benign_fd_redirect_target_filenames_are_inert() {
-        // Filenames textually containing mutating-verb substrings must not
-        // flip the intent to mutating after redirect stripping.
-        assert!(!intent("cargo check &>> /tmp/rm_me.log").mutating);
-        assert!(!intent("cargo check &>> /var/log/mv_state").mutating);
-        assert!(!intent("cargo check &>> ./cp_backup.log").mutating);
-        assert!(!intent("cargo check &> /tmp/chmod.out").mutating);
-        assert!(!intent("cargo check 2> /tmp/git_commit_trace.log").mutating);
-        assert!(!intent("cargo check &>> /tmp/rm_me.log && echo done").mutating);
+    fn ordinary_fd_redirect_targets_are_mutating() {
+        assert!(intent("cargo check &>> /tmp/rm_me.log").mutating);
+        assert!(intent("cargo check &>> /var/log/mv_state").mutating);
+        assert!(intent("cargo check &>> ./cp_backup.log").mutating);
+        assert!(intent("cargo check &> /tmp/chmod.out").mutating);
+        assert!(intent("cargo check 2> /tmp/git_commit_trace.log").mutating);
+        assert!(intent("cargo check &>> /tmp/rm_me.log && echo done").mutating);
         // Malformed tail (no target after `2>`): conservative contract —
         // the dangling `>` is left in place so it trips the mutation scan.
         assert!(intent("cargo check 2>").mutating);
-        // Non-ASCII filename: UTF-8 sequence must survive the byte-level
-        // scan intact (no mojibake that could hit a write-verb substring).
-        assert!(!intent("cargo check &>> /tmp/日志.log").mutating);
+        assert!(intent("cargo check &>> /tmp/日志.log").mutating);
     }
 
     /// Residual-risk guard: malformed trailing redirect (`cmd 2>` with no
@@ -373,11 +451,9 @@ mod tests {
     fn fd_redirect_requires_left_token_boundary() {
         assert!(intent("echo a2>/tmp/x").mutating);
         assert!(intent("echo a2>>/tmp/x").mutating);
-        // Sanity: genuine fd redirects (digit at a token boundary) remain
-        // non-mutating after stripping.
-        assert!(!intent("cargo check 2>/tmp/log").mutating);
-        assert!(!intent("2>/tmp/log cargo check").mutating);
-        assert!(!intent("true | 2>/tmp/log cargo check").mutating);
+        assert!(intent("cargo check 2>/tmp/log").mutating);
+        assert!(intent("2>/tmp/log cargo check").mutating);
+        assert!(intent("true | 2>/tmp/log cargo check").mutating);
     }
 
     // ─── Read-target extraction (data-driven) ───────────────────────────

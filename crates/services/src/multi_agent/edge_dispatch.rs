@@ -221,6 +221,20 @@ pub trait EdgeDispatchService: Send + Sync {
         result_json: &str,
     ) -> Result<bool, String>;
 
+    /// Whether this exact dispatch was already terminalized as a server-owned
+    /// cancellation.  The callback endpoint may acknowledge a late
+    /// `cancelled` result in that one case: the durable terminal outcome wins,
+    /// and accepting it cannot reopen or overwrite the dispatch.  This is
+    /// deliberately narrower than a generic terminal-row probe so a divergent
+    /// replay of a completed result remains a protocol error.
+    async fn is_server_cancelled_dispatch(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Move an in-flight dispatch to a failed terminal state.
     async fn fail_dispatch(
         &self,
@@ -230,6 +244,9 @@ pub trait EdgeDispatchService: Send + Sync {
     ) -> Result<bool, String>;
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
+    /// A zero timeout performs one exact durable read without subscribing;
+    /// nonzero timeouts wait for arrival. Neither path treats cache absence as
+    /// evidence that a durable result does not exist.
     async fn wait_result(
         &self,
         identity: &EdgeDispatchIdentity,
@@ -1401,6 +1418,51 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(accepted)
     }
 
+    async fn is_server_cancelled_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        let row = sqlx::query(
+            "SELECT status, CAST(result_json AS CHAR) AS result_json \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(edge_agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("edge_dispatch inspect cancelled terminal: {e}"))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let status = row
+            .try_get::<String, _>("status")
+            .map_err(|e| format!("edge_dispatch cancelled terminal status decode: {e}"))?;
+        if status != "failed" {
+            return Ok(false);
+        }
+        let Some(body) = row
+            .try_get::<Option<String>, _>("result_json")
+            .map_err(|e| format!("edge_dispatch cancelled terminal result decode: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            format!("edge_dispatch cancelled terminal payload is invalid JSON: {e}")
+        })?;
+        Ok(
+            value.get("status").and_then(serde_json::Value::as_str) == Some("error")
+                && value.get("output").and_then(serde_json::Value::as_str)
+                    == Some("edge dispatch cancelled"),
+        )
+    }
+
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id, reason = %reason))]
     async fn fail_dispatch(
         &self,
@@ -1445,6 +1507,29 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
+        if timeout.is_zero() {
+            if !identity.is_complete() {
+                return Err("edge result read requires complete owner identity".into());
+            }
+            let row = sqlx::query(
+                "SELECT CAST(result_json AS CHAR) AS result_json FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                   AND request_id = ? AND status IN ('completed', 'failed')",
+            )
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| format!("edge_dispatch exact result read: {error}"))?;
+            return row
+                .map(|row| row.try_get::<Option<String>, _>("result_json"))
+                .transpose()
+                .map(Option::flatten)
+                .map_err(|error| format!("edge_dispatch result decode: {error}"));
+        }
         let mut receiver = self.wait_coordinator.subscribe(identity.clone()).await;
         let wait = async {
             loop {
@@ -1569,8 +1654,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    static EDGE_DISPATCH_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
-        tokio::sync::OnceCell::const_new();
+    static EDGE_DISPATCH_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
     async fn setup_edge_dispatch_db_it() -> astra_core::SharedPool {
         assert_eq!(
@@ -1578,20 +1662,19 @@ mod tests {
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
-        EDGE_DISPATCH_DB
+        let settings = astra_core::MatrixOneSettings::from_env();
+        EDGE_DISPATCH_SCHEMA
             .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_string());
                 crate::storage::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure_core_schema");
-                astra_core::SharedPool::new(&settings)
-                    .await
-                    .expect("SharedPool::new")
             })
+            .await;
+        astra_core::SharedPool::new(&settings)
             .await
-            .clone()
+            .expect("SharedPool::new")
     }
 
     async fn cleanup_edge_dispatch_fixture(
@@ -2085,7 +2168,16 @@ mod tests {
             "request_id": request_id,
             "status": "completed",
             "output": "ok",
-            "duration_ms": 12
+            "duration_ms": 12,
+            "tool_result_fields": {
+                "nested": {
+                    "integral_float": 86400.0,
+                    "other_integral_float": 1800.0,
+                    "fraction": 0.125,
+                    "integer": 1800,
+                    "large_integer": 9007199254740993_u64,
+                }
+            }
         })
         .to_string();
         assert!(
@@ -2099,6 +2191,28 @@ mod tests {
             .expect("wait task should join")
             .expect("wait_result should not fail")
             .expect("wait_result should observe completed result");
+        let fresh_reader = DatabaseEdgeDispatchService::from_shared(&pool);
+        let recovered = fresh_reader
+            .wait_result(&identity, std::time::Duration::ZERO)
+            .await
+            .expect("exact read must not require a prior waiter")
+            .expect("completed durable row must survive coordinator recreation");
+        assert_eq!(
+            recovered, result_json,
+            "durable receipts must preserve signed bytes, including numeric representation"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recovered).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&result_json).unwrap()
+        );
+        assert!(
+            fresh_reader
+                .wait_result(&other_identity, std::time::Duration::ZERO)
+                .await
+                .unwrap()
+                .is_none(),
+            "exact recovery must preserve owner isolation"
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&waited)
                 .expect("waited result should be JSON"),
@@ -2110,6 +2224,15 @@ mod tests {
                 .await
                 .expect("exact replay after lost acknowledgement"),
             "an exact terminal replay must be acknowledged idempotently"
+        );
+        let mut changed: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+        changed["tool_result_fields"]["nested"]["fraction"] = json!(0.25);
+        assert!(
+            !pod_c
+                .deliver_result(&identity, &edge_agent_id, &changed.to_string())
+                .await
+                .unwrap(),
+            "a different execution fact cannot replace an accepted receipt"
         );
         assert!(
             !pod_c

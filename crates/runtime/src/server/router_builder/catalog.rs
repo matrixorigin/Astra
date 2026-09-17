@@ -3,6 +3,25 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/me/models",
+            get(data_layer::models::list_user_models_handler)
+                .post(data_layer::models::create_user_model_handler),
+        )
+        .route(
+            "/me/models/validate-endpoint",
+            post(data_layer::models::validate_user_model_endpoint_handler),
+        )
+        .route(
+            "/me/models/{model_id}",
+            get(data_layer::models::get_user_model_handler)
+                .put(data_layer::models::update_user_model_handler)
+                .delete(data_layer::models::delete_user_model_handler),
+        )
+        .route(
+            "/me/models/{model_id}/check",
+            post(data_layer::models::check_user_model_handler),
+        )
+        .route(
             "/model-access",
             get(data_layer::models::get_model_access_handler),
         )
@@ -45,10 +64,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/skills/user/{skill_name}/activate",
             post(user_skill_handlers::activate_user_skill_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/install",
-            post(user_skill_handlers::install_user_skill_handler),
         )
         .route(
             "/skills/{skill_name}/info",
@@ -109,14 +124,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/marketplace/credentials",
             post(crate::service_handlers::marketplace::save_credential_handler)
                 .delete(crate::service_handlers::marketplace::delete_credential_handler),
-        )
-        .route(
-            "/marketplace/skills/{skill_name}/publish",
-            post(crate::service_handlers::marketplace::publish_skill_handler),
-        )
-        .route(
-            "/marketplace/skills/{skill_name}/deprecate",
-            post(crate::service_handlers::marketplace::deprecate_skill_handler),
         )
         .route(
             "/marketplace/quality-report",

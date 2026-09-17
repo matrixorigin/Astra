@@ -11,7 +11,6 @@ pub mod delegation;
 pub mod in_process;
 pub mod metrics;
 pub mod router;
-pub mod send_tool;
 pub mod transport;
 pub mod types;
 
@@ -32,7 +31,6 @@ pub use metrics::{
     MessagingMetrics, MetricsSnapshot, StderrEventHandler,
 };
 pub use router::{AgentMailbox, AgentMailboxRouter, PermissionOutcome};
-pub use send_tool::SendResult;
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{
     AgentAddress, AgentMessage, AgentSignal, MailboxError, MessagePayload, MessageTarget,

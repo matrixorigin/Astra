@@ -279,8 +279,8 @@ pub struct CompressionStage {
 pub enum CompressionMethod {
     /// Tool result truncation.
     ToolResultTruncation,
-    /// Duplicate file read elimination.
-    DuplicateReadElimination,
+    /// Byte-identical tool output elimination.
+    DuplicateToolOutputElimination,
     /// LLM-based summarization.
     LlmSummarization,
     /// Tiered compaction.
@@ -294,6 +294,8 @@ pub enum CompressionMethod {
 /// Trace of memory retrieval operations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryRetrievalTrace {
+    /// Whether the retrieval authority completed all attempted queries.
+    pub outcome: astra_turn_types::MemoryRetrievalOutcome,
     /// The query used for retrieval.
     pub query: String,
     /// Total candidates considered.
@@ -727,10 +729,48 @@ pub fn build_memory_trace_from_retrieval(
     let total_tokens: u32 = memories_selected.iter().map(|m| m.tokens).sum();
 
     MemoryRetrievalTrace {
+        outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
         query: query.to_string(),
         candidates_considered: candidates_count,
         memories_selected,
         memories_rejected: Vec::new(), // Would need scoring internals
+        total_tokens,
+        retrieval_latency_ms,
+    }
+}
+
+/// Build a trace from the exact typed entries admitted to the Context
+/// Pipeline. Unlike the legacy ranked-content helper, this preserves backend
+/// memory identities and types for durable diagnostics.
+pub fn build_memory_trace_from_entries(
+    query: &str,
+    outcome: astra_turn_types::MemoryRetrievalOutcome,
+    entries: &[crate::context_sources::MemoryEntry],
+    retrieval_latency_ms: u64,
+) -> MemoryRetrievalTrace {
+    let memories_selected = entries
+        .iter()
+        .filter_map(|entry| {
+            let memory_id = entry.memory_id.as_deref()?.trim();
+            let memory_type = entry.memory_type.as_deref()?.trim();
+            (!memory_id.is_empty() && !memory_type.is_empty()).then(|| MemorySelection {
+                memory_id: memory_id.to_string(),
+                memory_type: memory_type.to_string(),
+                content_preview: preview_snippet(&entry.content, 100),
+                relevance_score: entry.relevance_score,
+                tokens: entry.token_estimate,
+                source: MemorySource::Memoria,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_tokens = memories_selected.iter().map(|memory| memory.tokens).sum();
+
+    MemoryRetrievalTrace {
+        outcome,
+        query: query.to_string(),
+        candidates_considered: u32::try_from(entries.len()).unwrap_or(u32::MAX),
+        memories_selected,
+        memories_rejected: Vec::new(),
         total_tokens,
         retrieval_latency_ms,
     }
@@ -903,8 +943,8 @@ mod tests {
             12_000,
             &[
                 (
-                    "duplicate read elimination".to_string(),
-                    CompressionMethod::DuplicateReadElimination,
+                    "duplicate tool output elimination".to_string(),
+                    CompressionMethod::DuplicateToolOutputElimination,
                     3_000,
                 ),
                 (
@@ -922,7 +962,7 @@ mod tests {
         assert_eq!(trace.compression_stages.len(), 1);
         assert_eq!(
             trace.compression_stages[0].stage,
-            "duplicate read elimination"
+            "duplicate tool output elimination"
         );
         assert_eq!(trace.compression_stages[0].tokens_freed, 3_000);
     }

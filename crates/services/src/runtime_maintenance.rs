@@ -50,6 +50,13 @@ pub struct RuntimeMaintenanceSweepResult {
     pub orphaned_manifest_references_collected: u64,
     /// Owner-deduplicated segment payloads with no remaining reference.
     pub unreferenced_segments_collected: u64,
+    /// Terminal branch-control operation receipts removed after retention.
+    pub work_branch_control_operations_expired: u64,
+    /// Terminal or abandoned branch-creation operation receipts removed after
+    /// retention.
+    pub work_branch_creation_operations_expired: u64,
+    /// Read attachments removed after their Server-issued expiry.
+    pub expired_session_attachments_deleted: u64,
     /// Individual maintenance operations that failed after the other bounded
     /// operations in the sweep had completed.
     pub cleanup_errors: Vec<String>,
@@ -101,6 +108,21 @@ pub async fn maintain_runtime_storage(
             );
         }
     }
+    result.work_branch_control_operations_expired = record_runtime_storage_maintenance(
+        &mut result.cleanup_errors,
+        "expire_work_branch_control_operations",
+        expire_work_branch_control_operations(pool, policy.batch_limit).await,
+    );
+    result.work_branch_creation_operations_expired = record_runtime_storage_maintenance(
+        &mut result.cleanup_errors,
+        "expire_work_branch_creation_operations",
+        expire_work_branch_creation_operations(pool, policy.batch_limit).await,
+    );
+    result.expired_session_attachments_deleted = record_runtime_storage_maintenance(
+        &mut result.cleanup_errors,
+        "expire_session_attachments",
+        expire_session_attachments(pool, policy.batch_limit).await,
+    );
     if let Some(coordinator) = fork_coordinator {
         result.expired_fork_pins_released = record_runtime_storage_maintenance(
             &mut result.cleanup_errors,
@@ -153,7 +175,74 @@ impl RuntimeMaintenanceSweepResult {
             .saturating_add(self.orphaned_manifests_collected)
             .saturating_add(self.orphaned_manifest_references_collected)
             .saturating_add(self.unreferenced_segments_collected)
+            .saturating_add(self.work_branch_control_operations_expired)
+            .saturating_add(self.work_branch_creation_operations_expired)
+            .saturating_add(self.expired_session_attachments_deleted)
     }
+}
+
+const WORK_BRANCH_OPERATION_RETENTION_DAYS: u32 = 30;
+const ABANDONED_WORK_BRANCH_OPERATION_RETENTION_DAYS: u32 = 1;
+
+async fn expire_work_branch_control_operations(
+    pool: &astra_core::SharedPool,
+    batch_limit: u32,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM work_branch_control_operations
+         WHERE completed_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+            OR (operation_state = 'pending'
+                AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY))
+         ORDER BY COALESCE(completed_at, created_at) ASC, operation_id ASC
+         LIMIT ?",
+    )
+    .bind(WORK_BRANCH_OPERATION_RETENTION_DAYS)
+    .bind(ABANDONED_WORK_BRANCH_OPERATION_RETENTION_DAYS)
+    .bind(batch_limit)
+    .execute(pool.get())
+    .await
+    .map(|outcome| outcome.rows_affected())
+}
+
+async fn expire_work_branch_creation_operations(
+    pool: &astra_core::SharedPool,
+    batch_limit: u32,
+) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM work_branch_creation_operations
+         WHERE completed_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+            OR (operation_state = 'pending'
+                AND created_at < DATE_SUB(NOW(6), INTERVAL ? DAY))
+         ORDER BY COALESCE(completed_at, created_at) ASC, operation_id ASC
+         LIMIT ?",
+    )
+    .bind(WORK_BRANCH_OPERATION_RETENTION_DAYS)
+    .bind(ABANDONED_WORK_BRANCH_OPERATION_RETENTION_DAYS)
+    .bind(batch_limit)
+    .execute(pool.get())
+    .await
+    .map(|outcome| outcome.rows_affected())
+}
+
+async fn expire_session_attachments(
+    pool: &astra_core::SharedPool,
+    batch_limit: u32,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.get().begin().await?;
+    let database_now_ms = crate::db_row::database_now_unix_ms(&mut tx).await?;
+    let rows_affected = sqlx::query(
+        "DELETE FROM session_attachments
+         WHERE expires_at_ms <= ?
+         ORDER BY expires_at_ms ASC
+         LIMIT ?",
+    )
+    .bind(database_now_ms)
+    .bind(batch_limit)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(rows_affected)
 }
 
 fn record_runtime_storage_maintenance<E: std::fmt::Display>(

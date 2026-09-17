@@ -54,6 +54,21 @@ pub(crate) fn background_local_agent_fanout_projection(
 
 pub(crate) const LOCAL_AGENT_OUTPUT_TAIL_CHARS: usize = 8192;
 
+/// Build the presentation view before applying an arbitrary byte offset.
+/// Local-agent/fanout text is not an authoritative source read, so this is a
+/// display-only boundary.  Offsets and totals intentionally refer to the
+/// redacted view; otherwise a page starting inside a credential can leak a
+/// regex-unrecognisable fragment.
+pub(crate) fn safe_output_window(
+    raw: &str,
+    offset: u64,
+    max_bytes: usize,
+) -> (String, u64, u64, u64) {
+    let (output, end, total_bytes, total_lines) =
+        astra_tools::credential_redaction::redacted_output_window(raw, offset as usize, max_bytes);
+    (output, end as u64, total_bytes as u64, total_lines as u64)
+}
+
 pub(crate) fn local_agent_status_projection(
     status: &astra_turn_core::orchestration_types::AgentStatus,
 ) -> (&'static str, Option<String>, Option<String>) {
@@ -118,17 +133,12 @@ pub(crate) fn local_agent_output_tail(output: Option<String>) -> Option<String> 
         if trimmed.is_empty() {
             return None;
         }
-        let char_count = output.chars().count();
-        if char_count <= LOCAL_AGENT_OUTPUT_TAIL_CHARS {
-            Some(output)
-        } else {
-            Some(
-                output
-                    .chars()
-                    .skip(char_count.saturating_sub(LOCAL_AGENT_OUTPUT_TAIL_CHARS))
-                    .collect(),
-            )
-        }
+        Some(
+            astra_tools::credential_redaction::redacted_output_tail_chars(
+                &output,
+                LOCAL_AGENT_OUTPUT_TAIL_CHARS,
+            ),
+        )
     })
 }
 
@@ -590,17 +600,15 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             reason.clone(),
         ),
     };
-    let total_bytes = full_output.len() as u64;
-    let start = offset.min(total_bytes) as usize;
-    let end = start.saturating_add(max_bytes).min(full_output.len());
-    let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
+    let (output, end, total_bytes, total_lines) =
+        safe_output_window(&full_output, offset, max_bytes);
     crate::edge_tools::BgTaskOutputSnapshot {
         kind: "local agent".to_string(),
         title: Some(agent.description.clone()),
         output,
-        end_offset: end as u64,
+        end_offset: end,
         total_bytes,
-        total_lines: full_output.lines().count() as u64,
+        total_lines,
         status,
         output_ref: format!("agent_state: {}", agent.agent_id),
     }
@@ -612,10 +620,8 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     max_bytes: usize,
 ) -> crate::edge_tools::BgTaskOutputSnapshot {
     let full_output = projection.output_tail.clone().unwrap_or_default();
-    let total_bytes = full_output.len() as u64;
-    let start = offset.min(total_bytes) as usize;
-    let end = start.saturating_add(max_bytes).min(full_output.len());
-    let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
+    let (output, end, total_bytes, total_lines) =
+        safe_output_window(&full_output, offset, max_bytes);
     let status = match crate::edge_tools::BgTaskOutputStatus::parse(&projection.status) {
         Some(status) if status.is_terminal() => status,
         Some(_) => {
@@ -641,9 +647,9 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
         kind: "local agent".to_string(),
         title: Some(projection.title.clone()),
         output,
-        end_offset: end as u64,
+        end_offset: end,
         total_bytes,
-        total_lines: full_output.lines().count() as u64,
+        total_lines,
         status,
         output_ref: format!("workspace_projection: {}", projection.id),
     }

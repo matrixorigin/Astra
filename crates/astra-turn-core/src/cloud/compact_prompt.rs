@@ -17,7 +17,7 @@ Then write a <summary> block with the actual summary. The <analysis> block will 
 Think step by step:\n\
 1. What is the user's primary goal and current sub-task?\n\
 2. What key decisions were made and WHY?\n\
-3. What files are actively being worked on? What are the exact current contents/state?\n\
+3. What files are actively being worked on? What paths, symbols, values, and short excerpts were actually observed?\n\
 4. What approaches were tried? Which succeeded, which failed, and why?\n\
 5. What errors occurred and how were they fixed (or are they still open)?\n\
 6. What tasks remain and what is the immediate next step?\n\
@@ -25,7 +25,7 @@ Think step by step:\n\
 <summary>\n\
 ### Primary Request\nThe user's original task/goal in 1-2 sentences.\n\n\
 ### Key Technical Concepts\nDomain knowledge, architecture decisions, constraints discovered.\n\n\
-### Files & Code Modified\nFile paths and what changed. Include brief code snippets for actively-edited sections. One bullet per file.\n\n\
+### Files & Code Modified\nFile paths and what changed. Preserve observed symbols, values, signatures, errors, and brief code excerpts needed to continue. One bullet per file.\n\n\
 ### Problem Solving\nApproaches tried, what worked, what failed, and why. Include specific error messages that led to pivots.\n\n\
 ### Errors & Fixes\nErrors encountered and how they were resolved (or still open).\n\n\
 ### All User Messages\nEvery user intent/instruction, preserving their exact meaning.\n\n\
@@ -35,7 +35,9 @@ Think step by step:\n\
 </summary>\n\n\
 ## Rules\n\
 - Be dense and factual. No filler.\n\
-- Paraphrase tool outputs, don't reproduce verbatim.\n\
+- Summarize tool outputs densely, but preserve exact paths, identifiers, values, error text, and short code excerpts when they are necessary to continue correctly.\n\
+- Treat file content as a historical observation from the summarized conversation, never as a claim about the live workspace.\n\
+- If continuation needs exact or current workspace bytes that are not retained, use the ordinary admitted read tool; never imply that compaction refreshed a file.\n\
 - For ### Files & Code Modified and ### Current Work, include brief code snippets when they help \
 the reader understand the current state (function signatures, struct definitions, key logic).\n\
 - Omit superseded decisions unless the failure is informative.\n\
@@ -62,6 +64,9 @@ pub fn render_messages_for_summary(messages: &[serde_json::Value]) -> String {
 
     let mut out = String::new();
     for msg in messages {
+        if astra_turn_types::is_runtime_owned_message(msg) {
+            continue;
+        }
         let role = msg
             .get("role")
             .and_then(|v| v.as_str())
@@ -163,26 +168,44 @@ pub fn strip_analysis_block(raw: &str) -> String {
     result.trim().to_string()
 }
 
+const REQUIRED_STRUCTURED_SUMMARY_SECTIONS: &[&str] = &[
+    "### Primary Request",
+    "### Pending Tasks",
+    "### Current Work",
+    "### Current State",
+];
+
+fn missing_structured_summary_sections(summary: &str) -> Vec<&'static str> {
+    REQUIRED_STRUCTURED_SUMMARY_SECTIONS
+        .iter()
+        .copied()
+        .filter(|required| !summary.lines().any(|line| line.trim() == *required))
+        .collect()
+}
+
+/// Parse and validate a summary against the explicit section grammar.
+///
+/// This typed success/failure boundary is for control flow. Callers must not
+/// infer validity by matching warning text produced for display.
+pub fn validated_structured_summary(raw: &str) -> Option<String> {
+    let summary = strip_analysis_block(raw);
+    (!summary.is_empty() && missing_structured_summary_sections(&summary).is_empty())
+        .then_some(summary)
+}
+
 /// Strip analysis block and validate structured section headers.
 ///
 /// If the summary lacks key section headers, prepends a warning so the LLM
 /// (on the next turn) knows the summary may be incomplete.
 pub fn format_structured_summary(raw: &str) -> String {
     let summary = strip_analysis_block(raw);
-    const REQUIRED: &[&str] = &[
-        "### Primary Request",
-        "### Pending Tasks",
-        "### Current Work",
-        "### Current State",
-    ];
-    let missing: Vec<&&str> = REQUIRED.iter().filter(|h| !summary.contains(**h)).collect();
+    let missing = missing_structured_summary_sections(&summary);
     if missing.is_empty() {
         summary
     } else {
-        let names: Vec<&str> = missing.iter().map(|s| **s).collect();
         format!(
             "[compact warning: missing sections: {}]\n\n{}",
-            names.join(", "),
+            missing.join(", "),
             summary
         )
     }
@@ -330,6 +353,23 @@ mod tests {
         let rendered = render_messages_for_summary(&msgs);
         assert!(!rendered.contains("file content"));
         assert!(rendered.contains("[USER]: real question"));
+    }
+
+    #[test]
+    fn render_does_not_relabel_runtime_authority_as_user_speech() {
+        let mut authority = json!({"role": "user", "content": "runtime-only settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let rendered = render_messages_for_summary(&[
+            json!({"role": "user", "content": "real question"}),
+            authority,
+        ]);
+
+        assert!(rendered.contains("[USER]: real question"));
+        assert!(!rendered.contains("runtime-only settlement"));
     }
 
     #[test]
@@ -508,6 +548,18 @@ mod tests {
     }
 
     #[test]
+    fn structured_summary_validation_uses_exact_header_lines() {
+        let valid = "### Primary Request\nA\n### Pending Tasks\nB\n### Current Work\nC\n### Current State\nD";
+        assert_eq!(validated_structured_summary(valid).as_deref(), Some(valid));
+
+        let prose = "mentions ### Primary Request inline\nmentions ### Pending Tasks inline\nmentions ### Current Work inline\nmentions ### Current State inline";
+        assert!(
+            validated_structured_summary(prose).is_none(),
+            "free-form substring matches must not satisfy the summary grammar"
+        );
+    }
+
+    #[test]
     fn compact_system_prompt_has_analysis_instruction() {
         assert!(COMPACT_SYSTEM_PROMPT.contains("<analysis>"));
         assert!(COMPACT_SYSTEM_PROMPT.contains("<summary>"));
@@ -529,6 +581,9 @@ mod tests {
         for s in &sections {
             assert!(COMPACT_SYSTEM_PROMPT.contains(s), "missing section: {s}");
         }
+        assert!(COMPACT_SYSTEM_PROMPT.contains("historical observation"));
+        assert!(COMPACT_SYSTEM_PROMPT.contains("ordinary admitted read tool"));
+        assert!(COMPACT_SYSTEM_PROMPT.contains("never imply that compaction refreshed a file"));
     }
 
     #[test]

@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 # MatrixOne entrypoint with logging
 
 # Create logs directory if it doesn't exist

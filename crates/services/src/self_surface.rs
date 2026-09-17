@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::durable_task::{ContractStatus, SubtaskStage, TaskContract};
 use crate::session_journal::{self, JournalEvent, JournalEventType};
 use crate::session_restore::{HybridRestoreService, RestoredSession};
 use crate::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
@@ -225,10 +224,7 @@ pub struct GoalSurface {
     pub session_id: String,
     pub persistence_error: Option<String>,
     pub goal: Option<String>,
-    pub plan_goal: Option<String>,
     pub phase: String,
-    pub plan_execution_rounds: usize,
-    pub plan_corrections: Vec<String>,
     pub recent_goal_events: Vec<EventPreview>,
     pub pending_blockers: Vec<String>,
 }
@@ -323,15 +319,6 @@ pub struct VerificationSurface {
 pub struct ObjectiveVerificationSurface {
     pub ok: bool,
     pub goal: Option<String>,
-    pub plan_goal: Option<String>,
-    pub contract_status: Option<String>,
-    pub subtasks_total: usize,
-    pub subtasks_satisfied: usize,
-    pub subtasks_incomplete: usize,
-    pub subtasks_failed: usize,
-    pub subtasks_blocked: usize,
-    pub global_checks_total: usize,
-    pub global_checks_passed: usize,
     pub pending_blockers: Vec<String>,
     pub latest_verification: Option<VerificationEventView>,
     pub recent_verifications: Vec<VerificationEventView>,
@@ -683,11 +670,6 @@ fn build_run_surface(
         runtime_checks,
         &persistence_pending_blockers(persistence_error),
     );
-    let effective_goal = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.plan_goal.clone());
-
     RunSurface {
         session_id: artifacts.session_id.clone(),
         status: artifacts
@@ -718,7 +700,9 @@ fn build_run_surface(
             })
             .unwrap_or_default(),
         persistence_error: persistence_error.map(str::to_string),
-        goal: effective_goal,
+        // Durable execution goals belong to the owner-scoped Work repository.
+        // A local session workspace is not authoritative for Work identity.
+        goal: None,
         active_skill: latest_active_skill(&artifacts.journal_events),
         latest_user_request: latest_event_text(&artifacts.journal_events, true),
         latest_assistant_output: latest_event_text(&artifacts.journal_events, false),
@@ -840,27 +824,11 @@ fn build_goal_surface(
     snapshot: &PersistentSelfSnapshot,
     artifacts: &SessionArtifacts,
 ) -> GoalSurface {
-    let plan_goal = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.plan_goal.clone());
-
     GoalSurface {
         session_id: artifacts.session_id.clone(),
         persistence_error: snapshot.run.persistence_error.clone(),
-        goal: plan_goal.clone(),
-        plan_goal,
+        goal: snapshot.run.goal.clone(),
         phase: snapshot.run.phase.clone(),
-        plan_execution_rounds: artifacts
-            .workspace
-            .as_ref()
-            .map(|ws| ws.plan_execution_rounds)
-            .unwrap_or_default(),
-        plan_corrections: artifacts
-            .workspace
-            .as_ref()
-            .map(|ws| ws.plan_corrections.clone())
-            .unwrap_or_default(),
         recent_goal_events: recent_event_previews(
             &artifacts.journal_events,
             10,
@@ -992,93 +960,10 @@ fn build_objective_verification_surface(
     artifacts: &SessionArtifacts,
 ) -> ObjectiveVerificationSurface {
     let goal = snapshot.run.goal.clone();
-    let plan_goal = artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.plan_goal.clone());
     let pending_blockers = snapshot.run.pending_blockers.clone();
     let recent_verifications = recent_verification_events(&artifacts.journal_events, 8);
     let latest_verification = recent_verifications.first().cloned();
-
-    if let Some(contract) = task_contract_from_artifacts(artifacts) {
-        let subtasks_total = contract.subtasks.len();
-        let subtasks_satisfied = contract
-            .subtasks
-            .iter()
-            .filter(|subtask| subtask_stage_satisfied(&subtask.stage))
-            .count();
-        let subtasks_failed = contract
-            .subtasks
-            .iter()
-            .filter(|subtask| subtask_stage_failed(&subtask.stage))
-            .count();
-        let subtasks_blocked = contract
-            .subtasks
-            .iter()
-            .filter(|subtask| matches!(subtask.stage, SubtaskStage::Blocked { .. }))
-            .count();
-        let subtasks_incomplete = subtasks_total.saturating_sub(subtasks_satisfied);
-        let global_checks_total = contract.global_verification.len();
-        let global_checks_passed = contract
-            .last_global_results
-            .iter()
-            .filter(|result| result.passed)
-            .count();
-        let global_ok = global_checks_total == 0
-            || (contract.last_global_results.len() >= global_checks_total
-                && global_checks_passed == global_checks_total);
-        let objective_ok = pending_blockers.is_empty()
-            && match contract.status {
-                ContractStatus::Completed => true,
-                _ if subtasks_total == 0 && global_checks_total == 0 => latest_verification
-                    .as_ref()
-                    .and_then(|event| event.passed)
-                    .unwrap_or(false),
-                _ => {
-                    subtasks_incomplete == 0
-                        && subtasks_failed == 0
-                        && subtasks_blocked == 0
-                        && global_ok
-                }
-            };
-        let summary = if objective_ok {
-            format!(
-                "objective satisfied: {subtasks_satisfied}/{subtasks_total} subtasks complete, {global_checks_passed}/{global_checks_total} global checks passed"
-            )
-        } else if !pending_blockers.is_empty() {
-            format!("objective blocked: {}", pending_blockers.join("; "))
-        } else if subtasks_incomplete > 0 || subtasks_failed > 0 || subtasks_blocked > 0 {
-            format!(
-                "objective pending: {subtasks_satisfied}/{subtasks_total} subtasks satisfied, {subtasks_blocked} blocked, {subtasks_failed} failed"
-            )
-        } else if !global_ok {
-            format!(
-                "global verification incomplete: {global_checks_passed}/{global_checks_total} checks passed"
-            )
-        } else {
-            "objective has not produced passing verification evidence yet".to_string()
-        };
-
-        return ObjectiveVerificationSurface {
-            ok: objective_ok,
-            goal,
-            plan_goal,
-            contract_status: Some(contract.status.as_str().to_string()),
-            subtasks_total,
-            subtasks_satisfied,
-            subtasks_incomplete,
-            subtasks_failed,
-            subtasks_blocked,
-            global_checks_total,
-            global_checks_passed,
-            pending_blockers,
-            latest_verification,
-            recent_verifications,
-            summary,
-        };
-    }
-
-    let has_objective = goal.is_some() || plan_goal.is_some();
+    let has_objective = goal.is_some();
     let latest_passed = latest_verification
         .as_ref()
         .and_then(|event| event.passed)
@@ -1092,7 +977,7 @@ fn build_objective_verification_surface(
         if has_objective {
             "goal has passing verification evidence".to_string()
         } else {
-            "no explicit objective contract recorded".to_string()
+            "no owner-scoped Work objective is projected on the local session surface".to_string()
         }
     } else if !pending_blockers.is_empty() {
         format!("objective blocked: {}", pending_blockers.join("; "))
@@ -1103,15 +988,6 @@ fn build_objective_verification_surface(
     ObjectiveVerificationSurface {
         ok: objective_ok,
         goal,
-        plan_goal,
-        contract_status: None,
-        subtasks_total: 0,
-        subtasks_satisfied: 0,
-        subtasks_incomplete: 0,
-        subtasks_failed: 0,
-        subtasks_blocked: 0,
-        global_checks_total: 0,
-        global_checks_passed: 0,
         pending_blockers,
         latest_verification,
         recent_verifications,
@@ -1163,30 +1039,6 @@ fn verification_event_view_from_event(event: &JournalEvent) -> Option<Verificati
         passed,
         summary,
     })
-}
-
-fn task_contract_from_artifacts(artifacts: &SessionArtifacts) -> Option<TaskContract> {
-    artifacts
-        .workspace
-        .as_ref()
-        .and_then(|ws| ws.contract_json.as_deref())
-        .and_then(|json| serde_json::from_str::<TaskContract>(json).ok())
-}
-
-fn subtask_stage_satisfied(stage: &SubtaskStage) -> bool {
-    matches!(
-        stage,
-        SubtaskStage::Verified | SubtaskStage::Completed | SubtaskStage::Skipped { .. }
-    )
-}
-
-fn subtask_stage_failed(stage: &SubtaskStage) -> bool {
-    matches!(
-        stage,
-        SubtaskStage::ExecutionFailed { .. }
-            | SubtaskStage::VerificationFailed { .. }
-            | SubtaskStage::Abandoned { .. }
-    )
 }
 
 #[derive(Default)]
@@ -2042,6 +1894,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
+        JournalEventType::SubsystemDiagnostic => "subsystem_diagnostic",
+        JournalEventType::SubsystemSettled => "subsystem_settled",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
@@ -2166,20 +2020,6 @@ mod tests {
         assert!(error.contains("failed to read session journal"));
     }
 
-    fn sample_verification_criterion(id: &str) -> crate::verification::VerificationCriterion {
-        crate::verification::VerificationCriterion {
-            id: id.to_string(),
-            description: format!("verify {id}"),
-            verifier: crate::verification::VerifierKind::Command {
-                cmd: "true".to_string(),
-                expected_exit: 0,
-            },
-            required: true,
-            timeout_sec: 30,
-            global_only: false,
-        }
-    }
-
     fn sample_verification_result(
         criterion_id: &str,
         passed: bool,
@@ -2198,37 +2038,12 @@ mod tests {
         }
     }
 
-    fn sample_contract(status: ContractStatus, stage: SubtaskStage) -> TaskContract {
-        TaskContract {
-            contract_id: "contract-1".to_string(),
-            task_id: "task-1".to_string(),
-            goal: "ship self surface".to_string(),
-            scope: crate::durable_task::TaskScope::default(),
-            subtasks: vec![crate::durable_task::DurableSubtask {
-                id: "subtask-1".to_string(),
-                title: "finish verifier".to_string(),
-                stage,
-                criteria: vec![sample_verification_criterion("subtask-check")],
-                ..Default::default()
-            }],
-            global_verification: vec![sample_verification_criterion("global-check")],
-            version: 1,
-            status,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        }
-    }
-
     #[tokio::test]
     async fn local_service_builds_snapshot_from_artifacts() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-snapshot";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("ship self surface".to_string());
         ws.discovered_skills = vec![
             " ".to_string(),
             " goal-driven-evolution ".to_string(),
@@ -2328,7 +2143,7 @@ mod tests {
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
         let snapshot = service.snapshot(session_id, 10).await.unwrap();
 
-        assert_eq!(snapshot.run.goal.as_deref(), Some("ship self surface"));
+        assert!(snapshot.run.goal.is_none());
         assert_eq!(
             snapshot.run.active_skill.as_deref(),
             Some("goal-driven-evolution")
@@ -2644,19 +2459,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_run_goal_prefers_active_plan_goal() {
+    async fn snapshot_does_not_invent_a_work_objective_from_session_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-snapshot-plan-goal";
-        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("execute migration plan".to_string());
+        let ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         session_workspace::write_workspace(&ws).unwrap();
 
         let service =
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
         let snapshot = service.snapshot(session_id, 10).await.unwrap();
 
-        assert_eq!(snapshot.run.goal.as_deref(), Some("execute migration plan"));
+        assert!(snapshot.run.goal.is_none());
     }
 
     #[tokio::test]
@@ -2768,55 +2582,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_surface_reports_pending_contract_objective() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let session_id = "svc-self-objective-pending";
-        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("ship self surface".to_string());
-        ws.contract_json = Some(
-            serde_json::to_string(&sample_contract(
-                ContractStatus::Active,
-                SubtaskStage::Pending,
-            ))
-            .unwrap(),
-        );
-        session_workspace::write_workspace(&ws).unwrap();
-        append_turn_event(session_id, 2);
-
-        let service =
-            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
-        let surface = service
-            .surface(session_id, SelfSurfaceDimension::Verify, 10)
-            .await
-            .unwrap();
-
-        let SelfSurfaceResponse::Verify(verify) = surface else {
-            panic!("expected verify surface");
-        };
-        assert!(!verify.ok);
-        assert!(verify.acceptance_ok);
-        assert!(!verify.objective_ok);
-        assert_eq!(verify.objective.contract_status.as_deref(), Some("active"));
-        assert_eq!(verify.objective.subtasks_total, 1);
-        assert_eq!(verify.objective.subtasks_satisfied, 0);
-        assert_eq!(verify.objective.subtasks_incomplete, 1);
-        assert_eq!(
-            verify.objective.summary,
-            "objective pending: 0/1 subtasks satisfied, 0 blocked, 0 failed"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_surface_reports_verified_contract_objective() {
+    async fn verify_surface_ignores_legacy_contract_and_keeps_journal_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-objective-verified";
-        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("ship self surface".to_string());
-        let mut contract = sample_contract(ContractStatus::Completed, SubtaskStage::Verified);
-        contract.last_global_results = vec![sample_verification_result("global-check", true)];
-        ws.contract_json = Some(serde_json::to_string(&contract).unwrap());
+        let ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         session_workspace::write_workspace(&ws).unwrap();
         append_turn_event(session_id, 2);
         JournalWriter::new(session_id)
@@ -2844,11 +2614,7 @@ mod tests {
         assert!(verify.ok);
         assert!(verify.acceptance_ok);
         assert!(verify.objective_ok);
-        assert_eq!(
-            verify.objective.contract_status.as_deref(),
-            Some("completed")
-        );
-        assert_eq!(verify.objective.global_checks_passed, 1);
+        assert!(verify.objective.goal.is_none());
         assert_eq!(
             verify
                 .objective
@@ -2859,7 +2625,7 @@ mod tests {
         );
         assert_eq!(
             verify.objective.summary,
-            "objective satisfied: 1/1 subtasks complete, 1/1 global checks passed"
+            "no owner-scoped Work objective is projected on the local session surface"
         );
     }
 

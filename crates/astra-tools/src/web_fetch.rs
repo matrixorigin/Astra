@@ -78,7 +78,7 @@ impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             format: OutputFormat::Markdown,
-            max_content: 80_000,
+            max_content: DEFAULT_CONTENT_BYTES,
             timeout: Duration::from_secs(30),
             max_links: 25,
             allow_http: false,
@@ -102,7 +102,8 @@ impl FetchConfig {
             .get("max_content")
             .or_else(|| args.get("max_bytes"))
             .and_then(Value::as_u64)
-            .unwrap_or(80_000) as usize;
+            .unwrap_or(DEFAULT_CONTENT_BYTES as u64)
+            .min(MAX_CONTENT_BYTES as u64) as usize;
 
         let timeout_secs = args.get("timeout").and_then(Value::as_u64).unwrap_or(30);
 
@@ -133,12 +134,15 @@ struct CacheKey {
     scope: String,
     url: String,
     format: OutputFormat,
-    max_content: usize,
     max_links: usize,
 }
 
 struct CacheEntry {
     result: Arc<FetchResult>,
+    /// Number of content bytes retained before the serialized truncation
+    /// marker. This lets callers project one bounded cached result into
+    /// smaller limits without parsing presentation text.
+    content_limit: usize,
     inserted_at: Instant,
 }
 
@@ -157,17 +161,27 @@ impl Cache {
         }
     }
 
-    fn get(&mut self, key: &CacheKey) -> Option<Arc<FetchResult>> {
+    fn get_with_limit(&mut self, key: &CacheKey) -> Option<(Arc<FetchResult>, usize)> {
         let now = Instant::now();
         self.entries
             .retain(|(_, e)| now.duration_since(e.inserted_at) < self.ttl);
         self.entries
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, e)| Arc::clone(&e.result))
+            .map(|(_, e)| (Arc::clone(&e.result), e.content_limit))
     }
 
+    #[cfg(test)]
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<FetchResult>> {
+        self.get_with_limit(key).map(|(result, _)| result)
+    }
+
+    #[cfg(test)]
     fn put(&mut self, key: CacheKey, result: Arc<FetchResult>) {
+        self.put_with_limit(key, result, usize::MAX);
+    }
+
+    fn put_with_limit(&mut self, key: CacheKey, result: Arc<FetchResult>, content_limit: usize) {
         if self.entries.len() >= self.max_entries {
             self.entries.remove(0);
         }
@@ -175,6 +189,7 @@ impl Cache {
             key,
             CacheEntry {
                 result,
+                content_limit,
                 inserted_at: Instant::now(),
             },
         ));
@@ -189,6 +204,14 @@ fn shared_cache() -> &'static Arc<Mutex<Cache>> {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+/// A fetched page is evidence for the model, not an archive. Keep one
+/// bounded representation in the process cache and cap caller-controlled
+/// output so a single page cannot inflate every later model round.
+/// The default is intentionally below the runtime's persisted-tool-result
+/// boundary; callers that need a long document can opt into a larger window.
+const DEFAULT_CONTENT_BYTES: usize = 24 * 1024;
+const CACHE_CONTENT_BYTES: usize = 128 * 1024;
+const MAX_CONTENT_BYTES: usize = CACHE_CONTENT_BYTES;
 const MAX_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const MAX_URL_LENGTH: usize = 4096;
@@ -199,17 +222,13 @@ const MAX_WALK_DEPTH: usize = 256;
 
 /// Tool dispatcher entry point. Returns JSON on success, `"Error: ..."` on failure.
 /// HTTP 4xx/5xx responses are returned as error strings so the caller marks them as errors.
-pub async fn fetch(client: Option<&reqwest::Client>, args: &Value) -> String {
-    fetch_with_cache_scope(client, args, "").await
+pub async fn fetch(args: &Value) -> String {
+    fetch_with_cache_scope(args, "").await
 }
 
 /// Same as [`fetch`], but isolates the URL cache by caller-provided session/workspace scope.
-pub async fn fetch_with_cache_scope(
-    client: Option<&reqwest::Client>,
-    args: &Value,
-    cache_scope: &str,
-) -> String {
-    match fetch_inner(client, args, cache_scope).await {
+pub async fn fetch_with_cache_scope(args: &Value, cache_scope: &str) -> String {
+    match fetch_inner(args, cache_scope).await {
         Ok(result) if result.status >= 400 => {
             format!("Error: HTTP {} — {}", result.status, result.content)
         }
@@ -218,11 +237,7 @@ pub async fn fetch_with_cache_scope(
     }
 }
 
-async fn fetch_inner(
-    client: Option<&reqwest::Client>,
-    args: &Value,
-    cache_scope: &str,
-) -> Result<Arc<FetchResult>, FetchError> {
+async fn fetch_inner(args: &Value, cache_scope: &str) -> Result<Arc<FetchResult>, FetchError> {
     let (raw_url, config) = FetchConfig::from_args(args)?;
     let url = if config.allow_http {
         raw_url.clone()
@@ -239,46 +254,92 @@ async fn fetch_inner(
         scope: cache_scope.to_string(),
         url: url.clone(),
         format: config.format,
-        max_content: config.max_content,
         max_links: config.max_links,
     };
 
     if !cache_scope.is_empty() {
         let mut cache = shared_cache().lock().await;
-        if let Some(cached) = cache.get(&cache_key) {
-            // Zero-copy hit: return an Arc clone to the stored result.
-            // The stored FetchResult already has `cached: true` (we set
-            // it pre-store below), so no mutation is needed here.
-            return Ok(cached);
+        if let Some((cached, content_limit)) = cache.get_with_limit(&cache_key)
+            && let Some(projected) =
+                project_cached_result(&cached, content_limit, config.max_content, true)
+        {
+            return Ok(Arc::new(projected));
         }
     }
 
     let start = Instant::now();
-    let (status, final_url, content_type, body) = do_fetch(client, &url, config.timeout).await?;
+    let (status, final_url, content_type, body) = do_fetch(&url, config.timeout).await?;
+    // Store one bounded representation independent of the caller's requested
+    // slice. A later model round asking for 8k after an initial 3k read can
+    // reuse the same network response; only the returned projection changes.
+    let cache_config = FetchConfig {
+        max_content: CACHE_CONTENT_BYTES,
+        ..config.clone()
+    };
     let result = transform(
         &url,
         final_url.as_deref(),
         status,
         &content_type,
         &body,
-        &config,
+        &cache_config,
         start.elapsed(),
     );
 
     if status < 400 && !cache_scope.is_empty() {
-        // Store a SECOND Arc (pre-flagged `cached: true`) separately so
-        // the fresh-miss return value keeps `cached: false` for the
-        // current caller. The clone is paid once at store time, not on
-        // every subsequent hit. Net: one O(FetchResult) allocation per
-        // miss; O(1) Arc::clone per hit.
         let mut for_cache = result.clone();
         for_cache.cached = true;
         let cache_arc = Arc::new(for_cache);
         let mut cache = shared_cache().lock().await;
-        cache.put(cache_key, cache_arc);
+        cache.put_with_limit(cache_key, cache_arc, CACHE_CONTENT_BYTES);
     }
 
-    Ok(Arc::new(result))
+    let projected = project_cached_result(&result, CACHE_CONTENT_BYTES, config.max_content, false)
+        .expect("fresh result is always projectable within the bounded content limit");
+    Ok(Arc::new(projected))
+}
+
+/// Project the bounded cache representation into the caller's requested
+/// content window. The cache keeps structured metadata and the retained byte
+/// limit, so this never needs to inspect or match a presentation marker.
+fn project_cached_result(
+    cached: &FetchResult,
+    content_limit: usize,
+    requested_max_content: usize,
+    cache_hit: bool,
+) -> Option<FetchResult> {
+    let available = floor_char_boundary(&cached.content, cached.content.len().min(content_limit));
+    let requested = floor_char_boundary(&cached.content[..available], requested_max_content);
+    let complete = !cached.truncated && cached.content_length <= requested;
+    let truncated = !complete;
+    let content = if truncated {
+        format!(
+            "{}\n\n[…truncated — showing {} of {} chars]",
+            &cached.content[..requested],
+            requested,
+            cached.content_length
+        )
+    } else {
+        cached.content[..requested].to_string()
+    };
+    let mut projected = cached.clone();
+    projected.content = content;
+    projected.truncated = truncated;
+    projected.cached = cache_hit;
+    projected.elapsed_ms = if cache_hit { 0 } else { cached.elapsed_ms };
+    Some(projected)
+}
+
+fn floor_char_boundary(value: &str, max_bytes: usize) -> usize {
+    if max_bytes >= value.len() {
+        return value.len();
+    }
+    value
+        .char_indices()
+        .take_while(|(index, _)| *index <= max_bytes)
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 // ─── URL Validation ──────────────────────────────────────────────────────────
@@ -455,15 +516,14 @@ fn is_private_ipv4(v4: Ipv4Addr) -> bool {
 // ─── HTTP Fetch ──────────────────────────────────────────────────────────────
 
 async fn do_fetch(
-    client: Option<&reqwest::Client>,
     url: &str,
     timeout: Duration,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
-    if let Some(_client) = client {
-        fetch_reqwest(url, timeout).await
-    } else {
-        fetch_curl(url, timeout).await
-    }
+    // The transport must be self-contained. In particular, the CLI/edge path
+    // deliberately has no shared HTTP client, and it must not silently fall
+    // back to a task image's `curl` binary. Both entry points use the same
+    // pinned, SSRF-checked Rust transport.
+    fetch_reqwest(url, timeout).await
 }
 
 async fn fetch_reqwest(
@@ -490,10 +550,11 @@ async fn fetch_reqwest(
             .user_agent(USER_AGENT)
             .no_proxy();
 
-        // Pin ALL resolved addresses — reqwest will try them in order.
-        for addr in &resolved {
-            builder = builder.resolve(&host, *addr);
-        }
+        // Pin the complete validated address set in one override. Calling
+        // `resolve()` repeatedly would replace the previous override, leaving
+        // only the final DNS answer (often an unreachable IPv6 address on an
+        // otherwise IPv4-capable host).
+        builder = builder.resolve_to_addrs(&host, &resolved);
 
         let pinned_client = builder
             .build()
@@ -573,130 +634,6 @@ async fn read_limited_body(resp: &mut reqwest::Response) -> Result<String, Fetch
         bytes.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Sentinel used to separate body from curl metadata.
-/// Chosen to be long and random-looking so it cannot appear in real HTTP content.
-const CURL_SENTINEL: &str = "\n---ASTRA_FETCH_7f3a9b2e1d4c---\n";
-
-async fn fetch_curl(
-    url: &str,
-    timeout: Duration,
-) -> Result<(u16, Option<String>, String, String), FetchError> {
-    let mut current = url.to_string();
-    let mut final_url = None;
-
-    for redirect_count in 0..=MAX_REDIRECTS {
-        validate_url(&current)?;
-        // Resolve + validate; pin the first resolved IP for curl --resolve.
-        let resolved = resolve_and_validate_host(&current).await?;
-
-        let (status, content_type, redirect_url, body) =
-            fetch_curl_once(&current, timeout, &resolved).await?;
-        if (300..400).contains(&status)
-            && let Some(location) = redirect_url.filter(|u| !u.is_empty())
-        {
-            if redirect_count >= MAX_REDIRECTS {
-                return Err(FetchError::Network(format!(
-                    "Too many redirects (>{MAX_REDIRECTS})"
-                )));
-            }
-            validate_url(&location)?;
-            final_url = Some(location.clone());
-            current = location;
-            continue;
-        }
-        return Ok((status, final_url, content_type, body));
-    }
-
-    Err(FetchError::Network(format!(
-        "Too many redirects (>{MAX_REDIRECTS})"
-    )))
-}
-
-async fn fetch_curl_once(
-    url: &str,
-    timeout: Duration,
-    resolved: &[SocketAddr],
-) -> Result<(u16, String, Option<String>, String), FetchError> {
-    let timeout_secs = timeout.as_secs().to_string();
-    let write_format =
-        format!("{CURL_SENTINEL}%{{http_code}}\n%{{content_type}}\n%{{redirect_url}}");
-
-    // Build curl --resolve directive to pin DNS, preventing rebinding.
-    let parsed =
-        url::Url::parse(url).map_err(|e| FetchError::Validation(format!("Invalid URL: {e}")))?;
-    let host = parsed.host_str().unwrap_or_default();
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let resolve_addrs: String = resolved
-        .iter()
-        .map(|a| a.ip().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    // curl --resolve requires brackets around IPv6 hosts to avoid ambiguity.
-    let resolve_directive = if host.contains(':') {
-        format!("[{host}]:{port}:{resolve_addrs}")
-    } else {
-        format!("{host}:{port}:{resolve_addrs}")
-    };
-
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            &timeout_secs,
-            "--max-filesize",
-            &MAX_DOWNLOAD_BYTES.to_string(),
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--resolve",
-            &resolve_directive,
-            "-H",
-            &format!("User-Agent: {USER_AGENT}"),
-            "-H",
-            "Accept: text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
-            "-w",
-            &write_format,
-            url,
-        ])
-        .output()
-        .await
-        .map_err(|e| FetchError::Network(format!("curl: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FetchError::Network(format!("curl: {}", stderr.trim())));
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (body, meta) = raw
-        .rsplit_once(CURL_SENTINEL)
-        .ok_or_else(|| FetchError::Network("Failed to parse curl output".into()))?;
-
-    let lines: Vec<&str> = meta.lines().collect();
-    let status: u16 = lines.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let content_type = lines.get(1).unwrap_or(&"text/html").to_string();
-    let redirect_url = lines
-        .get(2)
-        .map(|s| s.to_string())
-        .filter(|u| !u.is_empty());
-
-    if status == 0 {
-        return Err(FetchError::Network("curl returned HTTP status 0".into()));
-    }
-
-    let body = if is_binary_content_type(&content_type.to_lowercase()) {
-        String::new()
-    } else if body.len() > MAX_DOWNLOAD_BYTES {
-        // --max-filesize only works with Content-Length; enforce cap for chunked.
-        String::from_utf8_lossy(&body.as_bytes()[..MAX_DOWNLOAD_BYTES]).into_owned()
-    } else {
-        body.to_string()
-    };
-
-    Ok((status, content_type, redirect_url, body))
 }
 
 // ─── Content Transformation ──────────────────────────────────────────────────
@@ -1241,46 +1178,112 @@ mod extract {
     }
 
     pub fn extract_links(doc: &scraper::Html, base_url: &str, max: usize) -> Vec<ExtractedLink> {
+        if max == 0 {
+            return Vec::new();
+        }
         let sel = match Selector::parse("a[href]") {
             Ok(s) => s,
             Err(_) => return vec![],
         };
-        let mut seen = HashSet::new();
-        let mut links = Vec::new();
+        let mut semantic_links = Vec::new();
+        let mut content_links = Vec::new();
+        let mut chrome_links = Vec::new();
+        let mut semantic_seen = HashSet::new();
+        let mut content_seen = HashSet::new();
+        let mut chrome_seen = HashSet::new();
 
+        // One bounded DOM pass keeps extraction cheap for large pages while
+        // making the ordering structural: semantic content first, then links
+        // outside navigation chrome, then the remaining document links. No
+        // domain names, URL patterns, or prompt text are inspected.
         for el in doc.select(&sel) {
-            if links.len() >= max {
-                break;
-            }
-            let href = match el.value().attr("href") {
-                Some(h) => h.trim(),
-                None => continue,
+            let navigation = is_navigation_link(el);
+            let semantic = !navigation && is_semantic_content_link(el);
+            let (target, target_seen) = if semantic {
+                (&mut semantic_links, &mut semantic_seen)
+            } else if navigation {
+                (&mut chrome_links, &mut chrome_seen)
+            } else {
+                (&mut content_links, &mut content_seen)
             };
-            if should_skip(href) {
-                continue;
+            if target.len() < max {
+                append_link(target, target_seen, el, base_url);
             }
-            let resolved = match super::resolve_url(base_url, href) {
-                Some(u) => u,
-                None => continue,
-            };
-            if !seen.insert(resolved.clone()) {
-                continue;
+        }
+
+        let mut seen = HashSet::new();
+        let mut links = Vec::with_capacity(
+            max.min(
+                semantic_links
+                    .len()
+                    .saturating_add(content_links.len())
+                    .saturating_add(chrome_links.len()),
+            ),
+        );
+        for bucket in [&semantic_links, &content_links, &chrome_links] {
+            for link in bucket {
+                if links.len() >= max {
+                    return links;
+                }
+                if seen.insert(link.href.clone()) {
+                    links.push(link.clone());
+                }
             }
-            let text: String = el
-                .text()
-                .collect::<String>()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            if text.is_empty() || text.len() > 200 {
-                continue;
-            }
-            links.push(ExtractedLink {
-                href: resolved,
-                text,
-            });
         }
         links
+    }
+
+    fn is_semantic_content_link(el: scraper::ElementRef<'_>) -> bool {
+        el.ancestors().any(|ancestor| {
+            ancestor.value().as_element().is_some_and(|element| {
+                element.name() == "main"
+                    || element.name() == "article"
+                    || element.attr("role") == Some("main")
+            })
+        })
+    }
+
+    fn is_navigation_link(el: scraper::ElementRef<'_>) -> bool {
+        el.ancestors().any(|ancestor| {
+            ancestor.value().as_element().is_some_and(|element| {
+                matches!(element.name(), "header" | "nav" | "footer" | "aside")
+            })
+        })
+    }
+
+    fn append_link(
+        links: &mut Vec<ExtractedLink>,
+        seen: &mut HashSet<String>,
+        el: scraper::ElementRef<'_>,
+        base_url: &str,
+    ) {
+        let href = match el.value().attr("href") {
+            Some(h) => h.trim(),
+            None => return,
+        };
+        if should_skip(href) {
+            return;
+        }
+        let resolved = match super::resolve_url(base_url, href) {
+            Some(u) => u,
+            None => return,
+        };
+        if !seen.insert(resolved.clone()) {
+            return;
+        }
+        let text: String = el
+            .text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() || text.len() > 200 {
+            return;
+        }
+        links.push(ExtractedLink {
+            href: resolved,
+            text,
+        });
     }
 
     fn select_text(doc: &scraper::Html, selector: &str) -> Option<String> {
@@ -1488,6 +1491,19 @@ mod tests {
         assert!(OutputFormat::parse(Some("markdwon")).is_err());
     }
 
+    #[test]
+    fn default_content_window_stays_below_persisted_tool_result_boundary() {
+        let config = FetchConfig::from_args(&serde_json::json!({
+            "url": "https://example.com"
+        }))
+        .expect("default fetch arguments");
+        assert_eq!(config.1.max_content, DEFAULT_CONTENT_BYTES);
+        assert!(
+            std::hint::black_box(DEFAULT_CONTENT_BYTES) < 30_000,
+            "default web evidence should stay inline; callers can opt into a larger window"
+        );
+    }
+
     // ── Ordered List Fix ──────────────────────────────────────────────
 
     #[test]
@@ -1521,7 +1537,11 @@ mod tests {
         let doc = scraper::Html::parse_document(&html);
         let md = to_markdown(&doc, "https://x.com");
         // Should not panic — depth guard truncates
-        assert!(!md.is_empty() || md.is_empty()); // just assert no panic
+        assert!(
+            md.len() < 1024,
+            "depth guard should keep deeply nested output bounded, got {} bytes",
+            md.len()
+        );
     }
 
     // ── Cache ─────────────────────────────────────────────────────────
@@ -1531,7 +1551,6 @@ mod tests {
             scope: scope.into(),
             url: url.into(),
             format,
-            max_content: 80_000,
             max_links: 25,
         }
     }
@@ -1561,18 +1580,40 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_isolates_scope_and_limits() {
-        let mut key_a = cache_key("session-a", "https://x.com", OutputFormat::Markdown);
+    fn cache_key_isolates_scope_and_link_limits() {
+        let key_a = cache_key("session-a", "https://x.com", OutputFormat::Markdown);
         let mut key_b = cache_key("session-b", "https://x.com", OutputFormat::Markdown);
         assert_ne!(key_a, key_b);
 
         key_b.scope = key_a.scope.clone();
-        key_b.max_content = 10_000;
-        assert_ne!(key_a, key_b);
-
-        key_a.max_content = key_b.max_content;
         key_b.max_links = 5;
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn cached_result_projects_different_content_limits_without_re_fetching() {
+        let result = FetchResult {
+            url: "https://x.com".into(),
+            final_url: None,
+            status: 200,
+            content_type: "text/html".into(),
+            metadata: PageMetadata::default(),
+            content: "0123456789".into(),
+            links: vec![],
+            content_length: 10,
+            truncated: false,
+            cached: true,
+            elapsed_ms: 99,
+        };
+
+        let projected = project_cached_result(&result, 10, 4, true).expect("projectable");
+        assert_eq!(
+            projected.content,
+            "0123\n\n[…truncated — showing 4 of 10 chars]"
+        );
+        assert!(projected.truncated);
+        assert!(projected.cached);
+        assert_eq!(projected.elapsed_ms, 0);
     }
 
     // ── R3-P0-#3: cache hit must be Arc::clone, not deep clone ────────────
@@ -1745,6 +1786,37 @@ mod tests {
         assert_eq!(links.len(), 5);
     }
 
+    #[test]
+    fn semantic_content_links_are_prioritized_over_document_navigation() {
+        let html = r#"
+            <header><a href="/home">Home</a></header>
+            <nav><a href="/nav">Navigation</a></nav>
+            <main>
+                <nav><a href="/inner-nav">Inner navigation</a></nav>
+                <article><a href="/story">Current story</a></article>
+            </main>
+        "#;
+        let doc = scraper::Html::parse_document(html);
+        let links = extract_links(&doc, "https://x.com", 1);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].href, "https://x.com/story");
+        assert_eq!(links[0].text, "Current story");
+    }
+
+    #[test]
+    fn nonsemantic_content_links_are_prioritized_over_structural_chrome() {
+        let html = r#"
+            <header><a href="/home">Home</a></header>
+            <nav><a href="/nav">Navigation</a></nav>
+            <div class="content"><a href="/story">Current story</a></div>
+            <footer><a href="/legal">Legal</a></footer>
+        "#;
+        let doc = scraper::Html::parse_document(html);
+        let links = extract_links(&doc, "https://x.com", 1);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].href, "https://x.com/story");
+    }
+
     // ── HTML → Text ───────────────────────────────────────────────────
 
     #[test]
@@ -1874,25 +1946,21 @@ mod tests {
 
     #[tokio::test]
     async fn error_on_missing_url() {
-        let r = fetch(None, &serde_json::json!({})).await;
+        let r = fetch(&serde_json::json!({})).await;
         assert!(r.starts_with("Error:"), "got: {r}");
         assert!(r.contains("Missing 'url'"));
     }
 
     #[tokio::test]
     async fn error_on_private_ip() {
-        let r = fetch(None, &serde_json::json!({"url": "http://127.0.0.1/admin"})).await;
+        let r = fetch(&serde_json::json!({"url": "http://127.0.0.1/admin"})).await;
         assert!(r.starts_with("Error:"), "got: {r}");
         assert!(r.contains("SSRF"), "got: {r}");
     }
 
     #[tokio::test]
     async fn error_on_bad_format() {
-        let r = fetch(
-            None,
-            &serde_json::json!({"url": "https://x.com", "format": "raw"}),
-        )
-        .await;
+        let r = fetch(&serde_json::json!({"url": "https://x.com", "format": "raw"})).await;
         assert!(r.starts_with("Error:"), "got: {r}");
     }
 
@@ -1953,21 +2021,6 @@ mod tests {
             serde_json::to_string(&*result).unwrap()
         };
         assert!(output.starts_with("Error: HTTP 410"), "got: {output}");
-    }
-
-    // ── Curl Sentinel ─────────────────────────────────────────────────
-
-    #[test]
-    fn curl_sentinel_is_sufficiently_unique() {
-        // Verify the sentinel won't appear in typical web content
-        assert!(CURL_SENTINEL.contains("ASTRA_FETCH_7f3a9b2e1d4c"));
-        assert!(
-            CURL_SENTINEL.len() > 30,
-            "sentinel must be long enough to be unique"
-        );
-        // Verify it starts and ends with newlines for clean splitting
-        assert!(CURL_SENTINEL.starts_with('\n'));
-        assert!(CURL_SENTINEL.ends_with('\n'));
     }
 
     // ── Empty Body Handling ───────────────────────────────────────────

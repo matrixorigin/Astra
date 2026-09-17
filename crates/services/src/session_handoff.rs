@@ -10,10 +10,10 @@ use std::{sync::Arc, time::Duration};
 use astra_core::SharedPool;
 use astra_turn_types::{
     ActorContextV1, ConversationWriterLeaseV1, HandoffOperationWatermarksV1, HandoffRiskEvidenceV1,
-    ManifestDeltaV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SESSION_HANDOFF_SCHEMA_VERSION,
-    SessionAttachmentModeV1, SessionAttachmentV1, SessionContextHeadV1, SessionCursorV1,
-    SessionHandoffModeV1, SessionHandoffRecordV1, SessionHandoffStateV1, SessionKeyV1,
-    SessionPlacementV1, WorkspaceHandoffEvidenceV1,
+    ManifestDeltaV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SESSION_COORDINATION_SCHEMA_VERSION,
+    SESSION_HANDOFF_SCHEMA_VERSION, SessionAttachmentModeV1, SessionAttachmentV1,
+    SessionContextHeadV1, SessionCursorV1, SessionHandoffModeV1, SessionHandoffRecordV1,
+    SessionHandoffStateV1, SessionKeyV1, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -29,11 +29,14 @@ use crate::{
 const MAX_ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_HANDOFF_DEADLINE: Duration = Duration::from_secs(60 * 60);
 const MAX_IDEMPOTENCY_BYTES: usize = 512;
+const MAX_ACTIVE_ATTACHMENTS_PER_BRANCH: i64 = 64;
 
 #[derive(Debug, Error)]
 pub enum SessionHandoffError {
     #[error("invalid handoff request: {0}")]
     Invalid(String),
+    #[error("execution custody storage unavailable: {0}")]
+    StorageUnavailable(String),
     #[error("session handoff or attachment was not found")]
     NotFound,
     #[error("another handoff is active: {active_handoff_id}")]
@@ -53,6 +56,16 @@ pub enum SessionHandoffError {
     DeadlineExpired,
     #[error("session attachment expired")]
     AttachmentExpired,
+    #[error("session attachment is participating in an active handoff")]
+    AttachmentInUse,
+    #[error("controller attachment must release branch control before detaching")]
+    AttachmentControlsBranch,
+    #[error("session branch has reached its active attachment capacity")]
+    AttachmentCapacityExceeded,
+    #[error("forced takeover is waiting for durable run {run_id} to stop")]
+    ActiveRunsRemain { run_id: String },
+    #[error("forced takeover effect evidence exceeds the bounded safety capacity")]
+    EffectEvidenceCapacityExceeded,
     #[error(
         "local manifest {observed_manifest_root} diverges from Server head; fork is required (quarantine {quarantine_id})"
     )]
@@ -97,6 +110,43 @@ pub struct AttachSessionOutcomeV1 {
     pub delta: ManifestDeltaV1,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimSessionControllerOutcomeV1 {
+    Acquired(SessionAttachmentV1),
+    AlreadyControlled(SessionAttachmentV1),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSessionControllerOutcomeV1 {
+    Released(SessionAttachmentV1),
+    AlreadyReleased(SessionAttachmentV1),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionControllerBasisV1 {
+    pub writer_epoch: u64,
+    #[serde(default)]
+    pub canonical_root_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleControllerMutationV1 {
+    Acquire,
+    Release,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdleControllerMutationOutcomeV1 {
+    Acquired(SessionAttachmentV1),
+    AlreadyControlled(SessionAttachmentV1),
+    Released(SessionAttachmentV1),
+    AlreadyReleased(SessionAttachmentV1),
+    Conflict,
+    BasisConflict(SessionControllerBasisV1),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestSessionHandoffV1 {
     pub idempotency_key: String,
@@ -130,8 +180,6 @@ pub struct HandoffTransitionPatchV1 {
     pub workspace: Option<WorkspaceHandoffEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermarks: Option<HandoffOperationWatermarksV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk: Option<HandoffRiskEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_detail: Option<String>,
 }
@@ -202,6 +250,23 @@ impl DatabaseSessionHandoffService {
                 })
             })
             .collect()
+    }
+
+    /// Read the exact O(1) control CAS basis. This includes the global writer
+    /// epoch even before the first canonical message is committed.
+    pub async fn load_controller_basis(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<SessionControllerBasisV1, SessionHandoffError> {
+        key.validate()
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+        let mut tx = self.begin("begin_load_controller_basis").await?;
+        let now = database_now_ms(&mut tx).await?;
+        let fact = lock_controller_head_fact(&mut tx, key, now).await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_load_controller_basis", source))?;
+        Ok(fact.basis)
     }
 
     pub async fn attach_read_only(
@@ -292,7 +357,26 @@ impl DatabaseSessionHandoffService {
         }
 
         ensure_slot(&mut tx, &request.key).await?;
+        // The slot row serializes capacity admission and epoch allocation for
+        // this exact owner/session/branch. Concurrent opens therefore cannot
+        // both observe the final available slot.
         let next_epoch = lock_and_increment_attachment_epoch(&mut tx, &request.key).await?;
+        let active_attachment_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_attachments
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND expires_at_ms > ?",
+        )
+        .bind(&request.key.isolation_domain)
+        .bind(&request.key.owner_user_id)
+        .bind(&request.key.session_id)
+        .bind(&request.key.branch_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|source| database_error("count_active_attachments", source))?;
+        if active_attachment_count >= MAX_ACTIVE_ATTACHMENTS_PER_BRANCH {
+            return Err(SessionHandoffError::AttachmentCapacityExceeded);
+        }
         let expires_at_unix_ms = checked_expiry(now, ttl)?;
         let mut attachment = SessionAttachmentV1 {
             schema_version: SESSION_ATTACHMENT_SCHEMA_VERSION,
@@ -344,6 +428,227 @@ impl DatabaseSessionHandoffService {
             .await
             .map_err(|source| database_error("commit_attach", source))?;
         Ok(AttachSessionOutcomeV1 { attachment, delta })
+    }
+
+    /// Remove a read attachment without changing conversation authority.
+    /// Missing rows are an idempotent success; an attachment referenced by an
+    /// active handoff is preserved so the authority operation cannot lose one
+    /// of its durable participants.
+    pub async fn detach_read_only(
+        &self,
+        key: &SessionKeyV1,
+        attachment_id: &str,
+    ) -> Result<(), SessionHandoffError> {
+        validate_key_and_id(key, attachment_id)?;
+        let mut tx = self.begin("begin_detach_attachment").await?;
+        // Serialize with handoff admission before touching an attachment.
+        // Handoff creation uses the same branch slot and then locks its
+        // participants, so it can never admit a resource after detach has
+        // validated it but before deletion commits.
+        let active_handoff_id: Option<String> = sqlx::query_scalar(
+            "SELECT active_handoff_id FROM session_handoff_slots
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+             FOR UPDATE",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_detach_handoff_slot", source))?
+        .flatten();
+        if active_handoff_id.is_some() {
+            return Err(SessionHandoffError::AttachmentInUse);
+        }
+        let row = sqlx::query(
+            "SELECT attachment_json FROM session_attachments
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND attachment_id = ?
+             FOR UPDATE",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(attachment_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_detach_attachment", source))?;
+        let Some(row) = row else {
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_detach_missing", source))?;
+            return Ok(());
+        };
+        let attachment: SessionAttachmentV1 =
+            decode_json_row(&row, "attachment_json", "attachment")?;
+        validate_stored_attachment(&attachment, key)?;
+        if attachment.mode == SessionAttachmentModeV1::Controller {
+            return Err(SessionHandoffError::AttachmentControlsBranch);
+        }
+
+        let result = sqlx::query(
+            "DELETE FROM session_attachments
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND attachment_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(attachment_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("delete_attachment", source))?;
+        if result.rows_affected() != 1 {
+            return Err(SessionHandoffError::NeedsRepair(
+                "locked attachment disappeared before detach".into(),
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_detach_attachment", source))?;
+        Ok(())
+    }
+
+    /// Promote an attached reader when the branch is genuinely idle. This is
+    /// conversation control only: writer leases remain the coordinator's
+    /// short-lived execution authority and are acquired by the admitted run.
+    pub async fn claim_idle_controller(
+        &self,
+        key: &SessionKeyV1,
+        attachment_id: &str,
+    ) -> Result<ClaimSessionControllerOutcomeV1, SessionHandoffError> {
+        validate_key_and_id(key, attachment_id)?;
+        let mut tx = self.begin("begin_claim_controller").await?;
+        let now = database_now_ms(&mut tx).await?;
+        let active_handoff_id: Option<String> = sqlx::query_scalar(
+            "SELECT active_handoff_id FROM session_handoff_slots
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+             FOR UPDATE",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_controller_handoff_slot", source))?
+        .flatten();
+        if active_handoff_id.is_some() {
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_controller_handoff_conflict", source))?;
+            return Ok(ClaimSessionControllerOutcomeV1::Conflict);
+        }
+
+        let mut target = lock_attachment(&mut tx, key, attachment_id).await?;
+        if target.expires_at_unix_ms <= now {
+            return Err(SessionHandoffError::AttachmentExpired);
+        }
+        let controllers = lock_active_controllers(&mut tx, key, now).await?;
+        if let Some(controller) = controllers.first() {
+            let outcome = if controller.attachment_id == attachment_id {
+                ClaimSessionControllerOutcomeV1::AlreadyControlled(controller.clone())
+            } else {
+                ClaimSessionControllerOutcomeV1::Conflict
+            };
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_controller_replay", source))?;
+            return Ok(outcome);
+        }
+
+        if lock_active_writer_fact(&mut tx, key, now).await? {
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_controller_writer_conflict", source))?;
+            return Ok(ClaimSessionControllerOutcomeV1::Conflict);
+        }
+
+        target.mode = SessionAttachmentModeV1::Controller;
+        update_attachment_mode(&mut tx, &target).await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_claim_controller", source))?;
+        Ok(ClaimSessionControllerOutcomeV1::Acquired(target))
+    }
+
+    /// Explicitly move conversation control to an attached reader only when
+    /// no execution writer or handoff is active. Unlike first-send claim,
+    /// this operation may demote another idle controller, but it never fences
+    /// work or manufactures execution authority.
+    pub async fn take_idle_controller(
+        &self,
+        key: &SessionKeyV1,
+        attachment_id: &str,
+    ) -> Result<ClaimSessionControllerOutcomeV1, SessionHandoffError> {
+        validate_key_and_id(key, attachment_id)?;
+        let mut tx = self.begin("begin_take_idle_controller").await?;
+        let outcome = mutate_idle_controller_in_transaction(
+            &mut tx,
+            key,
+            attachment_id,
+            IdleControllerMutationV1::Acquire,
+            None,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_take_idle_controller", source))?;
+        match outcome {
+            IdleControllerMutationOutcomeV1::Acquired(attachment) => {
+                Ok(ClaimSessionControllerOutcomeV1::Acquired(attachment))
+            }
+            IdleControllerMutationOutcomeV1::AlreadyControlled(attachment) => Ok(
+                ClaimSessionControllerOutcomeV1::AlreadyControlled(attachment),
+            ),
+            IdleControllerMutationOutcomeV1::Conflict => {
+                Ok(ClaimSessionControllerOutcomeV1::Conflict)
+            }
+            other => Err(SessionHandoffError::NeedsRepair(format!(
+                "invalid acquire controller outcome {other:?}"
+            ))),
+        }
+    }
+
+    /// Relinquish conversation control without detaching the reader. Release
+    /// is idempotent and refuses to race an execution writer or handoff.
+    pub async fn release_idle_controller(
+        &self,
+        key: &SessionKeyV1,
+        attachment_id: &str,
+    ) -> Result<ReleaseSessionControllerOutcomeV1, SessionHandoffError> {
+        validate_key_and_id(key, attachment_id)?;
+        let mut tx = self.begin("begin_release_idle_controller").await?;
+        let outcome = mutate_idle_controller_in_transaction(
+            &mut tx,
+            key,
+            attachment_id,
+            IdleControllerMutationV1::Release,
+            None,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_release_idle_controller", source))?;
+        match outcome {
+            IdleControllerMutationOutcomeV1::Released(attachment) => {
+                Ok(ReleaseSessionControllerOutcomeV1::Released(attachment))
+            }
+            IdleControllerMutationOutcomeV1::AlreadyReleased(attachment) => Ok(
+                ReleaseSessionControllerOutcomeV1::AlreadyReleased(attachment),
+            ),
+            IdleControllerMutationOutcomeV1::Conflict => {
+                Ok(ReleaseSessionControllerOutcomeV1::Conflict)
+            }
+            other => Err(SessionHandoffError::NeedsRepair(format!(
+                "invalid release controller outcome {other:?}"
+            ))),
+        }
     }
 
     pub async fn request_handoff(
@@ -488,6 +793,36 @@ impl DatabaseSessionHandoffService {
         Ok(record)
     }
 
+    pub async fn find_handoff_by_idempotency(
+        &self,
+        key: &SessionKeyV1,
+        idempotency_key: &str,
+    ) -> Result<Option<SessionHandoffRecordV1>, SessionHandoffError> {
+        key.validate()
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+        validate_identity("idempotency key", idempotency_key, MAX_IDEMPOTENCY_BYTES)?;
+        let idempotency_hash = identity_hash("handoff", idempotency_key);
+        let row = sqlx::query(
+            "SELECT record_json FROM session_handoffs
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND idempotency_hash = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(idempotency_hash)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("find_handoff_by_idempotency", source))?;
+        row.map(|row| {
+            let record = decode_json_row(&row, "record_json", "handoff")?;
+            validate_stored_handoff(&record, key)?;
+            Ok(record)
+        })
+        .transpose()
+    }
+
     pub async fn load_attachment(
         &self,
         key: &SessionKeyV1,
@@ -571,6 +906,17 @@ impl DatabaseSessionHandoffService {
             return Ok(event.record);
         }
 
+        let locked_run = lock_handoff_execution_scope(
+            &mut tx,
+            &request.key,
+            &request.handoff_id,
+            request.patch.watermarks.as_ref(),
+            matches!(
+                request.next_state,
+                SessionHandoffStateV1::Checkpointed | SessionHandoffStateV1::Hydrating
+            ),
+        )
+        .await?;
         let row = sqlx::query(
             "SELECT record_json FROM session_handoffs
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -607,7 +953,18 @@ impl DatabaseSessionHandoffService {
             });
         }
         let from = record.state;
-        apply_patch(&mut record, &request.patch);
+        apply_patch(&mut record, &request.patch)?;
+        if !same_execution_reference(&record.watermarks, &locked_run) {
+            return Err(SessionHandoffError::Invalid(
+                "handoff execution changed while acquiring its authority locks".into(),
+            ));
+        }
+        if record.mode == SessionHandoffModeV1::Forced
+            && from == SessionHandoffStateV1::Fenced
+            && request.next_state == SessionHandoffStateV1::Hydrating
+        {
+            seal_forced_takeover_effects(&mut tx, &mut record, now).await?;
+        }
         if request.next_state == SessionHandoffStateV1::Checkpointed
             && (record.watermarks.checkpoint_id.is_none()
                 || record.watermarks.pending_invocation_count != 0
@@ -693,6 +1050,7 @@ impl DatabaseSessionHandoffService {
             return Ok(event.record);
         }
 
+        let locked_run = lock_handoff_execution_scope(&mut tx, key, handoff_id, None, true).await?;
         let row = sqlx::query(
             "SELECT record_json FROM session_handoffs
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -710,6 +1068,11 @@ impl DatabaseSessionHandoffService {
         .ok_or(SessionHandoffError::NotFound)?;
         let mut record: SessionHandoffRecordV1 = decode_json_row(&row, "record_json", "handoff")?;
         validate_stored_handoff(&record, key)?;
+        if !same_execution_reference(&record.watermarks, &locked_run) {
+            return Err(SessionHandoffError::Invalid(
+                "handoff execution changed while acquiring its authority locks".into(),
+            ));
+        }
         if now > record.deadline_unix_ms {
             return Err(SessionHandoffError::DeadlineExpired);
         }
@@ -740,16 +1103,18 @@ impl DatabaseSessionHandoffService {
                 "target attachment expired or workspace/actor evidence changed".into(),
             ));
         }
-        if let Some(source_id) = &record.from_attachment_id {
-            let mut source = lock_attachment(&mut tx, key, source_id).await?;
-            source.mode = SessionAttachmentModeV1::ReadOnly;
-            update_attachment_mode(&mut tx, &source).await?;
+        let controllers = lock_active_controllers(&mut tx, key, now).await?;
+        for mut controller in controllers {
+            if controller.attachment_id != target.attachment_id {
+                controller.mode = SessionAttachmentModeV1::ReadOnly;
+                update_attachment_mode(&mut tx, &controller).await?;
+            }
         }
         target.mode = SessionAttachmentModeV1::Controller;
         update_attachment_mode(&mut tx, &target).await?;
 
         let from = record.state;
-        apply_patch(&mut record, &request.patch);
+        apply_patch(&mut record, &request.patch)?;
         record
             .transition(from, SessionHandoffStateV1::Active, now)
             .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
@@ -773,6 +1138,7 @@ impl DatabaseSessionHandoffService {
         key: &SessionKeyV1,
         handoff_id: &str,
         source_lease: Option<ConversationWriterLeaseV1>,
+        expected_writer_epoch: Option<u64>,
         ttl: Duration,
         transition_idempotency_key: &str,
     ) -> Result<FenceSessionWriterOutcomeV1, SessionHandoffError> {
@@ -812,6 +1178,7 @@ impl DatabaseSessionHandoffService {
             key: record.key.clone(),
             mode: record.mode,
             source_lease,
+            expected_writer_epoch,
             expected_cursor: record.base_cursor.clone(),
             target_actor: record.target_actor.clone(),
             risk: record.risk.clone(),
@@ -925,6 +1292,10 @@ fn validate_attach_request(request: &AttachSessionRequestV1) -> Result<(), Sessi
 
 fn validate_handoff_request(request: &RequestSessionHandoffV1) -> Result<(), SessionHandoffError> {
     request
+        .watermarks
+        .validate()
+        .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    request
         .key
         .validate()
         .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
@@ -970,6 +1341,15 @@ fn validate_handoff_request(request: &RequestSessionHandoffV1) -> Result<(), Ses
             "forced handoff requires verified authorization".into(),
         ));
     }
+    if request.mode == SessionHandoffModeV1::Forced
+        && (request.risk.unsynced_suffix_root.is_some()
+            || !request.risk.unknown_effect_invocation_ids.is_empty()
+            || request.risk.effects_are_sealed())
+    {
+        return Err(SessionHandoffError::Invalid(
+            "forced handoff effect evidence is sealed by the Server after fencing".into(),
+        ));
+    }
     if request.mode == SessionHandoffModeV1::Graceful
         && request.risk != HandoffRiskEvidenceV1::default()
     {
@@ -988,6 +1368,11 @@ fn validate_handoff_request(request: &RequestSessionHandoffV1) -> Result<(), Ses
 fn validate_transition_request(
     request: &TransitionSessionHandoffV1,
 ) -> Result<(), SessionHandoffError> {
+    if let Some(watermarks) = &request.patch.watermarks {
+        watermarks
+            .validate()
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    }
     validate_key_and_id(&request.key, &request.handoff_id)?;
     validate_identity(
         "idempotency key",
@@ -1092,7 +1477,15 @@ fn install_observation(attachment: &mut SessionAttachmentV1, delta: &ManifestDel
         .map(|head| head.latest_manifest_root.clone());
 }
 
-fn apply_patch(record: &mut SessionHandoffRecordV1, patch: &HandoffTransitionPatchV1) {
+fn apply_patch(
+    record: &mut SessionHandoffRecordV1,
+    patch: &HandoffTransitionPatchV1,
+) -> Result<(), SessionHandoffError> {
+    if let Some(watermarks) = &patch.watermarks {
+        record
+            .replace_watermarks(watermarks.clone())
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    }
     if let Some(cursor) = &patch.base_cursor {
         record.base_cursor = Some(cursor.clone());
     }
@@ -1102,15 +1495,90 @@ fn apply_patch(record: &mut SessionHandoffRecordV1, patch: &HandoffTransitionPat
     if let Some(workspace) = &patch.workspace {
         record.workspace = Some(workspace.clone());
     }
-    if let Some(watermarks) = &patch.watermarks {
-        record.watermarks = watermarks.clone();
-    }
-    if let Some(risk) = &patch.risk {
-        record.risk = risk.clone();
-    }
     if let Some(detail) = &patch.status_detail {
         record.status_detail = Some(detail.clone());
     }
+    Ok(())
+}
+
+/// Seal the effect boundary after canonical authority has moved away from the
+/// old controller and before the target attachment can hydrate. Holding every
+/// still-active run row makes dispatch admission serialize behind this check;
+/// the absence of such rows is the durable proof that no new provider boundary
+/// can be crossed by the old execution.
+async fn seal_forced_takeover_effects(
+    tx: &mut Transaction<'_, MySql>,
+    record: &mut SessionHandoffRecordV1,
+    now_unix_ms: i64,
+) -> Result<(), SessionHandoffError> {
+    if record.target_writer_epoch.is_none() {
+        return Err(SessionHandoffError::Invalid(
+            "forced effects cannot be sealed before canonical writer fencing".into(),
+        ));
+    }
+
+    let active_runs = sqlx::query(
+        "SELECT run_id FROM agent_runs
+         WHERE user_id = ? AND session_id = ?
+           AND status NOT IN ('completed', 'delegated', 'failed', 'cancelled')
+         ORDER BY run_id
+         LIMIT 2
+         FOR UPDATE",
+    )
+    .bind(&record.key.owner_user_id)
+    .bind(&record.key.session_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| database_error("lock_forced_takeover_runs", source))?;
+    if !active_runs.is_empty() {
+        return Err(SessionHandoffError::ActiveRunsRemain {
+            run_id: active_runs[0]
+                .try_get("run_id")
+                .map_err(|source| database_error("decode_active_takeover_run", source))?,
+        });
+    }
+
+    // A prepared attempt_count=0 proves dispatch never started. Everything
+    // else that may have crossed the provider boundary becomes conservative,
+    // durable OutcomeUnknown evidence. Concurrent terminal completion either
+    // wins before this lock or loses its state CAS after this commit.
+    sqlx::query(
+        "UPDATE tool_invocation_ledger
+         SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
+             dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
+             updated_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?
+           AND (state = 'dispatched'
+                OR (state = 'prepared' AND attempt_count > 0))",
+    )
+    .bind(&record.key.owner_user_id)
+    .bind(&record.key.session_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|source| database_error("seal_forced_takeover_effects", source))?;
+
+    let evidence_limit = i64::try_from(astra_turn_types::MAX_HANDOFF_EFFECT_IDENTITIES + 1)
+        .expect("handoff effect identity bound fits BIGINT");
+    let evidence = sqlx::query_scalar::<_, String>(
+        "SELECT identity_key FROM tool_invocation_ledger
+         WHERE user_id = ? AND session_id = ? AND state = 'outcome_unknown'
+         ORDER BY identity_key
+         LIMIT ?",
+    )
+    .bind(&record.key.owner_user_id)
+    .bind(&record.key.session_id)
+    .bind(evidence_limit)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| database_error("load_forced_takeover_effects", source))?;
+    if evidence.len() > astra_turn_types::MAX_HANDOFF_EFFECT_IDENTITIES {
+        return Err(SessionHandoffError::EffectEvidenceCapacityExceeded);
+    }
+
+    record.risk.unknown_effect_invocation_ids = evidence;
+    record.risk.effects_sealed_at_unix_ms = Some(now_unix_ms);
+    record.status_detail = Some("forced_effects_sealed".into());
+    Ok(())
 }
 
 async fn quarantine_divergent_attachment(
@@ -1168,6 +1636,124 @@ async fn quarantine_divergent_attachment(
         .await
         .map_err(|source| database_error("commit_attachment_quarantine", source))?;
     Ok(quarantine_id)
+}
+
+/// Share the execution admission fence before acquiring handoff/attachment
+/// locks. The same order applies to forced effect sealing and activation.
+async fn lock_handoff_execution_scope(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    handoff_id: &str,
+    proposed_watermarks: Option<&HandoffOperationWatermarksV1>,
+    require_execution_boundary: bool,
+) -> Result<HandoffOperationWatermarksV1, SessionHandoffError> {
+    crate::storage::admit_session_execution_write(tx, &key.session_id, &key.owner_user_id)
+        .await
+        .map_err(|source| database_error("admit_handoff_execution", source))?;
+    // This is a lock-order hint, not an authority snapshot. The caller must
+    // recheck the effective reference after locking the handoff itself.
+    let row = sqlx::query(
+        "SELECT record_json FROM session_handoffs
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ? AND handoff_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(handoff_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| database_error("load_handoff_execution_hint", source))?
+    .ok_or(SessionHandoffError::NotFound)?;
+    let mut hint: SessionHandoffRecordV1 = decode_json_row(&row, "record_json", "handoff")?;
+    validate_stored_handoff(&hint, key)?;
+    if let Some(proposed) = proposed_watermarks {
+        hint.watermarks = proposed.clone();
+    }
+    let run_id = hint.watermarks.run_id.clone();
+    if require_execution_boundary && hint.mode == SessionHandoffModeV1::Graceful {
+        let other_active: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ?
+             AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+             AND (? IS NULL OR run_id <> ?) LIMIT 1 FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| database_error("check_handoff_active_execution", source))?;
+        if other_active.is_some() {
+            return Err(SessionHandoffError::Invalid(
+                "another active execution is not covered by the handoff checkpoint".into(),
+            ));
+        }
+    }
+    if let Some(run_id) = &run_id {
+        let exists: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| database_error("lock_handoff_run", source))?;
+        if exists.is_none() {
+            return Err(SessionHandoffError::Invalid(
+                "handoff run does not belong to this session".into(),
+            ));
+        }
+    }
+    if require_execution_boundary && hint.mode == SessionHandoffModeV1::Graceful {
+        validate_execution_checkpoint(tx, &hint).await?;
+    }
+    lock_active_handoff(tx, key).await?;
+    Ok(hint.watermarks)
+}
+
+fn same_execution_reference(
+    left: &HandoffOperationWatermarksV1,
+    right: &HandoffOperationWatermarksV1,
+) -> bool {
+    left.run_id == right.run_id
+        && left.run_generation == right.run_generation
+        && left.checkpoint_id == right.checkpoint_id
+}
+
+async fn validate_execution_checkpoint(
+    tx: &mut Transaction<'_, MySql>,
+    record: &SessionHandoffRecordV1,
+) -> Result<(), SessionHandoffError> {
+    let Some(run_id) = record.watermarks.run_id.as_deref() else {
+        return Ok(());
+    };
+    let checkpoint_id = record.watermarks.checkpoint_id.as_deref().ok_or_else(|| {
+        SessionHandoffError::Invalid("execution checkpoint identity is missing".into())
+    })?;
+    let generation = record.watermarks.run_generation.ok_or_else(|| {
+        SessionHandoffError::Invalid("execution checkpoint generation is missing".into())
+    })?;
+    crate::runs::lock_and_validate_execution_handoff_reference_tx(
+        tx,
+        &record.key.owner_user_id,
+        &record.key.session_id,
+        run_id,
+        checkpoint_id,
+        generation,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::runs::ExecutionHandoffReferenceError::Rejected(reason) => {
+            SessionHandoffError::Invalid(reason.into())
+        }
+        crate::runs::ExecutionHandoffReferenceError::Unavailable(error) => {
+            SessionHandoffError::StorageUnavailable(error)
+        }
+    })
 }
 
 async fn ensure_slot(
@@ -1274,6 +1860,259 @@ async fn lock_attachment(
     let attachment = decode_json_row(&row, "attachment_json", "attachment")?;
     validate_stored_attachment(&attachment, key)?;
     Ok(attachment)
+}
+
+async fn lock_active_controllers(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    now_unix_ms: i64,
+) -> Result<Vec<SessionAttachmentV1>, SessionHandoffError> {
+    let rows = sqlx::query(
+        "SELECT attachment_json FROM session_attachments
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?
+           AND mode = 'controller' AND expires_at_ms > ?
+         ORDER BY attachment_epoch DESC
+         LIMIT 2
+         FOR UPDATE",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(now_unix_ms)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| database_error("lock_active_controllers", source))?;
+    if rows.len() > 1 {
+        return Err(SessionHandoffError::NeedsRepair(
+            "multiple unexpired controller attachments exist".into(),
+        ));
+    }
+    rows.into_iter()
+        .map(|row| {
+            let attachment = decode_json_row(&row, "attachment_json", "attachment")?;
+            validate_stored_attachment(&attachment, key)?;
+            Ok(attachment)
+        })
+        .collect()
+}
+
+pub(crate) async fn mutate_idle_controller_in_transaction(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    attachment_id: &str,
+    mutation: IdleControllerMutationV1,
+    expected_basis: Option<&SessionControllerBasisV1>,
+) -> Result<IdleControllerMutationOutcomeV1, SessionHandoffError> {
+    validate_key_and_id(key, attachment_id)?;
+    let now = database_now_ms(tx).await?;
+    if lock_active_handoff(tx, key).await?.is_some() {
+        return Ok(IdleControllerMutationOutcomeV1::Conflict);
+    }
+    let mut target = lock_attachment(tx, key, attachment_id).await?;
+    if target.expires_at_unix_ms <= now {
+        return Err(SessionHandoffError::AttachmentExpired);
+    }
+    let controllers = lock_active_controllers(tx, key, now).await?;
+    let target_controls = controllers
+        .first()
+        .is_some_and(|controller| controller.attachment_id == attachment_id);
+    if expected_basis.is_none() {
+        match (mutation, target_controls) {
+            (IdleControllerMutationV1::Acquire, true) => {
+                return Ok(IdleControllerMutationOutcomeV1::AlreadyControlled(target));
+            }
+            (IdleControllerMutationV1::Release, false) => {
+                return Ok(IdleControllerMutationOutcomeV1::AlreadyReleased(target));
+            }
+            _ => {}
+        }
+    }
+    let writer = lock_controller_head_fact(tx, key, now).await?;
+    if expected_basis.is_some_and(|expected| expected != &writer.basis) {
+        return Ok(IdleControllerMutationOutcomeV1::BasisConflict(writer.basis));
+    }
+    match (mutation, target_controls) {
+        (IdleControllerMutationV1::Acquire, true) => {
+            return Ok(IdleControllerMutationOutcomeV1::AlreadyControlled(target));
+        }
+        (IdleControllerMutationV1::Release, false) => {
+            return Ok(IdleControllerMutationOutcomeV1::AlreadyReleased(target));
+        }
+        _ => {}
+    }
+    if writer.active {
+        return Ok(IdleControllerMutationOutcomeV1::Conflict);
+    }
+    match mutation {
+        IdleControllerMutationV1::Acquire => {
+            if let Some(mut source) = controllers.into_iter().next() {
+                source.mode = SessionAttachmentModeV1::ReadOnly;
+                update_attachment_mode(tx, &source).await?;
+            }
+            target.mode = SessionAttachmentModeV1::Controller;
+            update_attachment_mode(tx, &target).await?;
+            Ok(IdleControllerMutationOutcomeV1::Acquired(target))
+        }
+        IdleControllerMutationV1::Release => {
+            target.mode = SessionAttachmentModeV1::ReadOnly;
+            update_attachment_mode(tx, &target).await?;
+            Ok(IdleControllerMutationOutcomeV1::Released(target))
+        }
+    }
+}
+
+pub(crate) async fn load_controller_basis_in_transaction(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<SessionControllerBasisV1, SessionHandoffError> {
+    key.validate()
+        .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+    let now = database_now_ms(tx).await?;
+    Ok(lock_controller_head_fact(tx, key, now).await?.basis)
+}
+
+struct LockedControllerHeadFactV1 {
+    basis: SessionControllerBasisV1,
+    active: bool,
+}
+
+async fn lock_active_writer_fact(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    now_unix_ms: i64,
+) -> Result<bool, SessionHandoffError> {
+    Ok(lock_controller_head_fact(tx, key, now_unix_ms)
+        .await?
+        .active)
+}
+
+async fn lock_controller_head_fact(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    now_unix_ms: i64,
+) -> Result<LockedControllerHeadFactV1, SessionHandoffError> {
+    let row = sqlx::query(
+        "SELECT head_json, canonical_root_hash, writer_epoch,
+                active_writer_json, active_writer_expires_at_ms
+         FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?
+         FOR UPDATE",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| database_error("lock_controller_writer_fact", source))?;
+    let Some(row) = row else {
+        return Ok(LockedControllerHeadFactV1 {
+            basis: SessionControllerBasisV1 {
+                writer_epoch: 0,
+                canonical_root_hash: None,
+            },
+            active: false,
+        });
+    };
+    let writer_epoch = row
+        .try_get::<i64, _>("writer_epoch")
+        .map_err(|source| database_error("decode_controller_writer_epoch", source))?;
+    let writer_epoch = u64::try_from(writer_epoch)
+        .map_err(|_| SessionHandoffError::NeedsRepair("negative controller writer epoch".into()))?;
+    let head_json: Option<String> = row
+        .try_get("head_json")
+        .map_err(|source| database_error("decode_controller_head_json", source))?;
+    let indexed_root: Option<String> = row
+        .try_get("canonical_root_hash")
+        .map_err(|source| database_error("decode_controller_root", source))?;
+    let canonical_root_hash = match (head_json, indexed_root) {
+        (None, None) => None,
+        (Some(json), Some(indexed_root)) => {
+            let head: SessionContextHeadV1 =
+                serde_json::from_str(&json).map_err(|source| SessionHandoffError::Json {
+                    entity: "context_head",
+                    source,
+                })?;
+            if head.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
+                || head.key != *key
+                || !key.validates_cursor(&head.cursor)
+                || head.latest_manifest_root != indexed_root
+                || head.cursor.canonical_root_hash != indexed_root
+                || head.writer_epoch > writer_epoch
+            {
+                return Err(SessionHandoffError::NeedsRepair(
+                    "controller head projection is internally inconsistent".into(),
+                ));
+            }
+            Some(indexed_root)
+        }
+        _ => {
+            return Err(SessionHandoffError::NeedsRepair(
+                "controller head JSON and root index disagree".into(),
+            ));
+        }
+    };
+    let writer_json: Option<String> = row
+        .try_get("active_writer_json")
+        .map_err(|source| database_error("decode_controller_writer_json", source))?;
+    let indexed_expiry: Option<i64> = row
+        .try_get("active_writer_expires_at_ms")
+        .map_err(|source| database_error("decode_controller_writer_expiry", source))?;
+    let (json, indexed_expiry) = match (writer_json, indexed_expiry) {
+        (None, None) => {
+            return Ok(LockedControllerHeadFactV1 {
+                basis: SessionControllerBasisV1 {
+                    writer_epoch,
+                    canonical_root_hash,
+                },
+                active: false,
+            });
+        }
+        (Some(json), Some(indexed_expiry)) => (json, indexed_expiry),
+        _ => {
+            return Err(SessionHandoffError::NeedsRepair(
+                "active writer JSON and expiry index disagree".into(),
+            ));
+        }
+    };
+    let lease: ConversationWriterLeaseV1 =
+        serde_json::from_str(&json).map_err(|source| SessionHandoffError::Json {
+            entity: "writer_lease",
+            source,
+        })?;
+    if lease.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
+        || lease.key != *key
+        || lease.writer_epoch == 0
+        || lease.writer_epoch != writer_epoch
+        || validate_identity("writer lease id", &lease.lease_id, 512).is_err()
+        || validate_identity(
+            "writer idempotency key",
+            &lease.idempotency_key,
+            MAX_IDEMPOTENCY_BYTES,
+        )
+        .is_err()
+        || lease.expires_at_unix_ms != indexed_expiry
+        || lease.expires_at_unix_ms <= lease.acquired_at_unix_ms
+        || lease.actor.validate_for(key).is_err()
+        || lease
+            .expected_cursor
+            .as_ref()
+            .is_some_and(|cursor| !key.validates_cursor(cursor))
+    {
+        return Err(SessionHandoffError::NeedsRepair(
+            "active writer projection is internally inconsistent".into(),
+        ));
+    }
+    Ok(LockedControllerHeadFactV1 {
+        basis: SessionControllerBasisV1 {
+            writer_epoch,
+            canonical_root_hash,
+        },
+        active: indexed_expiry > now_unix_ms,
+    })
 }
 
 async fn update_attachment_mode(
@@ -1546,7 +2385,7 @@ mod tests {
     };
     use serde_json::json;
 
-    static HANDOFF_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+    static HANDOFF_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
     async fn setup_handoff_db_it() -> SharedPool {
         assert_eq!(
@@ -1555,18 +2394,17 @@ mod tests {
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
         let _ = dotenvy::dotenv();
-        HANDOFF_DB
+        let settings = astra_core::MatrixOneSettings::from_env();
+        HANDOFF_SCHEMA
             .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_owned());
                 crate::storage::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure core schema");
-                SharedPool::new(&settings).await.expect("shared pool")
             })
-            .await
-            .clone()
+            .await;
+        SharedPool::new(&settings).await.expect("shared pool")
     }
 
     fn actor(owner: &str, identity: &str) -> ActorContextV1 {
@@ -1597,6 +2435,25 @@ mod tests {
     }
 
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {
+        for table in [
+            "agent_session_execution_slots",
+            "run_checkpoints",
+            "tool_invocation_ledger",
+            "agent_run_events",
+            "agent_events",
+            "agent_runs",
+            "agent_sessions",
+            "agent_session_lifecycle_fences",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("cleanup {table}: {error}"));
+        }
         for table in [
             "session_attachment_quarantines",
             "session_handoff_events",
@@ -1629,9 +2486,311 @@ mod tests {
         .expect("cleanup segments");
     }
 
+    async fn create_session_root(pool: &SharedPool, key: &SessionKeyV1) {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (user_id, session_id, status, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool.get())
+        .await
+        .expect("create active session root");
+    }
+
+    #[test]
+    fn handoff_admission_rejects_partial_execution_coordinates() {
+        let key = SessionKeyV1::owner_session("test", "owner", "session", "main");
+        let mut request = RequestSessionHandoffV1 {
+            idempotency_key: "request".into(),
+            key: key.clone(),
+            mode: SessionHandoffModeV1::Graceful,
+            from_attachment_id: Some("source".into()),
+            to_attachment_id: "target".into(),
+            from_placement: SessionPlacementV1::Cli,
+            to_placement: SessionPlacementV1::Edge,
+            target_actor: actor(&key.owner_user_id, "target"),
+            base_cursor: None,
+            authority_epochs: AuthorityEpochsV1::default(),
+            workspace: None,
+            watermarks: HandoffOperationWatermarksV1::default(),
+            risk: HandoffRiskEvidenceV1::default(),
+            reason: "move".into(),
+        };
+        let mut transition = TransitionSessionHandoffV1 {
+            idempotency_key: "transition".into(),
+            key,
+            handoff_id: "handoff".into(),
+            expected_state: SessionHandoffStateV1::Draining,
+            expected_transition_seq: 3,
+            next_state: SessionHandoffStateV1::Checkpointed,
+            patch: HandoffTransitionPatchV1::default(),
+        };
+        for (run_id, run_generation, valid) in [
+            (None, None, true),
+            (Some("run"), None, false),
+            (None, Some(0), false),
+            (Some("run"), Some(0), true),
+        ] {
+            request.watermarks = HandoffOperationWatermarksV1 {
+                run_id: run_id.map(str::to_owned),
+                run_generation,
+                checkpoint_id: Some("checkpoint".into()),
+                ..Default::default()
+            };
+            transition.patch.watermarks = Some(request.watermarks.clone());
+            assert_eq!(validate_handoff_request(&request).is_ok(), valid);
+            assert_eq!(validate_transition_request(&transition).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn forced_handoff_admission_accepts_authorization_but_not_effect_claims() {
+        let key = SessionKeyV1::owner_session("test", "owner", "session", "main");
+        let mut request = RequestSessionHandoffV1 {
+            idempotency_key: "forced-request".into(),
+            key: key.clone(),
+            mode: SessionHandoffModeV1::Forced,
+            from_attachment_id: None,
+            to_attachment_id: "target".into(),
+            from_placement: SessionPlacementV1::Server,
+            to_placement: SessionPlacementV1::Cli,
+            target_actor: actor(&key.owner_user_id, "target"),
+            base_cursor: None,
+            authority_epochs: AuthorityEpochsV1::default(),
+            workspace: None,
+            watermarks: HandoffOperationWatermarksV1::default(),
+            risk: HandoffRiskEvidenceV1 {
+                forced_authorization_id: Some("verified-authorization".into()),
+                ..HandoffRiskEvidenceV1::default()
+            },
+            reason: "controller unavailable".into(),
+        };
+        validate_handoff_request(&request)
+            .expect("server authorization is sufficient for fence intent");
+
+        request.risk.unknown_effect_invocation_ids = vec!["caller-effect".into()];
+        assert!(matches!(
+            validate_handoff_request(&request),
+            Err(SessionHandoffError::Invalid(message))
+                if message.contains("sealed by the Server")
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn idle_controller_transfer_and_release_are_writer_safe_and_idempotent() {
+        let pool = setup_handoff_db_it().await;
+        let suffix = Uuid::new_v4();
+        let key = SessionKeyV1::owner_session(
+            "controller-it",
+            format!("owner-{suffix}"),
+            format!("session-{suffix}"),
+            "main",
+        );
+        cleanup(&pool, &key).await;
+        let coordinator: Arc<dyn SessionContextCoordinator> =
+            Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
+        let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
+        let source_actor = actor(&key.owner_user_id, "source");
+        let target_actor = actor(&key.owner_user_id, "target");
+        let source = service
+            .attach_read_only(
+                &AttachSessionRequestV1 {
+                    idempotency_key: "attach-source".into(),
+                    key: key.clone(),
+                    actor: source_actor.clone(),
+                    placement: SessionPlacementV1::Cli,
+                    after_manifest_root: None,
+                    workspace: None,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("attach source")
+            .attachment;
+        let target = service
+            .attach_read_only(
+                &AttachSessionRequestV1 {
+                    idempotency_key: "attach-target".into(),
+                    key: key.clone(),
+                    actor: target_actor,
+                    placement: SessionPlacementV1::Edge,
+                    after_manifest_root: None,
+                    workspace: None,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("attach target")
+            .attachment;
+
+        assert!(matches!(
+            service
+                .claim_idle_controller(&key, &source.attachment_id)
+                .await
+                .expect("claim source"),
+            ClaimSessionControllerOutcomeV1::Acquired(_)
+        ));
+        assert_eq!(
+            service
+                .claim_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("conservative first-send claim"),
+            ClaimSessionControllerOutcomeV1::Conflict
+        );
+        assert!(matches!(
+            service
+                .take_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("take idle control"),
+            ClaimSessionControllerOutcomeV1::Acquired(_)
+        ));
+        assert!(matches!(
+            service
+                .take_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("retry take idle control"),
+            ClaimSessionControllerOutcomeV1::AlreadyControlled(_)
+        ));
+        assert!(matches!(
+            service
+                .release_idle_controller(&key, &source.attachment_id)
+                .await
+                .expect("release already demoted source"),
+            ReleaseSessionControllerOutcomeV1::AlreadyReleased(_)
+        ));
+        assert_eq!(
+            service
+                .load_attachment(&key, &source.attachment_id)
+                .await
+                .expect("load demoted source")
+                .mode,
+            SessionAttachmentModeV1::ReadOnly
+        );
+
+        let writer = acquired(
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &source_actor,
+                    Duration::from_secs(60),
+                    "active-writer",
+                )
+                .await
+                .expect("acquire writer"),
+        );
+        assert_eq!(
+            service
+                .take_idle_controller(&key, &source.attachment_id)
+                .await
+                .expect("take conflicts with writer"),
+            ClaimSessionControllerOutcomeV1::Conflict
+        );
+        assert_eq!(
+            service
+                .release_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("release conflicts with writer"),
+            ReleaseSessionControllerOutcomeV1::Conflict
+        );
+        assert_eq!(
+            service
+                .load_attachment(&key, &target.attachment_id)
+                .await
+                .expect("writer conflict preserves target")
+                .mode,
+            SessionAttachmentModeV1::Controller
+        );
+
+        coordinator
+            .release_writer(&writer)
+            .await
+            .expect("release writer");
+        assert!(matches!(
+            service
+                .release_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("release idle control"),
+            ReleaseSessionControllerOutcomeV1::Released(_)
+        ));
+        assert!(matches!(
+            service
+                .release_idle_controller(&key, &target.attachment_id)
+                .await
+                .expect("retry release idle control"),
+            ReleaseSessionControllerOutcomeV1::AlreadyReleased(_)
+        ));
+        service
+            .detach_read_only(&key, &target.attachment_id)
+            .await
+            .expect("released controller can detach");
+        cleanup(&pool, &key).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn graceful_handoff_is_durable_idempotent_and_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::WithoutExecution).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_with_exact_checkpoint_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::ExactCheckpoint).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_rejects_generation_change_before_activation() {
+        exercise_graceful_handoff(GracefulScenario::GenerationChanged).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_after_repeated_recovery_fences_old_writer() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredCheckpoint).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_recovered_execution_rejects_new_activity() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredNewActivity).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn graceful_handoff_recovered_execution_rejects_ancestor_cancellation() {
+        exercise_graceful_handoff(GracefulScenario::RecoveredAncestorCancellation).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum GracefulScenario {
+        WithoutExecution,
+        ExactCheckpoint,
+        GenerationChanged,
+        RecoveredCheckpoint,
+        RecoveredNewActivity,
+        RecoveredAncestorCancellation,
+    }
+
+    async fn exercise_graceful_handoff(scenario: GracefulScenario) {
+        use crate::runs::RunStateStore;
+        let with_execution = !matches!(scenario, GracefulScenario::WithoutExecution);
+        let invalidate_before_activation = matches!(
+            scenario,
+            GracefulScenario::GenerationChanged
+                | GracefulScenario::RecoveredNewActivity
+                | GracefulScenario::RecoveredAncestorCancellation
+        );
+        let recovering = matches!(
+            scenario,
+            GracefulScenario::RecoveredCheckpoint
+                | GracefulScenario::RecoveredNewActivity
+                | GracefulScenario::RecoveredAncestorCancellation
+        );
         let pool = setup_handoff_db_it().await;
         let suffix = Uuid::new_v4();
         let key = SessionKeyV1::owner_session(
@@ -1642,6 +2801,7 @@ mod tests {
         );
         cleanup(&pool, &key).await;
         let authority_reader = DatabaseSessionContextCoordinator::new(pool.clone());
+        create_session_root(&pool, &key).await;
         let coordinator: Arc<dyn SessionContextCoordinator> = Arc::new(authority_reader.clone());
         let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
         let source_actor = actor(&key.owner_user_id, "source");
@@ -1660,7 +2820,13 @@ mod tests {
         );
         let reservation = reserved(
             coordinator
-                .reserve_turn(&source_lease, None, Duration::from_secs(30), "source-turn")
+                .reserve_turn(
+                    &source_lease,
+                    None,
+                    Duration::from_secs(30),
+                    "source-turn",
+                    None,
+                )
                 .await
                 .expect("reserve source turn"),
         );
@@ -1750,6 +2916,45 @@ mod tests {
             .await
             .expect("attach target")
             .attachment;
+        assert_eq!(
+            service
+                .claim_idle_controller(&key, &target_attachment.attachment_id)
+                .await
+                .expect("observe active writer conflict"),
+            ClaimSessionControllerOutcomeV1::Conflict,
+            "a read attachment cannot claim control while a real writer is active"
+        );
+        sqlx::query(
+            "UPDATE session_context_heads SET active_writer_expires_at_ms = NULL
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(pool.get())
+        .await
+        .expect("corrupt writer expiry projection");
+        assert!(matches!(
+            service
+                .claim_idle_controller(&key, &target_attachment.attachment_id)
+                .await,
+            Err(SessionHandoffError::NeedsRepair(_))
+        ));
+        sqlx::query(
+            "UPDATE session_context_heads SET active_writer_expires_at_ms = ?
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(source_lease.expires_at_unix_ms)
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(pool.get())
+        .await
+        .expect("restore writer expiry projection");
         let mut handoff = service
             .request_handoff(
                 &RequestSessionHandoffV1 {
@@ -1772,6 +2977,12 @@ mod tests {
             )
             .await
             .expect("request handoff");
+        assert!(matches!(
+            service
+                .detach_read_only(&key, &target_attachment.attachment_id)
+                .await,
+            Err(SessionHandoffError::AttachmentInUse)
+        ));
         for (state, idempotency) in [
             (SessionHandoffStateV1::Validating, "validate"),
             (SessionHandoffStateV1::Draining, "drain"),
@@ -1789,22 +3000,253 @@ mod tests {
                 .await
                 .expect("advance handoff");
         }
+        let checkpoint_request = TransitionSessionHandoffV1 {
+            idempotency_key: "checkpoint".into(),
+            key: key.clone(),
+            handoff_id: handoff.handoff_id.clone(),
+            expected_state: handoff.state,
+            expected_transition_seq: handoff.transition_seq,
+            next_state: SessionHandoffStateV1::Checkpointed,
+            patch: HandoffTransitionPatchV1 {
+                watermarks: Some(HandoffOperationWatermarksV1 {
+                    checkpoint_id: Some("checkpoint-1".into()),
+                    effect_cursor: Some("effect-1".into()),
+                    ..HandoffOperationWatermarksV1::default()
+                }),
+                ..HandoffTransitionPatchV1::default()
+            },
+        };
+        let competing_run = format!("competing-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, ?, 0, 'running')",
+        )
+        .bind(&competing_run)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&competing_run)
+        .bind(&competing_run)
+        .execute(pool.get())
+        .await
+        .expect("insert competing execution");
+        assert!(matches!(
+            service.transition_handoff(&checkpoint_request).await,
+            Err(SessionHandoffError::Invalid(_))
+        ));
+        assert_eq!(
+            service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap()
+                .transition_seq,
+            handoff.transition_seq,
+            "rejected admission must not advance the durable handoff"
+        );
+        sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&key.owner_user_id)
+            .bind(&competing_run)
+            .execute(pool.get())
+            .await
+            .expect("release execution into ordinary continuation");
+        let checkpoint_id = format!("checkpoint-{suffix}");
+        let payload = serde_json::to_string(&crate::runs::DurableExecutionHandoff::V1 {
+            producer_run_id: competing_run.clone(),
+            producer_owner_generation: 0,
+            heavy: json!({"opaque_runtime_payload": [1, 2, 3]}),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_checkpoints
+             (checkpoint_id, run_id, user_id, session_id, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json)
+             VALUES (?, ?, ?, ?, 'execution_handoff', 'execution_handoff_v1', ?, ?)",
+        )
+        .bind(&checkpoint_id)
+        .bind(&competing_run)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(format!("checkpoint:{competing_run}:execution_handoff:0"))
+        .bind(&payload)
+        .execute(pool.get()).await.expect("persist exact execution checkpoint");
+        let mut exact = checkpoint_request.clone();
+        exact.patch.watermarks = Some(HandoffOperationWatermarksV1 {
+            run_id: Some(competing_run.clone()),
+            run_generation: Some(0),
+            checkpoint_id: Some(checkpoint_id.clone()),
+            ..Default::default()
+        });
+        let mut bound_record = handoff.clone();
+        bound_record
+            .replace_watermarks(exact.patch.watermarks.clone().unwrap())
+            .unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        validate_execution_checkpoint(&mut tx, &bound_record)
+            .await
+            .expect("exact checkpoint validates");
+        tx.rollback().await.unwrap();
+        for (run_id, generation, checkpoint) in [
+            ("missing-run".to_owned(), 0, checkpoint_id.clone()),
+            (competing_run.clone(), 1, checkpoint_id.clone()),
+            (competing_run.clone(), 0, "missing-checkpoint".to_owned()),
+        ] {
+            let mut wrong = exact.clone();
+            wrong.patch.watermarks = Some(HandoffOperationWatermarksV1 {
+                run_id: Some(run_id),
+                run_generation: Some(generation),
+                checkpoint_id: Some(checkpoint),
+                ..Default::default()
+            });
+            assert!(matches!(
+                service.transition_handoff(&wrong).await,
+                Err(SessionHandoffError::Invalid(_))
+            ));
+        }
+        for (column, original, invalid) in [
+            ("session_id", key.session_id.as_str(), "other-session"),
+            ("checkpoint_kind", "execution_handoff", "phase"),
+            (
+                "checkpoint_version",
+                "execution_handoff_v1",
+                "phase_checkpoint_v1",
+            ),
+        ] {
+            let update = format!(
+                "UPDATE run_checkpoints SET {column} = ? WHERE user_id = ? AND checkpoint_id = ?"
+            );
+            sqlx::query(&update)
+                .bind(invalid)
+                .bind(&key.owner_user_id)
+                .bind(&checkpoint_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    service.transition_handoff(&exact).await,
+                    Err(SessionHandoffError::Invalid(_))
+                ),
+                "invalid {column} must not authorize handoff"
+            );
+            sqlx::query(&update)
+                .bind(original)
+                .bind(&key.owner_user_id)
+                .bind(&checkpoint_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        let mut stale_reader = pool.get().begin().await.unwrap();
+        let before: i64 = sqlx::query_scalar(
+            "SELECT run_generation FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&competing_run)
+        .fetch_one(&mut *stale_reader)
+        .await
+        .unwrap();
+        assert_eq!(before, 0);
+        sqlx::query("UPDATE agent_runs SET run_generation = 1 WHERE user_id = ? AND run_id = ?")
+            .bind(&key.owner_user_id)
+            .bind(&competing_run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                validate_execution_checkpoint(&mut stale_reader, &bound_record).await,
+                Err(SessionHandoffError::Invalid(_))
+            ),
+            "authority validation must observe the generation committed after its earlier read"
+        );
+        stale_reader.rollback().await.unwrap();
+        assert!(matches!(
+            service.transition_handoff(&exact).await,
+            Err(SessionHandoffError::Invalid(_))
+        ));
+        assert_eq!(
+            service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap()
+                .transition_seq,
+            handoff.transition_seq
+        );
+        if with_execution {
+            let next_checkpoint = format!("next-{suffix}");
+            let next_payload = serde_json::to_string(&crate::runs::DurableExecutionHandoff::V1 {
+                producer_run_id: competing_run.clone(),
+                producer_owner_generation: 1,
+                heavy: json!({"opaque_runtime_payload": [4, 5, 6]}),
+            })
+            .unwrap();
+            let next_checkpoint = if recovering {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id("handoff-recovery-test");
+                if matches!(scenario, GracefulScenario::RecoveredAncestorCancellation) {
+                    let parent = format!("parent-{suffix}");
+                    sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status) VALUES (?, ?, ?, ?, ?, 0, 'paused')")
+                        .bind(&parent).bind(&key.owner_user_id).bind(&key.session_id).bind(&parent).bind(&parent)
+                        .execute(pool.get()).await.unwrap();
+                    sqlx::query("UPDATE agent_runs SET parent_run_id = ?, root_run_id = ?, ancestor_path = ?, depth = 1 WHERE user_id = ? AND run_id = ?")
+                        .bind(&parent).bind(&parent).bind(format!("{parent}/{competing_run}"))
+                        .bind(&key.owner_user_id).bind(&competing_run).execute(pool.get()).await.unwrap();
+                }
+                sqlx::query("UPDATE agent_runs SET status = 'running', owner_pod_id = 'handoff-recovery-test', owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+                    .bind(&key.owner_user_id).bind(&competing_run).execute(pool.get()).await.unwrap();
+                let receipt = store
+                    .save_checkpoint(crate::runs::RunCheckpointWriteRequest {
+                        user_id: &key.owner_user_id,
+                        expected_session_id: &key.session_id,
+                        run_id: &competing_run,
+                        checkpoint_json: &next_payload,
+                        authority: crate::runs::CheckpointWriteAuthority::ExecutionOwner {
+                            expected_owner_generation: 1,
+                        },
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut last_claim = None;
+                for expected_generation in 2..=4 {
+                    let claim = store
+                        .claim_exact_recovery_candidate_for_test(&key.owner_user_id, &competing_run)
+                        .await
+                        .unwrap();
+                    assert_eq!(claim.run.run_generation, expected_generation);
+                    last_claim = Some(claim);
+                }
+                let recovered = store
+                    .reconcile_execution_handoff(&last_claim.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered.run.status, "paused");
+                assert_eq!(recovered.run.run_generation, 4);
+                assert_eq!(
+                    recovered.run.checkpoint_json.as_deref(),
+                    Some(next_payload.as_str())
+                );
+                receipt.checkpoint_id
+            } else {
+                sqlx::query(
+                "INSERT INTO run_checkpoints
+                 (checkpoint_id, run_id, user_id, session_id, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json)
+                 VALUES (?, ?, ?, ?, 'execution_handoff', 'execution_handoff_v1', ?, ?)",
+            )
+            .bind(&next_checkpoint).bind(&competing_run)
+            .bind(&key.owner_user_id).bind(&key.session_id)
+            .bind(format!("checkpoint:{competing_run}:execution_handoff:1"))
+            .bind(next_payload).execute(pool.get()).await.unwrap();
+                next_checkpoint
+            };
+            exact.patch.watermarks.as_mut().unwrap().run_generation = Some(1);
+            exact.patch.watermarks.as_mut().unwrap().checkpoint_id = Some(next_checkpoint);
+        }
         handoff = service
-            .transition_handoff(&TransitionSessionHandoffV1 {
-                idempotency_key: "checkpoint".into(),
-                key: key.clone(),
-                handoff_id: handoff.handoff_id.clone(),
-                expected_state: handoff.state,
-                expected_transition_seq: handoff.transition_seq,
-                next_state: SessionHandoffStateV1::Checkpointed,
-                patch: HandoffTransitionPatchV1 {
-                    watermarks: Some(HandoffOperationWatermarksV1 {
-                        checkpoint_id: Some("checkpoint-1".into()),
-                        effect_cursor: Some("effect-1".into()),
-                        ..HandoffOperationWatermarksV1::default()
-                    }),
-                    ..HandoffTransitionPatchV1::default()
-                },
+            .transition_handoff(if with_execution {
+                &exact
+            } else {
+                &checkpoint_request
             })
             .await
             .expect("checkpoint handoff");
@@ -1813,6 +3255,7 @@ mod tests {
                 &key,
                 &handoff.handoff_id,
                 Some(source_lease.clone()),
+                None,
                 Duration::from_secs(60),
                 "fence",
             )
@@ -1831,6 +3274,62 @@ mod tests {
             })
             .await
             .expect("hydrate target");
+        if invalidate_before_activation {
+            if matches!(scenario, GracefulScenario::RecoveredNewActivity) {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone())
+                    .with_owner_pod_id("handoff-recovery-test");
+                store
+                    .append_event(
+                        &key.owner_user_id,
+                        &key.session_id,
+                        &competing_run,
+                        json!({"event_type":"tool_result", "data":{"result":"new activity"}}),
+                    )
+                    .await
+                    .unwrap();
+            } else if matches!(scenario, GracefulScenario::RecoveredAncestorCancellation) {
+                let store = crate::runs::DatabaseRunStateStore::new(pool.clone());
+                assert!(
+                    store
+                        .request_run_cancellation(&key.owner_user_id, &format!("parent-{suffix}"))
+                        .await
+                        .unwrap()
+                );
+            } else {
+                sqlx::query("UPDATE agent_runs SET run_generation = run_generation + 1 WHERE user_id = ? AND run_id = ?")
+                .bind(&key.owner_user_id).bind(&competing_run)
+                .execute(pool.get()).await.unwrap();
+            }
+            let target_before = service
+                .load_attachment(&key, &target_attachment.attachment_id)
+                .await
+                .unwrap();
+            assert!(matches!(
+                service
+                    .activate_handoff(
+                        &key,
+                        &handoff.handoff_id,
+                        handoff.transition_seq,
+                        "activate"
+                    )
+                    .await,
+                Err(SessionHandoffError::Invalid(_))
+            ));
+            let persisted = service
+                .load_handoff(&key, &handoff.handoff_id)
+                .await
+                .unwrap();
+            assert_eq!(persisted.state, SessionHandoffStateV1::Hydrating);
+            assert_eq!(persisted.transition_seq, handoff.transition_seq);
+            let target_after = service
+                .load_attachment(&key, &target_attachment.attachment_id)
+                .await
+                .unwrap();
+            assert_eq!(target_after.mode, target_before.mode);
+            assert_eq!(target_after.mode, SessionAttachmentModeV1::ReadOnly);
+            cleanup(&pool, &key).await;
+            return;
+        }
         handoff = service
             .activate_handoff(
                 &key,
@@ -1859,12 +3358,27 @@ mod tests {
             SessionAttachmentModeV1::Controller
         );
         assert!(matches!(
+            service
+                .detach_read_only(&key, &target_attachment.attachment_id)
+                .await,
+            Err(SessionHandoffError::AttachmentControlsBranch)
+        ));
+        service
+            .detach_read_only(&key, &source_attachment.attachment_id)
+            .await
+            .expect("detach demoted source reader");
+        service
+            .detach_read_only(&key, &source_attachment.attachment_id)
+            .await
+            .expect("replay source detach");
+        assert!(matches!(
             coordinator
                 .reserve_turn(
                     &source_lease,
                     Some(&cursor),
                     Duration::from_secs(10),
                     "stale-source-turn",
+                    None,
                 )
                 .await,
             Err(SessionContextCoordinatorError::Fenced)
@@ -1876,6 +3390,7 @@ mod tests {
                     Some(&cursor),
                     Duration::from_secs(10),
                     "target-turn",
+                    None,
                 )
                 .await
                 .expect("target reserve"),
@@ -1914,6 +3429,260 @@ mod tests {
                 .any(|event| event.outcome == "stale_fenced"),
             "the rejected old-writer reservation must remain causally queryable"
         );
+        cleanup(&pool, &key).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn forced_handoff_seals_server_derived_effects_before_hydration() {
+        let pool = setup_handoff_db_it().await;
+        let suffix = Uuid::new_v4();
+        let key = SessionKeyV1::owner_session(
+            "forced-handoff-it",
+            format!("owner-{suffix}"),
+            format!("session-{suffix}"),
+            "main",
+        );
+        cleanup(&pool, &key).await;
+        let coordinator: Arc<dyn SessionContextCoordinator> =
+            Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
+        let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
+        let source_actor = actor(&key.owner_user_id, "forced-source");
+        create_session_root(&pool, &key).await;
+        let target_actor = actor(&key.owner_user_id, "forced-target");
+        let _source_lease = acquired(
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &source_actor,
+                    Duration::from_secs(60),
+                    "forced-source-acquire",
+                )
+                .await
+                .expect("acquire source writer"),
+        );
+        let source = service
+            .attach_read_only(
+                &AttachSessionRequestV1 {
+                    idempotency_key: "forced-source-attachment".into(),
+                    key: key.clone(),
+                    actor: source_actor,
+                    placement: SessionPlacementV1::Cli,
+                    after_manifest_root: None,
+                    workspace: None,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("attach source")
+            .attachment;
+        let target = service
+            .attach_read_only(
+                &AttachSessionRequestV1 {
+                    idempotency_key: "forced-target-attachment".into(),
+                    key: key.clone(),
+                    actor: target_actor.clone(),
+                    placement: SessionPlacementV1::Cli,
+                    after_manifest_root: None,
+                    workspace: None,
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("attach target")
+            .attachment;
+        let mut handoff = service
+            .request_handoff(
+                &RequestSessionHandoffV1 {
+                    idempotency_key: "forced-request".into(),
+                    key: key.clone(),
+                    mode: SessionHandoffModeV1::Forced,
+                    from_attachment_id: Some(source.attachment_id),
+                    to_attachment_id: target.attachment_id.clone(),
+                    from_placement: SessionPlacementV1::Cli,
+                    to_placement: SessionPlacementV1::Cli,
+                    target_actor,
+                    base_cursor: None,
+                    authority_epochs: AuthorityEpochsV1::default(),
+                    workspace: None,
+                    watermarks: HandoffOperationWatermarksV1::default(),
+                    risk: HandoffRiskEvidenceV1 {
+                        forced_authorization_id: Some("consumed-reauth:test".into()),
+                        ..HandoffRiskEvidenceV1::default()
+                    },
+                    reason: "replace unavailable controller".into(),
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("request forced handoff");
+        handoff = service
+            .transition_handoff(&TransitionSessionHandoffV1 {
+                idempotency_key: "forced-validate".into(),
+                key: key.clone(),
+                handoff_id: handoff.handoff_id.clone(),
+                expected_state: SessionHandoffStateV1::Requested,
+                expected_transition_seq: handoff.transition_seq,
+                next_state: SessionHandoffStateV1::Validating,
+                patch: HandoffTransitionPatchV1::default(),
+            })
+            .await
+            .expect("validate forced handoff");
+        let fenced = service
+            .fence_writer(
+                &key,
+                &handoff.handoff_id,
+                None,
+                None,
+                Duration::from_secs(60),
+                "forced-fence",
+            )
+            .await
+            .expect("fence forced writer")
+            .handoff;
+        assert!(!fenced.risk.effects_are_sealed());
+
+        let run_id = format!("run-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, '', 0, 'running')",
+        )
+        .bind(&run_id)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .expect("insert active run");
+        let dispatched_identity = format!("sha256:{}", "a".repeat(64));
+        let prepared_identity = format!("sha256:{}", "b".repeat(64));
+        for (invocation_id, identity_key, state, certainty, attempt_count) in [
+            (
+                "dispatched-effect",
+                dispatched_identity.as_str(),
+                "dispatched",
+                "dispatched",
+                1_i64,
+            ),
+            (
+                "never-dispatched",
+                prepared_identity.as_str(),
+                "prepared",
+                "not_dispatched",
+                0_i64,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_invocation_ledger
+                 (user_id, session_id, run_id, turn_chain_id, invocation_id,
+                  identity_key, fingerprint_json, decision_json, state,
+                  dispatch_certainty, attempt_count)
+                 VALUES (?, ?, ?, 'turn-1', ?, ?, '{}', '{}', ?, ?, ?)",
+            )
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&run_id)
+            .bind(invocation_id)
+            .bind(identity_key)
+            .bind(state)
+            .bind(certainty)
+            .bind(attempt_count)
+            .execute(pool.get())
+            .await
+            .expect("insert invocation evidence");
+        }
+
+        let hydrate_request = TransitionSessionHandoffV1 {
+            idempotency_key: "forced-hydrate".into(),
+            key: key.clone(),
+            handoff_id: fenced.handoff_id.clone(),
+            expected_state: SessionHandoffStateV1::Fenced,
+            expected_transition_seq: fenced.transition_seq,
+            next_state: SessionHandoffStateV1::Hydrating,
+            patch: HandoffTransitionPatchV1::default(),
+        };
+        assert!(matches!(
+            service.transition_handoff(&hydrate_request).await,
+            Err(SessionHandoffError::ActiveRunsRemain { run_id: active }) if active == run_id
+        ));
+        assert_eq!(
+            service
+                .load_handoff(&key, &fenced.handoff_id)
+                .await
+                .expect("load blocked handoff")
+                .state,
+            SessionHandoffStateV1::Fenced,
+            "failed sealing must not partially advance the handoff"
+        );
+        let dispatched_state: String = sqlx::query_scalar(
+            "SELECT state FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND identity_key = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&dispatched_identity)
+        .fetch_one(pool.get())
+        .await
+        .expect("load pre-seal invocation");
+        assert_eq!(dispatched_state, "dispatched");
+
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'cancelled'
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .expect("stop active run");
+        handoff = service
+            .transition_handoff(&hydrate_request)
+            .await
+            .expect("seal effects and hydrate");
+        assert_eq!(handoff.state, SessionHandoffStateV1::Hydrating);
+        assert!(handoff.risk.effects_are_sealed());
+        assert_eq!(
+            handoff.risk.unknown_effect_invocation_ids,
+            vec![dispatched_identity.clone()]
+        );
+        assert_eq!(
+            handoff.status_detail.as_deref(),
+            Some("forced_effects_sealed")
+        );
+        let states: Vec<(String, String)> = sqlx::query_as(
+            "SELECT identity_key, state FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? ORDER BY identity_key",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .fetch_all(pool.get())
+        .await
+        .expect("load sealed ledger");
+        assert_eq!(
+            states,
+            vec![
+                (dispatched_identity, "outcome_unknown".into()),
+                (prepared_identity, "prepared".into()),
+            ]
+        );
+        let replay = service
+            .transition_handoff(&hydrate_request)
+            .await
+            .expect("hydrate retry is idempotent");
+        assert_eq!(replay, handoff);
+
+        let active = service
+            .activate_handoff(
+                &key,
+                &handoff.handoff_id,
+                handoff.transition_seq,
+                "forced-activate",
+            )
+            .await
+            .expect("activate sealed target");
+        assert_eq!(active.state, SessionHandoffStateV1::Active);
         cleanup(&pool, &key).await;
     }
 }

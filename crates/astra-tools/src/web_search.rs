@@ -110,13 +110,9 @@ pub fn web_search(args: &Value) -> String {
 /// Provider admission decides whether this runs on a network-capable server or
 /// a bound edge. This function only performs the already-admitted network work;
 /// it does not alter capability routing or availability.
-pub async fn perform_web_search(
-    client: Option<&reqwest::Client>,
-    args: &Value,
-    cache_scope: &str,
-) -> ToolResult {
+pub async fn perform_web_search(args: &Value, cache_scope: &str) -> ToolResult {
     perform_web_search_with(args, |fetch_args| async move {
-        crate::web_fetch::fetch_with_cache_scope(client, &fetch_args, cache_scope).await
+        crate::web_fetch::fetch_with_cache_scope(&fetch_args, cache_scope).await
     })
     .await
 }

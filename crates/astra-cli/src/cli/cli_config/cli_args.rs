@@ -81,12 +81,6 @@ pub(crate) struct Cli {
     /// System prompt to prepend (useful with --print for scripting)
     #[arg(long = "system-prompt")]
     pub system_prompt: Option<String>,
-    /// Maximum agentic turns (useful with --print to limit cost)
-    #[arg(long = "max-turns")]
-    pub max_turns: Option<usize>,
-    /// Maximum session cost in USD before auto-exit (0 = unlimited)
-    #[arg(long = "max-budget", default_value_t = 0.0)]
-    pub max_budget: f64,
     /// Comma or space-separated list of tool names to allow (e.g. "Bash Edit Read")
     #[arg(long = "allowed-tools", num_args = 1..)]
     pub allowed_tools: Vec<String>,
@@ -110,7 +104,7 @@ pub(crate) struct Cli {
     ///
     /// Examples:
     ///   astra -p 'fix tests' --model sonnet-4-6 \
-    ///     --settings '{"token_budget":{"max_turn_input_tokens":500000}}'
+    ///     --settings '{"memory":{"retrieval_top_k":8}}'
     ///   astra --settings overrides.json
     #[arg(long = "settings", value_name = "JSON-OR-PATH")]
     pub settings: Option<String>,
@@ -215,8 +209,9 @@ pub(crate) enum Command {
     /// Team orchestration and shared context management
     #[command(alias = "teams")]
     Team(TeamArgs),
-    /// Local/cloud background task management
-    Task(TaskArgs),
+    /// Start, inspect, and continue durable Work
+    #[command(subcommand)]
+    Work(WorkSubcommand),
     /// Memory search and inspection
     #[command(alias = "memories")]
     Memory(MemoryArgs),
@@ -261,6 +256,25 @@ impl Command {
             }
             _ => CliProfileIdentityAdmission::RequireBoundAccount,
         }
+    }
+}
+
+impl Cli {
+    /// Reject the ambiguous `astra <unknown> --help` shape before it can be
+    /// interpreted as a direct model message and appended to a session.
+    /// Direct-message shorthand remains supported; command-looking help must
+    /// fail fast because its natural meaning is CLI discovery, not chat.
+    pub(crate) fn validate_external_message_shorthand(&self) -> Result<(), String> {
+        let Some(Command::Message(words)) = self.command.as_ref() else {
+            return Ok(());
+        };
+        if words.len() == 2 && matches!(words[1].as_str(), "--help" | "-h") {
+            return Err(format!(
+                "unknown command `{}`; run `astra --help` to list commands, or use `astra chat -m ...` for an explicit message",
+                words[0]
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -316,7 +330,9 @@ pub(crate) struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_help = "Examples:\n  astra login --username alice --password secret")]
+#[command(
+    after_help = "Examples:\n  astra login\n  astra login --manual\n  astra login --username alice --password secret"
+)]
 pub(crate) struct LoginArgs {
     /// Username to log in with
     #[arg(long)]
@@ -324,6 +340,9 @@ pub(crate) struct LoginArgs {
     /// Password to log in with
     #[arg(long)]
     pub password: Option<String>,
+    /// Enter a Memoria connection key instead of opening the browser
+    #[arg(long)]
+    pub manual: bool,
 }
 
 #[derive(Args, Debug)]
@@ -369,7 +388,10 @@ pub(crate) struct ServeHttpArgs {
 )]
 pub(crate) struct ChatArgs {
     /// Chat message text
-    #[arg(short = 'm', long = "message")]
+    // A task, shell snippet, diff, or Markdown list commonly begins with a
+    // hyphen.  Treat the next token as the explicit `--message` value rather
+    // than attempting to parse it as another CLI option.
+    #[arg(short = 'm', long = "message", allow_hyphen_values = true)]
     pub message: Option<String>,
     /// Existing session id to continue
     #[arg(long)]
@@ -417,11 +439,19 @@ pub(crate) struct ChatArgs {
     /// Append extra context to the system prompt (used by gateway)
     #[arg(long = "append-system-prompt", hide = true)]
     pub append_system_prompt: Option<String>,
-    /// Emit structured JSONL events to stderr for gateway integration.
-    /// Each line is a JSON object with a "type" field (token, thinking,
-    /// tool_started, tool_completed, status).
-    #[arg(long = "stream-events", hide = true, default_value_t = false)]
-    pub stream_events: bool,
+    /// Write structured JSONL events to this dedicated machine-event file.
+    /// stderr remains a diagnostic channel and is never part of the JSONL
+    /// protocol.
+    #[arg(long = "stream-events", hide = true, value_name = "PATH")]
+    pub stream_events: Option<PathBuf>,
+    /// Bound a one-shot turn's execution time so cancellation and terminal
+    /// serialization finish before an external process supervisor intervenes.
+    #[arg(
+        long = "max-wall-time-seconds",
+        hide = true,
+        value_parser = clap::value_parser!(u64).range(71..)
+    )]
+    pub max_wall_time_seconds: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -521,106 +551,48 @@ pub(crate) struct TeamRestoreArgs {
     pub snapshot_id: String,
 }
 
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra task list\n  astra task pending\n  astra task run 在当前目录补一个最小登录页\n  astra task result abc12345"
-)]
-pub(crate) struct TaskArgs {
-    #[command(subcommand)]
-    pub command: Option<TaskSubcommand>,
-}
-
 #[derive(Subcommand, Debug)]
-pub(crate) enum TaskSubcommand {
-    /// List recent background tasks
-    List,
-    /// List claimable task queue (oldest first)
-    Pending,
-    /// Show task status and details
-    Status(TaskQueryArgs),
-    /// Run a headless background task with the agent
-    Run(TaskRunArgs),
-    /// Queue an API-backed cloud task without executing it locally (cloud-agent ops)
-    #[command(hide = true)]
-    Queue(TaskQueueArgs),
-    /// Claim and execute queued API-backed cloud tasks (cloud-agent ops)
-    #[command(hide = true)]
-    Worker(TaskWorkerArgs),
-    /// Show the result of a background task
-    Result(TaskResultArgs),
+pub(crate) enum WorkSubcommand {
+    /// Create a Work and start its server-owned developer loop
+    Start(WorkStartArgs),
+    /// Show the current Goal, delivery state, and canonical Task Graph
+    Show(WorkShowArgs),
+    /// Continue a Work branch with guidance or a new constraint
+    Continue(WorkContinueArgs),
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskRunArgs {
-    /// Output task result and metadata as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-    /// Suppress progress output; only print the final answer
-    #[arg(long, default_value_t = false)]
-    pub quiet: bool,
-    /// Emit structured JSONL lifecycle/stream events to stderr
-    #[arg(long = "stream-events", hide = true, default_value_t = false)]
-    pub stream_events: bool,
-    /// Task prompt
+pub(crate) struct WorkStartArgs {
+    /// Explicit user-authored Done-when criterion; may be repeated
+    #[arg(long = "done-when")]
+    pub done_when: Vec<String>,
+    /// Desired outcome
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub text: Vec<String>,
+    pub goal: Vec<String>,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskQueueArgs {
-    /// Output queued task metadata as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-    /// Task prompt to queue
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub text: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TaskWorkerArgs {
-    /// Edge agent identifier used for task leases
+pub(crate) struct WorkShowArgs {
+    /// Public Work identity
+    pub work_id: String,
+    /// Inspect a non-delivery branch
     #[arg(long)]
-    pub agent_id: Option<String>,
-    /// Claim and execute at most one task, then exit
-    #[arg(long, default_value_t = false)]
-    pub once: bool,
-    /// Keep polling for work until interrupted
-    #[arg(long = "loop", default_value_t = false)]
-    pub loop_mode: bool,
-    /// Seconds to wait between polls when --loop is set
-    #[arg(long, default_value_t = 5)]
-    pub poll_seconds: u64,
-    /// Lease TTL in seconds
-    #[arg(long, default_value_t = 900)]
-    pub ttl_seconds: i64,
-    /// Output lifecycle metadata as JSON
+    pub branch: Option<String>,
+    /// Print the exact JSON observation and Task Graph
     #[arg(long, default_value_t = false)]
     pub json: bool,
-    /// Suppress task output while the worker runs
-    #[arg(long, default_value_t = false)]
-    pub quiet: bool,
-    /// Emit structured JSONL lifecycle/stream events to stderr while
-    /// executing the claimed task. Useful for a supervising process
-    /// (e.g. cloud agent) to tail worker progress.
-    #[arg(long = "stream-events", hide = true, default_value_t = false)]
-    pub stream_events: bool,
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct TaskQueryArgs {
-    /// Task id or title query
+pub(crate) struct WorkContinueArgs {
+    /// Public Work identity
+    pub work_id: String,
+    /// Continue a non-delivery branch
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Guidance, correction, or additional constraint
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub query: Vec<String>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct TaskResultArgs {
-    /// Output result as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-    /// Task id or title query
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-    pub query: Vec<String>,
+    pub message: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -893,20 +865,37 @@ pub(crate) enum BugSubcommand {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
+    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000\n  astra session cancel 550e8400-e29b-41d4-a716-446655440000\n  astra session capture latest\n  astra session capture download --output llm_capture.json"
 )]
 pub(crate) enum SessionCmd {
+    /// Evaluate supplied evidence with one governed, tool-free model invocation
+    Judge(SessionJudgeArgs),
     /// List sessions
     List(SessionListArgs),
     /// Show session details
     Show(SessionShowArgs),
     /// Close an active session
     Close(SessionShowArgs),
+    /// Cancel active runs in a session and mark it cancelled
+    Cancel(SessionShowArgs),
     /// Delete a session record
     Delete(SessionShowArgs),
     /// Inspect or download session-scoped LLM captures
     #[command(subcommand)]
     Capture(SessionCaptureCmd),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SessionJudgeArgs {
+    /// Rubric and evidence to evaluate (not an agent task to execute)
+    #[arg(short, long)]
+    pub message: String,
+    /// Active Server model selector
+    #[arg(long)]
+    pub model: String,
+    /// Server-owned provider deadline in seconds
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=120))]
+    pub timeout_seconds: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1040,12 +1029,45 @@ pub(crate) struct SessionShowArgs {
 }
 
 #[derive(Subcommand, Debug)]
-#[command(after_help = "Examples:\n  astra model list\n  astra model show gpt-4o")]
+#[command(
+    after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
+)]
 pub(crate) enum ModelCmd {
     /// List available models
     List,
+    /// Add a personal Cloud BYOK model
+    Add(ModelAddArgs),
     /// Show model details
     Show(ModelShowArgs),
+    /// Check a personal model credential and endpoint
+    Probe(ModelShowArgs),
+    /// Delete a personal Cloud BYOK model
+    Delete(ModelShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelAddArgs {
+    /// Configuration alias used with chat --model (wizard default: provider model ID)
+    #[arg(value_name = "ALIAS")]
+    pub name: Option<String>,
+    /// Model provider (omit to choose interactively)
+    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible"])]
+    pub provider: Option<String>,
+    /// Exact model ID from your provider's API documentation (not the Astra alias)
+    #[arg(long)]
+    pub model: Option<String>,
+    /// HTTPS API base URL, required for openai-compatible
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Read the API key from standard input
+    #[arg(long)]
+    pub api_key_stdin: bool,
+    /// Make this the default model for the current user
+    #[arg(long)]
+    pub default: bool,
+    /// Model context-window size in tokens
+    #[arg(long, default_value_t = 128_000)]
+    pub context_window: i32,
 }
 
 #[derive(Args, Debug)]
@@ -1397,4 +1419,146 @@ pub(crate) struct ConfigShowPolicyArgs {
     /// Emit the resolved policy as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
+    use clap::Parser;
+
+    #[test]
+    fn session_judge_is_an_explicit_command_with_a_bounded_provider_deadline() {
+        let args = [
+            "astra",
+            "session",
+            "judge",
+            "--model",
+            "judge-model",
+            "-m",
+            "evaluate evidence",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session(SessionCmd::Judge(_)))
+        ));
+        for invalid in ["0", "121"] {
+            assert!(
+                Cli::try_parse_from(args.into_iter().chain(["--timeout-seconds", invalid]))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn session_cancel_is_a_distinct_lifecycle_command() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "session",
+            "cancel",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ])
+        .expect("session cancel command");
+        let Some(Command::Session(SessionCmd::Cancel(args))) = cli.command else {
+            panic!("expected SessionCmd::Cancel")
+        };
+        assert_eq!(args.session_id, "550e8400-e29b-41d4-a716-446655440000");
+    }
+
+    #[test]
+    fn work_commands_are_typed_and_do_not_reinterpret_goal_or_guidance() {
+        let start = Cli::try_parse_from([
+            "astra",
+            "work",
+            "start",
+            "--done-when",
+            "targeted tests pass",
+            "implement",
+            "the",
+            "feature",
+        ])
+        .expect("Start Work");
+        let Some(Command::Work(WorkSubcommand::Start(start))) = start.command else {
+            panic!("expected typed Start Work")
+        };
+        assert_eq!(start.done_when, ["targeted tests pass"]);
+        assert_eq!(start.goal, ["implement", "the", "feature"]);
+
+        let continuation = Cli::try_parse_from([
+            "astra", "work", "continue", "work-1", "--branch", "branch-2", "cancel", "the",
+            "obsolete", "path",
+        ])
+        .expect("Continue Work");
+        let Some(Command::Work(WorkSubcommand::Continue(continuation))) = continuation.command
+        else {
+            panic!("expected typed Continue Work")
+        };
+        assert_eq!(continuation.branch.as_deref(), Some("branch-2"));
+        assert_eq!(continuation.message, ["cancel", "the", "obsolete", "path"]);
+    }
+
+    #[test]
+    fn unknown_command_help_cannot_become_a_model_message() {
+        for help in ["--help", "-h"] {
+            let cli = Cli::try_parse_from(["astra", "history", help]).unwrap();
+            let error = cli
+                .validate_external_message_shorthand()
+                .expect_err("command-looking help must fail before session dispatch");
+            assert!(error.contains("unknown command `history`"));
+        }
+
+        let message = Cli::try_parse_from(["astra", "explain", "history", "please"]).unwrap();
+        assert!(message.validate_external_message_shorthand().is_ok());
+    }
+
+    #[test]
+    fn personal_byok_model_add_is_a_typed_user_command() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "deepseek",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+            "--api-key-stdin",
+            "--default",
+        ])
+        .expect("personal model add command");
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("expected ModelCmd::Add")
+        };
+        assert_eq!(args.name.as_deref(), Some("deepseek"));
+        assert_eq!(args.provider.as_deref(), Some("deepseek"));
+        assert_eq!(args.model.as_deref(), Some("deepseek-chat"));
+        assert!(args.api_key_stdin);
+        assert!(args.default);
+        assert_eq!(args.context_window, 128_000);
+    }
+
+    #[test]
+    fn personal_byok_supports_wizard_and_compatible_flags() {
+        assert!(Cli::try_parse_from(["astra", "model", "add"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "gateway",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://gateway.example/v1",
+            "--model",
+            "custom-model",
+            "--api-key-stdin",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("model add")
+        };
+        assert_eq!(args.base_url.as_deref(), Some("https://gateway.example/v1"));
+        assert_eq!(args.provider.as_deref(), Some("openai-compatible"));
+        assert!(Cli::try_parse_from(["astra", "model", "add", "--provider", "unknown"]).is_err());
+    }
 }

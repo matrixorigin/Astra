@@ -16,7 +16,7 @@ use crate::cli::session::{
         self, install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
     },
     session_recovery,
-    session_runtime::{self, PipelineModules, print_session_banner},
+    session_runtime::{self, PipelineModules, print_session_banner, resolved_session_project_root},
     session_state::SessionState,
 };
 use crate::cli::slash::slash_session;
@@ -38,6 +38,8 @@ pub(crate) struct GoalSteeringChange {
     pub previous_goal: Option<String>,
     pub turn: u32,
 }
+
+type SessionMemoryEventSink = dyn Fn(&session_journal::JournalEvent, &str) + Send + Sync + 'static;
 
 pub(crate) fn steer_observability_goal(
     _state: &mut SessionState,
@@ -204,6 +206,23 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
                 false,
             ),
         };
+    // A process can exit after the primary turn/context event is journaled but
+    // before the deferred workspace sidecar runs. Repair that deterministic
+    // recovery window from the journal so `/resume`, `/session`, and explain
+    // do not keep presenting an older context surface forever.
+    match session_runtime::latest_context_assembly_trace_from_journal(session_id) {
+        Ok(Some((trace_turn, trace))) if trace_turn >= ws.turn_count => {
+            state.latest_context_assembly_trace = Some(trace.clone());
+            ws.last_context_trace = Some(session_recovery::context_trace_signal_from_trace(&trace));
+            dirty = true;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            session_id,
+            %error,
+            "could not repair workspace context trace from the session journal"
+        ),
+    }
     if ws.status != "active" {
         ws.status = "active".to_string();
         dirty = true;
@@ -232,7 +251,6 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
         ws.total_cache_creation_tokens = ws
             .total_cache_creation_tokens
             .max(state.total_cache_creation_tokens);
-        session_recovery::sync_plan_fields_to_workspace(state, &mut ws);
         session_recovery::sync_context_trace_to_workspace(state, &mut ws);
         session_recovery::sync_session_state_to_workspace(state, &mut ws);
     }
@@ -559,54 +577,55 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
     }
 }
 
-fn build_cli_session_memory_event_sink()
--> std::sync::Arc<dyn Fn(&session_journal::JournalEvent) + Send + Sync> {
+fn build_cli_session_memory_event_sink() -> std::sync::Arc<SessionMemoryEventSink> {
     let writers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         String,
         session_journal::JournalWriter,
     >::new()));
-    std::sync::Arc::new(move |event: &session_journal::JournalEvent| {
-        let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
-            return;
-        };
-        let mut guard = match writers.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
+    std::sync::Arc::new(
+        move |event: &session_journal::JournalEvent, _user_id: &str| {
+            let Some(session_id) = event.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
+                return;
+            };
+            let mut guard = match writers.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        session_id,
+                        event_type = ?event.event_type,
+                        "session-memory journal writer cache poisoned; recovering"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let writer = match guard.entry(session_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let writer = match session_journal::JournalWriter::new(session_id) {
+                        Ok(writer) => writer,
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id,
+                                event_type = ?event.event_type,
+                                ?error,
+                                "failed to open local journal for session-memory event"
+                            );
+                            return;
+                        }
+                    };
+                    entry.insert(writer)
+                }
+            };
+            if let Err(error) = writer.append(event) {
                 tracing::warn!(
                     session_id,
                     event_type = ?event.event_type,
-                    "session-memory journal writer cache poisoned; recovering"
+                    ?error,
+                    "failed to append session-memory event to local journal"
                 );
-                poisoned.into_inner()
             }
-        };
-        let writer = match guard.entry(session_id.to_string()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let writer = match session_journal::JournalWriter::new(session_id) {
-                    Ok(writer) => writer,
-                    Err(error) => {
-                        tracing::warn!(
-                            session_id,
-                            event_type = ?event.event_type,
-                            ?error,
-                            "failed to open local journal for session-memory event"
-                        );
-                        return;
-                    }
-                };
-                entry.insert(writer)
-            }
-        };
-        if let Err(error) = writer.append(event) {
-            tracing::warn!(
-                session_id,
-                event_type = ?event.event_type,
-                ?error,
-                "failed to append session-memory event to local journal"
-            );
-        }
-    })
+        },
+    )
 }
 
 async fn build_cli_session_memory_extractor(
@@ -726,7 +745,11 @@ pub(crate) async fn complete_session_startup(
 
     tracer.phase("config_load");
 
-    let pipeline_modules = session_runtime::create_tui_pipeline_modules(api, profile);
+    let pipeline_modules = session_runtime::create_tui_pipeline_modules(
+        api,
+        profile,
+        resolved_session_project_root().as_deref(),
+    );
     tracer.phase("pipeline_modules");
 
     // Load cross-session tool-health state from local files.
@@ -1277,6 +1300,67 @@ mod tests {
                 .as_ref()
                 .map(|trace| trace.turn_id.as_str()),
             Some("turn-7")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn initialize_journal_repairs_workspace_context_trace_from_journal() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("workspace-context-recovery-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: "turn-3".into(),
+            session_id: sid.clone(),
+            ..Default::default()
+        };
+        writer
+            .append(&session_journal::JournalEvent::context_assembly_recorded(
+                Some(&sid),
+                3,
+                trace.to_json_value(),
+            ))
+            .unwrap();
+
+        let mut workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        workspace.turn_count = 3;
+        workspace.last_context_trace =
+            Some(astra_services::session_workspace::ContextTraceSignal {
+                turn_id: "turn-1".into(),
+                captured_at: None,
+                tool_surface: None,
+                memory: None,
+                history: None,
+                budget: None,
+                timing: None,
+                explanations: Vec::new(),
+            });
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let mut state = SessionState::default();
+        initialize_journal(&mut state, &sid);
+
+        let persisted = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(
+            persisted
+                .last_context_trace
+                .as_ref()
+                .map(|trace| trace.turn_id.as_str()),
+            Some("turn-3")
+        );
+        assert_eq!(
+            state
+                .latest_context_assembly_trace
+                .as_ref()
+                .map(|trace| trace.turn_id.as_str()),
+            Some("turn-3")
         );
     }
 

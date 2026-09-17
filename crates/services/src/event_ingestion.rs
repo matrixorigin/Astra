@@ -1522,15 +1522,16 @@ impl EventIngestionWorker {
             std::collections::BTreeSet::<(String, String)>::new();
         for ((user_id, session_id), session_events) in grouped_events {
             let session_event_count = session_events.len();
-            let foreign_owner: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id <> ? LIMIT 1",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("session owner check for {user_id}/{session_id}: {e}"))?;
-            if foreign_owner.is_some() {
+            // BTreeMap iteration provides one deterministic lock order for
+            // the shared session-child admission protocol.
+            if let Err(error) =
+                crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
+            {
+                if !matches!(error, sqlx::Error::RowNotFound) {
+                    return Err(format!(
+                        "session admission check for {user_id}/{session_id}: {error}"
+                    ));
+                }
                 outcome.events_dropped_permanent = outcome
                     .events_dropped_permanent
                     .checked_add(session_event_count)
@@ -1543,7 +1544,7 @@ impl EventIngestionWorker {
                     user_id = %user_id,
                     session_id = %session_id,
                     event_count = session_event_count,
-                    "dropping ingestion events for a session_id owned by another user"
+                    "dropping ingestion events rejected by durable session admission"
                 );
                 continue;
             }
@@ -2291,6 +2292,33 @@ mod tests {
         assert_eq!(usage["cache_creation_tokens"], 0);
         assert_eq!(usage["output_tokens"], 200);
         assert_eq!(usage["total_tokens"], 700);
+    }
+
+    #[test]
+    fn trace_span_duration_is_preserved_for_the_database_latency_index() {
+        let journal = crate::session_journal::TraceSpanBuilder::default()
+            .session_id(Some("sess-trace-phase"))
+            .turn(Some(3))
+            .span_id("model-inference-3".to_string())
+            .name("model_inference".to_string())
+            .start_us(2_000)
+            .end_us(18_999)
+            .build();
+        let ingestion =
+            IngestionEvent::from_journal_event(&journal, "user-1").expect("valid trace span");
+        let values = IngestionEventInsertValues::from_event(&ingestion)
+            .expect("trace span database projection");
+
+        assert_eq!(ingestion.event_type, "trace_span");
+        assert_eq!(values.meta_duration_ms, Some(16));
+        assert_eq!(
+            ingestion
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("duration_us")),
+            Some(&serde_json::json!(16_999)),
+            "the indexed milliseconds must not replace the exact trace duration"
+        );
     }
 
     #[test]

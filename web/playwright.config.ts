@@ -1,5 +1,19 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// Playwright probes and drives a loopback-only server. Developer machines may
+// define an HTTP proxy without a matching bypass, which would turn readiness
+// checks into remote 503s and hide the actual browser result behind a timeout.
+const proxyBypass = new Set(
+  [process.env.NO_PROXY, process.env.no_proxy]
+    .flatMap((value) => value?.split(',') ?? [])
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
+proxyBypass.add('127.0.0.1');
+proxyBypass.add('localhost');
+process.env.NO_PROXY = [...proxyBypass].join(',');
+process.env.no_proxy = process.env.NO_PROXY;
+
 export default defineConfig({
   testDir: './e2e',
   timeout: 30_000,

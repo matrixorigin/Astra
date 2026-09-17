@@ -19,8 +19,6 @@ pub(crate) enum EdgeTransportAttempt {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeBoundExecutionPlan {
-    #[allow(dead_code)]
-    user_id: String,
     selected_executor_id: Option<String>,
     dispatch_request_id: String,
     identity: astra_turn_types::ToolInvocationIdentity,
@@ -39,7 +37,9 @@ pub(crate) struct EdgeBoundExecutionPlan {
 
 impl EdgeBoundExecutionPlan {
     const DEFAULT_TIMEOUT_SECS: u64 = 300;
-    const WAIT_GRACE_SECS: u64 = 10;
+    const MIN_TIMEOUT_SECS: u64 = 1;
+    const MAX_TIMEOUT_SECS: u64 = astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS;
+    const WAIT_GRACE_SECS: u64 = astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS;
 
     pub(crate) fn try_from_request_with_binding(
         request: &ToolExecutionRequest,
@@ -61,7 +61,6 @@ impl EdgeBoundExecutionPlan {
             &request.tool_call_id,
         )?;
         Ok(Self {
-            user_id: request.user_id.clone(),
             selected_executor_id: edge_executor_id(request).map(ToString::to_string),
             dispatch_request_id: identity.storage_key(),
             identity,
@@ -78,11 +77,6 @@ impl EdgeBoundExecutionPlan {
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn user_id(&self) -> &str {
-        &self.user_id
     }
 
     pub(crate) fn selected_executor_id(&self) -> Option<&str> {
@@ -119,6 +113,12 @@ impl EdgeBoundExecutionPlan {
 
     pub(crate) fn wait_timeout(&self) -> Duration {
         Duration::from_secs(self.timeout_secs.saturating_add(Self::WAIT_GRACE_SECS))
+    }
+
+    /// Deadline sent to the edge executor.  Keep this distinct from the
+    /// server-side wait grace so every layer agrees on the execution window.
+    pub(crate) fn execution_timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
@@ -168,7 +168,10 @@ fn timeout_secs_from_policy(binding: &astra_runtime_env::RunBinding) -> Option<u
     if !seconds.is_finite() {
         return None;
     }
-    Some(seconds.max(0.0).ceil().min(u64::MAX as f64) as u64)
+    Some((seconds.ceil().min(u64::MAX as f64) as u64).clamp(
+        EdgeBoundExecutionPlan::MIN_TIMEOUT_SECS,
+        EdgeBoundExecutionPlan::MAX_TIMEOUT_SECS,
+    ))
 }
 
 pub(crate) fn edge_executor_id(request: &ToolExecutionRequest) -> Option<&str> {

@@ -26,6 +26,8 @@ pub(crate) const DISTRIBUTED_ADMISSION_SCOPE: &str = "canonical_turn_v1";
 const DISTRIBUTED_ADMISSION_MAX_TTL: Duration = Duration::from_secs(15 * 60);
 const DISTRIBUTED_ADMISSION_IDEMPOTENCY_DOMAIN: &[u8] =
     b"astra.distributed-weighted-admission-idempotency.v1\0";
+const DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN: &[u8] =
+    b"astra.distributed-weighted-admission-capacity.v1\0";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdmissionWork {
@@ -96,6 +98,10 @@ pub enum DistributedAdmissionError {
     Fenced,
     #[error("distributed admission idempotency key was reused for different work")]
     IdempotencyMismatch,
+    #[error(
+        "distributed admission capacity configuration mismatch (active={active}, requested={requested})"
+    )]
+    ConfigurationMismatch { active: String, requested: String },
     #[error("distributed admission database operation {operation} failed: {source}")]
     Database {
         operation: &'static str,
@@ -130,6 +136,23 @@ impl DatabaseWeightedAdmissionController {
         Ok(Self { pool, limits })
     }
 
+    /// Replace the capacity snapshot used by subsequent reservations.
+    ///
+    /// The durable gate validates the new snapshot while its row is locked, so
+    /// changing a controller after it has been attached to a pool remains
+    /// fail-closed during a live rollout. This also keeps the public runtime
+    /// builder order-independent (`with_pool(...).with_admission_limits(...)`).
+    pub fn with_limits(
+        &mut self,
+        limits: WeightedAdmissionLimits,
+    ) -> Result<(), WeightedAdmissionError> {
+        if !limits.per_owner.fits_within(limits.global) {
+            return Err(WeightedAdmissionError::RequestExceedsGlobal);
+        }
+        self.limits = limits;
+        Ok(())
+    }
+
     /// Reserve hard capacity across all pods.
     ///
     /// The single gate row serializes only this short admission transaction.
@@ -153,16 +176,17 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_reservation", source))?;
-        let now = lock_distributed_admission_gate(&mut tx).await?;
+        let gate = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
-             WHERE scope_name = ? AND expires_at <= ?",
+             WHERE scope_name = ? AND expires_at <= NOW(6)",
         )
         .bind(DISTRIBUTED_ADMISSION_SCOPE)
-        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(|source| distributed_database_error("cleanup_expired", source))?;
+        ensure_distributed_admission_capacity(&mut tx, self.limits, gate.capacity_hash.as_deref())
+            .await?;
 
         if let Some(existing) =
             load_distributed_reservation(&mut tx, key, &idempotency_hash).await?
@@ -179,7 +203,8 @@ impl DatabaseWeightedAdmissionController {
         let (global_used, owner_used) = load_distributed_usage(&mut tx, &key.owner_user_id).await?;
         validate_available_work(self.limits, global_used, owner_used, work)?;
 
-        let expires_at = now
+        let expires_at = gate
+            .now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
             })?)
@@ -217,7 +242,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_renewal", source))?;
-        let now = lock_distributed_admission_gate(&mut tx).await?;
+        let now = lock_distributed_admission_gate(&mut tx).await?.now;
         let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
@@ -266,7 +291,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_release", source))?;
-        lock_distributed_admission_gate(&mut tx).await?;
+        let _gate = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
              WHERE scope_name = ? AND reservation_id = ?
@@ -403,11 +428,16 @@ fn validate_available_work(
     Ok(())
 }
 
+struct LockedDistributedAdmissionGate {
+    now: chrono::NaiveDateTime,
+    capacity_hash: Option<String>,
+}
+
 async fn lock_distributed_admission_gate(
     tx: &mut Transaction<'_, MySql>,
-) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
+) -> Result<LockedDistributedAdmissionGate, DistributedAdmissionError> {
     let row = sqlx::query(
-        "SELECT scope_name,
+        "SELECT capacity_hash,
                 CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
          FROM session_weighted_admission_gates
          WHERE scope_name = ? FOR UPDATE",
@@ -416,14 +446,129 @@ async fn lock_distributed_admission_gate(
     .fetch_one(&mut **tx)
     .await
     .map_err(|source| distributed_database_error("lock_gate", source))?;
+    let capacity_hash = row
+        .try_get::<Option<String>, _>("capacity_hash")
+        .map_err(|source| distributed_database_error("decode_gate_capacity_hash", source))?;
     let unix_ms = row
         .try_get::<i64, _>("database_now_unix_ms")
         .map_err(|source| distributed_database_error("decode_gate_database_time", source))?;
-    chrono::DateTime::from_timestamp_millis(unix_ms)
+    let now = chrono::DateTime::from_timestamp_millis(unix_ms)
         .map(|timestamp| timestamp.naive_utc())
         .ok_or_else(|| {
             DistributedAdmissionError::Invalid("database time is outside chrono range".into())
-        })
+        })?;
+    Ok(LockedDistributedAdmissionGate { now, capacity_hash })
+}
+
+/// Bind the durable admission scope to one capacity configuration.
+///
+/// Every server sharing this scope must use the same capacity snapshot. The
+/// first server records the snapshot; later servers fail closed while
+/// reservations are active and may adopt a new snapshot only after the active
+/// reservations have drained. A NULL hash is the uninitialized state of the
+/// current capacity protocol.
+async fn ensure_distributed_admission_capacity(
+    tx: &mut Transaction<'_, MySql>,
+    limits: WeightedAdmissionLimits,
+    active: Option<&str>,
+) -> Result<(), DistributedAdmissionError> {
+    let requested = admission_capacity_hash(limits);
+    if active == Some(requested.as_str()) {
+        return Ok(());
+    }
+    let active_reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_weighted_admission_reservations
+         WHERE scope_name = ?",
+    )
+    .bind(DISTRIBUTED_ADMISSION_SCOPE)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|source| distributed_database_error("count_capacity_reservations", source))?;
+    let transition = capacity_gate_transition(active, active_reservations, &requested);
+    let update_operation = match &transition {
+        CapacityGateTransition::Initialize => Some("initialize_capacity_configuration"),
+        CapacityGateTransition::Rotate => Some("rotate_capacity_configuration"),
+        CapacityGateTransition::Accept | CapacityGateTransition::Reject { .. } => None,
+    };
+    match transition {
+        CapacityGateTransition::Accept => Ok(()),
+        CapacityGateTransition::Reject { active, requested } => {
+            Err(DistributedAdmissionError::ConfigurationMismatch { active, requested })
+        }
+        CapacityGateTransition::Initialize | CapacityGateTransition::Rotate => {
+            sqlx::query(
+                "UPDATE session_weighted_admission_gates
+                 SET capacity_hash = ?, updated_at = NOW(6)
+                 WHERE scope_name = ?",
+            )
+            .bind(&requested)
+            .bind(DISTRIBUTED_ADMISSION_SCOPE)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                distributed_database_error(
+                    update_operation.expect("capacity update operation"),
+                    source,
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn admission_capacity_hash(limits: WeightedAdmissionLimits) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DISTRIBUTED_ADMISSION_CAPACITY_DOMAIN);
+    for value in [
+        limits.global.resident_bytes,
+        limits.global.context_tokens,
+        u64::from(limits.global.provider_slots),
+        limits.global.cpu_units,
+        limits.global.io_bytes,
+        limits.per_owner.resident_bytes,
+        limits.per_owner.context_tokens,
+        u64::from(limits.per_owner.provider_slots),
+        limits.per_owner.cpu_units,
+        limits.per_owner.io_bytes,
+    ] {
+        hasher.update(value.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityGateTransition {
+    Accept,
+    Initialize,
+    Rotate,
+    Reject { active: String, requested: String },
+}
+
+/// Decide how a locked gate row may adopt a requested capacity snapshot.
+///
+/// A NULL hash means that this scope has not initialized its capacity snapshot.
+/// It may only be initialized when no reservation is active: an active
+/// reservation has unknown provenance and must never be silently mixed with a
+/// newly declared budget.
+fn capacity_gate_transition(
+    active: Option<&str>,
+    active_reservations: i64,
+    requested: &str,
+) -> CapacityGateTransition {
+    if active == Some(requested) {
+        return CapacityGateTransition::Accept;
+    }
+    if active_reservations > 0 {
+        return CapacityGateTransition::Reject {
+            active: active.unwrap_or("unset").to_string(),
+            requested: requested.to_string(),
+        };
+    }
+    if active.is_none() {
+        CapacityGateTransition::Initialize
+    } else {
+        CapacityGateTransition::Rotate
+    }
 }
 
 async fn load_distributed_reservation(
@@ -476,33 +621,48 @@ async fn load_distributed_usage(
     tx: &mut Transaction<'_, MySql>,
     owner_user_id: &str,
 ) -> Result<(AdmissionWork, AdmissionWork), DistributedAdmissionError> {
-    let rows = sqlx::query(
-        "SELECT owner_user_id, resident_bytes, context_tokens, provider_slots,
-                cpu_units, io_bytes
+    // The gate row already serializes this transaction. Aggregate the bounded
+    // reservation set in MatrixOne so a thousand-session deployment transfers
+    // one row instead of materializing every active reservation into Rust for
+    // every admission attempt.
+    let row = sqlx::query(
+        "SELECT
+             CAST(COALESCE(SUM(resident_bytes), 0) AS CHAR) AS global_resident_bytes,
+             CAST(COALESCE(SUM(context_tokens), 0) AS CHAR) AS global_context_tokens,
+             CAST(COALESCE(SUM(provider_slots), 0) AS CHAR) AS global_provider_slots,
+             CAST(COALESCE(SUM(cpu_units), 0) AS CHAR) AS global_cpu_units,
+             CAST(COALESCE(SUM(io_bytes), 0) AS CHAR) AS global_io_bytes,
+             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN resident_bytes ELSE 0 END), 0) AS CHAR) AS owner_resident_bytes,
+             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN context_tokens ELSE 0 END), 0) AS CHAR) AS owner_context_tokens,
+             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN provider_slots ELSE 0 END), 0) AS CHAR) AS owner_provider_slots,
+             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN cpu_units ELSE 0 END), 0) AS CHAR) AS owner_cpu_units,
+             CAST(COALESCE(SUM(CASE WHEN BINARY owner_user_id = BINARY ? THEN io_bytes ELSE 0 END), 0) AS CHAR) AS owner_io_bytes,
+             CAST(COALESCE(SUM(CASE
+                 WHEN resident_bytes < 0 OR context_tokens < 0 OR provider_slots < 0
+                   OR provider_slots > 4294967295 OR cpu_units < 0 OR io_bytes < 0
+                 THEN 1 ELSE 0 END), 0) AS SIGNED) AS invalid_rows
          FROM session_weighted_admission_reservations
          WHERE scope_name = ?",
     )
+    .bind(owner_user_id)
+    .bind(owner_user_id)
+    .bind(owner_user_id)
+    .bind(owner_user_id)
+    .bind(owner_user_id)
     .bind(DISTRIBUTED_ADMISSION_SCOPE)
-    .fetch_all(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|source| distributed_database_error("load_active_usage", source))?;
-    let mut global = AdmissionWork::default();
-    let mut owner = AdmissionWork::default();
-    for row in rows {
-        let work = decode_admission_work(&row)?;
-        global = global.checked_add(work).ok_or_else(|| {
-            DistributedAdmissionError::Invalid("global admission usage overflow".into())
-        })?;
-        if row
-            .try_get::<String, _>("owner_user_id")
-            .map_err(|source| distributed_database_error("decode_usage_owner", source))?
-            == owner_user_id
-        {
-            owner = owner.checked_add(work).ok_or_else(|| {
-                DistributedAdmissionError::Invalid("owner admission usage overflow".into())
-            })?;
-        }
+    let invalid_rows: i64 = row
+        .try_get("invalid_rows")
+        .map_err(|source| distributed_database_error("decode_usage_invalid_rows", source))?;
+    if invalid_rows > 0 {
+        return Err(DistributedAdmissionError::Invalid(format!(
+            "distributed admission contains {invalid_rows} invalid stored reservation rows"
+        )));
     }
+    let global = decode_aggregate_admission_work(&row, "global_")?;
+    let owner = decode_aggregate_admission_work(&row, "owner_")?;
     Ok((global, owner))
 }
 
@@ -559,9 +719,44 @@ fn decode_admission_work(
     })
 }
 
+fn decode_aggregate_admission_work(
+    row: &sqlx::mysql::MySqlRow,
+    prefix: &str,
+) -> Result<AdmissionWork, DistributedAdmissionError> {
+    Ok(AdmissionWork {
+        resident_bytes: aggregate_admission_u64(row, &format!("{prefix}resident_bytes"))?,
+        context_tokens: aggregate_admission_u64(row, &format!("{prefix}context_tokens"))?,
+        provider_slots: u32::try_from(aggregate_admission_u64(
+            row,
+            &format!("{prefix}provider_slots"),
+        )?)
+        .map_err(|_| {
+            DistributedAdmissionError::Invalid(
+                "aggregated distributed provider slots exceed u32".into(),
+            )
+        })?,
+        cpu_units: aggregate_admission_u64(row, &format!("{prefix}cpu_units"))?,
+        io_bytes: aggregate_admission_u64(row, &format!("{prefix}io_bytes"))?,
+    })
+}
+
+fn aggregate_admission_u64(
+    row: &sqlx::mysql::MySqlRow,
+    column: &str,
+) -> Result<u64, DistributedAdmissionError> {
+    let value: String = row
+        .try_get(column)
+        .map_err(|source| distributed_database_error("decode_usage", source))?;
+    value.parse::<u64>().map_err(|_| {
+        DistributedAdmissionError::Invalid(format!(
+            "aggregated distributed admission {column} is outside u64"
+        ))
+    })
+}
+
 fn admission_u64(
     row: &sqlx::mysql::MySqlRow,
-    column: &'static str,
+    column: &str,
 ) -> Result<u64, DistributedAdmissionError> {
     let value = row
         .try_get::<i64, _>(column)
@@ -848,5 +1043,53 @@ mod tests {
             ),
             Err(WeightedAdmissionError::OwnerExhausted)
         ));
+    }
+
+    #[test]
+    fn capacity_hash_is_stable_and_changes_when_any_budget_changes() {
+        let baseline = admission_capacity_hash(limits());
+        assert_eq!(baseline, admission_capacity_hash(limits()));
+
+        let mut changed = limits();
+        changed.global.provider_slots += 1;
+        assert_ne!(baseline, admission_capacity_hash(changed));
+
+        let mut changed = limits();
+        changed.per_owner.context_tokens += 1;
+        assert_ne!(baseline, admission_capacity_hash(changed));
+    }
+
+    #[test]
+    fn capacity_gate_rejects_unknown_or_changed_budget_while_reservations_are_active() {
+        assert_eq!(
+            capacity_gate_transition(None, 1, "requested"),
+            CapacityGateTransition::Reject {
+                active: "unset".into(),
+                requested: "requested".into(),
+            }
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("active"), 1, "requested"),
+            CapacityGateTransition::Reject {
+                active: "active".into(),
+                requested: "requested".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn capacity_gate_initializes_or_rotates_only_after_reservations_drain() {
+        assert_eq!(
+            capacity_gate_transition(None, 0, "requested"),
+            CapacityGateTransition::Initialize
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("active"), 0, "requested"),
+            CapacityGateTransition::Rotate
+        );
+        assert_eq!(
+            capacity_gate_transition(Some("requested"), 999, "requested"),
+            CapacityGateTransition::Accept
+        );
     }
 }

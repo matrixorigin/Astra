@@ -1,7 +1,7 @@
 //! Message grouping by API round.
 //!
-//! Groups conversation messages into logical "rounds" — one group per LLM
-//! response (identified by the assistant message that ends each round).
+//! Groups conversation messages into logical human turns while retaining the
+//! exact assistant/tool response order inside each turn.
 //! This enables PTL (prompt-too-long) retry to drop complete rounds
 //! atomically, preserving tool_use/tool_result pairing integrity.
 
@@ -30,23 +30,52 @@ fn include_grouped_clone_measurement(measurement: &mut Option<(u64, u64)>, value
 /// response, and any tool messages that followed.
 #[derive(Debug, Clone)]
 pub struct ApiRound {
-    /// User messages that started this round (may include system injections).
-    pub user_messages: Vec<Value>,
-    /// The assistant response message.
-    pub assistant_message: Option<Value>,
-    /// Tool result messages following the assistant response.
-    pub tool_messages: Vec<Value>,
+    /// Single owned copy of the exact conversation order for this human turn.
+    /// Runtime-owned user-role controls remain here for provider-prefix reuse,
+    /// but do not start a round and are excluded by `summary_messages`.
+    ordered_messages: Vec<Value>,
 }
 
 impl ApiRound {
-    /// Flattened ordered messages for this round.
-    pub fn messages(&self) -> Vec<Value> {
-        let mut out = self.user_messages.clone();
-        if let Some(asst) = &self.assistant_message {
-            out.push(asst.clone());
+    fn empty() -> Self {
+        Self {
+            ordered_messages: Vec::new(),
         }
-        out.extend(self.tool_messages.iter().cloned());
-        out
+    }
+
+    /// Exact ordered provider-history projection for this round.
+    pub fn messages(&self) -> &[Value] {
+        &self.ordered_messages
+    }
+
+    /// Human-authored user messages only.
+    pub fn user_messages(&self) -> impl Iterator<Item = &Value> {
+        self.ordered_messages
+            .iter()
+            .filter(|message| astra_turn_types::is_human_user_message(message))
+    }
+
+    /// Most recent assistant response in this round.
+    pub fn assistant_message(&self) -> Option<&Value> {
+        self.ordered_messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+    }
+
+    /// Tool result messages in exact order.
+    pub fn tool_messages(&self) -> impl Iterator<Item = &Value> {
+        self.ordered_messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+    }
+
+    /// Semantic summary/learning projection. Runtime-owned frames never
+    /// become user intent merely because their provider wire role is `user`.
+    pub fn summary_messages(&self) -> impl Iterator<Item = &Value> {
+        self.ordered_messages
+            .iter()
+            .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
     }
 
     /// Total character count for this round (for budget estimation).
@@ -65,9 +94,11 @@ impl ApiRound {
 
 /// Group a flat message list into API rounds.
 ///
-/// Each round starts with user message(s) and ends when the next user
-/// message (or end of list) is encountered. System messages are collected
-/// as a leading preamble and returned separately.
+/// Each round starts with a human-authored user message and ends when the next
+/// human-authored user message (or end of list) is encountered. A
+/// runtime-owned `role=user` frame is a provider transport shape, not a new
+/// turn, and is excluded from the summary projection. System messages are
+/// collected as a leading preamble and returned separately.
 ///
 /// Returns `(system_messages, rounds)`.
 pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
@@ -91,43 +122,45 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
                 // system messages mid-conversation are treated as user-side injections
             }
             "user" => {
+                if !astra_turn_types::is_human_user_message(msg) {
+                    let cloned = msg.clone();
+                    include_grouped_clone_measurement(&mut clone_measurement, &cloned);
+                    current_round
+                        .get_or_insert_with(ApiRound::empty)
+                        .ordered_messages
+                        .push(cloned);
+                    continue;
+                }
                 // A new user message starts a new round (flush the current one)
                 if let Some(round) = current_round.take() {
                     rounds.push(round);
                 }
-                current_round
-                    .get_or_insert_with(|| ApiRound {
-                        user_messages: Vec::new(),
-                        assistant_message: None,
-                        tool_messages: Vec::new(),
-                    })
-                    .user_messages
-                    .push({
-                        let cloned = msg.clone();
-                        include_grouped_clone_measurement(&mut clone_measurement, &cloned);
-                        cloned
-                    });
+                current_round.get_or_insert_with(ApiRound::empty);
+                let cloned = msg.clone();
+                include_grouped_clone_measurement(&mut clone_measurement, &cloned);
+                let round = current_round
+                    .as_mut()
+                    .expect("human user initialized the current round");
+                round.ordered_messages.push(cloned);
             }
             "assistant" => {
                 let sanitized =
                     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_cloned(msg);
                 include_grouped_clone_measurement(&mut clone_measurement, &sanitized);
                 if let Some(round) = current_round.as_mut() {
-                    round.assistant_message = Some(sanitized);
+                    round.ordered_messages.push(sanitized);
                 } else {
                     // assistant without a preceding user (shouldn't happen, but handle it)
-                    current_round = Some(ApiRound {
-                        user_messages: Vec::new(),
-                        assistant_message: Some(sanitized),
-                        tool_messages: Vec::new(),
-                    });
+                    let mut round = ApiRound::empty();
+                    round.ordered_messages.push(sanitized);
+                    current_round = Some(round);
                 }
             }
             "tool" => {
                 if let Some(round) = current_round.as_mut() {
                     let cloned = msg.clone();
                     include_grouped_clone_measurement(&mut clone_measurement, &cloned);
-                    round.tool_messages.push(cloned);
+                    round.ordered_messages.push(cloned);
                 }
                 // tool without a round context is ignored
             }
@@ -156,7 +189,7 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
 pub fn flatten_rounds(system_messages: &[Value], rounds: &[ApiRound]) -> Vec<Value> {
     let mut out = system_messages.to_vec();
     for round in rounds {
-        out.extend(round.messages());
+        out.extend(round.messages().iter().cloned());
     }
     out
 }
@@ -210,9 +243,9 @@ mod tests {
         let (_, rounds) = group_by_api_round(&msgs);
         assert_eq!(rounds.len(), 1);
         let r = &rounds[0];
-        assert_eq!(r.user_messages.len(), 1);
-        assert!(r.assistant_message.is_some());
-        assert_eq!(r.tool_messages.len(), 1);
+        assert_eq!(r.user_messages().count(), 1);
+        assert!(r.assistant_message().is_some());
+        assert_eq!(r.tool_messages().count(), 1);
     }
 
     #[test]
@@ -226,8 +259,36 @@ mod tests {
         ];
         let (_, rounds) = group_by_api_round(&msgs);
         assert_eq!(rounds.len(), 2);
-        assert_eq!(rounds[0].tool_messages.len(), 1);
-        assert!(rounds[1].tool_messages.is_empty());
+        assert_eq!(rounds[0].tool_messages().count(), 1);
+        assert_eq!(rounds[1].tool_messages().count(), 0);
+    }
+
+    #[test]
+    fn runtime_user_frame_does_not_start_a_human_round_and_keeps_wire_order() {
+        let mut authority = user("runtime settlement");
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let msgs = vec![
+            user("real goal"),
+            assistant("tool decision"),
+            tool("result"),
+            authority,
+            assistant("final response"),
+        ];
+
+        let (_, rounds) = group_by_api_round(&msgs);
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].user_messages().count(), 1);
+        let flattened = rounds[0].messages();
+        assert_eq!(flattened.len(), 5);
+        assert_eq!(flattened[0]["content"], "real goal");
+        assert_eq!(flattened[1]["content"], "tool decision");
+        assert_eq!(flattened[2]["content"], "result");
+        assert!(astra_turn_types::is_runtime_owned_message(&flattened[3]));
+        assert_eq!(flattened[4]["content"], "final response");
     }
 
     #[test]
@@ -258,7 +319,7 @@ mod tests {
             json!({"role": "assistant", "content": "a", "tool_calls": []}),
         ];
         let (_, rounds) = group_by_api_round(&msgs);
-        let assistant = rounds[0].assistant_message.as_ref().unwrap();
+        let assistant = rounds[0].assistant_message().unwrap();
         assert!(assistant.get("tool_calls").is_none(), "{assistant:?}");
     }
 
@@ -289,11 +350,11 @@ mod tests {
 
         assert_eq!(system_messages[0]["content"], "系统🙂");
         assert_eq!(
-            rounds[0].user_messages[0]["metadata"]["nested"][1]["answer"],
+            rounds[0].user_messages().next().unwrap()["metadata"]["nested"][1]["answer"],
             "乙"
         );
         assert_eq!(
-            rounds[0].assistant_message.as_ref().unwrap()["tool_calls"][0]["function"]["name"],
+            rounds[0].assistant_message().unwrap()["tool_calls"][0]["function"]["name"],
             "lookup"
         );
     }
@@ -329,7 +390,12 @@ mod tests {
         let (_, rounds) = group_by_api_round(&msgs);
         let kept = drop_oldest_rounds(&rounds, 1, 1);
         assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].user_messages[0]["content"].as_str().unwrap(), "q2");
+        assert_eq!(
+            kept[0].user_messages().next().unwrap()["content"]
+                .as_str()
+                .unwrap(),
+            "q2"
+        );
     }
 
     #[test]

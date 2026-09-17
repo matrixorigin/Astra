@@ -23,6 +23,52 @@ pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
     "delegation_state",
 ];
 
+const STATE_ITEM_ID_MAX_BYTES: usize = 128;
+
+/// Builds a stable state-item identity without exceeding the storage contract.
+/// Existing readable identities are preserved; only composite identities that
+/// exceed the column limit are represented by their full SHA-256 digest.
+pub fn bounded_state_item_id(kind: &str, components: &[&str]) -> String {
+    let readable = std::iter::once("state")
+        .chain(std::iter::once(kind))
+        .chain(components.iter().copied())
+        .collect::<Vec<_>>()
+        .join("-");
+    bounded_state_item_id_from_readable(readable, kind, components)
+}
+
+fn bounded_state_item_id_from_readable(
+    readable: String,
+    kind: &str,
+    components: &[&str],
+) -> String {
+    if readable.len() <= STATE_ITEM_ID_MAX_BYTES {
+        return readable;
+    }
+
+    let mut hasher = Sha256::new();
+    for component in std::iter::once(kind).chain(components.iter().copied()) {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let categorized = format!("state-{kind}-{digest:x}");
+    if categorized.len() <= STATE_ITEM_ID_MAX_BYTES {
+        categorized
+    } else {
+        format!("state-{digest:x}")
+    }
+}
+
+fn bounded_bubble_state_item_id(source_run_id: &str, depth: u32) -> String {
+    let depth = depth.to_string();
+    bounded_state_item_id_from_readable(
+        format!("state-bubble:{source_run_id}:{depth}"),
+        "bubble",
+        &[source_run_id, &depth],
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionInvariant {
     pub id: &'static str,
@@ -150,6 +196,18 @@ pub enum StateProjectionError {
     },
     #[error("compaction invariant failed: {id} violations={violations}")]
     CompactionInvariantFailed { id: String, violations: i64 },
+    #[error("session is not active: owner={user_id}, session={session_id}")]
+    SessionNotActive { user_id: String, session_id: String },
+    #[error(
+        "personal skill version is unavailable: owner={user_id}, skill={skill_name}, version={version_id}"
+    )]
+    PersonalSkillVersionUnavailable {
+        user_id: String,
+        skill_name: String,
+        version_id: String,
+    },
+    #[error("personal skill version is not activatable: version={version_id}, status={status}")]
+    PersonalSkillVersionNotActivatable { version_id: String, status: String },
 }
 
 #[derive(Clone, Debug)]
@@ -554,7 +612,10 @@ impl DatabaseStateProjectionStore {
                 },
             })?;
         self.upsert_state_item(StateItemUpsert {
-            item_id: Some(format!("state-summary-{session_id}-{compaction_run_id}")),
+            item_id: Some(bounded_state_item_id(
+                "summary",
+                &[session_id, compaction_run_id],
+            )),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             scope: "session".to_string(),
@@ -822,7 +883,7 @@ impl DatabaseStateProjectionStore {
                 source,
             })?;
         let payload_hash = content_hash(&payload_json);
-        let item_id = format!("state-delegation-{}", record.delegation_id);
+        let item_id = bounded_state_item_id("delegation", &[&record.delegation_id]);
         let mut tx =
             self.pool
                 .get()
@@ -954,7 +1015,7 @@ impl DatabaseStateProjectionStore {
                 })?;
         for (idx, target) in targets.iter().enumerate() {
             let item_key = format!("bubble:{source_run_id}:{}", target.depth);
-            let item_id = format!("state-{item_key}");
+            let item_id = bounded_bubble_state_item_id(source_run_id, target.depth);
             let payload = json!({
                 "bubble_seq": idx + 1,
                 "severity": severity,
@@ -1085,7 +1146,7 @@ impl DatabaseStateProjectionStore {
         _llm_probe: Option<&dyn SkillActivationLlmProbe>,
     ) -> Result<(), StateProjectionError> {
         let event_id = format!("event-{}", Uuid::new_v4());
-        let item_id = format!("state-active-skill-{session_id}-{skill_name}");
+        let item_id = bounded_state_item_id("active-skill", &[session_id, skill_name]);
         let payload = json!({
             "skill_name": skill_name,
             "version_id": version_id,
@@ -1109,6 +1170,73 @@ impl DatabaseStateProjectionStore {
                     entity: session_id.to_string(),
                     source,
                 })?;
+        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
+            .await
+            .map_err(|_| StateProjectionError::SessionNotActive {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+            })?;
+        let session_status = sqlx::query(
+            "SELECT status FROM agent_sessions
+             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_session",
+            entity: session_id.to_string(),
+            source,
+        })?
+        .map(|row| row.try_get::<String, _>("status"))
+        .transpose()
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_session",
+            entity: session_id.to_string(),
+            source,
+        })?;
+        if session_status.as_deref() != Some("active") {
+            return Err(StateProjectionError::SessionNotActive {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+            });
+        }
+        let version_status = sqlx::query(
+            "SELECT status FROM user_skill_versions
+             WHERE owner_user_id = ? AND skill_name = ? AND version_id = ?
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(skill_name)
+        .bind(version_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_version",
+            entity: version_id.to_string(),
+            source,
+        })?
+        .map(|row| row.try_get::<String, _>("status"))
+        .transpose()
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_version",
+            entity: version_id.to_string(),
+            source,
+        })?;
+        let Some(version_status) = version_status else {
+            return Err(StateProjectionError::PersonalSkillVersionUnavailable {
+                user_id: user_id.to_string(),
+                skill_name: skill_name.to_string(),
+                version_id: version_id.to_string(),
+            });
+        };
+        if version_status != "published" {
+            return Err(StateProjectionError::PersonalSkillVersionNotActivatable {
+                version_id: version_id.to_string(),
+                status: version_status,
+            });
+        }
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, created_at)
@@ -1608,6 +1736,36 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_item_id_preserves_readable_identity_when_it_fits() {
+        assert_eq!(
+            bounded_state_item_id("summary", &["session-1", "run-1"]),
+            "state-summary-session-1-run-1"
+        );
+    }
+
+    #[test]
+    fn bubble_state_item_id_preserves_existing_short_format() {
+        assert_eq!(
+            bounded_bubble_state_item_id("run-1", 0),
+            "state-bubble:run-1:0"
+        );
+    }
+
+    #[test]
+    fn state_item_id_hashes_overlong_composites_stably() {
+        let session_id = "s".repeat(64);
+        let run_id = "r".repeat(68);
+        let first = bounded_state_item_id("decision", &[&session_id, &run_id, "2"]);
+        let repeated = bounded_state_item_id("decision", &[&session_id, &run_id, "2"]);
+        let next_turn = bounded_state_item_id("decision", &[&session_id, &run_id, "3"]);
+
+        assert!(first.len() <= STATE_ITEM_ID_MAX_BYTES);
+        assert!(first.starts_with("state-decision-"));
+        assert_eq!(first, repeated);
+        assert_ne!(first, next_turn);
+    }
 
     fn delegation_projection_upsert() -> DelegationProjectionUpsert {
         DelegationProjectionUpsert {

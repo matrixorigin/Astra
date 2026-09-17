@@ -22,23 +22,27 @@ pub use context::{
 };
 pub(crate) use context::{
     MODEL_FRAMING_TOKENS, PER_MESSAGE_OVERHEAD, estimate_single_message_tokens,
+    estimate_wire_input_tokens, measured_prompt_tokens_from_manifest,
 };
 pub use system::{
     CacheScope, DeferredToolsPromptBlock, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
     PromptSection, PromptTokenBucket, STALL_NUDGE, SYSTEM_PROMPT_BASE,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY, SystemPromptBuilder, apply_overrides,
-    build_deferred_tools_prompt_block_with_budget, build_deferred_tools_section,
-    build_deferred_tools_section_with_budget, build_main_system_prompt,
-    build_main_system_prompt_with_style, build_pipeline_static_sections,
+    build_deferred_tool_names_prompt_block_with_budget,
+    build_deferred_tools_prompt_block_with_budget, build_deferred_tools_section_with_budget,
+    build_main_system_prompt, build_main_system_prompt_with_style, build_pipeline_static_sections,
     build_skill_listing_section, build_skill_listing_section_for_model,
     build_skill_listing_section_with_caps,
     build_skill_listing_section_with_context_window_and_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
-    load_overrides, parallel_batching_nudge_directive, parallel_execution_feedback,
-    sections_to_string, self_awareness_prompt_section, tool_round_guidance,
-    tool_round_guidance_trace, trailing_single_tool_round_streak,
+    execution_slice_guidance, load_overrides, parallel_batching_nudge_directive,
+    parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
+    tool_round_guidance, tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
-pub(crate) use system::{self_model_section, tool_conditional_section};
+pub(crate) use system::{
+    DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION, DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION,
+    tool_conditional_section,
+};
 
 #[cfg(test)]
 mod tests {
@@ -67,12 +71,16 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("Reuse history"),
-            "should include history awareness"
+            p.contains("check history first"),
+            "should check existing evidence before rereading"
         );
         assert!(
             p.contains("Plan, Batch, Execute"),
             "should include protocol"
+        );
+        assert!(
+            p.contains("Evidence over surrogate checks"),
+            "should require user-supplied validation rather than a surrogate"
         );
     }
 
@@ -137,8 +145,17 @@ mod tests {
         let p = build_main_system_prompt(&["read_file", "bash", "memory", "github", "git"], "");
         assert!(
             p.len() < 13000,
-            "compressed prompt should be under 13000 chars, got {}",
-            p.len()
+            "compressed prompt should be under 13000 chars, got {}; sections={:?}",
+            p.len(),
+            build_system_prompt_sections(&["read_file", "bash", "memory", "github", "git"], "")
+                .iter()
+                .enumerate()
+                .map(|(index, section)| (
+                    index,
+                    section.text.lines().next().unwrap_or_default(),
+                    section.text.len()
+                ))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -234,8 +251,8 @@ mod tests {
             "should include plan execution section"
         );
         assert!(
-            p.contains("acceptance criteria"),
-            "should mention acceptance criteria"
+            p.contains("Executable acceptance"),
+            "should mention executable acceptance"
         );
         assert!(p.contains("Don't skip ahead"), "should warn about ordering");
     }

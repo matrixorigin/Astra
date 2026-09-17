@@ -679,9 +679,10 @@ fn show_context_trace(
     let mem = &trace.memory;
     eprintln!();
     eprintln!("  {}", "▸ Memory Retrieval".bold());
-    if mem.query.is_empty() && mem.candidates_considered == 0 {
+    if !mem.outcome.was_attempted() {
         eprintln!("    {}", "(no retrieval performed)".dim());
     } else {
+        eprintln!("    {:<22} {}", "status:".dim(), mem.outcome.as_str());
         let query_preview: String = mem.query.chars().take(60).collect();
         let suffix = if mem.query.len() > 60 { "…" } else { "" };
         eprintln!("    {:<22} {}{}", "query:".dim(), query_preview, suffix);
@@ -1893,7 +1894,7 @@ fn format_compression_method(
     use astra_turn_core::context_assembly_trace::CompressionMethod;
     match method {
         CompressionMethod::ToolResultTruncation => "ToolResultTrunc",
-        CompressionMethod::DuplicateReadElimination => "DuplicateReadElim",
+        CompressionMethod::DuplicateToolOutputElimination => "DuplicateToolOutputElim",
         CompressionMethod::LlmSummarization => "LlmSummarize",
         CompressionMethod::TieredCompaction => "TieredCompact",
         CompressionMethod::ReactiveCompact => "ReactiveCompact",

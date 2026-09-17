@@ -277,7 +277,8 @@ mod tests {
             model_offering_id: (depth > 0).then(|| "offer-gpt-5".into()),
             resolved_model_name: (depth > 0).then(|| "gpt-5".into()),
             runtime_profile: Some("server".into()),
-            provider_request_fingerprint: None,
+            start_request_fingerprint: None,
+            work_binding: None,
             events: Vec::new(),
             created_at: format!("2026-07-11T00:00:0{depth}Z"),
             updated_at: format!("2026-07-11T00:01:0{depth}Z"),
@@ -412,6 +413,7 @@ mod tests {
             ],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
         let first = build_session_run_tree_snapshot("session-1".into(), page.clone()).unwrap();
         let second = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -439,6 +441,7 @@ mod tests {
             runs: vec![run("delegated", STATUS_DELEGATED, 0)],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -459,6 +462,7 @@ mod tests {
                 runs: vec![descendant, ancestor],
                 limit: 200,
                 truncated: false,
+                recovery_next_cursor: None,
             };
 
             let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -483,6 +487,7 @@ mod tests {
             runs: vec![grandchild, child, root],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -503,6 +508,7 @@ mod tests {
             runs: vec![child, root],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -535,6 +541,7 @@ mod tests {
             runs: vec![child],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -555,6 +562,7 @@ mod tests {
             runs: vec![run("broken", "mystery", 1)],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
         let error = build_session_run_tree_snapshot("session-1".into(), page).unwrap_err();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);

@@ -4,10 +4,11 @@
 //!
 //! * **User intent** — Ctrl+T flips the board explicitly. Captured as
 //!   `user_pin: Option<bool>` where `None` means "user hasn't touched
-//!   this; use the compact baseline" and `Some(true|false)` pins the
+//!   this; follow the work-aware baseline" and `Some(true|false)` pins the
 //!   choice until the user toggles again or the board empties out.
-//! * **Automatic baseline** — task presence decides whether a board can be
-//!   shown; completion never hides non-empty work.
+//! * **Automatic baseline** — open work expands the board so the current
+//!   plan is visible while it is being executed. Terminal history stays
+//!   reachable through Ctrl+T without occupying the live viewport.
 //!
 //! Keeping the decision in one pure function means the event loop
 //! doesn't have to remember which branch wins in each state; it just
@@ -22,21 +23,23 @@
 
 /// Compute the new `expanded` flag for the task board.
 ///
-/// - `prev_expanded`: what the board was doing last tick.
 /// - `user_pin`:
-///   * `None` — user hasn't expressed an opinion; compact baseline applies.
+///   * `None` — user hasn't expressed an opinion; the work-aware baseline
+///     applies.
 ///   * `Some(true)` — user hit Ctrl+T to open; stay open.
 ///   * `Some(false)` — user hit Ctrl+T to close; stay closed even if
 ///     new tasks arrive (until the list empties, which resets the pin).
 /// - `has_tasks`: observer snapshot is non-empty (a live session has rows).
+/// - `has_open_work`: the canonical projection still has a task that needs
+///   execution or an explicitly reported outcome.
 ///
 /// Also returns `reset_pin: bool` — caller should clear
 /// `user_pin` back to `None` when `true`, i.e. when the list emptied
 /// out so the next auto-open can fire from a clean slate.
 pub(crate) fn resolve_board_visibility(
-    prev_expanded: bool,
     user_pin: Option<bool>,
     has_tasks: bool,
+    has_open_work: bool,
 ) -> (bool, bool) {
     // Empty list → hide, and reset the pin so the next session with
     // tasks is back in "auto" mode.
@@ -47,12 +50,11 @@ pub(crate) fn resolve_board_visibility(
     if let Some(pin) = user_pin {
         return (pin, false);
     }
-    // Default = collapsed (one-line summary). Earlier behaviour
-    // auto-expanded the full panel as soon as a task appeared, which
-    // ate ~8 rows of streaming space on every multi-step turn. Now
-    // the user opts in via Ctrl+T (which sets `user_pin = Some(true)`
-    // and short-circuits above) — the auto path stays compact.
-    (prev_expanded, false)
+    // A plan is most useful while it can still guide or explain execution.
+    // Do not make the user discover it through a keyboard shortcut in the
+    // middle of a multi-step turn. Once every row is terminal, collapse it
+    // unless the user explicitly pinned it open for review.
+    (has_open_work, false)
 }
 
 #[cfg(test)]
@@ -61,7 +63,7 @@ mod tests {
 
     #[test]
     fn empty_list_collapses_board() {
-        let (expanded, reset) = resolve_board_visibility(true, None, false);
+        let (expanded, reset) = resolve_board_visibility(None, false, false);
         assert!(!expanded, "empty list must collapse");
         assert!(!reset, "pin was already None — nothing to reset");
     }
@@ -70,14 +72,14 @@ mod tests {
     fn empty_list_resets_user_pin_for_next_session() {
         // User had pinned open; every task finished & list went empty.
         // The pin should clear so the next cycle's auto-open works.
-        let (expanded, reset) = resolve_board_visibility(true, Some(true), false);
+        let (expanded, reset) = resolve_board_visibility(Some(true), false, false);
         assert!(!expanded);
         assert!(reset, "empty list must reset the user pin");
     }
 
     #[test]
     fn user_pin_open_keeps_terminal_work_visible() {
-        let (expanded, reset) = resolve_board_visibility(true, Some(true), true);
+        let (expanded, reset) = resolve_board_visibility(Some(true), true, false);
         assert!(expanded, "user pin must keep the board open: {expanded}");
         assert!(!reset);
     }
@@ -87,47 +89,36 @@ mod tests {
         // User explicitly hit Ctrl+T to close. A new task arriving
         // must NOT re-pop the board — that's the "don't fight me"
         // rule that separates astra from reference-agent's auto surface.
-        let (expanded, _) = resolve_board_visibility(false, Some(false), true);
+        let (expanded, _) = resolve_board_visibility(Some(false), true, true);
         assert!(!expanded, "user pin closed must stay closed");
     }
 
     #[test]
-    fn first_tasks_appearing_stays_collapsed_until_user_pins() {
-        // Default behaviour: a brand-new task list does NOT auto-expand
-        // the full panel — it stays as a one-line summary above the
-        // composer. The user opts in via Ctrl+T (Some(true) pin).
-        let (expanded, reset) = resolve_board_visibility(false, None, true);
+    fn active_work_auto_expands_without_a_user_pin() {
+        let (expanded, reset) = resolve_board_visibility(None, true, true);
         assert!(
-            !expanded,
-            "default should stay collapsed; full-panel mode is opt-in"
+            expanded,
+            "active Work must be visible without requiring a Ctrl+T discovery step"
         );
         assert!(!reset);
     }
 
     #[test]
-    fn already_open_stays_open_with_ongoing_tasks() {
-        // Board is already showing; new tick has tasks. Nothing should flap.
-        let (expanded, _) = resolve_board_visibility(true, None, true);
-        assert!(expanded);
-    }
-
-    #[test]
-    fn unpinned_closed_stays_collapsed_for_new_tasks() {
-        // Inverted from the prior auto-open default: collapsed boards
-        // stay collapsed when new tasks land. The user explicitly
-        // expands via Ctrl+T → user_pin = Some(true).
-        let (expanded, _) = resolve_board_visibility(false, None, true);
-        assert!(!expanded);
+    fn terminal_history_auto_collapses_without_a_user_pin() {
+        let (expanded, reset) = resolve_board_visibility(None, true, false);
+        assert!(
+            !expanded,
+            "terminal history should not occupy the live viewport"
+        );
+        assert!(!reset);
     }
 
     #[test]
     fn user_pin_open_survives_multiple_ticks() {
         // Simulate 5 ticks: pin open, tasks ongoing, no flap.
-        let mut exp = true;
         for _ in 0..5 {
-            let (next, reset) = resolve_board_visibility(exp, Some(true), true);
+            let (next, reset) = resolve_board_visibility(Some(true), true, true);
             assert!(next && !reset, "pinned board must stay open every tick");
-            exp = next;
         }
     }
 }

@@ -18,7 +18,6 @@ import type {
 } from '@/lib/api/types';
 import { getRuntimeCapabilities } from '@/lib/api/chats';
 import {
-  resolveGitHubAccessAvailability,
   resolveWebAccessAvailability,
 } from '@/lib/runtime-capabilities';
 import { filterSlashCommands, skillToSlashCommand, type SlashCommandItem } from '@/lib/composer/slash-commands';
@@ -279,10 +278,7 @@ export function Composer({
     () => resolveWebAccessAvailability(runtimeCapabilities, workspaceSelection),
     [runtimeCapabilities, workspaceSelection],
   );
-  const githubAccess = useMemo(
-    () => resolveGitHubAccessAvailability(runtimeCapabilities, workspaceSelection),
-    [runtimeCapabilities, workspaceSelection],
-  );
+
 
   useEffect(() => {
     let cancelled = false;
@@ -302,11 +298,7 @@ export function Composer({
     if (!webAccess.available) setWebSearch(false);
   }, [webAccess.available]);
 
-  useEffect(() => {
-    if (!githubAccess.available) {
-      setActiveTools((tools) => tools.filter((tool) => tool !== 'github'));
-    }
-  }, [githubAccess.available]);
+
 
   useEffect(() => {
     const storedThinking = window.localStorage.getItem('astra.composer.thinking');
@@ -636,12 +628,9 @@ export function Composer({
           inProject={Boolean(projectContext)}
           webSearch={webSearch}
           webAccess={webAccess}
-          githubAccess={githubAccess}
           onWebSearchChange={setWebSearch}
           activeSkills={activeSkills}
           onActiveSkillsChange={handleActiveSkillsChange}
-          activeTools={activeTools}
-          onActiveToolsChange={setActiveTools}
           workspaceSelection={workspaceSelection}
           edgeWorkspaces={edgeWorkspaces}
           edgeWorkspacesLoading={edgeWorkspacesLoading}

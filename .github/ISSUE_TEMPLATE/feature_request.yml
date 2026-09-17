@@ -15,7 +15,6 @@ body:
     attributes:
       label: Is your feature request related to a problem?
       description: A clear description of the problem. Ex. I'm always frustrated when [...]
-      render: Markdown
     validations:
       required: false
   - type: textarea
@@ -28,7 +27,6 @@ body:
     attributes:
       label: Implementation / design notes (optional)
       description: Any implementation ideas, API shape, or alternatives you've considered.
-      render: Markdown
     validations:
       required: false
   - type: textarea

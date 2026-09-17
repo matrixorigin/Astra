@@ -409,7 +409,7 @@ mod tests {
             .named_step(
                 "blame",
                 "git",
-                json!({"action": "blame", "file": "$input.file"}),
+                json!({"action": "blame", "path": "$input.file"}),
             )
             .named_step(
                 "history",

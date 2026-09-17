@@ -134,6 +134,11 @@ pub struct CapacityProviderDeclaration {
     pub tool_names: BTreeSet<String>,
     #[serde(default)]
     pub tool_schema_digests: BTreeMap<String, String>,
+    /// Provider-native identity for each public tool projection. The public
+    /// name is an LLM/routing alias; execution must carry this producer-owned
+    /// identity instead of deriving it from the alias at the call site.
+    #[serde(default)]
+    pub tool_native_ids: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +150,8 @@ struct CapacityProviderDeclarationWire {
     tool_names: BTreeSet<String>,
     #[serde(default)]
     tool_schema_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    tool_native_ids: BTreeMap<String, String>,
 }
 
 impl TryFrom<CapacityProviderDeclarationWire> for CapacityProviderDeclaration {
@@ -167,6 +174,16 @@ impl TryFrom<CapacityProviderDeclarationWire> for CapacityProviderDeclaration {
             }
         }
 
+        for (tool_name, native_tool_id) in &raw.tool_native_ids {
+            validate_declared_tool_name_for_provider(raw.provider_type, tool_name.clone())?;
+            if !tool_names.contains(tool_name) {
+                return Err(format!(
+                    "provider native identity key must reference a declared tool name: {tool_name}"
+                ));
+            }
+            validate_native_tool_id(native_tool_id)?;
+        }
+
         let tool_schema_digests = tool_names
             .iter()
             .map(|tool_name| {
@@ -178,12 +195,22 @@ impl TryFrom<CapacityProviderDeclarationWire> for CapacityProviderDeclaration {
                 (tool_name.clone(), digest)
             })
             .collect();
+        let missing_native_identity = tool_names
+            .iter()
+            .find(|tool_name| !raw.tool_native_ids.contains_key(*tool_name));
+        if let Some(tool_name) = missing_native_identity {
+            return Err(format!(
+                "provider native identity is required for every declared tool: {tool_name}"
+            ));
+        }
+        let tool_native_ids = raw.tool_native_ids;
 
         Ok(Self {
             provider_type: raw.provider_type,
             provider_id,
             tool_names,
             tool_schema_digests,
+            tool_native_ids,
         })
     }
 }
@@ -227,11 +254,16 @@ impl CapacityProviderDeclaration {
             .iter()
             .map(|name| (name.clone(), canonical_tool_name_digest(name)))
             .collect();
+        let tool_native_ids = tool_names
+            .iter()
+            .map(|name| (name.clone(), name.clone()))
+            .collect();
         Self {
             provider_type,
             provider_id,
             tool_names,
             tool_schema_digests,
+            tool_native_ids,
         }
     }
 
@@ -249,6 +281,7 @@ impl CapacityProviderDeclaration {
             provider_id,
             tool_names: BTreeSet::new(),
             tool_schema_digests: BTreeMap::new(),
+            tool_native_ids: BTreeMap::new(),
         };
         for spec in registry.iter().filter(|spec| predicate(spec)) {
             let tool_name =
@@ -256,7 +289,10 @@ impl CapacityProviderDeclaration {
             declaration.tool_names.insert(tool_name.clone());
             declaration
                 .tool_schema_digests
-                .insert(tool_name, canonical_tool_spec_digest(spec));
+                .insert(tool_name.clone(), canonical_tool_spec_digest(spec));
+            declaration
+                .tool_native_ids
+                .insert(tool_name, spec.name.clone());
         }
         declaration
     }
@@ -269,8 +305,31 @@ impl CapacityProviderDeclaration {
         let tool_name = canonical_declared_tool_name_for_provider(self.provider_type, tool_name);
         self.tool_names.insert(tool_name.clone());
         self.tool_schema_digests
-            .insert(tool_name, schema_digest.into());
+            .insert(tool_name.clone(), schema_digest.into());
         self
+    }
+
+    /// Bind a provider-native identity to a public projection. Adapters that
+    /// expose an alias must call this with the identity obtained from their
+    /// provider snapshot; consumers never parse the public name to recreate
+    /// it.
+    pub fn with_native_tool_id(
+        mut self,
+        tool_name: impl Into<String>,
+        native_tool_id: impl Into<String>,
+    ) -> Self {
+        let tool_name = canonical_declared_tool_name_for_provider(self.provider_type, tool_name);
+        let native_tool_id = canonical_native_tool_id(native_tool_id);
+        self.tool_names.insert(tool_name.clone());
+        self.tool_native_ids.insert(tool_name, native_tool_id);
+        self
+    }
+
+    pub fn native_tool_id_for_tool(&self, tool_name: &str) -> Option<&str> {
+        if !self.tool_names.contains(tool_name) {
+            return None;
+        }
+        self.tool_native_ids.get(tool_name).map(String::as_str)
     }
 
     pub fn schema_digest_for_tool(&self, tool_name: &str) -> Option<&str> {
@@ -380,7 +439,6 @@ pub const CAP_INTROSPECT: &str = "introspect";
 pub const CAP_TOOL_SEARCH: &str = "tool_search";
 pub const CAP_MO_QUERY: &str = "mo_query";
 pub const CAP_SESSION: &str = "session";
-pub const CAP_TASK_BOARD: &str = "task_board";
 pub const CAP_PLAN: &str = "plan";
 pub const CAP_MULTI_AGENT: &str = "multi_agent";
 pub const CAP_POLICY: &str = "policy";
@@ -401,7 +459,6 @@ pub fn server_service_capabilities() -> Vec<String> {
 pub fn control_plane_capabilities(extra: impl IntoIterator<Item = &'static str>) -> Vec<String> {
     let mut capabilities = labels([
         CAP_SESSION,
-        CAP_TASK_BOARD,
         CAP_PLAN,
         CAP_POLICY,
         CAP_AUDIT,
@@ -537,6 +594,11 @@ fn runtime_workspace_provider_declares_tool(
         // Terminal rendering is an access-surface affordance, not generic
         // workspace executor capacity.
         "display_sixel" => matches!(provider_type, CapacityProviderType::CliLocal),
+        // Only these providers carry the CLI session-worktree owner.
+        "worktree" => matches!(
+            provider_type,
+            CapacityProviderType::CliLocal | CapacityProviderType::EdgeCapacity
+        ),
         // PowerShell is platform capacity. User text such as "Windows" must not
         // expose it; only a provider/runtime that advertises Windows may.
         "powershell" => {
@@ -611,6 +673,10 @@ fn mcp_provider_from_schemas_for_type(
         declaration
             .tool_schema_digests
             .insert(tool_name.to_string(), canonical_tool_schema_digest(schema));
+        declaration
+            .tool_native_ids
+            .entry(tool_name.to_string())
+            .or_insert_with(|| tool_name.to_string());
     }
     declaration
 }
@@ -629,6 +695,19 @@ fn canonical_declared_tool_name_for_provider(
 ) -> String {
     validate_declared_tool_name_for_provider(provider_type, tool_name)
         .unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn validate_native_tool_id(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("provider native tool id must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn canonical_native_tool_id(value: impl Into<String>) -> String {
+    let value = value.into();
+    validate_native_tool_id(&value).unwrap_or_else(|message| panic!("{message}"));
+    value
 }
 
 fn canonical_request_scoped_mcp_tool_name(tool_name: impl Into<String>) -> String {
@@ -751,7 +830,8 @@ mod tests {
         let provider: CapacityProviderDeclaration = serde_json::from_value(serde_json::json!({
             "provider_type": "edge_capacity",
             "provider_id": "edge:macpro.local",
-            "tool_names": ["bash"]
+            "tool_names": ["bash"],
+            "tool_native_ids": {"bash": "bash"}
         }))
         .expect("valid provider declaration should deserialize");
 
@@ -782,6 +862,56 @@ mod tests {
             invalid_tool
                 .to_string()
                 .contains("invalid provider-declared tool name")
+        );
+    }
+
+    #[test]
+    fn provider_declaration_preserves_explicit_native_identity() {
+        let provider = CapacityProviderDeclaration::new(
+            CapacityProviderType::EdgeCapacity,
+            "edge:macpro.local",
+            ["public_search".to_string()],
+        )
+        .with_native_tool_id("public_search", "search.v2");
+        assert_eq!(
+            provider.native_tool_id_for_tool("public_search"),
+            Some("search.v2")
+        );
+
+        let round_trip: CapacityProviderDeclaration = serde_json::from_value(
+            serde_json::to_value(&provider).expect("provider declaration serializes"),
+        )
+        .expect("provider declaration with native identity deserializes");
+        assert_eq!(
+            round_trip.native_tool_id_for_tool("public_search"),
+            Some("search.v2")
+        );
+    }
+
+    #[test]
+    fn provider_declaration_rejects_missing_native_identity() {
+        let error = serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+            "provider_type": "edge_capacity",
+            "provider_id": "edge:macpro.local",
+            "tool_names": ["public_search"]
+        }))
+        .expect_err("dynamic provider declarations require native identities");
+        assert!(error.to_string().contains("native identity is required"));
+    }
+
+    #[test]
+    fn provider_declaration_rejects_orphan_native_identity_keys() {
+        let error = serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
+            "provider_type": "server_service",
+            "provider_id": "server-builtin",
+            "tool_names": ["web_fetch"],
+            "tool_native_ids": {"web_search": "search"}
+        }))
+        .expect_err("native identity keys must be scoped to declared tools");
+        assert!(
+            error
+                .to_string()
+                .contains("provider native identity key must reference a declared tool name")
         );
     }
 
@@ -889,10 +1019,16 @@ mod tests {
         assert!(server.declares_tool("web_fetch"));
         assert!(server.declares_tool("web_search"));
         assert!(server.declares_tool("memory"));
+        assert!(!server.declares_tool("github"));
+        assert!(!server.declares_tool("git"));
         assert!(!server.declares_tool("bash"));
 
         assert!(control.declares_tool("ask_user"));
-        assert!(control.declares_tool("task_board"));
+        assert!(control.declares_tool("start_work"));
+        assert!(control.declares_tool("run_next_work_item"));
+        assert!(control.declares_tool("inspect_work_plan"));
+        assert!(control.declares_tool("propose_work_plan"));
+        assert!(!control.declares_tool("task_board"));
         assert!(!control.declares_tool("task"));
         assert!(!control.declares_tool("web_fetch"));
 
@@ -900,6 +1036,8 @@ mod tests {
         assert!(cli.declares_tool("web_fetch"));
         assert!(cli.declares_tool("web_search"));
         assert!(cli.declares_tool("read_file"));
+        assert!(!cli.declares_tool("github"));
+        assert!(!cli.declares_tool("git"));
         assert_eq!(
             cli.declares_tool("powershell"),
             RuntimePlatform::current().supports_powershell()

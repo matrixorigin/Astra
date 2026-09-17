@@ -14,6 +14,7 @@ use astra_thin_client::{
 use futures_util::FutureExt;
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const ROOT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -259,13 +260,23 @@ fn refresh_interval(state: &ObserverState) -> Duration {
             .saturating_mul(1_u32 << exponent)
             .min(MAX_FAILURE_BACKOFF);
     }
-    if state
-        .projection
-        .snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.runs.iter().any(|run| !run.status.is_terminal()))
-    {
+    if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.runs.iter().any(|run| {
+            run.parent_run_id.is_some()
+                && run.status == astra_thin_client::SessionRunLifecycleStatus::Running
+        })
+    }) {
         ACTIVE_POLL_INTERVAL
+    } else if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .runs
+            .iter()
+            .any(|run| run.status == astra_thin_client::SessionRunLifecycleStatus::Running)
+    }) {
+        // The chat SSE is the attached root's primary progress authority. A
+        // slower safety poll still discovers a run started by another client
+        // without multiplying one database query per connected user-second.
+        ROOT_ACTIVE_POLL_INTERVAL
     } else {
         QUIET_POLL_INTERVAL
     }
@@ -541,6 +552,41 @@ mod tests {
         assert!(
             !observer.request_refresh(),
             "a manual refresh must not cancel or duplicate an in-flight request"
+        );
+    }
+
+    #[test]
+    fn only_executing_runs_use_the_active_poll_interval() {
+        let observer = observer("session-1");
+        let mut running = snapshot("session-1", "running");
+        lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
+        assert_eq!(
+            refresh_interval(&lock_state(&observer.inner, "test")),
+            ACTIVE_POLL_INTERVAL
+        );
+
+        running.runs[0].parent_run_id = None;
+        lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
+        assert_eq!(
+            refresh_interval(&lock_state(&observer.inner, "test")),
+            ROOT_ACTIVE_POLL_INTERVAL,
+            "the root remains discoverable without duplicating its attached SSE at one query per second"
+        );
+        running.runs[0].parent_run_id = Some("root-1".into());
+
+        running.runs[0].status = SessionRunLifecycleStatus::Waiting;
+        lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
+        assert_eq!(
+            refresh_interval(&lock_state(&observer.inner, "test")),
+            QUIET_POLL_INTERVAL,
+            "waiting work remains observable without creating a permanent one-second poll"
+        );
+
+        running.runs[0].status = SessionRunLifecycleStatus::Paused;
+        lock_state(&observer.inner, "test").projection.snapshot = Some(running);
+        assert_eq!(
+            refresh_interval(&lock_state(&observer.inner, "test")),
+            QUIET_POLL_INTERVAL
         );
     }
 

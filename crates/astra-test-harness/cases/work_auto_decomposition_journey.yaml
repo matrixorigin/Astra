@@ -1,0 +1,103 @@
+name: work_auto_decomposition_journey
+description: |
+  **What**: Give Astra a realistic multi-step developer goal in ordinary product language and
+  require it to establish the canonical Work graph before reporting progress.
+  **Tests**: Semantic long-task recognition, real `start_work` execution, bounded decomposition,
+  durable tool evidence, and a low-interruption user journey through the Server-owned loop.
+  **Why**: Schema visibility and prose planning are not product proof. The reported regression
+  passed because earlier cases explicitly avoided tools; this case fails unless the model turns
+  the user's goal into real tracked state with exactly two meaningful initial outcomes.
+  **Pass means**: DeepSeek Flash establishes Work once, records two initial items, reports the
+  canonical next execution action, and neither asks for routine decomposition approval nor
+  pretends the work was executed.
+  **Fail means**: Astra returns a prose checklist, enters plan mode, asks the user to choose
+  routine steps, calls a missing/incorrect task tool, or claims completion without durable state.
+prompt: |
+  Help me deliver a safe migration from locally guessed credential identity to server-issued
+  account identity. This is work that will continue across several implementation and verification
+  steps, so begin by establishing durable progress tracking with the smallest useful structure.
+
+  Keep the initial structure to exactly two meaningful outcomes:
+  1. implement the server-issued identity binding and safe migration/recovery behavior;
+  2. independently verify fresh login, existing-profile migration, and invalid-profile recovery,
+     then remove obsolete behavior and tests.
+
+  This turn is only for establishing the durable structure; do not begin either
+  outcome. Leave both outcomes pending until I explicitly continue, do not ask me
+  to approve routine decomposition, and do not claim either outcome was executed.
+  Tell me the next safe action without starting any outcome.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_auto_decomposition_journey"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: start_work
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: start_work
+    document: arguments
+    path: /activation
+    equals: defer
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /status
+    equals: started
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /next_action
+    equals: await_explicit_continuation
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /initial_task
+    equals: null
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  - type: journal_tool_call_count
+    name: run_next_work_item
+    min: 0
+    max: 0
+  # Keep the stable admitted prefix intact even on the defer path.  Wrapping
+  # this quality signal in all_of makes it a hard journey contract without
+  # imposing a provider-specific cache-token floor.
+  - type: all_of
+    criteria:
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: enter_plan_mode
+    min: 0
+    max: 0
+  - type: tools_count_between
+    min: 1
+    max: 3
+  - type: turn_rounds_between
+    min: 2
+    max: 5
+  - type: duration_between
+    min_ms: 0
+    max_ms: 120000

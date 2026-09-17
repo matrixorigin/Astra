@@ -25,9 +25,17 @@ pub(crate) enum SlashResult {
     OpenRootTranscript {
         session_id: Option<String>,
     },
-    OpenBackgroundTasks,
+    OpenWorkTasks,
+    StartWork(Box<WorkStartRequest>),
     BackgroundRead(Box<SlashBackgroundRead>),
     Exit,
+}
+
+pub(crate) struct WorkStartRequest {
+    pub api: astra_thin_client::ThinClient,
+    pub profile: Option<String>,
+    pub session_id: String,
+    pub goal: String,
 }
 
 /// Session-lifecycle controls that must be honored before an input can enter
@@ -67,8 +75,12 @@ pub(crate) enum SlashBackgroundRead {
     Timeline {
         session_id: String,
     },
+    WorkExecution {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        session_id: String,
+    },
     ResumePicker,
-    ForkPicker,
     SessionHub {
         snapshot: Box<SessionHubSnapshot>,
     },
@@ -92,6 +104,26 @@ pub(crate) enum SlashBackgroundRead {
         session_id: Option<String>,
         journal_dir_override: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkCommandRoute {
+    Tasks,
+    Execution,
+    Start(String),
+    MissingGoal,
+    Unsupported,
+}
+
+pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
+    let (subcommand, remainder) = split_sub(args.trim());
+    match subcommand {
+        "" | "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
+        "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
+        "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
+        "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
+        _ => WorkCommandRoute::Unsupported,
+    }
 }
 
 /// Immutable request captured when a read-only memory surface is submitted.
@@ -307,15 +339,63 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         "/mcp" => handle_mcp_dispatch(args, ctx),
 
-        "/task" if matches!(args.trim(), "" | "list") => {
-            ctx.show_response("Opened background work".to_string());
-            SlashResult::OpenBackgroundTasks
-        }
-
-        "/task" => {
-            ctx.show_error("Usage: /task — opens background work".to_string());
-            SlashResult::Handled
-        }
+        "/work" => match work_command_route(args) {
+            WorkCommandRoute::Tasks => {
+                ctx.show_response("Opened Work tasks".to_string());
+                SlashResult::OpenWorkTasks
+            }
+            WorkCommandRoute::Execution => {
+                let Some(session_id) = ctx
+                    .state
+                    .session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+                else {
+                    ctx.show_error(
+                        "This conversation has no durable session yet. Send one message, then inspect Work execution."
+                            .to_string(),
+                    );
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Loading Work execution…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkExecution {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id,
+                })
+            }
+            WorkCommandRoute::MissingGoal => {
+                ctx.show_error("Usage: /work start <goal>".to_string());
+                SlashResult::Handled
+            }
+            WorkCommandRoute::Start(goal) => {
+                let Some(session_id) = ctx
+                    .state
+                    .session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+                else {
+                    ctx.show_error(
+                        "This conversation has no durable session yet. Send one message, then start Work."
+                            .to_string(),
+                    );
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Starting Work…".to_string());
+                SlashResult::StartWork(Box::new(WorkStartRequest {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id,
+                    goal,
+                }))
+            }
+            WorkCommandRoute::Unsupported => {
+                ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                SlashResult::Handled
+            }
+        },
 
         "/agent" if matches!(args.trim(), "" | "list") => {
             if crate::tui::agent_view::open_agents_view(ctx.chat_widget, ctx.bottom_pane) {
@@ -353,24 +433,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
 
             if ctx.state.cloud_plan_mirror.is_some() {
-                let Some(token) =
-                    crate::cli::plan::plan_lifecycle::fresh_token_for_plan(ctx.api, ctx.profile)
-                        .await
-                else {
-                    ctx.show_error("Not logged in. Use /login.".into());
-                    return SlashResult::Handled;
-                };
-                if let Err(error) = crate::cli::plan::plan_lifecycle::exit_remote_plan_mode(
-                    ctx.api, &token, ctx.state, true,
-                )
-                .await
-                {
-                    ctx.show_error(error);
-                    return SlashResult::Handled;
-                }
-                ctx.state
-                    .perm_manager
-                    .set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
                 return SlashResult::Handled;
             }
 
@@ -595,6 +658,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ExplainMode::On => "on",
                 ExplainMode::Verbose => "verbose",
             };
+            ctx.chat_widget
+                .set_explain_verbose(matches!(ctx.state.explain, ExplainMode::Verbose));
             ctx.show_response(format!("Explain mode: {label}"));
             SlashResult::Handled
         }
@@ -665,14 +730,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 .and_then(|event| event.selected_skills.clone())
                 .unwrap_or_default();
 
-            // Build the Session / Budget summary from SessionState.
+            // Build the Session summary from SessionState.
             // All fields are cheap reads — no I/O, no extra locks.
             snap.session = Some(SessionSummary {
                 session_id: ctx.state.session_id.clone().unwrap_or_default(),
                 turn: ctx.state.turn,
                 model: ctx.state.model.clone(),
                 total_cost: ctx.state.total_session_cost,
-                max_budget: ctx.state.max_budget_limit,
                 prompt_tokens: ctx.state.total_prompt_tokens,
                 completion_tokens: ctx.state.total_completion_tokens,
                 cache_read_tokens: ctx.state.total_cache_read_tokens,
@@ -800,7 +864,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Session ─────────────────────────────────────────────────
         //
-        // Five subcommands + the default hub cover the overwhelming
+        // Four subcommands + the default hub cover the overwhelming
         // majority of interactive usage.  Diagnostic subs (cleanup /
         // drift / errors / trace / verify / adaptive / switch) used
         // to live here too, but they duplicate functionality that
@@ -811,7 +875,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /session                 → session hub (current overview)
         //   /session list            → session picker
         //   /session history [id]    → conversation history
-        //   /session fork            → interactive fork flow
         //   /session analyze [id]    → counter-only diagnostics
         //   /session export [id]     → write markdown, echo path
         //   everything else          → explain the available workbench action
@@ -836,10 +899,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     },
                     None => SlashResult::Handled,
                 },
-                "fork" => {
-                    ctx.show_response("Loading sessions to fork…".into());
-                    SlashResult::background_read(SlashBackgroundRead::ForkPicker)
-                }
                 "analyze" | "diag" => {
                     // TUI-side analysis is a concise session summary. A deep
                     // text-only analyzer is not a separate workbench action.
@@ -2660,12 +2719,11 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     SlashResult::Handled
 }
 
-/// `/model set <name>` — apply immediately.  Also used as the
-/// fallback for `/model <name>` shorthand.
+/// Apply a direct `/model <name>` selection immediately.
 fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
     if name.is_empty() {
-        ctx.show_error("Model name cannot be empty — try `/model list`.".into());
+        ctx.show_error("Model name cannot be empty — choose one with `/model`.".into());
         return;
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
@@ -2706,13 +2764,13 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         Some(arg.trim().to_string())
     };
     let Some(name) = target else {
-        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+        ctx.show_error("No active model — choose one with `/model` or run `/model <name>`.".into());
         return SlashResult::Handled;
     };
 
     // Prefer the cached pricing the session already carries so
-    // `/model info` is instant — live refetch happens via
-    // `/model list` when the user explicitly asks.
+    // `/model info` is instant — live refetch happens when the user
+    // explicitly opens the `/model` picker.
     let pricing = &ctx.state.cached_pricing;
     let prompt_usd = if pricing.prompt > 0.0 {
         format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
@@ -2737,7 +2795,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         .state
         .total_prompt_tokens
         .saturating_add(ctx.state.total_completion_tokens);
-    let mut pairs: Vec<(&str, String)> = vec![
+    let pairs: Vec<(&str, String)> = vec![
         ("model", name.clone()),
         (
             "current",
@@ -2773,13 +2831,6 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
             format!("${:.4}", ctx.state.total_session_cost),
         ),
     ];
-    if ctx.state.max_budget_limit > 0.0 {
-        pairs.push((
-            "budget limit",
-            format!("${:.2}", ctx.state.max_budget_limit),
-        ));
-    }
-
     ctx.open_view(
         format!("Opened model info · {name}"),
         Box::new(InfoView::from_key_value(&format!("Model · {name}"), pairs)),
@@ -2805,12 +2856,13 @@ fn fmt_tokens(n: u64) -> String {
 
 /// Immutable input captured when `/session` is submitted. The background
 /// workspace read must never inspect a later re-bound `SessionState`.
+#[derive(Clone)]
 pub(crate) struct SessionHubSnapshot {
     pub(crate) session_id: String,
+    pending_recovery: Option<String>,
     turn: u32,
     model: String,
     total_cost: f64,
-    max_budget: f64,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -2837,10 +2889,10 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         .unwrap_or_else(|_| "?".into());
     SessionHubSnapshot {
         session_id: state.session_id.clone().unwrap_or_default(),
+        pending_recovery: state.pending_recovery.clone(),
         turn: state.turn,
         model: state.model.clone().unwrap_or_else(|| "—".into()),
         total_cost: state.total_session_cost,
-        max_budget: state.max_budget_limit,
         prompt_tokens: state.total_prompt_tokens,
         completion_tokens: state.total_completion_tokens,
         cache_read_tokens: state.total_cache_read_tokens,
@@ -2865,6 +2917,19 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
         persistence_error: state.session_persistence_error.clone(),
         cwd_fallback,
     }
+}
+
+/// Resolve slash commands that are safe to execute concurrently with an
+/// active model run. Only immutable-snapshot/background-read commands belong
+/// here; mutations, model input, and commands that rebind session state must
+/// wait for ordinary idle dispatch.
+pub(crate) fn active_run_concurrent_read(
+    text: &str,
+    session_snapshot: &SessionHubSnapshot,
+) -> Option<SlashBackgroundRead> {
+    (text.trim() == "/session").then(|| SlashBackgroundRead::SessionHub {
+        snapshot: Box::new(session_snapshot.clone()),
+    })
 }
 
 /// Build the session hub after its workspace read finishes. All live state was
@@ -2921,6 +2986,21 @@ pub(crate) fn session_hub_view(
     } else {
         pairs.push(("cwd", snapshot.cwd_fallback.clone()));
     }
+    if let Some(owner) = snapshot
+        .pending_recovery
+        .as_deref()
+        .filter(|owner| !owner.is_empty() && Some(*owner) != Some(snapshot.session_id.as_str()))
+    {
+        if snapshot.session_id.is_empty() {
+            pairs.push(("recovery", format!("available via /resume {owner}")));
+        } else {
+            pairs.push((
+                "execution",
+                format!("not admitted · checkout belongs to Session {owner}"),
+            ));
+            pairs.push(("next", format!("/resume {owner}")));
+        }
+    }
     if let Some(error) =
         session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())
     {
@@ -2929,9 +3009,6 @@ pub(crate) fn session_hub_view(
 
     // Live state
     pairs.push(("cost", format!("${:.4}", snapshot.total_cost)));
-    if snapshot.max_budget > 0.0 {
-        pairs.push(("budget", format!("${:.2}", snapshot.max_budget)));
-    }
     pairs.push(("prompt tokens", fmt_tokens(snapshot.prompt_tokens)));
     pairs.push(("completion tokens", fmt_tokens(snapshot.completion_tokens)));
     pairs.push(("cache-read tokens", fmt_tokens(snapshot.cache_read_tokens)));
@@ -2962,7 +3039,6 @@ pub(crate) fn session_hub_view(
     pairs.push(("/session history", "scroll transcript".into()));
     pairs.push(("/timeline", "per-turn trace timeline".into()));
     pairs.push(("/context", "context panel".into()));
-    pairs.push(("/session fork", "branch a parallel session".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
 
     let title = if snapshot.session_id.is_empty() {
@@ -2983,7 +3059,7 @@ fn session_hub_persistence_error(
         .filter(|error| !error.is_empty())
         .map(|error| {
             format!(
-                "degraded: {error} · live session can continue; resume/fork metadata may be stale until the next successful save"
+                "degraded: {error} · live session can continue; resume metadata may be stale until the next successful save"
             )
         })
 }
@@ -3324,10 +3400,11 @@ mod routing_tests {
     use super::{
         CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
         MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
-        SkillCommandRoute, config_command_route, context_breakdown_for_panel,
+        SkillCommandRoute, WorkCommandRoute, config_command_route, context_breakdown_for_panel,
         context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
-        keyboard_shortcut_pairs, memory_command_route, skill_command_route,
+        keyboard_shortcut_pairs, memory_command_route, skill_command_route, work_command_route,
     };
+    use crate::cli::command_registry;
     use crate::cli::session::session_state::SessionState;
     use crate::tui::context_panel::{
         ContextSnapshot,
@@ -3391,7 +3468,20 @@ mod routing_tests {
     }
 
     #[test]
-    fn model_catalog_request_matches_only_picker_forms() {
+    fn hidden_model_list_alias_remains_a_typed_picker_dispatch() {
+        let model = command_registry::resolve_command_meta("/model").expect("model command");
+        assert!(
+            model.subcommands.iter().any(|(name, _)| *name == "list"),
+            "the shared command parser must retain the typed `/model list` alias"
+        );
+        assert!(
+            model
+                .visible_tui_subcommands()
+                .iter()
+                .all(|(name, _)| *name != "list"),
+            "the redundant picker alias must stay out of TUI completion"
+        );
+
         assert!(is_model_picker_request("/model"));
         assert!(is_model_picker_request("/model list"));
         assert!(!is_model_picker_request("/model info"));
@@ -3432,6 +3522,30 @@ mod routing_tests {
         assert_eq!(
             memory_command_route("help"),
             Ok(MemoryCommandRoute::Unsupported)
+        );
+    }
+
+    #[test]
+    fn work_route_has_one_explicit_read_only_execution_surface() {
+        assert_eq!(work_command_route(""), WorkCommandRoute::Tasks);
+        assert_eq!(work_command_route("status"), WorkCommandRoute::Tasks);
+        assert_eq!(
+            work_command_route(" execution "),
+            WorkCommandRoute::Execution
+        );
+        assert_eq!(
+            work_command_route("start ship the durable flow"),
+            WorkCommandRoute::Start("ship the durable flow".into())
+        );
+        assert_eq!(work_command_route("start"), WorkCommandRoute::MissingGoal);
+        assert_eq!(
+            work_command_route("execution extra"),
+            WorkCommandRoute::Unsupported
+        );
+        assert_eq!(
+            work_command_route("list"),
+            WorkCommandRoute::Unsupported,
+            "the old list alias adds no distinct TUI behavior"
         );
     }
 
@@ -3514,7 +3628,6 @@ mod routing_tests {
             turn: 3,
             model: Some("model-x".into()),
             total_cost: 0.01,
-            max_budget: 1.0,
             prompt_tokens: 1_200,
             completion_tokens: 600,
             cache_read_tokens: 0,
@@ -3644,7 +3757,7 @@ mod view_result_tests {
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
     use crate::tui::bottom_pane::BottomPane;
-    use crate::tui::bottom_pane::view::{BottomPaneView, SessionSelectionIntent, ViewResult};
+    use crate::tui::bottom_pane::view::{BottomPaneView, ViewResult};
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::history_cell::system::SystemCell;
     use astra_runtime::plan;
@@ -3755,7 +3868,6 @@ mod view_result_tests {
         handle_view_result(
             ViewResult::Session {
                 session_id: "sess_1234567890".into(),
-                intent: SessionSelectionIntent::Resume,
             },
             &mut state,
             &mut bottom_pane,
@@ -4013,7 +4125,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_view)]
+    #[serial_test::serial]
     fn build_recent_session_history_lines_surfaces_scan_error() {
         let tmp = crate::tests::test_temp_dir();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -4030,7 +4142,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_view)]
+    #[serial_test::serial]
     fn build_recent_session_history_lines_marks_unreadable_journals() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let good_session = format!("stats-good-{}", uuid::Uuid::new_v4());
@@ -4051,7 +4163,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_view)]
+    #[serial_test::serial]
     fn build_recent_session_history_lines_surfaces_no_readable_sessions() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let bad_session = format!("stats-bad-only-{}", uuid::Uuid::new_v4());
@@ -4073,7 +4185,7 @@ mod stats_view_tests {
     }
 
     #[test]
-    #[serial_test::serial(stats_view)]
+    #[serial_test::serial]
     fn read_session_journal_for_stats_surfaces_directory_error() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("stats-dir-{}", uuid::Uuid::new_v4());
@@ -4143,8 +4255,8 @@ mod model_catalog_loading_tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer fresh-access"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
                     "offering_id": "offer-gpt-5",
                     "access_id": "self-hosted",
                     "access_kind": "self_hosted",
@@ -4158,8 +4270,12 @@ mod model_catalog_loading_tests {
                     "max_completion_tokens": null,
                     "architecture": null,
                     "thinking_capability": "both"
-                }])),
-            )
+                }],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 1,
+                "catalog_revision": "sha256:test"
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -4225,7 +4341,8 @@ mod fmt_tokens_tests {
 
 #[cfg(test)]
 mod session_hub_tests {
-    use super::session_hub_persistence_error;
+    use super::{SlashBackgroundRead, active_run_concurrent_read, session_hub_persistence_error};
+    use crate::cli::session::session_state::SessionState;
     use astra_services::session_workspace::WorkspaceMetadata;
 
     #[test]
@@ -4236,7 +4353,7 @@ mod session_hub_tests {
         assert_eq!(
             session_hub_persistence_error(Some("live commit failed"), Some(&ws)).as_deref(),
             Some(
-                "degraded: live commit failed · live session can continue; resume/fork metadata may be stale until the next successful save"
+                "degraded: live commit failed · live session can continue; resume metadata may be stale until the next successful save"
             )
         );
     }
@@ -4249,8 +4366,30 @@ mod session_hub_tests {
         assert_eq!(
             session_hub_persistence_error(None, Some(&ws)).as_deref(),
             Some(
-                "degraded: workspace write failed · live session can continue; resume/fork metadata may be stale until the next successful save"
+                "degraded: workspace write failed · live session can continue; resume metadata may be stale until the next successful save"
             )
         );
+    }
+
+    #[test]
+    fn active_run_executes_only_snapshot_safe_session_overview() {
+        let state = SessionState::default();
+        let snapshot = super::session_hub_snapshot(&state);
+        assert!(matches!(
+            active_run_concurrent_read(" /session ", &snapshot),
+            Some(SlashBackgroundRead::SessionHub { .. })
+        ));
+        for command in [
+            "/session list",
+            "/session history",
+            "/session export",
+            "/model",
+            "/unknown",
+        ] {
+            assert!(
+                active_run_concurrent_read(command, &snapshot).is_none(),
+                "stateful or unknown commands must wait for idle dispatch: {command}"
+            );
+        }
     }
 }

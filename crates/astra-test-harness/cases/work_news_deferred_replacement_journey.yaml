@@ -1,0 +1,79 @@
+name: work_news_deferred_replacement_journey
+description: |
+  **What**: Replay the natural task-board experiment that exposed retroactive cancellation,
+  invented replacement scope, and homepage-as-news false delivery.
+  **Tests**: A two-item serial graph is mutated at the execution boundary; the untouched second
+  item is explicitly cancelled, an equivalent fresh item is added under a fresh identity, and both delivered
+  results contain item-level article evidence rather than collection reachability.
+  **Pass means**: One Sina article and one NetEase article are reported with article title and
+  article URL; task-2 is never settled; one exact cancel plus add is accepted and delivered.
+  **Fail means**: A completed task is called cancelled, Tencent or another source is invented,
+  a portal homepage/category is passed off as an article, or internal mechanics replace results.
+prompt: |
+  实验一下task系统，先建立两个串行task，分别从新浪和网易抓一条新闻。先执行并完成新浪
+  第一个task，再取消尚未执行的网易第二个task，新增一个等价的网易抓取task并串行完成。
+  不要提前取消。直接完成，最后给我两条新闻各自的标题和文章URL，并简洁说明取消/新增结果。
+models:
+  - deepseek-v4-flash
+capability: "custom:work_news_deferred_replacement_journey"
+difficulty: 5
+weight: 4.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_work_graph_patch
+    require_addition: true
+    require_retired_revision: true
+    require_cancelled_revision: true
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 0
+    max: 0
+    document: result
+    path: /item_id
+    equals: task-2
+  - type: journal_work_replacement_lifecycle
+    initial_items: 2
+    cancelled_items: 1
+    added_items: 1
+    delivered_items: 2
+    cancellation_after_deliveries: 1
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: tools_count_between
+    min: 8
+    max: 20
+  - type: turn_rounds_between
+    min: 7
+    max: 22
+  - type: session_subsystem_healthy
+  - type: hard_judger
+    question: |
+      Verify the user-visible outcome against the provided tool arguments and results;
+      do not trust the final answer alone. Pass only if the answer provides two distinct,
+      concrete news articles: one from Sina and one from NetEase, each with a real article
+      headline and an item-level article URL. A portal root/homepage, channel/category page,
+      special index, or merely HTTP 200 is not a news article and must fail. Also require a clear
+      statement that the unexecuted second original task was cancelled/retired and an equivalent
+      fresh NetEase task was added; fail if an unrelated source/outcome such as Tencent was
+      invented. Score 1.0 only when all conditions hold, otherwise 0.0.
+    threshold: 0.9

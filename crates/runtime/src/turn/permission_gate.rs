@@ -749,7 +749,7 @@ mod tests {
     async fn explicit_actions_follow_auto_mode_without_parent() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
-            allow_rules: vec![PermissionRule::parse("git")],
+            allow_rules: vec![PermissionRule::parse("bash")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
@@ -759,8 +759,8 @@ mod tests {
         let ctx = PermissionSyncContext::shared(inherited);
 
         let result = check_tool_permission(
-            "git",
-            Some(r#"{"action":"commit","message":"ship it"}"#),
+            "bash",
+            Some(r#"{"command":"git commit -m ship"}"#),
             Some(&ctx),
             None,
             Duration::from_secs(1),
@@ -803,7 +803,7 @@ mod tests {
 
         let inherited = InheritedPermissions {
             mode: PermissionMode::Prompt,
-            allow_rules: vec![PermissionRule::parse("git")],
+            allow_rules: vec![PermissionRule::parse("bash")],
             deny_rules: vec![],
             ask_rules: vec![],
             allowed_tools: None,
@@ -836,8 +836,8 @@ mod tests {
         });
 
         let result = check_tool_permission(
-            "git",
-            Some(r#"{"action":"commit","message":"ship it"}"#),
+            "bash",
+            Some(r#"{"command":"git commit -m ship"}"#),
             Some(&ctx),
             Some(&mut child_mailbox),
             Duration::from_secs(1),
@@ -1025,10 +1025,6 @@ mod tests {
             ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
             ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
             ("compress_context", Some(r#"{"target_tokens":1000}"#)),
-            (
-                "task_board",
-                Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#),
-            ),
         ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
@@ -1111,32 +1107,6 @@ mod tests {
                 is_allowed(&result),
                 "`{tool}` is read-only — plan mode must allow it so the model \
                  can explore the codebase before writing the plan. Got: {result:?}"
-            );
-        }
-
-        for action in [
-            "status",
-            "diff",
-            "log",
-            "file_history",
-            "contributors",
-            "log_search",
-            "show",
-            "blame",
-        ] {
-            let args = serde_json::json!({"action": action}).to_string();
-            let result = check_tool_permission_in_plan_mode(
-                "git",
-                Some(args.as_str()),
-                Some(&ctx),
-                None,
-                Duration::from_secs(1),
-                true,
-            )
-            .await;
-            assert!(
-                is_allowed(&result),
-                "git(action={action}) is read-only — plan mode must allow it. Got: {result:?}"
             );
         }
     }

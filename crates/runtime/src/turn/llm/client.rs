@@ -21,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::OnceLock,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use astra_logging::redact_known_secret_patterns;
@@ -30,22 +30,24 @@ use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::prompts;
 #[cfg(test)]
 use astra_text_utils::output_style::current_output_style;
-use astra_turn_core::bridge_rate_limit_cooldown::{
+use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
-use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
     validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
 use astra_turn_core::thinking_config::ThinkingConfig;
+use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_call_shape::tool_call_name;
 
 /// Redact common provider secret patterns from a string before logging.
@@ -84,6 +86,17 @@ const LLM_NONSTREAM_TIMEOUT_S: u64 = 120;
 /// Total budget across all safe retries for a single LLM call (seconds).
 /// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
+/// Maximum time a streaming inference may go without yielding or advancing a
+/// deliverable answer/tool call. Reasoning is transport activity, but it does
+/// not postpone the initial actionable yield. Once delivery starts, visible
+/// text and authorized tool JSON fragments roll this deadline so a legitimate
+/// streamed tool payload is not cut off mid-object. Independent physical-idle,
+/// accumulation, and total-call budgets remain additional safety bounds.
+const LLM_SEMANTIC_PROGRESS_TIMEOUT_S: u64 = 120;
+/// Maximum slice reserved from a logical inference budget for durable attempt
+/// terminalization. The reserve scales down for very small test/operator
+/// budgets and is never available to HTTP work or retry backoff.
+const LLM_MANDATORY_SETTLEMENT_RESERVE_S: u64 = 10;
 /// Maximum grace period for trailing usage / `[DONE]` after a semantic
 /// provider terminal (`finish_reason`). A broken keep-alive must not leave a
 /// completed answer stuck behind the ordinary multi-minute idle watchdog.
@@ -92,7 +105,7 @@ const LLM_STREAM_TERMINAL_DRAIN_GRACE_MS: u64 = 500;
 // ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
 
 /// Per-model rate-limit cooldown tracker — shared with bridge_llm_stream.
-use super::super::bridge::llm_stream::rate_limit_cooldown;
+use super::super::model_cooldown::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
@@ -111,6 +124,14 @@ impl LlmProviderProtocol {
             Self::AnthropicMessages => "anthropic_messages",
             Self::BedrockConverse => "bedrock_converse",
         }
+    }
+
+    /// Whether the concrete request builder preserves each appended provider
+    /// message as a distinct wire item. Append-only caching is invalid for
+    /// transports that merge adjacent roles and thereby rewrite the old tail.
+    #[must_use]
+    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
     }
 }
 
@@ -133,6 +154,244 @@ pub(crate) struct ProviderWireRequestIdentity {
     pub provider_wire_hash: String,
     pub provider_wire_bytes: u64,
     pub composition: ProviderWireComposition,
+    /// Hashes of the provider-final, already-sanitized payload components.
+    /// These are computed from the same JSON value serialized into `body`;
+    /// diagnostics therefore never need to approximate the dispatched shape
+    /// from an earlier logical message/tool projection.
+    pub fingerprints: ProviderWireFingerprints,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderWireFingerprints {
+    pub message_sequence_sha256: String,
+    pub system_sequence_sha256: String,
+    pub cache_key_system_sha256: String,
+    pub conversation_sequence_sha256: String,
+    pub tool_schema_sequence_sha256: String,
+    pub cache_key_tool_schema_sequence_sha256: String,
+    pub cache_capability: Option<CacheCapability>,
+    pub cache_key_tool_schema_items:
+        Vec<astra_turn_core::cache_diagnostics::ProviderFinalToolFingerprint>,
+}
+
+impl ProviderWireFingerprints {
+    fn from_body(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        cache_capability: Option<CacheCapability>,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::OpenAiCompatible => {
+                let messages = body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                (
+                    messages.iter().collect::<Vec<_>>(),
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                        .collect::<Vec<_>>(),
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message.get("role").and_then(Value::as_str) != Some("system")
+                        })
+                        .collect::<Vec<_>>(),
+                    provider_wire_items(body.get("tools")),
+                )
+            }
+            LlmProviderProtocol::AnthropicMessages => (
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("system")),
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("tools")),
+            ),
+            LlmProviderProtocol::BedrockConverse => (
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("system")),
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.pointer("/toolConfig/tools")),
+            ),
+        };
+        let cache_key_tools = provider_cache_key_tool_items(body, protocol, cache_capability);
+        let cache_key_tool_schema_items = cache_key_tools
+            .iter()
+            .map(|tool| {
+                Ok(
+                    astra_turn_core::cache_diagnostics::ProviderFinalToolFingerprint {
+                        name: provider_wire_tool_name(protocol, tool).map(str::to_string),
+                        sha256: serialized_item_sha256(tool)?,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, astra_core::ClassifiedError>>()?;
+        let cache_key_system = provider_cache_key_system_items(body, protocol, cache_capability);
+        Ok(Self {
+            message_sequence_sha256: serialized_sequence_sha256(&messages)?,
+            system_sequence_sha256: serialized_sequence_sha256(&system)?,
+            cache_key_system_sha256: serialized_sequence_sha256(&cache_key_system)?,
+            conversation_sequence_sha256: serialized_sequence_sha256(&conversation)?,
+            tool_schema_sequence_sha256: serialized_sequence_sha256(&tools)?,
+            cache_key_tool_schema_sequence_sha256: serialized_sequence_sha256(&cache_key_tools)?,
+            cache_capability,
+            cache_key_tool_schema_items,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn cache_diagnostic_fingerprint(
+        &self,
+    ) -> Option<astra_turn_core::cache_diagnostics::ProviderFinalPromptFingerprint> {
+        let cache_capability = self.cache_capability?;
+        Some(
+            astra_turn_core::cache_diagnostics::ProviderFinalPromptFingerprint {
+                message_sequence_sha256: self.message_sequence_sha256.clone(),
+                system_sequence_sha256: self.system_sequence_sha256.clone(),
+                cache_key_system_sha256: self.cache_key_system_sha256.clone(),
+                conversation_sequence_sha256: self.conversation_sequence_sha256.clone(),
+                tool_schema_sequence_sha256: self.tool_schema_sequence_sha256.clone(),
+                cache_key_tool_schema_sequence_sha256: self
+                    .cache_key_tool_schema_sequence_sha256
+                    .clone(),
+                cache_capability,
+                cache_key_tool_schema_items: self.cache_key_tool_schema_items.clone(),
+            },
+        )
+    }
+}
+
+fn provider_cache_key_system_items(
+    body: &Value,
+    protocol: LlmProviderProtocol,
+    cache_capability: Option<CacheCapability>,
+) -> Vec<&Value> {
+    use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
+
+    let mut system = match protocol {
+        LlmProviderProtocol::OpenAiCompatible => {
+            let messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            match cache_capability.map(|capability| capability.volatile_placement) {
+                Some(VolatilePlacement::Free) => Vec::new(),
+                Some(VolatilePlacement::TailSuffix | VolatilePlacement::AppendOnlyUserTail) => {
+                    messages
+                        .iter()
+                        .take_while(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                        .collect()
+                }
+                _ => messages
+                    .iter()
+                    .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                    .collect(),
+            }
+        }
+        LlmProviderProtocol::AnthropicMessages => provider_wire_items(body.get("system")),
+        LlmProviderProtocol::BedrockConverse => provider_wire_items(body.get("system")),
+    };
+
+    let marker_protocol = cache_capability
+        .map(|capability| capability.protocol)
+        .filter(|protocol| {
+            matches!(
+                protocol,
+                CacheProtocol::MarkerExplicit | CacheProtocol::BedrockCachePoint
+            )
+        });
+    if let Some(marker_protocol) = marker_protocol {
+        let last_marker = system.iter().rposition(|item| match marker_protocol {
+            CacheProtocol::MarkerExplicit => item.get("cache_control").is_some(),
+            CacheProtocol::BedrockCachePoint => item.get("cachePoint").is_some(),
+            _ => false,
+        });
+        system.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+    }
+    system
+}
+
+fn provider_cache_key_tool_items(
+    body: &Value,
+    protocol: LlmProviderProtocol,
+    cache_capability: Option<CacheCapability>,
+) -> Vec<&Value> {
+    use astra_turn_core::cache_placement::CacheProtocol;
+
+    let mut tools = match protocol {
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages => {
+            provider_wire_items(body.get("tools"))
+        }
+        LlmProviderProtocol::BedrockConverse => {
+            provider_wire_items(body.pointer("/toolConfig/tools"))
+        }
+    };
+    let Some(cache_capability) = cache_capability else {
+        return tools;
+    };
+    match cache_capability.protocol {
+        CacheProtocol::None => Vec::new(),
+        CacheProtocol::MarkerExplicit => {
+            let last_marker = tools
+                .iter()
+                .rposition(|tool| tool.get("cache_control").is_some());
+            tools.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+            tools
+        }
+        CacheProtocol::BedrockCachePoint => {
+            let last_marker = tools
+                .iter()
+                .rposition(|tool| tool.get("cachePoint").is_some());
+            tools.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+            tools
+        }
+        CacheProtocol::OpenAiAutoPrefix | CacheProtocol::StrictHistoryMatch => tools,
+    }
+}
+
+fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
+    let pointer = match protocol {
+        LlmProviderProtocol::OpenAiCompatible => "/function/name",
+        LlmProviderProtocol::AnthropicMessages => "/name",
+        LlmProviderProtocol::BedrockConverse => "/toolSpec/name",
+    };
+    tool.pointer(pointer).and_then(Value::as_str)
+}
+
+fn provider_wire_items(value: Option<&Value>) -> Vec<&Value> {
+    match value {
+        Some(Value::Array(values)) => values.iter().collect(),
+        Some(value) => vec![value],
+        None => Vec::new(),
+    }
+}
+
+fn serialized_sequence_sha256(values: &[&Value]) -> Result<String, astra_core::ClassifiedError> {
+    serde_json::to_vec(values)
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize provider wire fingerprint sequence: {error}"),
+            )
+        })
+}
+
+fn serialized_item_sha256(value: &Value) -> Result<String, astra_core::ClassifiedError> {
+    serde_json::to_vec(value)
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize provider wire fingerprint item: {error}"),
+            )
+        })
 }
 
 /// Mutually exclusive byte zones from the exact serialized provider body.
@@ -297,9 +556,18 @@ pub(crate) struct PreparedProviderRequest {
 }
 
 impl PreparedProviderRequest {
+    #[cfg(test)]
     pub(crate) fn from_json(
         body: &Value,
         protocol: LlmProviderProtocol,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        Self::from_json_with_cache_capability(body, protocol, None)
+    }
+
+    pub(crate) fn from_json_with_cache_capability(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let encoded = serde_json::to_vec(body).map_err(|error| {
             astra_core::history_work::record_serialization_failure(
@@ -320,6 +588,7 @@ impl PreparedProviderRequest {
         }
         let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
         let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
+        let fingerprints = ProviderWireFingerprints::from_body(body, protocol, cache_capability)?;
         Ok(Self {
             body: Bytes::from(encoded),
             identity: ProviderWireRequestIdentity {
@@ -327,6 +596,7 @@ impl PreparedProviderRequest {
                 provider_wire_hash,
                 provider_wire_bytes,
                 composition,
+                fingerprints,
             },
         })
     }
@@ -370,7 +640,11 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
-        let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
+        // This client-level ceiling is only a transport backstop. Derive it
+        // from the same effective provider-attempt configuration so an
+        // operator override cannot be silently capped by the compiled 300s
+        // default. Per-request deadlines remain authoritative below.
+        let total = llm_total_budget().saturating_add(std::time::Duration::from_secs(60));
         let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -455,7 +729,7 @@ fn is_valid_tool_name(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
-fn canonical_valid_tool_name(name: &str) -> Option<&str> {
+pub(crate) fn canonical_valid_tool_name(name: &str) -> Option<&str> {
     astra_core::canonical_names::normalize_name(name).filter(|name| is_valid_tool_name(name))
 }
 
@@ -483,12 +757,132 @@ pub(crate) struct LlmCallResult {
     pub reasoning_signature: String,
     pub tool_calls: Vec<Value>,
     pub usage: Map<String, Value>,
+    /// Provider fields observed before token usage is normalized into
+    /// zero-filled accounting buckets.
+    pub usage_presence: crate::turn::token_usage::TokenUsagePresence,
     pub model_used: String,
     #[allow(dead_code)] // validated in tests; reserved for future telemetry
     pub duration_ms: u64,
     /// The finish_reason from the last SSE choice (e.g. "stop", "length", "tool_calls").
     /// `None` when the stream ended without an explicit finish_reason.
     pub finish_reason: Option<String>,
+    /// Lifecycle interpretation of the provider result when the raw protocol
+    /// did not carry enough information to make the boundary explicit.
+    ///
+    /// This is deliberately separate from [`Self::finish_reason`].  A few
+    /// OpenAI-compatible gateways close a stream with `[DONE]`, report usage
+    /// exactly at the requested output cap, and omit `finish_reason`.  The
+    /// collector must preserve that protocol fact (`None`), while the caller
+    /// may still need a typed `length` boundary for retry/finalization.
+    pub effective_finish_reason: Option<String>,
+}
+
+impl LlmCallResult {
+    /// Return the reason that should drive lifecycle decisions while keeping
+    /// the provider's raw terminal reason available for diagnostics.
+    #[must_use]
+    pub(crate) fn lifecycle_finish_reason(&self) -> Option<&str> {
+        self.effective_finish_reason
+            .as_deref()
+            .or(self.finish_reason.as_deref())
+    }
+}
+
+// Usage chunks are cumulative per reported field, but may omit other fields.
+// Keep the raw cache partition until normalization so a later cached-token
+// count can still be subtracted from an earlier inclusive prompt total.
+fn merge_reported_usage_fields(target: &mut Map<String, Value>, update: &Map<String, Value>) {
+    for (key, value) in update {
+        if value.as_u64().is_some() || value.as_i64().is_some() {
+            target.insert(key.clone(), value.clone());
+        } else if let Some(object) = value.as_object() {
+            let entry = target
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(existing) = entry.as_object_mut() {
+                merge_reported_usage_fields(existing, object);
+            }
+        }
+    }
+}
+
+fn current_usage_presence(
+    presence: &std::sync::Mutex<crate::turn::token_usage::TokenUsagePresence>,
+) -> crate::turn::token_usage::TokenUsagePresence {
+    *presence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn replace_usage_presence(
+    presence: &std::sync::Mutex<crate::turn::token_usage::TokenUsagePresence>,
+    observed: crate::turn::token_usage::TokenUsagePresence,
+) {
+    *presence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observed;
+}
+
+/// Normalize provider-native OpenAI-compatible calls once at the transport
+/// boundary. Canonical execution is about semantic shape and provider-owned
+/// identity, not the byte formatting or object-key order of an arguments JSON
+/// string. Invalid calls remain intact so admission can reject them with
+/// explicit evidence instead of silently losing the provider request.
+fn canonicalize_provider_tool_calls(tool_calls: &mut [Value]) {
+    for tool_call in tool_calls {
+        if let Ok(canonical) =
+            astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(tool_call)
+        {
+            *tool_call = canonical;
+        }
+    }
+}
+
+/// Read the output-token ceiling from the already assembled provider request.
+/// Looking at the wire body, rather than the logical budget passed by the
+/// caller, matters for thinking providers that reserve part of the completion
+/// budget for hidden reasoning.
+fn provider_request_output_limit(body: &Value) -> Option<usize> {
+    [
+        body.get("max_completion_tokens"),
+        body.get("max_tokens"),
+        body.pointer("/inferenceConfig/maxTokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_u64().filter(|value| *value > 0))
+    .and_then(|value| usize::try_from(value).ok())
+}
+
+/// Add a lifecycle-only cap interpretation when a compatible provider omitted
+/// its finish reason but reported a response at the exact requested ceiling.
+///
+/// This intentionally does not reinterpret an explicit `stop` (or any other
+/// provider reason), and it never applies to tool-bearing responses.  Those
+/// constraints keep the detector advisory and avoid turning a legitimate
+/// natural stop into an interruption merely because it happened to use the
+/// full budget.  The low-level SSE collector remains protocol-faithful; this
+/// function is called only after request-level usage and the wire cap are both
+/// known.
+pub(crate) fn reconcile_missing_output_cap_finish_reason(
+    result: &mut LlmCallResult,
+    wire_output_limit: Option<usize>,
+) -> bool {
+    if result.finish_reason.is_some()
+        || result.effective_finish_reason.is_some()
+        || !result.tool_calls.is_empty()
+    {
+        return false;
+    }
+    let Some(limit) = wire_output_limit else {
+        return false;
+    };
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+    if usage.output_tokens < limit as u64 {
+        return false;
+    }
+    result.effective_finish_reason = Some("length".to_string());
+    true
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -506,6 +900,8 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub model_name: &'a str,
     pub wire_model_name: Option<&'a str>,
     pub api_key: &'a str,
@@ -524,6 +920,8 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
             api_key: &execution.api_key,
@@ -550,6 +948,12 @@ pub(crate) struct OwnedLlmExecutionRoute {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
+    /// Capability established at model admission. Auxiliary callers may use
+    /// it to select a compatible bounded-reasoning request, never a heuristic.
+    pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
+    /// Mode-independent fixed temperature admitted with the Offering.
+    pub fixed_temperature: Option<f64>,
+    pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub header_overrides: HashMap<String, String>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub completions_url_override: Option<String>,
@@ -560,6 +964,8 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            fixed_temperature: self.fixed_temperature,
+            thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
             api_key: &self.api_key,
@@ -636,21 +1042,173 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         attempt_index: u32,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
+
+    /// Preserve provider lane presence for Explain Analyze without changing
+    /// the inference ledger's normalized accounting contract.
+    fn note_usage_presence(
+        &self,
+        _attempt_index: u32,
+        _presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+    }
+
+    /// Synchronous boundary when the HTTP send future is first polled.
+    /// Durable diagnostics use it to distinguish an admitted plan from a
+    /// request that actually crossed into transport execution.
+    fn note_dispatch_started(&self, _attempt_index: u32) {}
+}
+
+struct ControlledProviderAttemptObserver<'a> {
+    inner: &'a dyn ProviderAttemptObserver,
+    started: Instant,
+    work_budget: std::time::Duration,
+    logical_budget: std::time::Duration,
+    cancel: LlmCancel<'a>,
+}
+
+impl ControlledProviderAttemptObserver<'_> {
+    fn remaining_work(&self) -> std::time::Duration {
+        self.work_budget.saturating_sub(self.started.elapsed())
+    }
+
+    fn remaining_settlement(&self) -> std::time::Duration {
+        // The reserve stops provider work early enough to leave time for
+        // settlement; it is not a second, shorter deadline for a fast reply.
+        self.logical_budget.saturating_sub(self.started.elapsed())
+    }
+
+    fn cancellation_error(&self, stage: &str) -> astra_core::ClassifiedError {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled,
+            format!("LLM call cancelled during provider attempt {stage}"),
+        )
+    }
+
+    fn provider_work_deadline_before_admission(&self) -> astra_core::ClassifiedError {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider work deadline reached before provider attempt admission",
+        )
+    }
+
+    fn ledger_deadline_error(
+        &self,
+        stage: &'static str,
+        terminal: Option<&astra_services::InferenceInvocationTerminal>,
+    ) -> astra_core::ClassifiedError {
+        let phase = match stage {
+            "admission" => "provider_attempt_admission",
+            "terminalization" => "provider_attempt_terminalization",
+            _ => "provider_attempt_persistence",
+        };
+        let mut details = json!({
+            "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+            "deadline": {
+                "scope": "inference_ledger",
+                "phase": phase,
+                "elapsed_ms": self.started.elapsed().as_millis() as u64,
+                "retry_safety": "none"
+            }
+        });
+        if let Some(terminal) = terminal {
+            details["provider_terminal"] = json!({
+                "status": terminal.status.as_str(),
+                "usage_status": terminal.usage_status.as_str(),
+                "error_kind": terminal.error_kind,
+            });
+        }
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::DatabaseError,
+            format!("durable inference ledger timed out during provider attempt {stage}"),
+        )
+        .with_details_json(details.to_string())
+    }
+}
+
+#[async_trait]
+impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
+    async fn begin_attempt(
+        &self,
+        wire: &ProviderWireRequestIdentity,
+    ) -> Result<u32, astra_core::ClassifiedError> {
+        if self.cancel.is_triggered() {
+            return Err(self.cancellation_error("admission"));
+        }
+        let remaining = self.remaining_work();
+        if remaining.is_zero() {
+            return Err(self.provider_work_deadline_before_admission());
+        }
+        let operation = self.inner.begin_attempt(wire);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            result = &mut operation => result,
+            _ = wait_llm_cancel(self.cancel) => Err(self.cancellation_error("admission")),
+            _ = tokio::time::sleep(remaining) => Err(self.ledger_deadline_error("admission", None)),
+        }
+    }
+
+    async fn finish_attempt(
+        &self,
+        attempt_index: u32,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        // Poll the durable operation first so a cancellation/deadline winner
+        // detaches reconciliation instead of losing the terminal fact.
+        let operation = self.inner.finish_attempt(attempt_index, terminal);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            result = &mut operation => result,
+            _ = wait_llm_cancel(self.cancel) => Err(self.cancellation_error("terminalization")),
+            _ = tokio::time::sleep(self.remaining_settlement()) => {
+                Err(self.ledger_deadline_error("terminalization", Some(terminal)))
+            },
+        }
+    }
+
+    fn note_usage_presence(
+        &self,
+        attempt_index: u32,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner.note_usage_presence(attempt_index, presence);
+    }
+
+    fn note_dispatch_started(&self, attempt_index: u32) {
+        self.inner.note_dispatch_started(attempt_index);
+    }
 }
 
 pub(crate) fn provider_attempt_terminal_from_result(
     result: &LlmCallResult,
 ) -> astra_services::InferenceInvocationTerminal {
     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
-    astra_services::InferenceInvocationTerminal::succeeded(
+    let mut terminal = astra_services::InferenceInvocationTerminal::succeeded(
         astra_services::InferenceUsage {
-            input_tokens: usage.input_tokens,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_tokens,
+            ),
             output_tokens: usage.output_tokens,
-            cache_read_tokens: usage.cached_input_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
         },
         result.response_id.clone(),
-    )
+    );
+    terminal.usage_status = provider_usage_status_from_presence(result.usage_presence);
+    terminal
+}
+
+pub(crate) fn provider_usage_status_from_presence(
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) -> astra_services::InferenceUsageStatus {
+    if !presence.any() {
+        astra_services::InferenceUsageStatus::Unavailable
+    } else if !presence.fresh_input_tokens || !presence.output_tokens {
+        astra_services::InferenceUsageStatus::ProviderPartial
+    } else {
+        astra_services::InferenceUsageStatus::ProviderExact
+    }
 }
 
 pub(crate) fn provider_attempt_terminal_from_error(
@@ -665,7 +1223,9 @@ pub(crate) fn provider_attempt_terminal_from_error_with_partial(
 ) -> astra_services::InferenceInvocationTerminal {
     let status = match error.kind {
         astra_core::ErrorKind::Cancelled => astra_services::InferenceTerminalStatus::Cancelled,
-        astra_core::ErrorKind::StreamIdle | astra_core::ErrorKind::StreamTransport => {
+        astra_core::ErrorKind::StreamIdle
+        | astra_core::ErrorKind::StreamTransport
+        | astra_core::ErrorKind::ProviderDeadline => {
             astra_services::InferenceTerminalStatus::DeliveryUnknown
         }
         _ => astra_services::InferenceTerminalStatus::Failed,
@@ -677,10 +1237,17 @@ pub(crate) fn provider_attempt_terminal_from_error_with_partial(
     astra_services::InferenceInvocationTerminal {
         status,
         usage: astra_services::InferenceUsage {
-            input_tokens: usage.input_tokens,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_tokens,
+            ),
             output_tokens: usage.output_tokens,
-            cache_read_tokens: usage.cached_input_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
+        },
+        usage_status: if partial.is_some_and(|partial| !partial.usage.is_empty()) {
+            astra_services::InferenceUsageStatus::ProviderPartial
+        } else {
+            astra_services::InferenceUsageStatus::Unavailable
         },
         provider_response_id: partial.and_then(|partial| partial.response_id.clone()),
         error_kind: Some(error.kind.as_str().to_string()),
@@ -688,6 +1255,20 @@ pub(crate) fn provider_attempt_terminal_from_error_with_partial(
             astra_text_utils::str_preview::truncate_str(&message, 1_000).to_string(),
         ),
     }
+}
+
+/// Preserve the caller-visible control/error classification while recording
+/// that an admitted provider request may already have been delivered. This is
+/// required once `send()` has started (unless the transport proves a connect
+/// failure) and while consuming a successful response body: a local timeout or
+/// cancellation cannot prove that the provider stopped generating or billing.
+pub(crate) fn provider_attempt_terminal_from_delivery_unknown_error_with_partial(
+    error: &astra_core::ClassifiedError,
+    partial: Option<&LlmCallResult>,
+) -> astra_services::InferenceInvocationTerminal {
+    let mut terminal = provider_attempt_terminal_from_error_with_partial(error, partial);
+    terminal.status = astra_services::InferenceTerminalStatus::DeliveryUnknown;
+    terminal
 }
 
 /// Classify a request-builder `send` failure by whether provider delivery is
@@ -725,6 +1306,16 @@ pub(crate) async fn finish_observed_provider_attempt(
     observer.finish_attempt(attempt_index, terminal).await
 }
 
+fn note_observed_provider_usage_presence(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    presence: crate::turn::token_usage::TokenUsagePresence,
+) {
+    if let (Some(observer), Some(attempt_index)) = (observer, attempt_index) {
+        observer.note_usage_presence(attempt_index, presence);
+    }
+}
+
 pub(crate) async fn finish_observed_provider_error(
     observer: Option<&dyn ProviderAttemptObserver>,
     attempt_index: Option<u32>,
@@ -744,20 +1335,53 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
         attempt_index,
         &provider_attempt_terminal_from_error_with_partial(error, Some(partial)),
     )
     .await
+    .map_err(|ledger_error| attach_llm_result_details(ledger_error, partial))
+}
+
+pub(crate) async fn finish_observed_provider_delivery_unknown(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_attempt(
+        observer,
+        attempt_index,
+        &provider_attempt_terminal_from_delivery_unknown_error_with_partial(error, None),
+    )
+    .await
+}
+
+pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+    partial: &LlmCallResult,
+) -> Result<(), astra_core::ClassifiedError> {
+    note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
+    finish_observed_provider_attempt(
+        observer,
+        attempt_index,
+        &provider_attempt_terminal_from_delivery_unknown_error_with_partial(error, Some(partial)),
+    )
+    .await
+    .map_err(|ledger_error| attach_llm_result_details(ledger_error, partial))
 }
 
 fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
-    !result.full_text.is_empty()
+    result.response_id.is_some()
+        || !result.full_text.is_empty()
         || !result.reasoning.is_empty()
         || !result.tool_calls.is_empty()
         || !result.usage.is_empty()
         || result.finish_reason.is_some()
+        || result.effective_finish_reason.is_some()
 }
 
 fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
@@ -770,10 +1394,72 @@ fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
         "reasoning_signature": result.reasoning_signature,
         "tool_calls": result.tool_calls,
         "usage": result.usage,
+        "provider_response_id": result.response_id,
         "finish_reason": result.finish_reason,
+        "effective_finish_reason": result.effective_finish_reason,
         "model_used": result.model_used,
     }))
     .ok()
+}
+
+pub(super) fn attach_llm_result_details(
+    error: astra_core::ClassifiedError,
+    result: &LlmCallResult,
+) -> astra_core::ClassifiedError {
+    let Some(result_details) = llm_result_details_json(result)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return error;
+    };
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    details.extend(result_details);
+    error.with_details_json(Value::Object(details).to_string())
+}
+
+/// Build the user-facing error for a provider-work deadline that races with a
+/// response-body/stream decoder failure.
+///
+/// The deadline owns the classification and headline: once the hard provider
+/// work budget has expired, reporting the decoder's incidental error as a
+/// transport failure makes a healthy-but-too-slow inference look like a
+/// network outage. Keep the incidental cause in structured diagnostics so
+/// operators still have the evidence needed to distinguish a real reset from
+/// a deadline race.
+fn provider_deadline_from_transport(
+    phase: &'static str,
+    cause: &str,
+    elapsed: Duration,
+    partial: Option<&LlmCallResult>,
+) -> astra_core::ClassifiedError {
+    let details_value = partial
+        .and_then(llm_result_details_json)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let mut details = details_value.as_object().cloned().unwrap_or_default();
+    details.insert(
+        "deadline".to_string(),
+        json!({
+            "scope": "provider_attempt",
+            "phase": phase,
+            "elapsed_ms": elapsed.as_millis() as u64,
+            "retry_safety": "convergence_only"
+        }),
+    );
+    details.insert(
+        "underlying_error".to_string(),
+        Value::String(redact_provider_secrets(cause)),
+    );
+    astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ProviderDeadline,
+        format!("LLM provider work deadline reached while {phase}"),
+    )
+    .with_details_json(Value::Object(details).to_string())
 }
 
 /// Cooperative cancellation for [`call_llm_and_collect`] / [`collect_llm_stream`].
@@ -841,14 +1527,14 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
 
 /// Per-chunk idle watchdog (pre-progress): no SSE JSON for this long → treat as stalled.
 /// Production delegates to the canonical timeout in `sse_stream_host`; tests may
-/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
+/// override it through unit-test locals or the `e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow()) {
         return d;
     }
-    #[cfg(feature = "bridge-e2e-hooks")]
-    if let Some(d) = bridge_e2e_stream_idle_timeout_override() {
+    #[cfg(feature = "e2e-hooks")]
+    if let Some(d) = e2e_stream_idle_timeout_override() {
         return d;
     }
     astra_turn_core::sse_stream_host::stream_idle_timeout()
@@ -857,14 +1543,14 @@ pub(crate) fn stream_idle_timeout() -> std::time::Duration {
 /// Per-chunk idle watchdog (post-progress): once at least one SSE chunk has been
 /// received, allow a longer idle window to accommodate thinking/reasoning pauses.
 /// Production delegates to the canonical timeout in `sse_stream_host`; tests may
-/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
+/// override it through unit-test locals or the `e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout_after_progress() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow()) {
         return d;
     }
-    #[cfg(feature = "bridge-e2e-hooks")]
-    if let Some(d) = bridge_e2e_stream_idle_timeout_after_progress_override() {
+    #[cfg(feature = "e2e-hooks")]
+    if let Some(d) = e2e_stream_idle_timeout_after_progress_override() {
         return d;
     }
     astra_turn_core::sse_stream_host::stream_idle_timeout_after_progress()
@@ -878,74 +1564,72 @@ pub(crate) fn stream_terminal_drain_timeout(
     ))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+#[cfg(feature = "e2e-hooks")]
+static E2E_STREAM_IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "bridge-e2e-hooks")]
-static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: std::sync::atomic::AtomicU64 =
+#[cfg(feature = "e2e-hooks")]
+static E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) struct BridgeE2eStreamIdleTimeoutGuard {
+#[cfg(feature = "e2e-hooks")]
+pub(crate) struct E2eStreamIdleTimeoutGuard {
     prev_pre_ms: u64,
     prev_post_ms: u64,
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-impl Drop for BridgeE2eStreamIdleTimeoutGuard {
+#[cfg(feature = "e2e-hooks")]
+impl Drop for E2eStreamIdleTimeoutGuard {
     fn drop(&mut self) {
-        restore_bridge_e2e_stream_idle_timeouts_for_test(self.prev_pre_ms, self.prev_post_ms);
+        restore_e2e_stream_idle_timeouts_for_test(self.prev_pre_ms, self.prev_post_ms);
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn duration_override(ms: u64) -> Option<std::time::Duration> {
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-fn bridge_e2e_stream_idle_timeout_override() -> Option<std::time::Duration> {
-    duration_override(BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+#[cfg(feature = "e2e-hooks")]
+fn e2e_stream_idle_timeout_override() -> Option<std::time::Duration> {
+    duration_override(E2E_STREAM_IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-fn bridge_e2e_stream_idle_timeout_after_progress_override() -> Option<std::time::Duration> {
+#[cfg(feature = "e2e-hooks")]
+fn e2e_stream_idle_timeout_after_progress_override() -> Option<std::time::Duration> {
     duration_override(
-        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.load(std::sync::atomic::Ordering::SeqCst),
+        E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.load(std::sync::atomic::Ordering::SeqCst),
     )
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn set_bridge_e2e_stream_idle_timeouts_for_test(
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn set_e2e_stream_idle_timeouts_for_test(
     pre_ms: u64,
     post_ms: u64,
-) -> BridgeE2eStreamIdleTimeoutGuard {
+) -> E2eStreamIdleTimeoutGuard {
     assert!(pre_ms > 0, "pre-progress idle timeout must be positive");
     assert!(post_ms > 0, "post-progress idle timeout must be positive");
-    let prev_pre_ms =
-        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.swap(pre_ms, std::sync::atomic::Ordering::SeqCst);
-    let prev_post_ms = BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
+    let prev_pre_ms = E2E_STREAM_IDLE_TIMEOUT_MS.swap(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    let prev_post_ms = E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
         .swap(post_ms, std::sync::atomic::Ordering::SeqCst);
-    BridgeE2eStreamIdleTimeoutGuard {
+    E2eStreamIdleTimeoutGuard {
         prev_pre_ms,
         prev_post_ms,
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn restore_bridge_e2e_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) {
-    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.store(pre_ms, std::sync::atomic::Ordering::SeqCst);
-    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
-        .store(post_ms, std::sync::atomic::Ordering::SeqCst);
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn restore_e2e_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) {
+    E2E_STREAM_IDLE_TIMEOUT_MS.store(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.store(post_ms, std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn current_bridge_e2e_stream_idle_timeouts_for_test()
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn current_e2e_stream_idle_timeouts_for_test()
 -> (Option<std::time::Duration>, Option<std::time::Duration>) {
     (
-        bridge_e2e_stream_idle_timeout_override(),
-        bridge_e2e_stream_idle_timeout_after_progress_override(),
+        e2e_stream_idle_timeout_override(),
+        e2e_stream_idle_timeout_after_progress_override(),
     )
 }
 
@@ -1040,6 +1724,158 @@ pub(crate) fn llm_total_budget() -> std::time::Duration {
         "ASTRA_LLM_TOTAL_BUDGET_S",
         LLM_TOTAL_BUDGET_S,
     ))
+}
+
+/// Deadline for producing meaningful semantic progress inside a live provider
+/// stream. This is distinct from byte-stream idle and the hard physical-attempt
+/// deadline.
+pub(crate) fn llm_semantic_progress_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_SEMANTIC_PROGRESS_TIMEOUT_S",
+        LLM_SEMANTIC_PROGRESS_TIMEOUT_S,
+    ))
+}
+
+/// Action progress must be deliverable content, not provider keepalive text.
+/// Keeping this predicate shared also prevents protocol-specific collectors
+/// from disagreeing about whitespace-only deltas.
+pub(crate) fn text_has_actionable_content(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+/// Provider-neutral state of one streaming inference's liveness and delivery.
+///
+/// Semantic activity and actionable delivery are deliberately different facts:
+/// non-empty reasoning proves the provider is still doing work, but never
+/// authorizes success, a side effect, or replay. A valid, authorized tool name
+/// enters `Delivering` before its JSON arguments are complete; subsequent
+/// fragments roll the activity watchdog. `Terminal` permits only the bounded
+/// protocol drain for trailing usage/final markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamYieldState {
+    Deliberating {
+        last_semantic_activity_at: TokioInstant,
+        semantic_activity_observed: bool,
+    },
+    Delivering {
+        last_semantic_activity_at: TokioInstant,
+        actionable_delivery_observed: bool,
+    },
+    Terminal,
+}
+
+impl StreamYieldState {
+    pub(crate) fn new(now: TokioInstant) -> Self {
+        Self::Deliberating {
+            last_semantic_activity_at: now,
+            semantic_activity_observed: false,
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+
+    pub(crate) fn has_actionable_yield(self) -> bool {
+        matches!(
+            self,
+            Self::Delivering {
+                actionable_delivery_observed: true,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn deadline(self, timeout: std::time::Duration) -> Option<TokioInstant> {
+        match self {
+            Self::Deliberating {
+                last_semantic_activity_at,
+                ..
+            }
+            | Self::Delivering {
+                last_semantic_activity_at,
+                ..
+            } => Some(last_semantic_activity_at + timeout),
+            Self::Terminal => None,
+        }
+    }
+
+    pub(crate) fn timed_out(self, now: TokioInstant, timeout: std::time::Duration) -> bool {
+        self.deadline(timeout)
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    pub(crate) fn observe_text(&mut self, text: &str, now: TokioInstant) {
+        if text_has_actionable_content(text) && !self.is_terminal() {
+            *self = Self::Delivering {
+                last_semantic_activity_at: now,
+                actionable_delivery_observed: true,
+            };
+        }
+    }
+
+    /// Reasoning is liveness evidence, not an externally actionable yield.
+    /// Empty/whitespace chunks intentionally do not refresh the watchdog.
+    pub(crate) fn observe_reasoning_activity(&mut self, reasoning: &str, now: TokioInstant) {
+        if !text_has_actionable_content(reasoning) || self.is_terminal() {
+            return;
+        }
+        *self = match *self {
+            Self::Deliberating { .. } => Self::Deliberating {
+                last_semantic_activity_at: now,
+                semantic_activity_observed: true,
+            },
+            Self::Delivering {
+                actionable_delivery_observed,
+                ..
+            } => Self::Delivering {
+                last_semantic_activity_at: now,
+                actionable_delivery_observed,
+            },
+            Self::Terminal => Self::Terminal,
+        };
+    }
+
+    pub(crate) fn observe_tool_delivery(
+        &mut self,
+        name: &str,
+        authorized_tool_names: Option<&HashSet<String>>,
+        fragment_advanced: bool,
+        now: TokioInstant,
+    ) {
+        let Some(name) = canonical_valid_tool_name(name) else {
+            return;
+        };
+        if authorized_tool_names.is_some_and(|authorized| !authorized.contains(name))
+            || self.is_terminal()
+        {
+            return;
+        }
+        match *self {
+            Self::Deliberating { .. } => {
+                *self = Self::Delivering {
+                    last_semantic_activity_at: now,
+                    actionable_delivery_observed: true,
+                };
+            }
+            Self::Delivering { .. } if fragment_advanced => {
+                *self = Self::Delivering {
+                    last_semantic_activity_at: now,
+                    actionable_delivery_observed: true,
+                };
+            }
+            Self::Delivering { .. } | Self::Terminal => {}
+        }
+    }
+
+    pub(crate) fn mark_terminal(&mut self) {
+        *self = Self::Terminal;
+    }
+}
+
+fn llm_mandatory_settlement_reserve(logical_budget: std::time::Duration) -> std::time::Duration {
+    let configured_cap = std::time::Duration::from_secs(LLM_MANDATORY_SETTLEMENT_RESERVE_S);
+    configured_cap.min(logical_budget / 10)
 }
 
 #[cfg(test)]
@@ -1525,6 +2361,129 @@ pub(crate) fn repair_openai_tool_pairing(messages: &[Value]) -> Vec<Value> {
     repaired
 }
 
+fn append_only_history_contract_error(message: &'static str) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+}
+
+/// Validate the exact OpenAI-compatible conversation shape used by an
+/// append-only cache deployment.
+///
+/// Ordinary transports may repair interrupted tool groups. An append-only
+/// transport cannot: a later suffix must never cause a previously sent
+/// assistant or synthetic tool message to be replaced. Malformed/incomplete
+/// groups therefore fail before provider I/O and remain recoverable through
+/// the canonical lifecycle instead of silently changing the cache prefix.
+fn validate_append_only_openai_history(
+    messages: &[Value],
+) -> Result<(), astra_core::ClassifiedError> {
+    let mut pending_tool_ids = HashSet::<&str>::new();
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                if !pending_tool_ids.is_empty() {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains an incomplete assistant tool group",
+                    ));
+                }
+                let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for tool_call in tool_calls {
+                    let Some(id) = tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a stable id",
+                        ));
+                    };
+                    if !pending_tool_ids.insert(id) {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains duplicate tool call ids",
+                        ));
+                    }
+                    let Some(function) = tool_call.get("function") else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a function",
+                        ));
+                    };
+                    let Some(name) = function.get("name").and_then(Value::as_str) else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a function name",
+                        ));
+                    };
+                    if canonical_valid_tool_name(name) != Some(name)
+                        || !function.get("arguments").is_some_and(Value::is_string)
+                    {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a non-canonical tool call",
+                        ));
+                    }
+                }
+            }
+            Some("tool") => {
+                let Some(id) = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains a tool result without a stable id",
+                    ));
+                };
+                if !pending_tool_ids.remove(id) {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains an orphaned or duplicate tool result",
+                    ));
+                }
+                if matches!(
+                    message.get("content"),
+                    None | Some(Value::Null | Value::Object(_))
+                ) {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains non-canonical tool result content",
+                    ));
+                }
+            }
+            _ if !pending_tool_ids.is_empty() => {
+                return Err(append_only_history_contract_error(
+                    "append-only history interrupts an assistant tool group",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !pending_tool_ids.is_empty() {
+        return Err(append_only_history_contract_error(
+            "append-only history ends with an incomplete assistant tool group",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_append_only_transport_history(
+    messages: &[Value],
+    provider: &str,
+    cache_capability: Option<CacheCapability>,
+) -> Result<(), astra_core::ClassifiedError> {
+    let capability = CacheCapability::from_explicit_or_provider(cache_capability, provider);
+    if !matches!(
+        capability.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    ) {
+        return Ok(());
+    }
+    if !capability.is_valid()
+        || !llm_provider_protocol(provider).preserves_appended_message_boundaries()
+    {
+        return Err(append_only_history_contract_error(
+            "append-only cache capability is incompatible with the selected transport",
+        ));
+    }
+    validate_append_only_openai_history(messages)
+}
+
 fn anthropic_tool_use_ids(msg: &Value) -> Vec<String> {
     msg.get("content")
         .map(anthropic_content_as_blocks)
@@ -1851,68 +2810,7 @@ fn strip_internal_schema_extensions(value: &mut Value) {
             // well. Materialize one compact, deterministic description before
             // stripping so the provider sees the same contract the executor
             // enforces without relying on unsupported schema composition.
-            let mut requirements = Vec::new();
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} requires {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ANY_OF_REQUIRED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, alternatives) in per_action {
-                    let alternatives = alternatives
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_array)
-                        .map(|fields| {
-                            fields
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" + ")
-                        })
-                        .filter(|fields| !fields.is_empty())
-                        .collect::<Vec<_>>();
-                    if !alternatives.is_empty() {
-                        requirements.push(format!(
-                            "{action} also requires one of {}",
-                            alternatives.join(" or ")
-                        ));
-                    }
-                }
-            }
-            if let Some(per_action) = object
-                .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
-                .and_then(Value::as_object)
-            {
-                for (action, fields) in per_action {
-                    let fields = fields
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>();
-                    if !fields.is_empty() {
-                        requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
-                    }
-                }
-            }
-            if !requirements.is_empty() {
-                let contract = format!("Action contract: {}.", requirements.join("; "));
+            if let Some(contract) = astra_tools::schemas::action_contract_description(object) {
                 let description = object
                     .get("description")
                     .and_then(Value::as_str)
@@ -2094,8 +2992,7 @@ fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
 /// `reasoningContent.text` block but no `signature`. Incremented by
 /// [`assert_bedrock_thinking_signature_contract`] whenever the invariant is
 /// violated. Exposed as a `pub static` so health/metric handlers can surface
-/// it without plumbing a handle through every call site — matches the
-/// convention used by `PERSIST_FAIL_COUNT` / `PERSIST_OK_COUNT`.
+/// it without plumbing a handle through every call site.
 ///
 /// Any non-zero value in production means at least one turn will 400 at
 /// Bedrock; on-call should page and check `astra_core::agent_warn!` logs
@@ -2201,6 +3098,32 @@ pub(crate) fn build_provider_request_body_with_overrides(
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     request_body_overrides: Option<&Map<String, Value>>,
 ) -> Value {
+    build_provider_request_body_with_cache_capability(
+        messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        temperature,
+        streaming,
+        thinking,
+        request_body_overrides,
+        None,
+    )
+}
+
+fn build_provider_request_body_with_cache_capability(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    temperature: Option<f64>,
+    streaming: bool,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
+    cache_capability: Option<CacheCapability>,
+) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     // Direct body-building callers use the same projection as streaming and
@@ -2220,7 +3143,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
     ) && needs_role_projection
     {
         projected_messages =
-            consolidate_system_messages_for_provider(messages, provider, model_name, None);
+            consolidate_system_messages_for_provider(messages, provider, cache_capability);
         projected_messages.as_slice()
     } else {
         messages
@@ -2229,6 +3152,11 @@ pub(crate) fn build_provider_request_body_with_overrides(
     let messages = if messages.iter().any(|message| {
         crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
+            || astra_turn_types::is_runtime_owned_message(message)
+            || astra_turn_types::has_append_only_runtime_authority_policy(message)
+            || message
+                .get(astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD)
+                .is_some()
     }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
@@ -2252,10 +3180,27 @@ pub(crate) fn build_provider_request_body_with_overrides(
     // thinking, no prior reasoning) yields a no-op policy. We skip the
     // `messages.to_vec()` clone in that case using `Cow::Borrowed`, falling
     // back to an owned clone only when the policy may actually mutate.
-    let policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
-        messages, thinking, provider, model_name,
-    );
-    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy.is_no_op() {
+    let preserve_exact_history = cache_capability.is_some_and(|capability| {
+        matches!(
+            capability.volatile_placement,
+            VolatilePlacement::AppendOnlyUserTail
+        )
+    });
+    let policy = (!preserve_exact_history).then(|| {
+        astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+            messages, thinking, provider, model_name,
+        )
+    });
+    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy
+        .as_ref()
+        .is_none_or(astra_turn_core::edge_ledger::ReasoningReplayPolicy::is_no_op)
+    {
+        // Cache placement is not a reasoning-wire capability. Append-only
+        // deployments therefore preserve assistant fields exactly as
+        // captured: no pruning, placeholder inference, or field backfill.
+        // A deployment which requires synthetic replay fields must declare a
+        // separate typed reasoning capability before such normalization can
+        // be admitted here.
         std::borrow::Cow::Borrowed(messages)
     } else {
         astra_core::history_work::record_serialized_value(
@@ -2263,7 +3208,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
             messages,
         );
         let mut owned = messages.to_vec();
-        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut owned, &policy);
+        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(
+            &mut owned,
+            policy.as_ref().expect("non-no-op reasoning policy"),
+        );
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
@@ -2312,6 +3260,12 @@ pub(crate) fn build_provider_request_body_with_overrides(
                     .as_ref()
                     .map(|overrides| overrides.as_ref()),
             );
+            reconcile_authoritative_temperature(
+                &mut body,
+                TemperatureField::BedrockInferenceConfig,
+                temperature,
+                thinking.is_enabled(),
+            );
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -2329,7 +3283,9 @@ pub(crate) fn build_provider_request_body_with_overrides(
                     body["system"] = Value::Array(system);
                 }
                 if let Some(max_out) = max_output_tokens {
-                    body["max_tokens"] = json!(max_out);
+                    astra_core::model_wire::apply_chat_output_token_limit(
+                        &mut body, provider, max_out,
+                    );
                 }
                 if let Some(temp) = temperature {
                     body["temperature"] = json!(temp);
@@ -2346,10 +3302,23 @@ pub(crate) fn build_provider_request_body_with_overrides(
                         .as_ref()
                         .map(|overrides| overrides.as_ref()),
                 );
+                reconcile_authoritative_temperature(
+                    &mut body,
+                    TemperatureField::TopLevel,
+                    temperature,
+                    thinking.is_enabled(),
+                );
                 return body;
             }
-            let repaired = repair_openai_tool_pairing(&reasoning_repaired);
-            let normalized_messages = normalize_openai_tool_message_content(&repaired);
+            let normalized_messages = if preserve_exact_history {
+                // Append-only transport admits only already-valid canonical
+                // tool groups. Suffix-dependent recovery would let a later
+                // tool result rewrite a message that has already been sent.
+                reasoning_repaired.to_vec()
+            } else {
+                let repaired = repair_openai_tool_pairing(&reasoning_repaired);
+                normalize_openai_tool_message_content(&repaired)
+            };
             let mut body = json!({
                 "model": model_name,
                 "messages": normalized_messages,
@@ -2360,7 +3329,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
             }
             if let Some(max_out) = max_output_tokens {
                 // When thinking is active, providers like DeepSeek allocate a
-                // thinking_budget that must be LESS than max_completion_tokens.
+                // thinking_budget that must be LESS than the output token limit.
                 // If max_out is too small, the request will 400. Bump to at
                 // least thinking_budget + a headroom for the visible answer.
                 //
@@ -2378,7 +3347,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
                         tracing::debug!(
                             user_max = max_out,
                             bumped_to = required_floor,
-                            "max_completion_tokens bumped to fit thinking budget"
+                            "output token limit bumped to fit thinking budget"
                         );
                         required_floor
                     } else {
@@ -2387,7 +3356,11 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 } else {
                     max_out
                 };
-                body["max_completion_tokens"] = json!(effective_max);
+                astra_core::model_wire::apply_chat_output_token_limit(
+                    &mut body,
+                    provider,
+                    effective_max,
+                );
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -2431,9 +3404,101 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 thinking.apply_openai(&mut body);
             }
             apply_request_body_overrides(&mut body, sanitized_overrides.as_deref());
+            reconcile_authoritative_temperature(
+                &mut body,
+                TemperatureField::TopLevel,
+                temperature,
+                matches!(thinking, ThinkingConfig::Adaptive { .. })
+                    && !provider_uses_dashscope_thinking(provider),
+            );
             body
         }
     }
+}
+
+/// Apply a runtime-owned forced tool choice to an already assembled provider
+/// payload.  The tool must be present in the exact schema surface sent to the
+/// provider; otherwise forcing it would turn a server invariant into a remote
+/// provider validation error.
+fn apply_no_tool_choice(
+    body: &mut Value,
+    provider: &str,
+    tools: &[Value],
+) -> Result<(), astra_core::ClassifiedError> {
+    match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiCompatible => {
+            // Keep the explicit terminal instruction even when the repair
+            // request physically removed every schema. OpenAI-compatible
+            // models can otherwise infer the tool protocol from conversation
+            // history and emit a degraded text call despite an empty `tools`
+            // array.
+            body["tool_choice"] = Value::String("none".to_string());
+            Ok(())
+        }
+        LlmProviderProtocol::AnthropicMessages => {
+            if tools.is_empty() {
+                return Ok(());
+            }
+            body["tool_choice"] = json!({"type": "none"});
+            Ok(())
+        }
+        LlmProviderProtocol::BedrockConverse if tools.is_empty() => Ok(()),
+        LlmProviderProtocol::BedrockConverse => Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "Bedrock Converse cannot preserve a non-empty tool surface at a no-tool settlement boundary",
+        )),
+    }
+}
+
+#[cfg(test)]
+fn apply_required_tool_choice(
+    body: &mut Value,
+    provider: &str,
+    tools: &[Value],
+    required_tool_name: &str,
+) -> Result<(), astra_core::ClassifiedError> {
+    let tool_is_advertised = tools
+        .iter()
+        .any(|schema| tool_schema_name(schema) == Some(required_tool_name));
+    if !tool_is_advertised {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            format!(
+                "required provider tool choice `{required_tool_name}` is absent from the wire schema surface"
+            ),
+        ));
+    }
+
+    match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiCompatible => {
+            body["tool_choice"] = json!({
+                "type": "function",
+                "function": { "name": required_tool_name },
+            });
+        }
+        LlmProviderProtocol::AnthropicMessages => {
+            body["tool_choice"] = json!({
+                "type": "tool",
+                "name": required_tool_name,
+            });
+        }
+        LlmProviderProtocol::BedrockConverse => {
+            let Some(tool_config) = body.get_mut("toolConfig").and_then(Value::as_object_mut)
+            else {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!(
+                        "required Bedrock tool choice `{required_tool_name}` has no toolConfig on the wire"
+                    ),
+                ));
+            };
+            tool_config.insert(
+                "toolChoice".to_string(),
+                json!({ "tool": { "name": required_tool_name } }),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn apply_request_body_overrides(
@@ -2446,6 +3511,108 @@ fn apply_request_body_overrides(
     let keys: Vec<&String> = overrides.keys().collect();
     tracing::debug!(?keys, "applying request body overrides");
     merge_json_object(body, overrides);
+}
+
+fn apply_admitted_openai_protocol(
+    body: &mut Value,
+    protocol: astra_core::model_wire::thinking::ThinkingProtocol,
+    thinking: &ThinkingConfig,
+    temperature: Option<f64>,
+    overrides: Option<&Map<String, Value>>,
+) {
+    // The legacy OpenAI effort serializer removes temperature for Adaptive.
+    // A binary toggle is not that contract: restore explicit sampling only,
+    // never manufacture a default or infer a mode-specific allowed value.
+    if protocol.can_disable()
+        && let Some(value) = temperature
+            .map(|value| json!(value))
+            .or_else(|| overrides.and_then(|o| o.get("temperature")).cloned())
+    {
+        body["temperature"] = value;
+    }
+    thinking.apply_openai_protocol(body, protocol);
+}
+
+fn validate_request_body_overrides(
+    request_body_overrides: Option<&Map<String, Value>>,
+) -> Result<(), astra_core::ClassifiedError> {
+    const RUNTIME_OWNED_FIELDS: &[&str] = &[
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "toolConfig",
+        "tool_choice",
+        "stream",
+        "stream_options",
+    ];
+    let Some(overrides) = request_body_overrides else {
+        return Ok(());
+    };
+    let mut conflicts = RUNTIME_OWNED_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| overrides.contains_key(*field))
+        .collect::<Vec<_>>();
+    conflicts.sort_unstable();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContractViolation,
+        format!(
+            "request_body_overrides cannot replace runtime-owned provider fields: {}",
+            conflicts.join(", ")
+        ),
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum TemperatureField {
+    TopLevel,
+    BedrockInferenceConfig,
+}
+
+/// Reconcile the final provider payload after route overrides. An explicit
+/// call-level temperature is authoritative; an enabled thinking protocol
+/// forbids temperature entirely. `None` with thinking off leaves the admitted
+/// route default untouched.
+fn reconcile_authoritative_temperature(
+    body: &mut Value,
+    field: TemperatureField,
+    temperature: Option<f64>,
+    temperature_forbidden: bool,
+) {
+    let temperature = (!temperature_forbidden).then_some(temperature).flatten();
+    match field {
+        TemperatureField::TopLevel => {
+            if temperature_forbidden {
+                body.as_object_mut().map(|body| body.remove("temperature"));
+            } else if let Some(temperature) = temperature {
+                body["temperature"] = json!(temperature);
+            }
+        }
+        TemperatureField::BedrockInferenceConfig => {
+            let Some(body) = body.as_object_mut() else {
+                return;
+            };
+            if temperature_forbidden {
+                if let Some(inference) = body
+                    .get_mut("inferenceConfig")
+                    .and_then(Value::as_object_mut)
+                {
+                    inference.remove("temperature");
+                }
+            } else if let Some(temperature) = temperature {
+                let inference = body
+                    .entry("inferenceConfig")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(inference) = inference.as_object_mut() {
+                    inference.insert("temperature".into(), json!(temperature));
+                }
+            }
+        }
+    }
 }
 
 fn sanitize_request_body_overrides_for_thinking<'a>(
@@ -2556,44 +3723,114 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
 
 #[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    consolidate_system_messages_inner(messages, false)
+    consolidate_system_messages_inner(messages, false, true)
 }
 
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
-    _model_name: &str,
-    _explicit_cache_capability: Option<CacheCapability>,
+    explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
+    let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
+    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
+    let allow_suffix_dependent_history_repair = !matches!(
+        cache_cap.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    );
     if matches!(protocol, LlmProviderProtocol::OpenAiCompatible) {
         let projected = crate::turn::wire_assembly::project_runtime_roles(messages);
-        return consolidate_system_messages_inner(&projected, false);
+        return consolidate_system_messages_inner(
+            &projected,
+            false,
+            allow_suffix_dependent_history_repair,
+        );
     }
-    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
-    consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
+    consolidate_system_messages_inner(
+        messages,
+        preserve_runtime_system_tail,
+        allow_suffix_dependent_history_repair,
+    )
 }
 
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     for message in messages {
+        astra_turn_core::tool::result::advisory::project_advisories(message);
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
         if let Some(object) = message.as_object_mut() {
             object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
-            object.remove(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove("_compact_boundary");
+            // These fields are compaction/checkpoint bookkeeping. They are
+            // useful in runtime history, but are not part of the provider
+            // message contract and only add round-specific bytes to the
+            // prompt cache suffix.
+            for key in [
+                "_round_index",
+                "_tool_name",
+                "_timestamp",
+                "_synthetic",
+                astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+                astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+            ] {
+                object.remove(key);
+            }
         }
     }
+}
+
+/// Project canonical messages through provider presentation and metadata removal.
+///
+/// Canonical history retains typed provenance so intent, recovery, and
+/// append-only authority consumers can distinguish runtime-owned messages.
+/// Provider requests render per-tool guidance and remove internal metadata.
+/// Equality checks across these representations must use this same projection,
+/// including its derived content, roles, ordering, and provider-visible fields.
+fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+    }
+    strip_internal_runtime_markers(&mut projected);
+    projected
+}
+
+/// Return whether the request ends in the exact provider-visible projection
+/// of a staged canonical append.
+///
+/// This is intentionally a shape check, not a content classifier: the only
+/// differences accounted for are the same typed metadata and derived guidance
+/// presentation handled at the provider boundary.
+pub(crate) fn provider_request_preserves_projected_canonical_suffix(
+    provider_messages: &[Value],
+    canonical_appended: &[Value],
+) -> bool {
+    if canonical_appended.is_empty() {
+        return true;
+    }
+    let Some(suffix_start) = provider_messages
+        .len()
+        .checked_sub(canonical_appended.len())
+    else {
+        return false;
+    };
+    let provider_suffix = &provider_messages[suffix_start..];
+    project_provider_message_metadata(provider_suffix)
+        == project_provider_message_metadata(canonical_appended)
 }
 
 fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
+    allow_suffix_dependent_history_repair: bool,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
     let mut structured_system = false;
     let mut rest: Vec<Value> = Vec::new();
+    let mut primary_system_seen = false;
 
     let flush_string_parts_into_blocks = |blocks: &mut Vec<Value>, parts: &mut Vec<String>| {
         for part in parts.drain(..) {
@@ -2608,8 +3845,9 @@ fn consolidate_system_messages_inner(
         let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
         let preserve_runtime_control = preserve_runtime_system_tail
             && is_system
-            && crate::turn::wire_assembly::is_runtime_system_context(msg);
+            && (primary_system_seen || crate::turn::wire_assembly::is_runtime_system_context(msg));
         if is_system && !preserve_runtime_control {
+            primary_system_seen = true;
             match msg.get("content") {
                 Some(Value::String(text)) => {
                     if text.is_empty() {
@@ -2662,6 +3900,10 @@ fn consolidate_system_messages_inner(
     }
     out.extend(rest);
     strip_internal_runtime_markers(&mut out);
+
+    if !allow_suffix_dependent_history_repair {
+        return out;
+    }
 
     // Sanitize assistant messages: remove empty tool_calls arrays and fix
     // tool_calls with empty function names.
@@ -3084,85 +4326,192 @@ fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Split a streaming content chunk into (text, is_reasoning) segments,
-/// tracking whether we're inside a `<think>` block across chunks.
-///
-/// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
-/// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
-pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
+/// Provider-neutral hidden reasoning tags emitted in the content channel by
+/// some models.  The protocol-specific `reasoning_content`/`thinking_delta`
+/// fields are handled separately; these tags are only a compatibility layer
+/// for providers that put their private chain-of-thought in ordinary text.
+const HIDDEN_REASONING_TAGS: &[(&str, &str)] =
+    &[("<think>", "</think>"), ("<thinking>", "</thinking>")];
+
+#[derive(Debug, Default)]
+struct HiddenReasoningStreamState {
+    in_reasoning: bool,
+    expected_close: Option<&'static str>,
+    /// Compatibility tags are an envelope, not a general-purpose XML
+    /// language. Once actionable visible text starts, later `<thinking>`
+    /// literals must remain user-visible rather than being silently removed.
+    visible_started: bool,
+    /// A suffix that may be the beginning of a tag split across provider
+    /// chunks (for example `<th` followed by `inking>`).  It must not be
+    /// emitted as user-visible text until the next chunk disambiguates it.
+    pending: String,
+}
+
+fn earliest_hidden_tag<'a>(
+    text: &str,
+    tags: impl IntoIterator<Item = &'a str>,
+) -> Option<(usize, &'a str)> {
+    tags.into_iter()
+        .filter_map(|tag| text.find(tag).map(|index| (index, tag)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn longest_tag_prefix_suffix(text: &str, tags: &[&str]) -> usize {
+    let max_len = tags
+        .iter()
+        .map(|tag| tag.len())
+        .max()
+        .unwrap_or_default()
+        .saturating_sub(1);
+    let mut longest = 0;
+    for start in text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+    {
+        let length = text.len().saturating_sub(start);
+        if length == 0 || length > max_len || length <= longest {
+            continue;
+        }
+        let suffix = &text[start..];
+        if tags.iter().any(|tag| tag.starts_with(suffix)) {
+            longest = length;
+        }
+    }
+    longest
+}
+
+/// Streaming parser for hidden reasoning tags.  Unlike the historical
+/// `<think>`-only parser, this preserves partial delimiters across provider
+/// chunks and recognizes the common `<thinking>` spelling as well.
+fn split_hidden_reasoning_chunks(
+    content: &str,
+    state: &mut HiddenReasoningStreamState,
+) -> Vec<(String, bool)> {
+    if !content.is_empty() {
+        state.pending.push_str(content);
+    }
     let mut out = Vec::new();
     let mut pos = 0;
-    let len = content.len();
 
-    while pos < len {
-        if *in_think {
-            if let Some(end) = content[pos..].find("</think>") {
-                let abs_end = pos + end;
-                if abs_end > pos {
-                    out.push((content[pos..abs_end].to_string(), true));
-                }
-                *in_think = false;
-                pos = abs_end + "</think>".len();
-            } else {
-                out.push((content[pos..].to_string(), true));
-                pos = len;
+    loop {
+        let source = state.pending.as_str();
+        if state.expected_close.is_none() && state.visible_started {
+            if pos < source.len() {
+                out.push((source[pos..].to_string(), false));
             }
-        } else {
-            if let Some(start) = content[pos..].find("<think>") {
-                let abs_start = pos + start;
-                if abs_start > pos {
-                    out.push((content[pos..abs_start].to_string(), false));
-                }
-                *in_think = true;
-                pos = abs_start + "<think>".len();
-            } else {
-                out.push((content[pos..].to_string(), false));
-                pos = len;
-            }
+            state.pending.clear();
+            break;
         }
+        let tags: Vec<&str> = if let Some(expected_close) = state.expected_close {
+            vec![expected_close]
+        } else {
+            HIDDEN_REASONING_TAGS
+                .iter()
+                .map(|(open, _)| *open)
+                .collect()
+        };
+
+        if let Some((index, tag)) = earliest_hidden_tag(&source[pos..], tags.iter().copied()) {
+            let absolute = pos + index;
+            if !state.in_reasoning
+                && (state.visible_started || !source[pos..absolute].trim().is_empty())
+            {
+                let end = absolute + tag.len();
+                let visible = source[pos..end].to_string();
+                state.visible_started |= !visible.trim().is_empty();
+                out.push((visible, false));
+                pos = end;
+                continue;
+            }
+            if absolute > pos {
+                out.push((source[pos..absolute].to_string(), state.in_reasoning));
+            }
+            if state.in_reasoning {
+                state.in_reasoning = false;
+                state.expected_close = None;
+            } else {
+                state.in_reasoning = true;
+                state.expected_close = HIDDEN_REASONING_TAGS
+                    .iter()
+                    .find(|(open, _)| *open == tag)
+                    .map(|(_, close)| *close);
+            }
+            pos = absolute + tag.len();
+            continue;
+        }
+
+        // No complete delimiter remains. Keep a possible delimiter prefix;
+        // everything before it is unambiguously visible/reasoning content.
+        let remainder = &source[pos..];
+        let keep = longest_tag_prefix_suffix(remainder, &tags);
+        let emit_end = source.len().saturating_sub(keep);
+        if emit_end > pos {
+            let chunk = source[pos..emit_end].to_string();
+            if !state.in_reasoning && !chunk.trim().is_empty() {
+                state.visible_started = true;
+            }
+            out.push((chunk, state.in_reasoning));
+        }
+        state.pending = source[emit_end..].to_string();
+        break;
     }
     out
 }
 
-/// Extract `<think>...</think>` blocks from text, returning (reasoning, cleaned_text).
-///
-/// Some models (e.g. MiniMax) embed reasoning in content using `<think>` tags
-/// instead of a separate `reasoning_content` streaming field. This extracts
-/// all `<think>` blocks into reasoning and returns the remaining text.
+fn finish_hidden_reasoning_chunks(state: &mut HiddenReasoningStreamState) -> Vec<(String, bool)> {
+    if state.pending.is_empty() {
+        return Vec::new();
+    }
+    let pending = std::mem::take(&mut state.pending);
+    vec![(pending, state.in_reasoning)]
+}
+
+/// Backwards-compatible helper for callers that only need the boolean state.
+/// The collector uses [`split_hidden_reasoning_chunks`] so split delimiters
+/// remain buffered across provider chunks.
+#[cfg(test)]
+pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
+    let mut state = HiddenReasoningStreamState {
+        in_reasoning: *in_think,
+        // The legacy boolean API can only represent the historical
+        // `<think>` variant.  The collector uses the richer state above.
+        expected_close: (*in_think).then_some("</think>"),
+        ..HiddenReasoningStreamState::default()
+    };
+    let out = split_hidden_reasoning_chunks(content, &mut state);
+    *in_think = state.in_reasoning;
+    out
+}
+
+/// Extract hidden reasoning blocks from text, returning `(reasoning,
+/// cleaned_text)`.  This is also used as a final safety net for non-streaming
+/// provider paths, while the streaming collector uses the stateful parser
+/// above to avoid counting a split `<thinking>` opener as visible progress.
 fn extract_think_tags(text: &str) -> Option<(String, String)> {
-    if !text.contains("<think>") {
+    if !HIDDEN_REASONING_TAGS
+        .iter()
+        .any(|(open, close)| text.contains(open) || text.contains(close))
+    {
         return None;
     }
+    let mut state = HiddenReasoningStreamState::default();
     let mut reasoning = String::new();
     let mut cleaned = String::new();
-    let mut pos = 0;
-    while let Some(start) = text[pos..].find("<think>") {
-        let abs_start = pos + start;
-        cleaned.push_str(&text[pos..abs_start]);
-        if let Some(end) = text[abs_start..].find("</think>") {
-            let abs_end = abs_start + end + "</think>".len();
-            let inner = &text[abs_start + "<think>".len()..abs_start + end];
-            if !reasoning.is_empty() {
-                reasoning.push('\n');
-            }
-            reasoning.push_str(inner.trim());
-            pos = abs_end;
+    for (chunk, is_reasoning) in split_hidden_reasoning_chunks(text, &mut state)
+        .into_iter()
+        .chain(finish_hidden_reasoning_chunks(&mut state))
+    {
+        if is_reasoning {
+            reasoning.push_str(&chunk);
         } else {
-            // Unclosed <think> — treat rest as reasoning
-            let inner = &text[abs_start + "<think>".len()..];
-            if !reasoning.is_empty() {
-                reasoning.push('\n');
-            }
-            reasoning.push_str(inner.trim());
-            pos = text.len();
+            cleaned.push_str(&chunk);
         }
     }
-    cleaned.push_str(&text[pos..]);
-    let cleaned = cleaned.trim().to_string();
-    if reasoning.is_empty() {
+    if reasoning.trim().is_empty() {
         None
     } else {
-        Some((reasoning, cleaned))
+        Some((reasoning.trim().to_string(), cleaned.trim().to_string()))
     }
 }
 
@@ -3225,12 +4574,147 @@ pub(crate) async fn call_llm_and_collect(
     call_llm_and_collect_with_stream_callback(call, cancel, None, None).await
 }
 
+#[allow(dead_code)] // retained as the unconstrained call boundary for non-server callers.
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_stream_callback_and_tool_choice(
+        call,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        RuntimeToolChoice::Auto,
+    )
+    .await
+}
+
+/// Execute one logical provider boundary with an explicit wall-clock budget.
+/// Used by host-owned recovery slices that must not inherit the ordinary
+/// multi-minute provider allowance. This remains a new logical invocation,
+/// never a hidden transport retry.
+pub(crate) async fn call_llm_and_collect_with_stream_callback_and_budget(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_total_budget(
+        call,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        RuntimeToolChoice::Auto,
+        total_budget,
+    )
+    .await
+}
+
+/// Bounded counterpart of the text-only provider boundary. The explicit
+/// choice must survive recovery-budget selection; otherwise a convergence
+/// call can re-authorize schemas that the host deliberately kept inert.
+pub(crate) async fn call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_total_budget(
+        call,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        RuntimeToolChoice::None,
+        total_budget,
+    )
+    .await
+}
+
+/// Keep a stable tool-schema prefix while forbidding tool calls at a bounded
+/// text-only settlement boundary. Providers whose protocol cannot express
+/// this mode must not call this function with a non-empty tool surface.
+pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    // Reuse the provider-attempt deadline owner. Do not put a second timeout
+    // around the durable invocation, which would lose terminal settlement.
+    let total_budget = bounded_auxiliary_budget(
+        call.purpose,
+        llm_total_budget(),
+        std::time::Duration::from_secs(llm_secs_from_env("ASTRA_INTROSPECTION_TOTAL_BUDGET_S", 8)),
+    );
+    call_llm_and_collect_with_total_budget(
+        call,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        RuntimeToolChoice::None,
+        total_budget,
+    )
+    .await
+}
+
+pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
+    matches!(
+        llm_provider_protocol(provider),
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+    )
+}
+
+fn bounded_auxiliary_budget(
+    purpose: astra_turn_types::InferencePurpose,
+    global: std::time::Duration,
+    introspection: std::time::Duration,
+) -> std::time::Duration {
+    if purpose == astra_turn_types::InferencePurpose::Introspection {
+        global.min(introspection)
+    } else {
+        global
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeToolChoice {
+    Auto,
+    None,
+}
+
+async fn call_llm_and_collect_with_stream_callback_and_tool_choice(
+    call: LlmCall<'_>,
+    cancel: LlmCancel<'_>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_total_budget(
+        call,
+        cancel,
+        stream_callback,
+        attempt_observer,
+        tool_choice,
+        llm_total_budget(),
+    )
+    .await
+}
+
+async fn call_llm_and_collect_with_total_budget(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+    total_budget: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let logical_total_budget = total_budget;
+    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
+    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
     let LlmCall {
         purpose,
         messages,
@@ -3242,7 +4726,21 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         has_fallback,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
+    let temperature = if route.fixed_temperature.is_some() {
+        configured_temperature
+    } else {
+        temperature
+    };
     let LlmExecutionRoute {
+        fixed_temperature: _,
+        thinking_protocol,
         model_name,
         wire_model_name,
         api_key,
@@ -3258,21 +4756,32 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     let model_key = model_name;
     // `upstream_name` is what goes in the outbound request body + URL.
     let upstream_name = wire_model_name.unwrap_or(model_name);
+    validate_request_body_overrides(request_body_overrides)?;
 
     let started = Instant::now();
-    let total_budget = llm_total_budget();
+    let controlled_attempt_observer =
+        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
+            inner,
+            started,
+            work_budget: total_budget,
+            logical_budget: logical_total_budget,
+            cancel,
+        });
+    let attempt_observer = controlled_attempt_observer
+        .as_ref()
+        .map(|observer| observer as &dyn ProviderAttemptObserver);
     let client = global_llm_client();
 
-    // Consolidate system messages: merge all system-role messages into the first
-    // one, converting extras to a single leading system message. Some providers
-    // (e.g. MiniMax) reject system messages after the first position.
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    // Project system messages according to the declared transport/cache shape.
+    // A current-user-only capability consolidates them at the head; protocols
+    // that admit a runtime system suffix preserve that boundary.
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
+    validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
     // to the streaming variant for every supported provider.
-    let mut body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_cache_capability(
         &messages,
         tools,
         upstream_name,
@@ -3282,10 +4791,47 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         true,
         thinking,
         request_body_overrides,
+        cache_capability,
     );
-    thinking.apply_openai_suppression(&mut body, provider, base_url);
-    let prepared_request =
-        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
+    // `ThinkingConfig::Off` is provider-agnostic; native OpenAI-compatible
+    // endpoints still need their typed suppression field to honor it. Apply
+    // this after user/catalog overrides so an admitted Off policy cannot be
+    // accidentally re-enabled by stale model metadata.
+    if !matches!(provider, "anthropic" | "bedrock") {
+        let protocol = thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                provider,
+                base_url,
+                upstream_name,
+            )
+        });
+        apply_admitted_openai_protocol(
+            &mut body,
+            protocol,
+            thinking,
+            temperature,
+            request_body_overrides,
+        );
+    }
+    let wire_output_limit = provider_request_output_limit(&body);
+    match tool_choice {
+        RuntimeToolChoice::Auto => {}
+        RuntimeToolChoice::None => apply_no_tool_choice(&mut body, provider, tools)?,
+    }
+    let authorized_tool_names = match tool_choice {
+        RuntimeToolChoice::Auto => tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter_map(canonical_valid_tool_name)
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>(),
+        RuntimeToolChoice::None => HashSet::new(),
+    };
+    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+        &body,
+        llm_provider_protocol(provider),
+        cache_capability,
+    )?;
 
     let url = llm_request_url(
         base_url,
@@ -3305,15 +4851,10 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     // parallel tests (and to ensure consistent timeouts across retries).
     let idle_pre = stream_idle_timeout();
     let idle_post = stream_idle_timeout_after_progress();
-    let attach_partial_details = |error: astra_core::ClassifiedError,
-                                  partial: &LlmCallResult|
-     -> astra_core::ClassifiedError {
-        if let Some(details_json) = llm_result_details_json(partial) {
-            error.with_details_json(details_json)
-        } else {
-            error
-        }
-    };
+    let attach_partial_details =
+        |error: astra_core::ClassifiedError,
+         partial: &LlmCallResult|
+         -> astra_core::ClassifiedError { attach_llm_result_details(error, partial) };
 
     for attempt in 0..=max_retries {
         if cancel.is_triggered() {
@@ -3322,12 +4863,12 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 "LLM call cancelled",
             ));
         }
-        // Total budget guard: abort if we've already spent too long across retries.
-        if started.elapsed() > total_budget {
+        // Provider work deadline guard: abort if we've already spent too long across retries.
+        if started.elapsed() >= total_budget {
             return Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::BudgetExhausted,
+                astra_core::ErrorKind::ProviderDeadline,
                 format!(
-                    "LLM total budget exhausted ({:.0}s): {last_err}",
+                    "LLM provider work deadline reached ({:.0}s): {last_err}",
                     total_budget.as_secs_f64()
                 ),
             ));
@@ -3339,16 +4880,70 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             let delay = retry_delay_override_ms
                 .take()
                 .unwrap_or_else(|| retry_backoff_ms(attempt));
+            let remaining = total_budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ProviderDeadline,
+                    format!(
+                        "LLM provider work deadline reached ({:.0}s) before provider retry",
+                        total_budget.as_secs_f64()
+                    ),
+                ));
+            }
+            let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay));
+            tokio::pin!(sleep);
             tokio::select! {
                 biased;
                 _ = wait_llm_cancel(cancel) => return Err(astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::Cancelled,
                     "LLM call cancelled",
                 )),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                _ = tokio::time::sleep(remaining), if remaining <= std::time::Duration::from_millis(delay) => {
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        format!(
+                            "LLM provider work deadline reached ({:.0}s) during provider retry backoff",
+                            total_budget.as_secs_f64()
+                        ),
+                    ));
+                }
+                _ = &mut sleep => {}
             }
         }
 
+        // Scheduler delay after a retry backoff is outside the HTTP attempt.
+        // Recheck the hard deadline before journaling `begin_attempt`; a
+        // durable attempt must correspond to a request that can actually be
+        // sent, not to an already exhausted retry loop.
+        if started.elapsed() >= total_budget {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                format!(
+                    "LLM provider work deadline reached ({:.0}s) before provider retry request",
+                    total_budget.as_secs_f64()
+                ),
+            ));
+        }
+
+        // Every configured observer is wrapped by
+        // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
+        // that single layer so a durable-admission stall is classified as an
+        // inference-ledger failure instead of racing an outer provider timer.
+        let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+            Some(
+                astra_services::byok_endpoint::endpoint_client(&url)
+                    .await
+                    .map_err(|error| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::InvalidRequest,
+                            error,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let client = compatible_client.as_deref().unwrap_or(client);
         let observed_attempt = match attempt_observer {
             Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
             None => None,
@@ -3356,9 +4951,37 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         let mut req = client.post(&url).header("content-type", "application/json");
         req = apply_provider_auth(req, provider, api_key, header_overrides);
         req = apply_llm_header_overrides(req, header_overrides);
-        if let Some(timeout) = request_timeout {
-            req = req.timeout(timeout);
+        // `total_budget` is the provider-work wall-clock bound, not merely a retry-loop
+        // check.  Previously a streaming request without an offering-specific
+        // timeout could remain inside one `send`/response body beyond the
+        // advertised 300s budget, holding an entire foreground fanout group
+        // hostage.  Reqwest carries this timeout into response-body streaming,
+        // while the SSE idle watchdog still provides the more precise
+        // pre/post-progress classification.
+        let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
+        if remaining_total_budget.is_zero() {
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                format!(
+                    "LLM provider work deadline reached ({:.0}s) before provider request",
+                    total_budget.as_secs_f64()
+                ),
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
         }
+        let total_budget_owns_deadline = request_timeout
+            .map(|timeout| remaining_total_budget <= timeout)
+            .unwrap_or(true);
+        let request_deadline = request_timeout
+            .map(|timeout| timeout.min(remaining_total_budget))
+            .unwrap_or(remaining_total_budget);
+        // Reqwest's request timeout covers the response body as well as
+        // headers. Keep that transport deadline at the hard remaining total;
+        // the offering-specific response-start limit is enforced only by the
+        // `send()` select below. A healthy progressing stream may therefore
+        // outlive its header deadline without outliving total/idle budgets.
+        req = req.timeout(remaining_total_budget);
 
         tracing::debug!(
             target: "astra_runtime::llm_client",
@@ -3369,8 +4992,63 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             model_name,
             "LLM request sending"
         );
-        let response = match req.body(prepared_request.body()).send().await {
-            Ok(r) => {
+        // Keep the dispatch marker inside the future selected below. If a
+        // cancellation branch wins before the send future is ever polled,
+        // diagnostics must not claim that transport execution started.
+        let send_request = async {
+            if let Some(attempt_index) = observed_attempt {
+                attempt_observer
+                    .expect("observed attempt requires observer")
+                    .note_dispatch_started(attempt_index);
+            }
+            req.body(prepared_request.body()).send().await
+        };
+        let send_result = tokio::select! {
+            biased;
+            _ = wait_llm_cancel(cancel) => {
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "LLM call cancelled while waiting for provider response",
+                );
+                finish_observed_provider_delivery_unknown(
+                    attempt_observer,
+                    observed_attempt,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            result = tokio::time::timeout(request_deadline, send_request) => result,
+        };
+        let response = match send_result {
+            Err(_) => {
+                let (kind, message) = if total_budget_owns_deadline {
+                    (
+                        astra_core::ErrorKind::ProviderDeadline,
+                        format!(
+                            "LLM provider work deadline reached ({:.0}s) while waiting for provider response",
+                            total_budget.as_secs_f64()
+                        ),
+                    )
+                } else {
+                    (
+                        astra_core::ErrorKind::StreamIdle,
+                        format!(
+                            "LLM provider did not start a response within {}ms",
+                            request_deadline.as_millis()
+                        ),
+                    )
+                };
+                let error = astra_core::ClassifiedError::new(kind, message);
+                finish_observed_provider_delivery_unknown(
+                    attempt_observer,
+                    observed_attempt,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            Ok(Ok(r)) => {
                 tracing::debug!(
                     target: "astra_runtime::llm_client",
                     url = %url,
@@ -3379,15 +5057,43 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                 );
                 r
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     target: "astra_runtime::llm_client",
                     url = %url,
                     error = %e,
                     "LLM send failed"
                 );
-                let (error, retry_safe) = classify_provider_send_error("LLM request failed", &e);
-                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                let (mut error, retry_safe) =
+                    classify_provider_send_error("LLM request failed", &e);
+                if e.is_timeout() && total_budget_owns_deadline {
+                    error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        format!(
+                            "LLM provider work deadline reached ({:.0}s) during provider request",
+                            total_budget.as_secs_f64()
+                        ),
+                    );
+                } else if e.is_timeout() {
+                    error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::StreamIdle,
+                        format!(
+                            "LLM provider did not start a response within {}ms",
+                            request_deadline.as_millis()
+                        ),
+                    );
+                }
+                if retry_safe {
+                    finish_observed_provider_error(attempt_observer, observed_attempt, &error)
+                        .await?;
+                } else {
+                    finish_observed_provider_delivery_unknown(
+                        attempt_observer,
+                        observed_attempt,
+                        &error,
+                    )
+                    .await?;
+                }
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -3402,23 +5108,34 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             // Success — record to cooldown tracker
             cooldown.with(model_key, |c| c.record_success());
             if provider_uses_bedrock_converse(provider) {
-                match crate::turn::bedrock::transport::collect_bedrock_stream(
+                match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
                     response,
                     model_name,
                     started,
+                    total_budget,
                     cancel,
                     idle_pre,
+                    &authorized_tool_names,
                     stream_callback.as_deref_mut(),
                 )
                 .await
                 {
-                    Ok(result) => {
-                        finish_observed_provider_attempt(
+                    Ok(mut result) => {
+                        reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
+                        note_observed_provider_usage_presence(
+                            attempt_observer,
+                            observed_attempt,
+                            result.usage_presence,
+                        );
+                        if let Err(error) = finish_observed_provider_attempt(
                             attempt_observer,
                             observed_attempt,
                             &provider_attempt_terminal_from_result(&result),
                         )
-                        .await?;
+                        .await
+                        {
+                            return Err(attach_llm_result_details(error, &result));
+                        }
                         return Ok(result);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
@@ -3426,12 +5143,73 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     }) => {
                         let error = attach_partial_details(
                             astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::StreamTransport,
-                                "Bedrock delivery became unknown after cancellation",
+                                astra_core::ErrorKind::Cancelled,
+                                "Bedrock stream cancelled after provider delivery",
                             ),
                             &partial,
                         );
-                        finish_observed_provider_error_with_partial(
+                        finish_observed_provider_delivery_unknown_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Err(
+                        crate::turn::bedrock::transport::BedrockStreamError::ProviderWorkDeadline {
+                            elapsed_ms,
+                            partial,
+                        },
+                    ) => {
+                        let error = provider_deadline_from_transport(
+                            "consuming a continuously progressing Bedrock provider stream",
+                            "stream exceeded the invocation-wide provider work budget",
+                            std::time::Duration::from_millis(elapsed_ms),
+                            Some(&partial),
+                        );
+                        finish_observed_provider_delivery_unknown_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Err(crate::turn::bedrock::transport::BedrockStreamError::SemanticProgressTimeout {
+                        elapsed_ms,
+                        made_semantic_progress,
+                        partial,
+                    }) => {
+                        let details = serde_json::json!({
+                            "deadline": {
+                                "scope": "provider_attempt",
+                                "phase": "semantic_progress",
+                                "limit_ms": elapsed_ms,
+                                "elapsed_ms": started.elapsed().as_millis() as u64,
+                                "semantic_activity_observed": !partial.reasoning.trim().is_empty() || made_semantic_progress,
+                                "actionable_delivery_observed": made_semantic_progress,
+                                "retry_safety": "convergence_only"
+                            },
+                            "partial_full_text": partial.full_text,
+                            "partial_reasoning": partial.reasoning,
+                            "reasoning_signature": partial.reasoning_signature,
+                            "tool_calls": partial.tool_calls,
+                            "usage": partial.usage,
+                            "finish_reason": partial.finish_reason,
+                            "effective_finish_reason": partial.effective_finish_reason,
+                            "model_used": partial.model_used,
+                        });
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ProviderDeadline,
+                            format!(
+                                "provider stream produced no semantic progress for {elapsed_ms}ms"
+                            ),
+                        )
+                        .with_details_json(details.to_string());
+                        finish_observed_provider_delivery_unknown_with_partial(
                             attempt_observer,
                             observed_attempt,
                             &error,
@@ -3476,10 +5254,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                         continue;
                                     }
                                     RateLimitAction::UseFallback { reason } => {
-                                        return Err(crate::turn::bridge::llm_stream::fallback_required_error(
-                                            error,
-                                            reason,
-                                        ));
+                                        return Err(
+                                            crate::turn::model_cooldown::fallback_required_error(
+                                                error, reason,
+                                            ),
+                                        );
                                     }
                                     RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
                                         return Err(error);
@@ -3531,14 +5310,28 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         error: transport_error,
                         partial,
                     }) => {
-                        let error = attach_partial_details(
-                            astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::StreamTransport,
-                                format!("bedrock transport: {transport_error}"),
-                            ),
-                            &partial,
-                        );
-                        finish_observed_provider_error_with_partial(
+                        let kind = if started.elapsed() >= total_budget {
+                            astra_core::ErrorKind::ProviderDeadline
+                        } else {
+                            astra_core::ErrorKind::StreamTransport
+                        };
+                        let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                            provider_deadline_from_transport(
+                                "consuming the Bedrock provider stream",
+                                &transport_error,
+                                started.elapsed(),
+                                Some(&partial),
+                            )
+                        } else {
+                            attach_partial_details(
+                                astra_core::ClassifiedError::new(
+                                    kind,
+                                    format!("bedrock transport: {transport_error}"),
+                                ),
+                                &partial,
+                            )
+                        };
+                        finish_observed_provider_delivery_unknown_with_partial(
                             attempt_observer,
                             observed_attempt,
                             &error,
@@ -3551,47 +5344,79 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             }
             let byte_stream = response.bytes_stream();
             let stream_result = if provider_uses_anthropic_messages(provider) {
-                collect_anthropic_llm_stream(
+                collect_anthropic_llm_stream_for_wire(
                     byte_stream,
                     model_name,
                     started,
+                    total_budget,
                     cancel,
                     idle_pre,
                     idle_post,
+                    &authorized_tool_names,
                     stream_callback.as_deref_mut(),
                 )
                 .await
             } else {
-                collect_llm_stream(
+                collect_llm_stream_for_wire(
                     byte_stream,
                     model_name,
                     started,
+                    total_budget,
                     cancel,
                     idle_pre,
                     idle_post,
+                    &authorized_tool_names,
                     stream_callback.as_deref_mut(),
                 )
                 .await
             };
             match stream_result {
-                Ok(result) => {
-                    finish_observed_provider_attempt(
+                Ok(mut result) => {
+                    reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
+                    note_observed_provider_usage_presence(
+                        attempt_observer,
+                        observed_attempt,
+                        result.usage_presence,
+                    );
+                    if let Err(error) = finish_observed_provider_attempt(
                         attempt_observer,
                         observed_attempt,
                         &provider_attempt_terminal_from_result(&result),
                     )
-                    .await?;
+                    .await
+                    {
+                        return Err(attach_llm_result_details(error, &result));
+                    }
                     return Ok(result);
                 }
                 Err(StreamCollectError::Cancelled { partial }) => {
                     let error = attach_partial_details(
                         astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::StreamTransport,
-                            "LLM delivery became unknown after stream cancellation",
+                            astra_core::ErrorKind::Cancelled,
+                            "LLM stream cancelled after provider delivery",
                         ),
                         &partial,
                     );
-                    finish_observed_provider_error_with_partial(
+                    finish_observed_provider_delivery_unknown_with_partial(
+                        attempt_observer,
+                        observed_attempt,
+                        &error,
+                        &partial,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(StreamCollectError::ProviderWorkDeadline {
+                    elapsed_ms,
+                    partial,
+                }) => {
+                    let error = provider_deadline_from_transport(
+                        "consuming the provider stream",
+                        "stream exceeded the invocation-wide provider work budget",
+                        std::time::Duration::from_millis(elapsed_ms),
+                        Some(&partial),
+                    );
+                    finish_observed_provider_delivery_unknown_with_partial(
                         attempt_observer,
                         observed_attempt,
                         &error,
@@ -3601,14 +5426,28 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     return Err(error);
                 }
                 Err(StreamCollectError::Transport { error, partial }) => {
-                    let observed_error = attach_partial_details(
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::StreamTransport,
-                            format!("LLM stream transport error: {error}"),
-                        ),
-                        &partial,
-                    );
-                    finish_observed_provider_error_with_partial(
+                    let kind = if started.elapsed() >= total_budget {
+                        astra_core::ErrorKind::ProviderDeadline
+                    } else {
+                        astra_core::ErrorKind::StreamTransport
+                    };
+                    let observed_error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                        provider_deadline_from_transport(
+                            "consuming the provider stream",
+                            &error,
+                            started.elapsed(),
+                            Some(&partial),
+                        )
+                    } else {
+                        attach_partial_details(
+                            astra_core::ClassifiedError::new(
+                                kind,
+                                format!("LLM stream transport error: {error}"),
+                            ),
+                            &partial,
+                        )
+                    };
+                    finish_observed_provider_delivery_unknown_with_partial(
                         attempt_observer,
                         observed_attempt,
                         &observed_error,
@@ -3629,7 +5468,45 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         ),
                         &partial,
                     );
-                    finish_observed_provider_error_with_partial(
+                    finish_observed_provider_delivery_unknown_with_partial(
+                        attempt_observer,
+                        observed_attempt,
+                        &observed_error,
+                        &partial,
+                    )
+                    .await?;
+                    return Err(observed_error);
+                }
+                Err(StreamCollectError::SemanticProgressTimeout {
+                    elapsed_ms,
+                    made_semantic_progress,
+                    partial,
+                }) => {
+                    let details = serde_json::json!({
+                        "deadline": {
+                            "scope": "provider_attempt",
+                            "phase": "semantic_progress",
+                            "limit_ms": elapsed_ms,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "semantic_activity_observed": !partial.reasoning.trim().is_empty() || made_semantic_progress,
+                            "actionable_delivery_observed": made_semantic_progress,
+                            "retry_safety": "convergence_only"
+                        },
+                        "partial_full_text": partial.full_text,
+                        "partial_reasoning": partial.reasoning,
+                        "reasoning_signature": partial.reasoning_signature,
+                        "tool_calls": partial.tool_calls,
+                        "usage": partial.usage,
+                        "finish_reason": partial.finish_reason,
+                        "effective_finish_reason": partial.effective_finish_reason,
+                        "model_used": partial.model_used,
+                    });
+                    let observed_error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        format!("provider stream produced no semantic progress for {elapsed_ms}ms"),
+                    )
+                    .with_details_json(details.to_string());
+                    finish_observed_provider_delivery_unknown_with_partial(
                         attempt_observer,
                         observed_attempt,
                         &observed_error,
@@ -3648,10 +5525,64 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<body read error: {e}>"));
+        let remaining = total_budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "LLM provider work deadline reached before reading provider error response",
+            );
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+        let body = response.text();
+        tokio::pin!(body);
+        let body_result = tokio::select! {
+            biased;
+            _ = wait_llm_cancel(cancel) => {
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "LLM call cancelled while reading provider error response",
+                );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            result = &mut body => result,
+            _ = tokio::time::sleep(remaining) => {
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ProviderDeadline,
+                    "LLM provider work deadline reached while reading provider error response",
+                );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+        };
+        let text = match body_result {
+            Ok(text) => text,
+            Err(error) => {
+                let kind = if started.elapsed() >= total_budget {
+                    astra_core::ErrorKind::ProviderDeadline
+                } else if error.is_timeout() {
+                    astra_core::ErrorKind::StreamIdle
+                } else {
+                    astra_core::ErrorKind::StreamTransport
+                };
+                let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                    provider_deadline_from_transport(
+                        "reading the provider error response body",
+                        &error.to_string(),
+                        started.elapsed(),
+                        None,
+                    )
+                } else {
+                    astra_core::ClassifiedError::new(
+                        kind,
+                        format!("LLM error response body could not be read: {error}"),
+                    )
+                };
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+        };
 
         // Auth errors: redact the body in logs and return a generic message
         // so provider-echoed secrets cannot leak through error propagation.
@@ -3714,7 +5645,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     continue;
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    return Err(crate::turn::bridge::llm_stream::fallback_required_error(
+                    return Err(crate::turn::model_cooldown::fallback_required_error(
                         observed_error,
                         reason,
                     ));
@@ -3743,7 +5674,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                     continue;
                 }
                 RateLimitAction::UseFallback { reason } => {
-                    return Err(crate::turn::bridge::llm_stream::fallback_required_error(
+                    return Err(crate::turn::model_cooldown::fallback_required_error(
                         observed_error,
                         reason,
                     ));
@@ -3792,12 +5723,30 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     ))
 }
 
+#[cfg(test)]
+pub(crate) async fn call_llm_and_collect_with_total_budget_for_test(
+    call: LlmCall<'_>,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    total_budget: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_and_collect_with_total_budget(
+        call,
+        LlmCancel::None,
+        None,
+        attempt_observer,
+        RuntimeToolChoice::Auto,
+        total_budget,
+    )
+    .await
+}
+
 /// Maximum accumulated response size (text + reasoning + args) before aborting stream (16 MB).
-const MAX_STREAM_ACCUMULATION_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAM_ACCUMULATION_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of tool calls per LLM stream response.
-const MAX_STREAM_TOOL_CALLS: usize = 128;
+pub(crate) const MAX_STREAM_TOOL_CALLS: usize = 128;
 
 /// Parse an OpenAI-compatible SSE stream and collect into `LlmCallResult`.
+#[cfg(test)]
 async fn collect_llm_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -3805,17 +5754,102 @@ async fn collect_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_semantic_progress_deadline(
+        stream,
+        model_name,
+        started,
+        cancel,
+        idle_pre,
+        idle_post,
+        llm_semantic_progress_timeout(),
+        stream_callback,
+    )
+    .await
+}
+
+async fn collect_llm_stream_for_wire(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: std::time::Duration,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    authorized_tool_names: &HashSet<String>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_semantic_progress_deadline_and_surface(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        llm_semantic_progress_timeout(),
+        Some(authorized_tool_names),
+        stream_callback,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn collect_llm_stream_with_semantic_progress_deadline(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_semantic_progress_deadline_and_surface(
+        stream,
+        model_name,
+        started,
+        llm_total_budget(),
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        None,
+        stream_callback,
+    )
+    .await
+}
+
+async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: std::time::Duration,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
+    let mut reported_usage = Map::new();
+    let usage_presence =
+        std::sync::Mutex::new(crate::turn::token_usage::TokenUsagePresence::default());
     let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
-    let mut in_think = false;
+    let mut yield_state = StreamYieldState::new(TokioInstant::now());
+    let mut hidden_reasoning_state = HiddenReasoningStreamState::default();
+    let mut visible_text_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
+    let mut visible_reasoning_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
                           reasoning: &String,
@@ -3830,31 +5864,84 @@ async fn collect_llm_stream(
             .collect();
         LlmCallResult {
             response_id: response_id.clone(),
-            full_text: full_text.clone(),
-            reasoning: reasoning.clone(),
+            full_text:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    full_text,
+                ),
+            reasoning:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    reasoning,
+                ),
             reasoning_signature: String::new(),
             tool_calls,
             usage: usage.clone(),
+            usage_presence: current_usage_presence(&usage_presence),
             model_used: model_name.to_string(),
             duration_ms: started.elapsed().as_millis() as u64,
             finish_reason: finish_reason.clone(),
+            effective_finish_reason: None,
         }
     };
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let mut saw_terminal = false;
+    let provider_work_deadline = started + provider_work_budget;
     loop {
+        if cancel.is_triggered() {
+            if yield_state.is_terminal() {
+                break;
+            }
+            return Err(StreamCollectError::Cancelled {
+                partial: partial_result(
+                    &response_id,
+                    &full_text,
+                    &reasoning,
+                    &tool_calls_map,
+                    &usage,
+                    &finish_reason,
+                ),
+            });
+        }
+        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+            return Err(StreamCollectError::ProviderWorkDeadline {
+                elapsed_ms: provider_work_budget.as_millis() as u64,
+                partial: partial_result(
+                    &response_id,
+                    &full_text,
+                    &reasoning,
+                    &tool_calls_map,
+                    &usage,
+                    &finish_reason,
+                ),
+            });
+        }
+        if yield_state.timed_out(TokioInstant::now(), semantic_progress_timeout) {
+            return Err(StreamCollectError::SemanticProgressTimeout {
+                elapsed_ms: semantic_progress_timeout.as_millis() as u64,
+                made_semantic_progress: yield_state.has_actionable_yield(),
+                partial: partial_result(
+                    &response_id,
+                    &full_text,
+                    &reasoning,
+                    &tool_calls_map,
+                    &usage,
+                    &finish_reason,
+                ),
+            });
+        }
         let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if saw_terminal {
+        let idle = if yield_state.is_terminal() {
             stream_terminal_drain_timeout(ordinary_idle)
         } else {
             ordinary_idle
         };
+        let yield_deadline = yield_state
+            .deadline(semantic_progress_timeout)
+            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
-                if saw_terminal {
+                if yield_state.is_terminal() {
                     break;
                 }
                 return Err(StreamCollectError::Cancelled {
@@ -3868,10 +5955,39 @@ async fn collect_llm_stream(
                     ),
                 });
             },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                provider_work_deadline
+            )), if !yield_state.is_terminal() => {
+                return Err(StreamCollectError::ProviderWorkDeadline {
+                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    partial: partial_result(
+                        &response_id,
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage,
+                        &finish_reason,
+                    ),
+                });
+            },
+            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+                return Err(StreamCollectError::SemanticProgressTimeout {
+                    elapsed_ms: semantic_progress_timeout.as_millis() as u64,
+                    made_semantic_progress: yield_state.has_actionable_yield(),
+                    partial: partial_result(
+                        &response_id,
+                        &full_text,
+                        &reasoning,
+                        &tool_calls_map,
+                        &usage,
+                        &finish_reason,
+                    ),
+                });
+            },
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
-                    if saw_terminal {
+                    if yield_state.is_terminal() {
                         break;
                     }
                     return Err(StreamCollectError::IdleTimeout {
@@ -3887,17 +6003,17 @@ async fn collect_llm_stream(
                         ),
                     });
                 }
-            },
+            }
         };
         let Some(item) = item else { break };
         let chunk = match item {
             Ok(ParsedSseEvent::Done) => {
-                saw_terminal = true;
+                yield_state.mark_terminal();
                 break;
             }
             Ok(ParsedSseEvent::Data(v)) => v,
             Err(error) => {
-                if saw_terminal {
+                if yield_state.is_terminal() {
                     break;
                 }
                 return Err(StreamCollectError::Transport {
@@ -3922,16 +6038,24 @@ async fn collect_llm_stream(
         // Parse usage from any chunk. Streaming endpoints we call are always
         // OpenAI-compatible: Bedrock Converse streams are intercepted at a
         // higher level and decoded by the dedicated Bedrock transport.
-        if let Some(u) = chunk.get("usage").and_then(Value::as_object)
-            && let Some(extracted) = crate::turn::token_usage::extract_usage(
+        if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
+            merge_reported_usage_fields(&mut reported_usage, u);
+            if let Some(extracted) = crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
-                u,
-            )
-        {
-            usage = extracted.to_json_map();
-            made_progress = true;
+                &reported_usage,
+            ) {
+                replace_usage_presence(
+                    &usage_presence,
+                    crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::OpenAi,
+                        &reported_usage,
+                    ),
+                );
+                usage = extracted.to_json_map();
+                made_progress = true;
+            }
         }
-        if saw_terminal && !usage.is_empty() {
+        if yield_state.is_terminal() && !usage.is_empty() {
             break;
         }
 
@@ -3946,7 +6070,7 @@ async fn collect_llm_stream(
             .and_then(Value::as_str)
         {
             finish_reason = Some(fr.to_string());
-            saw_terminal = true;
+            yield_state.mark_terminal();
             made_progress = true;
         }
 
@@ -3955,7 +6079,7 @@ async fn collect_llm_stream(
             .and_then(|c| c.get("delta"))
             .and_then(Value::as_object)
         else {
-            if saw_terminal && !usage.is_empty() {
+            if yield_state.is_terminal() && !usage.is_empty() {
                 break;
             }
             continue;
@@ -3981,20 +6105,28 @@ async fn collect_llm_stream(
                     ),
                 });
             }
-            let chunks = split_think_chunks(content, &mut in_think);
+            let chunks = split_hidden_reasoning_chunks(content, &mut hidden_reasoning_state);
             for (chunk, is_reasoning) in chunks {
                 if chunk.is_empty() {
                     continue;
                 }
                 if is_reasoning {
                     reasoning.push_str(&chunk);
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Reasoning(chunk));
+                    yield_state.observe_reasoning_activity(&chunk, TokioInstant::now());
+                    let visible = visible_reasoning_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Reasoning(visible));
                     }
                 } else {
                     full_text.push_str(&chunk);
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Text(chunk));
+                    yield_state.observe_text(&chunk, TokioInstant::now());
+                    let visible = visible_text_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Text(visible));
                     }
                 }
             }
@@ -4022,8 +6154,12 @@ async fn collect_llm_stream(
                 });
             }
             reasoning.push_str(r);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Reasoning(r.to_string()));
+            yield_state.observe_reasoning_activity(r, TokioInstant::now());
+            let visible = visible_reasoning_filter.push(r);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
             }
             made_progress = true;
         }
@@ -4048,10 +6184,14 @@ async fn collect_llm_stream(
                         ("function".to_string(), json!({"name": "", "arguments": ""})),
                     ])
                 });
+                let mut fragment_advanced = false;
                 if let Some(id) = tc.get("id").and_then(Value::as_str)
                     && !id.is_empty()
                 {
-                    entry.insert("id".to_string(), Value::String(id.to_string()));
+                    if entry.get("id").and_then(Value::as_str) != Some(id) {
+                        entry.insert("id".to_string(), Value::String(id.to_string()));
+                        fragment_advanced = true;
+                    }
                     made_progress = true;
                 }
                 if let Some(func) = tc.get("function").and_then(Value::as_object) {
@@ -4066,7 +6206,10 @@ async fn collect_llm_stream(
                         .and_then(Value::as_str)
                         .and_then(canonical_valid_tool_name)
                     {
-                        f.insert("name".to_string(), Value::String(name.to_string()));
+                        if f.get("name").and_then(Value::as_str) != Some(name) {
+                            f.insert("name".to_string(), Value::String(name.to_string()));
+                            fragment_advanced = true;
+                        }
                         made_progress = true;
                     } else if let Some(bad_name) = func
                         .get("name")
@@ -4101,8 +6244,16 @@ async fn collect_llm_stream(
                         if let Value::String(s) = existing {
                             s.push_str(args);
                             made_progress = true;
+                            fragment_advanced |= !args.is_empty();
                         }
                     }
+                    let name = f.get("name").and_then(Value::as_str).unwrap_or_default();
+                    yield_state.observe_tool_delivery(
+                        name,
+                        authorized_tool_names,
+                        fragment_advanced,
+                        TokioInstant::now(),
+                    );
                 }
                 if let Some(callback) = stream_callback.as_deref_mut() {
                     callback(LlmStreamUpdate::ToolCall {
@@ -4112,12 +6263,49 @@ async fn collect_llm_stream(
                 }
             }
         }
-        if saw_terminal && !usage.is_empty() {
+        if yield_state.is_terminal() && !usage.is_empty() {
             break;
         }
     }
 
-    if !saw_terminal {
+    // A provider may close the stream immediately after a delimiter prefix
+    // (for example `<th`).  Flush that suffix according to the current state
+    // instead of silently dropping it or treating it as a completed visible
+    // answer.
+    for (chunk, is_reasoning) in finish_hidden_reasoning_chunks(&mut hidden_reasoning_state) {
+        if is_reasoning {
+            reasoning.push_str(&chunk);
+            let visible = visible_reasoning_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
+            }
+        } else {
+            full_text.push_str(&chunk);
+            let visible = visible_text_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Text(visible));
+            }
+        }
+    }
+
+    let trailing_visible_text = visible_text_filter.finish();
+    if !trailing_visible_text.is_empty()
+        && let Some(callback) = stream_callback.as_deref_mut()
+    {
+        callback(LlmStreamUpdate::Text(trailing_visible_text));
+    }
+    let trailing_visible_reasoning = visible_reasoning_filter.finish();
+    if !trailing_visible_reasoning.is_empty()
+        && let Some(callback) = stream_callback
+    {
+        callback(LlmStreamUpdate::Reasoning(trailing_visible_reasoning));
+    }
+
+    if !yield_state.is_terminal() {
         return Err(StreamCollectError::Transport {
             error: "provider SSE ended without a terminal marker".to_string(),
             partial: partial_result(
@@ -4137,23 +6325,55 @@ async fn collect_llm_stream(
         .into_iter()
         .map(|(_, v)| Value::Object(v))
         .collect();
+    // A non-empty provider surface is an exact execution authority. Keep an
+    // explicitly tool-less response intact for the private summary adapter so
+    // it can classify a provider-emitted call as invalid structured output;
+    // those calls never enter the agent executor. Ordinary tool-bearing turns
+    // retain only names present in the exact wire surface.
+    if let Some(authorized) = authorized_tool_names
+        && !authorized.is_empty()
+    {
+        tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized.contains(name))
+        });
+    }
 
-    // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
-    // tags in content instead of structured tool_calls. Recover them.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    // Degraded tool-call fallback is governed by the same exact wire surface
+    // as native tool-call deltas. In particular, a text-only request carries
+    // `Some(empty)`: it must never manufacture an executable call after the
+    // stream has already passed native authorization.
+    let parsed_degraded =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text);
+    let text_only_degraded_response =
+        authorized_tool_names.is_some_and(HashSet::is_empty) && parsed_degraded.is_some();
+    if let Some(parsed) = parsed_degraded {
+        let admitted = parsed
+            .into_iter()
+            .filter(|call| {
+                let Some(name) = tool_call_name(call).and_then(canonical_valid_tool_name) else {
+                    return false;
+                };
+                authorized_tool_names.is_none_or(|authorized| authorized.contains(name))
+            })
+            .collect::<Vec<_>>();
+        if tool_calls.is_empty() && !admitted.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
-                parsed.len()
+                admitted.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
-            tool_calls = parsed;
+            tool_calls = admitted;
         }
     }
+    if !text_only_degraded_response {
+        full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    }
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
+    canonicalize_provider_tool_calls(&mut tool_calls);
 
     // Extract <think>...</think> blocks from content into reasoning.
     // Models like MiniMax embed thinking in content with <think> tags
@@ -4172,12 +6392,15 @@ async fn collect_llm_stream(
         reasoning_signature: String::new(),
         tool_calls,
         usage,
+        usage_presence: current_usage_presence(&usage_presence),
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
+        effective_finish_reason: None,
     })
 }
 
+#[cfg(test)]
 async fn collect_anthropic_llm_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -4185,6 +6408,83 @@ async fn collect_anthropic_llm_stream(
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_semantic_progress_deadline(
+        stream,
+        model_name,
+        started,
+        cancel,
+        idle_pre,
+        idle_post,
+        llm_semantic_progress_timeout(),
+        stream_callback,
+    )
+    .await
+}
+
+async fn collect_anthropic_llm_stream_for_wire(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: std::time::Duration,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    authorized_tool_names: &HashSet<String>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        llm_semantic_progress_timeout(),
+        Some(authorized_tool_names),
+        stream_callback,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+        stream,
+        model_name,
+        started,
+        llm_total_budget(),
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        None,
+        stream_callback,
+    )
+    .await
+}
+
+async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: std::time::Duration,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
@@ -4199,10 +6499,13 @@ async fn collect_anthropic_llm_stream(
     let mut reasoning_signature = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
+    let usage_presence =
+        std::sync::Mutex::new(crate::turn::token_usage::TokenUsagePresence::default());
     let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
+    let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
                           reasoning: &String,
@@ -4223,20 +6526,23 @@ async fn collect_anthropic_llm_stream(
             reasoning_signature: reasoning_signature.clone(),
             tool_calls,
             usage: usage_tokens.to_json_map(),
+            usage_presence: current_usage_presence(&usage_presence),
             model_used: model_name.to_string(),
             duration_ms: started.elapsed().as_millis() as u64,
             finish_reason: finish_reason.clone(),
+            effective_finish_reason: None,
         }
     };
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let mut saw_terminal = false;
+    let provider_work_deadline = started + provider_work_budget;
     loop {
-        let idle = if made_progress { idle_post } else { idle_pre };
-        let item = tokio::select! {
-            biased;
-            _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled {
+        if cancel.is_triggered() {
+            if yield_state.is_terminal() {
+                break;
+            }
+            return Err(StreamCollectError::Cancelled {
                 partial: partial_result(
                     &response_id,
                     &full_text,
@@ -4246,10 +6552,101 @@ async fn collect_anthropic_llm_stream(
                     &usage_tokens,
                     &finish_reason,
                 ),
-            }),
+            });
+        }
+        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+            return Err(StreamCollectError::ProviderWorkDeadline {
+                elapsed_ms: provider_work_budget.as_millis() as u64,
+                partial: partial_result(
+                    &response_id,
+                    &full_text,
+                    &reasoning,
+                    &reasoning_signature,
+                    &tool_calls_map,
+                    &usage_tokens,
+                    &finish_reason,
+                ),
+            });
+        }
+        if yield_state.timed_out(TokioInstant::now(), semantic_progress_timeout) {
+            return Err(StreamCollectError::SemanticProgressTimeout {
+                elapsed_ms: semantic_progress_timeout.as_millis() as u64,
+                made_semantic_progress: yield_state.has_actionable_yield(),
+                partial: partial_result(
+                    &response_id,
+                    &full_text,
+                    &reasoning,
+                    &reasoning_signature,
+                    &tool_calls_map,
+                    &usage_tokens,
+                    &finish_reason,
+                ),
+            });
+        }
+        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
+        let idle = if yield_state.is_terminal() {
+            stream_terminal_drain_timeout(ordinary_idle)
+        } else {
+            ordinary_idle
+        };
+        let yield_deadline = yield_state
+            .deadline(semantic_progress_timeout)
+            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let item = tokio::select! {
+            biased;
+            _ = wait_llm_cancel(cancel) => {
+                if yield_state.is_terminal() {
+                    break;
+                }
+                return Err(StreamCollectError::Cancelled {
+                    partial: partial_result(
+                        &response_id,
+                        &full_text,
+                        &reasoning,
+                        &reasoning_signature,
+                        &tool_calls_map,
+                        &usage_tokens,
+                        &finish_reason,
+                    ),
+                });
+            },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                provider_work_deadline
+            )), if !yield_state.is_terminal() => {
+                return Err(StreamCollectError::ProviderWorkDeadline {
+                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    partial: partial_result(
+                        &response_id,
+                        &full_text,
+                        &reasoning,
+                        &reasoning_signature,
+                        &tool_calls_map,
+                        &usage_tokens,
+                        &finish_reason,
+                    ),
+                });
+            },
+            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+                return Err(StreamCollectError::SemanticProgressTimeout {
+                    elapsed_ms: semantic_progress_timeout.as_millis() as u64,
+                    made_semantic_progress: yield_state.has_actionable_yield(),
+                    partial: partial_result(
+                        &response_id,
+                        &full_text,
+                        &reasoning,
+                        &reasoning_signature,
+                        &tool_calls_map,
+                        &usage_tokens,
+                        &finish_reason,
+                    ),
+                });
+            },
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
+                    if yield_state.is_terminal() {
+                        break;
+                    }
                     return Err(StreamCollectError::IdleTimeout {
                         elapsed_ms: idle.as_millis() as u64,
                         made_progress,
@@ -4264,12 +6661,14 @@ async fn collect_anthropic_llm_stream(
                         ),
                     });
                 }
-            },
+            }
         };
         let Some(item) = item else { break };
         let event = match item {
             Ok(ParsedSseEvent::Done) => {
-                saw_terminal = true;
+                // `[DONE]` is an OpenAI stream sentinel, not Anthropic's
+                // protocol terminal. Gateways may append it, but it cannot
+                // substitute for Anthropic `message_stop`.
                 break;
             }
             Ok(ParsedSseEvent::Data(v)) => v,
@@ -4306,6 +6705,12 @@ async fn collect_anthropic_llm_stream(
                         u,
                     )
                 {
+                    let mut observed = current_usage_presence(&usage_presence);
+                    observed.merge(crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    ));
+                    replace_usage_presence(&usage_presence, observed);
                     usage_tokens.input_tokens = extracted.input_tokens;
                     usage_tokens.cached_input_tokens = extracted.cached_input_tokens;
                     usage_tokens.cache_creation_tokens = extracted.cache_creation_tokens;
@@ -4333,6 +6738,15 @@ async fn collect_anthropic_llm_stream(
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or("_unknown");
+                    let arguments = block
+                        .get("input")
+                        .filter(|input| input.is_object())
+                        .map(Value::to_string)
+                        .unwrap_or_default();
+                    let initial_arguments_advanced = block
+                        .get("input")
+                        .and_then(Value::as_object)
+                        .is_some_and(|input| !input.is_empty());
                     tool_calls_map.insert(
                         index,
                         Map::from_iter([
@@ -4340,9 +6754,15 @@ async fn collect_anthropic_llm_stream(
                             ("type".to_string(), Value::String("function".to_string())),
                             (
                                 "function".to_string(),
-                                json!({"name": name, "arguments": ""}),
+                                json!({"name": name, "arguments": arguments.clone()}),
                             ),
                         ]),
+                    );
+                    yield_state.observe_tool_delivery(
+                        name,
+                        authorized_tool_names,
+                        initial_arguments_advanced,
+                        TokioInstant::now(),
                     );
                     if let Some(callback) = stream_callback.as_deref_mut()
                         && let Some(tool_call) = tool_calls_map.get(&index)
@@ -4380,6 +6800,7 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             full_text.push_str(text);
+                            yield_state.observe_text(text, TokioInstant::now());
                             if let Some(callback) = stream_callback.as_deref_mut() {
                                 callback(LlmStreamUpdate::Text(text.to_string()));
                             }
@@ -4406,6 +6827,7 @@ async fn collect_anthropic_llm_stream(
                                 });
                             }
                             reasoning.push_str(text);
+                            yield_state.observe_reasoning_activity(text, TokioInstant::now());
                             if let Some(callback) = stream_callback.as_deref_mut() {
                                 callback(LlmStreamUpdate::Reasoning(text.to_string()));
                             }
@@ -4461,6 +6883,22 @@ async fn collect_anthropic_llm_stream(
                             existing.push_str(args);
                             made_progress = true;
                         }
+                        if let Some(function) = tool_calls_map
+                            .get(&index)
+                            .and_then(|entry| entry.get("function"))
+                            .and_then(Value::as_object)
+                        {
+                            let name = function
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            yield_state.observe_tool_delivery(
+                                name,
+                                authorized_tool_names,
+                                !args.is_empty(),
+                                TokioInstant::now(),
+                            );
+                        }
                         if let Some(callback) = stream_callback.as_deref_mut()
                             && let Some(tool_call) = tool_calls_map.get(&index)
                         {
@@ -4488,6 +6926,12 @@ async fn collect_anthropic_llm_stream(
                         u,
                     )
                 {
+                    let mut observed = current_usage_presence(&usage_presence);
+                    observed.merge(crate::turn::token_usage::extract_usage_presence(
+                        crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                        u,
+                    ));
+                    replace_usage_presence(&usage_presence, observed);
                     if u.contains_key("input_tokens") {
                         usage_tokens.input_tokens = extracted.input_tokens;
                     }
@@ -4504,7 +6948,7 @@ async fn collect_anthropic_llm_stream(
                 }
             }
             Some("message_stop") => {
-                saw_terminal = true;
+                yield_state.mark_terminal();
                 break;
             }
             Some("error") => {
@@ -4525,7 +6969,7 @@ async fn collect_anthropic_llm_stream(
         }
     }
 
-    if !saw_terminal {
+    if !yield_state.is_terminal() {
         return Err(StreamCollectError::Transport {
             error: "Anthropic SSE ended without message_stop".to_string(),
             partial: partial_result(
@@ -4553,9 +6997,11 @@ async fn collect_anthropic_llm_stream(
         reasoning_signature,
         tool_calls,
         usage: usage_tokens.to_json_map(),
+        usage_presence: current_usage_presence(&usage_presence),
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
+        effective_finish_reason: None,
     })
 }
 
@@ -4567,6 +7013,19 @@ enum StreamCollectError {
         made_progress: bool,
         partial: LlmCallResult,
     },
+    SemanticProgressTimeout {
+        elapsed_ms: u64,
+        made_semantic_progress: bool,
+        partial: LlmCallResult,
+    },
+    /// The invocation-wide provider-work budget elapsed while the stream was
+    /// still producing data. This is distinct from an idle or semantic
+    /// progress timeout: a healthy stream must not bypass the finite
+    /// user-facing work budget merely by continuing to emit tokens.
+    ProviderWorkDeadline {
+        elapsed_ms: u64,
+        partial: LlmCallResult,
+    },
     /// Byte stream error from the HTTP client (e.g. reset, TLS failure).
     Transport {
         error: String,
@@ -4576,21 +7035,36 @@ enum StreamCollectError {
     Cancelled { partial: LlmCallResult },
 }
 
-/// For `tokio::select!`: completes when `cancel` fires, or never if `cancel` is `None`.
-pub(crate) async fn wait_until_cancelled_or_pending(cancel: Option<&CancellationToken>) {
-    match cancel {
-        Some(t) => t.cancelled().await,
-        None => std::future::pending().await,
-    }
-}
-
 #[cfg(test)]
 pub(crate) async fn call_llm_nonstream(
     client: &reqwest::Client,
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_with_attempt_observer(client, call, timeout, None).await
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        None,
+        RuntimeToolChoice::Auto,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn call_llm_nonstream_no_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        None,
+        RuntimeToolChoice::None,
+    )
+    .await
 }
 
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
@@ -4599,6 +7073,25 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        attempt_observer,
+        RuntimeToolChoice::Auto,
+    )
+    .await
+}
+
+async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let logical_timeout = timeout;
+    let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
     let LlmCall {
         purpose,
         messages,
@@ -4610,7 +7103,21 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         has_fallback: _,
         thinking,
     } = call;
+    let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
+        route.request_body_overrides,
+        route.fixed_temperature,
+    )
+    .map_err(|message| {
+        astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+    })?;
+    let temperature = if route.fixed_temperature.is_some() {
+        configured_temperature
+    } else {
+        temperature
+    };
     let LlmExecutionRoute {
+        fixed_temperature: _,
+        thinking_protocol,
         model_name,
         wire_model_name,
         api_key,
@@ -4622,12 +7129,24 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         request_timeout,
     } = route;
     let started = Instant::now();
+    let controlled_attempt_observer =
+        attempt_observer.map(|inner| ControlledProviderAttemptObserver {
+            inner,
+            started,
+            work_budget: timeout,
+            logical_budget: logical_timeout,
+            cancel: LlmCancel::None,
+        });
+    let attempt_observer = controlled_attempt_observer
+        .as_ref()
+        .map(|observer| observer as &dyn ProviderAttemptObserver);
     let upstream_name = wire_model_name.unwrap_or(model_name);
+    validate_request_body_overrides(request_body_overrides)?;
 
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
+    validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
-    let mut body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_cache_capability(
         &messages,
         tools,
         upstream_name,
@@ -4637,10 +7156,33 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         false,
         thinking,
         request_body_overrides,
+        cache_capability,
     );
-    thinking.apply_openai_suppression(&mut body, provider, base_url);
-    let prepared_request =
-        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
+    if !matches!(provider, "anthropic" | "bedrock") {
+        let protocol = thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                provider,
+                base_url,
+                upstream_name,
+            )
+        });
+        apply_admitted_openai_protocol(
+            &mut body,
+            protocol,
+            thinking,
+            temperature,
+            request_body_overrides,
+        );
+    }
+    if matches!(tool_choice, RuntimeToolChoice::None) {
+        apply_no_tool_choice(&mut body, provider, tools)?;
+    }
+    let wire_output_limit = provider_request_output_limit(&body);
+    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+        &body,
+        llm_provider_protocol(provider),
+        cache_capability,
+    )?;
 
     let url = llm_request_url(
         base_url,
@@ -4651,6 +7193,18 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     );
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+        Some(
+            astra_services::byok_endpoint::endpoint_client(&url)
+                .await
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+                })?,
+        )
+    } else {
+        None
+    };
+    let client = compatible_client.as_deref().unwrap_or(client);
     let observed_attempt = match attempt_observer {
         Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
         None => None,
@@ -4660,9 +7214,19 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     req = apply_llm_header_overrides(req, header_overrides);
 
     // Apply per-request timeout (overrides the client-level default).
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM non-stream total budget exhausted before provider request",
+        );
+        finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+        return Err(error);
+    }
     let effective_timeout = request_timeout
-        .map(|value| value.min(timeout))
-        .unwrap_or(timeout);
+        .map(|value| value.min(remaining))
+        .unwrap_or(remaining);
+    let total_budget_owns_deadline = request_timeout.is_none_or(|value| remaining <= value);
     tracing::debug!(
         target: "astra_runtime::llm_client",
         url = %url,
@@ -4671,12 +7235,18 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         model_name,
         "LLM non-stream request sending"
     );
-    let resp = match req
-        .timeout(effective_timeout)
-        .body(prepared_request.body())
-        .send()
-        .await
-    {
+    let send_request = async {
+        if let Some(attempt_index) = observed_attempt {
+            attempt_observer
+                .expect("observed attempt requires observer")
+                .note_dispatch_started(attempt_index);
+        }
+        req.timeout(effective_timeout)
+            .body(prepared_request.body())
+            .send()
+            .await
+    };
+    let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
             let elapsed = started.elapsed();
@@ -4692,21 +7262,69 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
             let kind = if retry_safe {
                 astra_core::ErrorKind::Network
             } else if e.is_timeout() {
-                astra_core::ErrorKind::StreamIdle
+                if total_budget_owns_deadline {
+                    astra_core::ErrorKind::ProviderDeadline
+                } else {
+                    astra_core::ErrorKind::StreamIdle
+                }
             } else {
                 astra_core::ErrorKind::StreamTransport
             };
-            let error = astra_core::ClassifiedError::new(
-                kind,
-                nonstream_send_error_message(&e, effective_timeout, elapsed),
-            );
-            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                provider_deadline_from_transport(
+                    "sending the non-stream provider request",
+                    &e.to_string(),
+                    elapsed,
+                    None,
+                )
+            } else {
+                astra_core::ClassifiedError::new(
+                    kind,
+                    nonstream_send_error_message(&e, effective_timeout, elapsed),
+                )
+            };
+            if retry_safe {
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            } else {
+                finish_observed_provider_delivery_unknown(
+                    attempt_observer,
+                    observed_attempt,
+                    &error,
+                )
+                .await?;
+            }
             return Err(error);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let text = resp.text().await.unwrap_or_default();
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(body_error) => {
+                let kind = if body_error.is_timeout() && total_budget_owns_deadline {
+                    astra_core::ErrorKind::ProviderDeadline
+                } else if body_error.is_timeout() {
+                    astra_core::ErrorKind::StreamIdle
+                } else {
+                    astra_core::ErrorKind::StreamTransport
+                };
+                let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                    provider_deadline_from_transport(
+                        "reading the non-stream provider error response body",
+                        &body_error.to_string(),
+                        started.elapsed(),
+                        None,
+                    )
+                } else {
+                    astra_core::ClassifiedError::new(
+                        kind,
+                        format!("LLM non-stream error response body failed: {body_error}"),
+                    )
+                };
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+        };
         let kind = if status == 401 || status == 403 {
             astra_core::ErrorKind::Auth
         } else if is_rate_limit_status(status) {
@@ -4741,15 +7359,28 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let v: Value = match resp.json().await {
         Ok(value) => value,
         Err(error) => {
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::StreamTransport,
-                error.to_string(),
-            );
+            let kind = if error.is_timeout() && total_budget_owns_deadline {
+                astra_core::ErrorKind::ProviderDeadline
+            } else if error.is_timeout() {
+                astra_core::ErrorKind::StreamIdle
+            } else {
+                astra_core::ErrorKind::StreamTransport
+            };
+            let error = if kind == astra_core::ErrorKind::ProviderDeadline {
+                provider_deadline_from_transport(
+                    "decoding the non-stream provider response",
+                    &error.to_string(),
+                    started.elapsed(),
+                    None,
+                )
+            } else {
+                astra_core::ClassifiedError::new(kind, error.to_string())
+            };
             let partial = LlmCallResult {
                 response_id: transport_response_id.clone(),
                 ..LlmCallResult::default()
             };
-            finish_observed_provider_error_with_partial(
+            finish_observed_provider_delivery_unknown_with_partial(
                 attempt_observer,
                 observed_attempt,
                 &error,
@@ -4760,15 +7391,37 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         }
     };
     let mut result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    if matches!(tool_choice, RuntimeToolChoice::Auto) {
+        let authorized_tool_names = tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter_map(canonical_valid_tool_name)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        result.tool_calls.retain(|call| {
+            tool_call_name(call)
+                .and_then(canonical_valid_tool_name)
+                .is_some_and(|name| authorized_tool_names.contains(name))
+        });
+    }
+    reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
     if result.response_id.is_none() {
         result.response_id = transport_response_id;
     }
-    finish_observed_provider_attempt(
+    note_observed_provider_usage_presence(
+        attempt_observer,
+        observed_attempt,
+        result.usage_presence,
+    );
+    if let Err(error) = finish_observed_provider_attempt(
         attempt_observer,
         observed_attempt,
         &provider_attempt_terminal_from_result(&result),
     )
-    .await?;
+    .await
+    {
+        return Err(attach_llm_result_details(error, &result));
+    }
     Ok(result)
 }
 
@@ -4807,9 +7460,16 @@ fn parse_bedrock_nonstream_response(
     let mut reasoning = String::new();
     let mut reasoning_signature = String::new();
     let mut tool_calls = Vec::new();
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage_obj = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage_obj
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::BedrockConverse,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage_obj
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::BedrockConverse,
@@ -4868,12 +7528,14 @@ fn parse_bedrock_nonstream_response(
         reasoning_signature,
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason: v
             .get("stopReason")
             .and_then(Value::as_str)
             .map(map_bedrock_finish_reason),
+        effective_finish_reason: None,
     }
 }
 
@@ -4885,9 +7547,16 @@ fn parse_openai_compatible_nonstream_response(
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage_obj = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage_obj
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage_obj
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::OpenAi,
@@ -4923,20 +7592,23 @@ fn parse_openai_compatible_nonstream_response(
         .map(String::from);
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    if let Some(parsed) =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    {
+        if tool_calls.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
+    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
+    canonicalize_provider_tool_calls(&mut tool_calls);
 
     if reasoning.is_empty() {
         if let Some((extracted_reasoning, cleaned_text)) = extract_think_tags(&full_text) {
@@ -4952,9 +7624,11 @@ fn parse_openai_compatible_nonstream_response(
         reasoning_signature: String::new(),
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason,
+        effective_finish_reason: None,
     }
 }
 
@@ -5008,9 +7682,16 @@ fn parse_anthropic_nonstream_response(
             }
         }
     }
-    let usage = v
-        .get("usage")
-        .and_then(Value::as_object)
+    let usage = v.get("usage").and_then(Value::as_object);
+    let usage_presence = usage
+        .map(|u| {
+            crate::turn::token_usage::extract_usage_presence(
+                crate::turn::token_usage::UsageDialect::AnthropicMessages,
+                u,
+            )
+        })
+        .unwrap_or_default();
+    let usage = usage
         .and_then(|u| {
             crate::turn::token_usage::extract_usage(
                 crate::turn::token_usage::UsageDialect::AnthropicMessages,
@@ -5027,12 +7708,14 @@ fn parse_anthropic_nonstream_response(
         reasoning_signature,
         tool_calls,
         usage,
+        usage_presence,
         model_used: model_name.to_string(),
         duration_ms: started.elapsed().as_millis() as u64,
         finish_reason: v
             .get("stop_reason")
             .and_then(Value::as_str)
             .map(String::from),
+        effective_finish_reason: None,
     }
 }
 
@@ -5141,6 +7824,359 @@ pub(crate) fn parse_openai_sse_json_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn primary_streaming_and_nonstreaming_preserve_admitted_protocol_and_sampling() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use axum::{Json, response::IntoResponse};
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let capture = captured.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |Json(body): Json<Value>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push(body.clone());
+                if body["stream"] == true {
+                    ([ ("content-type", "text/event-stream") ],
+                     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
+                } else {
+                    Json(json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for streaming in [false, true] {
+            for (protocol, thinking, fixed) in [
+                (ThinkingProtocol::Moonshot, ThinkingConfig::Off, Some(0.7)),
+                (
+                    ThinkingProtocol::Moonshot,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::Unknown,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    None,
+                ),
+                (ThinkingProtocol::Unknown, ThinkingConfig::Off, Some(0.7)),
+                (
+                    ThinkingProtocol::EnableThinking,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ThinkingObject,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+                (
+                    ThinkingProtocol::ReasoningEffort,
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                    Some(0.7),
+                ),
+            ] {
+                let mut overrides = json!({"top_p":0.9,"presence_penalty":0.1});
+                if protocol == ThinkingProtocol::Unknown && thinking.is_enabled() {
+                    overrides["reasoning_effort"] = json!("medium");
+                }
+                let route = OwnedLlmExecutionRoute {
+                    model_name: "local-alias".into(),
+                    wire_model_name: Some("upstream-fixture".into()),
+                    api_key: "fixture".into(),
+                    base_url: base.clone(),
+                    provider: "openai".into(),
+                    thinking_capability: None,
+                    fixed_temperature: fixed,
+                    thinking_protocol: Some(protocol),
+                    header_overrides: HashMap::new(),
+                    request_body_overrides: overrides.as_object().cloned(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &[json!({"role":"user","content":"hello"})],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route.borrowed(),
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &thinking,
+                };
+                if streaming {
+                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                        call,
+                        LlmCancel::None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    call_llm_nonstream(
+                        global_llm_client(),
+                        call,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let body = captured.lock().unwrap().last().unwrap().clone();
+                assert_eq!(body["model"], "upstream-fixture");
+                if protocol == ThinkingProtocol::Moonshot {
+                    assert_eq!(
+                        body["thinking"]["type"],
+                        if thinking.is_enabled() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    assert_eq!(body["top_p"], 0.9);
+                    assert_eq!(body["presence_penalty"], 0.1);
+                }
+                if thinking.is_enabled() && protocol == ThinkingProtocol::Unknown {
+                    assert_eq!(body["reasoning_effort"], "medium");
+                } else if protocol == ThinkingProtocol::ReasoningEffort {
+                    assert!(
+                        body.get("temperature").is_none(),
+                        "native effort restrictions remain authoritative"
+                    );
+                } else {
+                    assert_eq!(body["temperature"], 0.7);
+                }
+                if protocol == ThinkingProtocol::EnableThinking {
+                    assert_eq!(body["enable_thinking"], true);
+                    assert!(body.get("reasoning_effort").is_none());
+                }
+            }
+        }
+        assert_eq!(captured.lock().unwrap().len(), 14);
+        // Validate generic overrides even without fixed_temperature, in both
+        // public transports, before any request can reach the provider.
+        for streaming in [false, true] {
+            for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
+                let route = OwnedLlmExecutionRoute {
+                    model_name: "fixture".into(),
+                    wire_model_name: None,
+                    api_key: "fixture".into(),
+                    base_url: base.clone(),
+                    provider: "openai".into(),
+                    thinking_capability: None,
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    header_overrides: HashMap::new(),
+                    request_body_overrides: json!({"temperature":invalid}).as_object().cloned(),
+                    completions_url_override: None,
+                    request_timeout: None,
+                };
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &[],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route.borrowed(),
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let result = if streaming {
+                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                        call,
+                        LlmCancel::None,
+                        None,
+                        None,
+                    )
+                    .await
+                } else {
+                    call_llm_nonstream(
+                        global_llm_client(),
+                        call,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                };
+                assert!(result.unwrap_err().message.contains("finite non-negative"));
+            }
+        }
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            14,
+            "invalid overrides must not reach provider I/O"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn introspection_budget_does_not_shorten_primary_or_extend_global_limit() {
+        use astra_turn_types::InferencePurpose;
+        let global = std::time::Duration::from_secs(60);
+        let cap = std::time::Duration::from_secs(8);
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::Introspection, global, cap),
+            cap
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::Introspection, cap, global),
+            cap
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::PrimaryAgent, global, cap),
+            global
+        );
+        assert_eq!(
+            bounded_auxiliary_budget(InferencePurpose::RequiredCompaction, global, cap),
+            global
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_introspection_slow_provider_exits_without_protocol_retry() {
+        use axum::{Router, routing::post};
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                captured.fetch_add(1, Ordering::SeqCst);
+                async { std::future::pending::<axum::response::Response>().await }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let call = LlmCall {
+            purpose: astra_turn_types::InferencePurpose::Introspection,
+            messages: &[json!({"role":"user","content":"hello"})],
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                fixed_temperature: None,
+                thinking_protocol: Some(
+                    astra_core::model_wire::thinking::ThinkingProtocol::Moonshot,
+                ),
+                model_name: "slow-fixture",
+                wire_model_name: None,
+                api_key: "fixture",
+                base_url: &base,
+                provider: "openai",
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: Some(1024),
+            temperature: None,
+            has_fallback: false,
+            thinking: &ThinkingConfig::Off,
+        };
+        let result = call_llm_and_collect_with_total_budget(
+            call,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::None,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        assert!(matches!(
+            result.unwrap_err().kind,
+            astra_core::ErrorKind::BudgetExhausted | astra_core::ErrorKind::ProviderDeadline
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn cloud_byok_compatible_reuses_openai_message_and_tool_wire_format() {
+        let messages = vec![json!({"role":"user","content":"Use the calculator"})];
+        let tools = vec![json!({"type":"function", "function":{
+            "name":"calculator", "description":"Add numbers",
+            "parameters":{"type":"object", "properties":{"a":{"type":"number"}}}
+        }})];
+        for streaming in [false, true] {
+            let body = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai-compatible",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            let expected = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            assert_eq!(body, expected);
+            assert_eq!(body["model"], "upstream-model");
+            assert_eq!(body["tools"][0]["function"]["name"], "calculator");
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_byok_compatible_blocks_private_endpoint_in_both_transports() {
+        let messages = vec![json!({"role":"user","content":"hello"})];
+        for streaming in [false, true] {
+            let call = LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "test-model",
+                    wire_model_name: None,
+                    api_key: "sk-private-secret",
+                    base_url: "http://127.0.0.1:9/v1",
+                    provider: "openai-compatible",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(128),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            };
+            let result = if streaming {
+                call_llm_and_collect(call, LlmCancel::None).await
+            } else {
+                call_llm_nonstream(
+                    global_llm_client(),
+                    call,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            };
+            let error = result.expect_err("private endpoint must fail before network I/O");
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("HTTPS"));
+            assert!(!error.to_string().contains("sk-private-secret"));
+        }
+    }
     use axum::Router;
     use axum::body::Body;
     use axum::extract::State;
@@ -5176,10 +8212,10 @@ mod tests {
         Guard
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
-    fn bridge_e2e_stream_idle_timeout_override_is_visible_to_runtime_paths() {
-        let _guard = set_bridge_e2e_stream_idle_timeouts_for_test(123, 456);
+    fn e2e_stream_idle_timeout_override_is_visible_to_runtime_paths() {
+        let _guard = set_e2e_stream_idle_timeouts_for_test(123, 456);
         assert_eq!(stream_idle_timeout(), std::time::Duration::from_millis(123));
         assert_eq!(
             stream_idle_timeout_after_progress(),
@@ -5283,6 +8319,8 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            fixed_temperature: None,
+            thinking_protocol: None,
             model_name: "model-a",
             wire_model_name: Some("wire-model-a"),
             api_key: "api-key-secret",
@@ -5332,15 +8370,741 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn total_budget_exhausted_returns_error() {
-        // Simulate a scenario where started time is already past budget.
-        // We test the logic inline since call_llm_and_collect needs a server.
-        let budget = std::time::Duration::from_millis(1);
+    async fn streaming_request_without_catalog_timeout_obeys_total_budget() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|State(Hit(hits)): State<Hit>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from("data: [DONE]\n\n"))
+                        .unwrap()
+                }),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = RecordingAttemptObserver::default();
         let started = Instant::now();
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        assert!(
-            started.elapsed() > budget,
-            "elapsed should exceed tiny budget"
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("one provider request must not outlive the total LLM budget");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "timed-out delivery is not retried"
+        );
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)],
+            "the user-visible hard-budget error must not claim that an already sent request failed before delivery"
+        );
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: Some(std::time::Duration::from_millis(20)),
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the shorter offering response-start deadline must win");
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamIdle);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![
+                (0, astra_services::InferenceTerminalStatus::DeliveryUnknown),
+                (1, astra_services::InferenceTerminalStatus::DeliveryUnknown),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn progressing_stream_may_outlive_response_start_deadline() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                    yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"}}]}\n\ndata: [DONE]\n\n",
+                    ));
+                };
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+
+        let result = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: Some(std::time::Duration::from_millis(30)),
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("response-start timeout must stop applying after headers arrive");
+
+        assert_eq!(result.full_text, "first second");
+    }
+
+    #[tokio::test]
+    async fn continuously_progressing_stream_still_obeys_total_work_budget() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let stream = async_stream::stream! {
+                    loop {
+                        yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                };
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let started = Instant::now();
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(80),
+        )
+        .await
+        .expect_err("continuing SSE chunks must not extend the total work budget");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn successful_headers_then_body_budget_records_delivery_unknown() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    ));
+                    std::future::pending::<()>().await;
+                };
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = RecordingAttemptObserver::default();
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .expect_err("the successful response body must still obey the hard total budget");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert_eq!(
+            error.message, "LLM provider work deadline reached while consuming the provider stream",
+            "a hard-budget decoder race must not be presented as a transport outage"
+        );
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("deadline diagnostics should preserve partial evidence"),
+        )
+        .expect("deadline details should be valid JSON");
+        assert_eq!(
+            details["deadline"]["phase"],
+            "consuming the provider stream"
+        );
+        assert!(details["underlying_error"].is_string());
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_headers_then_body_cancel_preserves_caller_reason_and_partial() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    ));
+                    std::future::pending::<()>().await;
+                };
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = RecordingAttemptObserver::default();
+        let cancel = CancellationToken::new();
+        let call = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::Token(&cancel),
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(5),
+        );
+        let trigger = async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        };
+
+        let (result, ()) = tokio::join!(call, trigger);
+        let error = result.expect_err("body cancellation must stop the local consumer");
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("partial response details must be retained"),
+        )
+        .expect("partial details json");
+        assert_eq!(details["partial_full_text"], "partial");
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_successful_headers_then_body_cancel_preserves_caller_reason() {
+        let app = Router::new().fallback(|| async {
+            let stream = async_stream::stream! {
+                std::future::pending::<()>().await;
+                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::new());
+            };
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/vnd.amazon.eventstream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        });
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = RecordingAttemptObserver::default();
+        let cancel = CancellationToken::new();
+        let call = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "bedrock",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::Token(&cancel),
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(5),
+        );
+        let trigger = async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            cancel.cancel();
+        };
+
+        let (result, ()) = tokio::join!(call, trigger);
+        let error = result.expect_err("Bedrock body cancellation must stop the local consumer");
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_while_waiting_for_provider_response_headers() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|State(Hit(hits)): State<Hit>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from("data: [DONE]\n\n"))
+                        .unwrap()
+                }),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let cancel = CancellationToken::new();
+        let observer = RecordingAttemptObserver::default();
+        let started = Instant::now();
+        let call = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::Token(&cancel),
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(5),
+        );
+        let trigger = async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while hits.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider request must begin");
+            cancel.cancel();
+        };
+
+        let (result, ()) = tokio::join!(call, trigger);
+        let error = result.expect_err("cancellation must stop the header wait");
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_while_reading_provider_error_body() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|State(Hit(hits)): State<Hit>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        std::future::pending::<()>().await;
+                        yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::new());
+                    };
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let cancel = CancellationToken::new();
+        let call = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::Token(&cancel),
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(5),
+        );
+        let trigger = async {
+            while hits.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        };
+
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(call, trigger);
+        let error = result.expect_err("cancellation must stop the error-body read");
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_total_budget_bound_provider_attempt_admission() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|State(Hit(hits)): State<Hit>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from("data: [DONE]\n\n"))
+                        .unwrap()
+                }),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = PendingAttemptObserver::default();
+        let cancel = CancellationToken::new();
+        let cancelled = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::Token(&cancel),
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_secs(5),
+        );
+        let trigger = async {
+            while observer.began.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(cancelled, trigger);
+        assert_eq!(
+            result.expect_err("admission cancellation").kind,
+            astra_core::ErrorKind::Cancelled
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let budget_observer = PendingAttemptObserver::default();
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&budget_observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("attempt admission must obey total budget");
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_crossing_total_budget_does_not_create_ghost_attempt() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_retry_two_seconds))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = RecordingAttemptObserver::default();
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("retry delay must not outlive the hard total budget");
+        reset_rate_limit_cooldown_for_tests();
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *observer.began.lock().expect("began"),
+            vec![0],
+            "every durable attempt must correspond to a provider request"
         );
     }
 
@@ -5366,7 +9130,8 @@ mod tests {
             .expect("build client");
         // Use a very short timeout — should fail before the 5s delay completes.
         let timeout = std::time::Duration::from_millis(100);
-        let result = call_llm_nonstream(
+        let observer = RecordingAttemptObserver::default();
+        let result = call_llm_nonstream_with_attempt_observer(
             &client,
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
@@ -5374,6 +9139,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -5390,18 +9157,24 @@ mod tests {
                 thinking: &ThinkingConfig::Off,
             },
             timeout,
+            Some(&observer),
         )
         .await;
         assert!(result.is_err(), "should timeout: {result:?}");
         let err = result.unwrap_err();
         assert_eq!(
             err.kind,
-            astra_core::ErrorKind::StreamIdle,
-            "the provider request deadline must have a typed timeout outcome"
+            astra_core::ErrorKind::ProviderDeadline,
+            "the hard non-stream total budget must retain ownership of its deadline"
         );
-        assert!(
-            err.message.contains("timeout") || err.message.contains("Timeout"),
-            "error should mention timeout: {err}"
+        assert_eq!(
+            err.message,
+            "LLM provider work deadline reached while sending the non-stream provider request",
+            "the hard budget owns the user-facing headline even when reqwest reports a timeout"
+        );
+        assert_eq!(
+            *observer.finished.lock().expect("finished"),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
         );
     }
 
@@ -5458,6 +9231,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
                     api_key: "",
@@ -5529,6 +9304,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
                     api_key: "k",
@@ -5761,6 +9538,823 @@ mod tests {
         assert_eq!(e1, ParsedSseEvent::Data(json!({"a": 1})));
         assert_eq!(st.next().await.unwrap().unwrap(), ParsedSseEvent::Done);
         assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_stream_uses_idle_watchdog_when_it_expires_first() {
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n";
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+            .chain(stream::pending());
+        let error = collect_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("a stalled reasoning stream remains governed by physical idle");
+        match error {
+            StreamCollectError::IdleTimeout { partial, .. } => {
+                assert_eq!(partial.reasoning, "still thinking");
+                assert!(partial.full_text.is_empty());
+                assert!(partial.tool_calls.is_empty());
+            }
+            other => panic!("expected idle timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_reasoning_cannot_bypass_provider_work_budget() {
+        let source = Box::pin(stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n",
+                )),
+                (),
+            ))
+        }));
+        let started = Instant::now();
+        let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+            source,
+            "test-model",
+            started,
+            std::time::Duration::from_millis(30),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a progressing stream must still honor the total work budget");
+
+        match error {
+            StreamCollectError::ProviderWorkDeadline { partial, .. } => {
+                assert!(partial.reasoning.contains("still thinking"));
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            }
+            other => panic!("expected provider-work deadline, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_reasoning_cannot_bypass_provider_work_budget() {
+        let source = Box::pin(stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"still thinking\"}}\n\n",
+                )),
+                (),
+            ))
+        }));
+        let started = Instant::now();
+        let error = collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+            source,
+            "test-model",
+            started,
+            std::time::Duration::from_millis(30),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            None,
+            None,
+        )
+        .await
+        .expect_err("Anthropic reasoning must still honor the provider-work budget");
+
+        match error {
+            StreamCollectError::ProviderWorkDeadline { partial, .. } => {
+                assert!(partial.reasoning.contains("still thinking"));
+                assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            }
+            other => panic!("expected Anthropic provider-work deadline, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_anthropic_reasoning_refreshes_liveness_until_delivery() {
+        let source = Box::pin(async_stream::stream! {
+            for _ in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                    b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"thinking\"}}\n\n",
+                ));
+            }
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+            ));
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            ));
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"type\":\"message_stop\"}\n\n",
+            ));
+        });
+        let result = collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+            source,
+            "test-model",
+            Instant::now(),
+            std::time::Duration::from_secs(1),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(12),
+            None,
+            None,
+        )
+        .await
+        .expect("continuous Anthropic reasoning must not look idle");
+
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.reasoning, "thinkingthinkingthinkingthinking");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_reasoning_refreshes_liveness_without_becoming_delivery() {
+        let source = Box::pin(async_stream::stream! {
+            for _ in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\n",
+                ));
+            }
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ));
+        });
+        let result = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+            source,
+            "test-model",
+            Instant::now(),
+            std::time::Duration::from_secs(1),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(12),
+            None,
+            None,
+        )
+        .await
+        .expect("continuous reasoning is semantic activity until the provider delivers");
+
+        assert!(result.reasoning.contains("still thinking"));
+        assert_eq!(result.full_text, "answer");
+        assert!(result.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_stream_activity_is_local_to_each_provider_attempt() {
+        let active = async {
+            let source = Box::pin(async_stream::stream! {
+                for _ in 0..4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(6)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"working\"}}]}\n\n",
+                    ));
+                }
+                yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+                ));
+            });
+            collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_secs(1),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(12),
+                None,
+                None,
+            )
+            .await
+        };
+        let stalled = async {
+            let source = Box::pin(
+                stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"one thought\"}}]}\n\n",
+                ))])
+                .chain(stream::pending()),
+            );
+            collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_secs(1),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(12),
+                None,
+                None,
+            )
+            .await
+        };
+
+        let (active, stalled) = tokio::join!(active, stalled);
+        assert_eq!(active.expect("active stream completes").full_text, "done");
+        assert!(matches!(
+            stalled,
+            Err(StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn authorized_streaming_tool_json_rolls_delivery_yield_deadline() {
+        let source = async_stream::stream! {
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"\"}}]}}]}\n\n",
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"echo\"}}]}}]}\n\n",
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" hi\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            ));
+        };
+        let authorized = HashSet::from(["bash".to_string()]);
+        let result = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+            Box::pin(source),
+            "test-model",
+            Instant::now(),
+            std::time::Duration::from_secs(1),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            Some(&authorized),
+            None,
+        )
+        .await
+        .expect("active authorized JSON delivery must roll the yield deadline");
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(
+            result.tool_calls[0]["function"]["arguments"],
+            Value::String(r#"{"cmd":"echo hi"}"#.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_keepalives_after_progress_hit_the_rolling_semantic_deadline() {
+        let first = Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"useful output\"}}]}\n\n",
+        ));
+        let keepalives = stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+                )),
+                (),
+            ))
+        });
+        let error = collect_llm_stream_with_semantic_progress_deadline(
+            Box::pin(stream::iter(vec![first]).chain(keepalives)),
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            None,
+        )
+        .await
+        .expect_err("empty OpenAI keepalives must not extend a completed partial response");
+        match error {
+            StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress,
+                partial,
+                ..
+            } => {
+                assert!(made_semantic_progress);
+                assert_eq!(partial.full_text, "useful output");
+            }
+            other => panic!("expected rolling semantic-progress timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_thinking_tag_across_provider_chunks_stays_reasoning() {
+        let first =
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"<th\"}}]}\n\n");
+        let second = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"inking>still thinking\"}}]}\n\n",
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(first), Ok(second)])
+            .chain(stream::pending());
+        let error = collect_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .await
+        .expect_err("stalled <thinking> reasoning remains governed by physical idle");
+        match error {
+            StreamCollectError::IdleTimeout { partial, .. } => {
+                assert_eq!(partial.reasoning, "still thinking");
+                assert!(partial.full_text.is_empty());
+            }
+            other => panic!("expected idle timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_text_is_not_semantic_progress_for_any_sse_protocol() {
+        assert!(!text_has_actionable_content(" \n\t"));
+        assert!(text_has_actionable_content(" answer "));
+
+        let openai = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\" \\n\\t\"}}]}\n\n",
+        ))])
+        .chain(stream::pending());
+        let openai_error = collect_llm_stream_with_semantic_progress_deadline(
+            openai,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            None,
+        )
+        .await
+        .expect_err("OpenAI whitespace must not disarm the semantic-progress deadline");
+        assert!(matches!(
+            openai_error,
+            StreamCollectError::SemanticProgressTimeout { .. }
+        ));
+
+        let anthropic = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" \\n\\t\"}}\n\n",
+        ))])
+        .chain(stream::pending());
+        let anthropic_error = collect_anthropic_llm_stream_with_semantic_progress_deadline(
+            anthropic,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            None,
+        )
+        .await
+        .expect_err("Anthropic whitespace must not disarm the semantic-progress deadline");
+        assert!(matches!(
+            anthropic_error,
+            StreamCollectError::SemanticProgressTimeout { .. }
+        ));
+    }
+
+    #[test]
+    fn stream_yield_state_has_deliberating_delivering_and_terminal_deadlines() {
+        let start = TokioInstant::now();
+        let timeout = std::time::Duration::from_millis(20);
+        let authorized = HashSet::from(["bash".to_string()]);
+        let mut state = StreamYieldState::new(start);
+        assert_eq!(
+            state,
+            StreamYieldState::Deliberating {
+                last_semantic_activity_at: start,
+                semantic_activity_observed: false,
+            }
+        );
+        state.observe_reasoning_activity("working", start + std::time::Duration::from_millis(15));
+        assert!(matches!(
+            state,
+            StreamYieldState::Deliberating {
+                semantic_activity_observed: true,
+                ..
+            }
+        ));
+        assert!(!state.has_actionable_yield());
+        assert!(!state.timed_out(start + std::time::Duration::from_millis(21), timeout));
+
+        state.observe_tool_delivery("bash", Some(&authorized), true, start);
+        state.observe_tool_delivery(
+            "bash",
+            Some(&authorized),
+            true,
+            start + std::time::Duration::from_millis(15),
+        );
+        assert!(!state.timed_out(start + std::time::Duration::from_millis(21), timeout));
+        assert!(state.timed_out(start + std::time::Duration::from_millis(36), timeout));
+
+        state.mark_terminal();
+        assert_eq!(state, StreamYieldState::Terminal);
+        assert_eq!(state.deadline(timeout), None);
+    }
+
+    #[tokio::test]
+    async fn visible_text_establishes_semantic_progress_and_leaves_idle_watchdog_authoritative() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"answer started\"}}]}\n\n";
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+            .chain(stream::pending());
+        let error = collect_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("a stalled visible answer remains governed by stream idle");
+        assert!(matches!(error, StreamCollectError::IdleTimeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_reasoning_only_stream_uses_idle_when_it_expires_first() {
+        let body = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"still thinking\"}}\n\n";
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+            .chain(stream::pending());
+        let error = collect_anthropic_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("stalled Anthropic thinking remains governed by physical idle");
+        match error {
+            StreamCollectError::IdleTimeout { partial, .. } => {
+                assert_eq!(partial.reasoning, "still thinking");
+                assert!(partial.full_text.is_empty());
+                assert!(partial.tool_calls.is_empty());
+            }
+            other => panic!("expected idle timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_keepalives_after_progress_hit_the_rolling_semantic_deadline() {
+        let first = Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"useful output\"}}\n\n",
+        ));
+        let keepalives = stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from("data: {\"type\":\"ping\"}\n\n")),
+                (),
+            ))
+        });
+        let error = collect_anthropic_llm_stream_with_semantic_progress_deadline(
+            Box::pin(stream::iter(vec![first]).chain(keepalives)),
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            None,
+        )
+        .await
+        .expect_err("empty Anthropic keepalives must not extend a completed partial response");
+        match error {
+            StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress,
+                partial,
+                ..
+            } => {
+                assert!(made_semantic_progress);
+                assert_eq!(partial.full_text, "useful output");
+            }
+            other => panic!("expected rolling semantic-progress timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_invalid_tool_name_does_not_establish_semantic_progress() {
+        let body = concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":" "}}"#,
+            "\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+            .chain(stream::pending());
+        let error = collect_anthropic_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            None,
+        )
+        .await
+        .expect_err("an invalid tool name must not count as selected execution");
+        assert!(matches!(
+            error,
+            StreamCollectError::SemanticProgressTimeout { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn openai_tool_delivery_requires_wire_authority_and_times_out_partial_json_safely() {
+        let authorized = HashSet::from(["bash".to_string()]);
+        let cases = [
+            (
+                "unauthorized name",
+                false,
+                concat!(
+                    r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+                    "\n\n"
+                ),
+            ),
+            (
+                "incomplete arguments",
+                true,
+                concat!(
+                    r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"bash","arguments":"{\"cmd\":"}}]}}]}"#,
+                    "\n\n"
+                ),
+            ),
+        ];
+        for (label, delivery_started, body) in cases {
+            let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+                .chain(stream::pending());
+            let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_secs(30),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(20),
+                Some(&authorized),
+                None,
+            )
+            .await
+            .expect_err(label);
+            let StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress,
+                partial,
+                ..
+            } = error
+            else {
+                panic!("expected safe partial deadline for {label}");
+            };
+            assert_eq!(made_semantic_progress, delivery_started, "{label}");
+            assert!(partial.full_text.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_delivery_requires_wire_authority_and_times_out_partial_json_safely() {
+        let authorized = HashSet::from(["bash".to_string()]);
+        let cases = [
+            (
+                "unauthorized name",
+                false,
+                concat!(
+                    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"read_file","input":{}}}"#,
+                    "\n\n"
+                ),
+            ),
+            (
+                "incomplete arguments",
+                true,
+                concat!(
+                    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"bash"}}"#,
+                    "\n\n"
+                ),
+            ),
+        ];
+        for (label, delivery_started, body) in cases {
+            let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+                .chain(stream::pending());
+            let error = collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_secs(30),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(20),
+                Some(&authorized),
+                None,
+            )
+            .await
+            .expect_err(label);
+            let StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress,
+                partial,
+                ..
+            } = error
+            else {
+                panic!("expected safe partial deadline for {label}");
+            };
+            assert_eq!(made_semantic_progress, delivery_started, "{label}");
+            assert!(partial.full_text.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_stop_reason_without_message_stop_is_not_successful_eof() {
+        let body = concat!(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            "\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))]);
+        let error = collect_anthropic_llm_stream(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("stop_reason without message_stop must remain a partial transport result");
+
+        let StreamCollectError::Transport { error, partial } = error else {
+            panic!("expected missing-message-stop transport result")
+        };
+        assert!(error.contains("without message_stop"), "{error}");
+        assert_eq!(partial.finish_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_done_sentinel_does_not_replace_message_stop() {
+        let body = concat!(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))]);
+        let error = collect_anthropic_llm_stream(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect_err("Anthropic [DONE] without message_stop must remain a protocol error");
+
+        let StreamCollectError::Transport { error, partial } = error else {
+            panic!("expected missing-message-stop transport result")
+        };
+        assert!(error.contains("without message_stop"), "{error}");
+        assert_eq!(partial.finish_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stop_reason_without_message_stop_does_not_mask_cancel() {
+        let cancel = CancellationToken::new();
+        let body = concat!(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            "\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))])
+            .chain(stream::pending());
+        let collect = collect_anthropic_llm_stream(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::Token(&cancel),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            None,
+        );
+        let trigger = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(collect, trigger);
+        let StreamCollectError::Cancelled { partial } =
+            result.expect_err("missing message_stop must not turn cancellation into success")
+        else {
+            panic!("expected cancellation with partial Anthropic facts")
+        };
+        assert_eq!(partial.finish_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn repeated_openai_tool_headers_do_not_extend_delivery_deadline() {
+        let authorized = HashSet::from(["bash".to_string()]);
+        let repeated = stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from(concat!(
+                    r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"bash","arguments":""}}]}}]}"#,
+                    "\n\n"
+                ))),
+                (),
+            ))
+        });
+        let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+            Box::pin(repeated),
+            "test-model",
+            Instant::now(),
+            std::time::Duration::from_secs(1),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            Some(&authorized),
+            None,
+        )
+        .await
+        .expect_err("identical OpenAI tool metadata must not keep delivery alive");
+        assert!(matches!(
+            error,
+            StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_anthropic_tool_headers_do_not_extend_delivery_deadline() {
+        let authorized = HashSet::from(["bash".to_string()]);
+        let repeated = stream::unfold((), |_| async {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            Some((
+                Ok::<Bytes, reqwest::Error>(Bytes::from(concat!(
+                    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"bash","input":{}}}"#,
+                    "\n\n"
+                ))),
+                (),
+            ))
+        });
+        let error = collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+            Box::pin(repeated),
+            "test-model",
+            Instant::now(),
+            std::time::Duration::from_secs(1),
+            LlmCancel::None,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(20),
+            Some(&authorized),
+            None,
+        )
+        .await
+        .expect_err("identical Anthropic tool headers must not keep delivery alive");
+        assert!(matches!(
+            error,
+            StreamCollectError::SemanticProgressTimeout {
+                made_semantic_progress: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_cancel_wins_the_semantic_progress_deadline_race() {
+        let cancel = CancellationToken::new();
+        let source = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let collect = collect_llm_stream_with_semantic_progress_deadline(
+            source,
+            "test-model",
+            Instant::now(),
+            LlmCancel::Token(&cancel),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
+            None,
+        );
+        let trigger = async {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        };
+        let (result, ()) = tokio::join!(collect, trigger);
+        assert!(matches!(result, Err(StreamCollectError::Cancelled { .. })));
     }
 
     async fn sample_reqwest_stream_error() -> reqwest::Error {
@@ -6067,6 +10661,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
+        for (updates, expected_fresh, expected_cached) in [
+            (
+                vec![
+                    json!({"prompt_tokens": 100}),
+                    json!({"completion_tokens": 5}),
+                ],
+                100,
+                0,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens": 100}),
+                    json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"completion_tokens": 5, "prompt_tokens": null}),
+                ],
+                70,
+                30,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens": 100}),
+                    json!({"completion_tokens": 5}),
+                ],
+                70,
+                30,
+            ),
+        ] {
+            let mut frames = vec![Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            ))];
+            for usage in updates {
+                frames.push(Ok(Bytes::from(format!(
+                    "data: {}\n\n",
+                    json!({"usage": usage})
+                ))));
+            }
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "gpt-test",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("partial usage chunks must converge");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
+            assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
+            assert_eq!(terminal.usage.output_tokens, 5);
+            assert_eq!(
+                terminal.usage_status,
+                astra_services::InferenceUsageStatus::ProviderExact
+            );
+            assert!(result.usage_presence.fresh_input_tokens);
+            assert!(result.usage_presence.output_tokens);
+            assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
+            assert!(!result.usage_presence.cache_creation_tokens);
+        }
+    }
+
+    #[test]
+    fn missing_finish_reason_at_wire_cap_is_lifecycle_length_only() {
+        let mut result = LlmCallResult {
+            usage: Map::from_iter([(String::from("output_tokens"), json!(8192))]),
+            ..Default::default()
+        };
+        assert!(reconcile_missing_output_cap_finish_reason(
+            &mut result,
+            Some(8192)
+        ));
+        assert_eq!(result.finish_reason, None, "raw provider fact is preserved");
+        assert_eq!(result.lifecycle_finish_reason(), Some("length"));
+
+        let mut below = LlmCallResult {
+            usage: Map::from_iter([(String::from("output_tokens"), json!(8191))]),
+            ..Default::default()
+        };
+        assert!(!reconcile_missing_output_cap_finish_reason(
+            &mut below,
+            Some(8192)
+        ));
+        assert_eq!(below.lifecycle_finish_reason(), None);
+
+        let mut explicit_stop = LlmCallResult {
+            finish_reason: Some("stop".to_string()),
+            usage: Map::from_iter([(String::from("output_tokens"), json!(8192))]),
+            ..Default::default()
+        };
+        assert!(!reconcile_missing_output_cap_finish_reason(
+            &mut explicit_stop,
+            Some(8192)
+        ));
+        assert_eq!(explicit_stop.lifecycle_finish_reason(), Some("stop"));
+    }
+
+    #[test]
+    fn wire_output_limit_uses_provider_specific_request_shape() {
+        assert_eq!(
+            provider_request_output_limit(&json!({
+                "max_completion_tokens": 8192
+            })),
+            Some(8192)
+        );
+        assert_eq!(
+            provider_request_output_limit(&json!({
+                "max_tokens": 4096
+            })),
+            Some(4096)
+        );
+        assert_eq!(
+            provider_request_output_limit(&json!({
+                "max_completion_tokens": 0,
+                "max_tokens": 4096
+            })),
+            Some(4096)
+        );
+        assert_eq!(
+            provider_request_output_limit(&json!({
+                "inferenceConfig": {"maxTokens": 2048}
+            })),
+            Some(2048)
+        );
+        assert_eq!(
+            provider_request_output_limit(&json!({"stream": true})),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_invokes_incremental_callback() {
         let d1 = json!({"choices":[{"delta":{"content":"Hi ","reasoning_content":"R"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"there"}}]});
@@ -6094,6 +10822,94 @@ mod tests {
                 LlmStreamUpdate::Text("there".to_string()),
             ],
             "callback should receive deltas before aggregate completion",
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
+        let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d3 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo ok</｜｜DSML｜｜parameter>"}}]});
+        let d4 = json!({"choices":[{"delta":{"content":"</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls><｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d5 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>\nvisible after"}}]});
+        let body = format!(
+            "data: {d1}\n\ndata: {d2}\n\ndata: {d3}\n\ndata: {d4}\n\ndata: {d5}\n\ndata: [DONE]\n\n"
+        );
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+
+        let result = collect_llm_stream(
+            stream,
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect");
+
+        assert_eq!(result.full_text, "visible before\n\nvisible after");
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(result.tool_calls[1]["function"]["name"], "bash");
+        let published = updates
+            .iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) | LlmStreamUpdate::Reasoning(text) => Some(text),
+                LlmStreamUpdate::ToolCall { .. } => None,
+            })
+            .cloned()
+            .collect::<String>();
+        assert_eq!(published, "visible before\n\nvisible after");
+        assert!(!published.contains("DSML"));
+        assert!(!published.contains("echo ok"));
+        assert!(!published.contains("pwd"));
+    }
+
+    #[tokio::test]
+    async fn degraded_tool_recovery_obeys_the_exact_wire_authority() {
+        let event = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\"><｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke><｜｜DSML｜｜invoke name=\"memory\"><｜｜DSML｜｜parameter name=\"action\" string=\"true\">recall</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"query\" string=\"true\">x</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"}}]});
+        let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+
+        let allowed = HashSet::from(["bash".to_string()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body.clone()))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+        )
+        .await
+        .expect("collect with a partial exact surface");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+
+        let no_tools = HashSet::new();
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(body))]),
+            "deepseek-test",
+            Instant::now(),
+            llm_total_budget(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &no_tools,
+            None,
+        )
+        .await
+        .expect("collect with an explicitly empty surface");
+        assert!(result.tool_calls.is_empty());
+        assert!(
+            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&result.full_text)
+                .is_some(),
+            "a private no-tool caller must receive typed-invalid content for its bounded repair path"
         );
     }
 
@@ -6182,6 +10998,36 @@ mod tests {
         .expect("collect");
         assert_eq!(res.tool_calls.len(), 1);
         assert_eq!(res.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_preserves_parallel_semantic_tool_batch() {
+        let c1 = json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call-read","function":{"name":"read_file","arguments":"{ \"path\": \"README.md\" }"}},
+            {"index":1,"id":"call-bash","function":{"name":"bash","arguments":"{\n \"command\": \"pwd\"\n}"}}
+        ]}}]});
+        let body = format!("data: {c1}\n\ndata: [DONE]\n\n");
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+
+        let res = collect_llm_stream(
+            stream,
+            "m",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("collect");
+
+        assert_eq!(res.tool_calls.len(), 2);
+        assert_eq!(res.tool_calls[0]["type"], "function");
+        assert_eq!(res.tool_calls[1]["type"], "function");
+        for call in &res.tool_calls {
+            astra_turn_core::tool::args::shape::canonicalize_tool_call_for_execution(call)
+                .expect("provider calls must leave transport in canonical execution shape");
+        }
     }
 
     #[test]
@@ -6360,6 +11206,410 @@ mod tests {
         finished: Mutex<Vec<(u32, astra_services::InferenceTerminalStatus)>>,
     }
 
+    #[test]
+    fn provider_work_budget_preserves_a_bounded_terminalization_slice() {
+        assert_eq!(
+            llm_mandatory_settlement_reserve(std::time::Duration::from_secs(300)),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            llm_mandatory_settlement_reserve(std::time::Duration::from_millis(30)),
+            std::time::Duration::from_millis(3)
+        );
+        let terminal = provider_attempt_terminal_from_error(&astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "provider work deadline",
+        ));
+        assert_eq!(
+            terminal.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown,
+            "a delivered inference deadline must not be projected as a known provider failure"
+        );
+        assert_eq!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn early_provider_completion_keeps_unused_budget_for_terminalization() {
+        let inner = PendingAttemptObserver::default();
+        let logical_budget = std::time::Duration::from_secs(8);
+        let reserve = llm_mandatory_settlement_reserve(logical_budget);
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: logical_budget - reserve,
+            logical_budget,
+            cancel: LlmCancel::None,
+        };
+        assert!(
+            observer.remaining_settlement() > reserve,
+            "reserving the final slice must not discard unused provider time"
+        );
+    }
+
+    #[test]
+    fn provider_deadline_transport_race_keeps_deadline_as_primary_diagnostic() {
+        let partial = LlmCallResult {
+            full_text: "partial answer".to_string(),
+            ..LlmCallResult::default()
+        };
+        let error = provider_deadline_from_transport(
+            "consuming the provider stream",
+            "error decoding response body: Bearer sk-secret",
+            std::time::Duration::from_secs(300),
+            Some(&partial),
+        );
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+        assert_eq!(
+            error.message,
+            "LLM provider work deadline reached while consuming the provider stream"
+        );
+        assert!(!error.message.contains("transport"));
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("deadline race should retain structured diagnostics"),
+        )
+        .expect("deadline diagnostics should be valid JSON");
+        assert_eq!(details["partial_full_text"], "partial answer");
+        assert_eq!(
+            details["underlying_error"],
+            "error decoding response body: Bearer [REDACTED]"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_terminalization_obeys_remaining_logical_deadline() {
+        let inner = PendingAttemptObserver::default();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now() - std::time::Duration::from_millis(980),
+            work_budget: std::time::Duration::from_secs(1),
+            logical_budget: std::time::Duration::from_secs(1),
+            cancel: LlmCancel::None,
+        };
+        let terminal = provider_attempt_terminal_from_error(&astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "provider work deadline",
+        ));
+        let started = Instant::now();
+        let error = observer
+            .finish_attempt(0, &terminal)
+            .await
+            .expect_err("pending persistence must stop at the logical deadline");
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("ledger timeout must carry typed phase evidence"),
+        )
+        .expect("ledger timeout details");
+        assert_eq!(details["deadline"]["scope"], "inference_ledger");
+        assert_eq!(
+            details["deadline"]["phase"],
+            "provider_attempt_terminalization"
+        );
+        assert_eq!(details["provider_terminal"]["status"], "delivery_unknown");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "terminalization must not restart the logical budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminalization_cancellation_does_not_consume_unused_budget() {
+        let inner = PendingFinishAttemptObserver;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: std::time::Duration::from_secs(7),
+            logical_budget: std::time::Duration::from_secs(8),
+            cancel: LlmCancel::Token(&cancel),
+        };
+        let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
+        let error = observer.finish_attempt(0, &terminal).await.unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn durable_admission_stall_is_not_misclassified_as_provider_inference() {
+        let inner = PendingAttemptObserver::default();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: std::time::Duration::from_millis(20),
+            logical_budget: std::time::Duration::from_millis(25),
+            cancel: LlmCancel::None,
+        };
+        let prepared = PreparedProviderRequest::from_json(
+            &json!({"model":"m","messages":[],"stream":true}),
+            LlmProviderProtocol::OpenAiCompatible,
+        )
+        .expect("provider request identity");
+
+        let error = observer
+            .begin_attempt(prepared.identity())
+            .await
+            .expect_err("pending durable admission must be bounded");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("ledger timeout must carry typed phase evidence"),
+        )
+        .expect("ledger timeout details");
+        assert_eq!(details["deadline"]["scope"], "inference_ledger");
+        assert_eq!(details["deadline"]["phase"], "provider_attempt_admission");
+        assert_eq!(inner.began.load(Ordering::SeqCst), 1);
+        assert!(!inner.dispatched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn durable_admission_timeout_never_starts_provider_transport() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_500_once))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = PendingAttemptObserver::default();
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("durable admission timeout must stop before provider transport");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(!observer.dispatched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn successful_provider_result_survives_slow_terminalization_as_partial_evidence() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"completed answer\"}}]}\n\n",
+                        "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )))
+                    .unwrap()
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = PendingFinishAttemptObserver;
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .expect_err("a successful response cannot outrun its durable terminal fact");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("completed provider evidence must be retained"),
+        )
+        .expect("completed provider evidence details");
+        assert_eq!(details["deadline"]["scope"], "inference_ledger");
+        assert_eq!(details["provider_terminal"]["status"], "succeeded");
+        assert_eq!(details["partial_full_text"], "completed answer");
+    }
+
+    #[tokio::test]
+    async fn partial_provider_failure_survives_slow_terminalization_as_evidence() {
+        let inner = PendingFinishAttemptObserver;
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now(),
+            work_budget: std::time::Duration::from_millis(20),
+            logical_budget: std::time::Duration::from_millis(25),
+            cancel: LlmCancel::None,
+        };
+        let provider_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::StreamTransport,
+            "provider stream stopped after partial delivery",
+        );
+        let partial = LlmCallResult {
+            response_id: Some("response-partial".to_string()),
+            full_text: "partial answer".to_string(),
+            reasoning: "partial reasoning".to_string(),
+            usage: json!({"input_tokens": 7, "output_tokens": 3})
+                .as_object()
+                .expect("usage object")
+                .clone(),
+            model_used: "m".to_string(),
+            ..LlmCallResult::default()
+        };
+
+        let error = finish_observed_provider_delivery_unknown_with_partial(
+            Some(&observer),
+            Some(0),
+            &provider_error,
+            &partial,
+        )
+        .await
+        .expect_err("slow durable terminalization must remain a ledger error");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("ledger error must retain provider evidence"),
+        )
+        .expect("provider evidence details");
+        assert_eq!(details["deadline"]["scope"], "inference_ledger");
+        assert_eq!(details["provider_terminal"]["status"], "delivery_unknown");
+        assert_eq!(details["partial_full_text"], "partial answer");
+        assert_eq!(details["partial_reasoning"], "partial reasoning");
+        assert_eq!(details["provider_response_id"], "response-partial");
+        assert_eq!(details["usage"]["input_tokens"], 7);
+        assert_eq!(details["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn provider_response_identity_alone_is_retained_as_partial_evidence() {
+        let result = LlmCallResult {
+            response_id: Some("response-only".to_string()),
+            ..LlmCallResult::default()
+        };
+
+        let details: Value = serde_json::from_str(
+            llm_result_details_json(&result)
+                .as_deref()
+                .expect("a provider response id is independently meaningful evidence"),
+        )
+        .expect("provider response evidence details");
+
+        assert_eq!(details["provider_response_id"], "response-only");
+    }
+
+    #[derive(Default)]
+    struct PendingAttemptObserver {
+        began: AtomicU32,
+        dispatched: AtomicBool,
+    }
+
+    struct PendingFinishAttemptObserver;
+
+    #[async_trait]
+    impl ProviderAttemptObserver for PendingAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            _wire: &ProviderWireRequestIdentity,
+        ) -> Result<u32, astra_core::ClassifiedError> {
+            self.began.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+
+        async fn finish_attempt(
+            &self,
+            _attempt_index: u32,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            std::future::pending().await
+        }
+
+        fn note_dispatch_started(&self, _attempt_index: u32) {
+            self.dispatched.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAttemptObserver for PendingFinishAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            _wire: &ProviderWireRequestIdentity,
+        ) -> Result<u32, astra_core::ClassifiedError> {
+            Ok(0)
+        }
+
+        async fn finish_attempt(
+            &self,
+            _attempt_index: u32,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            std::future::pending().await
+        }
+    }
+
     #[async_trait]
     impl ProviderAttemptObserver for RecordingAttemptObserver {
         async fn begin_attempt(
@@ -6459,6 +11709,543 @@ mod tests {
     }
 
     #[test]
+    fn ordered_message_fingerprint_preserves_system_conversation_interleaving() {
+        let first = json!({
+            "messages": [
+                {"role": "system", "content": "s1"},
+                {"role": "user", "content": "u1"},
+                {"role": "system", "content": "s2"},
+                {"role": "assistant", "content": "a1"}
+            ]
+        });
+        let second = json!({
+            "messages": [
+                {"role": "system", "content": "s1"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "system", "content": "s2"}
+            ]
+        });
+        let first =
+            PreparedProviderRequest::from_json(&first, LlmProviderProtocol::OpenAiCompatible)
+                .expect("first request");
+        let second =
+            PreparedProviderRequest::from_json(&second, LlmProviderProtocol::OpenAiCompatible)
+                .expect("second request");
+
+        assert_eq!(
+            first.identity().fingerprints.system_sequence_sha256,
+            second.identity().fingerprints.system_sequence_sha256
+        );
+        assert_eq!(
+            first.identity().fingerprints.conversation_sequence_sha256,
+            second.identity().fingerprints.conversation_sequence_sha256
+        );
+        assert_ne!(
+            first.identity().fingerprints.message_sequence_sha256,
+            second.identity().fingerprints.message_sequence_sha256,
+            "provider-final diagnostics must detect changes in role interleaving"
+        );
+    }
+
+    #[test]
+    fn provider_final_cache_key_system_identity_obeys_typed_capability() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+
+        let tail = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let tail_body = |stable: &str, volatile: &str| {
+            json!({
+                "messages": [
+                    {"role": "system", "content": stable},
+                    {"role": "user", "content": "task"},
+                    {"role": "system", "content": volatile}
+                ]
+            })
+        };
+        let first = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("stable", "round 1"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("first tail request");
+        let second = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("stable", "round 2"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("second tail request");
+        assert_ne!(
+            first.identity().fingerprints.system_sequence_sha256,
+            second.identity().fingerprints.system_sequence_sha256,
+            "the raw provider receipt must retain the changed suffix"
+        );
+        assert_eq!(
+            first.identity().fingerprints.cache_key_system_sha256,
+            second.identity().fingerprints.cache_key_system_sha256,
+            "a typed TailSuffix excludes system messages after conversation"
+        );
+        let changed_leading = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("changed", "round 2"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("changed leading request");
+        assert_ne!(
+            second.identity().fingerprints.cache_key_system_sha256,
+            changed_leading
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+
+        let marker = CacheCapability {
+            protocol: CacheProtocol::MarkerExplicit,
+            volatile_placement: VolatilePlacement::MarkerIsolated,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let marker_body = |stable: &str, volatile: &str| {
+            json!({
+                "system": [
+                    {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": volatile}
+                ],
+                "messages": [{"role": "user", "content": "task"}]
+            })
+        };
+        let marker_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("stable", "round 1"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("first marker request");
+        let marker_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("stable", "round 2"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("second marker request");
+        assert_eq!(
+            marker_first.identity().fingerprints.cache_key_system_sha256,
+            marker_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+        let marker_changed = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("changed", "round 2"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("changed marker request");
+        assert_ne!(
+            marker_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256,
+            marker_changed
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+
+        let marker_tool_body = |stable_description: &str, dynamic_name: &str| {
+            json!({
+                "system": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [{"role": "user", "content": "task"}],
+                "tools": [
+                    {
+                        "name": "stable_tool",
+                        "description": stable_description,
+                        "input_schema": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "name": dynamic_name,
+                        "input_schema": {"type": "object"}
+                    }
+                ]
+            })
+        };
+        let marker_tools_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("stable", "dynamic_one"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("first marker tool request");
+        let marker_tools_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("stable", "dynamic_two"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("second marker tool request");
+        assert_ne!(
+            marker_tools_first
+                .identity()
+                .fingerprints
+                .tool_schema_sequence_sha256,
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .tool_schema_sequence_sha256
+        );
+        assert_eq!(
+            marker_tools_first
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            "typed marker capability excludes dynamic tools after the last marker"
+        );
+        let marker_tools_changed = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("changed", "dynamic_two"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("changed marker tool request");
+        assert_ne!(
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            marker_tools_changed
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256
+        );
+
+        let append = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let append_first_body = json!({
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "task"},
+                {"role": "user", "content": "runtime authority 1"}
+            ]
+        });
+        let append_second_body = json!({
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "task"},
+                {"role": "user", "content": "runtime authority 1"},
+                {"role": "assistant", "content": "progress"},
+                {"role": "user", "content": "runtime authority 2"}
+            ]
+        });
+        let prefix = append_first_body["messages"]
+            .as_array()
+            .expect("first messages");
+        let extension = append_second_body["messages"]
+            .as_array()
+            .expect("second messages");
+        assert!(
+            extension.starts_with(prefix),
+            "append-only provider body must preserve the exact ordered message prefix"
+        );
+        let append_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &append_first_body,
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(append),
+        )
+        .expect("first append request");
+        let append_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &append_second_body,
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(append),
+        )
+        .expect("second append request");
+        assert_eq!(
+            append_first.identity().fingerprints.cache_key_system_sha256,
+            append_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_receipt_matches_sanitized_http_body() {
+        #[derive(Clone, Default)]
+        struct CapturedBody(Arc<Mutex<Vec<Value>>>);
+
+        async fn handler(
+            State(captured): State<CapturedBody>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            captured.0.lock().expect("capture lock").push(body);
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(format!("data: {payload}\n\ndata: [DONE]\n\n")))
+                .expect("response")
+        }
+
+        fn has_internal_schema_extension(value: &Value) -> bool {
+            match value {
+                Value::Array(values) => values.iter().any(has_internal_schema_extension),
+                Value::Object(values) => {
+                    values.keys().any(|key| key.starts_with("x-astra-"))
+                        || values.values().any(has_internal_schema_extension)
+                }
+                _ => false,
+            }
+        }
+
+        reset_rate_limit_cooldown_for_tests();
+        let captured = CapturedBody::default();
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(captured.clone());
+        let base = spawn_local_http_server(app).await;
+        let observer = RecordingAttemptObserver::default();
+        let messages = [json!({"role": "user", "content": "run"})];
+        let tools_first = [json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "x-astra-discovery-summary": "internal-one"
+                }
+            }
+        })];
+        let mut tools_second = tools_first.clone();
+        tools_second[0]["function"]["parameters"]["x-astra-discovery-summary"] =
+            Value::String("internal-two".to_string());
+        let cache_capability = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+
+        for tools in [&tools_first[..], &tools_second[..]] {
+            call_llm_and_collect_with_stream_callback(
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools,
+                    cache_capability: Some(cache_capability),
+                    route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                },
+                LlmCancel::None,
+                None,
+                Some(&observer),
+            )
+            .await
+            .expect("provider call");
+        }
+
+        let bodies = captured.0.lock().expect("capture lock").clone();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !has_internal_schema_extension(body))
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "internal schema metadata must not alter the provider-final body"
+        );
+        let wires = observer.wires.lock().expect("wire receipts");
+        assert_eq!(wires.len(), 2);
+        for (wire, body) in wires.iter().zip(&bodies) {
+            let actual = PreparedProviderRequest::from_json_with_cache_capability(
+                body,
+                LlmProviderProtocol::OpenAiCompatible,
+                Some(cache_capability),
+            )
+            .expect("captured provider request");
+            assert_eq!(wire.fingerprints, actual.identity().fingerprints);
+        }
+        assert_eq!(wires[0].fingerprints, wires[1].fingerprints);
+
+        let mut detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+        for (index, wire) in wires.iter().enumerate() {
+            let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
+                "planned-only",
+                &[],
+                "m",
+                0,
+            );
+            snapshot.attach_provider_final_fingerprint(
+                wire.fingerprints
+                    .cache_diagnostic_fingerprint()
+                    .expect("resolved cache capability"),
+            );
+            let (accepted, event) = detector.record_provider_attempt_for_source(
+                "main",
+                &astra_turn_core::cache_diagnostics::ProviderAttemptCacheIdentity {
+                    request_id: format!("request-{index}"),
+                    attempt: u32::try_from(index).expect("bounded test attempt"),
+                },
+                snapshot,
+                Some(if index == 0 { 0 } else { 1 }),
+            );
+            assert!(accepted);
+            assert!(
+                event.is_none(),
+                "sanitized-equal final receipts cannot produce a structural cache break"
+            );
+        }
+        assert_eq!(detector.stats.total_turns, 2);
+        assert_eq!(detector.stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn required_tool_choice_uses_each_provider_native_wire_shape() {
+        let messages = [json!({"role": "user", "content": "run"})];
+        let tools = [json!({
+            "type": "function",
+            "function": {
+                "name": "start_work",
+                "description": "Establish durable Work",
+                "parameters": {"type": "object"}
+            }
+        })];
+
+        let cases = [
+            (
+                "openai",
+                json!({"type": "function", "function": {"name": "start_work"}}),
+            ),
+            ("anthropic", json!({"type": "tool", "name": "start_work"})),
+            ("bedrock", json!({"tool": {"name": "start_work"}})),
+        ];
+
+        for (provider, expected_choice) in cases {
+            let mut body = build_provider_request_body(
+                &messages,
+                &tools,
+                "test-model",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            apply_required_tool_choice(&mut body, provider, &tools, "start_work")
+                .expect("advertised required tool should be forceable");
+            let choice = if provider == "bedrock" {
+                &body["toolConfig"]["toolChoice"]
+            } else {
+                &body["tool_choice"]
+            };
+            assert_eq!(choice, &expected_choice, "provider={provider}");
+        }
+    }
+
+    #[test]
+    fn required_tool_choice_rejects_a_tool_outside_the_wire_surface() {
+        let mut body = json!({"tool_choice": "auto"});
+        let error = apply_required_tool_choice(&mut body, "openai", &[], "start_work")
+            .expect_err("a force must never name a tool the provider did not receive");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn no_tool_choice_preserves_supported_provider_tool_schemas() {
+        let messages = [json!({"role": "user", "content": "summarize"})];
+        let tools = [json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object"}
+            }
+        })];
+
+        for (provider, expected_choice) in [
+            ("openai", json!("none")),
+            ("anthropic", json!({"type": "none"})),
+        ] {
+            let mut body = build_provider_request_body(
+                &messages,
+                &tools,
+                "test-model",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            apply_no_tool_choice(&mut body, provider, &tools)
+                .expect("provider supports a typed no-tool choice");
+
+            assert_eq!(body["tool_choice"], expected_choice, "provider={provider}");
+            assert!(
+                body.get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty()),
+                "provider={provider} must retain the stable schema prefix"
+            );
+            assert!(provider_supports_no_tool_choice(provider));
+        }
+    }
+
+    #[test]
+    fn openai_no_tool_choice_remains_explicit_with_empty_schema_surface() {
+        let mut body = json!({"model": "test-model", "messages": []});
+        apply_no_tool_choice(&mut body, "openai", &[])
+            .expect("empty repair surface still supports an explicit no-tool choice");
+
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn no_tool_choice_fails_closed_for_nonempty_bedrock_surface() {
+        let tools = [json!({
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}}
+        })];
+        let mut body = json!({"toolConfig": {"tools": []}});
+        let error = apply_no_tool_choice(&mut body, "bedrock", &tools)
+            .expect_err("Bedrock has no no-tool choice that preserves schemas");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(!provider_supports_no_tool_choice("bedrock"));
+    }
+
+    #[test]
     fn uncertain_stream_terminal_preserves_observed_usage_and_response_identity() {
         let partial = LlmCallResult {
             response_id: Some("provider-response-7".to_string()),
@@ -6487,12 +12274,14 @@ mod tests {
             Some("provider-response-7")
         );
         assert_eq!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderPartial
+        );
+        assert_eq!(
             terminal.usage,
             astra_services::InferenceUsage {
-                input_tokens: 200,
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(200, 800, 100),
                 output_tokens: 50,
-                cache_read_tokens: 800,
-                cache_creation_tokens: 100,
             }
         );
     }
@@ -7890,6 +13679,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -7950,6 +13741,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -7996,6 +13789,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
                         api_key: "k",
@@ -8039,6 +13834,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8079,6 +13876,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8122,6 +13921,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
                         api_key: "k",
@@ -8195,6 +13996,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8225,6 +14028,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8276,6 +14081,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8341,6 +14148,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8388,6 +14197,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8439,6 +14250,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8484,6 +14297,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8528,6 +14343,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
                     api_key: "k",
@@ -8703,12 +14520,24 @@ mod tests {
             "schema_version": 1,
             "objective_relation": "continue"
         });
-        runtime[astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD] = json!({
+        runtime[astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD] = json!({
             "schema_version": 1,
             "turn_chain_id": "chain-current"
         });
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD] = json!("run-1");
+        runtime[astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD] = json!({
+            "version": 1,
+            "call_id": "call-1",
+            "run_id": "run-1",
+            "byte_len": 4,
+            "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        runtime["_round_index"] = json!(7);
+        runtime["_tool_name"] = json!("read_file");
+        runtime["_timestamp"] = json!(1234);
+        runtime["_synthetic"] = json!(true);
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", None);
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -8723,16 +14552,186 @@ mod tests {
         );
         assert!(
             out[0]
-                .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+                .get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
+        for key in [
+            "_round_index",
+            "_tool_name",
+            "_timestamp",
+            "_synthetic",
+            astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
+            astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
+        ] {
+            assert!(out[0].get(key).is_none(), "internal key leaked: {key}");
+        }
+    }
+
+    #[test]
+    fn direct_request_projects_tool_guidance_without_other_runtime_markers() {
+        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
+        let messages = vec![
+            json!({"role":"system", "content":"system"}),
+            json!({"role":"assistant", "content":"", "tool_calls":[{
+                "id":"call-probe", "type":"function", "function":{"name":"probe","arguments":"{}"}
+            }]}),
+            json!({"role":"tool", "tool_call_id":"call-probe", "content":"null",
+                TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"]}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "probe-model",
+            "openai",
+            None,
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let tool = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        assert!(
+            tool["content"]
+                .as_str()
+                .unwrap()
+                .contains("inspect the existing operation")
+        );
+        assert!(tool.get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
+        assert_eq!(messages[2]["content"], "null");
+    }
+
+    #[test]
+    fn tool_guidance_projection_preserves_canonical_suffix_and_does_not_accumulate() {
+        use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
+        let canonical = vec![json!({
+            "role":"tool", "tool_call_id":"call-probe", "content":r#"{"executed":false}"#,
+            TOOL_RESULT_ADVISORIES_FIELD:["inspect the existing operation"],
+        })];
+        let projected = project_provider_message_metadata(&canonical);
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &projected, &canonical
+        ));
+        assert_eq!(project_provider_message_metadata(&projected), projected);
+        assert_eq!(canonical[0]["content"], r#"{"executed":false}"#);
+        assert!(
+            projected[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("inspect the existing operation")
+        );
+        assert!(projected[0].get(TOOL_RESULT_ADVISORIES_FIELD).is_none());
+        let mut missing_guidance = projected.clone();
+        missing_guidance[0]["content"] = canonical[0]["content"].clone();
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &missing_guidance,
+            &canonical
+        ));
+    }
+
+    #[test]
+    fn provider_projection_preserves_nested_tool_result_data() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": {
+                "quoted": {
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD: "run-1",
+                    astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD:
+                        {"unexpected": "nested"},
+                }
+            }
+        })];
+
+        let out = consolidate_system_messages_for_provider(&messages, "openai", None);
+        let quoted = &out[0]["content"]["quoted"];
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD)
+                .is_some_and(|value| value == "run-1")
+        );
+        assert!(
+            quoted
+                .get(astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD)
+                .is_some_and(|value| value == &json!({"unexpected": "nested"}))
+        );
+    }
+
+    #[test]
+    fn canonical_suffix_check_compares_the_exact_provider_metadata_projection() {
+        let mut assistant = json!({"role": "assistant", "content": "tool result accepted"});
+        assert!(astra_turn_types::mark_turn_message(
+            &mut assistant,
+            "turn-chain-1"
+        ));
+        let work_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "establish the admitted work graph",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let budget_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "finish before the admitted deadline",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let canonical_appended = vec![assistant, work_frame, budget_frame.clone()];
+
+        // The main assembly was already consolidated, while the dispatch-time
+        // budget frame was appended afterward. This mixed representation is
+        // the real provider-attempt boundary that exposed the regression.
+        let mut provider_messages = vec![
+            json!({"role": "system", "content": "stable policy"}),
+            json!({"role": "user", "content": "do the task"}),
+        ];
+        provider_messages.extend(project_provider_message_metadata(
+            &canonical_appended[..canonical_appended.len() - 1],
+        ));
+        provider_messages.push(budget_frame);
+
+        assert!(!provider_messages.ends_with(&canonical_appended));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &canonical_appended,
+        ));
+
+        let mut changed_content = canonical_appended.clone();
+        changed_content[0]["content"] = Value::String("different response".to_string());
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &changed_content,
+        ));
+
+        let mut reordered = canonical_appended.clone();
+        reordered.swap(0, 1);
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &reordered,
+        ));
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages[..2],
+            &canonical_appended,
+        ));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &[],
+        ));
     }
 
     #[test]
     fn consolidate_for_openai_projects_runtime_data_at_current_turn_boundary() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -8743,7 +14742,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -8766,9 +14765,45 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_strict_history_openai_keeps_runtime_data_as_user() {
+    fn provider_system_consolidation_is_idempotent_with_runtime_tail() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "completion settlement",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::FinalWorkSynthesis,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .expect("runtime message");
+        let input = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "answer"}),
+            runtime,
+        ];
+
+        let once = consolidate_system_messages_for_provider(&input, "openai", None);
+        let twice = consolidate_system_messages_for_provider(&once, "openai", None);
+
+        assert_eq!(once, twice);
+        assert!(once[0]["content"].as_str().unwrap().contains("stable"));
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("<astra-runtime-context>\ncompletion settlement\n</astra-runtime-context>")
+        );
+    }
+
+    #[test]
+    fn declared_strict_history_shape_moves_required_runtime_to_initial_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -8779,7 +14814,14 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
+        let capability = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(capability));
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -8798,9 +14840,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_capability_does_not_elevate_runtime_data_to_system() {
+    fn explicit_current_user_only_capability_overrides_provider_baseline() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -8813,15 +14857,12 @@ mod tests {
         let explicit = CacheCapability {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
-        let out = consolidate_system_messages_for_provider(
-            &msgs,
-            "openai",
-            "metadata-defined-alias",
-            Some(explicit),
-        );
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(explicit));
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -8843,6 +14884,8 @@ mod tests {
     fn consolidate_for_anthropic_preserves_runtime_system_boundary_for_body_builder() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -8853,8 +14896,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out =
-            consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "anthropic", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -9903,6 +15945,84 @@ mod tests {
     }
 
     #[test]
+    fn hidden_reasoning_parser_buffers_split_open_and_close_tags() {
+        let mut state = HiddenReasoningStreamState::default();
+        assert!(split_hidden_reasoning_chunks("<th", &mut state).is_empty());
+        assert_eq!(
+            split_hidden_reasoning_chunks("inking>reason", &mut state),
+            vec![("reason".to_string(), true)]
+        );
+        assert_eq!(
+            split_hidden_reasoning_chunks("</thinking", &mut state),
+            Vec::<(String, bool)>::new()
+        );
+        assert_eq!(
+            split_hidden_reasoning_chunks(">answer", &mut state),
+            vec![("answer".to_string(), false)]
+        );
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn hidden_reasoning_parser_requires_matching_close_tag() {
+        let mut state = HiddenReasoningStreamState::default();
+        assert!(
+            split_hidden_reasoning_chunks("<thinking>plan", &mut state)
+                .into_iter()
+                .all(|(_, reasoning)| reasoning)
+        );
+        let mismatched = split_hidden_reasoning_chunks("</think>still private", &mut state);
+        assert!(mismatched.iter().all(|(_, reasoning)| *reasoning));
+        assert!(state.in_reasoning);
+        let closed = split_hidden_reasoning_chunks("</thinking>answer", &mut state);
+        assert_eq!(
+            closed,
+            vec![("answer".to_string(), false)],
+            "only the opener's exact close tag may end hidden reasoning"
+        );
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn hidden_reasoning_parser_handles_utf8_before_partial_close_delimiter() {
+        let mut state = HiddenReasoningStreamState::default();
+        assert_eq!(
+            split_hidden_reasoning_chunks("<thinking>你x</think", &mut state),
+            vec![("你x".to_string(), true)]
+        );
+        assert_eq!(
+            split_hidden_reasoning_chunks("ing>answer", &mut state),
+            vec![("answer".to_string(), false)]
+        );
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn hidden_reasoning_compatibility_tags_never_swallow_started_visible_text() {
+        let mut state = HiddenReasoningStreamState::default();
+        assert_eq!(
+            split_hidden_reasoning_chunks("visible <think>", &mut state),
+            vec![("visible <think>".to_string(), false)]
+        );
+        assert_eq!(
+            split_hidden_reasoning_chunks("literal</think>", &mut state),
+            vec![("literal</think>".to_string(), false)]
+        );
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn analysis_like_markup_remains_visible_without_catalog_framing() {
+        let mut state = HiddenReasoningStreamState::default();
+        let chunks =
+            split_hidden_reasoning_chunks("<analysis>user-visible XML</analysis>", &mut state);
+        assert_eq!(
+            chunks,
+            vec![("<analysis>user-visible XML</analysis>".to_string(), false)]
+        );
+    }
+
+    #[test]
     fn split_think_chunks_multi_phase_reasoning() {
         // Some models emit multiple <think> phases in one stream.
         // Verify in_think correctly toggles false→true→false→true→false.
@@ -9951,6 +16071,14 @@ mod tests {
         let (reasoning, cleaned) = extract_think_tags(text).unwrap();
         assert_eq!(reasoning, "The user says \"hi\". Should be concise.");
         assert_eq!(cleaned, "Hello! How can I help you today?");
+    }
+
+    #[test]
+    fn extract_thinking_tags_is_provider_neutral() {
+        let (reasoning, cleaned) =
+            extract_think_tags("<thinking>internal plan</thinking>visible answer").unwrap();
+        assert_eq!(reasoning, "internal plan");
+        assert_eq!(cleaned, "visible answer");
     }
 
     #[test]
@@ -10607,6 +16735,8 @@ mod tests {
     fn build_anthropic_body_keeps_runtime_system_tail_out_of_cached_prefix_block() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let messages = vec![
@@ -10621,12 +16751,7 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages = consolidate_system_messages_for_provider(
-            &messages,
-            "anthropic",
-            "claude-sonnet-4",
-            None,
-        );
+        let messages = consolidate_system_messages_for_provider(&messages, "anthropic", None);
         let body = build_provider_request_body(
             &messages,
             &[],
@@ -10697,7 +16822,7 @@ mod tests {
     #[test]
     fn openai_single_system_contract_covers_moi_context_and_runtime_policy() {
         use crate::turn::wire_assembly::{
-            required_runtime_preamble_message, runtime_instruction_message,
+            runtime_system_context_message, runtime_volatile_preamble_message,
         };
         let user = json!({"role":"user", "content":"Translate only this sentence."});
         for history in [
@@ -10711,14 +16836,21 @@ mod tests {
                 vec![json!({"role":"system", "content":"Astra and MOI stable policy"})];
             messages.extend(history);
             messages.push(
-                required_runtime_preamble_message(
+                runtime_system_context_message(
                     "Current date: 2026-09-09\nAttachments: report.pdf",
+                    true,
                 )
                 .unwrap(),
             );
-            messages.push(runtime_instruction_message("Read-only plan mode.").unwrap());
+            messages.push(runtime_volatile_preamble_message(&astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                kind: "plan_mode_marker".into(),
+                delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                payload: json!("Read-only plan mode."),
+                round_index: 0,
+                authority_lifetime: None,
+            }).unwrap());
             messages.push(
-                required_runtime_preamble_message("Current goal: Translate only this sentence.")
+                runtime_system_context_message("Current goal: Translate only this sentence.", true)
                     .unwrap(),
             );
             messages.push(user.clone());
@@ -11697,9 +17829,53 @@ mod tests {
         assert!(stop_slot["properties"].get("slots").is_none());
     }
 
-    // --- Regression: max_completion_tokens bump respects user's ceiling ---
     #[test]
-    fn max_completion_tokens_honors_user_when_above_floor() {
+    fn build_provider_request_body_output_limits_follow_provider_contract() {
+        for (provider, model, limit, forbidden) in [
+            ("openai", "o3", "max_completion_tokens", "max_tokens"),
+            ("openai", "gpt-4o", "max_completion_tokens", "max_tokens"),
+            (
+                "openai-compatible",
+                "custom-model",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            for streaming in [false, true] {
+                let body = build_provider_request_body(
+                    &[json!({"role": "user", "content": "hi"})],
+                    &[],
+                    model,
+                    provider,
+                    Some(4096),
+                    None,
+                    streaming,
+                    &ThinkingConfig::Off,
+                );
+                assert_eq!(
+                    body[limit], 4096,
+                    "{provider}, streaming={streaming}: {body}"
+                );
+                assert!(body.get(forbidden).is_none(), "{provider}: {body}");
+            }
+        }
+    }
+
+    // --- Regression: output-limit bump respects user's ceiling ---
+    #[test]
+    fn deepseek_max_tokens_honors_user_when_above_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
         let thinking = ThinkingConfig::Enabled {
@@ -11716,14 +17892,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(128_000),
             "user ceiling above floor must not be bumped"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_bumps_when_user_below_floor() {
+    fn deepseek_max_tokens_bumps_when_user_below_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
         let thinking = ThinkingConfig::Enabled {
@@ -11740,14 +17917,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(40_192),
             "configured max below thinking_budget+headroom must be bumped to floor"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_unchanged_when_thinking_off() {
+    fn deepseek_max_tokens_unchanged_when_thinking_off() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         let body = build_provider_request_body(
             &[json!({"role": "user", "content": "hi"})],
@@ -11760,10 +17938,11 @@ mod tests {
             &ThinkingConfig::Off,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(4_096),
             "thinking=off must never bump user's max"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
@@ -11800,9 +17979,339 @@ mod tests {
     }
 
     #[test]
+    fn request_body_overrides_cannot_replace_runtime_owned_wire_shape() {
+        for field in [
+            "model",
+            "messages",
+            "system",
+            "tools",
+            "toolConfig",
+            "tool_choice",
+            "stream",
+            "stream_options",
+        ] {
+            let overrides = Map::from_iter([(field.to_string(), json!([]))]);
+            let error = validate_request_body_overrides(Some(&overrides))
+                .expect_err("runtime-owned request fields must fail closed");
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            assert!(error.message.contains(field));
+        }
+        assert!(
+            validate_request_body_overrides(Some(&Map::from_iter([(
+                "context_management".to_string(),
+                json!({"edits": []}),
+            )])))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn append_only_capability_matches_final_transport_message_boundaries() {
+        let frame = |seconds: u64| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                &format!("remaining_seconds={seconds}"),
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .expect("valid typed frame")
+            .expect("non-empty frame")
+        };
+        let first = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "do the work"}),
+            frame(10),
+        ];
+        // A transport failure has no assistant response. Retrying appends a
+        // fresher typed authority directly after the prior user-role frame.
+        let mut second = first.clone();
+        second.push(frame(8));
+
+        let openai_first = build_provider_request_body(
+            &first,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let openai_second = build_provider_request_body(
+            &second,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let first_wire = openai_first["messages"].as_array().unwrap();
+        let second_wire = openai_second["messages"].as_array().unwrap();
+        assert!(second_wire.starts_with(first_wire));
+        assert!(second_wire.iter().all(|message| {
+            message
+                .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        }));
+        assert!(llm_provider_protocol("openai").preserves_appended_message_boundaries());
+
+        for provider in ["anthropic", "bedrock"] {
+            let first_body = build_provider_request_body(
+                &first,
+                &[],
+                "deployment",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            let second_body = build_provider_request_body(
+                &second,
+                &[],
+                "deployment",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            let first_wire = first_body["messages"].as_array().unwrap();
+            let second_wire = second_body["messages"].as_array().unwrap();
+            assert!(
+                !second_wire.starts_with(first_wire),
+                "{provider} merges consecutive roles and must not advertise append-only boundaries"
+            );
+            assert!(!llm_provider_protocol(provider).preserves_appended_message_boundaries());
+        }
+    }
+
+    #[test]
+    fn append_only_reasoning_replay_never_rewrites_the_sent_prefix() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+        };
+        let first = vec![
+            json!({"role": "user", "content": "work"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "first decision",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "ok"}),
+        ];
+        let mut second = first.clone();
+        second.push(json!({
+            "role": "assistant",
+            "content": "continue",
+            "reasoning_content": "second decision",
+        }));
+
+        let assemble = |history: Vec<Value>| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.current_round_index = 1;
+            state.messages = history.clone();
+            crate::turn::llm::context::assemble_wire_messages(
+                crate::turn::llm::context::LlmWireAssemblyInput {
+                    artifact_recovery_route:
+                        crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                    system_messages: vec![json!({"role": "system", "content": "stable"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: history,
+                    state: &mut state,
+                    compaction_boundary_hit: false,
+                    thinking: &thinking,
+                    session_id: "session",
+                    provider: "openai",
+                    model_name: "deployment",
+                    cache_capability: Some(capability),
+                    cache_cfg: &crate::turn::prompt_cache::PromptCacheConfig::default(),
+                },
+            )
+            .expect("production wire assembly")
+        };
+        let first = assemble(first);
+        let second = assemble(second);
+
+        let first_body = build_provider_request_body_with_cache_capability(
+            &first,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &thinking,
+            None,
+            Some(capability),
+        );
+        let second_body = build_provider_request_body_with_cache_capability(
+            &second,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &thinking,
+            None,
+            Some(capability),
+        );
+
+        let first_wire = first_body["messages"].as_array().unwrap();
+        let second_wire = second_body["messages"].as_array().unwrap();
+        assert!(
+            second_wire.starts_with(first_wire),
+            "a later reasoning response must only extend the immutable provider prefix"
+        );
+        assert_eq!(
+            second_wire[2]["reasoning_content"], "first decision",
+            "historical reasoning must not be rewritten after a later response"
+        );
+    }
+
+    #[test]
+    fn append_only_cache_shape_does_not_invent_reasoning_wire_fields() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let messages = vec![
+            json!({"role": "user", "content": "work"}),
+            json!({"role": "assistant", "content": "prior answer"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let body = build_provider_request_body_with_cache_capability(
+            &messages,
+            &[],
+            "strict-openai-compatible-deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            None,
+            Some(capability),
+        );
+
+        assert!(
+            body["messages"].as_array().unwrap().iter().all(|message| {
+                message.get("role").and_then(Value::as_str) != Some("assistant")
+                    || message.get("reasoning_content").is_none()
+            }),
+            "cache placement alone must not add a non-standard assistant field"
+        );
+    }
+
+    #[test]
+    fn append_only_history_rejects_suffix_dependent_tool_repairs() {
+        let incomplete = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "shell", "arguments": "{}"},
+            }],
+        })];
+        let error = validate_append_only_openai_history(&incomplete)
+            .expect_err("an incomplete group would require a synthetic suffix rewrite");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+
+        let late_name_recovery = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "", "arguments": "{}"},
+                }],
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-2",
+                "name": "shell",
+                "content": "ok",
+            }),
+        ];
+        let error = validate_append_only_openai_history(&late_name_recovery)
+            .expect_err("a later result name must never rewrite a sent assistant message");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+    }
+
+    #[test]
+    fn explicit_temperature_is_authoritative_after_route_overrides() {
+        let overrides = Map::from_iter([("temperature".to_string(), json!(0.7))]);
+        for provider in ["openai", "anthropic"] {
+            let body = build_provider_request_body_with_overrides(
+                &[json!({"role": "user", "content": "classify"})],
+                &[],
+                "classifier",
+                provider,
+                Some(256),
+                Some(0.0),
+                false,
+                &ThinkingConfig::Off,
+                Some(&overrides),
+            );
+            assert_eq!(body["temperature"], json!(0.0), "provider={provider}");
+        }
+    }
+
+    #[test]
+    fn thinking_protocol_removes_temperature_reintroduced_by_route_overrides() {
+        let overrides = Map::from_iter([("temperature".to_string(), json!(0.7))]);
+        let thinking = ThinkingConfig::Adaptive {
+            effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+        };
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role": "user", "content": "classify"})],
+            &[],
+            "reasoning-classifier",
+            "openai",
+            Some(256),
+            None,
+            false,
+            &thinking,
+            Some(&overrides),
+        );
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
     fn request_body_overrides_merge_nested_bedrock_inference_config() {
         let overrides = Map::from_iter([
-            ("inferenceConfig".to_string(), json!({"topP": 0.9})),
+            (
+                "inferenceConfig".to_string(),
+                json!({"topP": 0.9, "temperature": 0.7}),
+            ),
             (
                 "additionalModelRequestFields".to_string(),
                 json!({"reasoningMode": "compact"}),

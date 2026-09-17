@@ -13,7 +13,7 @@
 # Then build the image (build context = repo root):
 #   docker buildx build --platform linux/amd64 -f Dockerfile.prebuilt -t astra-server:TAG .
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
@@ -21,21 +21,19 @@ ARG IMAGE_BRANCH=unknown
 
 LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.description="Astra API server and CLI runtime image (prebuilt)" \
+      org.opencontainers.image.url="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.source="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.documentation="https://github.com/matrixorigin/Astra#readme" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="MatrixOrigin" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
 
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-# Proxy vars are intentionally kept as build-time ARGs only (used by apt/curl
-# during build). They are NOT promoted to ENV to avoid baking proxy URLs —
-# which may contain credentials — into the image layers. Inject proxy settings
-# at runtime via docker run -e or Kubernetes pod env if needed.
+# Docker exposes standard proxy build arguments to RUN instructions without an
+# ARG declaration. Keeping them out of ARG and ENV prevents proxy credentials
+# from being persisted in image metadata or the final runtime configuration.
 
 WORKDIR /app
 
@@ -49,16 +47,19 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
-    groupadd -r appgroup; \
-    useradd --system --create-home --home-dir /home/appuser \
-            --shell /usr/sbin/nologin -g appgroup appuser
+    groupadd --gid 10001 appgroup; \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/appuser \
+            --shell /usr/sbin/nologin appuser
 
 COPY target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
 COPY target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
+COPY LICENSE /usr/share/licenses/astra/LICENSE
 
-RUN chown root:appgroup /app && chmod 0770 /app
+RUN chown root:appgroup /app && \
+    chmod 0770 /app && \
+    chmod 0444 /usr/share/licenses/astra/LICENSE
 
-USER appuser
+USER 10001:10001
 
 EXPOSE 17001
 ENV HOME=/home/appuser

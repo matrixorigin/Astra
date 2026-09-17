@@ -14,10 +14,13 @@ pub(crate) use checkpoint::{
 };
 
 pub(crate) use workspace::{
-    session_workspace_git_root, sync_context_trace_to_workspace, sync_plan_fields_to_workspace,
+    context_trace_signal_from_trace, sync_context_trace_to_workspace,
     sync_session_state_to_workspace, workspace_metadata_from_live_state,
     workspace_metadata_from_live_state_after_read_failure,
 };
+
+#[cfg(test)]
+pub(crate) use workspace::session_workspace_git_root;
 
 #[cfg(test)]
 mod tests {
@@ -35,7 +38,7 @@ mod tests {
     use super::{
         build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
         persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
-        session_workspace_git_root, sync_context_trace_to_workspace, sync_plan_fields_to_workspace,
+        session_workspace_git_root, sync_context_trace_to_workspace,
         sync_recovery_snapshot_after_history_edit, sync_session_state_to_workspace,
         workspace_metadata_from_live_state,
     };
@@ -225,21 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_plan_fields_copies_repl_into_workspace() {
-        let mut state = SessionState::default();
-        state.executing_plan_goal = Some("goal-x".to_string());
-        state.plan_execution_rounds = 9;
-        state.plan_execution_corrections = vec!["note".to_string()];
-
-        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-plan", "m");
-        sync_plan_fields_to_workspace(&state, &mut ws);
-
-        assert_eq!(ws.plan_goal.as_deref(), Some("goal-x"));
-        assert_eq!(ws.plan_execution_rounds, 9);
-        assert_eq!(ws.plan_corrections, vec!["note".to_string()]);
-    }
-
-    #[test]
     fn sync_context_trace_copies_latest_trace_into_workspace() {
         let mut state = SessionState::default();
         let mut obs = astra_runtime::observability::ObservabilitySession::new_simple("sid-trace");
@@ -254,6 +242,7 @@ mod tests {
                     ..Default::default()
                 },
                 memory: astra_turn_core::context_assembly_trace::MemoryRetrievalTrace {
+                    outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
                     query: "resume trace persistence".into(),
                     memories_selected: vec![astra_turn_core::context_assembly_trace::MemorySelection {
                         memory_id: "m1".into(),
@@ -442,9 +431,15 @@ mod tests {
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
-            activated_deferred_tool_names: vec!["github".to_string()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: "sha256:previous".to_string(),
+                descriptor: None,
+            }],
             memory_context: Some(astra_pipeline::step_protocol::MemoryContext {
                 retrieved_memory_ids: vec!["m-1".to_string()],
                 domain_hints: vec!["rust".to_string()],
@@ -462,6 +457,7 @@ mod tests {
             pipeline_state: Some(serde_json::json!({"ema": 0.9})),
             compaction_state: Some(serde_json::json!({"attempt_count": 2})),
             config_version_id: Some("cfg-old".to_string()),
+            workspace_observation_quarantine: None,
         };
 
         let session_state = session_state_compact_from_heavy_checkpoint(&previous_heavy);
@@ -475,9 +471,13 @@ mod tests {
             panic!("expected Heavy checkpoint");
         };
         assert_eq!(
-            heavy.activated_deferred_tool_names,
-            vec!["github"],
-            "manual recovery must retain prompt-visible deferred schemas independently of interruption state"
+            heavy.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: "sha256:previous".to_string(),
+                descriptor: None,
+            }],
+            "manual recovery must retain typed deferred evidence independently of interruption state"
         );
         assert_eq!(heavy.budget_remaining_tokens, 0);
         assert_eq!(heavy.budget_remaining_rounds, 0);
@@ -524,9 +524,11 @@ mod tests {
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -537,6 +539,7 @@ mod tests {
             pipeline_state: Some(serde_json::json!({"ema": 0.9})),
             compaction_state: Some(serde_json::json!({"attempt_count": 2})),
             config_version_id: Some("cfg-old".to_string()),
+            workspace_observation_quarantine: None,
         };
 
         let checkpoint = build_manual_heavy_step_checkpoint(
@@ -809,9 +812,15 @@ mod tests {
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["read_file".to_string()],
-            activated_deferred_tool_names: vec!["github".to_string()],
+            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
+                name: "github".to_string(),
+                schema_digest: "sha256:checkpoint".to_string(),
+                descriptor: None,
+            }],
             memory_context: None,
             delegation_id: Some("deleg-1".to_string()),
             delegation_pattern: Some("fan_out".to_string()),
@@ -832,15 +841,13 @@ mod tests {
             pipeline_state: None,
             compaction_state: Some(serde_json::json!({"attempt_count": 4})),
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
 
         let compact = session_state_compact_from_heavy_checkpoint(&heavy);
 
         assert_eq!(compact.recent_tools, vec!["read_file".to_string()]);
-        assert_eq!(
-            compact.activated_deferred_tool_names,
-            vec!["github".to_string()]
-        );
+        assert_eq!(compact.deferred_tool_activations.len(), 1);
         assert!(compact.blocked_tools.is_empty());
         assert!(compact.approval_overrides.is_none());
         assert!(compact.compaction_tracker.is_none());
@@ -868,9 +875,11 @@ mod tests {
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: Some("deleg-1".to_string()),
             delegation_pattern: None,
@@ -881,6 +890,7 @@ mod tests {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
 
         let compact = session_state_compact_from_heavy_checkpoint(&heavy);
@@ -919,7 +929,10 @@ mod tests {
         assert_eq!(ws.last_scenario_change_turn, Some(11));
         assert_eq!(ws.last_token_budget_direction, -1);
         assert_eq!(ws.last_token_budget_change_turn, Some(7));
-        assert!(ws.tuned_config_json.is_some());
+        assert!(
+            ws.tuned_config_json.is_none(),
+            "workspace config remains authoritative during recovery projection"
+        );
     }
 
     #[serial_test::serial]
@@ -957,9 +970,11 @@ mod tests {
             messages: vec![serde_json::json!({"role": "user", "content": "stale"})],
             budget_remaining_tokens: 1234,
             budget_remaining_rounds: 9,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["write_file".to_string()],
             recent_tools: vec!["read_file".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -970,6 +985,7 @@ mod tests {
             pipeline_state: Some(serde_json::json!({"ema": 0.9})),
             compaction_state: Some(serde_json::json!({"attempt_count": 2})),
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             TEST_USER_ID,

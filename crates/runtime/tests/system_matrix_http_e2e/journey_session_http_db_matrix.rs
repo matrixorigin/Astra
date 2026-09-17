@@ -63,5 +63,5 @@ pub async fn run_session_http_matches_agent_sessions_row() {
     assert_eq!(title_sql, new_title);
     assert_eq!(db_uid, ctx.user_id);
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

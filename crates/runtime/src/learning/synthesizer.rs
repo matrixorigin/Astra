@@ -126,13 +126,13 @@ mod tests {
             tool_name: Some("grep".into()),
             detail: "timed out after 30s on node_modules".into(),
             recent_user_messages: vec!["search for the config parser".into()],
-            project_hint: Some("astra-engine".into()),
+            project_hint: Some("Astra".into()),
         };
         let prompt = build_synthesis_user_prompt(&ctx);
         assert!(prompt.contains("Signal: tool_failure"));
         assert!(prompt.contains("Tool: grep"));
         assert!(prompt.contains("timed out after 30s"));
-        assert!(prompt.contains("astra-engine"));
+        assert!(prompt.contains("Astra"));
         assert!(prompt.contains("search for the config parser"));
         assert!(prompt.contains("Lesson (one sentence):"));
     }
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn synthesis_quality_gate_accepts_specific_lessons() {
         assert!(is_synthesized_lesson_acceptable(
-            "In astra-engine (280k files), use `rg --glob '!node_modules'` instead of `grep -r`"
+            "In Astra (280k files), use `rg --glob '!node_modules'` instead of `grep -r`"
         ));
         assert!(is_synthesized_lesson_acceptable(
             "This repo uses pnpm workspaces; always pass --filter to avoid cross-package installs"

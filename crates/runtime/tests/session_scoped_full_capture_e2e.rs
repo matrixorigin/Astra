@@ -224,6 +224,7 @@ impl RunLifecycleService for RecordingLifecycle {
         _user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunStatusRecord {
+            artifact_publication: None,
             root_run_id: Some(run_id.clone()),
             run_id,
             session_id: "capture-session".to_string(),
@@ -235,6 +236,7 @@ impl RunLifecycleService for RecordingLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 
@@ -305,9 +307,13 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
     let (mut ws, _) = connect_async(&url).await.expect("WS connect");
 
     ws.send(Message::Text(
-        json!({"type": "auth", "token": "Bearer test-capture-token"})
-            .to_string()
-            .into(),
+        json!({
+            "type": "auth",
+            "token": "Bearer test-capture-token",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+        })
+        .to_string()
+        .into(),
     ))
     .await
     .expect("auth send should succeed");

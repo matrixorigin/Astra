@@ -19,8 +19,6 @@ pub enum InterruptionKind {
     EmptyCompletion,
     /// Per-turn input token limit exceeded.
     TokenBudgetExceeded,
-    /// Cumulative token budget across turns exceeded.
-    CumulativeBudgetExceeded,
     /// LLM API returned 429 / TPM / RPM limit.
     RateLimited,
     /// Rate-limit cooldown rejected further requests.
@@ -41,6 +39,9 @@ pub enum InterruptionKind {
     StreamTransport,
     /// Streaming response went idle and retry/recovery did not complete.
     StreamIdle,
+    /// One physical provider inference exceeded its deadline. The run itself
+    /// may still have capacity for a bounded convergence step.
+    ProviderDeadline,
     /// Harness verifier returned Fatal → session blocked.
     HarnessBlocked,
     /// Harness debug breakpoint hit → session paused.
@@ -62,7 +63,6 @@ impl InterruptionKind {
             Self::BudgetExhausted => "budget_exhausted",
             Self::EmptyCompletion => "empty_completion",
             Self::TokenBudgetExceeded => "token_budget_exceeded",
-            Self::CumulativeBudgetExceeded => "cumulative_budget_exceeded",
             Self::RateLimited => "rate_limited",
             Self::CooldownRejected => "cooldown_rejected",
             Self::UserCancelled => "user_cancelled",
@@ -73,6 +73,7 @@ impl InterruptionKind {
             Self::ServerOverload => "server_overload",
             Self::StreamTransport => "stream_transport",
             Self::StreamIdle => "stream_idle",
+            Self::ProviderDeadline => "provider_deadline",
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
             Self::Interrupted => "interrupted",
@@ -87,7 +88,6 @@ impl InterruptionKind {
             "budget_exhausted" => Some(Self::BudgetExhausted),
             "empty_completion" => Some(Self::EmptyCompletion),
             "token_budget_exceeded" => Some(Self::TokenBudgetExceeded),
-            "cumulative_budget_exceeded" => Some(Self::CumulativeBudgetExceeded),
             "rate_limited" => Some(Self::RateLimited),
             "cooldown_rejected" => Some(Self::CooldownRejected),
             "user_cancelled" => Some(Self::UserCancelled),
@@ -98,6 +98,7 @@ impl InterruptionKind {
             "server_overload" => Some(Self::ServerOverload),
             "stream_transport" => Some(Self::StreamTransport),
             "stream_idle" => Some(Self::StreamIdle),
+            "provider_deadline" => Some(Self::ProviderDeadline),
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
             "interrupted" => Some(Self::Interrupted),
@@ -114,7 +115,6 @@ impl InterruptionKind {
             Self::BudgetExhausted
             | Self::EmptyCompletion
             | Self::TokenBudgetExceeded
-            | Self::CumulativeBudgetExceeded
             | Self::RateLimited
             | Self::CooldownRejected
             | Self::UserCancelled
@@ -122,6 +122,7 @@ impl InterruptionKind {
             | Self::ServerOverload
             | Self::StreamTransport
             | Self::StreamIdle
+            | Self::ProviderDeadline
             | Self::Interrupted
             | Self::ExecutionIncomplete
             | Self::ExecutorDropped => true,
@@ -142,9 +143,7 @@ impl InterruptionKind {
     pub fn user_status(self) -> &'static str {
         match self {
             Self::EmptyCompletion => "Needs final answer",
-            Self::BudgetExhausted | Self::TokenBudgetExceeded | Self::CumulativeBudgetExceeded => {
-                "Needs continuation"
-            }
+            Self::BudgetExhausted | Self::TokenBudgetExceeded => "Needs continuation",
             Self::RateLimited | Self::CooldownRejected | Self::ServerOverload => "Retry later",
             Self::UserCancelled => "Cancelled",
             Self::ContextOverflow => "Needs compaction",
@@ -152,6 +151,7 @@ impl InterruptionKind {
             Self::CriticalVerdict | Self::HarnessBlocked => "Needs attention",
             Self::ApprovalRejected => "Approval declined",
             Self::StreamTransport | Self::StreamIdle => "Connection interrupted",
+            Self::ProviderDeadline => "Model response deadline reached",
             Self::HarnessPaused => "Paused",
             Self::Interrupted | Self::ExecutionIncomplete | Self::ExecutorDropped => {
                 "Needs continuation"
@@ -167,7 +167,6 @@ impl InterruptionKind {
             Self::BudgetExhausted => "The run reached its turn budget.",
             Self::EmptyCompletion => "The run stopped before producing a final answer.",
             Self::TokenBudgetExceeded => "The current request exceeded its input token budget.",
-            Self::CumulativeBudgetExceeded => "The run reached its cumulative token budget.",
             Self::RateLimited => "The model provider is temporarily rate limited.",
             Self::CooldownRejected => "The model provider is still in its retry cooldown.",
             Self::UserCancelled => "The run was cancelled.",
@@ -178,6 +177,7 @@ impl InterruptionKind {
             Self::ServerOverload => "The model provider is temporarily overloaded.",
             Self::StreamTransport => "The model response connection failed.",
             Self::StreamIdle => "The model response stopped making progress.",
+            Self::ProviderDeadline => "The current model response exceeded its inference deadline.",
             Self::HarnessBlocked => "The execution harness blocked the run.",
             Self::HarnessPaused => "The execution harness paused the run.",
             Self::Interrupted => "The run stopped before it completed.",
@@ -403,7 +403,6 @@ impl InterruptionRecord {
         let cause_note = match kind {
             InterruptionKind::BudgetExhausted
             | InterruptionKind::TokenBudgetExceeded
-            | InterruptionKind::CumulativeBudgetExceeded
             | InterruptionKind::HarnessPaused => summary
                 .stall_signal
                 .as_deref()
@@ -661,7 +660,7 @@ pub fn build_resume_guidance_with_context(
     } else {
         // Kind-specific advice
         match inp.kind {
-            "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
+            "budget_exhausted" | "token_budget_exceeded" => {
                 g.push_str(
                     "  Action: Prioritize completing the most important remaining work first. \
                   Avoid exploratory tool calls — focus on delivering a result.\n",
@@ -795,6 +794,10 @@ pub fn interruption_from_error_kind(
             InterruptionKind::StreamIdle,
             ResumeAction::ContinueImmediately,
         )),
+        ErrorKind::ProviderDeadline => Some((
+            InterruptionKind::ProviderDeadline,
+            ResumeAction::ContinueImmediately,
+        )),
         _ => None,
     }
 }
@@ -811,7 +814,6 @@ mod tests {
             InterruptionKind::BudgetExhausted,
             InterruptionKind::EmptyCompletion,
             InterruptionKind::TokenBudgetExceeded,
-            InterruptionKind::CumulativeBudgetExceeded,
             InterruptionKind::RateLimited,
             InterruptionKind::CooldownRejected,
             InterruptionKind::UserCancelled,
@@ -822,6 +824,7 @@ mod tests {
             InterruptionKind::ServerOverload,
             InterruptionKind::StreamTransport,
             InterruptionKind::StreamIdle,
+            InterruptionKind::ProviderDeadline,
             InterruptionKind::HarnessBlocked,
             InterruptionKind::HarnessPaused,
             InterruptionKind::Interrupted,
@@ -851,7 +854,6 @@ mod tests {
         assert!(InterruptionKind::StreamIdle.is_resumable());
         assert!(InterruptionKind::CriticalVerdict.is_resumable());
         assert!(InterruptionKind::ApprovalRejected.is_resumable());
-        assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
         assert!(InterruptionKind::ServerOverload.is_resumable());
         assert!(InterruptionKind::CooldownRejected.is_resumable());
         assert!(InterruptionKind::Interrupted.is_resumable());
@@ -1273,16 +1275,6 @@ mod tests {
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("approval_rejected"));
         assert!(guidance.contains("read-only"));
-
-        // cumulative_budget_exceeded
-        let irj = serde_json::json!({
-            "kind": "cumulative_budget_exceeded", "resumable": true, "has_checkpoint": true,
-            "tool_calls_completed": 20, "turns_completed": 10, "remaining_turns": 0,
-            "user_message": ""
-        });
-        let guidance = build_resume_guidance(&irj).unwrap();
-        assert!(guidance.contains("cumulative_budget_exceeded"));
-        assert!(guidance.contains("Prioritize"));
     }
 
     #[test]

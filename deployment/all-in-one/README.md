@@ -2,29 +2,108 @@
 
 This compose stack starts MatrixOne, Memoria, and `astra-server`.
 
+The guided setup requires a current Docker Compose v2 with `--dry-run` support,
+OpenSSL, and Python 3.9 or newer.
+
 The development flow is separate and still uses `docker-compose.deps.yml` through the repo-root `make dev-deps-*` targets, followed by `make dev-api-start` for a locally built API server.
 
 ## Start With Make
 
-From the repo root:
+Install the released client binaries if they are not already available:
 
 ```bash
-make stack-env
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`make stack-env` creates `deployment/all-in-one/.env` and generates local
-stack secrets. Fill the required embedding configuration:
+Use this directory from the matching `vX.Y.Z` source checkout. The installer
+prints the exact clone command after resolving the latest stable release. The
+checked-in `.env.example` pins Astra, MatrixOne, and Memoria to the release's
+tested compatibility set; advancing only one image makes the deployment an
+intentional compatibility test rather than the supported default.
+The canonical Compose file requires those image variables and fails before a
+pull if `.env` is missing, rather than silently substituting mutable images.
 
-- `MEMORIA_EMBEDDING_API_KEY`
-- `MEMORIA_EMBEDDING_BASE_URL`
-
-Then start the stack:
+From the repository root, the recommended first-run path is guided:
 
 ```bash
-make stack-up
+make stack-setup
 ```
 
-`make stack-up` fails before starting containers if any required value is empty.
+The guided path first identifies the installation the user intends to change
+and prints its current status. When an older or differently configured stack
+exists, it offers an explicit update, a separate installation with independent
+containers, data, logs, and ports, or a no-change exit. It then tests the
+embedding endpoint, credentials, model, and dimension, reuses or repairs
+services, and verifies a memory round trip. Administrator/model setup is
+optional: the recommended path launches `astra admin setup`, while skipping it
+finishes the stack and prints a resumable command. The summary distinguishes
+`Stack ready` from `Chat ready`. Startup failures offer repair/retry,
+stop-and-preserve, and leave-for-inspection choices. API keys are hidden and
+the local `.env` is owner-only. The API address is saved before the optional
+step, and the completion screen leads with the `astra` TUI. The released
+clients and full guided path support Linux, macOS, and Windows through WSL.
+Native Windows and Git Bash are not release targets yet.
+Separate installations use sibling descriptors (for example
+`.env.astra-0-2-1.env`) so the original `.env` remains usable. Pass the selected
+file explicitly when managing one: `make stack-status STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env`.
+Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
+proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
+
+```bash
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
+```
+
+Mock embeddings replace only semantic-memory embedding calls. They do not
+provide the agent's LLM; `astra admin setup` still needs a hosted model or an
+OpenAI-compatible local endpoint. Because model inference is server-side, a
+model running on the Docker host is reached as
+`http://host.docker.internal:<port>`, not `localhost`.
+
+When configuring the file by hand, set `MEMORIA_EMBEDDING_BASE_URL` and, when
+required, `MEMORIA_EMBEDDING_API_KEY`. For no-credential evaluation, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank.
+
+`stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
+validates Compose, starts every service, waits for readiness, and verifies an
+exact memory write/retrieval round trip. For lower-level automation, run
+`make stack-env`, `make stack-up`, and `make stack-verify` explicitly.
+
+`make stack-up` fails before starting containers if a required secret is empty,
+or if a non-mock embedding provider is missing its base URL. An API key is
+optional for unauthenticated local endpoints. If a service does not become
+healthy, the command prints container status and recent logs while leaving the
+partial stack available for inspection. Fix the first reported error and rerun
+the command, or use `make stack-down` to stop it.
+
+For semantic memory, supply a real OpenAI-compatible embedding endpoint; its
+API key is optional when the endpoint is unauthenticated:
+
+```bash
+MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
+MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
+make stack-start
+```
+
+Process-level credentials are passed to Compose but are not written to `.env`.
+Put embedding settings in that file only when persistence is intentional;
+otherwise export them again on subsequent `make stack-up` invocations.
+`make stack-verify` repeats dependency verification. It reports separately whether Astra account memory access was tested. Operators must select two non-admin accounts; `/auth/me` does not expose roles, so the script cannot certify that they are non-admin. See [user memory verification](../../docs/quickstart/docker.md#verify-ordinary-user-memory).
+
+If a service does not become healthy, startup prints container status and
+recent logs while leaving the partial stack available for inspection. Fix the
+first reported error and rerun `make stack-up`, or use `make stack-down`.
+
+The complete operator loop is:
+
+```bash
+make stack-status
+make stack-verify
+make stack-logs SERVICE=api
+make stack-down
+```
 
 ## Runtime Startup Profiles
 
@@ -53,6 +132,10 @@ astra login
 ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 ```
 
+With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.2 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
+
+Existing `.env` files are not overwritten by `stack-env`. If upgrading from the older Memoria pin, back up the database, update `MEMORIA_IMAGE` to the compatible digest in `.env.example`, set `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, and run `make stack-up` to recreate affected containers. `make stack-setup` offers this change with confirmation and preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401).
+
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the
 selected Astra CLI profile token by default; set `ASTRA_TOKEN` if you need to
@@ -67,18 +150,30 @@ make test-runtime-profiles
 
 ## Admin Accounts
 
-Use `astra admin register` to create an administrator account. On a fresh MatrixOne
-data volume this performs the initial admin bootstrap. After an admin exists,
-`astra admin register` must be run while logged in as an existing admin.
+Use `astra admin setup` for the guided administrator and model flow. It asks
+whether the MatrixOne data volume is fresh, then bootstraps or signs in before
+configuring the model. `astra admin register` and `astra admin model ...`
+remain available for automation.
 
 ```bash
-./target/debug/astra admin --api-url http://127.0.0.1:17001 register \
+astra admin --api-url http://127.0.0.1:17001 register \
   --username admin \
   --email admin@example.com \
   --password '<password>'
 
-./target/debug/astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
 ```
+
+Connect the installed User Runner to expose one explicit local workspace:
+
+```bash
+astra-edge --server-url http://127.0.0.1:17001 \
+  --workspace-dir /path/to/workspace
+```
+
+When building from source, use `./target/debug/astra` (or
+`./target/release/astra`) in place of `astra` above. `--api-url` can be omitted
+whenever the server listens on the default `http://127.0.0.1:17001`.
 
 `astra admin register` stores the returned admin credentials locally. It prints
 `registered and logged in (initial admin)` for the first admin, and
@@ -98,10 +193,13 @@ Required for startup:
 
 - `ASTRA_JWT_SECRET`
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
-- `ASTRA_BRIDGE_SECRET`
+- `ASTRA_RUNTIME_ROOT_SECRET`
 - `MEMORIA_MASTER_KEY`
-- `MEMORIA_EMBEDDING_API_KEY`
+
+For non-mock embeddings, also configure:
+
 - `MEMORIA_EMBEDDING_BASE_URL`
+- `MEMORIA_EMBEDDING_API_KEY` when the endpoint requires authentication
 
 The Makefile generates the four secret values for local single-host bring-up.
 When using plain `docker compose`, generate and fill them yourself instead of
@@ -118,16 +216,23 @@ Fill the required configuration in `.env`:
 
 - `ASTRA_JWT_SECRET`
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
-- `ASTRA_BRIDGE_SECRET`
+- `ASTRA_RUNTIME_ROOT_SECRET`
 - `MEMORIA_MASTER_KEY`
-- `MEMORIA_EMBEDDING_API_KEY`
-- `MEMORIA_EMBEDDING_BASE_URL`
+
+For semantic memory, configure `MEMORIA_EMBEDDING_BASE_URL` and add
+`MEMORIA_EMBEDDING_API_KEY` when the endpoint requires it. Alternatively, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` for deterministic local evaluation and leave
+both values blank.
 
 Then start the stack:
 
 ```bash
-docker compose up -d
+env UID="$(id -u)" GID="$(id -g)" \
+  docker compose up -d --wait --wait-timeout 180
 ```
+
+Passing the host UID and GID keeps bind-mounted service logs owned by the user
+running Compose. The Make targets do this automatically.
 
 ## Services
 
@@ -138,27 +243,40 @@ docker compose up -d
 | `matrixone`       | `26001`   | MatrixOne MySQL-compatible endpoint |
 | `matrixone` debug | `26060`   | MatrixOne debug/health endpoint     |
 
-`ASTRA_API_PORT` in `.env` controls the host-facing published port. The API container itself listens on `17001`.
+All published ports bind to `127.0.0.1` by default. `ASTRA_BIND_ADDRESS` changes
+that interface, and `ASTRA_API_PORT` controls the host-facing API port. The API
+container itself listens on `17001`. Do not use a non-loopback bind with the
+development credentials on an untrusted network.
+
+`ASTRA_STACK_NAME` identifies the Compose installation. A separate installation
+must also use a separate `MATRIXONE_DATA_VOLUME`, log paths, and host ports;
+changing only the name is unsafe. Prefer `make stack-setup`, which keeps these
+values together and refuses to attach a volume owned by another installation.
 
 ## Images
 
-By default the stack pulls:
+The release's `.env.example` selects one tested compatibility set:
 
-- `matrixorigin/astra:latest`
-- `matrixorigin/memoria:latest`
-- `matrixorigin/matrixone:latest`
+- an exact semantic Astra version;
+- immutable multi-platform Memoria and MatrixOne manifest digests.
 
-Override image tags in `.env`, for example:
+`make stack-env` copies those selections into the local `.env`. Upgrading the
+source checkout does not silently rewrite an existing deployment. To perform a
+deliberate compatibility test, change one or more image references in `.env`,
+for example:
 
 ```dotenv
-ASTRA_IMAGE=matrixorigin/astra:0.1.0
-MEMORIA_IMAGE=matrixorigin/memoria:latest
+ASTRA_IMAGE=matrixorigin/astra:0.2.0-rc.1
 ```
+
+Avoid floating `latest` tags in reproducibility reports and production-like
+evaluations; always record the exact image references used.
 
 ## Operations
 
 ```bash
 make stack-status
+make stack-verify
 make stack-logs SERVICE=api
 
 docker compose ps

@@ -38,7 +38,7 @@ fn items() -> Vec<SlashItem> {
     ]
 }
 
-/// Items exercising usage ranking and curated discoverability.
+/// Items exercising usage ranking and featured-command ordering.
 fn ranked_items() -> Vec<SlashItem> {
     vec![
         SlashItem::simple("/help", "show help"),
@@ -52,6 +52,7 @@ fn ranked_items() -> Vec<SlashItem> {
         SlashItem {
             name: "/debug".into(),
             description: "advanced diagnostics".into(),
+            usage_boost: 1_000,
             primary: false,
             ..Default::default()
         },
@@ -280,7 +281,7 @@ fn enter_on_empty_matches_does_not_submit_garbage() {
 
 // ─── Task-6 end-to-end coverage ───────────────────────────────────
 //
-// These tests lock in curated discovery, usage ranking, navigation, and
+// These tests lock in complete discovery, usage ranking, navigation, and
 // fuzzy/prefix ordering through the real BottomPane input path.
 
 fn fresh_with_ranked_items() -> BottomPane {
@@ -290,13 +291,21 @@ fn fresh_with_ranked_items() -> BottomPane {
 }
 
 #[test]
-fn bare_menu_hides_search_only_actions() {
+fn bare_menu_includes_search_only_actions() {
     let mut bp = fresh_with_ranked_items();
     type_string(&mut bp, "/");
     assert!(bp.slash_menu_is_open());
     let names = bp.slash_menu_names();
     assert!(names.iter().any(|n| n == "/help"));
-    assert!(!names.iter().any(|n| n == "/debug"), "{names:?}");
+    assert!(
+        names.iter().any(|n| n == "/debug"),
+        "bare slash should expose every TUI command; got {names:?}"
+    );
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("/history"),
+        "featured commands and usage ranking should still determine the top result"
+    );
 }
 
 #[test]

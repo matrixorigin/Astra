@@ -2,7 +2,9 @@
 name = "astra-tools"
 version.workspace = true
 edition.workspace = true
-description = "Extracted tool execution library for astra-engine. Shared by CLI and server."
+license.workspace = true
+publish = false
+description = "Tool execution library shared by the Astra CLI and server"
 
 [dependencies]
 astra-core.workspace = true
@@ -28,9 +30,11 @@ uuid.workspace = true
 url = "2.5"
 scraper = "0.27"
 futures = "0.3"
+fs2.workspace = true
+hex.workspace = true
 
-# Git operations (gix)
-gix = { version = "0.85.0", features = ["status", "blame", "mailmap", "revision"] }
+# Repository identity and HEAD queries; shell owns ordinary Git operations.
+gix = { version = "0.85.0", default-features = false, features = ["max-performance-safe", "auto-chain-error", "sha1"] }
 
 # Code intelligence (tree-sitter)
 tree-sitter = "0.24"

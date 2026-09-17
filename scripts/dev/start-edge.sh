@@ -5,6 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/edge-process.sh"
 
 if [ -f "$REPO_ROOT/.env" ]; then
     set -a
@@ -34,24 +36,13 @@ fi
 
 echo "Starting astra-edge provider (mode: $BUILD_MODE, workspace: $WORKSPACE_DIR)..."
 
-RUNNING_PIDS=$(pgrep -x "astra-edge" 2>/dev/null || true)
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
-    EXTRA_PIDS=$(echo "$RUNNING_PIDS" | tr ' ' '\n' | grep -v "^${PID}$" || true)
-    if [ -z "$EXTRA_PIDS" ]; then
+    if edge_process_is_owned "$REPO_ROOT" "$PID"; then
         echo "⚠️  astra-edge already running (PID: $PID)"
         exit 0
     fi
-    echo "⚠️  Multiple astra-edge processes detected; restarting the provider"
-    ASTRA_EDGE_LOCK_HELD=1 "$SCRIPT_DIR/stop-edge.sh" >/dev/null 2>&1 || true
-elif [ -n "$RUNNING_PIDS" ]; then
-    echo "⚠️  Stale astra-edge process detected; restarting the provider"
-    ASTRA_EDGE_LOCK_HELD=1 "$SCRIPT_DIR/stop-edge.sh" >/dev/null 2>&1 || true
-fi
-
-if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "⚠️  astra-edge already running (PID: $(cat "$PID_FILE"))"
-    exit 0
+    echo "⚠️  Removing stale astra-edge PID file"
 fi
 rm -f "$PID_FILE"
 

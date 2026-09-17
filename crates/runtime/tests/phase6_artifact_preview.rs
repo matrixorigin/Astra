@@ -1,3 +1,5 @@
+mod test_support;
+
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
     DatabaseRunStateStore, budget_for_turn_intent, build_presigned_artifact_download,
@@ -139,7 +141,7 @@ async fn artifact_retention_until(
     .unwrap()
 }
 
-#[tokio::test]
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_storage() {
     let pool = setup_pool().await;
@@ -176,7 +178,9 @@ async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_stora
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     let pool = setup_pool().await;
@@ -222,7 +226,9 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     assert_eq!(cold_ref, None);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
     let pool = setup_pool().await;
@@ -276,7 +282,9 @@ async fn l2_51_unknown_tool_uses_400b_fallback_and_writes_warning_event() {
     assert_eq!(row.try_get::<i64, _>("warning_count").unwrap(), 1);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_52_preview_template_normalize_versions_are_seeded_and_deterministic() {
     let pool = setup_pool().await;
@@ -318,7 +326,9 @@ async fn l2_52_preview_template_normalize_versions_are_seeded_and_deterministic(
     }
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
     let pool = setup_pool().await;
@@ -370,7 +380,9 @@ async fn l2_53_large_pg_dump_uses_artifact_ref_and_never_prompt_raw_payload() {
     assert!(row.try_get::<i64, _>("payload_bytes").unwrap() > 1000);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
     let pool = setup_pool().await;
@@ -398,7 +410,9 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
     assert_eq!(status, "active");
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling() {
     let pool = setup_pool().await;
@@ -445,7 +459,9 @@ async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling
     assert_eq!(metadata, json!({"retentionExpired": true}));
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_55_presigned_download_contains_ttl_and_signature() {
     let signed = build_presigned_artifact_download(
@@ -466,7 +482,9 @@ async fn l2_55_presigned_download_contains_ttl_and_signature() {
     assert!(signed.signature.starts_with("sha256:"));
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_56_expired_artifact_renders_historical_placeholder() {
     let placeholder = expired_artifact_placeholder("artifact-x", Some("row count preserved"));
@@ -475,7 +493,9 @@ async fn l2_56_expired_artifact_renders_historical_placeholder() {
     assert!(placeholder.contains("row count preserved"));
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_57_benchmark_comparison_expands_tool_previews_from_recent_tail() {
     let normal = budget_for_turn_intent(Some("normal"));
@@ -490,7 +510,9 @@ async fn l2_57_benchmark_comparison_expands_tool_previews_from_recent_tail() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     let pool = setup_pool().await;
@@ -577,7 +599,9 @@ async fn l3_17_s08_dba_audit_large_artifacts_batch_and_gc() {
     assert_eq!(cold_ref, None, "sweeper must not fabricate cold storage");
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     let pool = setup_pool().await;
@@ -648,4 +672,5 @@ async fn l3_18_s12_14_day_review_retention_and_benchmark_budget_flex() {
     let budget = budget_for_turn_intent(Some("benchmark_comparison"));
     assert_eq!(budget.budget.tool_previews, 2_500);
     assert!(budget.borrowed_from_recent_tail > 0);
+}
 }

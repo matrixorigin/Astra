@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Box, ChevronLeft, ChevronRight, Info, MoreHorizontal, Trash2 } from 'lucide-react';
+import { Box, ChevronLeft, ChevronRight, Info, MessageSquare, MoreHorizontal, Trash2 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import { ChatActionsMenu } from '@/components/app/chat-actions-menu';
@@ -22,13 +22,15 @@ import { cn } from '@/lib/utils/cn';
 type NavItem = {
   href: string | null;
   label: string;
-  mark: 'chat' | 'project' | 'search' | 'harness';
+  mark: 'chat' | 'now' | 'work' | 'project' | 'search' | 'harness';
   disabled?: boolean;
   badge?: string;
 };
 
 const nav: NavItem[] = [
   { href: null, label: 'Search', mark: 'search' },
+  { href: '/now', label: 'Now', mark: 'now' },
+  { href: '/works', label: 'Work', mark: 'work' },
   { href: '/chats', label: 'Chats', mark: 'chat' },
   { href: '/projects', label: 'Projects', mark: 'project' },
   { href: '/harnesses', label: 'Harnesses', mark: 'harness' },
@@ -82,7 +84,7 @@ export function Sidebar({ onSearch }: { onSearch: () => void }) {
   return (
     <aside className={cn('astra-sidebar hidden h-screen shrink-0 p-3 md:flex md:flex-col', collapsed ? 'w-sidebar-collapsed' : 'w-sidebar')}>
       <div className="astra-sidebar-header flex items-center justify-between gap-2">
-        <Link href="/" className="astra-sidebar-brand flex h-10 min-w-0 items-center gap-2 rounded-control px-2 text-sm font-semibold" aria-label="Astra home">
+        <Link href="/now" className="astra-sidebar-brand flex h-10 min-w-0 items-center gap-2 rounded-control px-2 text-sm font-semibold" aria-label="Astra home">
           <span className="astra-sidebar-brand-mark flex size-7 shrink-0 items-center justify-center rounded-control text-xs font-semibold">A</span>
           {collapsed ? null : (
             <span className="min-w-0">
@@ -99,10 +101,16 @@ export function Sidebar({ onSearch }: { onSearch: () => void }) {
         />
       </div>
 
-      <Link href="/" className={cn('astra-sidebar-command mt-4 flex h-10 items-center justify-center gap-2 rounded-control text-sm font-medium', collapsed && 'px-0')}>
-        <TuiEntityMark kind="new" className="astra-sidebar-command-mark" />
-        {collapsed ? null : <span>New chat</span>}
-      </Link>
+      <div className="mt-4 space-y-2">
+        <Link href="/works" className={cn('astra-sidebar-command flex h-10 items-center justify-center gap-2 rounded-control text-sm font-medium', collapsed && 'px-0')}>
+          <TuiEntityMark kind="new" className="astra-sidebar-command-mark" />
+          {collapsed ? null : <span>New Work</span>}
+        </Link>
+        <Link href="/" className={cn('flex h-9 items-center justify-center gap-2 rounded-control border border-border text-sm font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text', collapsed && 'px-0')}>
+          <MessageSquare className="size-4" />
+          {collapsed ? null : <span>New chat</span>}
+        </Link>
+      </div>
 
       <nav className="astra-sidebar-nav mt-4 space-y-1" aria-label="Primary">
         {nav.map((item) => {

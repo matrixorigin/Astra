@@ -46,31 +46,63 @@ fi
 # Clean up old process record
 rm -f "$PID_FILE"
 
-# Load .env early so DB host/port are available for the readiness check
-if [ -f .env ]; then
-    set -a; source .env; set +a
+# Load the selected env file early so DB host/port are available for the
+# readiness check. ASTRA_ENV_FILE lets cross-repository local harnesses use an
+# isolated configuration without rewriting a developer's normal .env.
+ENV_FILE="${ASTRA_ENV_FILE:-.env}"
+if [ -f "$ENV_FILE" ]; then
+    set -a; source "$ENV_FILE"; set +a
+fi
+
+# A caller-selected env file is an explicit configuration boundary. Prevent
+# the server's own config loader from filling missing values from the repo
+# .env or user/system config after this script has deliberately omitted them.
+if [ -n "${ASTRA_ENV_FILE:-}" ]; then
+    export ASTRA_CONFIG_SOURCE="${ASTRA_CONFIG_SOURCE:-explicit-env}"
+fi
+
+# Cloud BYOK must resolve a per-user Memoria credential. This explicit switch
+# guarantees an inherited shell variable cannot silently re-enable master-key
+# fallback in the local cross-repository test topology.
+if [ "${ASTRA_DISABLE_MEMORIA_MASTER_KEY:-}" = "1" ]; then
+    unset MEMORIA_MASTER_KEY
+fi
+
+# Service reachability does not imply that local accounts can use memory.
+if [[ -n "${MEMORIA_MASTER_KEY:-}" && -z "${MEMORIA_WEB_URL:-}" && "${MEMORIA_SELF_HOSTED_MASTER_ACCESS:-0}" != 1 ]]; then
+    echo "⚠️  Memoria is configured but local user memory is disabled. Set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in $ENV_FILE for self-hosted Memoria 0.5.2+."
 fi
 
 API_PORT="${ASTRA_API_PORT:-17001}"
 DB_HOST="${MATRIXONE_HOST:-127.0.0.1}"
 DB_PORT="${MATRIXONE_PORT:-6001}"
+HEALTH_URL="http://127.0.0.1:${API_PORT}/health"
+READY_URL="http://127.0.0.1:${API_PORT}/ready"
+
+# Startup readiness is owned by the core API dependency: the primary
+# database.  Optional capabilities (currently Memoria) are reported by
+# /health as degraded and must not prevent a usable API from starting.
+api_ready() {
+    local status
+    status=$(NO_PROXY=localhost,127.0.0.1 curl -s \
+        --connect-timeout 1 --max-time 2 \
+        -o /dev/null -w '%{http_code}' "$READY_URL" 2>/dev/null || true)
+    [ "$status" = "200" ]
+}
 
 # Recover from an earlier launcher losing its PID after the server became
-# healthy (notably the macOS screen branch). Starting a second server would
+# ready (notably the macOS screen branch). Starting a second server would
 # only produce a misleading bind failure while the first instance is usable.
-EXISTING_HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 \
-    "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
-if echo "$EXISTING_HEALTH" | grep -q '"status":"healthy"' && \
-   echo "$EXISTING_HEALTH" | grep -q '"database":"connected"'; then
+if api_ready; then
     EXISTING_PID=""
     if command -v lsof >/dev/null 2>&1; then
         EXISTING_PID=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)
     fi
     if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
         echo "$EXISTING_PID" > "$PID_FILE"
-        echo "⚠️  API server already healthy (PID: $EXISTING_PID, port: $API_PORT)"
+        echo "⚠️  API server already ready (PID: $EXISTING_PID, port: $API_PORT)"
     else
-        echo "⚠️  API server already healthy (port: $API_PORT; PID unavailable)"
+        echo "⚠️  API server already ready (port: $API_PORT; PID unavailable)"
     fi
     exit 0
 fi
@@ -180,16 +212,16 @@ if [ "$API_HEALTH_INTERVAL_SECONDS" -le 0 ]; then
     exit 1
 fi
 
-# Wait until the process is alive and the health endpoint reports a connected DB.
-echo "Waiting for API health (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
+# Wait until the process is alive and the core readiness endpoint accepts
+# traffic.  /health may legitimately report `degraded` while an optional
+# capability is unavailable.
+echo "Waiting for API readiness (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
 START_SECONDS=$SECONDS
 while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
-    HEALTH=$(NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "http://127.0.0.1:${API_PORT}/health" 2>/dev/null || true)
-    if echo "$HEALTH" | grep -q '"status":"healthy"' && \
-       echo "$HEALTH" | grep -q '"database":"connected"'; then
+    if api_ready; then
         echo "✅ API server started (PID: $PID, port: $API_PORT)"
         exit 0
     fi
@@ -197,8 +229,16 @@ while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
 done
 
 if kill -0 "$PID" 2>/dev/null; then
-    echo "❌ API server did not become healthy in time"
-    echo "Stopping unhealthy API server (PID: $PID)..."
+    echo "❌ API server did not become ready in time"
+    echo "Last /ready response:"
+    NO_PROXY=localhost,127.0.0.1 curl -sS --connect-timeout 1 --max-time 2 \
+        "$READY_URL" 2>/dev/null || true
+    echo "Last /health response:"
+    NO_PROXY=localhost,127.0.0.1 curl -sS --connect-timeout 1 --max-time 2 \
+        "$HEALTH_URL" 2>/dev/null || true
+    echo "Recent API log:"
+    tail -20 "$LOG_FILE" 2>/dev/null || true
+    echo "Stopping unready API server (PID: $PID)..."
     kill "$PID" 2>/dev/null || true
     for _ in {1..20}; do
         if ! kill -0 "$PID" 2>/dev/null; then

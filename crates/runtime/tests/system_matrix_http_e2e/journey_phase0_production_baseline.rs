@@ -278,7 +278,7 @@ async fn run_server_only_production_baseline_inner() -> AnyResult<()> {
             &result.scenario,
         )?;
     }
-    bootstrap_result.ctx.pool.close().await;
+    bootstrap_result.ctx.close().await;
     Ok(())
 }
 

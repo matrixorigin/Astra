@@ -47,6 +47,9 @@ pub trait SkillSubRunExecutor: Send + Sync {
         parent_recursion_depth: u8,
         effort: Option<&str>,
         agent_type: Option<&str>,
+        invocation_id: Option<&str>,
+        expected_control_epoch: Option<i64>,
+        parent_turn_chain_id: Option<&str>,
     ) -> Result<SubRunResult, String>;
 }
 
@@ -190,6 +193,18 @@ impl SkillExecutor for IsolatedSkillExecutor {
                     .map(|e| e.to_string())
                     .as_deref(),
                 skill.manifest.agent_type.as_deref(),
+                context
+                    .arguments
+                    .get("__astra_invocation_id")
+                    .map(String::as_str),
+                context
+                    .arguments
+                    .get("__astra_expected_control_epoch")
+                    .and_then(|value| value.parse::<i64>().ok()),
+                context
+                    .arguments
+                    .get("__astra_parent_turn_chain_id")
+                    .map(String::as_str),
             )
             .await;
 
@@ -342,6 +357,9 @@ mod tests {
             _parent_recursion_depth: u8,
             _effort: Option<&str>,
             _agent_type: Option<&str>,
+            _invocation_id: Option<&str>,
+            _expected_control_epoch: Option<i64>,
+            _parent_turn_chain_id: Option<&str>,
         ) -> Result<SubRunResult, String> {
             Ok(SubRunResult {
                 output: format!("Result from {skill_name}: processed '{task_context}'"),
@@ -366,6 +384,9 @@ mod tests {
             _parent_recursion_depth: u8,
             _effort: Option<&str>,
             _agent_type: Option<&str>,
+            _invocation_id: Option<&str>,
+            _expected_control_epoch: Option<i64>,
+            _parent_turn_chain_id: Option<&str>,
         ) -> Result<SubRunResult, String> {
             Ok(SubRunResult {
                 output: "partial review".to_string(),
@@ -529,6 +550,9 @@ mod tests {
             _parent_recursion_depth: u8,
             _effort: Option<&str>,
             _agent_type: Option<&str>,
+            _invocation_id: Option<&str>,
+            _expected_control_epoch: Option<i64>,
+            _parent_turn_chain_id: Option<&str>,
         ) -> Result<SubRunResult, String> {
             Err("sub-run failed: timeout".into())
         }
@@ -639,6 +663,9 @@ mod tests {
             parent_recursion_depth: u8,
             effort: Option<&str>,
             agent_type: Option<&str>,
+            _invocation_id: Option<&str>,
+            _expected_control_epoch: Option<i64>,
+            _parent_turn_chain_id: Option<&str>,
         ) -> Result<SubRunResult, String> {
             *self
                 .captured_effort

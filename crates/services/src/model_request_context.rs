@@ -12,7 +12,7 @@ use astra_core::SharedPool;
 
 use crate::{ServiceError, ServiceErrorKind, ServiceResult};
 
-pub const MODEL_REQUEST_CONTEXT_SCHEMA: &str = "model_request_context_v1";
+pub const MODEL_REQUEST_CONTEXT_SCHEMA: &str = "model_request_context_v2";
 pub(crate) const MODEL_REQUEST_CONTEXT_RETENTION_DAYS: u32 = 30;
 pub(crate) const MAX_MODEL_REQUEST_CONTEXT_EVENTS_PER_SCOPE: u32 = 2048;
 
@@ -676,11 +676,18 @@ impl ModelRequestEventStage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRequestUsage {
-    pub fresh_input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub request_input_tokens: u64,
+    pub input: astra_turn_types::NormalizedPromptCacheUsage,
     pub output_tokens: u64,
+}
+
+impl ModelRequestUsage {
+    /// Provider-normalized request input. The three stored input fields are
+    /// the only authority; total input is always derived from their disjoint
+    /// buckets so cache reads can never be divided by fresh input alone.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input.total_input_tokens()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -697,6 +704,9 @@ pub struct ModelRequestContextEvent {
     pub cache: ModelRequestCache,
     pub compaction: ModelRequestCompaction,
     pub terminal_status: Option<String>,
+    /// Whether terminal token usage is exact, partial, or unavailable.
+    #[serde(default)]
+    pub usage_status: Option<String>,
     pub error_kind: Option<String>,
 }
 
@@ -799,6 +809,39 @@ fn row_string(row: &sqlx::mysql::MySqlRow, column: &'static str) -> ServiceResul
     })
 }
 
+fn validate_model_request_event_projection(
+    stored_stage: ModelRequestEventStage,
+    stored_terminal_status: Option<&str>,
+    event_schema: &str,
+    event_stage: ModelRequestEventStage,
+    event_terminal_status: Option<&str>,
+) -> ServiceResult<()> {
+    if event_schema != MODEL_REQUEST_CONTEXT_SCHEMA {
+        return Err(ServiceError::conflict(format!(
+            "stored model request context uses unsupported schema {}",
+            event_schema
+        )));
+    }
+    if event_stage != stored_stage {
+        return Err(ServiceError::conflict(
+            "stored model request context stage disagrees with its typed payload",
+        ));
+    }
+    if event_terminal_status != stored_terminal_status {
+        return Err(ServiceError::conflict(
+            "stored model request context terminal status disagrees with its typed payload",
+        ));
+    }
+    match (stored_stage, stored_terminal_status) {
+        (ModelRequestEventStage::Accepted, None) | (ModelRequestEventStage::Terminal, Some(_)) => {
+            Ok(())
+        }
+        _ => Err(ServiceError::conflict(
+            "stored model request context stage has an invalid terminal status",
+        )),
+    }
+}
+
 /// Query the append-only per-request trace without scanning raw prompt data.
 pub async fn list_model_request_context_events(
     pool: &SharedPool,
@@ -855,13 +898,28 @@ pub async fn list_model_request_context_events(
                 error,
             )
         })?;
-        let event = serde_json::from_str(&event_json).map_err(|error| {
+        let event: ModelRequestContextEvent =
+            serde_json::from_str(&event_json).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode model request context event",
+                    error,
+                )
+            })?;
+        let terminal_status: Option<String> = row.try_get("terminal_status").map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "decode model request context event",
+                "decode model request context terminal_status",
                 error,
             )
         })?;
+        validate_model_request_event_projection(
+            stage,
+            terminal_status.as_deref(),
+            &event.schema,
+            event.stage,
+            event.terminal_status.as_deref(),
+        )?;
         records.push(ModelRequestContextRecord {
             event_id: row.try_get("event_id").map_err(|error| {
                 ServiceError::with_source(
@@ -871,13 +929,7 @@ pub async fn list_model_request_context_events(
                 )
             })?,
             stage,
-            terminal_status: row.try_get("terminal_status").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode model request context terminal_status",
-                    error,
-                )
-            })?,
+            terminal_status,
             event,
             created_at: row.try_get("created_at").map_err(|error| {
                 ServiceError::with_source(
@@ -994,4 +1046,66 @@ pub async fn model_request_trace_coverage(
         terminal_requests,
         open_requests: accepted_requests.saturating_sub(terminal_requests),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_projection_requires_the_exact_latest_typed_contract() {
+        assert!(
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Accepted,
+                None,
+                MODEL_REQUEST_CONTEXT_SCHEMA,
+                ModelRequestEventStage::Accepted,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+                MODEL_REQUEST_CONTEXT_SCHEMA,
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+            )
+            .is_ok()
+        );
+
+        for invalid in [
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+                "model_request_context_v1",
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+            ),
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+                MODEL_REQUEST_CONTEXT_SCHEMA,
+                ModelRequestEventStage::Accepted,
+                Some("succeeded"),
+            ),
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Terminal,
+                Some("failed"),
+                MODEL_REQUEST_CONTEXT_SCHEMA,
+                ModelRequestEventStage::Terminal,
+                Some("succeeded"),
+            ),
+            validate_model_request_event_projection(
+                ModelRequestEventStage::Terminal,
+                None,
+                MODEL_REQUEST_CONTEXT_SCHEMA,
+                ModelRequestEventStage::Terminal,
+                None,
+            ),
+        ] {
+            assert!(invalid.is_err());
+        }
+    }
 }

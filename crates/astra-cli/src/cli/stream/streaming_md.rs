@@ -7,7 +7,6 @@
 //!
 //! Uses [`TerminalRegion`] for flicker-free diff-based updates.
 
-use termimad::crossterm::style::Color;
 use termimad::{FmtText, MadSkin};
 
 use crate::cli::terminal_region::TerminalRegion;
@@ -484,17 +483,20 @@ pub(crate) fn could_become_suppressed_tag(partial: &str) -> bool {
     false
 }
 
-fn make_skin() -> MadSkin {
-    let mut skin = MadSkin::default();
-    skin.headers[0].set_fg(Color::Cyan);
-    skin.headers[1].set_fg(Color::Cyan);
-    skin.bold.set_fg(Color::White);
-    skin.italic.set_fg(Color::Magenta);
-    skin
+fn make_skin(no_color: bool) -> MadSkin {
+    if no_color {
+        // termimad's crossterm version does not honor NO_COLOR itself.
+        MadSkin::no_style()
+    } else {
+        // Keep the terminal's foreground for emphasis and headings so both
+        // light and dark themes remain readable. The default skin retains
+        // bold, italic and heading underline attributes.
+        MadSkin::default()
+    }
 }
 
 fn render_md(text: &str, width: usize) -> String {
-    let skin = make_skin();
+    let skin = make_skin(std::env::var_os("NO_COLOR").is_some());
     let fmt = FmtText::from(&skin, text, Some(width));
     format!("{fmt}")
 }
@@ -530,7 +532,7 @@ fn is_block_start(text: &str) -> bool {
 mod tests {
     use super::{
         StreamingMarkdown, could_become_suppressed_tag, find_attr_tag_open,
-        find_last_block_boundary, has_open_xml_tag, render_md, rendered_to_lines,
+        find_last_block_boundary, has_open_xml_tag, make_skin, render_md, rendered_to_lines,
         strip_leading_narration, strip_xml_tags_inplace,
     };
 
@@ -573,6 +575,84 @@ mod tests {
     fn render_md_produces_output() {
         let out = render_md("**bold** text", 80);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn markdown_emphasis_preserves_terminal_foreground() {
+        let skin = make_skin(false);
+        for (input, content, bold, italic, underline) in [
+            ("ordinary **bold** text", "bold", true, false, false),
+            ("- **Label:** body", "Label:", true, false, false),
+            ("* **Label:** body", "Label:", true, false, false),
+            ("*italic*", "italic", false, true, false),
+            ("# Heading", "Heading", true, false, true),
+            ("## Heading", "Heading", false, false, true),
+            ("###### Heading", "Heading", false, false, true),
+        ] {
+            let output = termimad::FmtText::from(&skin, input, Some(80)).to_string();
+            let mut terminal = vt100::Parser::new(4, 80, 0);
+            terminal.process(output.as_bytes());
+            let screen = terminal.screen();
+            let row: String = (0..80)
+                .map(|col| screen.cell(0, col).unwrap().contents())
+                .collect();
+            let byte_offset = row.find(content).expect("rendered content");
+            let column = row[..byte_offset].chars().count() as u16;
+            for offset in 0..content.len() as u16 {
+                let cell = screen.cell(0, column + offset).unwrap();
+                assert_eq!(cell.fgcolor(), vt100::Color::Default, "{input}");
+                assert_eq!(cell.bgcolor(), vt100::Color::Default, "{input}");
+                assert_eq!(cell.bold(), bold, "{input}");
+                assert_eq!(cell.italic(), italic, "{input}");
+                assert_eq!(cell.underline(), underline, "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_color_markdown_has_no_style_escapes() {
+        let skin = make_skin(true);
+        let input = "# Heading\n\n**bold** *italic* ~~strike~~ `code`\n\n* item\n\n> quote\n\n```\nblock\n```\n\n| A | B |\n|---|---|\n| x | y |";
+        let output = termimad::FmtText::from(&skin, input, Some(80)).to_string();
+        for content in [
+            "Heading", "bold", "italic", "strike", "code", "item", "quote", "block", "A", "B", "x",
+            "y",
+        ] {
+            assert!(output.contains(content), "missing {content}: {output:?}");
+        }
+        assert!(!output.contains('\x1b'), "{output:?}");
+    }
+
+    #[test]
+    fn render_md_respects_no_color_environment() {
+        const CASE_ENV: &str = "ASTRA_TEST_MARKDOWN_COLOR_CASE";
+        if let Ok(case) = std::env::var(CASE_ENV) {
+            let output = render_md("**bold** `code`", 80);
+            assert!(output.contains("bold") && output.contains("code"));
+            assert_eq!(output.contains('\x1b'), case == "unset", "{output:?}");
+            return;
+        }
+
+        // Isolate environment changes from other tests and exercise the actual
+        // render entrypoint, including NO_COLOR values used by --no-color.
+        let test_name = format!(
+            "{}::render_md_respects_no_color_environment",
+            module_path!().split_once("::").unwrap().1
+        );
+        for (case, value) in [("unset", None), ("set", Some("1")), ("empty", Some(""))] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", &test_name, "--nocapture"]);
+            child.env(CASE_ENV, case).env_remove("NO_COLOR");
+            if let Some(value) = value {
+                child.env("NO_COLOR", value);
+            }
+            let result = child.output().expect("run isolated Markdown test");
+            assert!(result.status.success(), "{case}: {result:?}");
+            assert!(
+                String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+                "child must execute the test: {result:?}"
+            );
+        }
     }
 
     #[test]

@@ -8,15 +8,14 @@
 //!     Hoisting it to a top-level always_load tool gives the deferred
 //!     activation flow an unambiguous entry point.
 //!   - Some paths treated an activated deferred name as an execution allowlist.
-//!     The fixed contract makes activation pending schema-injection state
-//!     retained until the selected tool is actually called or becomes stale;
+//!     The fixed contract makes activation schema-injection state retained
+//!     while canonical activation state remains valid, including after calls;
 //!     execution still depends on the current request's visible schema set or
 //!     an explicit transport/plugin grant.
 //!
-//! `introspect` stays in the catalog — it exposes runtime diagnostics
-//! (token pressure, cache hit rate, tool health, volatile injections,
-//! stall state) that `session` does not duplicate. It is a genuinely
-//! separate always-load capability, dispatched by the edge-tool executor.
+//! `introspect` and `reflect` stay eager as the observation plane's compact
+//! first-class entrypoints. Their canonical schemas remain searchable for
+//! advanced fields without re-entering the resident provider prefix.
 
 use astra_tools::schemas::all_tool_schemas;
 use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
@@ -87,14 +86,10 @@ fn tool_search_schema_advertises_select_mode() {
     );
 }
 
-// ── 2. introspect coexists with tool_search ─────────────────────────────────
-//
-// `introspect` and `reflect` are recovery/debug entrypoints. They should not
-// require the model to discover that self-observation exists before it can use
-// it to recover from drift, runtime errors, or confusing state.
+// ── 2. observation entrypoints are eager and advanced contracts searchable ──
 
 #[test]
-fn observation_tools_are_available_and_always_load_by_default() {
+fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
     let introspect = TOOL_CATALOG
         .iter()
         .find(|t| t.name == "introspect")
@@ -108,12 +103,16 @@ fn observation_tools_are_available_and_always_load_by_default() {
 
     let always_load = astra_runtime::tool_registry::surface::default_always_load_names();
     assert!(
-        always_load.iter().any(|name| name == "introspect")
-            && always_load.iter().any(|name| name == "reflect"),
-        "observation tools must be in every local always_load tool prefix"
+        always_load.iter().any(|name| name == "introspect"),
+        "artifact recovery must not require a discovery round"
+    );
+    assert!(
+        always_load.iter().any(|name| name == "reflect"),
+        "persisted reflection is a first-class observation entrypoint"
     );
 
-    let names = schema_names(&all_tool_schemas());
+    let schemas = all_tool_schemas();
+    let names = schema_names(&schemas);
     assert!(
         names.contains(&"introspect".to_string()),
         "introspect schema must still be emitted"
@@ -122,9 +121,40 @@ fn observation_tools_are_available_and_always_load_by_default() {
         names.contains(&"reflect".to_string()),
         "reflect schema must still be emitted"
     );
-    // They live side-by-side with tool_search; tool_search remains the
-    // activation primitive for the rest of the deferred catalog.
     assert!(names.contains(&"tool_search".to_string()));
+
+    let surface = astra_runtime::tool_registry::surface::ToolSurface::build(
+        schemas.clone(),
+        &astra_config::ToolSurfaceConfig::default(),
+        &[],
+    );
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(!deferred.contains("introspect"));
+    assert!(!deferred.contains("reflect"));
+
+    let selected = astra_tools::tool_search::tool_search(
+        &schemas,
+        &serde_json::json!({"query": "select:reflect"}),
+    );
+    let selected: Value = serde_json::from_str(&selected).expect("structured select result");
+    assert_eq!(selected["mode"], "select");
+    assert_eq!(selected["resolved"], serde_json::json!(["reflect"]));
+
+    let introspect_schema = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"] == "introspect")
+        .expect("introspect schema");
+    let properties = &introspect_schema["function"]["parameters"]["properties"];
+    for field in ["artifact", "offset", "max_bytes"] {
+        assert!(
+            properties.get(field).is_some(),
+            "missing recovery field {field}"
+        );
+    }
 }
 
 // ── 3. Validator extras are explicit grants, not deferred state ─────────────

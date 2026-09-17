@@ -9,9 +9,9 @@
 
 #![cfg(test)]
 
+use super::super::work_board_projection::SessionTask;
 use super::render;
 use crate::tui::testing::render::{buffer_to_string, draw_widget};
-use astra_tools::task_mgmt::SessionTask;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -26,7 +26,6 @@ impl Widget for LinesWidget {
 
 fn mk_task(id: &str, title: &str, status: &str) -> SessionTask {
     SessionTask {
-        archived_at: None,
         id: id.into(),
         title: title.into(),
         description: None,

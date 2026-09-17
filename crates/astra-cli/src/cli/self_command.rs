@@ -55,15 +55,43 @@ pub(crate) struct CheckResult {
 }
 
 #[derive(Debug, Serialize)]
-struct MutatePreviewResponse {
-    session_id: String,
-    path: String,
-    old_value: serde_json::Value,
-    new_value: serde_json::Value,
+pub(crate) struct MutatePreviewResponse {
+    pub(crate) session_id: String,
+    pub(crate) path: String,
+    pub(crate) old_value: serde_json::Value,
+    pub(crate) new_value: serde_json::Value,
     valid: bool,
     effective_config_changed: bool,
     would_clear_override: bool,
     checks: Vec<CheckResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MutateApplyResponse {
+    #[serde(flatten)]
+    pub(crate) preview: MutatePreviewResponse,
+    pub(crate) config_revision: u64,
+    #[serde(skip)]
+    pub(crate) committed_config: RuntimeConfig,
+    pub(crate) audit_recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) audit_warning: Option<String>,
+}
+
+pub(crate) enum GovernedConfigMutationError {
+    Rejected(serde_json::Value),
+    Persistence(String),
+    OutcomeUnknown(Box<GovernedConfigMutationUnknown>),
+}
+
+pub(crate) struct GovernedConfigMutationUnknown {
+    pub(crate) preview: MutatePreviewResponse,
+    pub(crate) drift: Option<f64>,
+    pub(crate) proposed_revision: u64,
+    pub(crate) observed_revision: Option<u64>,
+    pub(crate) observed_config: Option<RuntimeConfig>,
+    pub(crate) retry_revision: Option<u64>,
+    pub(crate) reason: String,
 }
 
 pub(crate) async fn execute_self_command(
@@ -182,9 +210,7 @@ pub(crate) async fn execute_self_command(
         }
         SelfCmd::Mutate(SelfMutateCmd::Apply(args)) => {
             let session_id = resolve_target_session_id(args.session_id.as_deref(), profile).await?;
-            let preview = preview_config_mutation(&session_id, args)?;
-            persist_config_mutation(&session_id, args, &preview)?;
-            to_json(&preview)
+            to_json(&persist_config_mutation(&session_id, args)?)
         }
     }
 }
@@ -467,6 +493,7 @@ async fn build_reflect_response(
         graph_slice,
         budget_result: ObservationBudgetResult::default(),
     }
+    .project_lightweight()
 }
 
 fn session_agent_delivery_summary(events: &[JournalEvent]) -> Option<String> {
@@ -733,87 +760,302 @@ fn preview_config_mutation_value(
     let workspace = session_workspace::read_workspace(session_id)
         .map_err(|e| format!("workspace metadata missing for session {session_id}: {e}"))?;
     let base_config = effective_runtime_config(Some(&workspace))?;
-    let base_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
+    prepare_config_mutation(session_id, path, new_value, &base_config).map(|(preview, _)| preview)
+}
+
+fn prepare_config_mutation(
+    session_id: &str,
+    path: &str,
+    new_value: serde_json::Value,
+    base_config: &RuntimeConfig,
+) -> Result<(MutatePreviewResponse, RuntimeConfig), String> {
+    let base_json = serde_json::to_value(base_config).map_err(|e| e.to_string())?;
     let mut value = base_json.clone();
-    let old_value = replace_json_path(&mut value, path, new_value.clone())?;
+    let old_value = astra_config::replace_existing_json_path(&mut value, path, new_value.clone())
+        .map_err(|error| error.to_string())?;
     let candidate_config: RuntimeConfig = serde_json::from_value(value.clone())
         .map_err(|e| format!("mutation produced invalid RuntimeConfig at '{}': {e}", path))?;
     let candidate_json = serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?;
     let candidate_checks = verify_runtime_config(Some(&candidate_json));
     let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
-    Ok(MutatePreviewResponse {
+    Ok((
+        MutatePreviewResponse {
+            session_id: session_id.to_string(),
+            path: path.to_string(),
+            old_value,
+            new_value,
+            valid: candidate_checks.iter().all(|check| check.ok),
+            effective_config_changed: value != base_json,
+            would_clear_override: value == baseline_json,
+            checks: candidate_checks,
+        },
+        candidate_config,
+    ))
+}
+
+pub(crate) fn prepare_governed_config_mutation(
+    session_id: &str,
+    path: &str,
+    new_value: serde_json::Value,
+    base_config: &RuntimeConfig,
+    force: bool,
+    drift_ceiling: f64,
+) -> Result<(MutatePreviewResponse, RuntimeConfig, Option<f64>), serde_json::Value> {
+    let mut candidate_config = base_config.clone();
+    let mutation = astra_config::apply_governed_config_mutation(
+        &mut candidate_config,
+        path,
+        &new_value,
+        force,
+        drift_ceiling,
+    )
+    .map_err(|error| error.to_json())?;
+    let candidate_json = serde_json::to_string(&candidate_config).map_err(
+        |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
+    )?;
+    let candidate_checks = verify_runtime_config(Some(&candidate_json));
+    let candidate_value = serde_json::to_value(&candidate_config).map_err(
+        |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
+    )?;
+    let base_value = serde_json::to_value(base_config).map_err(
+        |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
+    )?;
+    let baseline = serde_json::to_value(RuntimeConfig::load()).map_err(
+        |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
+    )?;
+    let preview = MutatePreviewResponse {
         session_id: session_id.to_string(),
-        path: path.to_string(),
-        old_value,
-        new_value,
+        path: mutation.path.as_str().to_string(),
+        old_value: mutation.old_value,
+        new_value: mutation.new_value,
         valid: candidate_checks.iter().all(|check| check.ok),
-        effective_config_changed: value != base_json,
-        would_clear_override: value == baseline_json,
+        effective_config_changed: candidate_value != base_value,
+        would_clear_override: candidate_value == baseline,
         checks: candidate_checks,
-    })
+    };
+    if !preview.valid {
+        return Err(serde_json::json!({
+            "error": "invalid_runtime_config",
+            "checks": preview.checks,
+        }));
+    }
+    Ok((preview, candidate_config, mutation.drift))
 }
 
 fn persist_config_mutation(
     session_id: &str,
     args: &SelfMutateConfigArgs,
-    preview: &MutatePreviewResponse,
-) -> Result<(), String> {
-    persist_config_mutation_value(
-        session_id,
-        &args.path,
-        parse_value_arg(&args.value),
-        preview,
-    )
+) -> Result<MutateApplyResponse, String> {
+    persist_config_mutation_value(session_id, &args.path, parse_value_arg(&args.value))
 }
 
 fn persist_config_mutation_value(
     session_id: &str,
     path: &str,
     new_value: serde_json::Value,
-    preview: &MutatePreviewResponse,
-) -> Result<(), String> {
-    let ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let base_config = effective_runtime_config(Some(&ws))?;
-    let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
-    replace_json_path(&mut value, path, new_value)?;
-    let candidate_config: RuntimeConfig =
-        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
-    let tuned_config_json = if value == baseline_json {
-        None
-    } else {
-        Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
-    };
-    let mut turn = ws.turn_count;
-    let existed = session_workspace::update_existing_workspace(session_id, |workspace| {
-        workspace.tuned_config_json = tuned_config_json;
-        workspace.updated_at = Utc::now().to_rfc3339();
-        turn = workspace.turn_count;
-    })
-    .map_err(|e| e.to_string())?;
-    if !existed {
-        return Err(format!(
-            "workspace disappeared while persisting config for session {session_id}"
-        ));
-    }
-    append_config_change_event(
+) -> Result<MutateApplyResponse, String> {
+    let outcome = session_workspace::update_existing_workspace_config(
         session_id,
-        turn,
-        path,
-        &preview.new_value,
-        Some(preview.old_value.clone()),
-    )?;
-    Ok(())
+        |workspace| {
+            let base_config = effective_runtime_config(Some(workspace))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let (preview, candidate_config) =
+                prepare_config_mutation(session_id, path, new_value.clone(), &base_config)
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })?;
+            let candidate_json =
+                serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?;
+            workspace.tuned_config_json = if preview.would_clear_override {
+                None
+            } else {
+                Some(candidate_json)
+            };
+            workspace.updated_at = Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::<(), _>::Continue((
+                preview,
+                workspace.turn_count,
+            )))
+        },
+        |_, revision, value| {
+            append_config_change_event(
+                session_id,
+                value.1,
+                path,
+                &value.0.new_value,
+                Some(value.0.old_value.clone()),
+                revision,
+            )
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let (preview, config_revision, committed_config, postcommit) = match outcome {
+        session_workspace::WorkspaceConfigMutationOutcome::Applied {
+            value,
+            revision,
+            workspace,
+            postcommit,
+        } => (
+            value.0,
+            revision,
+            effective_runtime_config(Some(&workspace))?,
+            postcommit,
+        ),
+        session_workspace::WorkspaceConfigMutationOutcome::Rejected(()) => {
+            unreachable!("unconditional CLI config mutation cannot reject")
+        }
+        session_workspace::WorkspaceConfigMutationOutcome::OutcomeUnknown { reason, .. } => {
+            return Err(format!("workspace config commit outcome unknown: {reason}"));
+        }
+    };
+    let audit_warning = postcommit
+        .warning
+        .map(|warning| warning.chars().take(240).collect());
+    Ok(MutateApplyResponse {
+        preview,
+        config_revision,
+        committed_config,
+        audit_recorded: postcommit.recorded,
+        audit_warning,
+    })
 }
 
 pub(crate) fn persist_config_override(
     session_id: &str,
     path: &str,
     new_value: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let preview = preview_config_mutation_value(session_id, path, new_value.clone())?;
-    persist_config_mutation_value(session_id, path, new_value, &preview)?;
-    serde_json::to_value(&preview).map_err(|e| e.to_string())
+) -> Result<MutateApplyResponse, String> {
+    persist_config_mutation_value(session_id, path, new_value)
+}
+
+pub(crate) fn persist_governed_config_override(
+    session_id: &str,
+    path: &str,
+    new_value: serde_json::Value,
+    force: bool,
+    drift_ceiling: f64,
+) -> Result<(MutateApplyResponse, Option<f64>), GovernedConfigMutationError> {
+    let outcome = session_workspace::update_existing_workspace_config(
+        session_id,
+        |workspace| {
+            let base_config = effective_runtime_config(Some(workspace))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let prepared = prepare_governed_config_mutation(
+                session_id,
+                path,
+                new_value.clone(),
+                &base_config,
+                force,
+                drift_ceiling,
+            );
+            let (preview, candidate_config, drift) = match prepared {
+                Ok(prepared) => prepared,
+                Err(rejection) => return Ok(std::ops::ControlFlow::Break(rejection)),
+            };
+            workspace.tuned_config_json = if preview.would_clear_override {
+                None
+            } else {
+                Some(serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?)
+            };
+            workspace.updated_at = Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::Continue((
+                preview,
+                candidate_config,
+                drift,
+                workspace.turn_count,
+                workspace.tuned_config_json.clone(),
+            )))
+        },
+        |_, revision, value| {
+            append_config_change_event(
+                session_id,
+                value.3,
+                path,
+                &value.0.new_value,
+                Some(value.0.old_value.clone()),
+                revision,
+            )
+        },
+    )
+    .map_err(|error| GovernedConfigMutationError::Persistence(error.to_string()))?;
+    let (preview, committed_config, drift, config_revision, postcommit) = match outcome {
+        session_workspace::WorkspaceConfigMutationOutcome::Applied {
+            value,
+            revision,
+            postcommit,
+            ..
+        } => (value.0, value.1, value.2, revision, postcommit),
+        session_workspace::WorkspaceConfigMutationOutcome::Rejected(rejection) => {
+            return Err(GovernedConfigMutationError::Rejected(rejection));
+        }
+        session_workspace::WorkspaceConfigMutationOutcome::OutcomeUnknown {
+            value,
+            revision,
+            observed,
+            reason,
+        } => {
+            let observed_revision = observed
+                .as_ref()
+                .map(|workspace| workspace.config_mutation_revision);
+            let observed_config = observed
+                .as_deref()
+                .and_then(|workspace| effective_runtime_config(Some(workspace)).ok());
+            let retry_revision = session_workspace::exact_workspace_config_owner_revision(
+                revision,
+                &value.4,
+                observed.as_deref(),
+            );
+            return Err(GovernedConfigMutationError::OutcomeUnknown(Box::new(
+                GovernedConfigMutationUnknown {
+                    preview: value.0,
+                    drift: value.2,
+                    proposed_revision: revision,
+                    observed_revision,
+                    observed_config,
+                    retry_revision,
+                    reason,
+                },
+            )));
+        }
+    };
+    let audit_warning = postcommit
+        .warning
+        .map(|warning| warning.chars().take(240).collect());
+    Ok((
+        MutateApplyResponse {
+            preview,
+            config_revision,
+            committed_config,
+            audit_recorded: postcommit.recorded,
+            audit_warning,
+        },
+        drift,
+    ))
+}
+
+pub(crate) fn restore_config_override(
+    session_id: &str,
+    path: &str,
+    new_value: serde_json::Value,
+    expected_revision: u64,
+) -> Result<session_workspace::WorkspaceConfigRestoreOutcome, String> {
+    let outcome = session_workspace::restore_workspace_config_override(
+        session_id,
+        path,
+        new_value.clone(),
+        expected_revision,
+        |workspace, revision, previous_value| {
+            append_config_change_event(
+                session_id,
+                workspace.turn_count,
+                path,
+                &new_value,
+                Some(previous_value.clone()),
+                revision,
+            )
+        },
+    )?;
+    Ok(outcome)
 }
 
 pub(crate) fn persist_manual_compression(
@@ -836,12 +1078,17 @@ fn append_config_change_event(
     key: &str,
     new_value: &serde_json::Value,
     old_value: Option<serde_json::Value>,
+    config_revision: u64,
 ) -> Result<(), String> {
     let writer = session_journal::JournalWriter::new(session_id).map_err(|e| e.to_string())?;
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "source".to_string(),
         serde_json::Value::String("astra self mutate".to_string()),
+    );
+    metadata.insert(
+        "config_revision".to_string(),
+        serde_json::Value::from(config_revision),
     );
     if let Some(old_value) = old_value {
         metadata.insert("old_value".to_string(), old_value);
@@ -991,7 +1238,7 @@ fn restored_recent_turn_previews(
     for message in restored.resume_messages() {
         let role = message.get("role").and_then(serde_json::Value::as_str);
         match role {
-            Some("user") => {
+            Some("user") if astra_turn_types::is_human_user_message(message) => {
                 pending_user = extract_text_content(message);
             }
             Some("assistant") => {
@@ -1090,14 +1337,10 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
         }
     };
 
-    let verification_ok = config.verification.min_strictness <= config.verification.strictness
-        && config.verification.strictness <= config.verification.max_strictness
-        && (0.0..=1.0).contains(&config.verification.min_strictness)
-        && (0.0..=1.0).contains(&config.verification.strictness)
-        && (0.0..=1.0).contains(&config.verification.max_strictness);
+    let invariant_validation = astra_config::governed_config_invariant_validation(&config);
     checks.push(CheckResult {
         name: "verification_bounds".to_string(),
-        ok: verification_ok,
+        ok: invariant_validation.verification_bounds,
         detail: format!(
             "min={} strictness={} max={}",
             config.verification.min_strictness,
@@ -1106,14 +1349,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
         ),
     });
 
-    let compression_ok = (0.0..=1.0).contains(&config.compression.compression_threshold)
-        && (0.0..=1.0).contains(&config.context_window.compression_threshold_min)
-        && (0.0..=1.0).contains(&config.context_window.compression_threshold_max)
-        && config.context_window.compression_threshold_min
-            <= config.context_window.compression_threshold_max;
     checks.push(CheckResult {
         name: "compression_bounds".to_string(),
-        ok: compression_ok,
+        ok: invariant_validation.compression_bounds,
         detail: format!(
             "compression={} window=[{}, {}]",
             config.compression.compression_threshold,
@@ -1144,38 +1382,6 @@ pub(crate) fn cli_provider_visible_tool_names() -> Vec<String> {
     names.sort();
     names.dedup();
     names
-}
-
-fn replace_json_path(
-    root: &mut serde_json::Value,
-    path: &str,
-    new_value: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let segments: Vec<&str> = path
-        .split('.')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return Err("mutation path cannot be empty".to_string());
-    }
-
-    let mut current = root;
-    for segment in &segments[..segments.len() - 1] {
-        current = current
-            .get_mut(*segment)
-            .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
-    }
-
-    let last = segments.last().expect("checked non-empty");
-    let object = current
-        .as_object_mut()
-        .ok_or_else(|| format!("config path '{}' does not point to an object parent", path))?;
-    let slot = object
-        .get_mut(*last)
-        .ok_or_else(|| format!("unknown config leaf '{}'", last))?;
-    let old_value = slot.clone();
-    *slot = new_value;
-    Ok(old_value)
 }
 
 fn parse_value_arg(raw: &str) -> serde_json::Value {
@@ -1230,6 +1436,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
+        JournalEventType::SubsystemDiagnostic => "subsystem_diagnostic",
+        JournalEventType::SubsystemSettled => "subsystem_settled",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
@@ -1443,10 +1651,12 @@ mod tests {
     use super::{
         EventPreview, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
-        execute_self_command, persist_config_override, replace_json_path, resolve_session_id,
-        session_agent_delivery_summary, verify_runtime_config,
+        execute_self_command, persist_config_override, resolve_session_id,
+        restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
-    use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
+    use crate::cli::cli_config::cli_args::{
+        SelfCmd, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs, SelfSessionArgs,
+    };
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
@@ -1485,6 +1695,43 @@ mod tests {
         ] {
             assert!(summary.contains(evidence), "{summary}");
         }
+    }
+
+    #[test]
+    fn restored_preview_does_not_show_runtime_authority_as_user_input() {
+        let mut runtime = serde_json::json!({"role": "user", "content": "runtime control"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut runtime,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "real request"}),
+            runtime,
+            serde_json::json!({"role": "assistant", "content": "answer"}),
+        ];
+        let artifacts = astra_services::self_surface::LoadedSelfSurfaceArtifacts {
+            session_id: "sid".to_string(),
+            workspace: None,
+            restored: Some(astra_services::session_restore::RestoredSession {
+                session_id: "sid".to_string(),
+                resume_bundle: Some(typed_resume_bundle("sid", 1, messages)),
+                ..Default::default()
+            }),
+            journal_events: Vec::new(),
+            latest_full_context_trace: None,
+        };
+
+        let previews = restored_recent_turn_previews(&artifacts, 4);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(
+            previews[0].user_input_preview.as_deref(),
+            Some("real request")
+        );
+        assert_eq!(
+            previews[0].assistant_output_preview.as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]
@@ -1654,6 +1901,40 @@ mod tests {
         assert!(persisted.tuned_config_json.is_some());
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mutate_apply_reports_audit_failure_without_rolling_back_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-config-audit-failure";
+        session_workspace::write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        std::fs::create_dir_all(session_journal::journal_file_path(session_id)).unwrap();
+        let current = astra_config::RuntimeConfig::load().memory.retrieval_top_k;
+        let replacement = if current == 5 { 6 } else { 5 };
+
+        let output = execute_self_command(
+            &SelfCmd::Mutate(SelfMutateCmd::Apply(SelfMutateConfigArgs {
+                session_id: Some(session_id.into()),
+                path: "memory.retrieval_top_k".into(),
+                value: replacement.to_string(),
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(output["audit_recorded"], false);
+        assert!(
+            output["audit_warning"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        let persisted = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(persisted.config_mutation_revision, 1);
+        assert!(persisted.tuned_config_json.is_some());
+    }
+
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.old {
@@ -1667,11 +1948,54 @@ mod tests {
         }
     }
 
+    fn typed_resume_bundle(
+        session_id: &str,
+        turn_count: u32,
+        messages: Vec<serde_json::Value>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let sequence = u64::from(turn_count);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: turn_count,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: None,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }],
+        )
+        .expect("valid test resume bundle")
+    }
+
     async fn mock_cloud_resume(
         server: &MockServer,
         session_id: &str,
         restored: &astra_services::session_restore::RestoredSession,
     ) {
+        let mut restored = restored.clone();
+        if restored.resume_bundle.is_none() {
+            restored.resume_bundle = Some(typed_resume_bundle(
+                session_id,
+                restored.turn_count,
+                restored.conversation_messages.clone(),
+            ));
+        }
+        restored.conversation_messages.clear();
         Mock::given(method("POST"))
             .and(path(format!("/sessions/{session_id}/resume")))
             .respond_with(ResponseTemplate::new(200).set_body_json(restored))
@@ -1692,25 +2016,6 @@ mod tests {
             ))
             .mount(server)
             .await;
-    }
-
-    #[test]
-    fn replace_json_path_updates_existing_leaf() {
-        let mut value = serde_json::json!({
-            "verification": {
-                "strictness": 0.5
-            }
-        });
-
-        let old = replace_json_path(
-            &mut value,
-            "verification.strictness",
-            serde_json::json!(0.8),
-        )
-        .unwrap();
-
-        assert_eq!(old, serde_json::json!(0.5));
-        assert_eq!(value["verification"]["strictness"], serde_json::json!(0.8));
     }
 
     #[test]
@@ -1760,7 +2065,6 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("finish the engine".to_string());
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
         ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
@@ -1862,7 +2166,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
-        assert_eq!(value["run"]["goal"], "finish the engine");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["recent_steps"][0]["event_type"], "turn");
         assert!(
             value["environment"]["last_context_trace_preview"]
@@ -2108,7 +2412,6 @@ mod tests {
 
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
-        workspace.plan_goal = Some("ship cloud restore".to_string());
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),
@@ -2138,7 +2441,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
         assert_eq!(value["run"]["turn_count"], 3);
-        assert_eq!(value["run"]["goal"], "ship cloud restore");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["environment"]["cwd"], "/srv/cloud-repo");
         assert_eq!(value["environment"]["model"], "gpt-5.4");
         assert_eq!(
@@ -2266,15 +2569,10 @@ mod tests {
                 .is_some_and(|ref_id| ref_id.starts_with("urn:astra:event:cloud:")),
             "{value}"
         );
-        assert_eq!(
-            value["graph_slice"]["nodes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|node| node["layer"] == "runtime")
-                .count(),
-            1
-        );
+        assert_eq!(value["depth"], "summary");
+        assert!(value["graph_slice"].get("nodes").is_none());
+        assert_eq!(value["budget_result"]["truncated"], true);
+        assert!(value["budget_result"]["omitted"]["nodes"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -2420,7 +2718,7 @@ mod tests {
         let request = ReflectRequest::from_observation_params(
             None,
             Some("errors"),
-            None,
+            Some("diagnostic"),
             None,
             8,
             "why did the operation fail?",
@@ -2438,6 +2736,19 @@ mod tests {
         assert_eq!(projected_event_labels, vec!["tool_call_error"]);
         assert_eq!(response.evidence.len(), 1);
         assert_eq!(response.evidence[0].source, "local_journal");
+        let summary_request = ReflectRequest::from_observation_params(
+            None,
+            Some("errors"),
+            None,
+            None,
+            8,
+            "why did the operation fail?",
+        );
+        let summary = build_reflect_response(&artifacts, 8, summary_request).await;
+        assert!(summary.graph_slice.nodes.is_empty());
+        assert_eq!(summary.evidence.len(), 1);
+        assert_eq!(summary.evidence[0].ref_id, response.evidence[0].ref_id);
+        assert!(summary.budget_result.truncated);
     }
 
     #[test]

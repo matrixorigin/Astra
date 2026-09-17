@@ -1,10 +1,11 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use regex::Regex;
 use serde_json::{Map, Value};
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
+
+pub use astra_tools::credential_redaction::redact_credentials_for_display as redact_credentials_in_text;
 
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 fn is_shell_execution_tool(name: &str) -> bool {
@@ -252,8 +253,14 @@ pub fn sanitize_tool_output_for_llm(output: &str) -> ToolOutputSanitization {
         let stripped_lines = sanitize_json_value_for_llm(&mut value);
         let credential_redactions = redact_json_credentials(&mut value);
         let content = serde_json::to_string(&value).unwrap_or_else(|_| output.to_string());
+        let marker_status = astra_tools::credential_redaction::redaction_marker_status(&content);
         return ToolOutputSanitization {
-            content: with_tool_output_safety_note(content, stripped_lines, credential_redactions),
+            content: with_tool_output_safety_note(
+                content,
+                stripped_lines,
+                credential_redactions,
+                marker_status,
+            ),
             stripped_lines,
             credential_redactions,
         };
@@ -261,8 +268,14 @@ pub fn sanitize_tool_output_for_llm(output: &str) -> ToolOutputSanitization {
 
     let (content, stripped_lines) = sanitize_tool_output_plaintext(output);
     let (content, credential_redactions) = redact_credentials_in_text(&content);
+    let marker_status = astra_tools::credential_redaction::redaction_marker_status(&content);
     ToolOutputSanitization {
-        content: with_tool_output_safety_note(content, stripped_lines, credential_redactions),
+        content: with_tool_output_safety_note(
+            content,
+            stripped_lines,
+            credential_redactions,
+            marker_status,
+        ),
         stripped_lines,
         credential_redactions,
     }
@@ -316,8 +329,17 @@ fn with_tool_output_safety_note(
     content: String,
     stripped_lines: usize,
     credential_redactions: usize,
+    marker_status: (bool, bool),
 ) -> String {
-    if stripped_lines == 0 && credential_redactions == 0 {
+    // Governance may run at several internal boundaries (executor, runtime,
+    // journal, and final model projection).  The content is already safe when
+    // it carries our own note; adding another copy wastes context and makes a
+    // valid source marker look less trustworthy to the model.
+    if let Some(canonical) = canonicalize_generated_safety_notes(&content) {
+        return canonical;
+    }
+    let (has_trusted_marker, has_any_marker) = marker_status;
+    if stripped_lines == 0 && credential_redactions == 0 && !has_any_marker {
         return content;
     }
     let mut parts = Vec::new();
@@ -330,11 +352,23 @@ fn with_tool_output_safety_note(
         parts.push(format!(
             "redacted {credential_redactions} credential/secret pattern(s)"
         ));
+    } else if has_any_marker {
+        parts.push("preserved opaque redaction marker(s)".to_string());
     }
     let note = format!(
         "[tool output safety] {} before adding this tool output to model context.",
         parts.join("; ")
     );
+    let note = if credential_redactions > 0 || has_any_marker {
+        let marker_guidance = if has_trusted_marker {
+            "Preserve complete executor-issued [REDACTED:opaque-label:opaque-ref] markers when editing; display-only [REDACTED:label] markers are not edit anchors."
+        } else {
+            "Complete redaction markers are opaque source references; preserve them verbatim and edit through the source-owning executor. Display-only [REDACTED:label] markers are not edit anchors; re-read when no owner is available."
+        };
+        format!("{note} {marker_guidance} The raw credential remains unavailable by design.")
+    } else {
+        note
+    };
     if content.is_empty() {
         note
     } else {
@@ -342,92 +376,50 @@ fn with_tool_output_safety_note(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Post-tool credential / secret redaction
-// ---------------------------------------------------------------------------
-
-struct CredentialPattern {
-    regex: &'static Regex,
-    label: &'static str,
-}
-
-/// High-confidence credential patterns. Each is designed for near-zero false
-/// positives so we can safely redact before the output enters model context.
-/// Raw audit/ledger payloads are NOT affected — redaction is model-context-only.
-fn credential_patterns() -> &'static [CredentialPattern] {
-    static PATTERNS: OnceLock<Vec<CredentialPattern>> = OnceLock::new();
-
-    macro_rules! pat {
-        ($re:expr, $label:expr) => {{
-            static RE: OnceLock<Regex> = OnceLock::new();
-            CredentialPattern {
-                regex: RE.get_or_init(|| Regex::new($re).expect("credential pattern regex")),
-                label: $label,
-            }
-        }};
+/// Recognize only the complete note shape emitted by this module. A bare
+/// `[tool output safety]` prefix is not a trust marker: foreign/legacy text
+/// must still pass through the sanitizer. When several trusted presentation
+/// boundaries prepended a note, retain one canonical first line and remove
+/// only immediately stacked generated notes.
+fn canonicalize_generated_safety_notes(content: &str) -> Option<String> {
+    let mut lines = content.split('\n');
+    let first = lines.next()?;
+    if !is_generated_safety_note_line(first) {
+        return None;
     }
 
-    PATTERNS.get_or_init(|| {
-        vec![
-            // PEM private key header (RSA, EC, DSA, ED25519, OPENSSH, generic)
-            pat!(
-                r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-                "PRIVATE_KEY"
-            ),
-            // AWS access key ID (fixed AKIA prefix + 16 uppercase alphanumeric)
-            pat!(r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY"),
-            // AWS secret access key assignment
-            pat!(
-                r#"(?i)(?:aws_secret_access_key|aws_secret_key)\s*[=:]\s*['"]?[A-Za-z0-9/+=]{30,}"#,
-                "AWS_SECRET_KEY"
-            ),
-            // GitHub tokens (PAT, OAuth, user-to-server, server-to-server, refresh)
-            pat!(r"gh[pousr]_[A-Za-z0-9_]{36,255}", "GITHUB_TOKEN"),
-            // Generic long bearer tokens (40+ chars of base64-ish content)
-            pat!(
-                r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{40,}",
-                "BEARER_TOKEN"
-            ),
-            // Connection strings with embedded password (proto://user:pass@host)
-            pat!(r"://[^:@\s/]+:[^:@\s/]+@", "CONNECTION_CREDENTIAL"),
-            // Generic secret assignment (password=, api_key=, etc. with 12+ char value)
-            pat!(
-                r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)\s*[=:]\s*['"]?[^\s'"]{12,}"#,
-                "SECRET_ASSIGNMENT"
-            ),
-        ]
-    })
+    let mut rest = Vec::new();
+    let mut removed_duplicate = false;
+    let mut skipping_stacked = true;
+    for line in lines {
+        if skipping_stacked && is_generated_safety_note_line(line) {
+            removed_duplicate = true;
+            continue;
+        }
+        skipping_stacked = false;
+        rest.push(line);
+    }
+    if !removed_duplicate {
+        return Some(content.to_string());
+    }
+    let mut canonical = String::with_capacity(content.len());
+    canonical.push_str(first);
+    if !rest.is_empty() {
+        canonical.push('\n');
+        canonical.push_str(&rest.join("\n"));
+    }
+    Some(canonical)
 }
 
-/// Redact credential/secret patterns in plaintext, replacing matches with
-/// `[REDACTED:<label>]`. Returns the redacted text and the count of redactions.
-pub fn redact_credentials_in_text(text: &str) -> (String, usize) {
-    let patterns = credential_patterns();
-    let mut result = text.to_string();
-    let mut total = 0usize;
-
-    for pat in patterns {
-        let mut new_result = String::new();
-        let mut last_end = 0;
-        let mut found = false;
-
-        for m in pat.regex.find_iter(&result) {
-            found = true;
-            total += 1;
-            new_result.push_str(&result[last_end..m.start()]);
-            new_result.push_str("[REDACTED:");
-            new_result.push_str(pat.label);
-            new_result.push(']');
-            last_end = m.end();
-        }
-
-        if found {
-            new_result.push_str(&result[last_end..]);
-            result = new_result;
-        }
-    }
-
-    (result, total)
+fn is_generated_safety_note_line(line: &str) -> bool {
+    let Some(body) = line.strip_prefix("[tool output safety] ") else {
+        return false;
+    };
+    let has_evidence = (body.contains("stripped ")
+        && body.contains(" suspicious prompt-like line(s)"))
+        || (body.contains("redacted ") && body.contains(" credential/secret pattern(s)"))
+        || body.contains("preserved opaque redaction marker(s)");
+    has_evidence && body.contains(" before adding this tool output to model context.")
 }
 
 fn destructive_sql_guard(
@@ -2631,6 +2623,52 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_full_pipeline_explains_preserved_executor_marker() {
+        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        )
+        .0;
+        let sanitized = sanitize_tool_output_for_llm(&issued);
+        assert!(sanitized.content.contains(&issued));
+        assert!(sanitized.content.contains("executor-issued"));
+    }
+
+    #[test]
+    fn sanitize_full_pipeline_explains_foreign_marker_without_edit_claim() {
+        let foreign = "[REDACTED:C1:0123456789abcdef0123456789abcdef:00000000000000000000000000000000:00000000000000000000000000000000]";
+        let sanitized = sanitize_tool_output_for_llm(foreign);
+        assert!(sanitized.content.contains(foreign));
+        assert!(sanitized.content.contains("source-owning executor"));
+        assert!(!sanitized.content.contains("executor-issued"));
+    }
+
+    #[test]
+    fn sanitize_full_pipeline_is_idempotent_for_already_governed_content() {
+        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        )
+        .0;
+        let once = sanitize_tool_output_for_llm(&issued).content;
+        let twice = sanitize_tool_output_for_llm(&once).content;
+        assert_eq!(twice, once);
+        assert_eq!(twice.matches("[tool output safety]").count(), 1);
+    }
+
+    #[test]
+    fn sanitize_full_pipeline_collapses_stacked_generated_notes() {
+        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        )
+        .0;
+        let once = sanitize_tool_output_for_llm(&issued).content;
+        let note = once.lines().next().expect("generated note");
+        let stacked = format!("{note}\n{once}");
+        let collapsed = sanitize_tool_output_for_llm(&stacked).content;
+        assert_eq!(collapsed, once);
+        assert_eq!(collapsed.matches("[tool output safety]").count(), 1);
+    }
+
+    #[test]
     fn structured_tool_metadata_is_governed_before_persistence() {
         let metadata = Map::from_iter([(
             "structuredContent".to_string(),
@@ -2648,6 +2686,77 @@ mod tests {
         assert!(!encoded.contains("ignore previous instructions"));
         assert!(!encoded.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(encoded.contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn runtime_environment_advertisement_remains_deserializable_after_metadata_sanitization() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/app", &registry),
+        );
+        let original = serde_json::to_value(&advertisement).expect("serialize advertisement");
+        let metadata = Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            original.clone(),
+        )]);
+
+        let sanitized = sanitize_tool_metadata_for_persistence(metadata);
+        let preserved = sanitized
+            .metadata
+            .get("runtime_environment_advertisement")
+            .cloned()
+            .expect("advertisement must remain present");
+        let decoded =
+            serde_json::from_value::<astra_runtime_env::RuntimeEnvironmentAdvertisement>(preserved)
+                .expect("typed runtime advertisement must remain valid");
+        assert_eq!(decoded.schema_version, advertisement.schema_version);
+        assert_eq!(decoded.binding.workspace, advertisement.binding.workspace);
+        assert_eq!(decoded.binding.executor, advertisement.binding.executor);
+        assert_eq!(decoded.binding.runtime, advertisement.binding.runtime);
+        assert_eq!(decoded.binding.policy, advertisement.binding.policy);
+        assert_eq!(
+            decoded.binding.capabilities,
+            advertisement.binding.capabilities
+        );
+        assert_eq!(
+            decoded.binding.tool_surface.tool_names,
+            advertisement.binding.tool_surface.tool_names
+        );
+    }
+
+    #[test]
+    fn edge_callback_json_sanitizer_preserves_typed_runtime_advertisement() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/app", &registry),
+        );
+        let mut encoded = serde_json::to_value(&advertisement).expect("serialize advertisement");
+        let original = encoded.clone();
+
+        // This is the exact key-aware JSON projection used at the Edge
+        // callback boundary.  It must preserve the typed policy enum rather
+        // than treating the overloaded `credentials` key as a secret field.
+        assert_eq!(
+            astra_tools::credential_redaction::redact_credentials_in_json(&mut encoded),
+            0
+        );
+        assert_eq!(encoded, original);
+        let decoded =
+            serde_json::from_value::<astra_runtime_env::RuntimeEnvironmentAdvertisement>(encoded)
+                .expect("callback projection must preserve typed advertisement");
+        assert_eq!(decoded.schema_version, advertisement.schema_version);
+        assert_eq!(decoded.binding.workspace, advertisement.binding.workspace);
+        assert_eq!(decoded.binding.executor, advertisement.binding.executor);
+        assert_eq!(decoded.binding.runtime, advertisement.binding.runtime);
+        assert_eq!(decoded.binding.policy, advertisement.binding.policy);
+        assert_eq!(
+            decoded.binding.capabilities,
+            advertisement.binding.capabilities
+        );
+        assert_eq!(
+            decoded.binding.tool_surface.tool_names,
+            advertisement.binding.tool_surface.tool_names
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════

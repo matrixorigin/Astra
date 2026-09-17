@@ -4,7 +4,6 @@ use crate::server::run::lifecycle::{AgenticRunLifecycleService, ServerSubRunExec
 pub(super) async fn build_runtime_wiring(
     settings: &AppSettings,
     shared_pool: &SharedPool,
-    lease_hold_cache: &Arc<TaskLeaseHoldCache>,
     run_encryptor: &Arc<FernetTokenEncryptor>,
     state: &AppState,
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
@@ -35,13 +34,19 @@ pub(super) async fn build_runtime_wiring(
         )),
         delegation_tracker.clone(),
     ));
+    let memoria_port = state.auth_service.memoria_credentials().map(|resolver| {
+        let mut port =
+            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::template(resolver);
+        if settings.memoria.allows_self_hosted_master_fallback()
+            && let Some(master_key) = settings.memoria.master_key.clone()
+        {
+            port = port.with_self_hosted_fallback(settings.memoria.base_url.clone(), master_key);
+        }
+        Arc::new(port) as Arc<dyn astra_memoria::MemoriaPort>
+    });
     let matrix_rt = Arc::new(
-        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
-            shared_pool.clone(),
-            "default",
-            Arc::clone(lease_hold_cache),
-        )
-        .with_encryptor(Arc::clone(run_encryptor)),
+        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(shared_pool.clone(), "default")
+            .with_encryptor(Arc::clone(run_encryptor), memoria_port),
     );
     let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
     let workspace_record_store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(
@@ -108,16 +113,16 @@ pub(super) async fn build_runtime_wiring(
         );
     }
     let resource_governor = initialize_resource_governor(shared_pool).await?;
-    let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let capacity = crate::capacity_model::CapacityInput::from_env();
+    let admission_limits = capacity.distributed_admission_limits();
+    let run_concurrency_limit = capacity.run_concurrency_limit();
     let mut run_lifecycle = AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
         state.edge_callback_ledger.clone(),
         run_engine,
     )
+    .with_admission_limits(admission_limits)
     .with_pool(shared_pool.clone())
     .with_agent_mailbox_router(agent_mailbox_router)
     .with_delegation_engine(Arc::clone(&delegation_engine))

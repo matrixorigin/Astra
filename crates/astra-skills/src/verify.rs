@@ -1,7 +1,6 @@
 //! Skill-level verification — runs success criteria after skill execution.
 //!
-//! Wraps the existing `VerificationRunner` from `astra_services::durable_task`
-//! to provide skill-specific verification without duplicating any verification logic.
+//! Uses the shared typed verification boundary without owning a second executor.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +11,7 @@ use crate::manifest::SkillManifest;
 
 /// Runs verification criteria declared in a skill manifest.
 ///
-/// Reuses `VerificationRunner` from durable tasks — same 8 verifier kinds,
-/// same timeout handling, same LLM judge integration.
+/// Reuses the shared verification runner and its typed verifier kinds.
 pub struct SkillVerifier {
     runner: VerificationRunner,
 }

@@ -101,8 +101,34 @@ that converges the root and descendants. A slow live stream may drop a
 non-terminal presentation event, but durable replay must reconstruct the
 current projection.
 
+When recovery releases a run as paused without a blocking wait, Work carrier
+reconciliation also pauses its unsettled primary attempt before the next turn
+selects work. Continuation transfers that same attempt to the new run; it does
+not create a replacement task or overwrite a recorded outcome. A blocking
+user-resume pause does not grant continuation ownership. This is session
+continuation, not automatic replay of an interrupted execution.
+
 ## Unhappy-path obligations
 
+- A malformed Work admission decision receives at most the existing bounded
+  repair, with its parser diagnostic and validated boundary hints; the invalid
+  candidate does not gain authority. If admission remains unavailable, repeating
+  `start_work` within the same turn cannot retry that cached decision and is
+  reported as non-retryable at the carrier boundary. This does not prevent
+  reassessment on a new turn or a supported context invalidation, nor change
+  retryability of an already admitted durable operation.
+- Requested mutations must remain explicit admission actions; goal prose is
+  insufficient. Missing cancel/replace targets are malformed, never silently
+  removed. The model may choose an initial target when the user delegates that
+  choice, but cannot invent an externally bound identity. Mutation delivery
+  triggers govern graph changes; nested task prerequisites govern execution,
+  so immediate creation does not imply immediate execution.
+- Admission task and goal text use the canonical Work domain validators.
+  Concise-generation targets are not validity limits: exceeding a brevity
+  target alone cannot reject Work or trigger repair. Domain byte bounds,
+  non-blank content, graph structure, and authorization remain enforced without
+  truncating accepted text. Generation token and deadline budgets remain bounded
+  independently of the largest domain-valid object.
 - Validate the complete fanout before spawning any slot. A partial launch has
   a fixed target count, explicit rejected slots, and no automatic replacements.
 - Fast children may finish before the UI draws the launch receipt; monotonic

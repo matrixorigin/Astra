@@ -15,6 +15,24 @@ pub(crate) struct AppliedStreamUserIntent {
     pub(crate) content: String,
 }
 
+/// Failure of the CLI's public stdout transport, kept distinct from model,
+/// tool, and Server failures so the process can finish exact remote cleanup
+/// before applying the conventional pipeline exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputTransportFailure {
+    Closed,
+    Failed,
+}
+
+impl OutputTransportFailure {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Closed => "stdout output transport closed by its consumer",
+            Self::Failed => "stdout output transport failed",
+        }
+    }
+}
+
 /// Partial data rescued from `AgenticLoopState` when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
@@ -28,8 +46,29 @@ pub(crate) struct PartialTurnData {
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
     pub tool_calls_count: u32,
+    /// Logical provider rounds observed before failure. Unlike retained tool
+    /// records, this survives stream cancellation and record-window eviction.
+    pub llm_rounds: Option<u32>,
+    /// Provider usage coverage captured before failure.
+    pub token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage,
+    /// Durable run-total tool lifecycle accounting. This remains separate
+    /// from local records because a server-owned executor may have requested,
+    /// rejected, or completed calls the thin client never observed live.
+    pub tool_outcomes: Option<astra_services::session_journal::ToolOutcomeSummary>,
+    /// Durable guidance applied by a server-owned loop before this attempt
+    /// failed. Failure is not permission to erase user-authored input from
+    /// local restart history.
+    pub applied_user_intents: Vec<AppliedStreamUserIntent>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Stable server classification for a stream failure.  A rejected
+    /// admission may carry this without having created a durable Run.
+    pub error_code: Option<String>,
+    pub error_metadata: Option<serde_json::Value>,
+    /// The server rejected the request before durable Run admission. Such a
+    /// request is not a failed turn and must not be reconciled or journaled as
+    /// one.
+    pub admission_rejected: bool,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
@@ -38,6 +77,30 @@ pub(crate) struct PartialTurnData {
     /// returned. This survives independently of `partial_text`, which is only
     /// a user-facing suffix and cannot represent tools or reasoning.
     pub run_transcript_messages: Vec<serde_json::Value>,
+    /// The local client can no longer settle or observe an admitted durable
+    /// run, so that exact owner must receive an explicit cancellation request.
+    pub remote_cancel_required: bool,
+    /// Exact durable owner: a callback-producer child when callback delivery
+    /// failed, otherwise the immutable physical SSE root.
+    pub remote_cancel_run_id: Option<String>,
+    /// Typed public-output failure that caused this turn to stop. This is set
+    /// only when output transport, rather than a model/tool failure, owns the
+    /// terminal outcome.
+    pub output_transport_failure: Option<OutputTransportFailure>,
+    /// Structured interruption captured by the runtime before returning a
+    /// failure.  Keeping this alongside the other partial facts lets one-shot
+    /// JSON surfaces preserve a typed, resumable terminal instead of dropping
+    /// the entire envelope when the loop returns `TurnFailure`.
+    pub interruption: Option<serde_json::Value>,
+}
+
+pub(crate) fn unsettled_physical_owner_run_id(
+    accum: &astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum,
+) -> Option<String> {
+    (accum.error_kind.is_some() && accum.run_terminal.is_none())
+        .then(|| accum.run_id.clone())
+        .flatten()
+        .filter(|run_id| !run_id.trim().is_empty())
 }
 
 /// A turn failure that carries partial data for post-mortem analysis.
@@ -45,6 +108,68 @@ pub(crate) struct PartialTurnData {
 pub(crate) struct TurnFailure {
     pub error: String,
     pub partial: PartialTurnData,
+}
+
+/// Promote a typed, resumable runtime interruption into the same terminal
+/// shape used by the normal stream path.
+///
+/// A `TurnFailure` is still a hard error unless the runtime supplied a known
+/// interruption record marked resumable.  In particular, this deliberately
+/// refuses to infer lifecycle state from free-form provider error text, so
+/// authentication, harness, and unknown failures remain fail-closed.
+pub(crate) fn stream_result_from_resumable_turn_failure(
+    failure: &TurnFailure,
+) -> Option<StreamResult> {
+    let interruption = failure.partial.interruption.as_ref()?;
+    let kind_label = interruption.get("kind")?.as_str()?;
+    let kind = astra_turn_core::interruption::InterruptionKind::from_label(kind_label)?;
+    if !kind.is_resumable()
+        || interruption
+            .get("resumable")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+
+    let mut full_text = failure.partial.partial_text.clone();
+    if full_text.trim().is_empty() {
+        full_text = interruption
+            .get("user_message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!("The turn was interrupted ({kind_label}) and can be continued.")
+            });
+    }
+
+    Some(StreamResult {
+        session_id: failure.partial.session_id.clone(),
+        run_id: failure.partial.run_id.clone(),
+        full_text,
+        prompt_tokens: failure.partial.prompt_tokens,
+        completion_tokens: failure.partial.completion_tokens,
+        cache_read_tokens: failure.partial.cache_read_tokens,
+        cache_creation_tokens: failure.partial.cache_creation_tokens,
+        tool_calls_count: failure.partial.tool_calls_count,
+        llm_rounds: failure.partial.llm_rounds,
+        token_usage_coverage: failure.partial.token_usage_coverage,
+        tools_used: failure.partial.tools_used.clone(),
+        tool_call_records: failure.partial.tool_call_records.clone(),
+        stall_events: failure.partial.stall_events.clone(),
+        verdict_events: failure.partial.verdict_events.clone(),
+        last_heavy_checkpoint: failure.partial.last_heavy_checkpoint.clone(),
+        interruption: Some(interruption.clone()),
+        final_state: "interrupted".to_string(),
+        interruption_kind: Some(kind.label().to_string()),
+        // A failed loop has not produced a verified terminal envelope.  Keep
+        // this fact explicit even when the interruption is resumable.
+        server_terminal_unverified: true,
+        tool_record_coverage_partial: true,
+        run_transcript_messages: failure.partial.run_transcript_messages.clone(),
+        ..StreamResult::default()
+    })
 }
 
 impl std::fmt::Display for TurnFailure {
@@ -130,14 +255,17 @@ pub(crate) struct StreamResult {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) tool_calls_count: u32,
+    /// Canonical fixed-size closure of every local and remote tool attempt in
+    /// this logical turn. Unlike `tool_call_records`, this is never a trimmed
+    /// audit window and therefore owns terminal result-class projection.
+    pub(crate) tool_ledger_aggregate:
+        astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate,
     /// Tool names visible to the LLM (first turn surface report).
     pub(crate) visible_tools: Vec<String>,
     /// Skill names selected by the LLM during tool surface.
     pub(crate) selected_skills: Vec<String>,
     /// Tool names with material execution across all turns.
     pub(crate) tools_used: Vec<String>,
-    /// Deferred schemas materialized in the retained session context.
-    pub(crate) activated_deferred_tool_names: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.
     pub(crate) tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
     /// Token budget used by selected dynamic tools.
@@ -173,6 +301,9 @@ pub(crate) struct StreamResult {
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
+    /// Provider-reported token usage coverage. Token totals are lower bounds
+    /// unless this reports `complete`.
+    pub(crate) token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage,
     /// Structured interruption context when the runtime completed the turn
     /// partially (for example due to budget exhaustion after tool progress).
     pub(crate) interruption: Option<serde_json::Value>,
@@ -180,8 +311,27 @@ pub(crate) struct StreamResult {
     pub(crate) final_state: String,
     /// Interruption kind label when final_state is interrupted.
     pub(crate) interruption_kind: Option<String>,
+    /// The authoritative Server-owned loop reported unresolved/rejected
+    /// execution evidence.  The local CLI may have no per-call records in
+    /// this topology, so terminal disposition must retain this fact instead
+    /// of silently presenting the response as verified.
+    pub(crate) server_terminal_unverified: bool,
+    /// Whether a Server-owned terminal is the final outcome authority for
+    /// this logical turn. Local edge records remain audit evidence but cannot
+    /// override this typed terminal fact.
+    pub(crate) server_terminal_authoritative: bool,
+    /// Whether any remote server run contributed tool calls without exposing
+    /// per-call records to this edge process. This coverage fact is
+    /// independent from the final terminal authority: a later edge terminal
+    /// may own exit status while the aggregate record view remains partial.
+    pub(crate) tool_record_coverage_partial: bool,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
+    /// Verified deferred-tool selection evidence. This is carried separately
+    /// from `final_messages` because compaction may remove the originating
+    /// tool-search response; it never grants authority without the current
+    /// capability-scoped catalog accepting its schema digest.
+    pub(crate) deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Exact prompt-history items appended by this root execution run.
     ///
     /// This is captured at the runtime append boundary before compaction may
@@ -198,6 +348,42 @@ pub(crate) struct StreamResult {
 }
 
 impl StreamResult {
+    /// Project the complete run-total ledger into the durable journal shape.
+    /// Per-call records may be absent or only cover the Edge wrapper for a
+    /// Server-owned run, so every CLI entrypoint must use this aggregate when
+    /// it is internally complete.
+    pub(crate) fn canonical_tool_outcomes(
+        &self,
+    ) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
+        let aggregate = self.tool_ledger_aggregate;
+        if !aggregate.is_complete_for(self.tool_calls_count) {
+            return None;
+        }
+        let classes = aggregate.result_classes;
+        let outcomes = astra_services::session_journal::ToolOutcomeSummary {
+            requested: aggregate.attempted,
+            executed: classes.succeeded.saturating_add(classes.failed),
+            succeeded: classes.succeeded,
+            failed: classes.failed,
+            rejected: classes.rejected,
+            reused: classes.reused,
+            suppressed: classes.suppressed,
+            deferred: 0,
+        };
+        outcomes.is_consistent().then_some(outcomes)
+    }
+
+    pub(crate) fn apply_canonical_tool_outcomes(
+        &self,
+        event: &mut astra_services::session_journal::JournalEvent,
+    ) {
+        let Some(outcomes) = self.canonical_tool_outcomes() else {
+            return;
+        };
+        event.tool_count = Some(outcomes.executed);
+        event.tool_outcomes = Some(outcomes);
+    }
+
     /// Merge terminal background-agent outputs into the user-facing aggregate
     /// response used by one-shot CLI and server surfaces.
     ///
@@ -301,8 +487,7 @@ fn user_inputs_from_current_turn(
     let user_contents = messages
         .iter()
         .filter_map(|message| {
-            let role = message.get("role")?.as_str()?;
-            if role != "user" {
+            if !astra_turn_types::is_human_user_message(message) {
                 return None;
             }
             let content = message.get("content")?.as_str()?.trim();
@@ -382,6 +567,26 @@ mod user_input_tests {
     }
 
     #[test]
+    fn effective_user_input_excludes_user_role_runtime_authority() {
+        let mut authority = json!({"role": "user", "content": "runtime settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![json!({"role": "user", "content": "real task"}), authority];
+
+        assert_eq!(
+            effective_user_input_from_messages("real task", &messages),
+            "real task"
+        );
+        assert_eq!(
+            latest_user_input_from_messages("real task", &messages),
+            "real task"
+        );
+    }
+
+    #[test]
     fn effective_user_input_uses_last_matching_primary_line() {
         let messages = vec![
             json!({"role": "user", "content": "repeat"}),
@@ -419,10 +624,10 @@ impl Default for StreamResult {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
+            tool_ledger_aggregate: Default::default(),
             visible_tools: vec![],
             selected_skills: vec![],
             tools_used: vec![],
-            activated_deferred_tool_names: vec![],
             tool_call_records: vec![],
             budget_used: 0,
             budget_pressure: 0.0,
@@ -439,10 +644,15 @@ impl Default for StreamResult {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            token_usage_coverage: Default::default(),
             interruption: None,
             final_state: "completed".to_string(),
             interruption_kind: None,
+            server_terminal_unverified: false,
+            server_terminal_authoritative: false,
+            tool_record_coverage_partial: false,
             final_messages: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
@@ -452,8 +662,12 @@ impl Default for StreamResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
+    use super::{
+        PartialTurnData, TurnFailure, apply_partial_turn_data_to_error_event,
+        stream_result_from_resumable_turn_failure,
+    };
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+    use serde_json::json;
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
@@ -506,5 +720,63 @@ mod tests {
         assert_eq!(event.cache_creation_tokens, Some(4));
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
         assert_eq!(event.metadata.as_ref().unwrap()["run_id"], "run-123");
+    }
+
+    #[test]
+    fn resumable_turn_failure_becomes_typed_partial_result() {
+        let failure = TurnFailure {
+            error: "[server_error] [budget_exhausted] provider budget exhausted".into(),
+            partial: PartialTurnData {
+                session_id: Some("session-1".into()),
+                run_id: Some("run-1".into()),
+                prompt_tokens: 123,
+                completion_tokens: 45,
+                tool_calls_count: 2,
+                partial_text: "partial answer".into(),
+                interruption: Some(json!({
+                    "kind": "budget_exhausted",
+                    "resumable": true,
+                    "user_message": "Continue to resume.",
+                })),
+                ..Default::default()
+            },
+        };
+
+        let result = stream_result_from_resumable_turn_failure(&failure)
+            .expect("typed resumable interruptions should be preserved");
+        assert_eq!(result.final_state, "interrupted");
+        assert_eq!(
+            result.interruption_kind.as_deref(),
+            Some("budget_exhausted")
+        );
+        assert_eq!(result.session_id.as_deref(), Some("session-1"));
+        assert_eq!(result.run_id.as_deref(), Some("run-1"));
+        assert_eq!(result.prompt_tokens, 123);
+        assert_eq!(result.completion_tokens, 45);
+        assert_eq!(result.tool_calls_count, 2);
+        assert_eq!(result.full_text, "partial answer");
+        assert!(result.server_terminal_unverified);
+        assert!(result.tool_record_coverage_partial);
+    }
+
+    #[test]
+    fn non_resumable_or_untyped_failure_stays_hard_error() {
+        for interruption in [
+            json!({"kind": "auth_failure", "resumable": false}),
+            json!({"kind": "budget_exhausted", "resumable": false}),
+            json!({"kind": "unknown_future_kind", "resumable": true}),
+        ] {
+            let failure = TurnFailure {
+                error: "provider failure".into(),
+                partial: PartialTurnData {
+                    interruption: Some(interruption),
+                    ..Default::default()
+                },
+            };
+            assert!(
+                stream_result_from_resumable_turn_failure(&failure).is_none(),
+                "untrusted interruption must not be promoted"
+            );
+        }
     }
 }

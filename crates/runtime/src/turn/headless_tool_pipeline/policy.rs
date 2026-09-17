@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::permission_gate::{PermissionCheckResult, permission_denied_error_result};
 use super::*;
-use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, openai_tool_roundtrip_values,
@@ -13,8 +12,8 @@ use astra_turn_core::headless_tool_assembly::{
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
-    journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_deferred_activation_hint, journal_record_duplicate_within_turn,
+    journal_record_blocked_tool, journal_record_cancelled_tool,
+    journal_record_cross_turn_cache_hit, journal_record_duplicate_within_turn,
     journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
     journal_record_unknown_tool,
 };
@@ -24,10 +23,11 @@ use astra_turn_core::headless_tool_stderr_lines::{
 };
 use astra_turn_core::tool::deferred_activation::{
     DirectDeferredCallAdmission, classify_direct_deferred_call,
-    deferred_tool_not_activatable_message, direct_deferred_call_activation_message,
-    tool_not_admitted_message,
+    deferred_tool_not_activatable_message, tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
+
+use super::record::safe_args_preview;
 
 const OUTCOME_MEMORY_FAILURE_BLOCK_WINDOW: usize = 2;
 const OUTCOME_MEMORY_FAILURE_BLOCK_MAX_AGE_SECS: u64 = 60 * 60;
@@ -111,6 +111,14 @@ fn is_validation_command_prefix(lower: &str) -> bool {
         || lower.starts_with("tsc --noemit ")
         || lower == "pytest"
         || lower.starts_with("pytest ")
+        || lower == "python -m pytest"
+        || lower.starts_with("python -m pytest ")
+        || lower == "python3 -m pytest"
+        || lower.starts_with("python3 -m pytest ")
+        || lower == "python -m unittest"
+        || lower.starts_with("python -m unittest ")
+        || lower == "python3 -m unittest"
+        || lower.starts_with("python3 -m unittest ")
         || lower == "npm test"
         || lower.starts_with("npm test ")
         || lower == "npm run build"
@@ -156,7 +164,28 @@ fn normalize_validation_prefix(tool_name: &str, args: &Value) -> Option<String> 
     None
 }
 
-fn emit_blocked_tool_result(
+fn edge_callback_conflict_message(
+    tool_name: &str,
+    call_id: &str,
+    conflict: EdgeMatchConflict,
+) -> String {
+    let detail = match conflict {
+        EdgeMatchConflict::DuplicateIdentity => {
+            "more than one callback claimed the provider call identity"
+        }
+        EdgeMatchConflict::AlreadyConsumed => {
+            "the callback identity was already consumed by another provider slot"
+        }
+        EdgeMatchConflict::ToolNameMismatch => {
+            "the callback identity claimed a different tool name"
+        }
+    };
+    format!(
+        "Error: headless edge protocol — tool `{tool_name}` (call `{call_id}`) has contradictory callback evidence: {detail}. The call was not redispatched. Retry only after the edge/server execution boundary is repaired."
+    )
+}
+
+pub(super) fn emit_blocked_tool_result(
     blocked: HeadlessBlockedTool<'_>,
     step_recorder: &mut astra_pipeline::step_recorder::StepRecorder,
     quiet: bool,
@@ -177,23 +206,37 @@ fn emit_blocked_tool_result(
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
-    let (tool_msg, err_tr) =
-        openai_tool_roundtrip_values(blocked.id, blocked.name, &blocked.err_msg);
+    let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+        blocked.id,
+        blocked.name,
+        &blocked.err_msg,
+        astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+    );
     messages.push(tool_msg);
     tool_results.push(err_tr);
     let record = match blocked.journal_kind {
         HeadlessShortCircuitJournalKind::HardBlocked => journal_record_blocked_tool(
+            blocked.id.to_string(),
             blocked.name.to_string(),
             blocked.journal_reason,
-            make_args_preview(blocked.name, blocked.args),
+            safe_args_preview(blocked.name, blocked.args),
             blocked.early_exit_ms,
         ),
         HeadlessShortCircuitJournalKind::SuppressedRetry => journal_record_suppressed_tool_retry(
+            blocked.id.to_string(),
             blocked.name.to_string(),
             blocked.reason_code,
             blocked.journal_reason,
-            make_args_preview(blocked.name, blocked.args),
+            safe_args_preview(blocked.name, blocked.args),
             blocked.early_exit_ms,
+        ),
+        HeadlessShortCircuitJournalKind::Cancelled { error_kind } => journal_record_cancelled_tool(
+            blocked.id.to_string(),
+            blocked.name.to_string(),
+            &blocked.journal_reason,
+            safe_args_preview(blocked.name, blocked.args),
+            blocked.early_exit_ms,
+            error_kind,
         ),
     };
     tool_call_records.push(record);
@@ -296,13 +339,28 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &slot.name,
             "turn_budget_exhausted",
             None,
-            make_args_preview(&slot.name, &slot.args).as_deref(),
+            safe_args_preview(&slot.name, &slot.args).as_deref(),
             Some(&body),
             false,
         );
-        let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+        let (tool_msg, tr) = headless_idempotency_hit_openai_pair(
+            &slot.id,
+            &slot.name,
+            &body,
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
+        );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
+        self.ctx
+            .tool_call_records
+            .push(journal_record_suppressed_tool_retry(
+                slot.id.clone(),
+                slot.name.clone(),
+                "turn_budget_exhausted",
+                body,
+                safe_args_preview(&slot.name, &slot.args),
+                0,
+            ));
     }
 
     pub(super) fn handle_empty_tool_name(
@@ -338,23 +396,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 headless_stderr_unknown_tool_detail(&err_msg),
             );
         }
-        let (tool_msg, err_tr) =
-            openai_tool_roundtrip_values(&slot.id, &slot.name, err_msg.as_str());
+        let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+            &slot.id,
+            &slot.name,
+            err_msg.as_str(),
+            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+        );
         trace_short_circuit_tool_skip(
             self.ctx.step_recorder,
             &slot.id,
             &slot.name,
             "unknown_tool",
             None,
-            make_args_preview(&slot.name, &slot.args).as_deref(),
+            safe_args_preview(&slot.name, &slot.args).as_deref(),
             Some(&err_msg),
             false,
         );
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(err_tr);
-        self.ctx
-            .tool_call_records
-            .push(journal_record_unknown_tool(slot.name.clone(), 0));
+        self.ctx.tool_call_records.push(journal_record_unknown_tool(
+            slot.id.clone(),
+            slot.name.clone(),
+            0,
+        ));
         // Unknown local tool names are catalog misses, not runtime failures.
         // Keeping them out of ToolHealth prevents removed or hallucinated
         // tools from being carried forward as "available but broken" hints.
@@ -375,15 +439,30 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         &mut self,
         item: HeadlessRoundToolIdx,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
-        if self.executed_this_turn >= self.ctx.max_tools_per_turn {
-            let slot = self.resolve_slot(item);
-            self.emit_turn_budget_stub(&slot);
+        let mut slot = self.resolve_slot(item);
+        if slot.synthetic_edge_index.is_none() {
+            super::inherit_external_effect_recovery_scope(
+                &slot.name,
+                &mut slot.args,
+                self.ctx.external_effect_recovery_paths,
+            );
+        }
+
+        if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        let slot = self.resolve_slot(item);
+        // The edge has already executed an exact provider call id.  Its
+        // settled result is historical fact, so post-execution retry and
+        // budget policy must not replace it with a synthetic skip.  A
+        // signature-only match is intentionally insufficient authority.
+        let has_exact_edge_result = self.exact_edge_callback_index(&slot).is_some_and(|index| {
+            self.ctx.edge_tool_round[index].has_explicit_assistant_tool_call_id()
+                && !self.consumed_edge[index]
+        });
 
-        if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
+        if !has_exact_edge_result && self.executed_this_turn >= self.ctx.max_tools_per_turn {
+            self.emit_turn_budget_stub(&slot);
             return HeadlessPipelineStage::ShortCircuit;
         }
 
@@ -396,10 +475,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.consecutive_empty_name = 0;
 
         let call_sig = tool_dedup_signature(&slot.name, &slot.args);
+        let health_identity =
+            astra_turn_core::tool_result_semantics::tool_health_identity(&slot.name, &slot.args);
         let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
         let scoped_call_sig = observation_scoped_signature(&slot.name, &call_sig, workspace_epoch);
         let idem_key = policy_idempotency_key(&slot.name, &slot.args, workspace_epoch);
-        let count = {
+        let count = if has_exact_edge_result {
+            0
+        } else {
             let count = self
                 .ctx
                 .call_counts
@@ -408,8 +491,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             *count = count.saturating_add(1);
             *count
         };
-        if count > self.ctx.max_identical_calls {
-            let args_preview = make_args_preview(&slot.name, &slot.args);
+        if !has_exact_edge_result && count > self.ctx.max_identical_calls {
+            let args_preview = safe_args_preview(&slot.name, &slot.args);
             let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(tr);
@@ -426,6 +509,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx
                 .tool_call_records
                 .push(journal_record_duplicate_within_turn(
+                    slot.id.clone(),
                     slot.name.clone(),
                     args_preview,
                 ));
@@ -440,8 +524,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        if let Some((repeat_count, remaining_secs)) =
-            should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &call_sig)
+        if !has_exact_edge_result
+            && let Some((repeat_count, remaining_secs)) =
+                should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
                 nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
@@ -467,8 +552,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        if let Some(failure_count) =
-            should_block_from_outcome_memory(&self.ctx.turn_guard.health, &call_sig)
+        if !has_exact_edge_result
+            && let Some(failure_count) =
+                should_block_from_outcome_memory(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
                 outcome_memory_block_message(&slot.name, &slot.args, failure_count);
@@ -494,14 +580,57 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        let execution = resolve_headless_tool_execution(
+        let (execution, edge_match_outcome) = resolve_headless_tool_execution(
             slot,
             self.ctx.edge_tool_round,
             &mut self.consumed_edge,
-            self.ctx.by_sig,
         );
+        self.observe_resolved_edge(&execution);
 
-        if !self.ctx.valid_tool_names.contains(&execution.name) {
+        // An explicit callback identity is execution custody. If that
+        // identity is contradictory, treating it as an absent callback would
+        // route the same provider call through a second executor and could
+        // repeat an external side effect. Fail closed with one shared-loop
+        // terminal; only the typed Absent outcome may continue to runtime
+        // dispatch below.
+        if let Some(conflict) = edge_match_outcome.conflict() {
+            let err_msg = edge_callback_conflict_message(&execution.name, &execution.id, conflict);
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "edge_callback_conflict",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
+                    err_msg: err_msg.clone(),
+                    journal_reason: err_msg,
+                    early_exit_ms: 0,
+                    status_line: None,
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let resolved_deferred = self
+            .ctx
+            .deferred_activations_by_call_id
+            .get(&execution.id)
+            .is_some_and(|activation| activation.name == execution.name);
+        let resolved_runtime_control = self
+            .ctx
+            .runtime_control_calls_by_id
+            .get(&execution.id)
+            .is_some_and(|kind| kind.tool_name() == execution.name);
+        if !self.ctx.valid_tool_names.contains(&execution.name)
+            && !resolved_deferred
+            && !resolved_runtime_control
+        {
             let is_prompt_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
             let is_activatable_deferred = self.ctx.runtime_tool_executor.is_some_and(|exec| {
                 exec.current_activatable_tool_names_snapshot()
@@ -518,15 +647,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 is_prompt_deferred && is_activatable_deferred,
                 tool_runtime_ready,
             ) {
-                DirectDeferredCallAdmission::Activate { name } => {
-                    if let Some(exec) = self.ctx.runtime_tool_executor {
-                        exec.record_direct_deferred_call_activation(&name);
-                    }
-                    (
-                        direct_deferred_call_activation_message(&name),
-                        "direct_deferred_call_activated",
-                    )
-                }
+                DirectDeferredCallAdmission::Activate { name } => (
+                    format!(
+                        "Tool '{name}' is deferred. Call tool_search with query 'select:{name}', then invoke it through invoke_tool."
+                    ),
+                    "direct_deferred_call_requires_carrier",
+                ),
                 DirectDeferredCallAdmission::NotAdmitted => {
                     if astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
                         &execution.name,
@@ -579,7 +705,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     }
                 }
             };
-            let args_preview = make_args_preview(&execution.name, &execution.args);
+            let args_preview = safe_args_preview(&execution.name, &execution.args);
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
                     HeadlessStderrStyle::Red,
@@ -590,8 +716,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     headless_stderr_unknown_tool_detail(&err_msg),
                 );
             }
-            let (tool_msg, err_tr) =
-                openai_tool_roundtrip_values(&execution.id, &execution.name, &err_msg);
+            let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+                &execution.id,
+                &execution.name,
+                &err_msg,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+            );
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
@@ -605,24 +735,17 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
             if is_prompt_deferred {
-                let record = if skip_reason == "direct_deferred_call_activated" {
-                    journal_record_deferred_activation_hint(
-                        execution.name.clone(),
-                        args_preview.clone(),
-                        &err_msg,
-                        execution.early_exit_ms,
-                    )
-                } else {
-                    journal_record_tool_not_admitted(
-                        execution.name.clone(),
-                        args_preview.clone(),
-                        &err_msg,
-                        execution.early_exit_ms,
-                    )
-                };
+                let record = journal_record_tool_not_admitted(
+                    execution.id.clone(),
+                    execution.name.clone(),
+                    args_preview.clone(),
+                    &err_msg,
+                    execution.early_exit_ms,
+                );
                 self.ctx.tool_call_records.push(record);
             } else {
                 self.ctx.tool_call_records.push(journal_record_unknown_tool(
+                    execution.id.clone(),
                     execution.name.clone(),
                     execution.early_exit_ms,
                 ));
@@ -670,8 +793,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        if let Some(validation_prefix) =
-            normalize_validation_prefix(&execution.name, &execution.args)
+        if !execution.is_edge_tool
+            && let Some(validation_prefix) =
+                normalize_validation_prefix(&execution.name, &execution.args)
         {
             let prior_attempts = self
                 .ctx
@@ -713,6 +837,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 .record_validation_attempt(&validation_prefix);
         }
 
+        if execution.is_edge_tool {
+            if let Some(snapshot) = execution.edge_replay_snapshot() {
+                self.slot_settlements.insert(
+                    execution.id.clone(),
+                    SlotSettlement::PendingEdgeValidated {
+                        execution: snapshot,
+                        idem_key: idem_key.clone(),
+                    },
+                );
+            }
+        }
+
         HeadlessPipelineStage::Continue(ValidatedExecution {
             execution,
             idem_key,
@@ -727,23 +863,33 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         execution: &HeadlessResolvedExecution,
         idem_key: &IdempotencyKey,
     ) -> bool {
+        // A settled edge result is already the execution outcome for this
+        // exact call id. Reusing an older observation here would overwrite
+        // executor truth and can make the ledger claim the call never ran.
+        if execution.is_edge_tool {
+            return false;
+        }
         if !READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             return false;
         }
 
         let workspace_epoch = self.ctx.turn_guard.workspace_epoch();
-        let call_sig = tool_dedup_signature(&execution.name, &execution.args);
-        let scoped_call_sig =
-            observation_scoped_signature(&execution.name, &call_sig, workspace_epoch);
+        let health_identity = astra_turn_core::tool_result_semantics::scoped_tool_health_identity(
+            &execution.name,
+            &execution.args,
+            READ_ONLY_TOOLS
+                .contains(&execution.name.as_str())
+                .then_some(workspace_epoch),
+        );
 
         if let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() {
             let cache_key = idem_key.cache_key();
-            let args_preview = make_args_preview(&execution.name, &execution.args);
+            let args_preview = safe_args_preview(&execution.name, &execution.args);
             let prior_cache_hits = self
                 .ctx
                 .turn_guard
                 .health
-                .cache_hits_for_signature(&scoped_call_sig);
+                .cache_hits_for_signature(&health_identity);
             if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                 let body = format!(
                     "⛔ Repeated cached read suppressed: this exact {} request has already \
@@ -752,8 +898,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                      change the arguments.",
                     execution.name, prior_cache_hits
                 );
-                let (tool_msg, tr) =
-                    openai_tool_roundtrip_values(&execution.id, &execution.name, &body);
+                let (tool_msg, tr) = openai_tool_roundtrip_values(
+                    &execution.id,
+                    &execution.name,
+                    &body,
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped,
+                );
                 self.ctx.messages.push(tool_msg);
                 self.ctx.tool_results.push(tr);
                 self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
@@ -772,10 +922,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
                 self.ctx
                     .turn_guard
-                    .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                    .record_cache_hit_for_signature(&health_identity);
                 self.ctx
                     .tool_call_records
                     .push(journal_record_cross_turn_cache_hit(
+                        execution.id.clone(),
                         execution.name.clone(),
                         body.len() as u32,
                         args_preview,
@@ -811,6 +962,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 &execution.id,
                 &execution.name,
                 &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
             );
             if let Some(obj) = tool_msg.as_object_mut() {
                 obj.insert(
@@ -841,10 +993,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
+                    execution.id.clone(),
                     execution.name.clone(),
                     cached.output.len() as u32,
                     args_preview,
@@ -861,12 +1014,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 workspace_epoch,
             )
         {
-            let args_preview = make_args_preview(&execution.name, &execution.args);
+            let args_preview = safe_args_preview(&execution.name, &execution.args);
             let prior_cache_hits = self
                 .ctx
                 .turn_guard
                 .health
-                .cache_hits_for_signature(&scoped_call_sig);
+                .cache_hits_for_signature(&health_identity);
             let (body, reason_code) =
                 if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     (
@@ -894,8 +1047,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     }
                     (output, "semantic_dedup_pre_check")
                 };
-            let (mut tool_msg, tr) =
-                headless_idempotency_hit_openai_pair(&execution.id, &execution.name, &body);
+            let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
+                &execution.id,
+                &execution.name,
+                &body,
+                if reason_code == REASON_REPEATED_CACHE_HIT_SUPPRESSED {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Skipped
+                } else {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+                },
+            );
             if let Some(obj) = tool_msg.as_object_mut() {
                 obj.insert(
                     "_round_index".to_string(),
@@ -920,10 +1081,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             );
             self.ctx
                 .turn_guard
-                .record_cache_hit_for_signature(&execution.name, &scoped_call_sig);
+                .record_cache_hit_for_signature(&health_identity);
             self.ctx
                 .tool_call_records
                 .push(journal_record_cross_turn_cache_hit(
+                    execution.id.clone(),
                     execution.name.clone(),
                     body.len() as u32,
                     args_preview,
@@ -1240,7 +1402,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
 fn should_block_from_outcome_memory(
     health: &astra_turn_core::tool_health::ToolHealthTracker,
-    call_sig: &str,
+    call_sig: &astra_pipeline::ToolHealthIdentity,
 ) -> Option<usize> {
     let history = health.outcome_history(call_sig)?;
     let recent: Vec<_> = history
@@ -1268,7 +1430,7 @@ fn should_block_from_outcome_memory(
 
 fn should_backoff_from_nonprogress(
     health: &astra_turn_core::tool_health::ToolHealthTracker,
-    call_sig: &str,
+    call_sig: &astra_pipeline::ToolHealthIdentity,
 ) -> Option<(usize, u64)> {
     use astra_turn_core::action_compensation::FailureCategory;
 

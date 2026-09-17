@@ -8,8 +8,8 @@
 //! variables, allowing production tuning without recompilation.
 //!
 //! ```text
-//! ASTRA_MAX_TURNS=300             # conversation turns per session
-//! ASTRA_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use ASTRA_MAX_TURNS)
+//! ASTRA_MAX_TURNS=300             # optional positive execution-round cap; unset = uncapped
+//! ASTRA_PLAN_SUBTASK_MAX_TURNS=100 # optional positive subtask cap; unset = inherit ASTRA_MAX_TURNS
 //! ASTRA_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
 //! ASTRA_GLOBAL_OUTPUT_LIMIT=200000 # combined tool output bytes
 //! ASTRA_TOOL_OUTPUT_LIMIT=80000   # per-tool output bytes
@@ -19,8 +19,6 @@
 //! ASTRA_MAX_TURN_INPUT_TOKENS=200000 # max LLM input tokens per turn (0 = use model ceiling only)
 //! ```
 
-pub(crate) const DEFAULT_MAX_TURNS: usize = 300;
-pub(crate) const DEFAULT_PLAN_SUBTASK_MAX_TURNS: usize = 0;
 pub(crate) const DEFAULT_TURN_TIMEOUT_S: u64 = 300;
 pub(crate) const DEFAULT_GLOBAL_OUTPUT_LIMIT: usize = 200_000;
 pub(crate) const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 80_000;
@@ -39,14 +37,19 @@ use std::sync::OnceLock;
 /// Global runtime limits, loaded once from env on first access.
 static LIMITS: OnceLock<RuntimeLimits> = OnceLock::new();
 
+/// Explicit round constraints. Parsing errors are retained until admission;
+/// they must never silently become an uncapped execution policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoundLimits {
+    pub max_turns: Option<std::num::NonZeroUsize>,
+    pub plan_subtask_max_turns: Option<std::num::NonZeroUsize>,
+}
+
 /// Centralized runtime limits.  Read from `MO_*` env vars with defaults.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimits {
-    /// Maximum conversation turns per session.
-    pub max_turns: usize,
-    /// Per-subtask turn budget for plan execution.
-    /// 0 means fall back to `max_turns`.
-    pub plan_subtask_max_turns: usize,
+    /// One authoritative parsing result for optional round constraints.
+    pub round_limits: Result<RoundLimits, String>,
     /// Per-turn hard timeout in seconds.
     pub turn_timeout_s: f64,
     /// Combined tool output truncation limit (bytes).
@@ -68,8 +71,7 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_turns: DEFAULT_MAX_TURNS,
-            plan_subtask_max_turns: DEFAULT_PLAN_SUBTASK_MAX_TURNS,
+            round_limits: Ok(RoundLimits::default()),
             turn_timeout_s: DEFAULT_TURN_TIMEOUT_S as f64,
             global_output_limit: DEFAULT_GLOBAL_OUTPUT_LIMIT,
             tool_output_limit: DEFAULT_TOOL_OUTPUT_LIMIT,
@@ -92,11 +94,15 @@ impl RuntimeLimits {
     /// set site-specific values while still permitting ad-hoc env tuning.
     pub fn from_config_with_env(cfg: &crate::config::ServerRuntimeConfig) -> Self {
         Self {
-            max_turns: env_parse("ASTRA_MAX_TURNS", cfg.max_turns()),
-            plan_subtask_max_turns: env_parse(
-                "ASTRA_PLAN_SUBTASK_MAX_TURNS",
-                cfg.plan_subtask_max_turns(),
-            ),
+            round_limits: (|| {
+                Ok(RoundLimits {
+                    max_turns: optional_round_limit("ASTRA_MAX_TURNS", cfg.max_turns)?,
+                    plan_subtask_max_turns: optional_round_limit(
+                        "ASTRA_PLAN_SUBTASK_MAX_TURNS",
+                        cfg.plan_subtask_max_turns,
+                    )?,
+                })
+            })(),
             turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", cfg.turn_timeout_s() as f64),
             global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", cfg.global_output_limit()),
             tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", cfg.tool_output_limit()),
@@ -115,14 +121,20 @@ impl RuntimeLimits {
         LIMITS.get_or_init(Self::from_env)
     }
 
+    pub fn max_rounds(&self) -> Result<Option<std::num::NonZeroUsize>, String> {
+        self.round_limits
+            .as_ref()
+            .map(|limits| limits.max_turns)
+            .map_err(Clone::clone)
+    }
+
     /// Effective turn budget for a plan subtask.
-    /// Returns `plan_subtask_max_turns` if set (> 0), otherwise `max_turns`.
-    pub fn effective_plan_subtask_turns(&self) -> usize {
-        if self.plan_subtask_max_turns > 0 {
-            self.plan_subtask_max_turns
-        } else {
-            self.max_turns
-        }
+    /// Returns the explicit plan limit, otherwise the optional global limit.
+    pub fn effective_plan_subtask_turns(&self) -> Result<Option<std::num::NonZeroUsize>, String> {
+        self.round_limits
+            .as_ref()
+            .map(|limits| limits.plan_subtask_max_turns.or(limits.max_turns))
+            .map_err(Clone::clone)
     }
 
     /// Resolve the effective max_turn_input_tokens for a given model.
@@ -160,6 +172,27 @@ impl RuntimeLimits {
             (None, configured) => configured,
         }
     }
+
+    /// Resolve input capacity for an admitted registered model.
+    ///
+    /// Registered execution must carry its catalog context window. Falling
+    /// back to a process-wide token number would silently invent a different
+    /// physical model limit for child runs.
+    pub fn require_admitted_model_input_tokens(
+        &self,
+        model: Option<&str>,
+        context_window: Option<u32>,
+    ) -> Result<u64, String> {
+        let context_window = context_window.ok_or_else(|| {
+            "admitted model execution requires positive context_window metadata".to_string()
+        })?;
+        if context_window == 0 {
+            return Err(
+                "admitted model execution requires positive context_window metadata".to_string(),
+            );
+        }
+        Ok(self.effective_max_turn_input_tokens_with_context_window(model, Some(context_window)))
+    }
 }
 
 /// Configured context window size for a model.
@@ -195,6 +228,33 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn optional_round_limit(
+    key: &str,
+    configured: Option<usize>,
+) -> Result<Option<std::num::NonZeroUsize>, String> {
+    parse_optional_round_limit(key, std::env::var(key), configured)
+}
+
+fn parse_optional_round_limit(
+    key: &str,
+    environment: Result<String, std::env::VarError>,
+    configured: Option<usize>,
+) -> Result<Option<std::num::NonZeroUsize>, String> {
+    match environment {
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{key} must be a positive integer when configured")),
+        Err(std::env::VarError::NotPresent) => configured
+            .map(|value| {
+                std::num::NonZeroUsize::new(value)
+                    .ok_or_else(|| format!("{key} configured round limit must be positive"))
+            })
+            .transpose(),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{key} must be valid UTF-8")),
+    }
+}
+
 // ── Default password constant ───────────────────────────────────────────────
 
 /// Default MatrixOne password used in development mode only.
@@ -225,23 +285,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_plan_subtask_turns_falls_back_to_max_turns() {
+    fn explicit_round_limit_parsing_preserves_absence_and_rejects_invalid_values() {
+        use std::env::VarError::NotPresent;
+        assert_eq!(
+            parse_optional_round_limit("limit", Err(NotPresent), None),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_optional_round_limit("limit", Err(NotPresent), Some(50)),
+            Ok(std::num::NonZeroUsize::new(50))
+        );
+        assert_eq!(
+            parse_optional_round_limit("limit", Ok("70".into()), Some(50)),
+            Ok(std::num::NonZeroUsize::new(70))
+        );
+        for value in ["0", "-1", "", "invalid-private-value"] {
+            let error =
+                parse_optional_round_limit("limit", Ok(value.into()), Some(50)).unwrap_err();
+            assert_eq!(error, "limit must be a positive integer when configured");
+        }
+        assert!(parse_optional_round_limit("limit", Err(NotPresent), Some(0)).is_err());
+    }
+
+    #[test]
+    fn invalid_round_policy_remains_an_error_at_admission() {
         let limits = RuntimeLimits {
-            plan_subtask_max_turns: 0,
-            max_turns: 50,
+            round_limits: Err("ASTRA_MAX_TURNS must be positive".to_string()),
             ..Default::default()
         };
-        assert_eq!(limits.effective_plan_subtask_turns(), 50);
+        assert_eq!(
+            limits.max_rounds(),
+            Err("ASTRA_MAX_TURNS must be positive".to_string())
+        );
+        assert_eq!(limits.effective_plan_subtask_turns(), limits.max_rounds());
+    }
+
+    #[test]
+    fn omitted_round_limits_do_not_manufacture_a_task_deadline() {
+        let limits = RuntimeLimits::default();
+        assert_eq!(limits.max_rounds(), Ok(None));
+        assert_eq!(limits.effective_plan_subtask_turns(), Ok(None));
+    }
+
+    #[test]
+    fn effective_plan_subtask_turns_falls_back_to_max_turns() {
+        let limits = RuntimeLimits {
+            round_limits: Ok(RoundLimits {
+                plan_subtask_max_turns: None,
+                max_turns: std::num::NonZeroUsize::new(50),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.effective_plan_subtask_turns(),
+            Ok(std::num::NonZeroUsize::new(50))
+        );
     }
 
     #[test]
     fn effective_plan_subtask_turns_uses_explicit_value() {
         let limits = RuntimeLimits {
-            plan_subtask_max_turns: 80,
-            max_turns: 50,
+            round_limits: Ok(RoundLimits {
+                plan_subtask_max_turns: std::num::NonZeroUsize::new(80),
+                max_turns: std::num::NonZeroUsize::new(50),
+            }),
             ..Default::default()
         };
-        assert_eq!(limits.effective_plan_subtask_turns(), 80);
+        assert_eq!(
+            limits.effective_plan_subtask_turns(),
+            Ok(std::num::NonZeroUsize::new(80))
+        );
     }
 
     #[test]
@@ -348,6 +461,30 @@ mod tests {
                 Some(1_000_000)
             ),
             800_000
+        );
+    }
+
+    #[test]
+    fn admitted_model_input_tokens_require_catalog_context_and_honor_admin_cap() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 150_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), Some(1_000_000))
+                .unwrap(),
+            150_000
+        );
+        assert!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), None)
+                .is_err()
+        );
+        assert!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), Some(0))
+                .is_err()
         );
     }
 }

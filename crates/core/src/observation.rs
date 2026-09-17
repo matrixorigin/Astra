@@ -117,7 +117,7 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
         // Workspace mutation
         "str_replace" | "write_file" | "apply_patch" | "write" | "edit" => ToolFamily::Write,
         // Version control
-        "git" | "git_commit" | "git_push" | "git_diff" | "git_log" | "git_blame" => ToolFamily::Git,
+        "worktree" => ToolFamily::Git,
         // Shell execution
         "bash" | "shell" | "run_command" | "exec" => ToolFamily::Shell,
         // Everything else
@@ -128,10 +128,7 @@ pub fn classify_tool_family(tool_name: &str) -> ToolFamily {
 fn is_workspace_mutation_tool(tool_name: &str, family: ToolFamily) -> bool {
     match family {
         ToolFamily::Write => true,
-        ToolFamily::Git => matches!(
-            tool_name,
-            "git_commit" | "git_push" | "git_merge" | "git_rebase" | "git_checkout" | "git_reset"
-        ),
+        ToolFamily::Git => tool_name == "worktree",
         _ => false,
     }
 }
@@ -269,38 +266,6 @@ impl TurnMetrics {
             file_access_counts,
             error_streaks,
         }
-    }
-
-    /// Build metrics from raw tool-call records (legacy tuple API).
-    ///
-    /// Each record is `(tool_name, ok, round, file_path)`. Surgically-removed
-    /// placeholders should already be filtered out before calling this.
-    #[deprecated(note = "Use from_samples with ToolCallSample for richer error tracking")]
-    pub fn from_tool_records(
-        records: &[(&str, bool, Option<u32>, Option<&str>)],
-        rounds_completed: u32,
-        tokens_consumed: u64,
-    ) -> Self {
-        // Sliding window: only count records from the last DEFAULT_WINDOW rounds.
-        // Records without a round marker are always included (conservative).
-        // e.g., rounds_completed=6, window=3 → rounds 4,5,6
-        const DEFAULT_WINDOW: u32 = 3;
-        let window_start = rounds_completed.saturating_sub(DEFAULT_WINDOW.saturating_sub(1));
-        let filtered: Vec<&(_, _, _, _)> = records
-            .iter()
-            .filter(|r| r.2.is_none_or(|round| round >= window_start))
-            .collect();
-        let samples: Vec<ToolCallSample<'_>> = filtered
-            .iter()
-            .map(|&&(name, ok, round, file_path)| ToolCallSample {
-                name,
-                ok,
-                round,
-                file_path,
-                error: None,
-            })
-            .collect();
-        Self::from_samples(&samples, rounds_completed, tokens_consumed)
     }
 
     /// Compute derived metrics that are ratios or aggregates.
@@ -492,6 +457,16 @@ pub enum ObservationDepth {
 }
 
 impl ObservationDepth {
+    /// Maximum observation, evidence, and action-hint counts for this depth.
+    pub const fn report_limits(self) -> (usize, usize, usize) {
+        match self {
+            Self::Hint => (3, 1, 2),
+            Self::Summary => (8, 4, 4),
+            Self::Diagnostic => (32, 16, 8),
+            Self::Forensic => (100, 50, 8),
+        }
+    }
+
     pub fn from_arg(arg: &str) -> Self {
         match normalize_observation_arg(arg).as_str() {
             "hint" => Self::Hint,
@@ -1052,139 +1027,6 @@ fn clamp_confidence(value: f64) -> f64 {
     }
 }
 
-// ── TuningJob ────────────────────────────────────────────────────────────────
-
-/// A tuning signal emitted when the Observation Plane detects adaptation
-/// triggers. TuningJobs are fire-and-forget — they are written to a sink
-/// (file, cloud queue) without blocking the agentic loop.
-///
-/// # When TuningJobs are generated
-///
-/// | Trigger | Generated Signal |
-/// |---------|-----------------|
-/// | Token pressure > 0.8 | `PromptCompaction` |
-/// | Token pressure > 0.95 | `AggressiveCompaction` |
-/// | Error rate > 0.3 | `CircuitBreakerTuning` |
-/// | Frequent compaction (≥3 in recent window) | `CompactionPolicyTuning` |
-/// | Cache hit ratio < 0.3 after 10+ turns | `CacheWarming` |
-/// | Task completion stalled (ratio < 1.0 for 5+ turns) | `TaskDecomposition` |
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TuningJob {
-    /// Type of tuning signal.
-    pub signal: TuningSignalType,
-    /// The current value that triggered this signal.
-    pub trigger_value: f64,
-    /// Brief diagnostic summary (max 200 chars).
-    pub reason: String,
-    /// Unix timestamp in milliseconds.
-    pub created_at_ms: u64,
-    /// Turn index when the signal was generated.
-    pub turn_index: u32,
-    /// Session id for traceability.
-    pub session_id: String,
-    /// Priority: 0 (advisory) to 10 (critical).
-    pub priority: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum TuningSignalType {
-    /// Token pressure crossed normal threshold → suggest compaction.
-    PromptCompaction,
-    /// Token pressure critical → urgent aggressive compaction.
-    AggressiveCompaction,
-    /// Error rate too high → tighten circuit breaker thresholds.
-    CircuitBreakerTuning,
-    /// Compaction triggered too frequently → adjust compaction policy.
-    CompactionPolicyTuning,
-    /// Cache hit ratio too low → warm cache or adjust prefetch.
-    CacheWarming,
-    /// Task board stalled for many turns → suggest decomposition.
-    TaskDecomposition,
-}
-
-impl std::fmt::Display for TuningSignalType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PromptCompaction => write!(f, "prompt_compaction"),
-            Self::AggressiveCompaction => write!(f, "aggressive_compaction"),
-            Self::CircuitBreakerTuning => write!(f, "circuit_breaker_tuning"),
-            Self::CompactionPolicyTuning => write!(f, "compaction_policy_tuning"),
-            Self::CacheWarming => write!(f, "cache_warming"),
-            Self::TaskDecomposition => write!(f, "task_decomposition"),
-        }
-    }
-}
-
-// ── Tuning Consumer Types ──────────────────────────────────────────────────
-
-/// Aggregated statistics for a single [`TuningSignalType`] across sessions.
-///
-/// Produced by [`TuningConsumer::aggregate`]; consumed to generate
-/// [`OptimizationSuggestion`] entries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TuningAggregation {
-    /// The signal type being aggregated.
-    pub signal_type: TuningSignalType,
-    /// Total count of this signal across all sessions.
-    pub total_count: u64,
-    /// Number of distinct sessions where this signal appeared.
-    pub session_count: u32,
-    /// Average priority (0-10) across occurrences.
-    pub avg_priority: f64,
-    /// Average trigger value across occurrences.
-    pub avg_trigger_value: f64,
-    /// Most recent timestamp (unix ms) when this signal was emitted.
-    pub latest_at_ms: u64,
-    /// Sample reasons (up to 3, for diagnostic display).
-    pub sample_reasons: Vec<String>,
-}
-
-/// A concrete optimization recommendation produced by [`TuningConsumer`].
-///
-/// Suggestions are advisory and human-readable; they describe *what* to change
-/// and *why*, but do not apply changes automatically.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OptimizationSuggestion {
-    /// Human-readable title (e.g. "Increase compaction pressure threshold").
-    pub title: String,
-    /// The signal type that triggered this suggestion.
-    pub source_signal: TuningSignalType,
-    /// What parameter or behavior to change.
-    pub target: String,
-    /// Recommended new value (as a human-readable string).
-    pub recommended_value: String,
-    /// Current observed value (if measurable).
-    pub current_value: Option<String>,
-    /// Evidence summary — why this change is recommended.
-    pub reason: String,
-    /// Confidence in this recommendation (0.0–1.0).
-    pub confidence: f64,
-    /// Priority: 0 (advisory) to 10 (critical).
-    pub priority: u8,
-    /// Number of tuning signals backing this suggestion.
-    pub signal_count: u64,
-}
-
-/// Overall summary of tuning data across all sessions.
-///
-/// The top-level output of [`TuningConsumer::summarize`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TuningSummary {
-    /// Number of sessions scanned.
-    pub sessions_scanned: u32,
-    /// Total tuning job entries found.
-    pub total_jobs: u64,
-    /// Per-signal-type aggregations.
-    pub aggregations: Vec<TuningAggregation>,
-    /// Generated optimization suggestions.
-    pub suggestions: Vec<OptimizationSuggestion>,
-    /// Human-readable summary text.
-    pub summary_text: String,
-    /// Unix timestamp when this summary was produced.
-    pub generated_at_ms: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_git_tools_do_not_count_as_workspace_mutations() {
+    fn removed_git_tools_do_not_count_as_workspace_mutations() {
         let samples = [
             ToolCallSample {
                 name: "git_diff",
@@ -1274,7 +1116,10 @@ mod tests {
             },
         ];
         let metrics = TurnMetrics::from_samples(&samples, 1, 100);
-        assert_eq!(metrics.tool_calls_by_family.get(&ToolFamily::Git), Some(&3));
+        assert_eq!(
+            metrics.tool_calls_by_family.get(&ToolFamily::Other),
+            Some(&3)
+        );
         assert_eq!(
             metrics.mutation_count, 0,
             "read-only git inspection must not fabricate workspace progress"
@@ -1282,17 +1127,17 @@ mod tests {
     }
 
     #[test]
-    fn mutating_git_tools_count_as_workspace_mutations() {
+    fn worktree_lifecycle_counts_as_workspace_mutations() {
         let samples = [
             ToolCallSample {
-                name: "git_commit",
+                name: "worktree",
                 ok: true,
                 round: Some(2),
                 file_path: None,
                 error: None,
             },
             ToolCallSample {
-                name: "git_push",
+                name: "worktree",
                 ok: true,
                 round: Some(2),
                 file_path: None,

@@ -4,6 +4,7 @@ import type {
   RunInterruptedEvent,
   StreamErrorEvent,
 } from "@astra/sdk";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
 import {
   setChatActiveRun,
   updateStreamingAssistantMessage,
@@ -97,6 +98,30 @@ export function isRunBlockedEvent(type: string): boolean {
   return type === "run_blocked";
 }
 
+/** Persist observation facts without replaying transcript or lifecycle mutations. */
+export function applyExplainAnalyzeObservation(
+  event: StreamEvent,
+  ctx: StreamEventContext,
+  replayOnly = false,
+): void {
+  if (event.type === "artifact_publication" && isArtifactPublicationV1(event)) {
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { artifactPublication: event });
+  } else if (event.type === "explain_analyze") {
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId,
+      isExplainAnalyzeEventV1(event)
+        ? { explainAnalyzeEvent: event }
+        : { explainAnalyzeDegraded: true, explainAnalyzeUnrecoverable: true });
+  } else if (event.type === "stream_gap" &&
+    event.explain_analyze_recovered !== true &&
+    (!replayOnly || event.explain_analyze_recovered === false)) {
+    // Legacy transport-gap markers can themselves be replayed. Only an explicit
+    // unrecoverable Explain boundary proves that a durable repair is incomplete.
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId,
+      { explainAnalyzeDegraded: true,
+        ...(event.explain_analyze_recovered === false ? { explainAnalyzeUnrecoverable: true } : {}) });
+  }
+}
+
 export function applyStreamEvent(
   event: StreamEvent,
   ctx: StreamEventContext,
@@ -187,6 +212,18 @@ export function applyStreamEvent(
           waitingFor: null,
         });
       }
+      break;
+    }
+
+    case "artifact_publication": {
+      if (!isArtifactPublicationV1(event)) throw new Error("Invalid report publication result.");
+      updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { artifactPublication: event });
+      break;
+    }
+
+    case "explain_analyze":
+    case "stream_gap": {
+      applyExplainAnalyzeObservation(event, ctx);
       break;
     }
 

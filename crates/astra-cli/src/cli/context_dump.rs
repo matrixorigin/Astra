@@ -79,7 +79,6 @@ pub struct ChatTurnDump {
 #[derive(Debug, Clone, Serialize)]
 pub struct Totals {
     pub cost_usd: f64,
-    pub max_budget_usd: f64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -139,7 +138,6 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
         chat_history,
         totals: Totals {
             cost_usd: state.total_session_cost,
-            max_budget_usd: state.max_budget_limit,
             prompt_tokens: state.total_prompt_tokens,
             completion_tokens: state.total_completion_tokens,
             cache_read_tokens: state.total_cache_read_tokens,
@@ -225,41 +223,41 @@ pub fn resolve_session_id(arg: Option<&str>) -> Result<String, String> {
 /// terminal.
 pub fn print_summary(session_id: &str) -> Result<(), String> {
     let dump = build_dump_from_journal(session_id)?;
-    println!(
+    stdout_println!(
         "Session {}  ·  turn {}",
         dump.session_id.as_deref().unwrap_or("?"),
         dump.turn
     );
     if let Some(m) = &dump.model {
-        println!("  model: {m}");
+        stdout_println!("  model: {m}");
     }
     if let Some(cwd) = &dump.cwd {
-        println!("  cwd: {cwd}");
+        stdout_println!("  cwd: {cwd}");
     }
     if let Some(git_branch) = &dump.git_branch {
-        println!("  git: {git_branch}");
+        stdout_println!("  git: {git_branch}");
     }
     if let Some(error) = &dump.persistence_error {
-        println!("  persistence: degraded · {error}");
+        stdout_println!("  persistence: degraded · {error}");
     }
-    println!(
+    stdout_println!(
         "  tokens: in {} · out {} · cache-read {} · cache-create {}",
         fmt_tokens_u64(dump.totals.prompt_tokens),
         fmt_tokens_u64(dump.totals.completion_tokens),
         fmt_tokens_u64(dump.totals.cache_read_tokens),
         fmt_tokens_u64(dump.totals.cache_creation_tokens),
     );
-    println!("  chat turns: {} recorded", dump.chat_history.len());
+    stdout_println!("  chat turns: {} recorded", dump.chat_history.len());
     if !dump.compressed_turns.is_empty() {
         let rendered: Vec<String> = dump
             .compressed_turns
             .iter()
             .map(|t| t.to_string())
             .collect();
-        println!("  compaction fired on turns: {}", rendered.join(", "));
+        stdout_println!("  compaction fired on turns: {}", rendered.join(", "));
     }
     if dump.trace.is_none() {
-        println!("  trace: (none captured in journal)");
+        stdout_println!("  trace: (none captured in journal)");
     }
     Ok(())
 }
@@ -397,7 +395,6 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
         chat_history: chat,
         totals: Totals {
             cost_usd,
-            max_budget_usd: 0.0,
             prompt_tokens,
             completion_tokens,
             cache_read_tokens,
@@ -537,7 +534,6 @@ mod tests {
             }],
             totals: Totals {
                 cost_usd: 0.0,
-                max_budget_usd: 0.0,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cache_read_tokens: 0,
@@ -571,7 +567,6 @@ mod tests {
             chat_history: Vec::new(),
             totals: Totals {
                 cost_usd: 0.0,
-                max_budget_usd: 0.0,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cache_read_tokens: 0,

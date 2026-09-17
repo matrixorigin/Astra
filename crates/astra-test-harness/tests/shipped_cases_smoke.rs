@@ -76,39 +76,39 @@ fn shipped_case_names_are_unique() {
     );
 }
 
+#[test]
+fn product_capability_model_probes_resolve_to_shipped_cases() {
+    let cases = Case::load_dir(&shipped_cases_dir()).expect("load shipped cases");
+    let coverage = astra_test_harness::capability_coverage::validate_capability_coverage(&cases)
+        .expect("every declared product model probe must resolve");
+
+    assert_eq!(
+        coverage.product_capabilities,
+        astra_harness::CAPABILITY_CASES.len()
+    );
+    assert!(!coverage.model_probes.is_empty());
+    assert!(coverage.deterministic_only > 0);
+}
+
 // ── Class D regression: YAML criteria that don't match real CLI behavior ──
 
 // text_rejects_hallucinated_file_claim removed — merged into anti_hallucination_two_vectors
 
 #[test]
-fn fork_prefix_hit_e2e_tool_count_allows_model_retry() {
-    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_hit_end_to_end.yaml"))
-        .expect("load case");
-    let max = case.criteria.iter().find_map(|c| match c {
-        astra_test_harness::criteria::Criterion::ToolsCountBetween { max, .. } => Some(*max),
-        _ => None,
-    });
-    let max = max
-        .expect("fork_prefix_hit_end_to_end is missing a tools_count_between criterion entirely");
-    assert!(
-        max >= 6,
-        "fork_prefix_hit_end_to_end tools_count max={max} is too strict; \
-         models may retry spawn_agent. Needs >= 6.",
-    );
-}
-
-#[test]
-fn fork_prefix_spawn_inherits_uses_spawn_agent_not_delegate() {
+fn fork_prefix_spawn_inherits_uses_canonical_agent_not_delegate() {
     let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_spawn_inherits.yaml"))
         .expect("load case");
     let requires_delegate = case.criteria.iter().any(|c| {
         matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "delegate")
     });
+    let requires_agent = case.criteria.iter().any(|c| {
+        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "agent")
+    });
     assert!(
-        !requires_delegate,
+        requires_agent && !requires_delegate,
         "fork_prefix_spawn_inherits must not require tool_called: delegate. \
          The delegate tool is not available in `astra chat` — it only exists \
-         in the server-side DelegationEngine. Use spawn_agent instead."
+         in the server-side DelegationEngine. Use canonical agent spawn instead."
     );
 }
 

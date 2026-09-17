@@ -1730,8 +1730,7 @@ impl PermissionManager {
     /// Export the current effective permission envelope for a spawned child agent.
     ///
     /// Issue #326 P0 / R1 Major 10 / task #17: previously this method
-    /// called `session_overrides.to_legacy_overrides()`, which collapses
-    /// every fingerprinted decision into a `tool_name → bool` map. So
+    /// collapsed every fingerprinted decision into a `tool_name → bool` map. So
     /// a parent who pressed "Always" on `Bash(argv_prefix="cargo test")`
     /// would hand the child a `Bash -> Allow` envelope, and the child could
     /// then run `Bash(rm -rf …)` without ever asking. That is exactly
@@ -1741,9 +1740,9 @@ impl PermissionManager {
     /// as JSON because runtime types can't depend on
     /// `approval_fingerprint`). The child is expected to consult those
     /// fingerprints first; only if no fingerprint matches does it fall
-    /// through to the inherited `allow_rules` / `deny_rules`. The
-    /// `to_legacy_overrides()` helper still exists for telemetry /
-    /// display but is **no longer wired into enforcement**.
+    /// through to the inherited `allow_rules` / `deny_rules`. There is no
+    /// tool-name-only downgrade path: display and enforcement both retain the
+    /// structured fingerprints.
     pub(crate) fn inherited_permissions_for_child(
         &self,
         is_background: bool,
@@ -1783,10 +1782,9 @@ impl PermissionManager {
         // of session-level decisions. We serialize the
         // FingerprintedOverrides to JSON so the runtime type stays
         // dependency-free; the child decodes it back. If serialization
-        // fails (it shouldn't — these are simple owned strings/enums),
-        // we deliberately do NOT fall back to to_legacy_overrides:
-        // a downgrade-on-error would re-introduce the bypass we're
-        // fixing here.
+        // fails (it shouldn't — these are simple owned strings/enums), we do
+        // not fall back to a tool-name-only map: a downgrade-on-error would
+        // re-introduce the bypass we're fixing here.
         match serde_json::to_value(&self.session_overrides) {
             Ok(value) if !value.is_null() => {
                 inherited.fingerprinted_overrides = Some(value);
@@ -4954,10 +4952,7 @@ mod tests {
             "bypass".parse::<PermissionMode>().unwrap(),
             PermissionMode::Bypass
         );
-        assert_eq!(
-            "skip".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Bypass
-        );
+        assert!("skip".parse::<PermissionMode>().is_err());
         assert!("yolo".parse::<PermissionMode>().is_err());
         assert!("bypass-safety".parse::<PermissionMode>().is_err());
         assert_eq!(
@@ -4976,10 +4971,7 @@ mod tests {
             "deny".parse::<PermissionMode>().unwrap(),
             PermissionMode::Deny
         );
-        assert_eq!(
-            "AUTO".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
+        assert!("AUTO".parse::<PermissionMode>().is_err());
         assert!("accept-edits".parse::<PermissionMode>().is_err());
         assert!("invalid".parse::<PermissionMode>().is_err());
     }
@@ -6821,7 +6813,9 @@ mod tests {
     #[test]
     fn read_only_allowlisted_handles_pipes() {
         // Previously rejected all pipes; now delegates to runtime classifier.
-        assert!(is_read_only_allowlisted("cargo check 2>&1 | head -50"));
+        // `cargo check` may execute build scripts/proc macros and therefore
+        // remains approval-gated even when its output pipeline is harmless.
+        assert!(!is_read_only_allowlisted("cargo check 2>&1 | head -50"));
         assert!(is_read_only_allowlisted("git diff | head -100"));
         assert!(is_read_only_allowlisted("ls -la | grep foo"));
         assert!(is_read_only_allowlisted(
@@ -6833,7 +6827,7 @@ mod tests {
 
     #[test]
     fn read_only_allowlisted_handles_fd_redirects() {
-        assert!(is_read_only_allowlisted("cargo check 2>&1"));
+        assert!(!is_read_only_allowlisted("cargo check 2>&1"));
         assert!(is_read_only_allowlisted("git status 2>/dev/null"));
     }
 
@@ -6883,6 +6877,7 @@ mod tests {
 
     // ── record_approval: content-aware fingerprints ───────────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn record_approval_with_match_target_trusts_safe_writes_across_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -7136,7 +7131,7 @@ mod tests {
         ));
 
         let read_only_compound = serde_json::json!({
-            "command": "cd /home/xupeng/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
+            "command": "cd /workspace/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
         });
         assert!(matches!(
             pm.check_nonblocking("bash", &read_only_compound),

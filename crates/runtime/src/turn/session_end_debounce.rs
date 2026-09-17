@@ -7,17 +7,16 @@
 //! and lets working-memory purges fire mid-conversation when a user
 //! reopens an existing session.
 //!
-//! This debounce tracks the **last governance completion timestamp**
-//! per `session_id`. A subsequent governance attempt within
-//! [`GOVERNANCE_MIN_INTERVAL`] of the last one is skipped — the caller
-//! gets a `DebounceDecision::Skip` and governance runs on a later turn
-//! (or at true session-end when the gap finally opens).
+//! This coordinator atomically grants one governance permit per session.
+//! Concurrent terminal runs cannot both purge/store/reflect, and dropping a
+//! permit before completion releases ownership so cancellation and failures do
+//! not strand the session. Successful completion starts a cooldown.
 //!
-//! The store is process-local, bounded by explicit resets from the
-//! caller at session-end cleanup.
+//! The store is process-local, lazily prunes expired completion records, and
+//! caps retained completed sessions without evicting active owners.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Minimum gap between governance runs for the same session. Below this
@@ -25,81 +24,189 @@ use std::time::{Duration, Instant};
 /// deferred. Aligns with Memoria's reflect 1h cooldown but is client-
 /// side so even purge_working and store_episode are debounced.
 pub const GOVERNANCE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const MAX_COMPLETED_SESSIONS: usize = 16 * 1024;
 
-/// What the caller should do for this governance attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DebounceDecision {
-    /// Run governance for this session.
-    Run,
-    /// Skip — the last run was too recent.
-    Skip,
+#[derive(Debug, Clone, Copy)]
+enum SessionGovernanceState {
+    InFlight { generation: u64 },
+    Completed { at: Instant },
 }
 
-/// Process-wide debounce store keyed by session_id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionEndKey {
+    owner_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Default)]
+struct SessionEndDebouncerInner {
+    sessions: HashMap<SessionEndKey, SessionGovernanceState>,
+    next_generation: u64,
+}
+
+/// Process-wide single-owner/cooldown store keyed by session id.
 #[derive(Debug, Default)]
 pub struct SessionEndDebouncer {
-    inner: RwLock<HashMap<String, Instant>>,
+    inner: Mutex<SessionEndDebouncerInner>,
     min_interval: Duration,
+    max_completed_sessions: usize,
+}
+
+/// Exclusive right to run session-end governance for one session.
+///
+/// A permit that is dropped without [`complete`](Self::complete) releases the
+/// in-flight state. This makes task cancellation, panic, and ordinary failures
+/// retryable without a separate error-path cleanup call.
+#[derive(Debug)]
+pub struct SessionEndPermit<'a> {
+    owner: &'a SessionEndDebouncer,
+    key: SessionEndKey,
+    generation: u64,
+    completed: bool,
 }
 
 impl SessionEndDebouncer {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: Mutex::new(SessionEndDebouncerInner::default()),
             min_interval: GOVERNANCE_MIN_INTERVAL,
+            max_completed_sessions: MAX_COMPLETED_SESSIONS,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_interval(min_interval: Duration) -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: Mutex::new(SessionEndDebouncerInner::default()),
             min_interval,
+            max_completed_sessions: MAX_COMPLETED_SESSIONS,
         }
     }
 
-    /// Decide whether to run governance for `session_id`. Does NOT record
-    /// the decision — the caller must call [`record`] once governance
-    /// actually completes, so a failed governance attempt doesn't use up
-    /// the debounce window.
-    pub fn should_run(&self, session_id: &str) -> DebounceDecision {
-        if session_id.is_empty() {
-            return DebounceDecision::Skip;
+    #[cfg(test)]
+    pub(crate) fn with_limits(min_interval: Duration, max_completed_sessions: usize) -> Self {
+        Self {
+            inner: Mutex::new(SessionEndDebouncerInner::default()),
+            min_interval,
+            max_completed_sessions,
         }
-        let Ok(g) = self.inner.read() else {
-            return DebounceDecision::Run;
+    }
+
+    /// Atomically acquire governance ownership for `session_id`.
+    ///
+    /// Returns `None` while another owner is active or a successful run is
+    /// still inside the cooldown. Poisoned coordination state fails closed:
+    /// duplicate destructive cleanup is riskier than deferring best-effort
+    /// memory maintenance to a later process lifetime.
+    pub fn try_begin(&self, owner_id: &str, session_id: &str) -> Option<SessionEndPermit<'_>> {
+        if owner_id.is_empty() || session_id.is_empty() {
+            return None;
+        }
+        let key = SessionEndKey {
+            owner_id: owner_id.to_string(),
+            session_id: session_id.to_string(),
         };
-        match g.get(session_id) {
-            Some(last) if last.elapsed() < self.min_interval => DebounceDecision::Skip,
-            _ => DebounceDecision::Run,
+        let now = Instant::now();
+        let Ok(mut inner) = self.inner.lock() else {
+            return None;
+        };
+        inner.sessions.retain(|_, state| match state {
+            SessionGovernanceState::InFlight { .. } => true,
+            SessionGovernanceState::Completed { at } => now.duration_since(*at) < self.min_interval,
+        });
+        if inner.sessions.contains_key(&key) {
+            return None;
         }
-    }
-
-    /// Record that governance completed for `session_id` at this moment.
-    pub fn record(&self, session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = self.inner.write() {
-            g.insert(session_id.to_string(), Instant::now());
-        }
+        inner.next_generation = inner.next_generation.wrapping_add(1).max(1);
+        let generation = inner.next_generation;
+        inner
+            .sessions
+            .insert(key.clone(), SessionGovernanceState::InFlight { generation });
+        Some(SessionEndPermit {
+            owner: self,
+            key,
+            generation,
+            completed: false,
+        })
     }
 
     /// Drop the entry for `session_id`. Intended for explicit cleanup
-    /// on session teardown so a long-lived server doesn't accumulate
-    /// an entry per session for the life of the process.
-    pub fn forget(&self, session_id: &str) {
-        if session_id.is_empty() {
+    /// on definitive session deletion or process-local reset.
+    pub fn forget(&self, owner_id: &str, session_id: &str) {
+        if owner_id.is_empty() || session_id.is_empty() {
             return;
         }
-        if let Ok(mut g) = self.inner.write() {
-            g.remove(session_id);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.sessions.remove(&SessionEndKey {
+                owner_id: owner_id.to_string(),
+                session_id: session_id.to_string(),
+            });
         }
     }
 
     #[cfg(test)]
     pub(crate) fn session_count(&self) -> usize {
-        self.inner.read().map(|g| g.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|inner| inner.sessions.len())
+            .unwrap_or(0)
+    }
+}
+
+impl SessionEndPermit<'_> {
+    /// Commit a successful governance run and start the session cooldown.
+    pub fn complete(mut self) {
+        if let Ok(mut inner) = self.owner.inner.lock()
+            && matches!(
+                inner.sessions.get(&self.key),
+                Some(SessionGovernanceState::InFlight { generation })
+                    if *generation == self.generation
+            )
+        {
+            inner.sessions.insert(
+                self.key.clone(),
+                SessionGovernanceState::Completed { at: Instant::now() },
+            );
+            while inner
+                .sessions
+                .values()
+                .filter(|state| matches!(state, SessionGovernanceState::Completed { .. }))
+                .count()
+                > self.owner.max_completed_sessions
+            {
+                let oldest = inner
+                    .sessions
+                    .iter()
+                    .filter_map(|(key, state)| match state {
+                        SessionGovernanceState::Completed { at } => Some((key.clone(), *at)),
+                        SessionGovernanceState::InFlight { .. } => None,
+                    })
+                    .min_by_key(|(_, at)| *at)
+                    .map(|(key, _)| key);
+                let Some(oldest) = oldest else {
+                    break;
+                };
+                inner.sessions.remove(&oldest);
+            }
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionEndPermit<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Ok(mut inner) = self.owner.inner.lock()
+            && matches!(
+                inner.sessions.get(&self.key),
+                Some(SessionGovernanceState::InFlight { generation })
+                    if *generation == self.generation
+            )
+        {
+            inner.sessions.remove(&self.key);
+        }
     }
 }
 
@@ -114,141 +221,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_call_runs() {
+    fn first_caller_gets_exclusive_permit() {
         let d = SessionEndDebouncer::new();
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Run);
+        let first = d
+            .try_begin("owner", "sess1")
+            .expect("first caller owns cleanup");
+        assert!(d.try_begin("owner", "sess1").is_none());
+        drop(first);
     }
 
     #[test]
     fn empty_session_id_always_skips() {
         let d = SessionEndDebouncer::new();
-        assert_eq!(d.should_run(""), DebounceDecision::Skip);
-        d.record(""); // no-op
+        assert!(d.try_begin("owner", "").is_none());
+        assert!(d.try_begin("", "session").is_none());
+        d.forget("owner", "");
         assert_eq!(d.session_count(), 0);
     }
 
     #[test]
-    fn second_call_within_window_skips() {
+    fn successful_completion_starts_cooldown() {
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        d.record("sess1");
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Skip);
-    }
-
-    #[test]
-    fn second_call_after_window_runs() {
-        let d = SessionEndDebouncer::with_interval(Duration::from_millis(10));
-        d.record("sess1");
-        std::thread::sleep(Duration::from_millis(25));
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Run);
-    }
-
-    #[test]
-    fn different_sessions_independent() {
-        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        d.record("sess1");
-        assert_eq!(d.should_run("sess2"), DebounceDecision::Run);
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Skip);
-    }
-
-    #[test]
-    fn forget_clears_debounce_state() {
-        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        d.record("sess1");
+        d.try_begin("owner", "sess1").unwrap().complete();
+        assert!(d.try_begin("owner", "sess1").is_none());
         assert_eq!(d.session_count(), 1);
-        d.forget("sess1");
-        assert_eq!(d.session_count(), 0);
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Run);
     }
 
     #[test]
-    fn should_run_does_not_record() {
-        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        let _ = d.should_run("sess1");
-        // No call to record — the window shouldn't be started yet.
-        assert_eq!(d.should_run("sess1"), DebounceDecision::Run);
-        assert_eq!(d.session_count(), 0);
-    }
-
-    // ─── Caller-sequence integration tests ─────────────────────────────
-    //
-    // These lock the exact should_run/record/forget sequence used by
-    // `server::crate::server::run::lifecycle::post_loop_memory_cleanup` (lines 98-147
-    // and the final `forget` at the end of cleanup). Regressions in
-    // the caller — e.g. recording on failure, skipping forget, or
-    // reversing the order — will show up here rather than only in a
-    // six-session production cascade.
-
-    #[test]
-    fn caller_sequence_success_path_skips_on_second_turn() {
-        // Simulates: first terminal run completes governance successfully,
-        // then the user issues another turn on the same session within
-        // the window. Caller path:
-        //   should_run=Run → governance Ok → record → forget-at-teardown
-        // Second turn (before forget, e.g. still active) must Skip.
-        let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        assert_eq!(d.should_run("sess-caller-1"), DebounceDecision::Run);
-        // caller: governance succeeded → record()
-        d.record("sess-caller-1");
-        // Second turn arrives on same session_id before forget/teardown:
-        assert_eq!(d.should_run("sess-caller-1"), DebounceDecision::Skip);
+    fn expired_completion_is_pruned_and_can_run_again() {
+        let d = SessionEndDebouncer::with_interval(Duration::from_millis(10));
+        d.try_begin("owner", "sess1").unwrap().complete();
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(d.try_begin("owner", "sess1").is_some());
     }
 
     #[test]
-    fn caller_sequence_governance_failure_does_not_consume_window() {
-        // Simulates: should_run=Run, governance returns Err, caller
-        // logs warn and SKIPS record (see server/run/lifecycle.rs).
-        // Next turn must still get Run — a failed governance attempt
-        // must not burn the 15-min window.
+    fn dropped_or_failed_owner_releases_session_immediately() {
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        assert_eq!(d.should_run("sess-fail"), DebounceDecision::Run);
-        // caller: governance returned Err → NO record() call.
-        // Next turn:
-        assert_eq!(d.should_run("sess-fail"), DebounceDecision::Run);
-        assert_eq!(d.session_count(), 0);
+        let permit = d.try_begin("owner", "sess-fail").unwrap();
+        assert!(d.try_begin("owner", "sess-fail").is_none());
+        drop(permit);
+        assert!(d.try_begin("owner", "sess-fail").is_some());
     }
 
     #[test]
-    fn caller_sequence_forget_allows_immediate_rerun_on_same_session_id() {
-        // Simulates: long-lived server reaches explicit teardown for a
-        // session_id, calls forget(), then the user reconnects with the
-        // same session_id (sticky IDs). Next should_run must be Run so
-        // the new conversation gets its own governance window.
+    fn different_sessions_have_independent_owners() {
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        d.record("sess-sticky");
-        assert_eq!(d.should_run("sess-sticky"), DebounceDecision::Skip);
-        // Explicit teardown path:
-        d.forget("sess-sticky");
-        // Reconnect with same id:
-        assert_eq!(d.should_run("sess-sticky"), DebounceDecision::Run);
+        let first = d.try_begin("owner", "sess1").unwrap();
+        let second = d.try_begin("owner", "sess2").unwrap();
+        assert_eq!(d.session_count(), 2);
+        drop((first, second));
     }
 
     #[test]
-    fn caller_sequence_empty_session_id_is_noop_throughout() {
-        // server/run/lifecycle.rs: `if session_id.is_empty() { return; }` at the
-        // top of post_loop_memory_cleanup. But if a future refactor drops
-        // that guard, the debouncer itself must still no-op cleanly for
-        // every method in the caller sequence.
+    fn forget_invalidates_old_permit_without_clearing_new_owner() {
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        assert_eq!(d.should_run(""), DebounceDecision::Skip);
-        d.record("");
-        d.forget("");
-        assert_eq!(d.session_count(), 0);
-        assert_eq!(d.should_run(""), DebounceDecision::Skip);
+        let stale = d.try_begin("owner", "sess-sticky").unwrap();
+        d.forget("owner", "sess-sticky");
+        let current = d.try_begin("owner", "sess-sticky").unwrap();
+        drop(stale);
+        assert!(
+            d.try_begin("owner", "sess-sticky").is_none(),
+            "an old guard must not release a newer generation"
+        );
+        current.complete();
     }
 
     #[test]
-    fn caller_sequence_concurrent_sessions_do_not_cross_contaminate() {
-        // Server handles multiple sessions in flight. One session's
-        // record()/forget() must not affect another's window — regression
-        // guard against a future HashMap keying bug.
+    fn successful_sessions_are_lazily_reclaimed_under_continued_traffic() {
+        let d = SessionEndDebouncer::with_interval(Duration::from_millis(5));
+        d.try_begin("owner", "expired").unwrap().complete();
+        std::thread::sleep(Duration::from_millis(10));
+        let live = d.try_begin("owner", "live").unwrap();
+        assert_eq!(d.session_count(), 1);
+        drop(live);
+    }
+
+    #[test]
+    fn identical_session_ids_are_isolated_by_authenticated_owner() {
         let d = SessionEndDebouncer::with_interval(Duration::from_secs(60));
-        d.record("sess-A");
-        d.record("sess-B");
-        assert_eq!(d.should_run("sess-A"), DebounceDecision::Skip);
-        assert_eq!(d.should_run("sess-B"), DebounceDecision::Skip);
-        d.forget("sess-A");
-        assert_eq!(d.should_run("sess-A"), DebounceDecision::Run);
-        // B's window must be untouched:
-        assert_eq!(d.should_run("sess-B"), DebounceDecision::Skip);
+        let owner_a = d.try_begin("owner-a", "shared-session").unwrap();
+        let owner_b = d.try_begin("owner-b", "shared-session").unwrap();
+        assert_eq!(d.session_count(), 2);
+        drop((owner_a, owner_b));
+    }
+
+    #[test]
+    fn completed_session_cache_is_hard_bounded() {
+        let d = SessionEndDebouncer::with_limits(Duration::from_secs(60), 2);
+        d.try_begin("owner", "session-1").unwrap().complete();
+        std::thread::sleep(Duration::from_millis(1));
+        d.try_begin("owner", "session-2").unwrap().complete();
+        std::thread::sleep(Duration::from_millis(1));
+        d.try_begin("owner", "session-3").unwrap().complete();
+
+        assert_eq!(d.session_count(), 2);
+        assert!(
+            d.try_begin("owner", "session-1").is_some(),
+            "the oldest completed cooldown should be evicted first"
+        );
+        assert!(d.try_begin("owner", "session-2").is_none());
+        assert!(d.try_begin("owner", "session-3").is_none());
     }
 }

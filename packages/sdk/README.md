@@ -1,10 +1,13 @@
 # @astra/sdk
 
-TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, task leases, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
+TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
 
-Paths match the Rust server and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`).
+Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Legacy task/plan/agent-job helpers remain in the clients for source compatibility with older servers, but the current runtime intentionally returns `404` for those routes and they are not runtime capabilities.
 
-**Distribution:** This package is versioned in the Astra monorepo and consumed via `file:../packages/sdk` (see `web/package.json`). Publishing to the public npm registry is optional; set `repository` / `publishConfig` when you are ready to release.
+**Distribution:** This package is versioned in the Astra monorepo and configured
+as a public scoped npm package. Publishing remains an explicit release action;
+no repository workflow publishes it automatically. The Web app consumes the
+workspace copy via `file:../packages/sdk` (see `web/package.json`).
 
 ## Installation
 
@@ -12,7 +15,8 @@ Paths match the Rust server and [`astra-thin-client`](../../crates/astra-thin-cl
 npm install @astra/sdk
 ```
 
-(From a checkout, depend on `file:../packages/sdk` or your pack tarball.)
+Before the first npm release, consume `file:../packages/sdk` from a checkout or
+install a locally generated pack tarball.
 
 ## Quick start
 
@@ -21,7 +25,7 @@ npm install @astra/sdk
 ```typescript
 import { AstraClient } from '@astra/sdk';
 
-const client = new AstraClient({ baseUrl: 'http://localhost:8080' });
+const client = new AstraClient({ baseUrl: 'http://localhost:17001' });
 
 const auth = await client.login('alice', 'password');
 // auth: access_token, refresh_token, token_type, expires_in
@@ -85,7 +89,9 @@ Delegation requires a configured **delegation engine** on the server; otherwise 
 
 ### Streaming (SSE)
 
-`streamChat` uses **`POST /chat/stream`** with a **JSON body** (same contract as the Next.js BFF example in `web/hooks/use-chat-stream.ts`).
+`streamChat` uses **`POST /chat/stream`** with a **JSON body** (the Web
+dashboard's typed BFF integration lives in
+`web/app/api/chats/[chatId]/stream/route.ts`).
 
 ```typescript
 const stream = client.streamChat(
@@ -110,7 +116,7 @@ The runtime exposes **`/chat/ws`** (not under `/api` unless you set `pathPrefix`
 import { AstraWebSocket } from '@astra/sdk';
 
 const ws = new AstraWebSocket({
-  url: 'ws://localhost:8080/chat/ws',
+  url: 'ws://localhost:17001/chat/ws',
   token: auth.access_token,
 });
 
@@ -146,7 +152,7 @@ import { useAstraChat } from '@astra/sdk/react';
 import { AstraClient } from '@astra/sdk';
 
 const client = new AstraClient({
-  baseUrl: 'http://localhost:8080',
+  baseUrl: 'http://localhost:17001',
   accessToken: token,
 });
 
@@ -212,7 +218,7 @@ When a **local edge** runs tools, use the same routes as `astra-thin-client`:
 | Approval | `postApprovalRespond(body)` | `POST /approval/respond` |
 | Register edge | `registerEdge(body, { edgeTransportId })` | `POST /agents/edge` |
 | Heartbeat | `postEdgeHeartbeat(body, { edgeTransportId })` | `POST /agents/edge/heartbeat` |
-| Lease | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` |
+| Legacy task lease helpers | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` (not registered by the current runtime) |
 
 Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHAT_STREAM`, `joinApiPath`, `ASTRA_EDGE_ID_HEADER`).
 
@@ -239,7 +245,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `getEdgesStatus` | `GET /edges/status` |
 | `memoryStore` / `memorySearch` / … | `/memory/*` |
 | `listSkills` | `GET /skills` (maps `skills[]` to `SkillInfo[]`) |
-| §5.5 | `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat`, task lease methods |
+| §5.5 | `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat` |
 
 ### `AstraWebSocket`
 
@@ -275,4 +281,4 @@ Vitest config: `vitest.config.ts`. Suites cover `AstraClient`, SSE/WebSocket hel
 
 ## License
 
-MIT
+Apache-2.0. See the repository's [LICENSE](../../LICENSE).

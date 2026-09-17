@@ -40,7 +40,7 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
     }
 
     match arg {
-        "read_only" | "readonly" => PermissionCommandAction::SetMode(PermissionMode::Plan),
+        "read_only" => PermissionCommandAction::SetMode(PermissionMode::Plan),
         // Plan lifecycle is not a permission-preset command. `/plan` owns
         // authoring, approval and execution transitions; its read-only policy
         // is represented here as `read_only`.
@@ -167,7 +167,6 @@ mod tests {
         let cases = [
             ("auto", PermissionMode::Auto),
             ("bypass", PermissionMode::Bypass),
-            ("skip", PermissionMode::Bypass),
             ("read_only", PermissionMode::Plan),
             ("accept_edits", PermissionMode::AcceptEdits),
             ("prompt", PermissionMode::Prompt),
@@ -185,7 +184,16 @@ mod tests {
 
     #[test]
     fn parser_rejects_removed_permission_aliases() {
-        for alias in ["all", "default", "ask", "status", "accept-edits", "plan"] {
+        for alias in [
+            "all",
+            "default",
+            "ask",
+            "status",
+            "accept-edits",
+            "plan",
+            "skip",
+            "readonly",
+        ] {
             assert_eq!(
                 parse_permission_command(alias),
                 PermissionCommandAction::Unknown(alias),

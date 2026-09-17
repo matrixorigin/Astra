@@ -17,11 +17,10 @@ matching**: any byte change mid-history invalidates the entire cache
 hit, unlike OpenAI's auto-prefix which would still match the stable
 portion.
 
-The fix lands in a new `cache_placement` module (see the `C1` commit
-on `improve_promts`) that classifies MiniMax as `StrictHistoryMatch`
-with `VolatilePlacement::CurrentUserOnly` — volatile content gets
-injected only on round 0 of a visible turn, and skipped on tool-loop
-continuations.
+The offering used by this capture declared `StrictHistoryMatch` with
+`VolatilePlacement::CurrentUserOnly`. The scrubbed fixtures retain that typed
+capability explicitly. Diagnostics must consume this request fact and must not
+reconstruct cache semantics from the provider or model label.
 
 ## What this fixture preserves
 

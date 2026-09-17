@@ -14,23 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-/// A verification command to run before the loop is allowed to complete.
-#[derive(Debug, Clone)]
-pub struct StopHook {
-    /// Human-readable label (e.g. "type-check", "lint").
-    pub label: String,
-    /// Shell command to execute (e.g. "cargo check").
-    pub command: String,
-    /// Working directory (informational, included in the prompt).
-    pub working_dir: Option<String>,
-    /// Labels of hooks that must complete before this one.
-    pub depends_on: Vec<String>,
-    /// Per-hook timeout hint (seconds). Included in the prompt for the LLM.
-    pub timeout_secs: Option<u32>,
-    /// Cache key for skipping re-runs. If present and the cache contains a
-    /// passing result for this key, the hook is omitted from the prompt.
-    pub cache_key: Option<String>,
-}
+pub use astra_turn_types::StopHook;
 
 /// Cached result from a previous stop-hook execution.
 #[derive(Debug, Clone)]
@@ -253,6 +237,7 @@ mod tests {
             depends_on: Vec::new(),
             timeout_secs: None,
             cache_key: None,
+            authoritative: false,
         }
     }
 
@@ -270,6 +255,7 @@ mod tests {
             depends_on: Vec::new(),
             timeout_secs: None,
             cache_key: None,
+            authoritative: false,
         }];
         let msg = build_stop_hook_prompt(&hooks).unwrap();
         let content = msg["content"].as_str().unwrap();
@@ -325,6 +311,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "lint".into(),
@@ -333,6 +320,7 @@ mod tests {
                 depends_on: vec!["test".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let layers = build_execution_layers(&hooks).unwrap();
@@ -354,6 +342,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "lint".into(),
@@ -362,6 +351,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "deploy".into(),
@@ -370,6 +360,7 @@ mod tests {
                 depends_on: vec!["test".into(), "lint".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let layers = build_execution_layers(&hooks).unwrap();
@@ -389,6 +380,7 @@ mod tests {
                 depends_on: vec!["b".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "b".into(),
@@ -397,6 +389,7 @@ mod tests {
                 depends_on: vec!["a".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         assert!(build_execution_layers(&hooks).is_none());
@@ -429,6 +422,7 @@ mod tests {
                 depends_on: Vec::new(),
                 timeout_secs: None,
                 cache_key: Some("lint-key".into()),
+                authoritative: false,
             },
             simple_hook("test", "make test"),
         ];
@@ -448,6 +442,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: Some(60),
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let msg = build_stop_hook_prompt(&hooks).unwrap();

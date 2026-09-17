@@ -3,60 +3,58 @@ use super::terminal_palette::{best_color, default_bg};
 use ratatui::style::{Color, Style};
 
 pub(crate) fn user_message_style() -> Style {
-    // A user turn needs a quiet surface, not a gray card. Fall back to the
-    // theme selection surface when the terminal background is unavailable so
-    // the conversational boundary remains visible without an opaque block.
-    if let Some(bg) = default_bg() {
-        return Style::default().bg(user_message_bg(bg));
-    }
-    let theme = super::theme::current();
-    Style::default().bg(theme.selected_bg)
+    user_message_style_for(default_bg())
 }
 
 pub(crate) fn composer_surface_style() -> Style {
-    if let Some(bg) = default_bg() {
-        return Style::default().bg(composer_surface_bg(bg));
-    }
-    let theme = super::theme::current();
-    Style::default().bg(theme.selected_bg)
+    surface_style(super::theme::current(), default_bg(), composer_surface_rgb)
 }
 
-/// Background for the deferred-follow-up queue panel.
-///
-/// Deliberately tinted *differently* from the composer surface so the
-/// queued-input band reads as a distinct region above the live input
-/// box, not as more of the same surface. A touch darker than the
-/// composer surface on dark backgrounds, a touch lighter on light ones.
+/// Background and foreground for the deferred-follow-up queue panel.
 pub(crate) fn queue_panel_style() -> Style {
-    if let Some(bg) = default_bg() {
-        return Style::default().bg(queue_panel_bg(bg));
-    }
-    let theme = super::theme::current();
-    Style::default().bg(theme.selected_bg)
+    surface_style(super::theme::current(), default_bg(), queue_panel_rgb)
 }
 
 pub(crate) fn footer_surface_style() -> Style {
-    // The footer is chrome, not a card. Its semantic colours and alignment
-    // provide hierarchy without drawing another horizontal band.
+    // The footer uses terminal defaults rather than an opaque panel.
     Style::default()
 }
 
 pub(crate) fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
-    match terminal_bg {
-        Some(bg) => Style::default().bg(user_message_bg(bg)),
-        None => Style::default().bg(super::theme::current().selected_bg),
-    }
+    surface_style(super::theme::current(), terminal_bg, user_message_rgb)
 }
 
 pub(crate) fn proposed_plan_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
-    match terminal_bg {
-        Some(bg) => Style::default().bg(proposed_plan_bg(bg)),
-        None => Style::default(),
-    }
+    user_message_style_for(terminal_bg)
 }
 
-fn user_message_bg(terminal_bg: (u8, u8, u8)) -> Color {
-    best_color(user_message_rgb(terminal_bg))
+type SurfaceTint = fn((u8, u8, u8)) -> (u8, u8, u8);
+
+fn surface_style(
+    theme: &super::theme::Theme,
+    terminal_bg: Option<(u8, u8, u8)>,
+    tint: SurfaceTint,
+) -> Style {
+    // Plain/unknown-background surfaces must stay transparent even when hints
+    // are present. Explicit theme selection wins over conflicting hints.
+    if theme.selected_bg == Color::Reset {
+        return Style::default();
+    }
+    let background = match terminal_bg {
+        Some(bg)
+            if is_light(bg) == theme.is_light
+                && matches!(theme.selected_bg, Color::Rgb(..) | Color::Indexed(_)) =>
+        {
+            let tinted = best_color(tint(bg));
+            if tinted == Color::Reset {
+                theme.selected_bg
+            } else {
+                tinted
+            }
+        }
+        _ => theme.selected_bg,
+    };
+    Style::default().bg(background).fg(theme.selected_fg)
 }
 
 fn user_message_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -68,10 +66,6 @@ fn user_message_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((84, 111, 145), 0.18)
     };
     blend(top, terminal_bg, alpha)
-}
-
-fn composer_surface_bg(terminal_bg: (u8, u8, u8)) -> Color {
-    best_color(composer_surface_rgb(terminal_bg))
 }
 
 fn composer_surface_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -89,10 +83,6 @@ fn composer_surface_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
 /// lifted than the live composer (so the user's typing surface stays the
 /// focal point). Previously 0.18 white was too close to a black terminal
 /// bg — the panel vanished and the queued content looked unanchored.
-fn queue_panel_bg(terminal_bg: (u8, u8, u8)) -> Color {
-    best_color(queue_panel_rgb(terminal_bg))
-}
-
 fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
     let (top, alpha) = if is_light(terminal_bg) {
         ((0, 0, 0), 0.10)
@@ -100,10 +90,6 @@ fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((84, 111, 145), 0.10)
     };
     blend(top, terminal_bg, alpha)
-}
-
-fn proposed_plan_bg(terminal_bg: (u8, u8, u8)) -> Color {
-    user_message_bg(terminal_bg)
 }
 
 #[cfg(test)]
@@ -127,5 +113,47 @@ mod tests {
             cr < 50 && cg < 55 && cb < 65,
             "composer must not become gray"
         );
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+
+    #[test]
+    fn conversation_surfaces_pair_foreground_and_background() {
+        for theme in [
+            Theme::light(),
+            Theme::dark(),
+            Theme::light_ansi(),
+            Theme::dark_ansi(),
+            Theme::light_256(),
+            Theme::dark_256(),
+        ] {
+            for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
+                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                    let style = surface_style(&theme, background, tint);
+                    assert_eq!(style.fg, Some(theme.selected_fg));
+                    assert_ne!(style.bg, Some(Color::Reset));
+                    if background.is_none()
+                        || background.is_some_and(|bg| is_light(bg) != theme.is_light)
+                    {
+                        assert_eq!(style.bg, Some(theme.selected_bg));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_surfaces_ignore_background_hints() {
+        for theme in [Theme::plain(), Theme::terminal_default()] {
+            for background in [None, Some((255, 255, 255)), Some((17, 22, 28))] {
+                for tint in [user_message_rgb, composer_surface_rgb, queue_panel_rgb] {
+                    assert_eq!(surface_style(&theme, background, tint), Style::default());
+                }
+            }
+        }
     }
 }

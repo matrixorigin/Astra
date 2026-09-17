@@ -85,30 +85,11 @@ pub struct ExecutionOutcomeInput<'a> {
     pub exit_semantics: Option<&'a str>,
 }
 
-/// Classify a tool result into a typed execution outcome.
+/// Classify a tool result from structured facts.
 ///
-/// Legacy convenience wrapper. Prefer [`classify_execution_outcome_from_input`]
-/// so callers can provide typed `error_kind`, `result_class`, or
-/// `exit_semantics` instead of relying on output prose.
-pub fn classify_execution_outcome(
-    result_text: &str,
-    is_error: bool,
-    duration_ms: u64,
-    was_rejected: bool,
-) -> ExecutionOutcomeClassification {
-    classify_execution_outcome_from_input(ExecutionOutcomeInput {
-        result_text,
-        is_error,
-        duration_ms,
-        was_rejected,
-        error_kind: None,
-        result_class: None,
-        exit_semantics: None,
-    })
-}
-
-/// Classify a tool result from structured facts first, falling back to text only
-/// for legacy callers that have not yet been migrated.
+/// When optional typed metadata is absent, classification remains conservative:
+/// rejection, error status, and duration determine the outcome. Result text is
+/// retained only as a bounded diagnostic snippet and never drives the category.
 pub fn classify_execution_outcome_from_input(
     input: ExecutionOutcomeInput<'_>,
 ) -> ExecutionOutcomeClassification {
@@ -169,7 +150,9 @@ fn classify_error_kind_outcome(
     use astra_core::ErrorKind;
 
     let (outcome, failure_category) = match kind {
-        ErrorKind::ToolTimeout => (ExecutionOutcome::Timeout, Some(FailureCategory::Timeout)),
+        ErrorKind::ToolTimeout | ErrorKind::ProviderDeadline => {
+            (ExecutionOutcome::Timeout, Some(FailureCategory::Timeout))
+        }
         ErrorKind::ResourceLimit => (
             ExecutionOutcome::ResourceLimit,
             Some(FailureCategory::ResourceExhaustion),
@@ -470,48 +453,6 @@ fn compress_context_compensation_summary() -> &'static str {
     "prefer `rollback_session_state` with scope=`current_turn` to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
 
-fn task_action_create_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-task snapshot; `task_board(action='stop')` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
-}
-
-fn task_action_update_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-update task snapshot; otherwise use `task_board(action='get')` plus the `previous_status` from the tool result and rerun `task_board(action='update', task_id='...', new_status='<previous_status>')` manually"
-}
-
-fn task_action_stop_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-stop task snapshot; otherwise use `task_board(action='update', task_id='...', new_status='<previous_status>')` with the `previous_status` from the tool result to reopen the task manually"
-}
-
-fn task_action_profile(args: &Value) -> ActionCompensationProfile {
-    match string_arg(args, "action")
-        .unwrap_or("list")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "create" => session_state_action_profile(
-            ActionCategory::Write,
-            task_action_create_compensation_summary(),
-        ),
-        "update" => {
-            let category = match string_arg(args, "new_status") {
-                Some("deleted") => ActionCategory::Destructive,
-                _ => ActionCategory::Write,
-            };
-            session_state_action_profile(category, task_action_update_compensation_summary())
-        }
-        "stop" => session_state_action_profile(
-            ActionCategory::Destructive,
-            task_action_stop_compensation_summary(),
-        ),
-        "archive" => session_state_action_profile(
-            ActionCategory::Write,
-            "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-archive task snapshot",
-        ),
-        "list" | "get" | "list_user" => ActionCompensationProfile::read(true),
-        _ => ActionCompensationProfile::read(true),
-    }
-}
-
 fn session_state_action_profile(
     category: ActionCategory,
     compensation_summary: impl Into<String>,
@@ -682,6 +623,41 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
     }
 }
 
+fn worktree_action_profile(args: &Value) -> ActionCompensationProfile {
+    let action = string_arg(args, "action");
+    let exit_action = string_arg(args, "exit_action").unwrap_or("keep");
+    let discard_changes = args
+        .get("discard_changes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match action {
+        Some("enter") => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            "entering a worktree changes the active session workspace and branch binding; use the worktree lifecycle to restore it",
+        ),
+        Some("exit") if exit_action == "keep" && !discard_changes => {
+            ActionCompensationProfile::manual(
+                true,
+                ActionCategory::Write,
+                "exiting with keep changes the active session workspace binding; the worktree and branch remain available",
+            )
+        }
+        Some("exit") if exit_action == "remove" || discard_changes => {
+            ActionCompensationProfile::manual(
+                true,
+                ActionCategory::Destructive,
+                "removing a worktree may permanently discard its files and commits and delete its branch; no automatic compensation is registered",
+            )
+        }
+        _ => ActionCompensationProfile::manual(
+            false,
+            ActionCategory::Destructive,
+            "the worktree lifecycle action or scope is unknown; explicit approval is required before changing repository state",
+        ),
+    }
+}
+
 pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationProfile {
     let normalized_args = normalize_args(args);
     match tool_name {
@@ -714,109 +690,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Write,
             compress_context_compensation_summary(),
         ),
-        "task_board" => task_action_profile(&normalized_args),
-        "git" => match string_arg(&normalized_args, "action")
-            .map(|action| action.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some(
-                "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
-                | "contributors",
-            ) => ActionCompensationProfile::read(true),
-            Some("commit") => ActionCompensationProfile::compensated(
-                false,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRevertCommit,
-                "call `git` with action=`revert_commit` and the returned commit_sha to create an explicit compensating revert commit".to_string(),
-            ),
-            Some("revert_commit") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git revert_commit creates a new compensating commit; undo it by reverting the new revert commit if needed",
-            ),
-            Some("checkout_file") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Destructive,
-                true,
-                CompensationKind::RestoreOrDeleteFile,
-                restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
-            ),
-            Some("stash") => match string_arg(&normalized_args, "sub_action")
-                .map(|action| action.to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("list") => ActionCompensationProfile::read(true),
-                Some("push" | "save") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitApplyStash,
-                    "re-apply the captured stash with `git` using action=`stash`, sub_action=`apply`, and the returned stash_ref"
-                        .to_string(),
-                ),
-                Some("apply") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git stash apply mutates the working tree; capture a fresh stash or commit first if you may need to undo it",
-                ),
-                Some("pop" | "drop") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git stash pop/drop mutates the stash stack and working tree; no automatic rollback is registered",
-                ),
-                _ => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git stash action is unknown or not yet modeled for automatic rollback",
-                ),
-            },
-            Some("worktree") => match string_arg(&normalized_args, "sub_action")
-                .map(|action| action.to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("list" | "ls") => ActionCompensationProfile::read(true),
-                Some("enter") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitRestoreWorktree,
-                    "leave the worktree with `git` action=`worktree`, sub_action=`exit`; remove the recorded worktree path manually only after confirming it is clean".to_string(),
-                ),
-                Some("add" | "create") => ActionCompensationProfile::compensated(
-                    true,
-                    ActionCategory::Execute,
-                    false,
-                    CompensationKind::GitRestoreWorktree,
-                    "remove the recorded clean worktree with `git` action=`worktree`, sub_action=`remove` and the recorded path; if it has changed, inspect it before removal".to_string(),
-                ),
-                Some("exit") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
-                ),
-                Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Destructive,
-                    "git worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
-                ),
-                _ => ActionCompensationProfile::manual(
-                    false,
-                    ActionCategory::Execute,
-                    "git worktree action is unknown or not yet modeled for automatic rollback",
-                ),
-            },
-            Some("push") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git push mutates remote refs; coordinate with the remote branch owner or push a corrective commit/ref update if it must be undone",
-            ),
-            _ => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git action is unknown or not yet modeled for automatic rollback",
-            ),
-        },
+
         "notebook_edit" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
@@ -850,6 +724,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             shell_action_profile(string_arg(&normalized_args, "command"))
         }
         "mo_query" => sql_action_profile(&normalized_args),
+        "worktree" => worktree_action_profile(&normalized_args),
         _ if tool_name.starts_with("mcp_") => ActionCompensationProfile::manual(
             false,
             ActionCategory::Execute,
@@ -954,6 +829,23 @@ pub fn compensation_prompt_note(tool_name: &str, args: &Value) -> Option<String>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn classify_untyped_for_test(
+        result_text: &str,
+        is_error: bool,
+        duration_ms: u64,
+        was_rejected: bool,
+    ) -> ExecutionOutcomeClassification {
+        classify_execution_outcome_from_input(ExecutionOutcomeInput {
+            result_text,
+            is_error,
+            duration_ms,
+            was_rejected,
+            error_kind: None,
+            result_class: None,
+            exit_semantics: None,
+        })
+    }
 
     #[test]
     fn file_write_and_delete_compensation() {
@@ -1083,88 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn task_mutators_use_session_rollback_compensation() {
-        let create =
-            tool_action_profile("task_board", &json!({"action": "create", "title": "demo"}));
-        assert!(create.bounded);
-        assert_eq!(create.category, ActionCategory::Write);
-        assert!(create.reversible);
-        assert_eq!(
-            create.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            create
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("rollback_session_state")
-        );
-
-        let update = tool_action_profile(
-            "task_board",
-            &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
-        );
-        assert!(update.bounded);
-        assert_eq!(update.category, ActionCategory::Write);
-        assert!(update.reversible);
-        assert_eq!(
-            update.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            update
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("pre-update task snapshot")
-        );
-        assert!(
-            update
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("new_status='<previous_status>'")
-        );
-
-        let stop = tool_action_profile(
-            "task_board",
-            &json!({"action": "stop", "task_id": "task-1"}),
-        );
-        assert!(stop.bounded);
-        assert_eq!(stop.category, ActionCategory::Destructive);
-        assert!(stop.reversible);
-        assert_eq!(
-            stop.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            stop.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("previous_status")
-        );
-        assert!(
-            stop.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("new_status='<previous_status>'")
-        );
-    }
-
-    #[test]
-    fn task_read_actions_do_not_require_session_rollback_compensation() {
-        for args in [
-            json!({"action": "list"}),
-            json!({"action": "get", "task_id": "task-1"}),
-        ] {
-            let profile = tool_action_profile("task_board", &args);
-            assert_eq!(profile.category, ActionCategory::Read);
-            assert!(profile.compensation_kind.is_none());
-        }
-    }
-
-    #[test]
     fn unknown_tool_names_are_not_special_compensation_surfaces() {
         let profile = tool_action_profile("unknown_task_surface", &json!({"title": "demo"}));
         assert_eq!(profile.category, ActionCategory::Read);
@@ -1172,171 +982,6 @@ mod tests {
     }
 
     // ── git compensation ──
-
-    #[test]
-    fn git_action_commit_compensation() {
-        // bash git commit
-        let p = tool_action_profile("bash", &json!({"command": "git commit -m 'x'"}));
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
-
-        // consolidated git commit action
-        let p = tool_action_profile("git", &json!({"action": "commit", "message": "x"}));
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitRevertCommit));
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`revert_commit`")
-        );
-    }
-
-    #[test]
-    fn git_action_worktree_compensation() {
-        // list: read-only
-        let p = tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Read);
-        assert_eq!(p.compensation_kind, None);
-
-        // enter: reversible via GitRestoreWorktree
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`worktree`")
-        );
-
-        // add: same compensation
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "add", "branch": "demo"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-    }
-
-    #[test]
-    fn git_irreversible_and_file_compensation() {
-        // revert commit: manual (irreversible)
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "revert_commit", "commit_sha": "abc123"}),
-        );
-        assert!(!p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(!p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
-
-        // stash push: reversible via GitApplyStash
-        let p = tool_action_profile("git", &json!({"action": "stash", "sub_action": "push"}));
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Execute);
-        assert!(p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::GitApplyStash));
-        assert!(
-            p.compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("stash_ref")
-        );
-
-        // checkout file: destructive but bounded + reversible
-        let p = tool_action_profile(
-            "git",
-            &json!({"action": "checkout_file", "path": "src/lib.rs"}),
-        );
-        assert!(p.bounded);
-        assert_eq!(p.category, ActionCategory::Destructive);
-        assert!(p.reversible);
-        assert_eq!(
-            p.compensation_kind,
-            Some(CompensationKind::RestoreOrDeleteFile)
-        );
-    }
-
-    #[test]
-    fn git_action_commit_has_compensation_summary() {
-        let profile = tool_action_profile("git", &json!({"action": "commit", "message": "x"}));
-        assert!(!profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRevertCommit)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`revert_commit`")
-        );
-    }
-
-    #[test]
-    fn git_action_revert_commit_is_manual() {
-        let profile = tool_action_profile(
-            "git",
-            &json!({"action": "revert_commit", "commit_sha": "abc123"}),
-        );
-        assert!(!profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
-    }
-
-    #[test]
-    fn git_action_worktree_list_is_read_only() {
-        let profile =
-            tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Read);
-        assert_eq!(profile.compensation_kind, None);
-    }
-
-    #[test]
-    fn git_action_worktree_enter_is_compensated() {
-        let profile = tool_action_profile(
-            "git",
-            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
-        );
-        assert!(profile.bounded);
-        assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(profile.reversible);
-        assert_eq!(
-            profile.compensation_kind,
-            Some(CompensationKind::GitRestoreWorktree)
-        );
-        assert!(
-            profile
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("action=`worktree`")
-        );
-    }
 
     #[test]
     fn rename_symbol_uses_file_rollback_hint() {
@@ -1421,14 +1066,7 @@ mod tests {
             "adjust_config",
             &json!({"path": "memory.retrieval_top_k", "value": 6})
         ));
-        assert!(tool_requires_explicit_approval(
-            "git",
-            &json!({"action": "commit", "message": "ship it"})
-        ));
-        assert!(tool_requires_explicit_approval(
-            "github",
-            &json!({"action": "create_issue", "owner": "o", "repo": "r", "title": "t"})
-        ));
+
         assert!(tool_requires_explicit_approval(
             "bash",
             &json!({"command": "rm -rf tmp"})
@@ -1437,16 +1075,46 @@ mod tests {
 
     #[test]
     fn explicit_approval_reason_describes_boundary_gap() {
-        let git_action_commit_reason =
-            explicit_approval_reason("git", &json!({"action": "commit", "message": "x"}))
-                .expect("git commit should require explicit approval");
-        assert!(git_action_commit_reason.contains("unbounded"));
-
         let bash_reason = explicit_approval_reason("bash", &json!({"command": "rm -rf tmp"}))
             .expect("destructive bash should require explicit approval");
         assert!(bash_reason.contains("rollback"));
 
         assert!(explicit_approval_reason("write_file", &json!({"path": "x"})).is_none());
+    }
+
+    #[test]
+    fn worktree_lifecycle_requires_approval_and_classifies_removal_as_destructive() {
+        let cases = [
+            (
+                json!({"action":"enter", "path":"/repo"}),
+                ActionCategory::Write,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"keep"}),
+                ActionCategory::Write,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"remove"}),
+                ActionCategory::Destructive,
+            ),
+            (
+                json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+                ActionCategory::Destructive,
+            ),
+            (json!({"action":"unknown"}), ActionCategory::Destructive),
+        ];
+
+        for (args, expected_category) in cases {
+            let profile = tool_action_profile("worktree", &args);
+            assert_eq!(profile.category, expected_category, "{args}");
+            assert!(!profile.reversible, "{args}");
+            assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+            assert!(tool_requires_explicit_approval("worktree", &args), "{args}");
+            assert!(
+                explicit_approval_reason("worktree", &args).is_some(),
+                "{args}"
+            );
+        }
     }
 
     #[test]
@@ -1461,15 +1129,16 @@ mod tests {
                 "edit_file" | "str_replace" => {
                     json!({"path": "tmp.txt", "old_str": "a", "new_str": "b"})
                 }
-                "git" => json!({"action": "push", "remote": "origin", "branch": "main"}),
-                "github" => {
-                    json!({"action": "create_issue", "owner": "o", "repo": "r", "title": "t"})
-                }
+
                 "multi_edit" => {
                     json!({"path": "tmp.txt", "edits": [{"old_str": "a", "new_str": "b"}]})
                 }
                 "apply_patch" => {
                     json!({"path": "tmp.txt", "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b"})
+                }
+                "publish_artifact" => json!({"path": "tmp.txt"}),
+                "worktree" => {
+                    json!({"action":"exit", "exit_action":"remove", "discard_changes":true})
                 }
                 "rollback_database_snapshots" | "rollback_file_edits" => json!({}),
                 other => panic!("add sample args for {other}"),
@@ -1587,8 +1256,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wrapper_does_not_infer_category_from_output_text() {
-        let c = classify_execution_outcome("error[E0433]: compile error", true, 2000, false);
+    fn untyped_input_does_not_infer_category_from_output_text() {
+        let c = classify_untyped_for_test("error[E0433]: compile error", true, 2000, false);
         assert_eq!(c.outcome, ExecutionOutcome::Failure);
         assert_eq!(c.failure_category, Some(FailureCategory::Unknown));
     }
@@ -1596,16 +1265,16 @@ mod tests {
     #[test]
     fn classify_success_and_edge_outcomes() {
         // success
-        let c = classify_execution_outcome(r#"{"ok":true,"result":"done"}"#, false, 500, false);
+        let c = classify_untyped_for_test(r#"{"ok":true,"result":"done"}"#, false, 500, false);
         assert_eq!(c.outcome, ExecutionOutcome::Success);
         assert!(c.failure_category.is_none());
         assert!(c.error_snippet.is_none());
         // rejected
-        let c = classify_execution_outcome("rejected by policy", true, 0, true);
+        let c = classify_untyped_for_test("rejected by policy", true, 0, true);
         assert_eq!(c.outcome, ExecutionOutcome::Rejected);
         assert!(c.failure_category.is_none());
         // rejected takes priority over content
-        let c = classify_execution_outcome("error[E0433]: some compile error", true, 100, true);
+        let c = classify_untyped_for_test("error[E0433]: some compile error", true, 100, true);
         assert_eq!(c.outcome, ExecutionOutcome::Rejected);
         assert!(c.failure_category.is_none());
         // structured resource limit
@@ -1624,11 +1293,11 @@ mod tests {
             Some(FailureCategory::ResourceExhaustion)
         );
         // timeout from duration, not output prose
-        let c = classify_execution_outcome("long-running failure", true, 130_000, false);
+        let c = classify_untyped_for_test("long-running failure", true, 130_000, false);
         assert_eq!(c.outcome, ExecutionOutcome::Timeout);
         assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
         // success with resource-limit text stays success (didn't fail)
-        let c = classify_execution_outcome("Killed", false, 100, false);
+        let c = classify_untyped_for_test("Killed", false, 100, false);
         assert_eq!(c.outcome, ExecutionOutcome::Success);
     }
 
@@ -1656,7 +1325,7 @@ mod tests {
     #[test]
     fn classify_snippet_truncation() {
         let long_error = format!("error[E0433]: {}", "x".repeat(500));
-        let c = classify_execution_outcome(&long_error, true, 2000, false);
+        let c = classify_untyped_for_test(&long_error, true, 2000, false);
         assert!(c.error_snippet.as_ref().unwrap().len() <= 210);
     }
 }

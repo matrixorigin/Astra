@@ -34,7 +34,6 @@ use astra_services::{
 use astra_tools::AskUserPrompt;
 #[cfg(feature = "server")]
 use axum::{Json, http::StatusCode};
-#[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 
 pub use completions::{
@@ -42,13 +41,734 @@ pub use completions::{
     CompletionResponse, CompletionUsage, MAX_COMPLETION_OUTPUT_TOKENS,
 };
 pub use edge_ws_protocol::{
-    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
-    EdgeClientMessage, EdgeServerMessage,
+    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_RESULT_GRACE_SECS,
+    EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
 };
 pub use session_run_tree::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
     SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
+
+pub const WORK_API_MAJOR_HEADER: &str = "x-astra-work-api-major";
+pub const WORK_API_MAJOR: &str = "1";
+/// Major version of the interactive run/tool contract shared by CLI, Web,
+/// and Server. Version 3 carries the server-authored Edge command-timeout
+/// cap. A missing or different value is a deployment mismatch, not a
+/// recoverable model/tool error.
+pub const AGENT_INTERACTION_API_MAJOR_HEADER: &str = "x-astra-agent-interaction-api-major";
+pub const AGENT_INTERACTION_API_MAJOR: &str = "3";
+
+/// Versioned, server-issued lifecycle update for the compact live Work board.
+///
+/// This is intentionally an event projection rather than a second task
+/// authority: the server emits it only after the corresponding Work mutation
+/// is durable.  Clients can therefore render current execution immediately
+/// without waiting for a later REST poll, while their normal graph observer
+/// remains responsible for reconciliation and deep navigation.
+pub const WORK_TASK_BOARD_UPDATE_SCHEMA_VERSION: u16 = 1;
+/// Stable SSE event type for a durable Work board projection. The payload is
+/// emitted by the server after the corresponding Work mutation commits; it is
+/// not inferred from tool names or assistant text by clients.
+pub const WORK_TASK_BOARD_UPDATE_EVENT_TYPE: &str = "work_task_board_update";
+/// A live-board receipt travels over the interactive event stream. It holds
+/// concise display text; complete task text belongs to the canonical graph
+/// read model. Keeping each field small lets every supported transport retain
+/// the receipt as structured output.
+pub const WORK_TASK_BOARD_TEXT_MAX_BYTES: usize = 512;
+pub const WORK_TASK_BOARD_MAX_UNAVAILABLE_CAPABILITIES: usize = 16;
+pub const WORK_TASK_BOARD_CAPABILITY_MAX_BYTES: usize = 128;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WorkTaskBoardUpdateV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    #[serde(flatten)]
+    pub change: WorkTaskBoardChangeV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkTaskBoardChangeV1 {
+    /// A complete bounded initial list. `start_work` accepts at most eight
+    /// tasks, so this is both exact and small.
+    Snapshot {
+        goal: String,
+        graph_revision: i64,
+        criteria_member_count: u16,
+        tasks: Vec<WorkTaskBoardTaskV1>,
+    },
+    /// One or more durable task-state transitions. Upserts preserve rows not
+    /// mentioned by the transition, so a long-lived board never requires a
+    /// full graph read on every task settlement.
+    Upsert {
+        graph_revision: Option<i64>,
+        tasks: Vec<WorkTaskBoardTaskV1>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskBoardTaskV1 {
+    pub item_id: String,
+    pub item_revision: i64,
+    pub objective: String,
+    pub expected_result: String,
+    pub declaration_state: WorkTaskBoardDeclarationStateV1,
+    pub execution_status: WorkTaskBoardExecutionStatusV1,
+    pub delivery_status: WorkTaskBoardDeliveryStatusV1,
+    pub delivery_summary: Option<String>,
+    pub blocker_kind: Option<WorkTaskBoardBlockerKindV1>,
+    pub unavailable_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskBoardDeclarationStateV1 {
+    Active,
+    Superseded,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskBoardExecutionStatusV1 {
+    NotStarted,
+    Running,
+    Waiting,
+    Paused,
+    Completed,
+    Delegated,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskBoardDeliveryStatusV1 {
+    Unreported,
+    Delivered,
+    Blocked,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskBoardBlockerKindV1 {
+    CapabilityUnavailable,
+    DependencyBlocked,
+    PolicyBlocked,
+    ExternalUnavailable,
+}
+
+/// Constant-size public identity projection for a session already owned by a
+/// canonical Work branch. The opaque session identifier is intentionally not
+/// echoed: surfaces use it only to bootstrap into the public Work identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSessionBindingResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub graph_revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkBranchActivityV1 {
+    Working,
+    Waiting,
+    Paused,
+    Idle,
+}
+
+/// Read-only, owner-scoped status used by Web observers to discover activity
+/// started by another client. It carries no Session or Run identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchActivityResponseV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub branch_revision: i64,
+    pub activity: WorkBranchActivityV1,
+    pub observed_at: String,
+}
+
+/// Public execution location for one Work branch. The canonical Session
+/// binding remains private; this projection exposes only the information a
+/// surface needs to explain where the next write will run.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionPlacementV1 {
+    Server,
+    Edge,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionStateV1 {
+    Ready,
+    Switching,
+    NeedsAttention,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionSwitchStateV1 {
+    Switching,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkExecutionTargetRequestV1 {
+    Edge { executor_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchRequestV1 {
+    pub request_id: String,
+    pub attachment_id: String,
+    pub expected_generation: u64,
+    pub target: WorkExecutionTargetRequestV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchRetryRequestV1 {
+    pub attachment_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionViewV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    /// `false` means the Work has not selected a durable provider yet. Reads
+    /// expose that state without creating a binding or taking mutation locks.
+    pub initialized: bool,
+    pub generation: u64,
+    pub state: WorkExecutionStateV1,
+    pub placement: WorkExecutionPlacementV1,
+    pub executor_id: Option<String>,
+    pub executor_name: Option<String>,
+    pub operation_id: Option<String>,
+    pub attempt: Option<u32>,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionTargetV1 {
+    pub executor_id: String,
+    pub display_name: Option<String>,
+    pub hostname: Option<String>,
+    pub capabilities: Vec<String>,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionTargetPageV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub targets: Vec<WorkExecutionTargetV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionSwitchOperationV1 {
+    pub schema_version: u16,
+    pub work_id: String,
+    pub branch_id: String,
+    pub operation_id: String,
+    pub request_id: String,
+    pub state: WorkExecutionSwitchStateV1,
+    pub expected_generation: u64,
+    pub switching_generation: u64,
+    pub completed_generation: Option<u64>,
+    pub attempt: u32,
+    pub target: WorkExecutionTargetRequestV1,
+    pub failure_code: Option<String>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct WorkObservationResponseV1(pub astra_services::work::WorkObservationReport);
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCatalogQueryV1 {
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_work_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCatalogResponseV1 {
+    pub schema_version: u16,
+    #[serde(flatten)]
+    pub page: astra_services::work::WorkCatalogPage,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchAttachRequestV1 {
+    pub request_id: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkBranchAttachmentModeV1 {
+    ReadOnly,
+    Controller,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkBranchSyncStateV1 {
+    Current,
+    ProjectionStale,
+    Degraded,
+    Corrupt,
+    Offline,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkConversationHeadV1 {
+    pub completed_turn: u32,
+    pub journal_event_seq: u64,
+    pub conversation_seq: u64,
+    pub canonical_root_hash: String,
+    pub projection_schema: u32,
+    pub compaction_generation: u64,
+    pub config_version_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchCreationRequestV1 {
+    pub request_id: String,
+    pub expected_branch_revision: i64,
+    pub committed_cursor: WorkConversationHeadV1,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchComparisonRequestV1 {
+    pub left_branch_id: String,
+    pub right_branch_id: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkArchivedBranchesQueryV1 {
+    pub before_archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_branch_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDeliverySelectionSubjectV1 {
+    pub graph_revision: i64,
+    pub subject_ref: String,
+    pub subject_revision: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkActionV1 {
+    SelectDeliveryBranch {
+        branch_id: String,
+        expected_branch_revision: i64,
+        expected_goal_revision: i64,
+        expected_criteria_set_revision: i64,
+        expected_graph_revision: i64,
+        expected_subject: Option<WorkDeliverySelectionSubjectV1>,
+        expected_evidence_manifest_hash: String,
+    },
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkActionRequestV1 {
+    pub request_id: String,
+    pub expected_work_revision: i64,
+    pub action: WorkActionV1,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkBranchActionV1 {
+    Archive,
+    Restore,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchActionRequestV1 {
+    pub request_id: String,
+    pub expected_work_revision: i64,
+    pub expected_branch_revision: i64,
+    pub action: WorkBranchActionV1,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchDeletionRequestV1 {
+    pub request_id: String,
+    pub expected_work_revision: i64,
+    pub expected_branch_revision: i64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchMaterializationRequestV1 {
+    pub request_id: String,
+    pub patch_artifact_id: String,
+    pub expected_target_branch_revision: i64,
+    pub expected_target_graph_revision: i64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchMaterializationsQueryV1 {
+    pub source_branch_id: String,
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_operation_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchCommitRequestV1 {
+    pub request_id: String,
+    pub patch_artifact_id: String,
+    pub expected_target_branch_revision: i64,
+    pub expected_target_graph_revision: i64,
+    pub message: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchCommitsQueryV1 {
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_operation_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchArtifactExportRequestV1 {
+    pub request_id: String,
+    pub expected_branch_revision: i64,
+    pub expected_graph_revision: i64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPatchArtifactsQueryV1 {
+    pub before_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_patch_artifact_id: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize)]
+pub struct WorkBranchAttachResponseV1 {
+    pub schema_version: u16,
+    pub work_id: astra_services::work::WorkId,
+    pub branch_id: astra_services::work::WorkBranchId,
+    pub attachment_id: String,
+    pub attachment_epoch: u64,
+    pub branch_revision: astra_services::work::WorkBranchRevision,
+    pub mode: WorkBranchAttachmentModeV1,
+    pub sync: WorkBranchSyncStateV1,
+    pub control_basis: WorkBranchControlBasisV1,
+    pub head: Option<WorkConversationHeadV1>,
+    pub attached_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WorkBranchControlBasisV1 {
+    pub writer_epoch: u64,
+    pub canonical_root_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkBranchControlCommandV1 {
+    AcquireBranchControl {
+        attachment_id: String,
+    },
+    ForceTakeover {
+        attachment_id: String,
+        reauthentication_proof: String,
+    },
+    ReleaseBranchControl {
+        attachment_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkBranchControlOperationRequestV1 {
+    pub request_id: String,
+    pub expected_branch_revision: i64,
+    pub expected_writer_epoch: u64,
+    pub expected_canonical_root_hash: Option<String>,
+    pub command: WorkBranchControlCommandV1,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTranscriptQueryV1 {
+    pub before_item_seq: Option<u64>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize)]
+pub struct WorkTranscriptItemV1 {
+    pub item_seq: u64,
+    pub committed_turn: u32,
+    pub role: String,
+    pub content: String,
+    pub content_truncated: bool,
+    pub payload: Option<serde_json::Value>,
+    pub payload_omitted: bool,
+    pub content_hash: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, Serialize)]
+pub struct WorkTranscriptPageResponseV1 {
+    pub schema_version: u16,
+    pub work_id: astra_services::work::WorkId,
+    pub branch_id: astra_services::work::WorkBranchId,
+    pub sync: WorkBranchSyncStateV1,
+    pub canonical_head: Option<WorkConversationHeadV1>,
+    pub transcript_cursor: Option<WorkConversationHeadV1>,
+    pub items: Vec<WorkTranscriptItemV1>,
+    pub next_before_item_seq: Option<u64>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkCreateCriterionV1 {
+    CommandCheck {
+        criterion_id: String,
+        statement: String,
+        command: String,
+    },
+    TestCheck {
+        criterion_id: String,
+        statement: String,
+        command: String,
+    },
+    HumanReview {
+        criterion_id: String,
+        statement: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCreateRequestV1 {
+    /// Caller-generated logical request identity. Exact retries create at
+    /// most one Work; reusing it with a different goal or criterion set fails closed.
+    pub request_id: String,
+    pub goal: String,
+    /// Explicit user-authored Done-when criteria. The server never infers
+    /// criterion definitions from goal text.
+    pub criteria: Vec<WorkCreateCriterionV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTurnRequestV1 {
+    /// Caller-generated identity for one logical branch continuation. Exact
+    /// retries attach to the same run; a changed message fails closed.
+    pub request_id: String,
+    pub attachment_id: String,
+    pub message: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkReadCursorRequestV1 {
+    pub through_event_seq: i64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkReadCursorResponseV1 {
+    pub schema_version: u16,
+    pub work_id: astra_services::work::WorkId,
+    pub through_event_seq: astra_services::work::WorkEventSeq,
+    pub receipt_revision: astra_services::work::WorkAttentionReceiptRevision,
+    pub receipt_hash: astra_services::work::WorkContentHash,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEventsQueryV1 {
+    pub after_event_seq: Option<i64>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTaskGraphQueryV1 {
+    /// Required on every continuation page; pins offsets to one immutable
+    /// graph revision and prevents torn pagination across a replan.
+    pub graph_revision: Option<i64>,
+    pub item_offset: Option<u16>,
+    pub item_limit: Option<u16>,
+    pub dependency_offset: Option<u16>,
+    pub dependency_limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct WorkTaskGraphResponseV1(pub astra_services::work::WorkTaskGraphPage);
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCriteriaQueryV1 {
+    /// Required on continuation pages so a concurrent criterion-set change
+    /// cannot splice two immutable sets into one user view.
+    pub criteria_set_revision: Option<i64>,
+    pub offset: Option<u16>,
+    pub limit: Option<u16>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct WorkCriteriaResponseV1(pub astra_services::work::WorkCriteriaPage);
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCriteriaProposalBasisV1 {
+    pub work_revision: astra_services::work::WorkRevision,
+    pub goal_revision: astra_services::work::GoalRevision,
+    pub criteria_set_revision: astra_services::work::CriterionSetRevision,
+    pub branch_revision: astra_services::work::WorkBranchRevision,
+    pub graph_revision: astra_services::work::GraphRevision,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCriteriaProposalSummaryV1 {
+    pub work_id: astra_services::work::WorkId,
+    pub branch_id: astra_services::work::WorkBranchId,
+    pub proposal_id: astra_services::work::WorkProposalId,
+    pub proposal_seq: i64,
+    pub payload_hash: astra_services::work::WorkContentHash,
+    pub status: astra_services::work::WorkProposalStatus,
+    pub basis: WorkCriteriaProposalBasisV1,
+    pub member_count: u16,
+    pub source_kind: astra_services::work::WorkProposalSourceKind,
+    pub proposed_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCriteriaProposalResolutionV1 {
+    pub resolution_ref: astra_services::work::WorkChangeRef,
+    pub resolved_at: chrono::DateTime<chrono::Utc>,
+    pub result_work_revision: Option<astra_services::work::WorkRevision>,
+    pub result_criteria_set_revision: Option<astra_services::work::CriterionSetRevision>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCriteriaProposalDetailResponseV1 {
+    pub schema_version: u16,
+    pub proposal: WorkCriteriaProposalSummaryV1,
+    pub members: Vec<astra_services::work::WorkCriteriaProposalMember>,
+    pub resolution: Option<WorkCriteriaProposalResolutionV1>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkCriteriaProposalListResponseV1 {
+    pub schema_version: u16,
+    pub work_id: astra_services::work::WorkId,
+    pub branch_id: astra_services::work::WorkBranchId,
+    pub proposals: Vec<WorkCriteriaProposalSummaryV1>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkCriteriaProposalDecisionV1 {
+    Accept,
+    Reject,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCriteriaProposalDecisionRequestV1 {
+    pub request_id: String,
+    pub decision: WorkCriteriaProposalDecisionV1,
+    pub payload_hash: String,
+    pub expected_work_revision: i64,
+    pub expected_goal_revision: i64,
+    pub expected_criteria_set_revision: i64,
+    pub expected_branch_revision: i64,
+    pub expected_graph_revision: i64,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize)]
+pub struct WorkEventPageResponseV1 {
+    pub schema_version: u16,
+    #[serde(flatten)]
+    pub page: astra_services::work::WorkEventPage,
+}
 
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
@@ -60,6 +780,7 @@ pub struct RootResponse {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthRegisterRequest {
     pub username: String,
     pub email: String,
@@ -69,6 +790,7 @@ pub struct AuthRegisterRequest {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthLoginRequest {
     pub username: String,
     pub password: String,
@@ -76,6 +798,14 @@ pub struct AuthLoginRequest {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthMemoriaRequest {
+    pub connection_key: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthRefreshRequest {
     pub refresh_token: String,
 }
@@ -84,7 +814,9 @@ pub struct AuthRefreshRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthReauthenticateRequest {
+    #[serde(default)]
     pub password: String,
+    pub memoria_proof: Option<String>,
     pub purpose: ReauthenticationPurpose,
 }
 
@@ -104,6 +836,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub work_binding: Option<astra_services::runs::WorkRuntimeBindingRequest>,
     pub agent_id: Option<String>,
     #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
@@ -137,8 +871,6 @@ pub struct ChatRequest {
     pub executor_binding: Option<astra_services::runs::ExecutorBindingRequest>,
     #[serde(default)]
     pub runtime_mcp_bindings: Vec<astra_services::runs::RuntimeMcpBindingRequest>,
-    #[serde(default)]
-    pub mcp_binding_ids: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub edge_executor_id: Option<String>,
@@ -146,6 +878,8 @@ pub struct ChatRequest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub execution_budget: Option<astra_services::runs::ExecutionBudget>,
+    #[serde(default)]
+    pub execution_time_budget: Option<astra_services::runs::ExecutionTimeBudget>,
     #[serde(default)]
     pub execution_policy: astra_services::runs::ExecutionPolicyRequest,
     #[serde(default)]
@@ -160,9 +894,9 @@ pub struct ChatRequest {
     pub plan_subtask_id: Option<String>,
     #[serde(default)]
     pub is_plan_subtask: Option<bool>,
-    /// Server-issued canonical authority. Omitted only by the revisioned
-    /// legacy bridge; identity inside this envelope is never trusted without
-    /// signature and authenticated-owner validation.
+    /// Server-issued canonical authority. Omitted on initial admission;
+    /// identity inside this envelope is never trusted without signature and
+    /// authenticated-owner validation.
     #[serde(default)]
     pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
@@ -172,18 +906,25 @@ pub struct ChatRequest {
 pub struct RunStreamQuery {
     #[serde(default)]
     pub last_index: u32,
+    /// Return only the durable backlog through its current high watermark.
+    /// Used by attached clients to repair a reported live delivery gap.
+    #[serde(default)]
+    pub replay_only: bool,
 }
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionCreateRequest {
     pub agent_id: Option<String>,
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub client_session_ref: Option<String>,
 }
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionUpdateRequest {
     pub title: Option<String>,
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
@@ -387,6 +1128,18 @@ pub struct AuthTokenResponse {
 
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
+pub struct AuthMemoriaResponse {
+    pub user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: u32,
+    pub memory_access: String,
+    pub granted_scopes: Vec<String>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
 pub struct AuthLogoutResponse {
     pub message: String,
 }
@@ -435,6 +1188,8 @@ pub struct ChatResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub session_id: String,
     pub parent_run_id: Option<String>,
@@ -446,6 +1201,8 @@ pub struct RunStatusResponse {
     pub workspace: Option<serde_json::Value>,
     pub executor: Option<serde_json::Value>,
     pub transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "server")]
@@ -453,11 +1210,14 @@ pub struct RunStatusResponse {
 pub struct CancelRunResponse {
     pub run_id: String,
     pub status: String,
+    pub execution_settled: bool,
 }
 
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunMutationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
     pub status: String,
     pub previous_status: String,
@@ -515,8 +1275,8 @@ pub struct HealthResponse {
     pub status: String,
     pub database: String,
     pub memoria: String,
-    pub persist_ok: u64,
-    pub persist_fail: u64,
+    pub interaction_api_major: String,
+    pub build_git_sha: String,
 }
 
 #[cfg(feature = "server")]
@@ -723,7 +1483,10 @@ pub struct AdminUserRoleResponse {
 pub enum WsClientMessage {
     /// Authenticate with a Bearer token (must be first message).
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth {
+        token: String,
+        interaction_api_major: String,
+    },
 
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
@@ -781,7 +1544,11 @@ pub enum WsClientMessage {
 pub enum WsServerMessage {
     /// Authentication succeeded.
     #[serde(rename = "auth_ok")]
-    AuthOk { user_id: String, username: String },
+    AuthOk {
+        user_id: String,
+        username: String,
+        interaction_api_major: String,
+    },
 
     /// Authentication failed.
     #[serde(rename = "auth_error")]
@@ -889,12 +1656,12 @@ pub enum WsServerMessage {
     Closing { reason: String },
 }
 
-/// Query params for WebSocket upgrade — allows token in URL for browser compat.
+/// Query params for WebSocket upgrade. Credentials belong in the typed first
+/// WebSocket frame and are never accepted in URLs.
 #[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WsUpgradeQuery {
-    /// Optional Bearer token (alternative to sending auth message).
-    pub token: Option<String>,
     /// Optional session ID to request on the first chat turn.
     pub session_id: Option<String>,
 }
@@ -1143,6 +1910,7 @@ impl From<ChatRunRecord> for ChatResponse {
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
+            artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             session_id: value.session_id,
             parent_run_id: value.parent_run_id,
@@ -1154,6 +1922,7 @@ impl From<RunStatusRecord> for RunStatusResponse {
             workspace: value.workspace,
             executor: value.executor,
             transport: value.transport,
+            accounting: value.accounting,
         }
     }
 }
@@ -1164,6 +1933,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
         Self {
             run_id: value.run_id,
             status: value.status,
+            execution_settled: value.execution_settled,
         }
     }
 }
@@ -1172,6 +1942,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
 impl From<RunMutationRecord> for RunMutationResponse {
     fn from(value: RunMutationRecord) -> Self {
         Self {
+            artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             status: value.status,
             previous_status: value.previous_status,
@@ -1227,6 +1998,7 @@ impl From<AuthReauthenticateRequest> for ReauthenticationRequestData {
     fn from(value: AuthReauthenticateRequest) -> Self {
         Self {
             password: value.password,
+            memoria_proof: value.memoria_proof,
             purpose: value.purpose,
         }
     }
@@ -1269,9 +2041,12 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         stable_runtime_system_prompt: request.stable_runtime_system_prompt,
         runtime_system_prompt: request.runtime_system_prompt,
         session_id: request.session_id,
+        work_binding: request.work_binding,
+        run_start_idempotency: None,
         full_llm_capture: false,
         agent_id: request.agent_id,
         model: None,
+        model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: request.model_selection,
         resolved_model_selection: request.resolved_model_selection,
         admitted_model_execution: None,
@@ -1289,14 +2064,17 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         enabled_tools: request.enabled_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
+        execution_binding_generation: None,
         runtime_mcp_bindings: request.runtime_mcp_bindings,
-        mcp_binding_ids: request.mcp_binding_ids,
         context,
         edge_executor_id,
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
+        provider_workspace_id: None,
         execution_budget: request.execution_budget,
+        execution_time_budget: request.execution_time_budget,
+        admitted_execution_deadline: None,
         execution_policy: request.execution_policy,
         explain: request.explain,
         interaction_mode: request.interaction_mode,

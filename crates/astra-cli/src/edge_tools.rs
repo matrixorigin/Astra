@@ -2,7 +2,7 @@
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
-//!        git(action=...), github(action=...), web_fetch, mo_query.
+//!        worktree, web_fetch, mo_query.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -70,7 +70,6 @@ pub enum SandboxExpansionError {
 }
 
 use crossterm::style::Stylize;
-use reqwest::Client;
 use serde_json::{Value, json};
 
 #[path = "edge_tools/agent_messaging.rs"]
@@ -85,17 +84,11 @@ pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 pub(crate) use astra_tools::fuzzy_replacer;
-#[path = "edge_tools/git_gix.rs"]
-mod git_gix;
-#[path = "edge_tools/github.rs"]
-mod github;
 #[path = "edge_tools/lsp_stdio_session.rs"]
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
 use astra_tools::passive_cargo_check;
-pub(crate) use git_gix::GitCommitRollbackJournal;
-pub(crate) use git_gix::GitStashRollbackJournal;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -115,7 +108,11 @@ mod config_tool;
 mod context_tools;
 
 pub fn all_tool_schemas() -> Vec<Value> {
-    full_tool_schemas()
+    let mut schemas = full_tool_schemas();
+    // The projector checks the same platform capability as the executor, so
+    // unsupported arguments are never advertised.
+    astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
+    schemas
 }
 
 const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -153,7 +150,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "session",
     "share_context",
     "symbol_search",
-    "task_board",
     "task_list",
     "task_output",
     "task_stop",
@@ -170,11 +166,17 @@ fn runtime_env_builtin_registry() -> &'static astra_runtime_env::ToolRegistry {
 fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
     let registry = runtime_env_builtin_registry();
     let binding = astra_runtime_env::RunBinding::local_developer(".", registry);
-    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_binding(
-        registry,
-        raw_schemas,
-        &binding,
-    )
+    astra_runtime_env::CapabilityResolver
+        .filter_tool_schemas_for_binding(registry, raw_schemas, &binding)
+        .into_iter()
+        // A CLI-local catalog has no trusted server-reserved WorkItem-attempt
+        // identity. Attempt-owned transitions are surfaced only when the
+        // Server binds that identity to a run.
+        .filter(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                .is_none_or(|name| registry.permits_work_execution_role(name, false))
+        })
+        .collect()
 }
 
 /// Construct the CLI's session-wide `CapabilitySet`.
@@ -186,7 +188,6 @@ pub fn cli_default_capabilities(
     CapabilitySet::empty()
         .with(Capability::MemoryService)
         .with(Capability::Database)
-        .with(Capability::GitHubAuth)
         .with(Capability::LSPServer)
         .with(Capability::SkillsCatalog)
         .with(Capability::PlanLifecycle)
@@ -204,8 +205,9 @@ struct CliCapabilityView {
     capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
 }
 
+/// Authorized inventory for registry/provider setup before request restrictions.
 pub fn local_tool_schemas() -> Vec<Value> {
-    local_runtime_tool_schemas(full_tool_schemas())
+    local_runtime_tool_schemas(all_tool_schemas())
 }
 
 /// Plan-mode write guard tool list (CLI parity with
@@ -213,22 +215,11 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
-/// Read-only tools (read_file, grep, glob, git(action=status/diff/log)) and
+/// Read-only tools (read_file, grep, glob) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
-}
-
-fn git_stash_sub_action_args(args: &Value) -> Value {
-    let sub_action = args.get("sub_action").and_then(Value::as_str);
-    let Some(sub_action) = sub_action else {
-        return args.clone();
-    };
-
-    let mut map = args.as_object().cloned().unwrap_or_default();
-    map.insert("action".to_string(), Value::String(sub_action.to_string()));
-    Value::Object(map)
 }
 
 #[path = "edge_tools/diagnose.rs"]
@@ -243,9 +234,7 @@ mod notebook_edit;
 mod self_mod_tools;
 #[path = "edge_tools/session_state.rs"]
 mod session_state;
-use astra_tools::task_mgmt;
 use file_state::FileState;
-pub(crate) use task_mgmt::TaskManager;
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
@@ -294,9 +283,6 @@ mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
-use worktree::detect_git_remote_repos;
-#[cfg(test)]
-use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]
 pub(crate) mod memoria;
 #[cfg(test)]
@@ -365,7 +351,7 @@ pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
 const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
 
 /// Soft threshold at which aggregate-aware gating starts warning.
-/// Tools that produce large output (read_file, git(action=show)) will check this
+/// Tools that produce large output (read_file) will check this
 /// before doing I/O and suggest lighter alternatives when exceeded.
 const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
@@ -403,12 +389,13 @@ fn cli_tool_output_is_error(output: &str) -> bool {
         == astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
 }
 
-pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
+pub(crate) use astra_tools::execution_outcome::ToolExecutionOutcome;
 
 pub(crate) fn nonexecuted_tool_result_fields(
     disposition: astra_services::session_journal::ToolCallDisposition,
 ) -> serde_json::Map<String, Value> {
     serde_json::Map::from_iter([
+        ("executed".to_string(), Value::Bool(false)),
         (
             "result_class".to_string(),
             Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
@@ -436,9 +423,22 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
         return outcome;
     }
     if cli_tool_output_is_error(&output) {
-        ToolExecutionOutcome::error(output)
+        let kind = astra_core::classify_tool_output(&output);
+        ToolExecutionOutcome::error_with_evidence(
+            output,
+            astra_core::ToolFailureEvidence::from_error_kind(kind),
+        )
     } else {
         ToolExecutionOutcome::ok(output)
+    }
+}
+
+fn cancelled_tool_execution_outcome(name: &str, execution_started: bool) -> ToolExecutionOutcome {
+    let result = astra_tools::cancelled_tool_result(name, execution_started);
+    ToolExecutionOutcome {
+        output: result.output,
+        tool_result_fields: result.metadata,
+        is_error: result.is_error,
     }
 }
 
@@ -467,6 +467,7 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
 
 struct EdgeToolRun {
     output: String,
+    is_error: bool,
     error_kind: Option<astra_core::ErrorKind>,
     tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
@@ -475,6 +476,7 @@ impl EdgeToolRun {
     fn ok(output: String) -> Self {
         Self {
             output,
+            is_error: false,
             error_kind: None,
             tool_result_fields: None,
         }
@@ -483,16 +485,27 @@ impl EdgeToolRun {
     fn error(output: String) -> Self {
         Self {
             output,
+            is_error: true,
             error_kind: None,
             tool_result_fields: None,
         }
     }
 
     fn classified_error(output: String, kind: astra_core::ErrorKind) -> Self {
+        let evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "disposition".to_string(),
+            serde_json::Value::String("rejected".to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(evidence) {
+            fields.insert("recovery_evidence".to_string(), value);
+        }
         Self {
             output,
+            is_error: true,
             error_kind: Some(kind),
-            tool_result_fields: None,
+            tool_result_fields: Some(fields),
         }
     }
 
@@ -507,28 +520,30 @@ impl EdgeToolRun {
         }
         Self {
             output,
+            is_error: true,
             error_kind: Some(evidence.kind),
             tool_result_fields: Some(fields),
         }
     }
 
     fn with_tool_result_fields(mut self, fields: Option<serde_json::Map<String, Value>>) -> Self {
-        self.tool_result_fields = fields;
+        if let Some(fields) = fields {
+            self.tool_result_fields
+                .get_or_insert_with(serde_json::Map::new)
+                .extend(fields);
+        }
         self
     }
 
     fn into_outcome(self) -> ToolExecutionOutcome {
-        if let Some(outcome) = sandbox_denied_outcome_from_output(&self.output) {
-            return outcome;
-        }
-
         let EdgeToolRun {
             output,
+            is_error,
             error_kind,
             tool_result_fields,
         } = self;
 
-        let mut outcome = if error_kind.is_some() || cli_tool_output_is_error(&output) {
+        let mut outcome = if is_error {
             ToolExecutionOutcome::error(output)
         } else {
             ToolExecutionOutcome::ok(output)
@@ -549,6 +564,16 @@ impl EdgeToolRun {
             );
         }
         outcome
+    }
+}
+
+fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
+    let result = astra_tools::cancelled_tool_result(name, execution_started);
+    EdgeToolRun {
+        output: result.output,
+        is_error: true,
+        error_kind: Some(astra_core::ErrorKind::Cancelled),
+        tool_result_fields: result.metadata,
     }
 }
 
@@ -1266,11 +1291,6 @@ fn background_task_id_arg(args: &Value) -> Result<Option<String>, &'static str> 
     Ok(Some(id.to_string()))
 }
 
-struct RoutedTaskAction {
-    output: String,
-    mutation: Option<crate::cli::session::session_todo_client::TodoMutationResult>,
-}
-
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -1278,24 +1298,16 @@ pub struct ToolExecutor {
     pub cloud_base: Option<String>,
     /// Auth token for cloud proxy calls.
     cloud_token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
-    /// Optional GitHub token for authenticated GitHub API requests.
-    pub github_token: Option<String>,
-    /// Shared async GitHub client for edge tools.
-    pub github_client: Client,
+
     /// Security sandbox policy for tool execution (None = Permissive/legacy).
     ///
     /// Wrapped in `RwLock` so the policy can be swapped per-turn (e.g. skill
     /// sandbox activation) while the executor is shared via `Arc<ToolExecutor>`.
     pub sandbox_policy: std::sync::RwLock<Option<SandboxPolicy>>,
-    /// Preferred repos for disambiguation (owner/repo format, lowercased).
-    /// Populated from: git remote origin, recent tool results, memory.
-    /// When a bare repo name like "memoria" matches multiple GitHub repos,
-    /// the resolver prefers repos whose owner/name is in this list.
-    /// Uses Mutex to allow learning from resolved repos without &mut self.
-    preferred_repos: std::sync::Mutex<Vec<String>>,
+
     /// Per-turn budget pressure (0.0 = normal, 1.0 = critical).
     /// Set before each tool execution batch, read by tools that produce
-    /// variable-size output (git(action=diff), git(action=show)) to scale their limits.
+    /// variable-size output to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
     /// Build/test iteration tracker — tracks error deltas across fix cycles.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
@@ -1312,6 +1324,8 @@ pub struct ToolExecutor {
     /// Used for staleness detection (prevent overwriting user edits)
     /// and dedup (skip re-reading unchanged files).
     file_state: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>,
+    convergence_tracker: astra_tools::workspace_observation::DesiredStateConvergenceTracker,
+    convergence_authority: String,
     /// Per-turn aggregate tool output size (bytes). When this exceeds
     /// `AGGREGATE_OUTPUT_BUDGET`, subsequent tool outputs are truncated
     /// more aggressively.
@@ -1345,17 +1359,12 @@ pub struct ToolExecutor {
     /// executor can perform a bounded restore without reconstructing tool history.
     pub(crate) database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
-    /// Git stash rollback journal — records captured stash handles so bounded
-    /// turn/batch rollback can re-apply shelved working tree state.
-    pub git_stash_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
-    /// Git commit rollback journal — records captured commit handles so bounded
-    /// turn/batch rollback can revert recent committed history when it is still safe.
-    pub git_commit_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
+
     /// Git worktree rollback journal — records newly created worktrees so bounded
     /// turn/batch rollback can remove them again while they are still clean.
     pub(crate) git_worktree_journal:
         std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
-    /// Session-state rollback journal — records bounded self-mod/task mutations so
+    /// Session-state rollback journal — records bounded self-mod mutations so
     /// same-turn rollback can restore prior in-memory session state.
     session_state_journal:
         std::sync::Arc<std::sync::Mutex<session_state::SessionStateRollbackJournal>>,
@@ -1364,13 +1373,6 @@ pub struct ToolExecutor {
     /// Active worktree session state. When set, `effective_project_root()` returns
     /// the worktree path instead of the original `project_root`.
     worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
-    /// In-memory task manager for the current session.
-    task_manager: std::sync::Arc<task_mgmt::TaskManager>,
-    /// Broadcast sender that signals the TaskBoardObserver after a
-    /// successful session task-board mutation. Payload is the session_id that
-    /// changed. `None` when offline (in-memory store handles its own
-    /// notifications via `InMemoryTaskStore::subscribe`).
-    pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Command queue for background task operations. Drained by the
     /// TUI event loop each tick. Allows the tool executor (which runs
     /// inside the agentic loop) to spawn/kill background tasks without
@@ -1456,12 +1458,6 @@ pub struct ToolExecutor {
     /// activation paths. Keeping them behind one lock prevents impossible
     /// mixed snapshots such as "new activatable names with old visible names".
     current_tool_surface: std::sync::RwLock<ToolSurfaceNames>,
-    /// Deferred tool names whose full schema has been fetched via
-    /// `tool_search(query="select:NAME")`. Names remain materialized in the
-    /// session's retained context until a non-empty runtime surface proves the
-    /// activation stale. Session reset and context restoration own this state;
-    /// a successful call never revokes it.
-    activated_deferred_tools: std::sync::RwLock<HashSet<String>>,
     /// Cached plan-mode authoring flag keyed by the session it was
     /// computed for. Mirrors the server-side write guard so a CLI run
     /// that talks to the same plan store cannot bypass plan mode by
@@ -1499,7 +1495,6 @@ pub struct ToolExecutor {
 impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
-        let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
         let executor = Self {
             project_root: root.clone(),
@@ -1507,28 +1502,22 @@ impl ToolExecutor {
             cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
             // memory-resident secrets from lingering after drop.
-            github_token: astra_tools::github::resolve_github_token(),
+
             // GitHub API is external traffic (api.github.com), so it honours
             // HTTPS_PROXY/ALL_PROXY via the authoritative helper in astra_core::net.
             // See core/src/net.rs for the workspace proxy policy (3e3d6fa8).
-            github_client: astra_core::net::apply_env_proxy(
-                Client::builder()
-                    .timeout(Duration::from_secs(15))
-                    .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION"))),
-            )
-            .build()
-            .unwrap_or_else(|_| Client::new()),
             cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
-            activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
-            preferred_repos: std::sync::Mutex::new(preferred_repos),
+
             budget_pressure: std::sync::Mutex::new(0.0),
             build_test_tracker: std::sync::Mutex::new(build_test::BuildTestTracker::new()),
             memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker::default(),
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             memory_attribution_id: None,
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            convergence_tracker: Default::default(),
+            convergence_authority: uuid::Uuid::new_v4().to_string(),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             bash_progress_sink: std::sync::RwLock::new(None),
             passive_cargo_pending: AtomicBool::new(false),
@@ -1541,12 +1530,7 @@ impl ToolExecutor {
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
-            git_stash_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                git_gix::GitStashRollbackJournal::default(),
-            )),
-            git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                git_gix::GitCommitRollbackJournal::default(),
-            )),
+
             git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 worktree::GitWorktreeRollbackJournal::default(),
             )),
@@ -1555,8 +1539,6 @@ impl ToolExecutor {
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
-            task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
-            task_notify_tx: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
@@ -1613,10 +1595,9 @@ impl ToolExecutor {
                 }
             })
         }));
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
-        *guard = ToolSurfaceNames::installed(names, HashSet::new());
+        *guard = ToolSurfaceNames::installed_with_schemas(schemas, HashSet::new());
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
@@ -1669,69 +1650,6 @@ impl ToolExecutor {
             .lock()
             .ok()
             .and_then(|mut g| g.take())
-    }
-
-    /// Names of deferred tools currently materialized for schema injection.
-    /// Stale entries are pruned against the current visible/activatable
-    /// surface so this side set cannot become a long-lived allowlist.
-    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let surface =
-            self.current_tool_surface_snapshot("current_tool_surface_activation_retention");
-        if matches!(surface, ToolSurfaceNames::Uninstalled) {
-            return Vec::new();
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_prune",
-        );
-        let retained =
-            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_tool_names(
-                &guard,
-                &surface,
-                |name| self.tool_has_runtime_binding(name),
-            );
-        // Use set-based comparison, not length comparison: same-count with
-        // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
-        let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
-        let before = guard.len();
-        guard.retain(|name| retained_set.contains(name.as_str()));
-        let after = guard.len();
-        tracing::debug!(before, after, "pruned CLI activated_deferred_tools entries");
-        retained
-    }
-
-    /// Return deferred tools materialized by retained conversation context for
-    /// the next schema-selection round. Calls do not consume this state: a
-    /// schema admitted to the model remains admitted until context/session
-    /// reset or a real surface change.
-    pub fn activated_deferred_tool_names_for_schema_injection(&self) -> Vec<String> {
-        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation_take");
-        if matches!(surface, ToolSurfaceNames::Uninstalled) {
-            return Vec::new();
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_take",
-        );
-        let before = guard.len();
-        let retained =
-            astra_turn_core::tool::deferred_activation::activated_tool_names_for_schema_injection(
-                &mut guard,
-                &surface,
-                |name| self.tool_has_runtime_binding(name),
-            );
-        let after = guard.len();
-        if before > 0 {
-            tracing::debug!(
-                before,
-                after,
-                returned = retained.len(),
-                "resolved CLI activated_deferred_tools for schema injection"
-            );
-        }
-        retained
     }
 
     /// Set the spawn context for agent spawning.
@@ -1821,11 +1739,10 @@ impl ToolExecutor {
     /// Install the visible `tools[]` names for the current LLM request.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
         let visible_schemas = self.runtime_bound_tool_schemas(schemas.to_vec());
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let activatable = guard.activatable().cloned().unwrap_or_default();
-        *guard = ToolSurfaceNames::installed(names, activatable);
+        *guard = ToolSurfaceNames::installed_with_schemas(visible_schemas, activatable);
     }
 
     /// Install the names that this turn's deferred manifest allows
@@ -1835,7 +1752,42 @@ impl ToolExecutor {
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let visible = guard.visible().cloned().unwrap_or_default();
-        *guard = ToolSurfaceNames::installed(visible, names);
+        let visible_schemas = guard.visible_schemas().unwrap_or_default().to_vec();
+        *guard = ToolSurfaceNames::Installed {
+            visible,
+            activatable: names,
+            visible_schemas: std::sync::Arc::new(visible_schemas),
+        };
+    }
+
+    /// Reconcile a Server-owned wire-schema admission into the Edge executor.
+    ///
+    /// This does not widen runtime capabilities: the tool must still have a
+    /// local public-schema binding, and argument validation, permission and
+    /// sandbox gates remain in the normal execution path.  It only removes a
+    /// second, stale deferred-surface decision after the Server already made
+    /// the authoritative per-round admission decision.
+    pub(crate) fn accept_server_tool_surface_admission(&self, name: &str) -> Result<(), String> {
+        if !self.tool_has_public_schema_runtime_binding(name) {
+            return Err(format!(
+                "Server admitted tool '{name}', but this Edge has no executable public-schema binding"
+            ));
+        }
+
+        let mut surface = rwlock_write_reset_on_poison(
+            &self.current_tool_surface,
+            "current_tool_surface_server_admission",
+        );
+        match &mut *surface {
+            ToolSurfaceNames::Uninstalled => {
+                *surface =
+                    ToolSurfaceNames::installed(HashSet::from([name.to_string()]), HashSet::new());
+            }
+            ToolSurfaceNames::Installed { visible, .. } => {
+                visible.insert(name.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Install the exact current surface in one write.
@@ -1849,35 +1801,10 @@ impl ToolExecutor {
         activatable_names: HashSet<String>,
     ) {
         let visible_schemas = self.runtime_bound_tool_schemas(visible_schemas.to_vec());
-        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let activatable = self.runtime_bound_tool_names(activatable_names);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
-        *guard = ToolSurfaceNames::installed(visible, activatable);
-    }
-
-    pub(crate) fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
-        let restored: HashSet<String> = names
-            .iter()
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        {
-            let mut surface = rwlock_write_reset_on_poison(
-                &self.current_tool_surface,
-                "current_tool_surface_restore_deferred_activation",
-            );
-            if !restored.is_empty() && matches!(*surface, ToolSurfaceNames::Uninstalled) {
-                *surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
-            }
-        }
-
-        *rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_restore",
-        ) = restored;
+        *guard = ToolSurfaceNames::installed_with_schemas(visible_schemas, activatable);
     }
 
     #[cfg(test)]
@@ -1886,11 +1813,6 @@ impl ToolExecutor {
             &self.current_tool_surface,
             "current_tool_surface_test_clear",
         ) = ToolSurfaceNames::default();
-        rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools_test_clear",
-        )
-        .clear();
     }
 
     /// Snapshot of the names that the model's `<deferred-tools>` manifest
@@ -1900,6 +1822,17 @@ impl ToolExecutor {
         self.current_tool_surface_snapshot("current_tool_surface_snapshot")
             .activatable()
             .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the exact provider-facing schemas from the last outbound
+    /// request.  Retention uses this structural snapshot so a follow-up
+    /// surface never replaces a compact/provider-specific schema with the
+    /// richer canonical catalog entry.
+    pub fn current_visible_tool_schemas_snapshot(&self) -> Vec<Value> {
+        self.current_tool_surface_snapshot("current_visible_tool_schemas_snapshot")
+            .visible_schemas()
+            .map(|schemas| schemas.to_vec())
             .unwrap_or_default()
     }
 
@@ -1926,8 +1859,10 @@ impl ToolExecutor {
         schemas
             .into_iter()
             .filter(|schema| {
-                astra_turn_core::tool::schema::tool_schema_name(schema)
-                    .is_some_and(|name| self.tool_has_public_schema_runtime_binding(name))
+                astra_turn_core::tool::schema::tool_schema_name(schema).is_some_and(|name| {
+                    self.tool_has_public_schema_runtime_binding(name)
+                        && runtime_env_builtin_registry().permits_work_execution_role(name, false)
+                })
             })
             .collect()
     }
@@ -1944,6 +1879,11 @@ impl ToolExecutor {
                     .is_some_and(|name| seen.insert(name.to_string()))
             })
             .collect();
+        if !astra_sandbox::process_scope_available() {
+            schemas.retain(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema) != Some("run_script")
+            });
+        }
         astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
         schemas
     }
@@ -1956,6 +1896,9 @@ impl ToolExecutor {
         let registry = runtime_env_builtin_registry();
         if let Some(spec) = registry.get(name) {
             if !spec.load_policy.is_public_schema_policy() {
+                return false;
+            }
+            if !registry.permits_work_execution_role(name, false) {
                 return false;
             }
             return self.tool_has_runtime_binding(name);
@@ -1993,13 +1936,7 @@ impl ToolExecutor {
         }
         let binding = self.runtime_environment_binding_for_tool(name, registry);
         astra_runtime_env::CapabilityResolver
-            .check_tool_call_for_surface(
-                registry,
-                name,
-                args,
-                &binding.capabilities,
-                &binding.tool_surface,
-            )
+            .check_tool_call(registry, name, args, &binding.capabilities)
             .err()
     }
 
@@ -2107,6 +2044,8 @@ impl ToolExecutor {
         use astra_turn_core::capability::Capability;
         match capability {
             Capability::AgentSpawner => self.spawn_context.is_some(),
+
+            Capability::LocalBackgroundTasks => self.bg_task_commands.is_some(),
             // Fail-closed: unknown executor-gated capabilities are denied.
             // If a new executor-gated variant is added here, it MUST get an
             // explicit match arm — the wildcard is a safety net, not a policy.
@@ -2196,66 +2135,26 @@ impl ToolExecutor {
         }
 
         let can_select = surface.activatable_contains(name);
-        use astra_turn_core::tool::deferred_activation::{
-            DirectDeferredCallAdmission, classify_direct_deferred_call,
-            direct_deferred_call_activation_message, tool_not_admitted_message,
-        };
-
-        match classify_direct_deferred_call(name, can_select, |tool_name| {
-            self.tool_has_runtime_binding(tool_name)
-        }) {
-            DirectDeferredCallAdmission::Activate {
-                name: activated_name,
-            } => {
-                // Direct deferred call: the model called a tool advertised in
-                // `<deferred-tools>` without first selecting it via
-                // `tool_search(select:NAME)`. Treat as activation intent —
-                // record the name so the next turn's `tools[]` includes the
-                // full schema, then ask the model to retry. Do NOT execute:
-                // the args are untrusted because the schema was not visible.
-                let mut guard = rwlock_write_reset_on_poison(
-                    &self.activated_deferred_tools,
-                    "activated_deferred_tools_direct_call",
-                );
-                astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(
-                    &mut guard,
-                    [activated_name.clone()],
-                );
-                return Some(EdgeToolRun::classified_error(
-                    direct_deferred_call_activation_message(&activated_name),
-                    astra_core::ErrorKind::ToolBinding,
-                ));
-            }
-            DirectDeferredCallAdmission::NotAdmitted => {
-                return Some(EdgeToolRun::classified_error(
-                    tool_not_admitted_message(name, true),
-                    astra_core::ErrorKind::ToolBinding,
-                ));
-            }
-            DirectDeferredCallAdmission::Unknown => {}
+        // A deferred target cannot be called by its own name merely because
+        // it appeared in discovery metadata.  Older clients turned such a
+        // call into a mutable name-only activation and reinjected the full
+        // schema next round, which both widened authority and changed the
+        // provider prefix.  The only transition is now
+        // `tool_search(select:NAME)` followed by the stable `invoke_tool`
+        // carrier, whose schema-addressed evidence is resolved by the shared
+        // admission path.
+        if can_select {
+            return Some(EdgeToolRun::classified_error(
+                format!(
+                    "Tool '{name}' is deferred. Call tool_search with query 'select:{name}', then invoke it through invoke_tool."
+                ),
+                astra_core::ErrorKind::ToolBinding,
+            ));
         }
         Some(EdgeToolRun::classified_error(
-            tool_not_admitted_message(name, can_select),
+            astra_turn_core::tool::deferred_activation::tool_not_admitted_message(name, false),
             astra_core::ErrorKind::ToolBinding,
         ))
-    }
-
-    fn record_tool_search_activation_output(&self, output: &str) {
-        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation");
-        let names = astra_turn_core::tool::deferred_activation::recordable_activated_tool_names(
-            output,
-            &surface,
-            |name| self.tool_has_runtime_binding(name),
-        );
-        if names.is_empty() {
-            return;
-        }
-
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.activated_deferred_tools,
-            "activated_deferred_tools",
-        );
-        astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(&mut guard, names);
     }
 
     pub(crate) fn runtime_bound_provider_owned_schemas_excluding(
@@ -2621,24 +2520,6 @@ impl ToolExecutor {
         self
     }
 
-    /// Use a shared git stash rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_git_stash_journal(
-        mut self,
-        journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
-    ) -> Self {
-        self.git_stash_journal = journal;
-        self
-    }
-
-    /// Use a shared git commit rollback journal (session-scoped) instead of the default.
-    pub fn with_shared_git_commit_journal(
-        mut self,
-        journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
-    ) -> Self {
-        self.git_commit_journal = journal;
-        self
-    }
-
     /// Use a shared git worktree rollback journal (session-scoped) instead of the default.
     pub(crate) fn with_shared_git_worktree_journal(
         mut self,
@@ -2654,28 +2535,6 @@ impl ToolExecutor {
         journal: std::sync::Arc<std::sync::Mutex<session_state::SessionStateRollbackJournal>>,
     ) -> Self {
         self.session_state_journal = journal;
-        self
-    }
-
-    /// Use a shared task manager (session-scoped) instead of the default.
-    pub fn with_shared_task_manager(
-        mut self,
-        task_manager: std::sync::Arc<task_mgmt::TaskManager>,
-    ) -> Self {
-        self.task_manager = task_manager;
-        self
-    }
-
-    /// Build a task context hint by delegating to the data-layer TaskManager.
-    /// The result flows through the standard `plan_resume_hint` →
-    /// `ExternalSources.plan_context` pipeline instead of polluting
-    /// `append_system_prompt`.
-    pub async fn build_task_context_hint(&self) -> Option<String> {
-        self.task_manager.build_active_task_context().await
-    }
-
-    pub fn with_task_notify_tx(mut self, tx: tokio::sync::broadcast::Sender<String>) -> Self {
-        self.task_notify_tx = Some(tx);
         self
     }
 
@@ -2701,8 +2560,13 @@ impl ToolExecutor {
     /// the TUI hold the same instance so the TUI can refill it
     /// between tool calls without rebuilding the executor.
     pub fn with_bash_detach_slot(mut self, slot: astra_tools::detach::DetachShellSlot) -> Self {
-        self.default_executor
-            .set_detach_shell_slot(Some(slot.clone()));
+        // Keep the slot on the top-level responsive Bash lane only.  The
+        // DefaultToolExecutor is also used as the nested `run_script` RPC
+        // delegate; giving it the host's live-child handle would allow a
+        // script-invoked Bash to outlive its executor-owned observation
+        // window.  The shared shell runner still has its own shape gate as a
+        // defense in depth, but nested calls must not receive the transport
+        // capability in the first place.
         self.bash_detach_slot = Some(slot);
         self
     }
@@ -2724,13 +2588,9 @@ impl ToolExecutor {
 
     // ─── Plan-mode write guard (parity with runtime_tool_executor) ───────────
     //
-    // While a plan is in authoring (`phase=planning` or `phase=refining`),
-    // world-mutating tools must be
-    // short-circuited so the model cannot bypass authoring by routing
-    // writes through the local executor. The check fails open when the
-    // CLI is offline / unauthenticated — without a cloud binding there
-    // is no plan store to consult, and a "fail closed" stance would
-    // break every offline `astra` invocation.
+    // While plan mode is active, world-mutating tools must be short-circuited
+    // so the model cannot bypass the client permission overlay. This cache is
+    // session-bound client state, not a shadow remote plan lifecycle.
 
     async fn plan_mode_authoring_active(&self) -> bool {
         let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
@@ -2742,62 +2602,7 @@ impl ToolExecutor {
         {
             return *cached;
         }
-        let active = self
-            .recompute_plan_mode_authoring_for_session(session_id.as_str())
-            .await;
-        if self.active_session_id().as_deref() == Some(session_id.as_str()) {
-            *self.plan_mode_authoring_cache.write().await = Some((session_id, active));
-        }
-        active
-    }
-
-    fn cloud_plan_summary_status<'a>(&self, plan: &'a Value) -> Option<&'a str> {
-        plan.get("status").and_then(Value::as_str)
-    }
-
-    fn cloud_plan_summary_id(&self, plan: &Value) -> Option<String> {
-        plan.get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    }
-
-    fn cloud_plan_is_authoring(&self, plan: &Value) -> bool {
-        matches!(
-            self.cloud_plan_summary_status(plan),
-            Some("planning" | "refining")
-        )
-    }
-
-    async fn lookup_active_cloud_plan_summary(&self, session_id: &str) -> Option<Value> {
-        let token = self.cloud_token()?;
-        let Ok(client) = self.remote_plan_client() else {
-            return None;
-        };
-        let plans = match client
-            .get_plans_query_json(
-                &token,
-                &[
-                    ("session_id", session_id.to_string()),
-                    ("active_session_only", "true".to_string()),
-                    ("limit", "1".to_string()),
-                ],
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => return None,
-        };
-        plans
-            .get("plans")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .cloned()
-    }
-
-    async fn recompute_plan_mode_authoring_for_session(&self, session_id: &str) -> bool {
-        self.lookup_active_cloud_plan_summary(session_id)
-            .await
-            .is_some_and(|plan| self.cloud_plan_is_authoring(&plan))
+        false
     }
 
     pub(crate) async fn invalidate_plan_mode_cache(&self) {
@@ -2812,196 +2617,7 @@ impl ToolExecutor {
         }
     }
 
-    // ─── Task management methods (delegated to task_mgmt module) ────────────
-
-    fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        astra_tools::task_tool_contract::validate_public_task_tool_args_for_action(action, args)
-    }
-
-    fn task_action_mutates_board(action: &str) -> bool {
-        matches!(action, "create" | "update" | "stop" | "adopt" | "archive")
-    }
-
-    fn task_lifecycle_summary(action: &str, payload: &Value) -> &'static str {
-        if payload.get("subtask_id").and_then(Value::as_str).is_some() {
-            return "subtask_updated";
-        }
-        match action {
-            "create" => "task_created",
-            "adopt" => "task_adopted",
-            "stop" => "task_cancelled",
-            "archive" => "task_archived",
-            "update" => match payload.get("status").and_then(Value::as_str) {
-                Some("completed") => "task_completed",
-                Some("failed") => "task_failed",
-                Some("cancelled") => "task_cancelled",
-                Some("deleted") => "task_deleted",
-                _ => "task_updated",
-            },
-            _ => "task_updated",
-        }
-    }
-
-    fn task_lifecycle_detail(action: &str, args: &Value, payload: &Value) -> Value {
-        let mut detail = serde_json::Map::new();
-        detail.insert("action".to_string(), json!(action));
-        if let Some(value) = payload
-            .get("task_id")
-            .cloned()
-            .or_else(|| args.get("task_id").cloned())
-        {
-            detail.insert("task_id".to_string(), value);
-        }
-        if let Some(value) = payload
-            .get("subtask_id")
-            .cloned()
-            .or_else(|| args.get("subtask_id").cloned())
-        {
-            detail.insert("subtask_id".to_string(), value);
-        }
-        if let Some(value) = args.get("title").cloned() {
-            detail.insert("title".to_string(), value);
-        }
-        if let Some(value) = payload.get("previous_status").cloned() {
-            detail.insert("previous_status".to_string(), value);
-        }
-        let final_status = payload.get("status").cloned().or_else(|| match action {
-            "create" | "adopt" => Some(json!("pending")),
-            "stop" => Some(json!("cancelled")),
-            _ => None,
-        });
-        if let Some(value) = final_status {
-            detail.insert("status".to_string(), value);
-        }
-        if let Some(value) = payload
-            .get("reason")
-            .cloned()
-            .or_else(|| args.get("reason").cloned())
-        {
-            detail.insert("reason".to_string(), value);
-        }
-        if let Some(value) = payload.get("cancelled_subtasks").cloned() {
-            detail.insert("cancelled_subtasks".to_string(), value);
-        }
-        if let Some(value) = payload.get("archived").cloned() {
-            detail.insert("archived".to_string(), value);
-        }
-        Value::Object(detail)
-    }
-
-    fn record_task_lifecycle_event(&self, action: &str, args: &Value, payload: &Value) {
-        let Some(session_id) = self
-            .active_session_id()
-            .filter(|sid| !sid.trim().is_empty())
-        else {
-            return;
-        };
-        let turn = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Acquire);
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &astra_services::session_journal::JournalEvent::task_lifecycle(
-                Some(&session_id),
-                turn,
-                Self::task_lifecycle_summary(action, payload),
-                Some(Self::task_lifecycle_detail(action, args, payload)),
-            ),
-            "edge_tools:record_task_lifecycle_event",
-        );
-    }
-
-    /// Route a `task` action either to the cloud (production) or the
-    /// local in-memory TaskManager (offline/tests). Cloud is the
-    /// preferred path: when `cloud_base` and `active_session_id` are
-    /// both set, the call goes to `POST /sessions/{sid}/todos:execute`
-    /// so the server is the single source of truth — CLI never
-    /// touches MO directly. Falls back to the in-memory manager only
-    /// when no cloud is wired (one-shot CLI, headless tests).
-    async fn route_task_action(&self, action: &str, args: &Value) -> Option<RoutedTaskAction> {
-        self.route_task_action_with_call_id(action, args, None)
-            .await
-    }
-
-    async fn route_task_action_with_call_id(
-        &self,
-        action: &str,
-        args: &Value,
-        tool_call_id: Option<&str>,
-    ) -> Option<RoutedTaskAction> {
-        let cloud_base = self.cloud_base.clone()?;
-        let session_id = self.active_session_id()?;
-        if session_id.is_empty() {
-            return None;
-        }
-        let token = self.cloud_token();
-        match crate::cli::session::session_todo_client::execute_todo_action_typed(
-            &cloud_base,
-            token.as_deref(),
-            &session_id,
-            action,
-            args,
-            tool_call_id,
-        )
-        .await
-        {
-            Ok(response) => {
-                if Self::task_action_mutates_board(action)
-                    && response
-                        .mutation
-                        .as_ref()
-                        .is_some_and(|mutation| mutation.status.changed())
-                    && let Some(tx) = &self.task_notify_tx
-                {
-                    let _ = tx.send(session_id);
-                }
-                Some(RoutedTaskAction {
-                    output: response.output,
-                    mutation: response.mutation,
-                })
-            }
-            Err(err) => Some(RoutedTaskAction {
-                output: format!("Error: cloud todo {action} failed: {err}"),
-                mutation: None,
-            }),
-        }
-    }
-
-    fn remote_plan_client(&self) -> Result<astra_thin_client::ThinClient, String> {
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return Err(
-                "Error: plan lifecycle is unavailable in offline CLI mode; connect to cloud first."
-                    .to_string(),
-            );
-        };
-        astra_thin_client::ThinClient::new(&cloud_base, None)
-            .map_err(|err| format!("Error: failed to initialize plan client: {err}"))
-    }
-
     async fn enter_plan_mode_remote(&self, args: &Value) -> String {
-        // Symmetric with `exit_plan_mode_remote`: there are two
-        // structurally different paths and we pick by what the
-        // environment supports, not by what the caller requests.
-        //
-        // 1. Cloud path — active session id + cloud token + reachable
-        //    plan client all present → POST `/plans` to create a
-        //    `phase=planning` row so the server-side write guard
-        //    engages and `/plan` UI / multi-client coordination can
-        //    see the authoring state. Used by the `/plan "goal"`
-        //    slash command and any web-agent driven entry.
-        //
-        // 2. Local path — any prerequisite missing (no session id,
-        //    no token, no client, network failure) → fall back to a
-        //    purely local plan-mode pivot. Stages
-        //    `PermissionMode::Plan` on the pending slot so the host
-        //    flips `perm_manager` at the next turn boundary, exactly
-        //    like an explicit local permission choice. No cloud row is created and no error
-        //    bubbles up: a detached / unauthenticated CLI run still
-        //    gets plan mode.
-        //
-        // Both branches always stage Plan on the pending slot —
-        // single-source-of-truth invariant I6: whichever path runs,
-        // `perm_manager.mode()` becomes `Plan` on the next turn.
         let goal = args
             .get("goal")
             .and_then(Value::as_str)
@@ -3009,63 +2625,12 @@ impl ToolExecutor {
             .filter(|goal| !goal.is_empty())
             .unwrap_or("(pending)");
 
-        let cloud_outcome = self.try_enter_plan_mode_cloud_path(goal).await;
-        match cloud_outcome {
-            Ok(message) => {
-                self.stage_pending_plan_mode();
-                message
-            }
-            Err(_unavailable) => {
-                self.stage_pending_plan_mode();
-                // Local guard cache is informational — there is no
-                // server guard to mirror in this branch. Set it to
-                // `Some(true)` so any cached probe consult sees
-                // "writes gated" while plan mode is active.
-                self.set_plan_mode_authoring_cache_for_active_session(true)
-                    .await;
-                format!(
-                    "Entered plan mode (local). goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
-                )
-            }
-        }
-    }
-
-    /// Attempt the cloud `enter_plan_mode` flow. Returns `Err(())`
-    /// (with no message) when any prerequisite is missing so the
-    /// caller falls back to the local path silently. Returns
-    /// `Err(message)` semantics are *not* used here — a real cloud
-    /// failure (e.g. server returned 5xx) is also swallowed into the
-    /// local fallback because the user's intent ("enter plan mode")
-    /// must succeed end-to-end.
-    async fn try_enter_plan_mode_cloud_path(&self, goal: &str) -> Result<String, ()> {
-        let session_id = self
-            .active_session_id()
-            .filter(|sid| !sid.is_empty())
-            .ok_or(())?;
-        let token = self.cloud_token().ok_or(())?;
-        let client = self.remote_plan_client().map_err(|_| ())?;
-
-        let response = client
-            .post_plans_json(
-                &token,
-                &json!({
-                    "goal": goal,
-                    "session_id": session_id,
-                }),
-            )
-            .await
-            .map_err(|_| ())?;
-
-        let plan_id = response
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .ok_or(())?
-            .to_string();
+        self.stage_pending_plan_mode();
         self.set_plan_mode_authoring_cache_for_active_session(true)
             .await;
-        Ok(format!(
-            "Entered plan mode. plan_id={plan_id} goal=\"{goal}\". Write tools are now blocked — author the plan, then call exit_plan_mode when it's ready for execution."
-        ))
+        format!(
+            "Entered plan mode. goal=\"{goal}\". Write tools are now blocked — investigate read-only, then call exit_plan_mode(plan=\"<markdown>\") when ready."
+        )
     }
 
     /// Stage `PermissionMode::Plan` on the pending slot so the host
@@ -3106,31 +2671,6 @@ impl ToolExecutor {
     }
 
     async fn exit_plan_mode_remote(&self, args: &Value) -> String {
-        // `exit_plan_mode` has two structurally different sources of
-        // truth depending on how plan mode was entered:
-        //
-        // 1. Cloud workflow (`/plan "goal"` or the `enter_plan_mode`
-        //    tool): a `plans` row with `phase=planning` exists; the
-        //    server-side write guard depends on it; approving the
-        //    plan must POST `/plans/{id}/exit-plan-mode` so the row
-        //    flips to `refining` and the guard releases.
-        // 2. `/allow plan`: only flips the local
-        //    `perm_manager` to `Plan`. There is no cloud row, no
-        //    server-side guard, and the user expects exiting to be
-        //    purely local — zero network calls.
-        //
-        // Conflating both broke session d9b5119f: the user pressed
-        // `/allow plan`, the model produced a plan, called exit_plan_mode,
-        // and the cloud lookup returned "no active planning plan
-        // found" because none was ever created.
-        //
-        // The fix: probe the cloud row only when the prerequisites
-        // are present (active session + cloud token + reachable plan
-        // client + a planning row actually exists). If any of those
-        // are missing, fall through to the local path which uses the
-        // overlay + `pending_permission_mode_change` slot exactly the
-        // same way the cloud path does — it just skips the network
-        // round-trips and the `phase=planning` row update.
         let plan_markdown = args
             .get("plan")
             .and_then(Value::as_str)
@@ -3139,107 +2679,8 @@ impl ToolExecutor {
             .map(str::trim)
             .filter(|plan| !plan.is_empty())
             .map(str::to_string);
-        let cloud_plan_id = self.lookup_active_authoring_cloud_plan_id().await;
-        match cloud_plan_id {
-            Some(plan_id) => {
-                self.exit_plan_mode_cloud_path(plan_id, plan_markdown.as_deref())
-                    .await
-            }
-            None => {
-                self.exit_plan_mode_local_path(plan_markdown.as_deref())
-                    .await
-            }
-        }
-    }
-
-    /// Best-effort lookup for an active authoring cloud plan
-    /// for the current session. Returns `None` whenever any of the
-    /// prerequisites for the cloud workflow are absent (no session,
-    /// no token, no client, no row, network failure). The caller
-    /// uses `None` as the signal to fall back to the purely local
-    /// `/allow plan` flow.
-    async fn lookup_active_authoring_cloud_plan_id(&self) -> Option<String> {
-        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
-        let plan = self
-            .lookup_active_cloud_plan_summary(session_id.as_str())
-            .await?;
-        if self.cloud_plan_is_authoring(&plan) {
-            self.cloud_plan_summary_id(&plan)
-        } else {
-            None
-        }
-    }
-
-    /// Cloud workflow exit path — there is a `phase=planning` row
-    /// in the `plans` table; flipping it to `refining` is the
-    /// authoritative signal that releases the server-side write
-    /// guard. The 4-option overlay still runs locally; only the
-    /// follow-up state mutation goes through the cloud API.
-    async fn exit_plan_mode_cloud_path(
-        &self,
-        plan_id: String,
-        plan_markdown: Option<&str>,
-    ) -> String {
-        let Some(token) = self.cloud_token() else {
-            return "Error: exit_plan_mode lost the cloud token mid-flight.".to_string();
-        };
-        let client = match self.remote_plan_client() {
-            Ok(client) => client,
-            Err(err) => return err,
-        };
-
-        let (approved, follow_up_mode) =
-            match self.resolve_exit_plan_mode_via_overlay(plan_markdown).await {
-                Ok(decision) => decision,
-                Err(message) => return message,
-            };
-
-        let mut body = json!({ "approved": approved });
-        if let Some(plan_markdown) = plan_markdown {
-            body["plan_md"] = Value::String(plan_markdown.to_string());
-        }
-
-        let response = match client
-            .post_plan_exit_mode_json(&token, &plan_id, &body)
+        self.exit_plan_mode_local_path(plan_markdown.as_deref())
             .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return format!(
-                    "Error: failed to exit plan mode: {}",
-                    crate::cli::cli_config::cli_utils::map_thin_err(err)
-                );
-            }
-        };
-        let resolved_plan_id = response
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .unwrap_or(&plan_id)
-            .to_string();
-
-        if approved {
-            let next_mode =
-                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
-            self.set_plan_mode_authoring_cache_for_active_session(false)
-                .await;
-            self.stage_pending_permission_mode_change(next_mode);
-            self.stage_pending_round_tool_boost(&[
-                "bash",
-                "read_file",
-                "write_file",
-                "str_replace",
-            ]);
-            let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
-            format!(
-                "Exited plan mode. plan_id={resolved_plan_id} is approved; write tools unlocked.{mode_suffix}"
-            )
-        } else {
-            self.set_plan_mode_authoring_cache_for_active_session(true)
-                .await;
-            format!(
-                "Plan {resolved_plan_id} left open for another authoring pass. Write tools remain blocked. Address the user's feedback and call exit_plan_mode again when ready."
-            )
-        }
     }
 
     /// `exit_plan_mode` here is a permission-state pivot driven by
@@ -3332,343 +2773,31 @@ impl ToolExecutor {
         }
     }
 
-    async fn task_action_create(&self, args: &Value) -> String {
-        self.task_action_create_with_invocation(args, None).await
-    }
-
-    async fn task_action_create_with_invocation(
+    /// Resolve a server-owned `exit_plan_mode` interaction through the same
+    /// trusted plan-review surface used by local execution. The server owns
+    /// durable plan state; the CLI owns only the user's review choice and the
+    /// permission mode selected for the following turn.
+    pub(crate) async fn resolve_remote_plan_review(
         &self,
-        args: &Value,
-        tool_call_id: Option<&str>,
-    ) -> String {
-        if let Some(routed) = self
-            .route_task_action_with_call_id("create", args, tool_call_id)
-            .await
-        {
-            if let Some(mutation) = routed
-                .mutation
-                .as_ref()
-                .filter(|mutation| mutation.status.changed())
-            {
-                self.record_task_lifecycle_event("create", args, &mutation.data);
-            }
-            return routed.output;
+        plan_markdown: Option<&str>,
+    ) -> Result<bool, String> {
+        let (approved, follow_up_mode) = self
+            .resolve_exit_plan_mode_via_overlay(plan_markdown)
+            .await?;
+        self.set_plan_mode_authoring_cache_for_active_session(!approved)
+            .await;
+        if approved {
+            let next_mode =
+                follow_up_mode.unwrap_or(crate::cli::permission_manager::PermissionMode::Auto);
+            self.stage_pending_permission_mode_change(next_mode);
+            self.stage_pending_round_tool_boost(&[
+                "bash",
+                "read_file",
+                "write_file",
+                "str_replace",
+            ]);
         }
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let outcome = self.task_manager.create_outcome(&public_args).await;
-        if outcome.status.changed() {
-            self.record_task_lifecycle_event("create", &public_args, &outcome.data);
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                tracing::warn!(
-                    target: "astra_cli::task",
-                    %error,
-                    "task create succeeded but rollback snapshot seal failed"
-                );
-                return outcome.output;
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_board:create:{}",
-                    public_args
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-        }
-        outcome.output
-    }
-
-    async fn execute_task_tool_args(&self, args: &Value, tool_call_id: Option<&str>) -> String {
-        let action = match astra_tools::task_tool_contract::task_action_from_args(args) {
-            Ok(action) => action,
-            Err(error) => return format!("Error: {error}"),
-        };
-        match action {
-            "create" => match Self::validate_task_tool_args_for_action("create", args) {
-                Ok(()) => {
-                    self.task_action_create_with_invocation(args, tool_call_id)
-                        .await
-                }
-                Err(error) => format!("Error: {error}"),
-            },
-            "list" => match Self::validate_task_tool_args_for_action("list", args) {
-                Ok(()) => self.task_list(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "get" => match Self::validate_task_tool_args_for_action("get", args) {
-                Ok(()) => self.task_get(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "update" => match Self::validate_task_tool_args_for_action("update", args) {
-                Ok(()) => self.task_action_update(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
-                Ok(()) => self.task_action_stop(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "list_user" => match Self::validate_task_tool_args_for_action("list_user", args) {
-                Ok(()) => self.task_list_user(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
-                Ok(()) => self.task_adopt(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
-                Ok(()) => self.task_action_archive(args).await,
-                Err(error) => format!("Error: {error}"),
-            },
-            other => match Self::validate_task_tool_args_for_action(other, args) {
-                Ok(()) => format!(
-                    "Error: {}",
-                    astra_tools::task_tool_contract::task_unknown_action_message(other)
-                ),
-                Err(error) => format!("Error: {error}"),
-            },
-        }
-    }
-
-    async fn task_list(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("list", args).await {
-            return routed.output;
-        }
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        self.task_manager.list(&public_args).await
-    }
-    async fn task_get(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("get", args).await {
-            return routed.output;
-        }
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        self.task_manager.get(&public_args).await
-    }
-    async fn task_action_update(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("update", args).await {
-            if let Some(mutation) = routed
-                .mutation
-                .as_ref()
-                .filter(|mutation| mutation.status.changed())
-            {
-                self.record_task_lifecycle_event("update", args, &mutation.data);
-            }
-            return routed.output;
-        }
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let outcome = self.task_manager.update_outcome(&public_args).await;
-        if outcome.status.changed() {
-            self.record_task_lifecycle_event("update", &public_args, &outcome.data);
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                tracing::warn!(
-                    target: "astra_cli::task",
-                    %error,
-                    "task update succeeded but rollback snapshot seal failed"
-                );
-                return outcome.output;
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_board:update:{}",
-                    public_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-        }
-        outcome.output
-    }
-    async fn task_action_stop(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("stop", args).await {
-            if let Some(mutation) = routed
-                .mutation
-                .as_ref()
-                .filter(|mutation| mutation.status.changed())
-            {
-                self.record_task_lifecycle_event("stop", args, &mutation.data);
-            }
-            return routed.output;
-        }
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let outcome = self.task_manager.stop_outcome(&public_args).await;
-        if outcome.status.changed() {
-            self.record_task_lifecycle_event("stop", &public_args, &outcome.data);
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                tracing::warn!(
-                    target: "astra_cli::task",
-                    %error,
-                    "task stop succeeded but rollback snapshot seal failed"
-                );
-                return outcome.output;
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_board:stop:{}",
-                    public_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("task")
-                ),
-            );
-        }
-        outcome.output
-    }
-
-    /// `task_board(action='list_user')` — cross-session active list. Cloud
-    /// only: in-memory mode by definition has only one session, so
-    /// the cross-session question is meaningless without a backing
-    /// store that aggregates across users.
-    async fn task_list_user(&self, args: &Value) -> String {
-        let status = match Self::normalize_task_user_status(args) {
-            Ok(status) => status,
-            Err(err) => return err,
-        };
-        let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: task_board(action='list_user') requires a cloud connection. \
-                    The cross-session view is server-side only — set ASTRA_API_URL \
-                    or sign in with `astra login` to enable it."
-                .to_string();
-        };
-        let token = self.cloud_token();
-        match crate::cli::session::session_todo_client::list_user_todos(
-            &cloud_base,
-            token.as_deref(),
-            status,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => format!("Error: list_user todos failed: {err}"),
-        }
-    }
-
-    fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
-        let Some(raw) = args.get("user_status") else {
-            return Ok("active");
-        };
-        let Some(status) = raw.as_str() else {
-            return Err("Error: field 'user_status' must be a string".to_string());
-        };
-        if astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.contains(&status) {
-            Ok(status)
-        } else {
-            Err(format!(
-                "Error: invalid user_status '{}' (valid: {})",
-                status,
-                astra_tools::task_mgmt::VALID_LIST_STATUS_FILTERS.join("|")
-            ))
-        }
-    }
-
-    /// `task_board(action='adopt', source_session_id, task_id)` — bring a
-    /// task from another of the user's sessions into the current
-    /// session. Server-side it copies the row's title/description/
-    /// metadata into a fresh todo here and marks the source migrated
-    /// so the user doesn't see it twice. Cloud-only.
-    async fn task_adopt(&self, args: &Value) -> String {
-        if self.cloud_base.is_none() {
-            return "Error: task_board(action='adopt') requires a cloud connection.".to_string();
-        }
-        // Adopt is a write — route through the same execute endpoint.
-        // Server-side dispatch will reject if source isn't owned by
-        // the same user (auth check via SessionService).
-        match self.route_task_action("adopt", args).await {
-            Some(routed) => {
-                if let Some(mutation) = routed
-                    .mutation
-                    .as_ref()
-                    .filter(|mutation| mutation.status.changed())
-                {
-                    self.record_task_lifecycle_event("adopt", args, &mutation.data);
-                }
-                routed.output
-            }
-            None => "Error: cannot adopt task without an active session id".to_string(),
-        }
-    }
-
-    /// `task_board(action='archive', task_id?)` — either archive one
-    /// current-session task immediately, or bulk-archive stale
-    /// completed history in the current session.
-    async fn task_action_archive(&self, args: &Value) -> String {
-        if let Some(routed) = self.route_task_action("archive", args).await {
-            if let Some(mutation) = routed
-                .mutation
-                .as_ref()
-                .filter(|mutation| mutation.status.changed())
-            {
-                self.record_task_lifecycle_event("archive", args, &mutation.data);
-            }
-            return routed.output;
-        }
-        let mut snapshot = match self.task_manager.try_snapshot_state().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return format!("Error: failed to capture task rollback snapshot: {error}");
-            }
-        };
-        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
-        let outcome = self.task_manager.archive_outcome(&public_args).await;
-        if outcome.status.changed() {
-            self.record_task_lifecycle_event("archive", &public_args, &outcome.data);
-            if let Err(error) = self
-                .task_manager
-                .seal_snapshot_for_restore(&mut snapshot)
-                .await
-            {
-                tracing::warn!(
-                    target: "astra_cli::task",
-                    %error,
-                    "task archive succeeded but rollback snapshot seal failed"
-                );
-                return outcome.output;
-            }
-            self.record_task_state_rollback(
-                snapshot,
-                format!(
-                    "task_board:archive:{}",
-                    public_args
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("bulk")
-                ),
-            );
-        }
-        outcome.output
+        Ok(approved)
     }
 
     async fn task_list_bg(&self) -> String {
@@ -4145,7 +3274,7 @@ impl ToolExecutor {
             "completed": summary.completed,
             "failed": summary.failed,
             "cancelled_by_user": summary.cancelled_by_user,
-            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+            "cancelled_by_runtime": summary.cancelled_by_runtime,
             "timed_out": summary.timed_out,
             "spawn_rejected": summary.spawn_rejected,
             "collected": summary.collected,
@@ -4163,9 +3292,12 @@ impl ToolExecutor {
             "hint": "This id belongs to a recoverable agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
         })
         .to_string();
-        let start = output.floor_char_boundary((offset as usize).min(output.len()));
-        let end = output.floor_char_boundary((start + max_bytes).min(output.len()));
-        let chunk = output[start..end].to_string();
+        let (chunk, end, total_bytes, total_lines) =
+            astra_tools::credential_redaction::redacted_output_window(
+                &output,
+                offset as usize,
+                max_bytes,
+            );
         let group_id = group.group_id.clone();
         let revision = group.revision;
         Some(FanoutTaskOutputProjection {
@@ -4176,8 +3308,8 @@ impl ToolExecutor {
                 title: Some(group.title),
                 output: chunk,
                 end_offset: end as u64,
-                total_bytes: output.len() as u64,
-                total_lines: output.lines().count() as u64,
+                total_bytes: total_bytes as u64,
+                total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{}", group.group_id),
             },
@@ -4287,18 +3419,22 @@ impl ToolExecutor {
             },
             "hint": "Recovered from the durable session journal; this is a settled historical observation, not a live fanout control handle.",
         }).to_string();
-        let start = output.floor_char_boundary((offset as usize).min(output.len()));
-        let end = output.floor_char_boundary((start + max_bytes).min(output.len()));
+        let (chunk, end, total_bytes, total_lines) =
+            astra_tools::credential_redaction::redacted_output_window(
+                &output,
+                offset as usize,
+                max_bytes,
+            );
         Some(FanoutTaskOutputProjection {
             group_id: group_id.clone(),
             revision: 1,
             snapshot: BgTaskOutputSnapshot {
                 kind: "agent fanout".into(),
                 title: Some(group_id.clone()),
-                output: output[start..end].to_string(),
+                output: chunk,
                 end_offset: end as u64,
-                total_bytes: output.len() as u64,
-                total_lines: output.lines().count() as u64,
+                total_bytes: total_bytes as u64,
+                total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{group_id}"),
             },
@@ -4452,8 +3588,12 @@ impl ToolExecutor {
             }
         );
         for (turn_num, user, assistant) in shown {
-            let user_preview: String = user.chars().take(120).collect();
-            let assist_preview: String = assistant.chars().take(200).collect();
+            let user_safe =
+                astra_tools::credential_redaction::redact_credentials_for_display(user).0;
+            let assistant_safe =
+                astra_tools::credential_redaction::redact_credentials_for_display(assistant).0;
+            let user_preview: String = user_safe.chars().take(120).collect();
+            let assist_preview: String = assistant_safe.chars().take(200).collect();
             out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
             if user.len() > 120 {
                 out.push('…');
@@ -4483,6 +3623,13 @@ impl ToolExecutor {
 
     fn handle_introspect(&self, args: &Value) -> String {
         if args.get("artifact").is_some() {
+            let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
+            if !request.source_policy.allows_edge_local_artifacts() {
+                return format!(
+                    "Error: source_policy={} does not allow CLI/Edge-local artifact recovery",
+                    request.source_policy.as_str()
+                );
+            }
             let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) else {
                 return "Error: introspect artifact recovery requires an active session"
                     .to_string();
@@ -4496,6 +3643,11 @@ impl ToolExecutor {
                     );
                 }
             };
+            if let Some(result) =
+                crate::explain_analyze_artifact::resolve_request(&session_dir, args)
+            {
+                return result.unwrap_or_else(|error| format!("Error: {error}"));
+            }
             return astra_turn_core::tool_result_storage::resolve_session_tool_result_artifact_request(
                 &session_dir,
                 args,
@@ -4540,17 +3692,6 @@ impl ToolExecutor {
             }
             None => astra_turn_core::introspect::IntrospectSnapshot::default(),
         };
-        if snap.current_model.is_none() {
-            snap.current_model = self.current_model();
-        }
-        if snap.effective_input_budget_tokens == 0 {
-            snap.effective_input_budget_tokens = self
-                .current_effective_input_budget_tokens()
-                .unwrap_or_default();
-        }
-        if snap.context_window_tokens == 0 {
-            snap.context_window_tokens = self.current_context_window_tokens().unwrap_or_default();
-        }
 
         // Overlay session-scoped injection freshness. The per-turn
         // snapshot lives on `AgenticLoopState` (not session) so the
@@ -4574,7 +3715,32 @@ impl ToolExecutor {
             }
         }
 
-        astra_turn_core::introspect::render_introspect_request(&snap, &request)
+        let rendered = astra_turn_core::introspect::render_introspect_request(&snap, &request);
+        if request.format.is_json()
+            || !matches!(
+                request.facet,
+                astra_core::ObservationFacet::Session | astra_core::ObservationFacet::Overview
+            )
+        {
+            return rendered;
+        }
+        if !request.source_policy.allows_edge_local_artifacts() {
+            return rendered;
+        }
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return rendered;
+        };
+        let store = astra_services::local_session_artifact_store();
+        let Ok(session_dir) = store.session_dir(&session_id) else {
+            return rendered;
+        };
+        match crate::explain_analyze_artifact::latest_notice(&session_dir) {
+            Ok(Some(notice)) => format!("{rendered}\n\n{notice}"),
+            Ok(None) => rendered,
+            Err(error) => {
+                format!("{rendered}\n\nExplain Analyze artifact status unavailable: {error}")
+            }
+        }
     }
 
     /// Render `introspect facet=session_memory`. Answers the
@@ -4864,6 +4030,7 @@ impl ToolExecutor {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .replace('\n', " ⏎ ");
+        let preview = astra_tools::credential_redaction::redact_credentials_for_display(&preview).0;
         let preview: String = preview.chars().take(80).collect();
 
         Some(format!(
@@ -5030,25 +4197,6 @@ impl ToolExecutor {
         out
     }
 
-    /// Add a preferred repo for disambiguation (e.g. from memory or recent usage).
-    pub fn add_preferred_repo(&self, owner_repo: &str) {
-        let normalized = owner_repo.to_lowercase();
-        match self.preferred_repos.lock() {
-            Ok(mut repos) => {
-                if !repos.iter().any(|r| r == &normalized) {
-                    repos.push(normalized);
-                }
-            }
-            Err(poisoned) => {
-                // Recover from poisoned mutex — clear and re-add
-                astra_core::agent_warn!("preferred_repos", "recovering from poisoned mutex");
-                let mut repos = poisoned.into_inner();
-                repos.clear();
-                repos.push(normalized);
-            }
-        }
-    }
-
     /// Set per-turn budget pressure before executing a batch of tool calls.
     /// 0.0 = normal, 0.3 = trimming, 0.6 = compact, 0.9 = aggressive.
     pub fn set_budget_pressure(&self, pressure: f64) {
@@ -5060,20 +4208,6 @@ impl ToolExecutor {
     /// Read current budget pressure. Returns 0.0 if mutex is poisoned.
     pub fn get_budget_pressure(&self) -> f64 {
         self.budget_pressure.lock().map(|p| *p).unwrap_or(0.0)
-    }
-
-    /// Get current preferred repos (for use in repo resolution).
-    fn get_preferred_repos(&self) -> Vec<String> {
-        match self.preferred_repos.lock() {
-            Ok(r) => r.clone(),
-            Err(poisoned) => {
-                astra_core::agent_warn!(
-                    "preferred_repos",
-                    "recovering from poisoned mutex on read"
-                );
-                poisoned.into_inner().clone()
-            }
-        }
     }
 
     /// Output limit scaled by budget pressure and aggregate output.
@@ -5121,6 +4255,8 @@ impl ToolExecutor {
         // must therefore preserve the evidence exactly; the session-aware
         // recording pipeline is the sole boundary allowed to turn oversized
         // output into a recoverable artifact handle.
+        let (output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&output);
         normalize_empty_output(output, name)
     }
 
@@ -5154,11 +4290,21 @@ impl ToolExecutor {
             if let Some(denied) = self.tool_admission_denial(name, args) {
                 return denied.into_outcome();
             }
-            if let Some(outcome) = self.execute_blocking_shell_tool(name, args, cancel_token) {
+            if name == "bash" {
+                let mut outcome = self
+                    .bash_outcome_with_cancel_async(args, invocation, cancel_token)
+                    .await;
+                outcome.output = self.finalize_tool_output(outcome.output, name);
+                self.record_output_size(outcome.output.len());
+                return outcome;
+            }
+            if let Some(outcome) =
+                self.execute_blocking_shell_tool(name, args, invocation, cancel_token)
+            {
                 return outcome;
             }
         }
-        self.execute_with_invocation_metadata(name, args, invocation)
+        self.execute_with_invocation_metadata_and_cancel(name, args, invocation, cancel_token)
             .await
     }
 
@@ -5172,10 +4318,11 @@ impl ToolExecutor {
         &self,
         name: &str,
         args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
         if name == "bash" {
-            let mut outcome = self.bash_outcome_with_cancel(args, cancel_token);
+            let mut outcome = self.bash_outcome_with_cancel(args, invocation, cancel_token);
             outcome.output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(outcome.output.len());
             return Some(outcome);
@@ -5207,14 +4354,34 @@ impl ToolExecutor {
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     ) -> ToolExecutionOutcome {
+        self.execute_with_invocation_metadata_and_cancel(name, args, invocation, None)
+            .await
+    }
+
+    /// Invocation-aware dispatch shared by the normal and cancellation-aware
+    /// entry points.  Keeping the special `mo_query` and Git metadata paths in
+    /// this helper is important: routing cancellation straight to
+    /// `execute_run_with_cancel` silently drops their structured fields.
+    async fn execute_with_invocation_metadata_and_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> ToolExecutionOutcome {
         // Admission gate (fail-closed). This is a public entry point called
         // directly by the server executor; without this gate, `mo_query`
         // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
         }
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return cancelled_tool_execution_outcome(name, false);
+        }
         if name == "bash" {
-            let mut outcome = self.bash_outcome_with_cancel(args, None);
+            let mut outcome = self
+                .bash_outcome_with_cancel_async(args, invocation, cancel_token)
+                .await;
             outcome.output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(outcome.output.len());
             return outcome;
@@ -5226,52 +4393,8 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
-        if name == "git" {
-            let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
-                Ok(action) => action,
-                Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
-            };
-            match action {
-                astra_tools::git_tool_contract::GitAction::Commit => {
-                    let mut outcome = self.commit_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::RevertCommit => {
-                    let mut outcome = self.revert_commit_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::Stash => {
-                    let stash_args = git_stash_sub_action_args(args);
-                    let mut outcome = self.stash_with_metadata(&stash_args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::Worktree => {
-                    let mut outcome = self.worktree_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
-                }
-                astra_tools::git_tool_contract::GitAction::Status
-                | astra_tools::git_tool_contract::GitAction::Diff
-                | astra_tools::git_tool_contract::GitAction::Log
-                | astra_tools::git_tool_contract::GitAction::Show
-                | astra_tools::git_tool_contract::GitAction::Blame
-                | astra_tools::git_tool_contract::GitAction::FileHistory
-                | astra_tools::git_tool_contract::GitAction::LogSearch
-                | astra_tools::git_tool_contract::GitAction::Contributors
-                | astra_tools::git_tool_contract::GitAction::CheckoutFile
-                | astra_tools::git_tool_contract::GitAction::Push => {
-                    // Other git actions are handled by execute_run below.
-                }
-            }
-        }
-        self.execute_run(name, args, invocation)
+
+        self.execute_run_with_cancel(name, args, invocation, cancel_token)
             .await
             .into_outcome()
     }
@@ -5292,46 +4415,303 @@ impl ToolExecutor {
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     ) -> EdgeToolRun {
-        if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
+        self.execute_run_with_cancel(name, args, invocation, None)
+            .await
+    }
+
+    async fn execute_run_with_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> EdgeToolRun {
+        let argument_validation = if astra_runtime_env::ToolRegistry::builtins()
+            .get(name)
+            .is_none()
+        {
+            self.provider_owned_schemas_snapshot("provider_owned_schema_argument_validation")
+                .into_iter()
+                .find(|schema| {
+                    astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                })
+                .map(|schema| {
+                    astra_tools::schemas::validate_tool_arguments_against_schema(
+                        name, args, &schema,
+                    )
+                })
+                .unwrap_or(Ok(()))
+        } else {
+            astra_tools::schemas::validate_tool_arguments(name, args)
+        };
+        if let Err(error) = argument_validation {
             let evidence = error.failure_evidence();
             return EdgeToolRun::failure_evidence(error.output(), evidence);
         }
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
         }
-        if name == "git"
-            && let Err(error) = astra_tools::git_gix::validate_git_request(&self.project_root, args)
-        {
-            return EdgeToolRun::failure_evidence(error.message, error.evidence);
+        // Edge-owned typed writers share the same per-workspace lease as the
+        // Bash pre/post observer. Bash acquires it inside its shell boundary;
+        // excluding Bash here avoids a nested-lock deadlock.
+        let nested_run_script_callback = astra_tools::rpc_bridge::is_run_script_rpc_dispatch();
+        if name == "run_script" && nested_run_script_callback {
+            return EdgeToolRun::error(
+                "run_script cannot recursively start another opaque script writer".to_string(),
+            );
         }
-        let mut tool_result_fields = None;
-        let output = self
-            .execute_raw(name, args, invocation, &mut tool_result_fields)
-            .await;
-        let embedded_work_observation = embedded_work_unit_observation(&output);
-        // Structural error propagation: `execute_raw` returns a plain String,
-        // discarding any structured error kind at the source. Recover it here
-        // so downstream `tool_work_surface_events` can route on `error_kind`
-        // metadata instead of re-deriving it from fragile string matching.
-        let is_error = cli_tool_output_is_error(&output);
-        let tool_result_fields = if is_error {
-            // Preserve producer-owned lifecycle truth even when the tool's
-            // business result is an error. Other raw fields retain the
-            // existing error-path behavior and are intentionally discarded.
-            embedded_work_observation.map(|observation| {
-                let mut fields = serde_json::Map::new();
-                observation.insert_into(&mut fields);
-                fields
-            })
-        } else {
-            if let Some(observation) = embedded_work_observation {
-                observation.insert_into(tool_result_fields.get_or_insert_with(Default::default));
+        let convergence_authority = invocation
+            .run_id
+            .filter(|identity| !identity.trim().is_empty())
+            .zip(
+                invocation
+                    .turn_chain_id
+                    .filter(|identity| !identity.trim().is_empty()),
+            )
+            .map(|(run_id, turn_chain_id)| {
+                format!("{run_id}:{turn_chain_id}:{}", self.convergence_authority)
+            });
+        let targeted_observer = convergence_authority.as_deref().is_some_and(|authority| {
+            self.convergence_tracker.requires_snapshot_lease(
+                authority,
+                name,
+                args,
+                &self.project_root,
+            )
+        });
+        let _workspace_mutation_lease = if name != "bash"
+            && name != "run_script"
+            && (astra_tools::executor::is_workspace_mutation_tool(name, args) || targeted_observer)
+            && !nested_run_script_callback
+        {
+            match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                &self.project_root,
+                cancel_token,
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        if let Some(authority) = convergence_authority.as_deref() {
+                            self.convergence_tracker.clear_authority(authority);
+                        }
+                        return cancelled_edge_tool_run(name, false);
+                    }
+                    return EdgeToolRun::error(
+                        "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .to_string(),
+                    );
+                }
             }
-            tool_result_fields
+        } else {
+            None
         };
+        // Structured writers have no trustworthy success fact in their
+        // display string. Capture an owner-side bounded preimage while the
+        // workspace lease is held, then stamp the result only if the bound
+        // workspace actually changed. An unavailable/ambiguous capture is
+        // deliberately not upgraded to a mutation receipt.
+        // Direct file writers below have an exact owner-side applied/no-op
+        // result and must never pay for (or depend on) a whole-tree scan.
+        // Other mutation-capable handlers retain the bounded fingerprint as
+        // a conservative fallback until their own commit boundary reports the
+        // same typed fact.
+        let owner_reports_structured_writer_fact = matches!(name, "write_file" | "str_replace");
+        let writer_fingerprint_before =
+            if astra_tools::executor::is_workspace_mutation_tool(name, args)
+                && !owner_reports_structured_writer_fact
+            {
+                astra_tools::workspace_observation::WorkspaceFingerprint::capture(
+                    &self.project_root,
+                )
+            } else {
+                None
+            };
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            if let Some(authority) = convergence_authority.as_deref() {
+                self.convergence_tracker.clear_authority(authority);
+            }
+            return cancelled_edge_tool_run(name, false);
+        }
+        let _recursive_writer_epoch = if name == "run_script" {
+            match astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                &self.project_root,
+                cancel_token,
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    return EdgeToolRun::error(
+                        "workspace writer coordination was unavailable, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let mut tool_result_fields = None;
+        let mut source_is_error = None;
+        let mut output = self
+            .execute_raw(
+                name,
+                args,
+                invocation,
+                cancel_token,
+                &mut tool_result_fields,
+                &mut source_is_error,
+            )
+            .await;
+        let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
+            astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
+        ) && _recursive_writer_epoch
+            .as_ref()
+            .is_none_or(astra_tools::workspace_observation::WorkspaceWriterGuard::coordination_integrity_valid);
+        let receipt_authority_valid = coordination_integrity_valid
+            && _workspace_mutation_lease.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
+            )
+            && _recursive_writer_epoch.as_ref().is_none_or(
+                astra_tools::workspace_observation::WorkspaceWriterGuard::receipt_authority_valid,
+            );
+        if nested_run_script_callback && let Some(fields) = tool_result_fields.as_mut() {
+            fields.remove("workspace_mutation_applied");
+            astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(
+                fields,
+            );
+            fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
+            fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
+            fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
+        }
+        if !coordination_integrity_valid {
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                &self.project_root,
+            );
+            if let Some(fields) = tool_result_fields.as_mut() {
+                fields.remove("workspace_mutation_applied");
+                astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
+                fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
+                fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
+                fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
+            }
+            output.push_str(
+                "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+            );
+        }
+        let writer_applied_by_owner = receipt_authority_valid
+            && !nested_run_script_callback
+            && tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        let writer_applied_by_fingerprint = if writer_applied_by_owner {
+            false
+        } else {
+            receipt_authority_valid
+                && writer_fingerprint_before
+                    .zip(
+                        astra_tools::workspace_observation::WorkspaceFingerprint::capture(
+                            &self.project_root,
+                        ),
+                    )
+                    .is_some_and(|(before, after)| before.changed_from(Some(after)))
+        };
+        // Redact before constructing EdgeToolRun.  This is deliberately
+        // before status classification, event emission, callback posting, and
+        // cache insertion: tool_call_end and the Edge→server transport must
+        // never become an earlier/raw persistence lane than headless record.
+        let (mut output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+        let embedded_work_observation = embedded_work_unit_observation(&output);
+        // Source status wins over result prose. Unmigrated String handlers
+        // retain their status adapter, but cannot invent an error category.
+        let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
+            || !coordination_integrity_valid;
+        // Owner metadata is the primary structured-writer fact. A whole-tree
+        // fingerprint remains only a conservative fallback for older/opaque
+        // handlers: large non-Git task roots can legitimately exceed its
+        // bounded scan even when a one-file write committed successfully.
+        // No output prose or exit-zero result participates in this decision.
+        let writer_applied = writer_applied_by_owner || writer_applied_by_fingerprint;
+        // Execution failure does not erase the producer's execution facts.
+        // In particular, timeout and partial mutation remain independently
+        // observable. Do not reconstruct a second metadata schema here.
+        if let Some(observation) = embedded_work_observation {
+            observation.insert_into(tool_result_fields.get_or_insert_with(Default::default));
+        }
+        if writer_applied {
+            tool_result_fields
+                .get_or_insert_with(Default::default)
+                .insert("workspace_mutation_applied".to_string(), Value::Bool(true));
+        }
+        let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
+            &mut tool_result_fields,
+            args,
+            &self.project_root,
+        ) {
+            Ok(desired_state) => desired_state,
+            Err(error) => {
+                is_error = true;
+                output.push_str(&format!("\n\nError: {error}; no convergence authority was issued."));
+                None
+            }
+        };
+        // Structured workspace writers have already been checked by this
+        // Edge executor against its bound workspace. Preserve that typed
+        // owner fact across the Edge→server ledger; the server may not stat
+        // the Edge path on its own filesystem. The runtime still requires a
+        // fresh post-mutation observation before accepting terminal text.
+        if let Some(receipt) =
+            astra_tools::workspace_observation::typed_workspace_tool_receipt_for_applied(
+                name,
+                args,
+                &self.project_root,
+                is_error,
+                writer_applied,
+            )
+        {
+            tool_result_fields
+                .get_or_insert_with(Default::default)
+                .extend(receipt);
+        }
+        match astra_tools::workspace_observation::project_typed_workspace_convergence(
+            &self.convergence_tracker,
+            convergence_authority.as_deref(),
+            name,
+            args,
+            &self.project_root,
+            is_error,
+            desired_state.as_ref(),
+            receipt_authority_valid && !nested_run_script_callback,
+            targeted_observer,
+            receipt_authority_valid && _workspace_mutation_lease.is_some(),
+        ) {
+            Ok(projection) => {
+                if let Some(receipt) = projection.convergence_receipt {
+                    tool_result_fields
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+                if let Some(receipt) = projection.observation_receipt {
+                    tool_result_fields
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+            }
+            Err(error) => {
+                is_error = true;
+                output.push_str(&format!(
+                    "\n\nError: {error}; no completion receipt was issued. Retry inside the active turn after cancelling or finishing abandoned work."
+                ));
+            }
+        }
         if is_error {
-            let kind = astra_core::classify_tool_output(&output);
-            EdgeToolRun::classified_error(output, kind)
+            EdgeToolRun::error(output)
         } else {
             EdgeToolRun::ok(output)
         }
@@ -5343,7 +4723,9 @@ impl ToolExecutor {
         name: &str,
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
+        source_is_error: &mut Option<bool>,
     ) -> String {
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
@@ -5358,30 +4740,79 @@ impl ToolExecutor {
             )
         } else {
             match name {
-                "bash" => self.bash_async(args).await,
+                "bash" => {
+                    let outcome = self
+                        .bash_outcome_with_cancel_async(args, invocation, cancel_token)
+                        .await;
+                    *tool_result_fields = outcome.tool_result_fields.clone();
+                    *source_is_error = Some(outcome.is_error);
+                    outcome.output
+                }
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 // Activation primitive for the deferred tool layer.
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => {
-                    let output = self.tool_search(args);
-                    self.record_tool_search_activation_output(&output);
-                    output
-                }
+                "tool_search" => self.tool_search(args),
                 "read_file" => {
-                    let (output, fields) = self.read_file_with_metadata(args);
-                    *tool_result_fields = fields;
-                    output
+                    let result = self.read_file_with_metadata(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
                 }
                 "write_file" => {
                     // delete=true routes to delete_file handler
-                    if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
-                        self.delete_file(args)
-                    } else {
-                        self.write_file(args)
+                    let (output, applied, already_desired) =
+                        if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                            let (output, applied) = self.delete_file_with_applied(args);
+                            (output, applied, false)
+                        } else {
+                            self.write_file_with_applied(args)
+                        };
+                    let mut output = output;
+                    if applied {
+                        tool_result_fields
+                            .get_or_insert_with(Default::default)
+                            .insert("workspace_mutation_applied".to_string(), Value::Bool(true));
                     }
+                    if already_desired {
+                        let content = args
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let requested_state =
+                            astra_tools::workspace_observation::workspace_file_state_identity(
+                                content.as_bytes(),
+                            );
+                        if let Some(desired_state) =
+                            astra_tools::fs_ops::write_file_desired_state_identity(
+                                &self.project_root,
+                                args,
+                            )
+                        {
+                            tool_result_fields
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    astra_tools::workspace_observation::DESIRED_STATE_CONVERGED_FIELD
+                                        .to_string(),
+                                    astra_tools::workspace_observation::workspace_desired_state_convergence_marker(
+                                        &requested_state,
+                                        &desired_state,
+                                    ),
+                                );
+                        } else {
+                            // A successful no-op writer must always have a
+                            // typed desired state. Do not mint a weaker
+                            // marker from display/request text when the
+                            // canonical state function cannot bind the call.
+                            *source_is_error = Some(true);
+                            output.push_str(
+                                "\n\nError: write_file no-op did not produce a typed desired state; no convergence authority was issued.",
+                            );
+                        }
+                    }
+                    output
                 }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
                 "rollback_file_edits" => self.rollback_file_edits(args),
@@ -5389,75 +4820,57 @@ impl ToolExecutor {
                 "str_replace" => {
                     let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
                         Ok(args) => args,
-                        Err(error) => return error,
+                        Err(error) => {
+                            *source_is_error = Some(true);
+                            return error;
+                        }
                     };
                     // edits array routes through the str_replace batch
                     // wrapper so both same-file and per-edit path batches
                     // share one contract.
                     if args.get("edits").and_then(Value::as_array).is_some() {
-                        self.str_replace_batch(&args)
+                        let result = self.str_replace_batch_result(&args);
+                        *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata.clone();
+                        result.output
                     } else {
-                        self.str_replace(&args)
+                        let (result, applied) = self.str_replace_with_applied(&args);
+                        *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata;
+                        if applied {
+                            tool_result_fields
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    "workspace_mutation_applied".to_string(),
+                                    Value::Bool(true),
+                                );
+                        }
+                        result.output
                     }
                 }
                 "list_dir" => self.list_dir(args),
                 "grep" => self.grep(args),
-                "glob" => self.glob(args),
-                "git" => {
-                    let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
-                        Ok(action) => action,
-                        Err(error) => return format!("Error: {error}"),
-                    };
-                    match action {
-                        astra_tools::git_tool_contract::GitAction::Status => {
-                            git_gix::status(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Diff => git_gix::diff(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        astra_tools::git_tool_contract::GitAction::Log => {
-                            git_gix::log(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Show => git_gix::show(
-                            &self.project_root,
-                            args,
-                            self.get_budget_pressure(),
-                            self.aggregate_output_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        astra_tools::git_tool_contract::GitAction::Blame => {
-                            git_gix::blame(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::FileHistory => {
-                            git_gix::file_history(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::LogSearch => {
-                            git_gix::log_search(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Contributors => {
-                            git_gix::contributors(&self.project_root, args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Commit => self.commit(args),
-                        astra_tools::git_tool_contract::GitAction::RevertCommit => {
-                            self.revert_commit(args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Stash => {
-                            let stash_args = git_stash_sub_action_args(args);
-                            self.stash(&stash_args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::CheckoutFile => {
-                            self.checkout_file(args)
-                        }
-                        astra_tools::git_tool_contract::GitAction::Worktree => self.worktree(args),
-                        astra_tools::git_tool_contract::GitAction::Push => {
-                            git_gix::push(&self.project_root, args)
-                        }
-                    }
+                // Glob is owned by the shared executor so CLI-local,
+                // CLI+Server edge callbacks, and pure Server runs have one
+                // traversal, ignore, pagination, and failure contract.
+                "glob" => {
+                    let result = astra_tools::ToolExecutor::execute_with_metadata(
+                        &self.default_executor,
+                        "glob",
+                        args,
+                    )
+                    .await;
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata.clone();
+                    result.output
                 }
+                "worktree" => {
+                    let outcome = self.worktree_with_metadata(args);
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
+                }
+
                 "find_definition" => self.find_definition(args),
                 "find_references" => self.find_references(args),
                 "call_graph" => self.call_graph(args),
@@ -5470,36 +4883,7 @@ impl ToolExecutor {
                 "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
-                "github" => {
-                    let action =
-                        match astra_tools::github_tool_contract::github_action_from_args(args) {
-                            Ok(action) => action,
-                            Err(error) => return format!("Error: {error}"),
-                        };
-                    match action {
-                        astra_tools::github_tool_contract::GithubAction::ListPrs => {
-                            self.list_prs(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::GetPr => {
-                            self.get_pr(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::CiStatus => {
-                            self.ci_status(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::RepoStats => {
-                            self.repo_stats(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::ListIssues => {
-                            self.list_issues(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::GetIssue => {
-                            self.get_issue(args).await
-                        }
-                        astra_tools::github_tool_contract::GithubAction::CreateIssue => {
-                            self.github_create_issue(args).await
-                        }
-                    }
-                }
+
                 "web_fetch" => {
                     let cache_scope = self
                         .active_session_id
@@ -5507,20 +4891,28 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
+                    astra_tools::web_fetch::fetch_with_cache_scope(args, &cache_scope).await
                 }
                 "display_sixel" => {
-                    astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
-                        .await
-                        .output
+                    let result =
+                        astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                            .await;
+                    *source_is_error = Some(result.is_error);
+                    result.output
                 }
                 "run_script" => {
                     #[cfg(unix)]
                     {
                         let config = astra_tools::run_script::RunScriptConfig::default();
-                        astra_tools::run_script::handle_run_script(args, self, config)
-                            .await
-                            .output
+                        let result = astra_tools::run_script::handle_run_script_with_cancel(
+                            args,
+                            self,
+                            config,
+                            cancel_token,
+                        )
+                        .await;
+                        *source_is_error = Some(result.is_error);
+                        result.output
                     }
                     #[cfg(not(unix))]
                     {
@@ -5685,7 +5077,9 @@ impl ToolExecutor {
                                         .get("input")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({}));
-                                    self.execute_chain(&chain, input).await
+                                    let outcome = self.execute_chain_outcome(&chain, input).await;
+                                    *source_is_error = Some(outcome.is_error);
+                                    outcome.output
                                 }
                                 Err(e) => format!("Error: Invalid chain format: {e}"),
                             }
@@ -5755,10 +5149,6 @@ impl ToolExecutor {
                         }
                     }
                 }
-                "task_board" => {
-                    self.execute_task_tool_args(args, invocation.tool_call_id)
-                        .await
-                }
                 "task_output" => self.task_output_with_fields(args, tool_result_fields).await,
                 "task_stop" => self.task_kill_bg(args).await,
                 "task_list" => self.task_list_bg().await,
@@ -5769,9 +5159,10 @@ impl ToolExecutor {
                         .ok()
                         .and_then(|guard| guard.clone())
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
-                    astra_tools::web_search::perform_web_search(None, args, &cache_scope)
-                        .await
-                        .output
+                    let result =
+                        astra_tools::web_search::perform_web_search(args, &cache_scope).await;
+                    *source_is_error = Some(result.is_error);
+                    result.output
                 }
                 "ask_user" => "Error: ask_user requires an interactive TUI prompt sink".to_string(),
                 "notify" => {
@@ -5820,7 +5211,10 @@ impl ToolExecutor {
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
-                    self.execute_mcp_tool(name, args).await
+                    let outcome = self.execute_mcp_tool(name, args).await;
+                    *source_is_error = Some(outcome.is_error);
+                    *tool_result_fields = outcome.tool_result_fields.clone();
+                    outcome.output
                 }
                 _ => format!("Error: Tool '{name}' is not implemented by the CLI executor"),
             }
@@ -5828,7 +5222,10 @@ impl ToolExecutor {
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
         if name != "memory"
-            && !cli_tool_output_is_error(&output)
+            // Feedback must follow the executor's terminal fact, not prose
+            // that can contain error examples or conceal a failed execution.
+            // Legacy handlers without a typed outcome supply no success proof.
+            && *source_is_error == Some(false)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let producer_id = self
@@ -5867,29 +5264,42 @@ impl ToolExecutor {
         output
     }
 
-    /// Execute a multi-step ToolChain, forwarding each step to self.execute().
-    ///
-    /// Returns a JSON summary with per-step outputs and the final result.
-    /// Execution stops on the first error unless the step has a skip condition.
+    #[cfg(test)]
     pub fn execute_chain(
         &self,
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
+        let outcome = self.execute_chain_outcome(chain, input);
+        Box::pin(async move { outcome.await.output })
+    }
+
+    /// Execute a multi-step ToolChain, preserving each executor's outcome.
+    ///
+    /// Returns a JSON summary with per-step outputs and the final result.
+    /// Execution stops on the first error unless the step has a skip condition.
+    fn execute_chain_outcome(
+        &self,
+        chain: &astra_turn_core::tool_registry_chain::ToolChain,
+        input: Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + '_>>
+    {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
 
         if let Err(error) = crate::tool_safety_guard::ToolSafetyGuard::check_chain(chain) {
             let chain_name = chain.name.clone();
             let steps_total = chain.steps.len();
             return Box::pin(async move {
-                serde_json::json!({
-                    "chain": chain_name,
-                    "steps_executed": 0,
-                    "steps_total": steps_total,
-                    "final_output": error,
-                    "steps": [],
-                })
-                .to_string()
+                ToolExecutionOutcome::error(
+                    serde_json::json!({
+                        "chain": chain_name,
+                        "steps_executed": 0,
+                        "steps_total": steps_total,
+                        "final_output": error,
+                        "steps": [],
+                    })
+                    .to_string(),
+                )
             });
         }
 
@@ -5901,8 +5311,7 @@ impl ToolExecutor {
         let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
         let database_checkpoint =
             rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
-        let stash_checkpoint = rollback_on_failure.then(|| self.git_stash_journal_checkpoint());
-        let commit_checkpoint = rollback_on_failure.then(|| self.git_commit_journal_checkpoint());
+
         let worktree_checkpoint =
             rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
         let session_state_checkpoint =
@@ -5913,6 +5322,7 @@ impl ToolExecutor {
             let mut ctx = ChainContext::new(input);
             let mut step_results = Vec::new();
             let mut rollback = None;
+            let mut failed = false;
 
             for (idx, step) in steps.iter().enumerate() {
                 if ctx.should_skip(step) {
@@ -5925,8 +5335,9 @@ impl ToolExecutor {
                 }
 
                 let resolved = resolve_args(&step.args, &ctx);
-                let output = self.execute(&step.tool, &resolved).await;
-                let is_err = cli_tool_output_is_error(&output);
+                let outcome = self.execute_with_metadata(&step.tool, &resolved).await;
+                let is_err = outcome.is_error;
+                let output = outcome.output;
 
                 ctx.record_step(
                     idx,
@@ -5944,19 +5355,16 @@ impl ToolExecutor {
                 }));
 
                 if is_err {
+                    failed = true;
                     if rollback_on_failure {
                         if let (
                             Some(file_checkpoint),
                             Some(database_checkpoint),
-                            Some(stash_checkpoint),
-                            Some(commit_checkpoint),
                             Some(worktree_checkpoint),
                             Some(session_state_checkpoint),
                         ) = (
                             file_checkpoint,
                             database_checkpoint,
-                            stash_checkpoint,
-                            commit_checkpoint,
                             worktree_checkpoint,
                             session_state_checkpoint,
                         ) {
@@ -5966,12 +5374,7 @@ impl ToolExecutor {
                             let database_entries_added = self
                                 .database_snapshot_journal_checkpoint()
                                 .saturating_sub(database_checkpoint);
-                            let stash_entries_added = self
-                                .git_stash_journal_checkpoint()
-                                .saturating_sub(stash_checkpoint);
-                            let commit_entries_added = self
-                                .git_commit_journal_checkpoint()
-                                .saturating_sub(commit_checkpoint);
+
                             let worktree_entries_added = self
                                 .git_worktree_journal_checkpoint()
                                 .saturating_sub(worktree_checkpoint);
@@ -5980,8 +5383,6 @@ impl ToolExecutor {
                                 .saturating_sub(session_state_checkpoint);
                             if file_entries_added > 0
                                 || database_entries_added > 0
-                                || stash_entries_added > 0
-                                || commit_entries_added > 0
                                 || worktree_entries_added > 0
                                 || session_state_entries_added > 0
                             {
@@ -5991,8 +5392,8 @@ impl ToolExecutor {
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
                                         "database_after_sequence": database_checkpoint,
-                                        "stash_after_sequence": stash_checkpoint,
-                                        "commit_after_sequence": commit_checkpoint,
+
+
                                         "worktree_after_sequence": worktree_checkpoint,
                                         "session_state_after_sequence": session_state_checkpoint,
                                     }))
@@ -6031,7 +5432,11 @@ impl ToolExecutor {
             if let Some(rollback) = rollback {
                 result.insert("rollback".to_string(), rollback);
             }
-            Value::Object(result).to_string()
+            ToolExecutionOutcome {
+                output: Value::Object(result).to_string(),
+                tool_result_fields: None,
+                is_error: failed,
+            }
         })
     }
 
@@ -6202,7 +5607,6 @@ impl ToolExecutor {
             Capability::MemoryService,
             Capability::Database,
             Capability::SkillsCatalog,
-            Capability::GitHubAuth,
             Capability::LSPServer,
             Capability::PlanLifecycle,
             Capability::LocalBackgroundTasks,
@@ -6499,11 +5903,36 @@ impl astra_tools::ToolExecutor for ToolExecutor {
         tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
     }
 
+    async fn execute_with_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // RPC calls made from run_script must use the same native
+        // cancellation-aware edge dispatch as top-level calls. The trait
+        // default only races the future against cancellation and can drop a
+        // child/lease owner before its post-execution cleanup runs.
+        tool_result_from_cli_outcome(
+            self.execute_with_invocation_metadata_cancelable(
+                name,
+                args,
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                cancel_token,
+            )
+            .await,
+        )
+    }
+
     fn tool_schemas(&self) -> Vec<Value> {
         self.runtime_available_tool_schemas()
     }
 
     fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    fn workspace_root(&self) -> &Path {
         &self.project_root
     }
 
@@ -6514,20 +5943,95 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+    #[tokio::test]
+    async fn removed_repository_tools_are_not_executable_or_discoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        for name in ["git", "github"] {
+            assert!(
+                !super::local_tool_schemas()
+                    .iter()
+                    .any(|s| s["function"]["name"] == name)
+            );
+            let result = executor
+                .execute_with_metadata(name, &json!({"action":"commit", "message":"must not run"}))
+                .await;
+            assert!(result.is_error, "{name}: {result:?}");
+            let search = executor
+                .execute("tool_search", &json!({"query":format!("select:{name}")}))
+                .await;
+            let parsed: Value = serde_json::from_str(&search).unwrap();
+            assert!(
+                parsed["missing"].as_array().unwrap().contains(&json!(name)),
+                "{search}"
+            );
+        }
+        assert!(!dir.path().join(".git").exists());
+    }
+
     use super::{
         BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot, BgTaskOutputSnapshot,
         BgTaskOutputStatus, ToolExecutor, WorkUnitObservation, WorkUnitStatus, all_tool_schemas,
-        background_task_output_result_fields, cli_tool_output_is_error, detect_git_remote_repos,
-        embedded_work_unit_observation, extract_github_owner_repo, file_checkpoint_dir_for,
-        format_background_task_error, format_background_task_output,
-        format_background_task_output_wait_timeout, format_background_task_stop_error,
-        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
+        background_task_output_result_fields, cli_tool_output_is_error,
+        embedded_work_unit_observation, file_checkpoint_dir_for, format_background_task_error,
+        format_background_task_output, format_background_task_output_wait_timeout,
+        format_background_task_stop_error, memoria, parse_memory_search_contents,
+        utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn feedback_frame(
+        session_turn: u32,
+        rounds: u32,
+        remaining: u32,
+    ) -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+        use astra_turn_core::context_feedback::{
+            RuntimeContextFeedback, RuntimeFeedbackFrame, RuntimeFeedbackIdentity,
+            RuntimeFeedbackProgress,
+        };
+        RuntimeFeedbackFrame {
+            schema_version: RuntimeFeedbackFrame::SCHEMA_VERSION,
+            identity: RuntimeFeedbackIdentity {
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                agent_id: "agent-1".into(),
+                model_id: "deepseek-v4-flash".into(),
+                topology: astra_services::ModelRequestTopology::ServerOnly,
+                request: None,
+            },
+            progress: RuntimeFeedbackProgress {
+                session_turn,
+                agentic_round_index: rounds.saturating_sub(1),
+                llm_rounds_completed: rounds,
+                slice_round_limit: rounds.saturating_add(remaining),
+                slice_rounds_remaining: remaining,
+                absolute_round_ceiling: None,
+            },
+            context: RuntimeContextFeedback {
+                prompt_cache_identity: None,
+                model_context_window_tokens: Some(1_000_000),
+                effective_input_limit_tokens: Some(800_000),
+                estimated_input_tokens: Some(12_345),
+                estimated_cache_eligible_tokens: None,
+                token_pressure: Some(12_345.0 / 800_000.0),
+                compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
+            },
+            request_usage: Some(
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(12_345, 0, 0, 678),
+            ),
+            run_usage: Some(
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(12_345, 0, 0, 678),
+            ),
+            was_truncated: false,
+            cache_break_detected: None,
+            policy_feedback: Default::default(),
+        }
+    }
 
     fn parse_control_result(output: &str) -> serde_json::Value {
         serde_json::from_str(output)
@@ -6552,6 +6056,37 @@ mod tests {
     }
 
     #[test]
+    fn local_background_tools_require_a_live_registry_binding() {
+        use astra_turn_core::capability::Capability;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let candidates = || {
+            vec![
+                function_schema("task_list"),
+                function_schema("task_output"),
+                function_schema("task_stop"),
+            ]
+        };
+        assert!(!executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert!(executor.runtime_bound_tool_schemas(candidates()).is_empty());
+
+        let executor =
+            executor.with_bg_task_commands(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        assert!(executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(
+                &executor.runtime_bound_tool_schemas(candidates())
+            ),
+            HashSet::from([
+                "task_list".to_string(),
+                "task_output".to_string(),
+                "task_stop".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn structured_tool_output_lifts_the_shared_work_observation() {
         let observation = embedded_work_unit_observation(
             &serde_json::json!({
@@ -6572,13 +6107,6 @@ mod tests {
         assert_eq!(observation.id, "fanout-group-1");
         assert_eq!(observation.kind, "agent_fanout");
         assert_eq!(observation.status, WorkUnitStatus::Completed);
-    }
-
-    #[test]
-    fn git_stash_bridge_remaps_canonical_sub_action() {
-        let canonical =
-            git_stash_sub_action_args(&serde_json::json!({"action":"stash","sub_action":"push"}));
-        assert_eq!(canonical["action"], "push");
     }
 
     struct ImmediateSpawnExecutor;
@@ -6617,7 +6145,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
-                cancelled_by_user: None,
+                cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
                 output: Some("child result".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -6648,7 +6176,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
-                cancelled_by_user: None,
+                cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
                 output: Some("child result".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -6677,11 +6205,13 @@ mod tests {
             spawner,
             inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
             ),
+            enabled_tools: None,
             active_skills: Vec::new(),
             live_event_sink: None,
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            workspace_mutation: astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location:
                 astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
         }
@@ -6721,6 +6251,21 @@ mod tests {
         (dir, executor)
     }
 
+    #[test]
+    fn top_level_detach_slot_is_not_inherited_by_nested_default_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
+        let executor = ToolExecutor::new(dir.path()).with_bash_detach_slot(slot);
+        assert!(
+            executor
+                .default_executor
+                .context()
+                .detach_shell_handle
+                .is_none(),
+            "run_script's nested default executor must remain foreground-only"
+        );
+    }
+
     fn function_schema(name: &str) -> serde_json::Value {
         serde_json::json!({
             "type": "function",
@@ -6756,6 +6301,502 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_dispatch_preserves_source_success_for_error_prefixed_content() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(
+            dir.path().join("message.txt"),
+            "Error: literal file content\n",
+        )
+        .unwrap();
+
+        let outcome = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "message.txt"}))
+            .await;
+
+        assert!(!outcome.is_error, "source status must win over body prose");
+        assert!(outcome.output.contains("Error: literal file content"));
+    }
+
+    #[tokio::test]
+    async fn read_file_dispatch_preserves_source_io_failure() {
+        use serde_json::Value;
+        let (_dir, executor) = temp_executor();
+
+        let outcome = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "missing.txt"}))
+            .await;
+
+        assert!(outcome.is_error);
+        assert!(outcome.output.starts_with("Error:"));
+        let fields = outcome.tool_result_fields.as_ref();
+        assert_ne!(
+            fields
+                .and_then(|fields| fields.get("disposition"))
+                .and_then(Value::as_str),
+            Some("rejected"),
+            "an attempted read's I/O failure is not an admission rejection"
+        );
+        assert!(
+            fields.and_then(|fields| fields.get("error_kind")).is_none(),
+            "unknown I/O cause must not be guessed from its message"
+        );
+    }
+
+    fn assert_typed_workspace_mutation_receipt(outcome: &super::ToolExecutionOutcome) {
+        assert!(!outcome.is_error, "writer failed: {outcome:?}");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("successful structured writer must retain owner metadata");
+        assert_eq!(
+            fields
+                .get(astra_tools::workspace_observation::OBSERVED_FIELD)
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            fields
+                .get(astra_tools::workspace_observation::SCOPE_FIELD)
+                .and_then(serde_json::Value::as_str),
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
+        );
+        assert!(
+            fields
+                .get(astra_tools::workspace_observation::RECEIPT_FIELD)
+                .is_some_and(astra_tools::workspace_observation::is_typed_workspace_tool_receipt),
+            "missing typed mutation receipt: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_writer_receipts_do_not_depend_on_full_workspace_fingerprints() {
+        fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
+            astra_tools::tool_engine::ToolInvocationMetadata {
+                task_resolution_authority: None,
+                run_id: Some("run-convergence"),
+                turn_chain_id: Some("turn-convergence"),
+                tool_call_id: Some(tool_call_id),
+                admission_source: None,
+                expected_control_epoch: None,
+            }
+        }
+
+        let (dir, executor) = temp_executor();
+        let oversized = std::fs::File::create(dir.path().join("large.sqlite")).unwrap();
+        oversized.set_len(33 * 1024 * 1024).unwrap();
+        assert!(
+            astra_tools::workspace_observation::WorkspaceFingerprint::capture(dir.path()).is_none(),
+            "setup must exceed the bounded non-Git workspace fingerprint"
+        );
+
+        let write = executor
+            .execute_with_metadata(
+                "write_file",
+                &serde_json::json!({"path": "answer.txt", "content": "before\n"}),
+            )
+            .await;
+        assert_typed_workspace_mutation_receipt(&write);
+        let journal_checkpoint = executor.file_journal_checkpoint();
+        let target_mtime = std::fs::metadata(dir.path().join("answer.txt"))
+            .expect("target metadata")
+            .modified()
+            .expect("mtime");
+        let no_op = executor
+            .execute_with_invocation_metadata(
+                "write_file",
+                &serde_json::json!({"path": "answer.txt", "content": "before\n"}),
+                invocation("write-answer-noop"),
+            )
+            .await;
+        assert!(
+            !no_op.is_error,
+            "idempotent write should succeed: {no_op:?}"
+        );
+        let no_op_receipt = no_op
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get(astra_tools::workspace_observation::RECEIPT_FIELD))
+            .expect("owner-bound convergence receipt");
+        assert!(
+            astra_tools::workspace_observation::is_typed_workspace_desired_state_convergence_receipt(
+                no_op_receipt,
+            ),
+            "an idempotent write must emit only typed convergence evidence: {no_op:?}"
+        );
+        assert!(
+            !astra_tools::workspace_observation::is_typed_workspace_tool_receipt(no_op_receipt),
+            "an idempotent write must not satisfy a changed-receipt contract: {no_op:?}"
+        );
+        assert_eq!(
+            executor.file_journal_checkpoint(),
+            journal_checkpoint,
+            "an idempotent write must not add an undo journal entry"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("answer.txt"))
+                .expect("target metadata")
+                .modified()
+                .expect("mtime"),
+            target_mtime,
+            "an idempotent write must not rewrite the target"
+        );
+
+        // Simulate an opaque Bash/user process creating the exact desired
+        // file: write_file must compare under its owner lease before requiring
+        // a prior typed read, then only a later same-authority full read may
+        // produce the strong snapshot.
+        std::fs::write(dir.path().join("opaque.txt"), "already\n").expect("opaque target");
+        let opaque_noop = executor
+            .execute_with_invocation_metadata(
+                "write_file",
+                &serde_json::json!({"path": "opaque.txt", "content": "already\n"}),
+                invocation("write-opaque"),
+            )
+            .await;
+        let opaque_receipt = opaque_noop
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get(astra_tools::workspace_observation::RECEIPT_FIELD))
+            .expect("opaque-created exact target convergence receipt");
+        assert!(
+            astra_tools::workspace_observation::is_typed_workspace_desired_state_convergence_receipt(
+                opaque_receipt
+            )
+        );
+        let partial = executor
+            .execute_with_invocation_metadata(
+                "read_file",
+                &serde_json::json!({"path": "opaque.txt", "start_line": 1, "end_line": 1}),
+                invocation("partial-opaque"),
+            )
+            .await;
+        assert!(
+            partial
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD))
+                .and_then(astra_tools::workspace_observation::typed_workspace_observation_evidence)
+                .is_none()
+        );
+        let full = executor
+            .execute_with_invocation_metadata(
+                "read_file",
+                &serde_json::json!({"path": "opaque.txt"}),
+                invocation("read-opaque"),
+            )
+            .await;
+        assert!(
+            full.tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields
+                    .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD))
+                .and_then(astra_tools::workspace_observation::typed_workspace_observation_evidence)
+                .is_some(),
+            "same-authority full read must carry strong snapshot: {full:?}"
+        );
+
+        std::fs::write(dir.path().join("anonymous.txt"), "anonymous\n").expect("anonymous target");
+        let anonymous = executor
+            .execute_with_metadata(
+                "write_file",
+                &serde_json::json!({"path": "anonymous.txt", "content": "anonymous\n"}),
+            )
+            .await;
+        assert!(
+            anonymous.is_error,
+            "missing invocation identity must fail closed"
+        );
+        assert!(
+            anonymous
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get(astra_tools::workspace_observation::RECEIPT_FIELD))
+                .is_none(),
+            "an anonymous no-op must not publish unobservable convergence authority"
+        );
+        assert!(
+            anonymous
+                .output
+                .contains("no completion receipt was issued")
+        );
+
+        let replace = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "answer.txt",
+                    "old_str": "before",
+                    "new_str": "after"
+                }),
+            )
+            .await;
+        assert_typed_workspace_mutation_receipt(&replace);
+
+        let delete = executor
+            .execute_with_metadata(
+                "write_file",
+                &serde_json::json!({"path": "answer.txt", "delete": true}),
+            )
+            .await;
+        assert_typed_workspace_mutation_receipt(&delete);
+        assert!(!dir.path().join("answer.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn allowed_absolute_noop_write_does_not_recheck_with_workspace_only_resolver() {
+        let (project, executor) = temp_executor();
+        let external = tempfile::tempdir_in("/var/tmp").expect("allowed external directory");
+        let target = external.path().join("post-receive");
+        let content = "#!/bin/sh\nexit 0\n";
+        std::fs::write(&target, content).expect("target");
+
+        let result = executor
+            .execute_with_invocation_metadata(
+                "write_file",
+                &serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": content,
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    task_resolution_authority: None,
+                    run_id: Some("run-external-noop"),
+                    turn_chain_id: Some("turn-external-noop"),
+                    tool_call_id: Some("call-external-noop"),
+                    admission_source: None,
+                    expected_control_epoch: None,
+                },
+            )
+            .await;
+
+        assert!(
+            !result.is_error,
+            "an explicitly allowed absolute no-op must not fail its typed writer check: {result:?}"
+        );
+        assert!(
+            result.output.contains("already_desired"),
+            "the owner should report the idempotent outcome: {result:?}"
+        );
+        assert!(project.path().exists());
+    }
+
+    #[tokio::test]
+    async fn structured_writer_failure_cannot_mint_a_mutation_receipt() {
+        let (dir, executor) = temp_executor();
+        let outcome = executor
+            .execute_with_metadata("write_file", &serde_json::json!({"path": "answer.txt"}))
+            .await;
+
+        assert!(outcome.is_error, "invalid writer must fail: {outcome:?}");
+        assert!(
+            outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| {
+                    fields.get(astra_tools::workspace_observation::RECEIPT_FIELD)
+                })
+                .is_none(),
+            "a rejected writer must not carry mutation authority: {outcome:?}"
+        );
+        assert!(!dir.path().join("answer.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn same_file_batch_replace_keeps_owner_side_mutation_receipt() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(dir.path().join("answer.txt"), "alpha\nbeta\n").unwrap();
+        let read = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "answer.txt"}))
+            .await;
+        assert!(!read.is_error, "precondition read failed: {read:?}");
+
+        let outcome = executor
+            .execute_with_metadata(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "answer.txt",
+                    "edits": [
+                        {"old_str": "alpha", "new_str": "first"},
+                        {"old_str": "beta", "new_str": "second"}
+                    ]
+                }),
+            )
+            .await;
+
+        assert_typed_workspace_mutation_receipt(&outcome);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("answer.txt")).unwrap(),
+            "first\nsecond\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_file_batch_preview_and_rejection_cannot_mint_mutation_receipt() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(dir.path().join("answer.txt"), "alpha\nbeta\n").unwrap();
+        let read = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "answer.txt"}))
+            .await;
+        assert!(!read.is_error, "precondition read failed: {read:?}");
+
+        for args in [
+            serde_json::json!({
+                "path": "answer.txt",
+                "dry_run": true,
+                "edits": [{"old_str": "alpha", "new_str": "first"}]
+            }),
+            serde_json::json!({
+                "path": "answer.txt",
+                "edits": [
+                    {"old_str": "alpha", "new_str": "first"},
+                    {"old_str": "missing", "new_str": "second"}
+                ]
+            }),
+        ] {
+            let outcome = executor.execute_with_metadata("str_replace", &args).await;
+            assert!(
+                outcome
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| {
+                        fields.get(astra_tools::workspace_observation::RECEIPT_FIELD)
+                    })
+                    .is_none(),
+                "preview/rejection cannot carry mutation authority: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("answer.txt")).unwrap(),
+                "alpha\nbeta\n",
+                "same-file batches are atomic and previews are non-mutating"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_executor_redacts_before_result_transport_and_keeps_edit_capability() {
+        let (dir, executor) = temp_executor();
+        let path = dir.path().join("settings.txt");
+        let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        std::fs::write(&path, raw).unwrap();
+
+        let read = executor
+            .execute("read_file", &serde_json::json!({"path": "settings.txt"}))
+            .await;
+        assert!(
+            !read.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw credential leaked: {read}"
+        );
+        let marker = read
+            .split_once('=')
+            .and_then(|(_, value)| value.lines().next())
+            .expect("executor should return an edit-capable marker");
+
+        let edit = executor
+            .execute(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "settings.txt",
+                    "old_str": marker,
+                    "new_str": "[configured-access-key]"
+                }),
+            )
+            .await;
+        assert!(edit.contains("Replaced successfully"), "{edit}");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "AWS_ACCESS_KEY_ID=[configured-access-key]\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_executor_redacts_indexed_assignments_and_token_arguments() {
+        let (dir, executor) = temp_executor();
+        let path = dir.path().join("tool-config.txt");
+        let raw = concat!(
+            "os.environ[\"AWS_SECRET_ACCESS_KEY\"] = \"D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF\"\n",
+            "tool --token hf_abcdefghijklmnopqrstuvwxyz123456\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+
+        let read = executor
+            .execute("read_file", &serde_json::json!({"path": "tool-config.txt"}))
+            .await;
+        assert!(!read.contains("D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF"));
+        assert!(!read.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+
+        let marker = read
+            .find("[REDACTED:C2:")
+            .and_then(|start| {
+                read[start..]
+                    .find(']')
+                    .map(|end| &read[start..start + end + 1])
+            })
+            .expect("indexed secret should have an edit-capable marker")
+            .to_string();
+        let edit = executor
+            .execute(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "tool-config.txt",
+                    "old_str": marker,
+                    "new_str": "[\"AWS_SECRET_ACCESS_KEY\"] = \"[configured-secret]\""
+                }),
+            )
+            .await;
+        assert!(edit.contains("Replaced successfully"), "{edit}");
+        let token_marker = read
+            .find("[REDACTED:C7:")
+            .and_then(|start| {
+                read[start..]
+                    .find(']')
+                    .map(|end| &read[start..start + end + 1])
+            })
+            .expect("token argument should have an edit-capable marker")
+            .to_string();
+        let token_edit = executor
+            .execute(
+                "str_replace",
+                &serde_json::json!({
+                    "path": "tool-config.txt",
+                    "old_str": token_marker,
+                    "new_str": "--token [configured-token]"
+                }),
+            )
+            .await;
+        assert!(token_edit.contains("Replaced successfully"), "{token_edit}");
+        let updated = std::fs::read_to_string(path).unwrap();
+        assert!(updated.contains("[configured-secret]"));
+        assert!(!updated.contains("D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF"));
+        assert!(!updated.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+    }
+
+    #[tokio::test]
+    async fn cli_glob_uses_shared_complete_match_authority() {
+        let (dir, executor) = temp_executor();
+        std::fs::write(dir.path().join("Makefile"), "test:\n").unwrap();
+        let unrelated = dir.path().join(".fixtures");
+        std::fs::create_dir(&unrelated).unwrap();
+        for index in 0..1_100 {
+            std::fs::write(unrelated.join(format!("candidate-{index:04}.txt")), "").unwrap();
+        }
+
+        for pattern in ["Makefile", "**/Makefile*", "{Makefile,README*.md}"] {
+            let result = astra_tools::ToolExecutor::execute_with_metadata(
+                &executor,
+                "glob",
+                &serde_json::json!({"path": ".", "pattern": pattern}),
+            )
+            .await;
+            assert!(!result.is_error, "pattern={pattern}: {result:?}");
+            assert!(
+                result.output.lines().any(|line| line == "Makefile"),
+                "pattern={pattern}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cli_boundary_preserves_invalid_argument_failure_evidence() {
         let (_dir, executor) = temp_executor();
         let result = astra_tools::ToolExecutor::execute_with_metadata(
@@ -6776,22 +6817,60 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cli_git_invalid_path_preserves_typed_source_evidence() {
-        let (_dir, executor) = temp_executor();
-
-        let result = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "git",
-            &serde_json::json!({"action": "diff", "path": "missing.rs"}),
+    #[test]
+    fn cli_unstructured_failure_boundary_emits_typed_recovery_contract() {
+        let outcome = super::EdgeToolRun::classified_error(
+            "Error: web provider is not available".to_string(),
+            astra_core::ErrorKind::ToolUnavailable,
         )
-        .await;
+        .with_tool_result_fields(Some(serde_json::Map::from_iter([(
+            "work_state".to_string(),
+            serde_json::json!("unchanged"),
+        )])))
+        .into_outcome();
 
-        assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.expect("typed validation metadata");
-        assert_eq!(metadata["error_kind"], "tool_invalid_args");
-        assert_eq!(metadata["recovery_evidence"]["cause"], "resource_missing");
-        assert_eq!(metadata["recovery_evidence"]["retryable"], false);
+        assert!(outcome.is_error);
+        let fields = outcome
+            .tool_result_fields
+            .expect("unstructured failures must carry typed metadata");
+        assert_eq!(fields["error_kind"], "tool_unavailable");
+        assert_eq!(
+            fields["recovery_evidence"]["cause"],
+            "capability_unavailable"
+        );
+        assert_eq!(fields["recovery_evidence"]["retryable"], false);
+        assert_eq!(fields["work_state"], "unchanged");
+    }
+
+    #[test]
+    fn typed_edge_success_keeps_error_shaped_content_as_content() {
+        for content in [
+            "Error: this is a line read from a file".to_string(),
+            r#"{"status":"failed","error":"quoted log record"}"#.to_string(),
+            "SANDBOX_DENIED: this prefix came from file content".to_string(),
+        ] {
+            let outcome = super::EdgeToolRun::ok(content).into_outcome();
+            assert!(!outcome.is_error, "content was reclassified: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn failed_edge_execution_preserves_source_facts_without_reclassifying_them() {
+        use serde_json::json;
+        let fields = serde_json::Map::from_iter([
+            ("exit_code".into(), json!(124)),
+            ("exit_semantics".into(), json!("timed_out")),
+            ("disposition".into(), json!("executed")),
+            ("execution_started".into(), json!(true)),
+            ("workspace_mutation_partial".into(), json!(true)),
+        ]);
+        let outcome = super::EdgeToolRun::error(
+            "SANDBOX_DENIED: quoted subprocess failure, not a policy decision".into(),
+        )
+        .with_tool_result_fields(Some(fields.clone()))
+        .into_outcome();
+        assert!(outcome.is_error);
+        assert_eq!(outcome.tool_result_fields, Some(fields));
     }
 
     #[test]
@@ -6809,10 +6888,12 @@ mod tests {
             names.contains("read_file"),
             "runtime-bound CLI surface must include core local tools"
         );
-        assert!(
-            names.contains("task_board"),
-            "runtime-bound CLI surface must include control-plane local tools"
+        assert_eq!(
+            names.contains("run_script"),
+            astra_sandbox::process_scope_available(),
+            "run_script visibility must follow the invocation-ownership capability"
         );
+        assert!(!names.contains("task_board"));
         assert_eq!(
             names
                 .iter()
@@ -6821,6 +6902,50 @@ mod tests {
             1,
             "duplicate provider schemas must not create duplicate prompt tools"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_edge_bash_exposes_managed_background_contract() {
+        let schemas = super::local_tool_schemas();
+        let bash = schemas
+            .iter()
+            .find(|schema| {
+                schema
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("bash")
+            })
+            .expect("CLI edge bash schema");
+        let properties = bash
+            .pointer("/function/parameters/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("bash properties");
+        assert!(properties.contains_key("run_in_background"));
+        assert!(properties.contains_key("ready_check"));
+        assert!(properties.contains_key("background_ttl"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cli_edge_bash_hides_unsupported_managed_background_contract() {
+        let schemas = super::local_tool_schemas();
+        let bash = schemas
+            .iter()
+            .find(|schema| {
+                schema
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("bash")
+            })
+            .expect("CLI edge bash schema");
+        let properties = bash
+            .pointer("/function/parameters/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("bash properties");
+        assert!(!properties.contains_key("run_in_background"));
+        assert!(!properties.contains_key("ready_check"));
+        assert!(!properties.contains_key("background_ttl"));
     }
 
     #[tokio::test]
@@ -6845,8 +6970,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_dynamic_provider_schema_rejects_invalid_arguments_before_dispatch() {
+        let executor = test_executor();
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "custom_weather",
+                "description": "Get a forecast.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_visible_tool_schemas(&[schema]);
+
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"city": 42}),
+            serde_json::json!({"city": "Shanghai", "extra": true}),
+        ] {
+            let output = executor.execute("custom_weather", &args).await;
+            assert!(
+                output.contains("Invalid arguments for tool `custom_weather`"),
+                "dynamic schema rejection must happen before handler dispatch: {output}"
+            );
+            assert!(!output.contains("not implemented by the CLI executor"));
+        }
+
+        let valid = executor
+            .execute("custom_weather", &serde_json::json!({"city": "Shanghai"}))
+            .await;
+        assert!(
+            valid.contains("not implemented by the CLI executor"),
+            "only a schema-valid call may reach provider handler dispatch: {valid}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn cli_run_script_is_explicit_shared_tool_delegate() {
+        let scope = astra_sandbox::apply_process_scope();
+        if !scope.ownership_guaranteed() {
+            return;
+        }
+        drop(scope);
         let executor = test_executor();
         let output = executor
             .execute(
@@ -6859,6 +7030,44 @@ mod tests {
             output.contains("shared-delegate-ok"),
             "run_script must be handled by its shared contract, got: {output}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_script_nested_bash_stays_out_of_detach_lane() {
+        let scope = astra_sandbox::apply_process_scope();
+        if !scope.ownership_guaranteed() {
+            return;
+        }
+        drop(scope);
+        let (dir, executor) = temp_executor();
+        let (slot, listener) = astra_tools::detach::new_slot_with_handle();
+        let executor = executor.with_bash_detach_slot(slot);
+        let future = tokio::spawn(async move {
+            executor
+                .execute(
+                    "run_script",
+                    &serde_json::json!({
+                        "script": "from astra_tools import bash\nprint(bash('sleep 0.25'))"
+                    }),
+                )
+                .await
+        });
+
+        // A nested RPC call must never acquire the top-level live-child
+        // handle. If it did, the listener would become active before the
+        // script finishes, even without a Ctrl+B signal.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !listener.is_active(),
+            "run_script RPC Bash must remain foreground-only"
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), future)
+            .await
+            .expect("nested run_script timeout")
+            .expect("nested run_script task");
+        assert!(!result.contains("bash_detached"), "{result}");
+        assert!(dir.path().exists());
     }
 
     #[test]
@@ -6875,28 +7084,6 @@ mod tests {
         assert!(
             !rendered.contains("<persisted-output>"),
             "only the call-id-aware runtime persistence layer may emit an artifact handle"
-        );
-    }
-
-    #[test]
-    fn cloud_plan_summary_requires_canonical_status_field() {
-        let executor = test_executor();
-
-        let authoring = serde_json::json!({"plan_id": "p1", "status": "planning"});
-        assert_eq!(
-            executor.cloud_plan_summary_status(&authoring),
-            Some("planning")
-        );
-        assert!(executor.cloud_plan_is_authoring(&authoring));
-
-        let refining = serde_json::json!({"plan_id": "p2", "status": "refining"});
-        assert!(executor.cloud_plan_is_authoring(&refining));
-
-        let old_phase_only = serde_json::json!({"plan_id": "p3", "phase": "planning"});
-        assert_eq!(executor.cloud_plan_summary_status(&old_phase_only), None);
-        assert!(
-            !executor.cloud_plan_is_authoring(&old_phase_only),
-            "phase-only plan summaries must not keep the cloud authoring guard active"
         );
     }
 
@@ -6987,6 +7174,11 @@ mod tests {
             surface.visible().cloned().unwrap_or_default(),
             HashSet::from(["read_file".to_string()]),
             "manual visible-surface installation must not admit internal helper schemas"
+        );
+        assert_eq!(
+            executor.current_visible_tool_schemas_snapshot(),
+            vec![function_schema("read_file")],
+            "the executor must retain the exact runtime-bound schema snapshot"
         );
         assert!(
             surface
@@ -8181,19 +8373,6 @@ mod tests {
         assert_eq!(result["error"], "task_id must be a non-empty string");
     }
 
-    #[tokio::test]
-    async fn unknown_task_action_is_a_typed_contract_error() {
-        let executor = test_executor();
-        let result = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "task_board",
-            &serde_json::json!({"action": "spawn_agents"}),
-        )
-        .await;
-
-        assert_tool_invalid_args(&result);
-    }
-
     fn bg_snapshot(
         end_offset: u64,
         total_bytes: u64,
@@ -8536,26 +8715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_select_github_resolves_on_cli_path() {
-        let executor = test_executor();
-        let out = executor
-            .execute(
-                "tool_search",
-                &serde_json::json!({"query": "select:github"}),
-            )
-            .await;
-        let parsed = parse_tool_search_output(&out);
-        assert_eq!(parsed["mode"].as_str(), Some("select"));
-        assert_eq!(
-            tool_search_string_array(&parsed, "requested"),
-            vec!["github".to_string()]
-        );
-        assert!(tool_search_string_array(&parsed, "missing").is_empty());
-        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
-        assert!(parsed["matches"][0].get("parameters").is_some());
-    }
-
-    #[tokio::test]
     async fn tool_search_select_memory_resolves_on_cli_path() {
         let executor = test_executor();
         let out = executor
@@ -8576,7 +8735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_deferred_tool_call_activates_without_executing_on_cli_path() {
+    async fn direct_deferred_tool_call_requires_the_carrier_protocol_on_cli_path() {
         let executor = test_executor();
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
@@ -8591,10 +8750,9 @@ mod tests {
         )
         .await;
         assert_tool_error_kind(&before, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "direct deferred call must record activation for the next schema-selection round"
+        assert!(
+            before.output.contains("invoke_tool"),
+            "a direct deferred name must receive the carrier recovery protocol: {before:?}"
         );
 
         let search = executor
@@ -8609,64 +8767,40 @@ mod tests {
             vec!["session".to_string()]
         );
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()]
-        );
+    }
 
-        let after = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "session",
-            &serde_json::json!({"action": "history_page"}),
-        )
-        .await;
-        assert_tool_error_kind(&after, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["session".to_string()],
-            "schema assembly should surface the selected deferred tool"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "schema assembly must preserve retained deferred materialization"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["session".to_string()],
-            "repeated schema assembly must keep the selected tool available"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "activation must remain available while conversation context retains it"
-        );
-
+    #[test]
+    fn server_wire_admission_reconciles_deferred_surface_without_bypassing_binding() {
+        let executor = test_executor();
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
-            serde_json::json!({"type": "function", "function": {"name": "session"}}),
         ]);
-        executor.set_current_activatable_tool_names(HashSet::new());
-        let injected = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "session",
-            &serde_json::json!({"action": "history_page"}),
-        )
-        .await;
-        assert_ne!(
-            injected
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("error_kind"))
-                .and_then(serde_json::Value::as_str),
-            Some(astra_core::ErrorKind::ToolBinding.as_str()),
-            "a visible tool call must reach its executor instead of the deferred binding gate: {injected:?}"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["session".to_string()],
-            "a successful call must not revoke retained schema materialization"
+        executor.set_current_activatable_tool_names(HashSet::from([
+            "session".to_string(),
+            "web_fetch".to_string(),
+        ]));
+
+        for (tool, args) in [
+            ("session", serde_json::json!({"action": "history_page"})),
+            (
+                "web_fetch",
+                serde_json::json!({"url": "https://example.com"}),
+            ),
+        ] {
+            executor
+                .accept_server_tool_surface_admission(tool)
+                .expect("the locally bound Edge tool must accept Server wire admission");
+            assert!(
+                executor.tool_admission_denial(tool, &args).is_none(),
+                "Edge must not independently reject Server-visible {tool}"
+            );
+        }
+        assert!(
+            executor
+                .accept_server_tool_surface_admission("definitely_unbound_tool")
+                .is_err(),
+            "Server admission must never manufacture an Edge runtime binding"
         );
     }
 
@@ -8686,10 +8820,6 @@ mod tests {
         )
         .await;
         assert_tool_error_kind(&activation, astra_core::ErrorKind::ToolBinding);
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
-        );
 
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
@@ -8697,11 +8827,6 @@ mod tests {
         ]);
         executor.set_current_activatable_tool_names(HashSet::new());
 
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale activation must be pruned once the tool is neither visible nor activatable"
-        );
         let denied = astra_tools::ToolExecutor::execute_with_metadata(
             &executor,
             "memory",
@@ -8892,25 +9017,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_update_unknown_field_names_action_that_accepts_field() {
-        let err = ToolExecutor::validate_task_tool_args_for_action(
-            "update",
-            &serde_json::json!({
-                "action": "update",
-                "task_id": "task-1",
-                "subtasks": []
-            }),
-        )
-        .expect_err("task_board.update must reject create-only subtasks");
-
-        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
-        assert!(
-            err.contains("field is valid for: task_board.create"),
-            "{err}"
-        );
-    }
-
     #[tokio::test]
     async fn agent_info_capability_reports_inactive_agent_spawner() {
         let executor = test_executor();
@@ -8937,7 +9043,7 @@ mod tests {
         );
         assert!(
             !inactive.contains(&"PlanLifecycle"),
-            "local CLI exposes client-backed plan lifecycle wrappers, so PlanLifecycle must stay active; got {out}"
+            "local CLI exposes plan lifecycle wrappers, so PlanLifecycle must stay active; got {out}"
         );
 
         let dropped = parsed["tools_dropped_by_capability"]
@@ -9155,11 +9261,6 @@ mod tests {
             tool_search_string_array(&parsed, "missing"),
             vec!["mcp__weather".to_string()]
         );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale MCP schemas must not create deferred activation state"
-        );
     }
 
     #[test]
@@ -9227,59 +9328,6 @@ mod tests {
                 .and_then(|fields| fields.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolBinding.as_str())
-        );
-    }
-
-    #[test]
-    fn restored_activated_deferred_tool_survives_first_schema_injection() {
-        let executor = test_executor();
-        executor.restore_activated_deferred_tool_names_for_session(&[
-            "memory".to_string(),
-            " ".to_string(),
-        ]);
-
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "session restore should seed valid pending activation"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
-            "restored activation must survive until the first schema-injection opportunity"
-        );
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
-            "schema injection preserves retained deferred materialization"
-        );
-    }
-
-    #[test]
-    fn activated_deferred_tool_is_pruned_when_runtime_binding_disappears() {
-        let executor = test_executor();
-        executor.set_current_visible_tool_schemas(&[serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__weather",
-                "description": "Get weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
-                }
-            }
-        })]);
-        executor
-            .activated_deferred_tools
-            .write()
-            .unwrap()
-            .insert("mcp__weather".to_string());
-
-        assert_eq!(
-            executor.activated_deferred_tool_names(),
-            Vec::<String>::new(),
-            "stale visible MCP schemas must not retain activation after runtime binding disappears"
         );
     }
 
@@ -9394,20 +9442,18 @@ mod tests {
         let session_dir = astra_services::SessionArtifactStore::session_dir(&store, session_id)
             .expect("safe session id resolves to its artifact directory");
         let content = "checked evidence 😀\n".repeat(4_000);
-        assert!(
-            astra_turn_core::tool_result_storage::maybe_persist_tool_result(
-                &session_dir,
-                "call-artifact-cli",
-                "git",
-                &content,
-            )
-            .is_some(),
-            "setup must create an oversized session artifact"
-        );
-
-        let artifact = astra_turn_core::tool_result_storage::session_tool_result_artifact_uri(
+        let persisted = astra_turn_core::tool_result_storage::persist_tool_result_with_descriptor(
+            &session_dir,
+            "run-artifact-cli",
             "call-artifact-cli",
-        );
+            "git",
+            &content,
+        )
+        .expect("setup must create an oversized immutable session artifact");
+        let artifact =
+            astra_turn_core::tool_result_storage::session_tool_result_artifact_uri_for_descriptor(
+                &persisted.descriptor,
+            );
         let active = test_executor().with_active_session_id(session_id);
         let first = active.handle_introspect(&serde_json::json!({
             "artifact": artifact,
@@ -9428,14 +9474,15 @@ mod tests {
     }
 
     #[test]
-    fn introspect_hint_first_turn_has_metrics_not_placeholder() {
+    fn introspect_hint_first_turn_reports_explicit_unobserved_state() {
         let executor = test_executor();
         let out = executor.handle_introspect(&serde_json::json!({"depth": "hint"}));
         assert!(
-            out.contains("pressure=") && out.contains("turns="),
-            "expected hint metrics line, got: {out}"
+            out.contains("runtime_feedback=not_yet_observed"),
+            "expected explicit unobserved state, got: {out}"
         );
-        assert!(!out.contains("first turn"));
+        assert!(!out.contains("pressure=0"));
+        assert!(!out.contains("turns=0"));
     }
 
     #[test]
@@ -9449,7 +9496,10 @@ mod tests {
             panic!("expected structured json introspect output: {error}; {out}")
         });
 
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(
+            parsed["schema_version"],
+            astra_turn_core::introspect::INTROSPECT_REPORT_SCHEMA_VERSION
+        );
         assert_eq!(parsed["tool"], "introspect");
         assert_eq!(parsed["facet"], "session_memory");
         assert_eq!(parsed["data_coverage"], parsed["view"]["data_coverage"]);
@@ -9481,29 +9531,28 @@ mod tests {
     }
 
     #[test]
-    fn introspect_first_turn_reports_current_model_from_executor() {
+    fn introspect_first_turn_does_not_fabricate_model_feedback() {
         let executor = test_executor();
         executor.set_current_model("deepseek-v4-pro-official(thinking:high)");
 
         let out = executor.handle_introspect(&serde_json::json!({"depth": "hint"}));
 
         assert!(
-            out.contains("model=deepseek-v4-pro-official(thinking:high)"),
-            "expected first-turn introspect to expose current model, got: {out}"
+            out.contains("runtime_feedback=not_yet_observed"),
+            "got: {out}"
         );
+        assert!(!out.contains("deepseek-v4-pro"), "got: {out}");
     }
 
     #[test]
-    fn introspect_first_turn_reports_effective_input_budget_from_executor() {
+    fn introspect_first_turn_does_not_fabricate_effective_input_limit() {
         let executor = test_executor();
         executor.set_current_effective_input_budget_tokens(800_000);
 
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
 
-        assert!(
-            out.contains("Effective input budget: 800000 tokens"),
-            "expected first-turn introspect to expose effective budget, got: {out}"
-        );
+        assert!(out.contains("not yet observed"), "got: {out}");
+        assert!(!out.contains("800000"), "got: {out}");
         assert!(
             !out.contains("262144"),
             "introspect must not expose guessed context-window values, got: {out}"
@@ -9511,21 +9560,16 @@ mod tests {
     }
 
     #[test]
-    fn introspect_first_turn_reports_provider_context_window_from_executor() {
+    fn introspect_first_turn_does_not_fabricate_context_window() {
         let executor = test_executor();
         executor.set_current_context_window_tokens(1_000_000);
         executor.set_current_effective_input_budget_tokens(800_000);
 
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
 
-        assert!(
-            out.contains("Provider context window: 1000000 tokens"),
-            "expected first-turn introspect to expose provider context window, got: {out}"
-        );
-        assert!(
-            out.contains("Effective input budget: 800000 tokens"),
-            "expected first-turn introspect to keep effective budget distinct, got: {out}"
-        );
+        assert!(out.contains("not yet observed"), "got: {out}");
+        assert!(!out.contains("1000000"), "got: {out}");
+        assert!(!out.contains("800000"), "got: {out}");
     }
 
     #[test]
@@ -9533,16 +9577,12 @@ mod tests {
         let executor = test_executor();
         // Populate a non-trivial snapshot.
         executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
-            turns_completed: 5,
-            turns_remaining: 10,
-            total_input_tokens: 12345,
-            total_output_tokens: 678,
-            compaction_tier: "None".to_string(),
+            runtime_feedback: Some(feedback_frame(5, 5, 10)),
             lifecycle_summary: "resume pending: [plan-resume] goal=\"Fix auth\"".to_string(),
             ..Default::default()
         });
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
-        assert!(out.contains("Turns: 5/15"), "got: {out}");
+        assert!(out.contains("session_turn=5"), "got: {out}");
         assert!(out.contains("input_total=12345"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
     }
@@ -9554,15 +9594,14 @@ mod tests {
             .journal_turn_index
             .store(9, std::sync::atomic::Ordering::Release);
         executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
-            turns_completed: 7,
-            turns_remaining: 0,
-            turn_budget_unlimited: true,
+            runtime_feedback: Some(feedback_frame(7, 7, 0)),
             ..Default::default()
         });
 
         let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
 
-        assert!(out.contains("Turns: 7/∞"), "got: {out}");
+        assert!(out.contains("remaining=0"), "got: {out}");
+        assert!(!out.contains('∞'), "got: {out}");
         assert!(out.contains("Snapshot age: 2 turn(s)"), "got: {out}");
     }
 
@@ -10339,54 +10378,9 @@ mod tests {
     mod schema_tests;
     mod self_mod_tests;
     mod sleep_tests;
-    mod task_tests;
     mod tool_search_tests;
     mod utf16_tests;
     mod worktree_tests;
-
-    /// Regression test for 3e3d6fa8 proxy policy:
-    /// `github_client` targets api.github.com (external traffic), so it must
-    /// honour HTTPS_PROXY/ALL_PROXY via `astra_core::net::apply_env_proxy`.
-    /// Before the fix, this builder silently inherited reqwest's default env
-    /// handling without NO_PROXY / socks5 / tracing parity with the LLM client.
-    ///
-    /// We can't introspect reqwest's internal proxy config, so we assert the
-    /// observable contract: (a) the builder constructs successfully under a
-    /// variety of proxy envs (NO_PROXY, malformed, socks5 via ALL_PROXY), and
-    /// (b) `ToolExecutor::new` never panics when those envs are set — which
-    /// was the actual risk if a caller forgot to call `apply_env_proxy` and
-    /// reqwest rejected a malformed env URL at build time.
-    // serial_test: proxy env mutations race with any parallel test whose
-    // HTTP client is env-proxy-aware (e.g. cloud_sync's remote-target
-    // clients after the client_builder_for_target policy).
-    #[serial_test::serial]
-    #[test]
-    fn github_client_honours_proxy_env_without_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // valid https proxy
-        temp_env::with_var("HTTPS_PROXY", Some("http://proxy.example:8080"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // socks5 via ALL_PROXY (parity with LLM client regression)
-        temp_env::with_var("ALL_PROXY", Some("socks5://127.0.0.1:1080"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // malformed must not panic (apply_env_proxy swallows parse errors)
-        temp_env::with_var("HTTPS_PROXY", Some("not a url"), || {
-            let _ = ToolExecutor::new(dir.path());
-        });
-        // NO_PROXY honoured
-        temp_env::with_vars(
-            [
-                ("HTTPS_PROXY", Some("http://proxy.example:8080")),
-                ("NO_PROXY", Some("api.github.com")),
-            ],
-            || {
-                let _ = ToolExecutor::new(dir.path());
-            },
-        );
-    }
 
     // ── introspect facet=session_memory (unhappy first) ───────────────
 

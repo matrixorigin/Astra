@@ -32,7 +32,10 @@ fn default_temp_allowed_paths() -> Vec<PathBuf> {
 }
 
 /// Security enforcement level (ordered from least to most restrictive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum IsolationLevel {
     /// No restrictions.
     Permissive,
@@ -51,7 +54,8 @@ pub enum IsolationLevel {
 ///
 /// ulimit -u is UID-wide and caused false-positive fork failures when the
 /// user already had many processes running.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxPolicy {
     /// Security enforcement level.
     pub isolation: IsolationLevel,
@@ -65,9 +69,14 @@ pub struct SandboxPolicy {
 
     /// Environment variable allowlist. When set, only these vars (plus
     /// a safe baseline) are passed to child processes.
+    #[serde(deserialize_with = "required_option")]
     pub env_allowlist: Option<Vec<String>>,
 
     /// Maximum command execution time in seconds.
+    #[serde(
+        serialize_with = "serialize_execution_timeout",
+        deserialize_with = "deserialize_execution_timeout"
+    )]
     pub max_execution_secs: f64,
 
     /// Maximum output size in bytes before truncation.
@@ -76,6 +85,38 @@ pub struct SandboxPolicy {
     /// Whether to allow network access from bash commands.
     /// When false, adds `--network=none` to unshare (Strict isolation only).
     pub network_allowed: bool,
+}
+
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+}
+
+fn serialize_execution_timeout<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if !value.is_finite() || *value < 0.0 {
+        return Err(serde::ser::Error::custom(
+            "sandbox timeout must be finite and nonnegative",
+        ));
+    }
+    serializer.serialize_f64(*value)
+}
+
+fn deserialize_execution_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(serde::de::Error::custom(
+            "sandbox timeout must be finite and nonnegative",
+        ));
+    }
+    Ok(value)
 }
 
 /// Baseline environment variables always allowed in Standard+ isolation.
@@ -416,6 +457,30 @@ impl SandboxPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_preserves_constraints_and_rejects_incomplete_policy() {
+        let policy = SandboxPolicy::strict("/original-workspace");
+        let wire = serde_json::to_value(&policy).unwrap();
+        let restored: SandboxPolicy = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+        assert!(!restored.network_allowed);
+        assert!(!restored.is_path_allowed(Path::new("/another-workspace/file")));
+        for field in wire.as_object().unwrap().keys() {
+            let mut incomplete = wire.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SandboxPolicy>(incomplete).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut invalid = policy;
+        invalid.max_execution_secs = f64::INFINITY;
+        assert!(serde_json::to_value(&invalid).is_err());
+        let mut invalid = wire;
+        invalid["max_execution_secs"] = serde_json::json!(-1);
+        assert!(serde_json::from_value::<SandboxPolicy>(invalid).is_err());
+    }
 
     #[test]
     fn standard_policy_defaults() {

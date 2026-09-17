@@ -41,9 +41,9 @@ pub enum ToolCategory {
     /// File read / write / list / search (`read_file`, `write_file`,
     /// `glob`, `grep`).
     FileSystem,
-    /// Git operations (`git` tool).
+    /// Repository lifecycle operations.
     VersionControl,
-    /// External API calls (`web_fetch`, `web_search`, `github`).
+    /// External API calls (`web_fetch`, `web_search`).
     ExternalApi,
     /// Session-level state management (`memory`, `session`, `task`).
     StateManagement,
@@ -77,8 +77,8 @@ impl ToolCategory {
             | "list_dir"
             | "grep"
             | "glob" => Some(Self::FileSystem),
-            "git" | "git_clone" => Some(Self::VersionControl),
-            "web_search" | "web_fetch" | "github" | "tool_search" => Some(Self::ExternalApi),
+            "git_clone" | "worktree" => Some(Self::VersionControl),
+            "web_search" | "web_fetch" | "tool_search" => Some(Self::ExternalApi),
             "ask_user"
             | "notify"
             | "enter_plan_mode"
@@ -88,7 +88,6 @@ impl ToolCategory {
             | "compress_context"
             | "memory"
             | "session"
-            | "task_board"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),
@@ -136,15 +135,12 @@ mod tests {
             ToolCategory::for_tool_name("ask_user"),
             Some(ToolCategory::StateManagement)
         );
-        assert_eq!(
-            ToolCategory::for_tool_name("task_board"),
-            Some(ToolCategory::StateManagement)
-        );
+        assert_eq!(ToolCategory::for_tool_name("task_board"), None);
         for local_background_tool in ["task_output", "task_stop", "task_list"] {
             assert_eq!(
                 ToolCategory::for_tool_name(local_background_tool),
                 Some(ToolCategory::BackgroundTaskProcess),
-                "{local_background_tool} must not be confused with the durable task board"
+                "{local_background_tool} must remain execution control, not Work planning"
             );
         }
         assert_eq!(

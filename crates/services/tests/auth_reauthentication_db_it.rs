@@ -42,6 +42,7 @@ async fn reauthentication_proofs_are_owner_purpose_expiry_and_one_time_bound() {
         .reauthenticate(
             &user.user_id,
             ReauthenticationRequestData {
+                memoria_proof: None,
                 password: "wrong-password".to_string(),
                 purpose: ReauthenticationPurpose::DeviceTrust,
             },
@@ -57,6 +58,7 @@ async fn reauthentication_proofs_are_owner_purpose_expiry_and_one_time_bound() {
         .reauthenticate(
             &user.user_id,
             ReauthenticationRequestData {
+                memoria_proof: None,
                 password: password.to_string(),
                 purpose: ReauthenticationPurpose::DeviceTrust,
             },
@@ -97,6 +99,7 @@ async fn reauthentication_proofs_are_owner_purpose_expiry_and_one_time_bound() {
         .reauthenticate(
             &user.user_id,
             ReauthenticationRequestData {
+                memoria_proof: None,
                 password: password.to_string(),
                 purpose: ReauthenticationPurpose::DeviceReenroll,
             },
@@ -125,6 +128,7 @@ async fn reauthentication_proofs_are_owner_purpose_expiry_and_one_time_bound() {
         .reauthenticate(
             &user.user_id,
             ReauthenticationRequestData {
+                memoria_proof: None,
                 password: password.to_string(),
                 purpose: ReauthenticationPurpose::DeviceTrust,
             },

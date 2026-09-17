@@ -688,8 +688,46 @@ pub struct LightCheckpoint {
     pub created_at: u64,
 }
 
-/// Heavy checkpoint: light + full conversation state + tool results.
-/// Written infrequently (phase transitions, before expensive operations).
+/// Run-scoped accounting facts, not permission to resume execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum RunExecutionBudget {
+    #[serde(rename = "1")]
+    V1 {
+        run_id: String,
+        producer_owner_generation: u64,
+        charged_iterations: u64,
+        granted_iteration_boundary: u64,
+        remaining_iterations: u64,
+        #[serde(deserialize_with = "deserialize_required_budget_limit")]
+        effective_hard_turn_limit: Option<std::num::NonZeroU64>,
+    },
+}
+
+fn deserialize_required_budget_limit<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::num::NonZeroU64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+/// Control facts paired with the budget in the same heavy checkpoint.
+/// Absence never grants ordinary execution or replenishes action attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum RunExecutionControl {
+    #[serde(rename = "2")]
+    V2 {
+        completion_settlement: astra_turn_types::CompletionSettlementState,
+        hook_obligations: astra_turn_types::StopHookObligations,
+        budget_wrapup_injected: bool,
+        budget_wrapup_ignored_rounds: u32,
+    },
+}
+
+/// Heavy checkpoint: conversation and execution facts at one frontier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeavyCheckpoint {
     /// All fields from light checkpoint
@@ -709,15 +747,21 @@ pub struct HeavyCheckpoint {
     /// signal.
     pub budget_remaining_tokens: u64,
     pub budget_remaining_rounds: u32,
-    /// Session state
+    /// Bound to this checkpoint's execution and conversation frontiers.
+    /// Missing accounting cannot be interpreted as a fresh allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_execution_budget: Option<RunExecutionBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_execution_control: Option<RunExecutionControl>,
+    /// Legacy diagnostic snapshot of names that were restricted at checkpoint
+    /// time. It has no scope/provenance and must not be treated as current
+    /// execution authority on restore.
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
-    /// Deferred schemas already materialized in the retained prompt context.
-    ///
-    /// This is not execution authority; resume paths must intersect it with
-    /// the current advertised surface and live runtime bindings.
+    /// Schema-addressed deferred selections. This is the durable carrier
+    /// authorization evidence; names above are only legacy prompt continuity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activated_deferred_tool_names: Vec<String>,
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Memory context snapshot (for auditing)
     pub memory_context: Option<MemoryContext>,
     /// Active delegation ID (if running inside a delegation)
@@ -763,6 +807,63 @@ pub struct HeavyCheckpoint {
     /// the id is content-addressed hex, `cfg_<16-hex>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    /// Durable execution uncertainty carried across a heavy-checkpoint
+    /// resume.  A foreground process-group receipt proves that the leader
+    /// finished, but not that a detached descendant is gone; once observed,
+    /// the resumed loop must remain conservative until a new workspace
+    /// binding is established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_observation_quarantine: Option<WorkspaceObservationQuarantineV1>,
+}
+
+/// Typed, transport-neutral workspace observation quarantine state.
+///
+/// This deliberately carries no path or command text.  The binding is owned
+/// by the resumed session/runtime, while the reason and scope keep the state
+/// auditable without allowing a checkpoint to become a new execution
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceObservationQuarantineV1 {
+    pub reason: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_call_id: Option<String>,
+}
+
+impl WorkspaceObservationQuarantineV1 {
+    pub const WEAK_PROCESS_OWNERSHIP_REASON: &'static str = "weak_process_ownership";
+    pub const PARTIAL_MUTATION_REASON: &'static str = "partial_workspace_mutation";
+    pub const BOUND_WORKSPACE_SCOPE: &'static str = "bound_workspace";
+
+    pub fn weak_process_ownership(source_tool_call_id: Option<String>) -> Self {
+        Self {
+            reason: Self::WEAK_PROCESS_OWNERSHIP_REASON.to_string(),
+            scope: Self::BOUND_WORKSPACE_SCOPE.to_string(),
+            source_tool_call_id,
+        }
+    }
+
+    pub fn partial_workspace_mutation(source_tool_call_id: Option<String>) -> Self {
+        Self {
+            reason: Self::PARTIAL_MUTATION_REASON.to_string(),
+            scope: Self::BOUND_WORKSPACE_SCOPE.to_string(),
+            source_tool_call_id,
+        }
+    }
+
+    /// Check the closed protocol vocabulary before a checkpoint can affect
+    /// runtime safety state.  Unknown values are rejected rather than being
+    /// interpreted as a stronger or weaker policy by a newer binary.
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self.reason.as_str(),
+            Self::WEAK_PROCESS_OWNERSHIP_REASON | Self::PARTIAL_MUTATION_REASON
+        ) && self.scope == Self::BOUND_WORKSPACE_SCOPE
+            && self
+                .source_tool_call_id
+                .as_deref()
+                .is_none_or(|id| !id.trim().is_empty())
+    }
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -863,9 +964,11 @@ impl StepCheckpoint {
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -876,6 +979,7 @@ impl StepCheckpoint {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }))
     }
 
@@ -948,6 +1052,15 @@ impl StepCheckpoint {
         {
             return Err(ProtocolError::CheckpointCorrupt(
                 "Heavy checkpoint has no messages for non-Perceive phase".into(),
+            ));
+        }
+
+        if let Self::Heavy(h) = self
+            && let Some(quarantine) = h.workspace_observation_quarantine.as_ref()
+            && !quarantine.is_valid()
+        {
+            return Err(ProtocolError::CheckpointCorrupt(
+                "Heavy checkpoint contains an unknown workspace observation quarantine".into(),
             ));
         }
 
@@ -1428,6 +1541,9 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepEvent {
     pub event_id: String,
+    /// Server-owned execution identity for this event.  A persisted step
+    /// event is certifiable only when it is bound to the run that produced it.
+    pub run_id: String,
     /// Canonical UUID v7 shared across EventLog, TraceEvent DB, and StepRecorder.
     pub canonical_event_id: Option<String>,
     pub step_id: String,
@@ -1587,7 +1703,62 @@ fn compute_idempotency_key(
 mod tests {
     use super::*;
 
+    #[test]
+    fn run_execution_budget_requires_explicit_limit_and_known_version() {
+        for limit in [None, std::num::NonZeroU64::new(100)] {
+            let snapshot = RunExecutionBudget::V1 {
+                run_id: "run".into(),
+                producer_owner_generation: 3,
+                charged_iterations: 2,
+                granted_iteration_boundary: 50,
+                remaining_iterations: 48,
+                effective_hard_turn_limit: limit,
+            };
+            let wire = serde_json::to_value(&snapshot).unwrap();
+            assert!(wire.get("effective_hard_turn_limit").is_some());
+            assert_eq!(
+                serde_json::from_value::<RunExecutionBudget>(wire.clone()).unwrap(),
+                snapshot
+            );
+            let mut missing = wire.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("effective_hard_turn_limit");
+            assert!(serde_json::from_value::<RunExecutionBudget>(missing).is_err());
+            let mut unknown = wire;
+            unknown["version"] = serde_json::json!("2");
+            assert!(serde_json::from_value::<RunExecutionBudget>(unknown).is_err());
+        }
+    }
+
     const TEST_USER_ID: &str = "test-user";
+
+    #[test]
+    fn run_execution_control_requires_complete_known_contract() {
+        let snapshot = RunExecutionControl::V2 {
+            completion_settlement: astra_turn_types::CompletionSettlementState::default(),
+            hook_obligations: astra_turn_types::StopHookObligations::default(),
+            budget_wrapup_injected: true,
+            budget_wrapup_ignored_rounds: 1,
+        };
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RunExecutionControl>(wire.clone()).unwrap(),
+            snapshot
+        );
+        for field in wire.as_object().unwrap().keys() {
+            let mut incomplete = wire.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<RunExecutionControl>(incomplete).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut unknown = wire;
+        unknown["version"] = serde_json::json!("future");
+        assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+    }
 
     // ── Protocol Version ──
 
@@ -2132,18 +2303,6 @@ mod tests {
             ("grep", None),
             ("glob", None),
             ("list_dir", None),
-            ("git", Some(json!({"action": "status"}))),
-            ("git", Some(json!({"action": "log"}))),
-            ("git", Some(json!({"action": "diff"}))),
-            (
-                "git",
-                Some(json!({"action": "blame", "path": "src/main.rs"})),
-            ),
-            ("github", Some(json!({"action": "list_prs"}))),
-            (
-                "github",
-                Some(json!({"action": "ci_status", "pr_number": 1})),
-            ),
             ("mo_query", None),
         ] {
             assert_eq!(
@@ -2151,6 +2310,20 @@ mod tests {
                 ToolIdempotency::PureRead,
                 "Expected PureRead for {tool}"
             );
+        }
+
+        // Retired tool names must not regain automatic read retries from old arguments.
+        for tool in ["git", "github"] {
+            for args in [
+                None,
+                Some(json!({"action": "status"})),
+                Some(json!({"action": "list_prs"})),
+            ] {
+                assert_eq!(
+                    classify_tool_idempotency(tool, args.as_ref()),
+                    ToolIdempotency::NonIdempotent
+                );
+            }
         }
 
         // memory is action-sensitive
@@ -2356,6 +2529,7 @@ mod tests {
             &mut store,
             StepEvent {
                 event_id: "e1".into(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::StepStarted,
@@ -2374,6 +2548,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-events-for-step");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2384,6 +2559,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e2".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s2".into(),
             event_type: StepEventType::StepStarted,
@@ -2394,6 +2570,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e3".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepCompleted,
@@ -2414,6 +2591,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-chain");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2424,6 +2602,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e2".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallStarted,
@@ -2434,6 +2613,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e3".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallCompleted,
@@ -2458,6 +2638,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-convergence");
         let _ = store.append(StepEvent {
             event_id: "start".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2469,6 +2650,7 @@ mod tests {
         for (i, tool) in ["grep", "read_file", "git"].iter().enumerate() {
             let _ = store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallStarted,
@@ -2481,6 +2663,7 @@ mod tests {
         for i in 0..3 {
             let _ = store.append(StepEvent {
                 event_id: format!("tool_done_{i}"),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -2492,6 +2675,7 @@ mod tests {
         }
         let _ = store.append(StepEvent {
             event_id: "converge".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolsConverged,
@@ -2898,9 +3082,11 @@ mod tests {
             messages: vec![], // empty for non-Perceive!
             budget_remaining_tokens: 1000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -2911,6 +3097,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2935,9 +3122,11 @@ mod tests {
             messages: vec![],
             budget_remaining_tokens: 4000,
             budget_remaining_rounds: 10,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec![],
             recent_tools: vec![],
-            activated_deferred_tool_names: vec![],
+            deferred_tool_activations: vec![],
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -2948,6 +3137,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }));
         assert!(cp.validate().is_ok());
     }
@@ -2994,6 +3184,34 @@ mod tests {
         assert!(cp.validate().is_ok());
     }
 
+    #[test]
+    fn validate_rejects_unknown_workspace_observation_quarantine() {
+        let mut cp = StepCheckpoint::heavy(
+            "s-quarantine".into(),
+            "t-quarantine".into(),
+            "a-quarantine".into(),
+            ExecutionCursor::default(),
+        );
+        if let StepCheckpoint::Heavy(ref mut heavy) = cp {
+            heavy.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
+                reason: "future_reason".into(),
+                scope: "bound_workspace".into(),
+                source_tool_call_id: Some("call-1".into()),
+            });
+        }
+        let error = cp
+            .validate()
+            .expect_err("unknown quarantine must fail closed");
+        assert!(matches!(error, ProtocolError::CheckpointCorrupt(_)));
+    }
+
+    #[test]
+    fn workspace_observation_quarantine_constructor_has_closed_vocabulary() {
+        let quarantine =
+            WorkspaceObservationQuarantineV1::weak_process_ownership(Some("call-1".into()));
+        assert!(quarantine.is_valid());
+    }
+
     // ── Checkpoint Round-Trip ──
 
     #[test]
@@ -3023,7 +3241,16 @@ mod tests {
             h.messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
-            h.activated_deferred_tool_names = vec!["github".into()];
+            h.deferred_tool_activations = vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }];
+            h.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
+                reason: "weak_process_ownership".into(),
+                scope: "bound_workspace".into(),
+                source_tool_call_id: Some("call-1".into()),
+            });
         }
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
@@ -3032,21 +3259,44 @@ mod tests {
             assert_eq!(h.messages.len(), 1);
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
-            assert_eq!(h.activated_deferred_tool_names, vec!["github"]);
+            assert_eq!(
+                h.deferred_tool_activations,
+                vec![astra_turn_types::DeferredToolActivation {
+                    name: "github".into(),
+                    schema_digest: "sha256:checkpoint".into(),
+                    descriptor: None,
+                }]
+            );
+            assert_eq!(
+                h.workspace_observation_quarantine,
+                Some(WorkspaceObservationQuarantineV1 {
+                    reason: "weak_process_ownership".into(),
+                    scope: "bound_workspace".into(),
+                    source_tool_call_id: Some("call-1".into()),
+                })
+            );
         }
 
         let mut legacy_json = serde_json::to_value(&cp).unwrap();
         legacy_json["Heavy"]
             .as_object_mut()
             .expect("externally tagged heavy checkpoint")
-            .remove("activated_deferred_tool_names");
+            .insert(
+                "activated_deferred_tool_names".into(),
+                serde_json::json!(["github"]),
+            );
         let legacy: StepCheckpoint = serde_json::from_value(legacy_json).unwrap();
         let StepCheckpoint::Heavy(legacy) = legacy else {
             panic!("expected heavy checkpoint");
         };
-        assert!(
-            legacy.activated_deferred_tool_names.is_empty(),
-            "checkpoints written before activation persistence must remain readable"
+        assert_eq!(
+            legacy.deferred_tool_activations,
+            vec![astra_turn_types::DeferredToolActivation {
+                name: "github".into(),
+                schema_digest: "sha256:checkpoint".into(),
+                descriptor: None,
+            }],
+            "unknown name-only checkpoint fields must not alter typed evidence"
         );
     }
 

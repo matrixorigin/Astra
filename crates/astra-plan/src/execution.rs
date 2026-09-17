@@ -1,9 +1,8 @@
 //! Execution-time helpers for prompting and subtask scheduling.
 
-use astra_services::{
-    VerifierKind,
-    task_orchestrator::{SubtaskPlan, TaskPlan},
-};
+use astra_services::VerifierKind;
+
+use crate::{SubtaskPlan, TaskPlan};
 
 /// Build the executor prompt for a subtask, optionally prefixed with stacked
 /// operator guidance from prior pause/correction turns.
@@ -71,7 +70,7 @@ pub fn format_subtask_prompt_with_operator_notes(
          - `skill` and `discover_skills` are advisory: consulting a skill does NOT \
            satisfy the subtask. The subtask is only complete when concrete files \
            have been written and any acceptance check passes.\n\
-         - Do not invoke `github_create_pr` (or any PR-creation skill) before you \
+         - Do not create a PR via shell or a PR-creation skill before you \
          have actually written and committed the changes this subtask requires.",
     );
 

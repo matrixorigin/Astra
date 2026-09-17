@@ -130,6 +130,12 @@ async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_
     .bind(user_id)
     .execute(pool)
     .await;
+    let _ =
+        sqlx::query("DELETE FROM session_deletion_tombstones WHERE session_id = ? AND user_id = ?")
+            .bind(session_id)
+            .bind(user_id)
+            .execute(pool)
+            .await;
 }
 
 async fn cleanup_config_version(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, version_id: &str) {
@@ -342,8 +348,8 @@ async fn direct_event_api_rejects_a_session_with_a_pending_delete_fence() {
     cleanup_session(&pool, &user_id, &session_id).await;
 }
 
-/// Verifies that concurrent writes with the same event_id both succeed
-/// without surfacing duplicate key errors to the caller.
+/// Verifies that concurrent lazy-root writers with the same event_id both
+/// succeed without surfacing duplicate key or false permanent-drop errors.
 ///
 /// Uses a multi-threaded runtime with a Barrier so both workers actually
 /// race their INSERT IGNORE at the same time — proving the DB layer
@@ -357,7 +363,6 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
     cleanup_session(&pool, TEST_USER_ID, &session_id).await;
-    insert_session_root(&pool, TEST_USER_ID, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_concurrent");
 
     let config = IngestionConfig::default();
@@ -370,11 +375,12 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let event1 = event.clone();
     let b1 = barrier.clone();
     let handle1 = tokio::spawn(async move {
-        let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool1, config);
+        let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool1, config);
         sender.enqueue_async(event1).await;
         b1.wait().await;
         shutdown.signal();
         handle.await.unwrap();
+        stats.lock().expect("first worker stats").clone()
     });
 
     let pool2 = pool.clone();
@@ -382,17 +388,22 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let config = IngestionConfig::default();
     let b2 = barrier.clone();
     let handle2 = tokio::spawn(async move {
-        let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool2, config);
+        let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool2, config);
         sender.enqueue_async(event2).await;
         b2.wait().await;
         shutdown.signal();
         handle.await.unwrap();
+        stats.lock().expect("second worker stats").clone()
     });
 
     // Both should complete without panicking — INSERT IGNORE handles the race
     let (r1, r2) = tokio::join!(handle1, handle2);
-    r1.expect("first concurrent worker panicked");
-    r2.expect("second concurrent worker panicked");
+    let stats1 = r1.expect("first concurrent worker panicked");
+    let stats2 = r2.expect("second concurrent worker panicked");
+    assert_eq!(stats1.errors, 0, "first worker: {stats1:?}");
+    assert_eq!(stats2.errors, 0, "second worker: {stats2:?}");
+    assert_eq!(stats1.events_dropped_permanent, 0, "first worker");
+    assert_eq!(stats2.events_dropped_permanent, 0, "second worker");
 
     // Verify only one row exists (INSERT IGNORE deduplicates)
     let row =
@@ -712,10 +723,13 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
         channel_capacity: 8,
         ..Default::default()
     };
-    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sender, shutdown, first_stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue_async(duplicate_a.clone()).await;
     shutdown.signal();
     handle.await.unwrap();
+
+    let first_stats = first_stats.lock().expect("first ingestion stats").clone();
+    assert_eq!(first_stats.errors, 0, "first ingestion: {first_stats:?}");
 
     assert_session_event_count(&pool, TEST_USER_ID, &session_a, 1).await;
 
@@ -758,7 +772,55 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events() {
+async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_root() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = format!("evt-deleted-session-{}", Uuid::new_v4());
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+    sqlx::query(
+        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP(6))",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("seed deletion tombstone");
+
+    let (sender, shutdown, stats, handle) =
+        EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
+    sender
+        .enqueue_async(test_event(&event_id, &session_id, "late_after_delete"))
+        .await;
+    shutdown.signal();
+    handle.await.expect("join ingestion worker");
+
+    let stats = stats.lock().expect("ingestion stats").clone();
+    assert_eq!(stats.events_dropped_permanent, 1, "{stats:?}");
+    let session_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count recreated session roots");
+    let event_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(TEST_USER_ID)
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count late events");
+    assert_eq!(session_rows, 0);
+    assert_eq!(event_rows, 0);
+    cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_valid_events() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
 
@@ -801,8 +863,8 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
     .await
     .expect("count test-user events");
     assert_eq!(
-        test_user_event_count, 0,
-        "foreign-owned session must reject test-user event rows"
+        test_user_event_count, 1,
+        "the same logical session id must be independently writable by another owner"
     );
 
     let test_user_session_count: i64 = sqlx::query_scalar(
@@ -814,10 +876,11 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
     .await
     .expect("count test-user sessions");
     assert_eq!(
-        test_user_session_count, 0,
-        "foreign-owned session must not create a test-user session root"
+        test_user_session_count, 1,
+        "session identity is the owner-scoped (user_id, session_id) pair"
     );
     assert_session_event_count(&pool, &foreign_user_id, &foreign_session_id, 7).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &foreign_session_id, 1).await;
     assert_session_event_count(&pool, TEST_USER_ID, &valid_session_id, 1).await;
 
     let valid_event_count: i64 =
@@ -834,19 +897,13 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
 
     let stats = stats.lock().expect("stats lock").clone();
     assert_eq!(stats.events_flushed, 2);
-    assert_eq!(stats.events_dropped_permanent, 1);
+    assert_eq!(stats.events_dropped_permanent, 0);
     assert_eq!(stats.flush_count, 1);
-    assert_eq!(stats.errors, 1);
-    assert!(
-        stats
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("permanently invalid ingestion events")),
-        "unexpected ingestion error: {:?}",
-        stats.last_error
-    );
+    assert_eq!(stats.errors, 0);
+    assert_eq!(stats.last_error, None);
 
     cleanup_session(&pool, &foreign_user_id, &foreign_session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &foreign_session_id).await;
     cleanup_session(&pool, TEST_USER_ID, &valid_session_id).await;
 }
 

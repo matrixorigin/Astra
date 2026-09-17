@@ -1,0 +1,40 @@
+name: agent_small_output_budget_completion
+description: |
+  **What**: Give a trivial child a small but practical output budget and require an exact completed result.
+  **Tests**: Child output-budget plumbing remains usable across reasoning and non-reasoning providers.
+  **Why**: Accepting the budget but returning an empty interrupted child is a broken public contract, not a successful fallback.
+  **Pass means**: One child completes within the requested budget and returns the exact short answer.
+  **Fail means**: The budget is rejected, consumed without output, or misreported as a successful capability.
+prompt: |
+  Call `agent` exactly once with:
+    action: "spawn"
+    name: "small-budget-child"
+    description: "Verify bounded child output"
+    prompt: "Reply with the exact text: small-budget-ok. Do not use tools."
+    max_output_tokens: 256
+
+  Return the child's exact reply. Do not retry and do not use other tools.
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /max_output_tokens
+    equals: 256
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /result
+    equals: small-budget-ok
+  - type: text_contains
+    needle: small-budget-ok

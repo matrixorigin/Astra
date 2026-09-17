@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
-use astra_runtime::pipeline::evaluation::TurnEvaluation;
 use astra_services::session_journal;
+use astra_turn_core::evaluation::TurnEvaluation;
 use crossterm::style::Stylize;
 
 pub(crate) fn compact_token_count(tokens: u64) -> String {
@@ -195,7 +195,7 @@ pub(crate) fn print_turn_status_line(
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     if let Some(notice) =
-        evaluation.and_then(astra_runtime::pipeline::evaluation::turn_evaluation_status_notice)
+        evaluation.and_then(astra_turn_core::evaluation::turn_evaluation_status_notice)
     {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
@@ -270,10 +270,10 @@ mod tests {
         build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
         interruption_status_notice,
     };
-    use astra_runtime::pipeline::evaluation::{
+    use astra_services::session_journal;
+    use astra_turn_core::evaluation::{
         EvalSignal, EvaluationThresholds, TurnEvaluation, turn_evaluation_status_notice,
     };
-    use astra_services::session_journal;
 
     fn make_record(
         name: &str,

@@ -63,10 +63,20 @@ fn is_emoji_like(ch: char) -> bool {
 ///
 /// * `schema_token_total` — sum of measured token costs for all selected tool
 ///   schemas (from `ToolRegistry::token_cost`). Pass 0 if unavailable.
-/// * `system_prompt_tokens` — estimated tokens of the system prompt, or 0 to
-///   use the default 14,000 estimate.
+/// * `system_prompt_tokens` — measured tokens of the assembled system lane, or
+///   0 to use the conservative pre-assembly fallback.  Once a provider
+///   manifest exists, callers should pass that measured value; the fallback is
+///   not a claim about the ordinary resident prompt size.
 ///
-/// Calibrated default: the full system prompt (~52 KB) is approximately 14,000 tokens.
+/// This is the canonical-history estimator: callers pass conversation history
+/// that does not already contain the assembled system prompt. For a final
+/// provider message list, use [`estimate_wire_input_tokens`] instead so the
+/// system prompt is not counted twice.
+///
+/// Conservative pre-assembly fallback for a full prompt that may include
+/// optional skill and deferred-tool catalogs.  Ordinary requests are smaller
+/// (the current resident/Work surface is measured separately), and the shared
+/// manifest replaces this fallback after the first assembled provider request.
 pub const DEFAULT_SYSTEM_PROMPT_TOKENS: usize = 14_000;
 pub(crate) const MODEL_FRAMING_TOKENS: usize = 300;
 
@@ -86,6 +96,37 @@ pub fn estimate_tokens(
         .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
         .sum();
     message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING_TOKENS
+}
+
+/// Return the measured prompt overhead that can be added to canonical
+/// conversation history estimates.
+///
+/// The generic history estimator has to use a conservative fallback before a
+/// provider request has been assembled. Once a request has crossed the shared
+/// assembler, its manifest is the authoritative source for the provider
+/// visible system lane. The final wire budget is preferred because it also
+/// includes runtime-owned system frames added after the pipeline pass; the
+/// pipeline lanes are retained as a fallback for traces captured earlier.
+/// Reading these typed fields avoids carrying a second prompt-size constant
+/// through the agentic loop. Missing or malformed fields remain unknown and
+/// keep the estimator's conservative fallback.
+pub(crate) fn measured_prompt_tokens_from_manifest(
+    trace: Option<&serde_json::Value>,
+) -> Option<usize> {
+    let trace = trace?;
+    if let Some(system) = trace
+        .pointer("/wire/budget/estimated_system_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(system.min(usize::MAX as u64) as usize);
+    }
+    let stable = trace.pointer("/system_prompt_tokens")?.as_u64()?;
+    let volatile = trace
+        .pointer("/volatile_preamble_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total = stable.saturating_add(volatile);
+    (total > 0).then_some(total.min(usize::MAX as u64) as usize)
 }
 
 pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
@@ -168,6 +209,22 @@ pub fn estimate_tokens_cache_aware_split(
         cache_eligible_tokens: cache_eligible,
         volatile_tokens,
     }
+}
+
+/// Estimate the provider-visible input portion of one already assembled wire
+/// request.
+///
+/// `messages` is the final message projection and therefore already contains
+/// any system prompt. Do not add [`DEFAULT_SYSTEM_PROMPT_TOKENS`] here: doing
+/// so would count a system prompt twice. The small framing allowance is kept
+/// here so provider admission and final-wire diagnostics share one formula.
+pub(crate) fn estimate_wire_input_tokens(
+    messages: &[serde_json::Value],
+    tool_schema_tokens: usize,
+) -> usize {
+    estimate_tokens_cache_aware_split(&[], messages, tool_schema_tokens)
+        .total_tokens
+        .saturating_add(MODEL_FRAMING_TOKENS)
 }
 
 /// Estimate tokens with cache-awareness, separating stable prefix from
@@ -1027,6 +1084,60 @@ mod tests {
             .collect();
         let est = estimate_tokens(&large_cjk, 25_000, 0);
         assert!(est > 40_000, "est={est}");
+    }
+
+    #[test]
+    fn measured_prompt_tokens_from_manifest_uses_typed_lanes() {
+        let trace = json!({
+            "system_prompt_tokens": 4_000,
+            "volatile_preamble_tokens": 125,
+            "wire": {
+                "budget": {
+                    "estimated_system_tokens": 3_900,
+                },
+            },
+        });
+        assert_eq!(
+            measured_prompt_tokens_from_manifest(Some(&trace)),
+            Some(3_900)
+        );
+        let pipeline_trace = json!({
+            "system_prompt_tokens": 4_000,
+            "volatile_preamble_tokens": 125,
+        });
+        assert_eq!(
+            measured_prompt_tokens_from_manifest(Some(&pipeline_trace)),
+            Some(4_125)
+        );
+        assert_eq!(measured_prompt_tokens_from_manifest(None), None);
+        assert_eq!(
+            measured_prompt_tokens_from_manifest(Some(&json!({
+                "system_prompt_tokens": 0,
+            }))),
+            None
+        );
+    }
+
+    #[test]
+    fn wire_input_estimate_counts_system_message_once() {
+        let messages = vec![
+            json!({"role": "system", "content": "stable system policy"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let schema_tokens = 123;
+        let message_and_schema =
+            estimate_tokens_cache_aware_split(&[], &messages, schema_tokens).total_tokens;
+
+        assert_eq!(
+            estimate_wire_input_tokens(&messages, schema_tokens),
+            message_and_schema + MODEL_FRAMING_TOKENS,
+            "an already assembled wire message list must not receive the default system estimate"
+        );
+        assert_ne!(
+            estimate_wire_input_tokens(&messages, schema_tokens),
+            estimate_tokens(&messages, schema_tokens, 0),
+            "the generic history estimator intentionally has different input semantics"
+        );
     }
 
     // === capped_output_tokens (10→2) ===

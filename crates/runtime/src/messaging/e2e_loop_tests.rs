@@ -1,10 +1,9 @@
 //! End-to-end tests for messaging integration with the agentic loop.
 //!
 //! Verifies:
-//! 1. Preamble injects send_message tool schema when mailbox is present
+//! 1. The legacy standalone send_message schema is never injected
 //! 2. Turn-start drain formats pending messages as system messages
-//! 3. send_message tool calls are intercepted and routed through mailbox
-//! 4. Turn-end sends progress to parent via mailbox
+//! 3. Execution progress stays on the live projection instead of the mailbox
 
 #[cfg(test)]
 mod tests {
@@ -34,7 +33,9 @@ mod tests {
     use astra_text_utils::semantic_dedup::SemanticDedup;
     use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+    use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+    use astra_turn_core::tool_result_semantics::ToolResultStatus;
     use astra_turn_core::turn_guard::TurnGuard;
 
     fn edge_runtime_environment_fields() -> Map<String, Value> {
@@ -56,6 +57,7 @@ mod tests {
         valid_tools: HashSet<String>,
         emitted_lines: Vec<String>,
         injected_schemas: Vec<Value>,
+        communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
     }
 
     impl MockHost {
@@ -66,6 +68,7 @@ mod tests {
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
                 injected_schemas: Vec::new(),
+                communication_events: Vec::new(),
             }
         }
 
@@ -114,6 +117,10 @@ mod tests {
             }
             self.injected_schemas.push(schema);
         }
+
+        fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
+            self.communication_events.push(event);
+        }
     }
 
     // ── Result builders ─────────────────────────────────────────────────────
@@ -134,22 +141,6 @@ mod tests {
         }
     }
 
-    fn server_tool_result(tool_calls: Vec<Value>) -> HostTurnResult {
-        HostTurnResult {
-            accum: ChatTurnSseAccum {
-                has_tool_calls: true,
-                has_usage: true,
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                tool_calls,
-                ..ChatTurnSseAccum::default()
-            },
-            ttft_ms: Some(10),
-            edge_tool_round: Vec::new(),
-            error_kind: None,
-        }
-    }
-
     // ── State builder ───────────────────────────────────────────────────────
 
     fn make_state() -> AgenticLoopState {
@@ -161,6 +152,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            current_run_owner_generation: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
@@ -176,14 +168,15 @@ mod tests {
             total_cache_creation: 0,
             total_tool_calls: 0,
             total_observation_tool_calls: 0,
+            tool_ledger_receipt: Default::default(),
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
+            charged_iterations: 0,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
+            budget_is_explicit: false,
             budget_policy: None,
+            loop_entry: Default::default(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -209,13 +202,14 @@ mod tests {
             messaging: Default::default(),
             user_intents: Default::default(),
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: None,
             message: "test query".to_string(),
             user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_finish_reason: None,
@@ -225,7 +219,7 @@ mod tests {
             delegation_engine: None,
             delegations_this_turn: 0,
             delegation_chain: Vec::new(),
-            self_agent_id: "orchestrator".to_string(),
+            self_agent_id: "main".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -241,17 +235,16 @@ mod tests {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-            recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,
@@ -263,12 +256,11 @@ mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: None,
+            root_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
-            observation_store: None,
         }
     }
 
@@ -407,147 +399,63 @@ mod tests {
             "should have mailbox injection in volatile_pending: {:?}",
             state.volatile_pending,
         );
-    }
-
-    #[tokio::test]
-    async fn send_message_tool_call_intercepted_and_routed() {
-        let (_router, mut parent_mb, child_mb, _dt) = setup_two_agents().await;
-
-        // Turn 1: LLM calls send_message tool → should be intercepted
-        // Turn 2: LLM produces final text
-        // Note: arguments must be a JSON *string* (OpenAI tool call convention).
-        let tool_calls = vec![json!({
-            "id": "call-send-1",
-            "type": "function",
-            "function": {
-                "name": "send_message",
-                "arguments": r#"{"target": "parent", "content": "Auth module looks clean.", "message_type": "result"}"#
-            }
-        })];
-
-        let mut host = MockHost::new(vec![
-            server_tool_result(tool_calls),
-            text_result("Reported to parent."),
-        ])
-        .with_valid_tools(&["send_message"]);
-
-        let mut state = make_state();
-        state.messaging.mailbox = Some(child_mb);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Reported to parent.");
-        assert_eq!(host.current_turn, 2);
-
-        // Parent should have received the message via mailbox.
-        let received = parent_mb.try_recv();
-        assert!(
-            received.is_some(),
-            "parent should have received send_message"
-        );
-        let msg = received.unwrap();
-        assert_eq!(msg.from.agent_id, "worker");
-        match &msg.payload {
-            MessagePayload::Signal(AgentSignal::Completed { output }) => {
-                assert_eq!(output, "Auth module looks clean.");
-            }
-            other => panic!("expected Completed signal, got: {other:?}"),
-        }
-
-        // The tool result should be in state.messages.
-        let has_tool_result = state.messages.iter().any(|m| {
-            m.get("role").and_then(Value::as_str) == Some("tool")
-                && m.get("tool_call_id").and_then(Value::as_str) == Some("call-send-1")
-        });
-        assert!(
-            has_tool_result,
-            "intercepted tool call should produce a tool result message"
+        assert_eq!(host.communication_events.len(), 1);
+        assert_eq!(
+            host.communication_events[0].payload_kind,
+            astra_turn_types::AgentCommunicationPayloadKind::Text
         );
     }
 
     #[tokio::test]
-    async fn send_message_mixed_with_regular_tools() {
-        let (_router, mut parent_mb, child_mb, _dt) = setup_two_agents().await;
-
-        // Turn 1: LLM calls BOTH send_message and a regular tool.
-        // send_message should be intercepted; the regular tool should pass through.
-        let tool_calls = vec![
-            json!({
-                "id": "call-send-2",
-                "type": "function",
-                "function": {
-                    "name": "send_message",
-                    "arguments": r#"{"target": "parent", "content": "Starting work", "message_type": "text"}"#
-                }
-            }),
-            json!({
-                "id": "call-bash-1",
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "arguments": r#"{"command": "echo hello"}"#
-                }
-            }),
-        ];
-
-        let edge_tools = vec![EdgeToolExecResult {
-            request_id: "call-bash-1".into(),
-            tool: "bash".into(),
-            args: json!({"command": "echo hello"}),
-            output: "hello".into(),
-            tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "completed".into(),
-            duration_ms: 5,
-        }];
-
-        let mut host = MockHost::new(vec![
-            HostTurnResult {
-                accum: ChatTurnSseAccum {
-                    has_tool_calls: true,
-                    has_usage: true,
-                    prompt_tokens: 10,
-                    completion_tokens: 5,
-                    tool_calls,
-                    ..ChatTurnSseAccum::default()
+    async fn mailbox_progress_is_consumed_without_polluting_model_or_durable_evidence() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        parent_mb
+            .send(AgentMessage::new(
+                parent_mb.address.clone(),
+                MessageTarget::Direct {
+                    address: child_mb.address.clone(),
                 },
-                ttft_ms: Some(10),
-                edge_tool_round: edge_tools,
-                error_kind: None,
-            },
-            text_result("Done."),
-        ])
-        .with_valid_tools(&["send_message", "bash"]);
+                MessagePayload::Progress {
+                    turn_index: 4,
+                    tool_calls: 3,
+                    status: "working".into(),
+                    detail: Some("inspecting storage".into()),
+                },
+            ))
+            .await
+            .unwrap();
 
+        let mut host = MockHost::new(vec![text_result("Still working.")]);
         let mut state = make_state();
         state.messaging.mailbox = Some(child_mb);
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("progress must not disrupt the turn");
 
-        // Parent should have received the send_message.
-        let received = parent_mb.try_recv();
         assert!(
-            received.is_some(),
-            "parent should have received text message"
+            state.volatile_pending.iter().all(|injection| !matches!(
+                injection.kind,
+                crate::turn::agentic_loop::host::VolatileKind::Mailbox
+            )),
+            "transient execution progress must not enter the model boundary"
         );
-        match &received.unwrap().payload {
-            MessagePayload::Text { content, .. } => {
-                assert_eq!(content, "Starting work");
-            }
-            other => panic!("expected Text, got: {other:?}"),
-        }
-
-        // bash tool should still have been processed (2 turns = tool + final text).
-        assert_eq!(host.current_turn, 2);
-        assert!(state.telemetry.all_tools_used.contains("bash"));
+        assert!(
+            host.communication_events.is_empty(),
+            "transient execution progress must not become durable communication evidence"
+        );
     }
 
     #[tokio::test]
-    async fn progress_sent_to_parent_on_tool_turn() {
+    async fn tool_turn_progress_uses_live_projection_without_duplicate_mailbox_message() {
         let (_router, mut parent_mb, child_mb, _dt) = setup_two_agents().await;
+
+        let progress = Arc::new(crate::orchestration::ProgressBroadcaster::default());
+        let mut progress_rx = progress.subscribe();
 
         // Tool turn → should send progress to parent.
         let edge_tools = vec![EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-read-1".into(),
             tool: "read_file".into(),
             args: json!({"path": "/tmp/x.txt"}),
@@ -586,25 +494,31 @@ mod tests {
 
         let mut state = make_state();
         state.messaging.mailbox = Some(child_mb);
+        state.messaging.progress_emitter = Some(progress.for_agent_with_run_context(
+            "worker".into(),
+            "run-child-0".into(),
+            "run-parent".into(),
+            None,
+        ));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Parent should have received a progress message from the tool turn.
-        let received = parent_mb.try_recv();
         assert!(
-            received.is_some(),
-            "parent should have received progress from tool turn"
+            parent_mb.try_recv().is_none(),
+            "live execution progress must not be duplicated into the durable mailbox"
         );
-        match &received.unwrap().payload {
-            MessagePayload::Progress {
-                status, tool_calls, ..
-            } => {
-                assert!(!status.is_empty());
-                assert!(*tool_calls >= 1);
-            }
-            other => panic!("expected Progress, got: {other:?}"),
+        let mut observed_turn_completion = false;
+        while let Ok(event) = progress_rx.try_recv() {
+            observed_turn_completion |= matches!(
+                event.event_type,
+                crate::orchestration::ProgressEventType::TurnCompleted { .. }
+            );
         }
+        assert!(
+            observed_turn_completion,
+            "the dedicated live lane must retain progress"
+        );
     }
 
     #[tokio::test]
@@ -654,8 +568,11 @@ mod tests {
     async fn child_tool_round_records_blocked_permission_denial() {
         let tool_calls = vec![json!({
             "id": "call-bash-perm",
-            "name": "bash",
-            "arguments": r#"{"command": "echo hi"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "echo hi"}"#
+            }
         })];
 
         let permission_context = PermissionSyncContext::shared(InheritedPermissions {
@@ -678,7 +595,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -691,11 +607,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -718,6 +638,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -744,8 +665,11 @@ mod tests {
     async fn plan_mode_blocks_mutating_tools_before_headless_protocol_fallback() {
         let tool_calls = vec![json!({
             "id": "call-write-plan",
-            "name": "write_file",
-            "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -759,7 +683,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -772,11 +695,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -799,6 +726,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: true,
@@ -828,19 +756,17 @@ mod tests {
         );
     }
 
-    /// Regression test for session 46fd8ed8: kimi-k2.5 returned tool_calls
-    /// with empty id → assistant message had id="" while tool result had a
-    /// UUID → API returned 400 "tool_call_id not found".
-    ///
-    /// After the fix, normalize_tool_call_for_accum generates a synthetic UUID
-    /// for empty ids, so the assistant message and tool result share the same id.
+    /// Provider tool batches are canonical authority input. Missing call ids
+    /// fail the whole batch closed instead of inventing execution identity.
     #[tokio::test]
-    async fn empty_tool_call_id_gets_synthetic_uuid_and_ids_match() {
-        // Tool call with empty id but valid name — simulates kimi-k2.5 behavior
+    async fn empty_tool_call_id_rejects_provider_batch_before_execution() {
         let tool_calls = vec![json!({
             "id": "",
-            "name": "bash",
-            "arguments": r#"{"command":"echo hi"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"echo hi"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -854,10 +780,9 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        let _ = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -867,11 +792,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -894,33 +823,22 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
         })
         .await;
 
-        // messages[0] = assistant message with tool_calls
-        // messages[1] = tool result message with tool_call_id
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
         assert!(
-            messages.len() >= 2,
-            "expected assistant + tool result messages"
-        );
-
-        let assistant_tc_id = messages[0]["tool_calls"][0]["id"]
-            .as_str()
-            .expect("assistant tool_call must have id");
-        let tool_result_id = messages[1]["tool_call_id"]
-            .as_str()
-            .expect("tool result must have tool_call_id");
-
-        assert!(
-            !assistant_tc_id.is_empty(),
-            "assistant tool_call id must not be empty"
-        );
-        assert_eq!(
-            assistant_tc_id, tool_result_id,
-            "assistant tool_call id and tool result tool_call_id must match"
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool call id is missing")),
+            "unexpected admission result: {outcome:?}"
         );
     }
 
@@ -957,13 +875,13 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // Simulate: skill interception resolved call_skill before headless round
-        let pre_resolved = vec![(
-            "call_skill".to_string(),
-            "Skill instructions here".to_string(),
+        let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
+            "call_skill",
+            "Skill instructions here",
+            ToolResultStatus::Completed,
         )];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -976,11 +894,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1003,6 +925,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1086,13 +1009,20 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // ALL tool calls were pre-resolved by upstream (skill + defer)
         let pre_resolved = vec![
-            ("skill:0".to_string(), "Skill instructions".to_string()),
-            ("read_file:1".to_string(), "file contents".to_string()),
+            HeadlessPreResolvedToolResult::new(
+                "skill:0",
+                "Skill instructions",
+                ToolResultStatus::Completed,
+            ),
+            HeadlessPreResolvedToolResult::new(
+                "read_file:1",
+                "file contents",
+                ToolResultStatus::Completed,
+            ),
         ];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1105,11 +1035,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1132,6 +1066,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1187,7 +1122,11 @@ mod tests {
 
         // Edge round has the grep result (executed at edge during SSE)
         let edge_tool_round = vec![EdgeToolExecResult {
-            request_id: String::new(),
+            execution_completion: None,
+            // Edge execution custody is keyed by the provider-emitted tool-call
+            // id.  An id-less result is diagnostic only and must not be
+            // attached to a different call by name/arguments.
+            request_id: "grep:1".into(),
             tool: "grep".to_string(),
             args: json!({"pattern": "TODO"}),
             output: "src/main.rs:10: // TODO fix".to_string(),
@@ -1207,11 +1146,12 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
         // Skill was pre-resolved; grep will be matched from edge_tool_round
-        let pre_resolved = vec![("skill:0".to_string(), "Skill instructions".to_string())];
+        let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
+            "skill:0",
+            "Skill instructions",
+            ToolResultStatus::Completed,
+        )];
         let permission_context = PermissionSyncContext::shared_root(PermissionMode::Auto);
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1224,11 +1164,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1251,6 +1195,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1283,23 +1228,26 @@ mod tests {
         let tool_calls = vec![
             json!({
                 "id": "call-empty-1",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-empty-2",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-empty-3",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-after-burst",
-                "name": "bash",
-                "arguments": r#"{"command":"echo should-not-run"}"#
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"echo should-not-run"}"#
+                }
             }),
         ];
 
@@ -1314,10 +1262,9 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -1327,11 +1274,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1354,17 +1305,22 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
         })
         .await;
 
-        assert_eq!(tool_results.len(), 3);
-        assert_eq!(tool_call_records.len(), 3);
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
         assert!(
-            tool_call_records.iter().all(|r| r.name.is_empty()),
-            "expected only malformed empty-name calls to be recorded before abort"
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool name is missing")),
+            "unexpected admission result: {outcome:?}"
         );
     }
 
@@ -1428,8 +1384,11 @@ mod tests {
         // Child sends tool call that requires permission
         let tool_calls = vec![json!({
             "id": "call-bash-touch",
-            "name": "bash",
-            "arguments": r#"{"command": "touch astra-permission-approved-test"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "touch astra-permission-approved-test"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -1443,7 +1402,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1456,11 +1414,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1483,6 +1445,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1560,11 +1523,14 @@ mod tests {
 
         let tool_calls = vec![json!({
             "id": "call-bash-denied",
-            "name": "bash",
+            "type": "function",
             // Keep this command non-read-only: Prompt mode now auto-approves
             // read-only bash calls like `echo hi` locally, so they never reach
             // the parent mailbox this test is exercising.
-            "arguments": r#"{"command": "touch astra-permission-denied-test"}"#
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "touch astra-permission-denied-test"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -1578,7 +1544,6 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1591,11 +1556,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1618,6 +1587,7 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
@@ -1647,14 +1617,14 @@ mod tests {
     /// so they don't inflate call_counts and flood the context with 50+ stubs.
     #[tokio::test]
     async fn empty_tool_name_rejected_before_dedup() {
-        // 5 tool calls with empty name — the round should stop after the
-        // malformed-call abort threshold, and none should hit the dedup path.
+        // A malformed member rejects the provider batch atomically, before
+        // dedup or per-call execution can create partial ledger evidence.
         let tool_calls: Vec<Value> = (0..5)
             .map(|i| {
                 json!({
                     "id": format!("call-{i}"),
-                    "name": "",
-                    "arguments": "{}"
+                    "type": "function",
+                    "function": { "name": "", "arguments": "{}" }
                 })
             })
             .collect();
@@ -1670,10 +1640,9 @@ mod tests {
         let mut tool_call_records = Vec::new();
         let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
         let mut term = NoopHeadlessTerminal;
-        let edge_callback_outputs = HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -1683,11 +1652,15 @@ mod tests {
             current_session_id: None,
             current_run_id: None,
             current_turn_chain_id: None,
-            tool_calls: &tool_calls,
+            durable_dispatch_admission: None,
+            task_resolution_authority: None,
+            physical_tool_calls: &tool_calls,
+            logical_tool_calls: &tool_calls,
+            deferred_activations_by_call_id: &std::collections::HashMap::new(),
+            runtime_control_calls_by_id: &std::collections::HashMap::new(),
             edge_tool_round: &edge_tool_round,
             reasoning_content: "",
             reasoning_signature: "",
-            edge_callback_outputs: &edge_callback_outputs,
             messages: &mut messages,
             tool_results: &mut tool_results,
             valid_tool_names: &valid_tool_names,
@@ -1710,25 +1683,22 @@ mod tests {
             progress_emitter: None,
             pre_resolved_results: &[],
             runtime_tool_executor: None,
+            external_effect_recovery_paths: None,
             turn_start: None,
             llm_round: 0,
             plan_mode_active: false,
         })
         .await;
 
-        // Only the malformed empty-name calls up to the abort threshold should
-        // be recorded, and each should still produce an immediate tool result.
-        assert_eq!(tool_call_records.len(), 3);
-        assert_eq!(tool_results.len(), 3);
-        // Every record should be unknown_tool, not duplicate_within_turn.
-        for rec in &tool_call_records {
-            assert!(
-                rec.error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("unknown_tool")),
-                "expected unknown_tool error, got: {:?}",
-                rec.error
-            );
-        }
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
+        assert!(
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool name is missing")),
+            "unexpected admission result: {outcome:?}"
+        );
     }
 }

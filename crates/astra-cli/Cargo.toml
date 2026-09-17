@@ -2,6 +2,8 @@
 name = "astra-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish = false
 
 [[bin]]
 name = "astra"
@@ -19,6 +21,7 @@ path = "src/lib.rs"
 default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]
 release-vendored-openssl = ["astra-services/openssl-vendored"]
+e2e-hooks = ["astra-services/e2e-hooks"]
 
 [dependencies]
 astra-core.workspace = true
@@ -31,6 +34,7 @@ astra-prompts.workspace = true
 astra-services.workspace = true
 astra-runtime-env.workspace = true
 astra-runtime.workspace = true
+astra-server-types.workspace = true
 astra-sandbox.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true
@@ -75,7 +79,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util.workspace = true
 uuid.workspace = true
 url = "2.5"
-gix = { version = "0.85.0", features = ["status", "blame", "mailmap", "revision"] }
+gix = { version = "0.85.0", default-features = false, features = ["max-performance-safe", "auto-chain-error", "sha1"] }
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"

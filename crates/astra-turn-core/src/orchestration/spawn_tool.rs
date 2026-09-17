@@ -27,6 +27,19 @@ pub struct InheritPrefixSpec {
     pub required: bool,
 }
 
+/// Exact declared WorkItem revision assigned to a spawned run.
+///
+/// This is only a request. The durable server resolves the parent's canonical
+/// Work binding and verifies that this revision is present in the branch's
+/// current graph before the child run becomes visible. The child run id is the
+/// attempt identity; callers cannot invent one or report their own status.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkItemExecutionSpec {
+    pub item_id: String,
+    pub item_revision: i64,
+}
+
 /// Input for `agent(action='spawn')`.
 ///
 /// **Field order is load-bearing.** The struct is serialized to
@@ -77,7 +90,9 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub isolated: bool,
 
-    /// Tool allowlist (overrides agent_type defaults).
+    /// Optional tool allowlist that narrows the agent profile. Profiles whose
+    /// default is `*` inherit the parent's admitted capability surface first;
+    /// this field can narrow that surface but cannot widen parent authority.
     pub allowed_tools: Option<Vec<String>>,
 
     /// Optional request to reuse a captured parent ForkPrefix for
@@ -135,6 +150,17 @@ pub struct SpawnAgentInput {
     /// extra top-level fields.
     #[serde(default)]
     pub fanout_slot_id: Option<String>,
+
+    /// Optional canonical WorkItem assignment. Valid only when the parent run
+    /// is durably bound to Work. Appended to preserve schema-cache field order.
+    #[serde(default)]
+    pub work_item: Option<WorkItemExecutionSpec>,
+
+    /// Explicit child model override. When absent, the child inherits the
+    /// parent's admitted model. This field is appended because the serialized
+    /// field order participates in fork-prefix schema identity.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl SpawnAgentInput {
@@ -229,12 +255,19 @@ impl Default for SpawnAgentInput {
             fanout_target_count: None,
             fanout_slot_index: None,
             fanout_slot_id: None,
+            work_item: None,
+            model: None,
         }
     }
 }
 
-/// Resolve the effective turn budget given an explicit `max_turns`,
-/// an optional `complexity` hint, and the agent-type default. Rules:
+/// Resolve the effective initial execution slice given an explicit
+/// `max_turns`, an optional `complexity` hint, and the agent-type default.
+///
+/// This pure calculation does not decide whether the result is a hard limit.
+/// The spawning runtime retains the numeric input's provenance separately:
+/// only an explicit `max_turns` becomes a hard boundary, while persona and
+/// complexity values remain renewable convergence checkpoints. Rules:
 ///
 ///  * an explicit `max_turns=Some(n)` is authoritative when it is the only
 ///    constraint (with a minimum of 1);
@@ -456,10 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn spawn_rejects_provider_model_selection() {
+    fn spawn_accepts_an_explicit_model_override_for_admitted_routing() {
         let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
-        serde_json::from_str::<SpawnAgentInput>(json)
-            .expect_err("dynamic agents inherit the admitted Offering");
+        let input = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect("an explicit child model override is part of the typed spawn contract");
+        assert_eq!(input.model.as_deref(), Some("gpt-4o"));
     }
 
     #[test]
@@ -887,5 +921,28 @@ mod strict_type_tests {
         )
         .expect_err("string fanout_target_count must not deserialize");
         assert!(err.to_string().contains("expected usize"), "{err}");
+    }
+
+    #[test]
+    fn work_item_assignment_is_exact_and_typed() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"implement","prompt":"implement it","work_item":{"item_id":"task-1","item_revision":2}}"#,
+        )
+        .expect("typed WorkItem assignment");
+        let item = input.work_item.expect("assignment");
+        assert_eq!(item.item_id, "task-1");
+        assert_eq!(item.item_revision, 2);
+
+        let unknown = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"implement","prompt":"implement it","work_item":{"item_id":"task-1","item_revision":2,"status":"completed"}}"#,
+        )
+        .expect_err("callers cannot smuggle execution status into the assignment");
+        assert!(unknown.to_string().contains("unknown field"), "{unknown}");
+
+        let coerced = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"implement","prompt":"implement it","work_item":{"item_id":"task-1","item_revision":"2"}}"#,
+        )
+        .expect_err("revision strings must not be coerced");
+        assert!(coerced.to_string().contains("expected i64"), "{coerced}");
     }
 }

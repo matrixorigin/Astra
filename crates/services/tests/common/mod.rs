@@ -26,6 +26,11 @@
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;
 
+/// A test only needs enough connections for its own concurrent actors. Keeping
+/// each runtime-local pool small leaves process-wide quota for sibling tests;
+/// production sizing remains entirely controlled by `MatrixOneSettings`.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 8;
+
 /// Loads `.env`, asserts `ASTRA_TEST_DB_IT=1` is set, and returns MatrixOneSettings.
 pub fn require_db_it_env() -> MatrixOneSettings {
     let _ = dotenvy::dotenv();
@@ -46,7 +51,13 @@ static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
 async fn bootstrap_shared() -> &'static MatrixOneSettings {
     SHARED_BOOTSTRAP
         .get_or_init(|| async {
-            let settings = require_db_it_env();
+            let mut settings = require_db_it_env();
+            settings.db_pool_max_connections = settings
+                .db_pool_max_connections
+                .min(TEST_POOL_MAX_CONNECTIONS);
+            settings.db_pool_min_connections = settings
+                .db_pool_min_connections
+                .min(settings.db_pool_max_connections);
             let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                 .unwrap_or_else(|_| "mysql".into());
             ensure_core_schema(&settings, &catalog)
@@ -68,4 +79,33 @@ pub async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
     let settings = bootstrap_shared().await.clone();
     let pool = SharedPool::new(&settings).await.expect("SharedPool::new");
     (pool, settings)
+}
+
+/// Canonical one-root Work fixture. Keeping genesis construction here means
+/// integration tests exercise the production invariant without duplicating
+/// its internal shape or silently recreating the old empty-graph fixture.
+pub fn work_genesis(
+    owner_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    session_id: &str,
+    intent_ref: &str,
+    goal: &str,
+) -> astra_services::work::WorkGenesis {
+    use astra_services::work::{
+        InternalSessionId, OriginalIntentRef, WorkBranchId, WorkGenesis, WorkGenesisParts,
+        WorkGoal, WorkId, WorkOwnerId,
+    };
+
+    WorkGenesis::new(WorkGenesisParts {
+        owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
+        work_id: WorkId::parse(work_id).expect("work"),
+        branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+        session_id: InternalSessionId::parse(session_id).expect("session"),
+        project_id: None,
+        original_intent_ref: OriginalIntentRef::parse(intent_ref).expect("intent"),
+        goal: WorkGoal::parse(goal).expect("goal"),
+        criteria: Vec::new(),
+    })
+    .expect("Work genesis")
 }

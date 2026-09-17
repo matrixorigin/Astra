@@ -43,9 +43,11 @@ mod admin;
 mod encryption;
 pub mod external;
 mod jwt;
+pub mod memoria;
 pub mod provider_request;
 pub mod session;
 mod validation;
+mod verified;
 
 pub use admin::{
     DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
@@ -72,9 +74,9 @@ use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
 pub use session::{
-    DatabaseSessionService, SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData,
-    SessionListCursor, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    DatabaseSessionService, ProviderSessionCreationIdentity, SessionActivityCursor,
+    SessionActivityRecord, SessionCreateRequestData, SessionCreationResult, SessionListCursor,
+    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 use validation::validate_register_request;
 
@@ -399,6 +401,12 @@ pub enum EdgeTokenBinding {
 
 #[async_trait]
 pub trait AuthService: Send + Sync {
+    async fn reauthentication_options(
+        &self,
+        _user_id: &str,
+    ) -> Result<serde_json::Value, AuthHttpError> {
+        Ok(serde_json::json!({"method":"password"}))
+    }
     async fn register(
         &self,
         request: AuthRegisterRequestData,
@@ -408,6 +416,31 @@ pub trait AuthService: Send + Sync {
         &self,
         request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)>;
+
+    /// The authentication service owns verification, identity, session and binding.
+    async fn login_memoria(
+        &self,
+        _connection_key: &str,
+    ) -> Result<memoria::MemoriaLogin, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Verified identity login is not configured",
+        ))
+    }
+
+    fn memoria_credentials(&self) -> Option<memoria::MemoriaCredentialResolver> {
+        None
+    }
+
+    async fn disconnect_memoria(
+        &self,
+        _user_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Memoria connection is not configured",
+        ))
+    }
 
     async fn refresh(
         &self,
@@ -588,6 +621,7 @@ impl ReauthenticationPurpose {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReauthenticationRequestData {
     pub password: String,
+    pub memoria_proof: Option<String>,
     pub purpose: ReauthenticationPurpose,
 }
 
@@ -643,6 +677,10 @@ impl AuthPrincipal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthPrincipalOrigin {
     Internal,
+    VerifiedProvider {
+        provider_id: String,
+        external_subject: String,
+    },
     ProviderAuthorizedRequest(AuthProviderAuthorizedRequestContext),
 }
 
@@ -680,8 +718,14 @@ pub struct AuthTokenRecord {
 pub struct DatabaseAuthService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    /// Optional control-plane pool reserved for authentication. Keeping
+    /// authentication off the long-running work pool prevents a burst of
+    /// agent/session persistence from starving login, registration, refresh,
+    /// and logout for every user.
+    control_pool: Option<SharedPool>,
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
+    memoria_provider: Option<memoria::MemoriaProvider>,
     ext_providers: Vec<ExternalAuthProviderConfig>,
     external_client: std::sync::Arc<dyn ExternalProviderClient>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
@@ -713,6 +757,7 @@ impl fmt::Debug for DatabaseAuthService {
         f.debug_struct("DatabaseAuthService")
             .field("matrixone", &self.matrixone)
             .field("pool_configured", &self.pool.is_some())
+            .field("control_pool_configured", &self.control_pool.is_some())
             .field("jwt", &self.jwt)
             .field("encryptor_configured", &self.encryptor.is_some())
             .field(
@@ -754,7 +799,9 @@ impl DatabaseAuthService {
             matrixone,
             jwt,
             pool: None,
+            control_pool: None,
             encryptor: None,
+            memoria_provider: None,
             ext_providers: Vec::new(),
             external_client: HttpExternalProviderClient::shared(),
             provider_request_auth: Vec::new(),
@@ -882,7 +929,14 @@ impl DatabaseAuthService {
                 iat: 0,
                 jti: String::new(),
             },
-            ChronoDuration::minutes(i64::from(self.jwt.access_token_expire_minutes)),
+            ChronoDuration::seconds(i64::from(
+                if origin == "memoria" || origin.starts_with("verified:memoria:") {
+                    self.access_token_expires_in_seconds()
+                        .min(memoria::ACCESS_TTL_SECONDS)
+                } else {
+                    self.access_token_expires_in_seconds()
+                },
+            )),
         )
     }
 
@@ -920,6 +974,14 @@ impl DatabaseAuthService {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Route authentication queries through a bounded control-plane pool.
+    /// The regular pool remains the fallback for tests and deployments that
+    /// do not configure a separate reservation.
+    pub fn with_control_pool(mut self, pool: SharedPool) -> Self {
+        self.control_pool = Some(pool);
         self
     }
 
@@ -1071,7 +1133,11 @@ impl DatabaseAuthService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        crate::require_shared_pool(self.pool.as_ref(), "DatabaseAuthService", &self.matrixone)
+        crate::require_shared_pool(
+            self.control_pool.as_ref().or(self.pool.as_ref()),
+            "DatabaseAuthService",
+            &self.matrixone,
+        )
     }
 
     fn provider_config(
@@ -1095,7 +1161,7 @@ impl DatabaseAuthService {
         authorized: &ProviderAuthorizedRequest,
         request_id: &str,
     ) -> Result<(), AuthHttpError> {
-        if let Some(pool) = self.pool.as_ref() {
+        if let Some(pool) = self.control_pool.as_ref().or(self.pool.as_ref()) {
             return self
                 .record_provider_request_authorization_durable(pool, authorized, request_id)
                 .await;
@@ -1217,7 +1283,8 @@ impl DatabaseAuthService {
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token origin"))?;
         match origin.as_str() {
-            "internal" => Ok((session_id, origin, None)),
+            "internal" | "memoria" => Ok((session_id, origin, None)),
+            value if value.starts_with("verified:memoria:") => Ok((session_id, origin, None)),
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Invalid token origin",
@@ -1266,69 +1333,19 @@ impl DatabaseAuthService {
         let now = Utc::now();
         let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
         let astra_session_id = Uuid::new_v4().to_string();
-        let astra_user_id = Uuid::new_v4().to_string();
-        let internal_username = format!("ext_{}", astra_user_id.replace('-', ""));
-        let internal_email = format!("{internal_username}@external.astra.invalid");
 
         let mut tx = pool
             .begin()
             .await
             .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
-        let existing_identity = query(
-            "SELECT astra_user_id FROM auth_external_identities \
-             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
-        )
-        .bind(&provider.id)
-        .bind(&external_subject)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.fetch_identity", Some(&pool)))?;
-
-        let astra_user_id = if let Some(row) = existing_identity {
-            let existing_user_id: String = row.try_get("astra_user_id").unwrap_or_default();
-            query(
-                "UPDATE auth_external_identities \
-                 SET username = ?, email = ?, display_name = ?, updated_at = NOW() \
-                 WHERE provider_id = ? AND external_subject = ?",
-            )
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .execute(&mut *tx)
-            .await
+        let user = self
+            .resolve_verified_provider_identity(&mut tx, &provider.id, &external_subject, None)
+            .await?;
+        let astra_user_id = user.user_id;
+        query("UPDATE auth_external_identities SET username = ?, email = ?, display_name = ?, updated_at = NOW() WHERE provider_id = ? AND external_subject = ?")
+            .bind(&external_username).bind(&external_email).bind(&external_display_name)
+            .bind(&provider.id).bind(&external_subject).execute(&mut *tx).await
             .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
-            existing_user_id
-        } else {
-            query(
-                "INSERT INTO auth_users \
-                 (user_id, username, email, password_hash, display_name, is_active) \
-                 VALUES (?, ?, ?, '', ?, 1)",
-            )
-            .bind(&astra_user_id)
-            .bind(&internal_username)
-            .bind(&internal_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_auth_user", Some(&pool)))?;
-            query(
-                "INSERT INTO auth_external_identities \
-                 (provider_id, external_subject, astra_user_id, username, email, display_name) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .bind(&astra_user_id)
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_identity", Some(&pool)))?;
-            astra_user_id
-        };
 
         query(
             "INSERT INTO auth_external_sessions \
@@ -1543,6 +1560,29 @@ fn map_auth_sqlx(
 
 #[async_trait]
 impl AuthService for DatabaseAuthService {
+    async fn reauthentication_options(
+        &self,
+        user_id: &str,
+    ) -> Result<serde_json::Value, AuthHttpError> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        if self.memoria_owner(&pool, user_id).await?.is_some() {
+            let web = self
+                .memoria_provider
+                .as_ref()
+                .and_then(|p| p.web_url.as_ref())
+                .ok_or_else(|| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Account reauthentication website is not configured",
+                    )
+                })?;
+            Ok(
+                serde_json::json!({"method":"memoria","verification_url":format!("{web}/astra/reauthenticate")}),
+            )
+        } else {
+            Ok(serde_json::json!({"method":"password"}))
+        }
+    }
     async fn register(
         &self,
         request: AuthRegisterRequestData,
@@ -1726,6 +1766,18 @@ impl AuthService for DatabaseAuthService {
         })
     }
 
+    async fn login_memoria(&self, key: &str) -> Result<memoria::MemoriaLogin, AuthHttpError> {
+        self.memoria_login(key).await
+    }
+
+    fn memoria_credentials(&self) -> Option<memoria::MemoriaCredentialResolver> {
+        self.credential_resolver()
+    }
+
+    async fn disconnect_memoria(&self, user_id: &str) -> Result<(), AuthHttpError> {
+        self.memoria_disconnect(user_id).await
+    }
+
     async fn refresh(
         &self,
         request: AuthRefreshRequestData,
@@ -1773,6 +1825,29 @@ impl AuthService for DatabaseAuthService {
             .map_err(|e| map_auth_sqlx(e, "refresh.fetch_user_by_id", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
 
+        if !user.is_active {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
+        }
+        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        let origin = if let Some(owner) = memoria_owner.as_deref() {
+            self.revalidate_memoria_connection(&pool, &user_id, owner)
+                .await?;
+            format!(
+                "verified:{}",
+                self.memoria_provider
+                    .as_ref()
+                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?
+                    .provider_id
+            )
+        } else if origin == "memoria" || origin.starts_with("verified:memoria:") {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria identity binding is missing",
+            ));
+        } else {
+            origin
+        };
+
         let access_token = self
             .create_access_token(&user.user_id, &user.username, &session_id, &origin)
             .map_err(internal_error)?;
@@ -1782,15 +1857,27 @@ impl AuthService for DatabaseAuthService {
         let new_refresh_token_hash = sha256_hex(&new_refresh_token);
         let expires_at = self.refresh_token_expires_at_string(Utc::now());
 
-        let mut tx = pool
-            .begin()
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        query("SELECT user_id FROM auth_users WHERE user_id = ? FOR UPDATE")
+            .bind(&user_id)
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.begin_tx", Some(&pool)))?;
-        query("UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ?")
-            .bind(&refresh_token_hash)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
+            .map_err(internal_error)?;
+        // A concurrent disconnect revokes this row under the same user lock;
+        // the compare-and-revoke prevents refresh from resurrecting it.
+        let revoked = query(
+            "UPDATE auth_refresh_tokens SET is_revoked = 1 WHERE token_hash = ? AND is_revoked = 0",
+        )
+        .bind(&refresh_token_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "refresh.revoke_old_token", Some(&pool)))?;
+        if revoked.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Token expired or revoked",
+            ));
+        }
         query(
             "INSERT INTO auth_refresh_tokens (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
              VALUES (?, ?, ?, ?, ?, 0)",
@@ -1812,7 +1899,12 @@ impl AuthService for DatabaseAuthService {
             access_token,
             refresh_token: new_refresh_token,
             token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
+            expires_in: if origin == "memoria" || origin.starts_with("verified:memoria:") {
+                self.access_token_expires_in_seconds()
+                    .min(memoria::ACCESS_TTL_SECONDS)
+            } else {
+                self.access_token_expires_in_seconds()
+            },
         })
     }
 
@@ -1881,12 +1973,6 @@ impl AuthService for DatabaseAuthService {
         user_id: &str,
         request: ReauthenticationRequestData,
     ) -> Result<ReauthenticationProofRecord, (StatusCode, Json<ErrorResponse>)> {
-        if request.password.is_empty() || request.password.len() > AUTH_PASSWORD_MAX_BYTES {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Reauthentication failed",
-            ));
-        }
         let pool = self
             .get_pool()
             .await
@@ -1896,7 +1982,41 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "reauthenticate.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Reauthentication failed"))?;
-        if !user.is_active
+        if !user.is_active {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Reauthentication failed",
+            ));
+        }
+        let binding = self.reauthentication_binding(&pool, user_id).await?;
+        if let Some(binding) = &binding {
+            if !request.password.is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Choose one reauthentication method",
+                ));
+            }
+            self.verify_memoria_step_up(
+                binding,
+                request.memoria_proof.as_deref().unwrap_or(""),
+                request.purpose,
+            )
+            .await?;
+            // Disconnect/rotation while the provider was verifying must fail closed.
+            if self
+                .reauthentication_binding(&pool, user_id)
+                .await?
+                .as_ref()
+                != Some(binding)
+            {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Reauthentication binding changed",
+                ));
+            }
+        } else if request.memoria_proof.is_some()
+            || request.password.is_empty()
+            || request.password.len() > AUTH_PASSWORD_MAX_BYTES
             || !bcrypt_verify(request.password.as_str(), &user.password_hash).unwrap_or(false)
         {
             return Err(error_response(
@@ -1906,7 +2026,7 @@ impl AuthService for DatabaseAuthService {
         }
 
         let proof = format!("rp_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let proof_hash = sha256_hex(&proof);
+        let proof_hash = memoria::reauthentication_proof_hash(&proof, binding.as_ref());
         let expires_at = Utc::now() + ChronoDuration::seconds(REAUTHENTICATION_PROOF_TTL_SECONDS);
         query(
             "INSERT INTO auth_reauthentication_proofs
@@ -1945,6 +2065,7 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let binding = self.reauthentication_binding(&pool, user_id).await?;
         let result = query(
             "UPDATE auth_reauthentication_proofs
              SET consumed_at = NOW(6)
@@ -1953,7 +2074,10 @@ impl AuthService for DatabaseAuthService {
         )
         .bind(user_id)
         .bind(purpose.as_str())
-        .bind(sha256_hex(proof))
+        .bind(memoria::reauthentication_proof_hash(
+            proof,
+            binding.as_ref(),
+        ))
         .execute(&pool)
         .await
         .map_err(|e| map_auth_sqlx(e, "reauthenticate.consume_proof", Some(&pool)))?;
@@ -2012,7 +2136,7 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, _, _) = self.parse_token_session(&claims)?;
+        let (session_id, token_origin, _) = self.parse_token_session(&claims)?;
         let pool = self
             .get_pool()
             .await
@@ -2028,11 +2152,37 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
+        // Bound legacy Memoria tokens too: earlier builds issued them with
+        // `internal` origin and the self-hosted deployment's longer TTL.
+        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        if (token_origin == "memoria" || token_origin.starts_with("verified:memoria:"))
+            && memoria_owner.is_none()
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria identity binding is missing",
+            ));
+        }
+        if memoria_owner.is_some()
+            && !claims.iat.is_some_and(|iat| {
+                Utc::now().timestamp() - iat < i64::from(memoria::ACCESS_TTL_SECONDS)
+            })
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria access token expired; refresh required",
+            ));
+        }
+
         let user = self
             .fetch_user_by_id_or_username(&pool, &user_id, None)
             .await
             .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+
+        if !user.is_active {
+            return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
+        }
 
         Ok(AuthPrincipal {
             user: AuthUserRecord {
@@ -2042,7 +2192,28 @@ impl AuthService for DatabaseAuthService {
                 display_name: user.display_name,
             },
             session_id: Some(session_id),
-            origin: AuthPrincipalOrigin::Internal,
+            origin: if let Some(subject) = memoria_owner {
+                let resolver = self
+                    .credential_resolver()
+                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?;
+                if resolver
+                    .resolve(&user_id)
+                    .await
+                    .map_err(internal_error)?
+                    .is_none()
+                {
+                    return Err(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Memoria connection disconnected",
+                    ));
+                }
+                AuthPrincipalOrigin::VerifiedProvider {
+                    provider_id: resolver.provider.provider_id,
+                    external_subject: subject,
+                }
+            } else {
+                AuthPrincipalOrigin::Internal
+            },
         })
     }
 

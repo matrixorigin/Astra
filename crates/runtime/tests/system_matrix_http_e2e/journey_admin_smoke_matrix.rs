@@ -28,5 +28,5 @@ pub async fn run_admin_control_plane_rbac() {
         "GET /admin/tokens should return a JSON array: {body}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }

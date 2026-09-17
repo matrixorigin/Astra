@@ -13,7 +13,6 @@ pub(crate) async fn run_interactive_chat(
     initial_model: Option<&str>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
-    max_budget: f64,
     cli_context: &CliContext,
 ) -> Result<(), String> {
     if !crate::tui::can_run_tui() {
@@ -35,7 +34,6 @@ pub(crate) async fn run_interactive_chat(
         initial_model,
         resume_session_id,
         no_instructions,
-        max_budget,
         cli_context,
     ))
     .await

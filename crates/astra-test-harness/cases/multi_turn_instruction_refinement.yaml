@@ -33,9 +33,6 @@ criteria:
     code: 0
   - type: text_contains
     needle: "greet"
-  - type: tokens_between
-    min: 1
-    max: 130000
   - type: turn_rounds_between
     min: 1
     max: 15

@@ -39,6 +39,49 @@ pub const PERSISTENT_TYPES: &[&str] = &["semantic", "episodic", "procedural", "p
 /// originating session.
 pub const SESSION_SCOPED_TYPE: &str = "working";
 
+/// Outcome of one bounded memory-retrieval stage. Empty successful results
+/// are `Complete`, not `Unavailable`; consumers must never infer backend
+/// health from the number of selected memories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetrievalOutcome {
+    #[default]
+    NotAttempted,
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+impl MemoryRetrievalOutcome {
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        use MemoryRetrievalOutcome::{Complete, NotAttempted, Partial, Unavailable};
+        match (self, other) {
+            (NotAttempted, value) | (value, NotAttempted) => value,
+            (Complete, Complete) => Complete,
+            (Unavailable, Unavailable) => Unavailable,
+            (Partial, _) | (_, Partial) | (Complete, Unavailable) | (Unavailable, Complete) => {
+                Partial
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn was_attempted(self) -> bool {
+        self != Self::NotAttempted
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not_attempted",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// A memory record exposing the fields needed for shaping. Callers
 /// build this from their Memoria client's result type — we keep the
 /// shaping layer free of crate dependencies so it can run in tests
@@ -467,5 +510,16 @@ mod tests {
         }
         assert!(!is_persistent_type(SESSION_SCOPED_TYPE));
         assert!(!is_persistent_type("tool_result"));
+    }
+
+    #[test]
+    fn retrieval_outcome_combines_independent_queries_without_conflating_empty_and_failure() {
+        use MemoryRetrievalOutcome::{Complete, NotAttempted, Partial, Unavailable};
+
+        assert_eq!(NotAttempted.combine(Complete), Complete);
+        assert_eq!(Complete.combine(Complete), Complete);
+        assert_eq!(Unavailable.combine(Unavailable), Unavailable);
+        assert_eq!(Complete.combine(Unavailable), Partial);
+        assert_eq!(Partial.combine(Complete), Partial);
     }
 }

@@ -1,12 +1,12 @@
-# astra-engine Makefile
+# Astra Makefile
 
 .PHONY: help
 help:
-	@echo "astra-engine Development Commands"
+	@echo "Astra Development Commands"
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  make dev-start          - Start all (deps + API server + web UI)"
+	@echo "  make dev-start          - Start deterministic server-only development (deps + debug API + web)"
 	@echo "  make dev-start-server-only - Start server-only runtime (deps + API + web; no edge provider)"
 	@echo "  make dev-start-server-edge - Start server + local astra-edge provider"
 	@echo "  make dev-stop           - Stop all services"
@@ -43,12 +43,15 @@ help:
 	@echo "  make dev-edge-start     - Start local astra-edge provider for web/server workspace tools"
 	@echo "  make dev-edge-stop      - Stop local astra-edge provider"
 	@echo "  make dev-edge-logs      - Show astra-edge logs"
-	@echo "  make dev-edge-status    - Show astra-edge status"
+	@echo "  make dev-edge-status    - Show this checkout's repo-managed astra-edge status"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
-	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case; default 2 nextest threads, override: NEXTEST_OFFLINE_THREADS=<n> / NEXTEST_OFFLINE_PROFILE=<profile>)"
+	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-memoria-databases - Verify Memoria database bootstrap contract"
+	@echo "  make test-stack-bootstrap - Verify stack startup bootstraps Memoria before API"
 	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
 	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
@@ -93,23 +96,28 @@ help:
 	@echo "  make memoria-stop       - Stop Memoria service"
 	@echo "  make memoria-logs       - Show Memoria logs"
 	@echo "  make memoria-status     - Show Memoria status"
-	@echo "  make memoria-clean      - Stop and remove Memoria data"
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
+	@echo "  make stack-setup        - Complete guided setup from any stack state (admin/model optional)"
+	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
 	@echo "  make stack-up-server-edge - Start compose stack plus local astra-edge provider"
 	@echo "  make stack-down         - Stop compose stack"
 	@echo "  make stack-clean        - Stop compose stack and remove MatrixOne data"
 	@echo "  make stack-status       - Show compose stack status"
+	@echo "  make stack-verify       - Verify API health and a memory round trip"
 	@echo "  make stack-logs         - Follow stack logs (SERVICE=api optional)"
 	@echo ""
 	@echo "Docker API (alternative to source mode):"
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
-	@echo "  make release-docker     - Build and push Docker image (VERSION=..., CONFIRM=yes)"
+	@echo ""
+	@echo "Release maintenance:"
+	@echo "  make release-prepare    - Synchronize release versions (VERSION=...)"
+	@echo "  make release-check      - Run the read-only release preflight (VERSION=...)"
 
 # ============================================================================
 # Variables
@@ -129,18 +137,24 @@ CLI_RELEASE_FLAGS ?= --no-default-features
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
-IMAGE_VERSION ?= $(if $(VERSION),$(VERSION),dev)
-IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+IMAGE_VERSION ?= $(if $(VERSION),$(patsubst v%,%,$(VERSION)),dev)
+IMAGE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+IMAGE_SOURCE_DIRTY ?= $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -z "$$(git status --porcelain=v1 --untracked-files=no 2>/dev/null)"; then echo false; else echo true; fi)
 IMAGE_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
-DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
+DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_SOURCE_DIRTY=$(IMAGE_SOURCE_DIRTY) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
 # Project-wide default for every API server mode. Compose may remap the
 # host-facing port, but the container listens on this value.
 DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
-STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
-STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_BRIDGE_SECRET MEMORIA_MASTER_KEY
-STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
+# Always resolve the Compose project from the selected env file. Explicit
+# --project-name/--file plus clearing the two process-level overrides keeps
+# stack-setup's isolation decision authoritative even in a user's shell.
+STACK_COMPOSE := cd $(STACK_DIR) && project_name="$$(. "$(abspath scripts/lib/env_file.sh)"; env_file_read "$(abspath $(STACK_ENV))" ASTRA_STACK_NAME 2>/dev/null || true)"; project_name="$${project_name:-all-in-one}"; env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE UID=$$(id -u) GID=$$(id -g) ASTRA_STACK_ENV_FILE="$(abspath $(STACK_ENV))" docker compose --project-name "$$project_name" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" --env-file "$(abspath $(STACK_ENV))"
+STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
+STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
+STACK_RECREATE ?= 0
+STACK_RECREATE_ARGS := $(if $(filter 1 true yes,$(STACK_RECREATE)),--force-recreate --remove-orphans,)
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -152,6 +166,13 @@ STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBE
 #   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
 NEXTEST_OFFLINE_PROFILE ?= strict
 NEXTEST_ONLINE_PROFILE  ?= strict-online
+# Keep the offline gate deterministic on hosts where the strict profile would
+# otherwise fan out to every CPU. The runtime tests create many independent
+# Tokio runtimes and filesystem-backed session fixtures; unconstrained
+# process-level fan-out turns scheduling and temporary-state contention into
+# false failures. Override for a tuned machine when doing an explicit stress
+# run (for example, NEXTEST_OFFLINE_THREADS=8).
+NEXTEST_OFFLINE_THREADS ?= 2
 CLEANUP_PRESSURE_PROFILE ?= smoke
 CLEANUP_PRESSURE_DATABASE_BASE ?= astra_runtime_test_cleanup_pressure
 CLEANUP_PRESSURE_ARGS ?=
@@ -159,8 +180,12 @@ DURABLE_EVENT_PRESSURE_PROFILE ?= smoke
 DURABLE_EVENT_PRESSURE_DATABASE ?= astra_runtime_test_durable_event_pressure
 DURABLE_EVENT_PRESSURE_ARGS ?=
 
-NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
+NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE) --test-threads $(NEXTEST_OFFLINE_THREADS)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
+# Operational pressure probes have dedicated runners and data-size controls.
+# Keep them out of the generic ignored-test lane, whose per-case timeout is a
+# correctness budget rather than a load-test budget.
+NEXTEST_CLEANUP_PRESSURE_EXCLUSION := not test(/(db_cleanup_expired|db_truncate_gc|prompt_retention)_pressure_probe/)
 # Phase-0 production baselines require hermetic binary/model inputs and the
 # ASTRA_PHASE0_BASELINE_EXCLUSIVE guard. They are owned by
 # scripts/phase0-production-baseline.sh, not the generic ignored-test lane.
@@ -174,13 +199,10 @@ NEXTEST_PHASE0_BASELINE_EXCLUSION := not test(/e2e_matrix_phase0_(server_only_pr
 dev-init: setup install-dev-deps
 	@echo "Initializing development environment..."
 	@bash scripts/dev/init.sh
-	@echo ""
-	@echo "✅ Development environment initialized!"
-	@echo "Next: make dev-start"
 
 .PHONY: setup
 setup:
-	@echo "Setting up astra-engine development environment..."
+	@echo "Setting up Astra development environment..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "✅ Created .env file (please review and customize)"; \
@@ -230,7 +252,9 @@ dev-deps-up:
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
-	@$(DEPS_COMPOSE) up -d
+	@$(DEPS_COMPOSE) up -d matrixone
+	@$(MAKE) dev-deps-wait-matrixone
+	@$(MAKE) dev-deps-ensure-memoria
 	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
 
 .PHONY: dev-deps-down
@@ -272,11 +296,13 @@ dev-deps-logs:
 dev-deps-logs-once:
 	@$(DEPS_COMPOSE) logs --no-color
 
-.PHONY: dev-deps-wait
-dev-deps-wait:
+.PHONY: dev-deps-wait-matrixone
+dev-deps-wait-matrixone:
 	@echo "Waiting for MatrixOne..."
-	@for i in $$(seq 1 90); do \
-		if curl --noproxy '*' -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	debug_port="$${MATRIXONE_DEBUG_HTTP_PORT:-6060}"; \
+	for i in $$(seq 1 90); do \
+		if curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:$$debug_port/debug/vars" >/dev/null 2>&1; then \
 			echo "✅ MatrixOne is healthy"; \
 			break; \
 		fi; \
@@ -288,6 +314,28 @@ dev-deps-wait:
 		echo "  Waiting for MatrixOne... ($$i/90)"; \
 		sleep 2; \
 	done
+
+.PHONY: dev-deps-ensure-memoria
+dev-deps-ensure-memoria:
+	@set -e; set -a; [ -f .env ] && . ./.env; set +a; \
+	./scripts/dev/ensure-memoria-databases.sh; \
+	( $(DEPS_COMPOSE) up -d memoria ); \
+	if [ -n "$${MEMORIA_MASTER_KEY:-}" ] && curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
+		-H "Authorization: Bearer $$MEMORIA_MASTER_KEY" \
+		"http://127.0.0.1:$${MEMORIA_PORT:-8100}/v1/health/analyze" >/dev/null 2>&1; then \
+		echo "✅ Memoria already healthy"; \
+	elif curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
+		"http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+		echo "Memoria listener is ready but authenticated storage is not; restarting Memoria..."; \
+		( $(DEPS_COMPOSE) restart memoria ); \
+	fi
+
+.PHONY: dev-deps-wait
+dev-deps-wait:
+	@$(MAKE) dev-deps-wait-matrixone
+	@$(MAKE) dev-deps-ensure-memoria
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	./scripts/dev/check-memoria-owner.sh
 	@echo "Waiting for Memoria..."
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ -z "$${MEMORIA_MASTER_KEY:-}" ]; then \
@@ -295,7 +343,7 @@ dev-deps-wait:
 		exit 2; \
 	fi; \
 	for i in $$(seq 1 60); do \
-		if curl --noproxy '*' -sf \
+		if curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
 			-H "Authorization: Bearer $$MEMORIA_MASTER_KEY" \
 			"http://127.0.0.1:$${MEMORIA_PORT:-8100}/v1/health/analyze" >/dev/null 2>&1; then \
 			echo "✅ Memoria is healthy"; \
@@ -376,7 +424,7 @@ dev-api-status:
 dev-sdk-deps:
 	@if [ ! -x packages/sdk/node_modules/.bin/tsup ]; then \
 		echo "Installing local @astra/sdk dependencies..."; \
-		cd packages/sdk && npm install --no-audit --no-fund; \
+		cd packages/sdk && npm ci --no-audit --no-fund; \
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
@@ -391,7 +439,7 @@ dev-sdk-deps:
 dev-web-deps: dev-sdk-deps
 	@if [ ! -f web/node_modules/next/dist/bin/next ]; then \
 		echo "Installing web UI dependencies..."; \
-		cd web && npm install --no-audit --no-fund; \
+		cd web && npm ci --no-audit --no-fund; \
 	else \
 		echo "✅ Web UI dependencies ready"; \
 	fi
@@ -461,9 +509,10 @@ dev-edge-logs:
 .PHONY: dev-edge-status
 dev-edge-status:
 	@PID_FILE=$${ASTRA_EDGE_PID_FILE:-$(CURDIR)/astra_edge.pid}; \
-	echo "Edge Provider Status:"; \
-	echo "====================="; \
-	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \
+	. ./scripts/dev/edge-process.sh; \
+	echo "Repo-managed Edge Provider Status:"; \
+	echo "=================================="; \
+	if [ -f "$$PID_FILE" ] && edge_process_is_owned "$(CURDIR)" "$$(cat "$$PID_FILE")"; then \
 		PID=$$(cat "$$PID_FILE"); \
 		echo "  ✅ Running (PID: $$PID)"; \
 	else \
@@ -506,23 +555,51 @@ dev-api-docker-scale:
 	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
-.PHONY: release-docker
-release-docker:
+.PHONY: release-prepare
+release-prepare:
 	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ VERSION is required, for example: make release-docker VERSION=0.1.0 CONFIRM=yes"; \
+		echo "❌ VERSION is required, for example: make release-prepare VERSION=0.2.0"; \
 		exit 1; \
 	fi
-	@if [ "$(CONFIRM)" != "yes" ]; then \
-		echo "❌ Refusing to push Docker image without explicit confirmation."; \
-		echo "   Run: make release-docker VERSION=$(VERSION) CONFIRM=yes"; \
+	@scripts/prepare-release-version.py "$(VERSION)"
+
+.PHONY: release-check
+release-check:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-check VERSION=0.1.0"; \
 		exit 1; \
 	fi
-	@echo "Building Docker image $(IMAGE_NAME):latest..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
-	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
-	@docker push $(IMAGE_NAME):latest
-	@if [ -n "$(VERSION)" ]; then docker push $(IMAGE_NAME):$(VERSION); fi
-	@echo "✅ Pushed Docker image $(IMAGE_NAME)"
+	@scripts/validate-release-version.sh "$(VERSION)"
+	@python3 scripts/ci/validate_repository.py
+	@echo "✅ Release metadata, installer, artifacts, and workflow contracts are consistent"
+	@echo "   Commit and merge the reviewed version changes, then run make release-publish VERSION=$(VERSION) from main."
+
+.PHONY: release-publish
+release-publish:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-publish VERSION=0.2.0"; \
+		exit 1; \
+	fi
+	@scripts/validate-release-version.sh "$(VERSION)"
+	@command -v gh >/dev/null 2>&1 || { echo "❌ GitHub CLI (gh) is required to start a release"; exit 1; }
+	@gh auth status -h github.com >/dev/null 2>&1 || { echo "❌ Authenticate gh with permission to dispatch repository workflows"; exit 1; }
+	@default_branch="$$(gh repo view matrixorigin/Astra --json defaultBranchRef --jq '.defaultBranchRef.name')"; \
+	if [ "$$(git branch --show-current)" != "$$default_branch" ]; then \
+		echo "❌ Run release-publish from $$default_branch after the release PR merges"; \
+		exit 1; \
+	fi; \
+	if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "❌ Commit or stash local changes before starting a release"; \
+		exit 1; \
+	fi; \
+	git fetch origin "$$default_branch"; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse "origin/$$default_branch")" ]; then \
+		echo "❌ Local $$default_branch is not at origin/$$default_branch; fast-forward it before starting a release"; \
+		exit 1; \
+	fi
+	@gh workflow run release.yml --repo matrixorigin/Astra --ref main \
+		-f version="$(VERSION)" -f recover_existing_tag=false
+	@echo "✅ Release Astra started for $(VERSION). Candidate builds run before the protected release approval."
 
 # ============================================================================
 # Compose Stack Deployment
@@ -530,39 +607,32 @@ release-docker:
 
 .PHONY: stack-env
 stack-env:
-	@if [ -f "$(STACK_ENV)" ]; then \
+	@set -eu; \
+	tmp=""; value_file=""; \
+	cleanup_stack_env() { rm -f "$${tmp:-}" "$${value_file:-}"; }; \
+	trap cleanup_stack_env EXIT HUP INT TERM; \
+	if [ -f "$(STACK_ENV)" ]; then \
 		echo "✅ $(STACK_ENV) already exists"; \
 	else \
 		cp $(STACK_DIR)/.env.example $(STACK_ENV); \
 		echo "✅ Created $(STACK_ENV)"; \
 	fi; \
-	if ! command -v openssl >/dev/null 2>&1; then \
-		echo "❌ openssl is required to generate stack secrets"; \
-		exit 1; \
-	fi; \
-	has_env_value() { \
-		key="$$1"; \
-		awk -v key="$$key" ' \
-			/^[[:space:]]*#/ { next } \
-			{ \
-				line = $$0; \
-				sub(/^[[:space:]]*/, "", line); \
-				if (line ~ "^" key "[[:space:]]*=") { \
-					sub(/^[^=]*=/, "", line); \
-					sub(/^[[:space:]]*/, "", line); \
-					lower = tolower(line); \
-					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
-				} \
-			} \
-			END { exit found ? 0 : 1 } \
-		' "$(STACK_ENV)"; \
-	}; \
+	chmod 600 "$(STACK_ENV)"; \
+	. scripts/lib/env_file.sh; \
 	set_env_value() { \
 		key="$$1"; \
 		value="$$2"; \
 		tmp="$$(mktemp)"; \
-		awk -v key="$$key" -v value="$$value" ' \
-			BEGIN { done = 0 } \
+		value_file="$$(mktemp)"; \
+		chmod 600 "$$tmp" "$$value_file"; \
+		printf '%s' "$$value" > "$$value_file"; \
+		ASTRA_STACK_VALUE_FILE="$$value_file" awk -v key="$$key" ' \
+			BEGIN { \
+				value_file = ENVIRON["ASTRA_STACK_VALUE_FILE"]; \
+				if ((getline value < value_file) < 0) exit 1; \
+				close(value_file); \
+				done = 0; \
+			} \
 			{ \
 				line = $$0; \
 				sub(/^[[:space:]]*/, "", line); \
@@ -576,12 +646,18 @@ stack-env:
 			END { if (!done) print key "=" value } \
 		' "$(STACK_ENV)" > "$$tmp"; \
 		mv "$$tmp" "$(STACK_ENV)"; \
+		rm -f "$$value_file"; \
+		tmp=""; value_file=""; \
 	}; \
 	ensure_secret() { \
 		key="$$1"; \
-		if has_env_value "$$key"; then \
+		if env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
 			echo "✅ $$key already configured"; \
 			return 0; \
+		fi; \
+		if ! command -v openssl >/dev/null 2>&1; then \
+			echo "❌ openssl is required to generate missing secret $$key"; \
+			exit 1; \
 		fi; \
 		value="$$(openssl rand -hex 32)"; \
 		set_env_value "$$key" "$$value"; \
@@ -589,9 +665,19 @@ stack-env:
 	}; \
 	ensure_secret ASTRA_JWT_SECRET; \
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
-	ensure_secret ASTRA_BRIDGE_SECRET; \
+	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
-	echo "Edit required embedding config before running: make stack-up"
+	embedding_provider="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
+	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
+	embedding_url="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_BASE_URL 2>/dev/null || true)"; \
+	if [ "$$embedding_provider" = mock ]; then \
+		echo "✅ Mock embeddings configured (local evaluation)"; \
+	elif [ -n "$$embedding_url" ]; then \
+		echo "✅ Embedding endpoint configured (run make stack-setup to test it)"; \
+	else \
+		echo "Configure a real embedding endpoint, or use make stack-setup for guided configuration."; \
+	fi; \
+	trap - EXIT HUP INT TERM
 
 .PHONY: stack-check-env
 stack-check-env:
@@ -600,28 +686,23 @@ stack-check-env:
 		echo "   Run: make stack-env"; \
 		exit 1; \
 	fi
-	@missing=""; \
-	for key in $(STACK_REQUIRED_ENV); do \
-		if ! awk -v key="$$key" ' \
-			/^[[:space:]]*#/ { next } \
-			{ \
-				line = $$0; \
-				sub(/^[[:space:]]*/, "", line); \
-				if (line ~ "^" key "[[:space:]]*=") { \
-					sub(/^[^=]*=/, "", line); \
-					sub(/^[[:space:]]*/, "", line); \
-					lower = tolower(line); \
-					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
-				} \
-			} \
-			END { exit found ? 0 : 1 } \
-		' "$(STACK_ENV)"; then \
+	@. scripts/lib/env_file.sh; \
+	embedding_provider="$$(env_resolve_value "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
+	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
+	required="$(STACK_SECRET_ENV)"; \
+	if [ "$${embedding_provider:-openai}" != "mock" ]; then \
+		required="$$required $(STACK_EMBEDDING_ENV)"; \
+	fi; \
+	missing=""; \
+	for key in $$required; do \
+		value="$$(env_resolve_value "$(STACK_ENV)" "$$key" 2>/dev/null || true)"; \
+		if env_value_is_placeholder "$$value"; then \
 			missing="$$missing $$key"; \
 		fi; \
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "❌ Missing or insecure required config in $(STACK_ENV):$$missing"; \
-		echo "   Run make stack-env to generate secrets, then fill embedding config."; \
+		echo "   Run make stack-env to generate secrets. For non-mock embeddings, fill the base URL and any provider-required API key."; \
 		exit 1; \
 	fi
 
@@ -630,25 +711,72 @@ stack-config: stack-check-env
 	@$(STACK_COMPOSE) config --quiet
 	@echo "✅ Compose stack config OK"
 
+.PHONY: stack-start
+stack-start: stack-env
+	@$(MAKE) stack-up
+	@$(MAKE) stack-verify
+	@echo ""
+	@echo "✅ Astra local stack is ready"
+	@echo "   Next: make stack-setup STACK_ENV=\"$(STACK_ENV)\" (resume guided status and optional chat setup)"
+	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
+
 .PHONY: stack-up
 stack-up: stack-config
 	@echo "Starting compose stack..."
-	@$(STACK_COMPOSE) up -d --wait --wait-timeout 180
+	@if ! ( \
+		set -e; \
+		( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 matrixone ) || exit 1; \
+		set -a; . "$(STACK_ENV)" || exit 1; set +a; \
+		scripts/dev/ensure-memoria-databases.sh || exit 1; \
+		( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 memoria api ) || exit 1; \
+	); then \
+		echo ""; \
+		echo "❌ Compose stack did not become healthy."; \
+		echo ""; \
+		echo "Service status:"; \
+		( $(STACK_COMPOSE) ps -a ) || true; \
+		echo ""; \
+		echo "Recent service logs:"; \
+		failed_services="$$( \
+			for state in exited dead restarting unhealthy; do \
+				( $(STACK_COMPOSE) ps -a --status "$$state" --services ) 2>/dev/null || true; \
+			done | sort -u | tr '\n' ' ' \
+		)"; \
+		if [ -n "$$failed_services" ]; then \
+			( $(STACK_COMPOSE) logs --no-color --tail=80 $$failed_services ) || true; \
+		else \
+			echo "No failed container was identified; run 'make stack-logs STACK_ENV=\"$(STACK_ENV)\"' for full logs."; \
+		fi; \
+		echo ""; \
+		echo "Fix the first reported error, then rerun 'make stack-up STACK_ENV=\"$(STACK_ENV)\"'."; \
+		echo "The partial stack is left running so it can be inspected; use 'make stack-down STACK_ENV=\"$(STACK_ENV)\"' to stop it."; \
+		exit 1; \
+	fi
 	@echo "✅ Compose stack started"
-	@API_PORT=$$(sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1); \
-	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"
+	@. scripts/lib/env_file.sh; \
+	API_PORT=$$(env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
+	BIND_ADDRESS=$$(env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
+	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
+	echo "   API: http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}"
+
+.PHONY: stack-setup
+stack-setup:
+	@scripts/setup/stack-setup.sh
 
 .PHONY: stack-up-server-only
 stack-up-server-only:
-	@echo "Ensuring no local astra-edge provider remains connected..."
+	@echo "Stopping this checkout's repo-managed astra-edge provider..."
 	@$(MAKE) dev-edge-stop
 	@$(MAKE) stack-up
-	@echo "✅ Server-only stack ready (no local edge provider connected)"
+	@echo "✅ Server-only stack ready (this checkout did not connect a User Runner)"
 
 .PHONY: stack-up-server-edge
 stack-up-server-edge: stack-up-server-only
-	@API_PORT=$$([ -f "$(STACK_ENV)" ] && sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1 || true); \
-	ASTRA_EDGE_SERVER_URL="http://127.0.0.1:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
+	@. scripts/lib/env_file.sh; \
+	API_PORT=$$([ -f "$(STACK_ENV)" ] && env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
+	BIND_ADDRESS=$$([ -f "$(STACK_ENV)" ] && env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
+	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
+	ASTRA_EDGE_SERVER_URL="http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
 	@echo "✅ Server + edge stack ready"
 
 .PHONY: stack-down
@@ -665,6 +793,10 @@ stack-clean:
 stack-status: stack-check-env
 	@$(STACK_COMPOSE) ps
 
+.PHONY: stack-verify
+stack-verify: stack-check-env
+	@scripts/ops/verify_all_in_one.sh "$(STACK_ENV)"
+
 .PHONY: stack-logs
 stack-logs: stack-check-env
 	@$(STACK_COMPOSE) logs -f $(SERVICE)
@@ -679,7 +811,7 @@ dev-start-server-only:
 	@$(MAKE) dev-edge-stop
 	@$(MAKE) dev-deps-up
 	@$(MAKE) dev-deps-wait
-	@$(MAKE) dev-api-start
+	@$(MAKE) dev-api-start-debug
 	@$(MAKE) dev-web-start
 	@echo ""
 	@echo "✅ Server-only development environment started!"
@@ -688,9 +820,10 @@ dev-start-server-only:
 	@echo "   Edge provider: not connected"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  astra register"
-	@echo "  astra login"
-	@echo "  astra chat"
+	@echo "  make build-cli-debug"
+	@echo "  ./target/debug/astra admin register       # first database only"
+	@echo "  ./target/debug/astra admin model load .models.yaml --update-existing"
+	@echo "  ./target/debug/astra"
 
 .PHONY: dev-start-server-edge
 dev-start-server-edge:
@@ -703,20 +836,7 @@ dev-start-server-edge:
 	@echo "   Edge workspace: $${ASTRA_EDGE_WORKSPACE_DIR:-$$(pwd)}"
 
 .PHONY: dev-start
-dev-start:
-	@echo "Starting development environment..."
-	@$(MAKE) dev-deps-up
-	@$(MAKE) dev-deps-wait
-	@$(MAKE) dev-api-start
-	@$(MAKE) dev-web-start
-	@echo ""
-	@echo "✅ Development environment started!"
-	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
-	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
-	@echo "   Edge provider: unchanged"
-	@echo ""
-	@echo "Use make dev-start-server-only to explicitly disconnect local edge."
-	@echo "Use make dev-start-server-edge to start or reconnect local edge."
+dev-start: dev-start-server-only
 
 .PHONY: dev-start-docker
 # Docker API mode reuses the dev dependency stack; dev-api-docker-up starts only api.
@@ -759,16 +879,24 @@ dev-reset: dev-clean
 dev-setup-demo:
 	@bash scripts/setup/demo-init.sh
 
+# A freshly recreated database must run the complete schema bootstrap before
+# /health can answer. MatrixOne can take several minutes on a cold schema;
+# keep the ordinary API-start timeout unchanged and give only this destructive
+# reseed flow the longer readiness window.
 .PHONY: dev-seed
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@echo "Stopping API server before dropping the database..."
+	@$(MAKE) dev-api-stop
+	@$(MAKE) dev-deps-wait
+	@sleep 2
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	scripts/dev/mysql-client.sh -e "$$SQL"
-	@$(MAKE) dev-api-restart-debug build-cli-debug
+	@API_START_TIMEOUT_SECONDS=$${API_START_TIMEOUT_SECONDS:-600} $(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
 	@NO_PROXY=localhost ./target/debug/astra admin register \
@@ -941,7 +1069,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
+.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online validate-capability-matrix
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -951,8 +1079,12 @@ test-dashboard: ## Build astra-test and launch live dashboard
 
 .PHONY: test-offline
 # Run the focused runtime profile gate first so provider/surface regressions fail
-# before the broader workspace, bridge-hook, SDK, and web offline suites.
-test-offline: sweep test-runtime-profiles test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+# before the broader workspace, server E2E-hook, SDK, and web offline suites.
+test-offline: sweep validate-capability-matrix test-runtime-profiles test-workspace test-runtime-e2e-hooks test-sdk-offline test-web-offline
+
+.PHONY: validate-capability-matrix
+validate-capability-matrix:
+	@python3 scripts/e2e/validate_capability_matrix.py
 
 .PHONY: test-runtime-profiles
 test-runtime-profiles: test-server-only test-server-edge test-managed-runtime test-cli-local
@@ -979,8 +1111,8 @@ test-server-only:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::subrun_turn_budget
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::server_subrun_
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::finalize_run_events
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test bridge_e2e_comprehensive --features bridge-e2e-hooks chat_stream_bridge_secret_does_not_route_to_bridge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks cli_thin_client_single_admission_completes_server_owned_multi_round_loop
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/chat-input-route.test.ts \
@@ -992,8 +1124,8 @@ test-server-only:
 test-server-edge:
 	@echo "Running focused server+edge provider tests..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-edge
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::edge_profile_can_declare_read_only_workspace_authority
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_execution_bindings_make_edge_provider_explicit
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::binding_resolution::tests::request_bindings_without_server_workspace_require_typed_binding
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::run::lifecycle::tests::edge_profile_does_not_infer_execution_bindings
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::turn_start_lifecycle_summary_reports_edge_provider_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_composes_server_owned_tools_with_edge_declared_runtime_tools
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::offline_edge_blocking_does_not_require_sse_event_channel
@@ -1005,9 +1137,9 @@ test-server-edge:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_selected_executor_does_not_route_to_other_connected_edge
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_bound_offline_or_unknown_status_blocks_without_dispatch
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib edge_dispatch_without_result_reports_transport_disconnected
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test edge_ws_e2e edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks web_agent_dynamic_spawn_inherits_edge_workspace_binding
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --test web_agent_e2e --features e2e-hooks edge_executor_offline_child_returns_actionable_wait_to_structured_parent
 	@cd web && npm test -- --run \
 		__tests__/app/edges-status-route.test.ts \
 		__tests__/lib/work-surface.test.ts \
@@ -1033,7 +1165,7 @@ test-managed-runtime:
 test-cli-local:
 	@echo "Running focused CLI-local provider tests..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib capabilities::tests::cli_local_catalog_filters_builtin_source_by_provider_ownership
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-cli --lib edge_tools::tests::schema_tests::local_cli_catalog_uses_runtime_env_surface_for_local_runtime
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-cli --lib edge_tools::tests::schema_tests::local_cli_catalog_exposes_the_root_work_lifecycle
 
 # Fast correctness gate for the no-sticky control plane. This intentionally
 # stays out of the default test targets: it is focused evidence for LB/session
@@ -1045,20 +1177,23 @@ test-no-sticky-control:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib do_not_require_sticky_pod -- --nocapture
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test edge_5_5_http_e2e without_sticky_ledger -- --nocapture
 
+.PHONY: test-mcp-fixture
+test-mcp-fixture:
+	@CARGO_INCREMENTAL=0 $(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin mock_mcp_server
+
 .PHONY: test-workspace
-test-workspace: sweep
+test-workspace: sweep test-mcp-fixture
 	@echo "Running Rust workspace tests (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
 	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) --workspace $(NEXTEST_OFFLINE_FLAGS)
 	@echo "Running workspace doctests (cargo test --doc; not covered by nextest)..."
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) --workspace --doc
 
-# Compiles chat/turn bridge hook paths and runs integration binaries that require
-# `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
-.PHONY: test-runtime-bridge-hooks
-test-runtime-bridge-hooks: sweep
-	@echo "Running astra-runtime tests with feature bridge-e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
-	@CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-		--features bridge-e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
+# Compiles deterministic model/edge hooks used by runtime system journeys.
+.PHONY: test-runtime-e2e-hooks
+test-runtime-e2e-hooks: sweep
+	@echo "Running astra-runtime tests with feature e2e-hooks (nextest profile=$(NEXTEST_OFFLINE_PROFILE))..."
+	@RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--features e2e-hooks $(NEXTEST_OFFLINE_FLAGS)
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
@@ -1081,22 +1216,22 @@ test-ignored-integration:
 			JOBS_FLAG="-j 1"; \
 			echo "Online integration tests: serial mode (ASTRA_TEST_DB_IT_TEST_THREADS=1)"; \
 		else \
-			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
+			echo "Running online integration tests (ignored; live MatrixOne; e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
 		PERF_FAILED=""; \
 		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
 			echo "Running runtime/plan integration and performance tests in one serial build..."; \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_RUNTIME_ROOT_SECRET=$${ASTRA_RUNTIME_ROOT_SECRET:-test-runtime-root-secret} ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime -p astra-plan \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
 				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
@@ -1104,7 +1239,7 @@ test-ignored-integration:
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
 				-p astra-runtime \
-				--features astra-runtime/bridge-e2e-hooks \
+				--features astra-runtime/e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) -j 1 \
 				-E 'binary(perf_benchmarks)' \
@@ -1158,13 +1293,14 @@ test-online:
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
-				-E 'not test(/durable_run_event_pressure_probe/)' \
+				-E 'not test(/durable_run_event_pressure_probe/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
 				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-turn-core-db-store"; \
 		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -1172,6 +1308,7 @@ test-online:
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
 				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-services-online"; \
 	fi; \
 	if [ "$$ONLINE_LANE" != "core" ]; then \
@@ -1179,6 +1316,12 @@ test-online:
 		ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
 			ASTRA_TEST_DB_IT=1 \
+			ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+			ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+			ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+			ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+			ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			$(MAKE) test-ignored-integration \
 			|| FAILED="$$FAILED test-ignored-integration"; \
 	fi; \
@@ -1206,6 +1349,17 @@ test-online:
 # test-online because pressure timings are operational evidence, not a normal
 # per-case correctness budget.
 .PHONY: test-memoria-online-contract
+# Scoped auth contract requires a separately provisioned Memoria API with the
+# scoped-key capability. Explicit selection fails if required inputs are absent.
+.PHONY: test-memoria-auth-online-contract
+test-memoria-auth-online-contract:
+	@test -n "$$ASTRA_TEST_MEMORIA_URL" || { echo "ASTRA_TEST_MEMORIA_URL is required"; exit 2; }
+	@test -n "$$ASTRA_TEST_MEMORIA_MASTER_KEY" || { echo "ASTRA_TEST_MEMORIA_MASTER_KEY is required"; exit 2; }
+	@test -n "$$ASTRA_TEST_DATABASE" || { echo "ASTRA_TEST_DATABASE must explicitly designate an isolated DB"; exit 2; }
+	ASTRA_TEST_DB_IT=1 ASTRA_DATABASE="$$ASTRA_TEST_DATABASE" ASTRA_DATABASE_PREFIX="" \
+		CARGO_INCREMENTAL=0 cargo test --locked -p astra-services --features external-contract-tests \
+		--test memoria_live_contract_it -- --ignored
+
 test-memoria-online-contract:
 	@if [ ! -f .env ]; then echo "❌ .env is required for the real Memoria contract"; exit 2; fi
 	@set -a; . ./.env; set +a; \
@@ -1243,12 +1397,17 @@ test-saas:
 	TEST_DB=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
 	echo "Running SaaS platform E2E (ASTRA_TEST_DB_IT=1, database=$$TEST_DB, --test-threads=1)..."; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+	ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+	ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+	ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+	RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
 	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
 	CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) \
 		-p astra-runtime \
-		--features bridge-e2e-hooks \
+		--features e2e-hooks \
 		--test system_matrix_http_e2e \
 		-- --ignored --nocapture e2e_matrix_saas_ --test-threads=1 \
 	&& ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -1266,7 +1425,7 @@ test-saas:
 	if [ "$$HEALTH" = "200" ]; then \
 		if command -v npm >/dev/null 2>&1; then \
 			echo "Running @astra/sdk SaaS remote (http://127.0.0.1:$$API_PORT)..."; \
-			cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts && \
+			cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts && \
 			ASTRA_SDK_BASE_URL="http://127.0.0.1:$$API_PORT" npm run test:integration:saas \
 			|| { echo "❌ test-saas failed (SDK)"; exit 1; }; \
 		else \
@@ -1299,13 +1458,18 @@ test-saas-coverage:
 	echo "Running SaaS E2E with llvm coverage (database=$$TEST_DB, --test-threads=1)..."; \
 	echo "NOTE: if tests fail with connection cap, run: make dev-stop"; \
 	ASTRA_DATABASE=$$TEST_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-	ASTRA_TEST_DB_IT=1 ASTRA_TEST_BRIDGE_SECRET=$${ASTRA_TEST_BRIDGE_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_TEST_DB_IT=1 ASTRA_TEST_E2E_SECRET=$${ASTRA_TEST_E2E_SECRET:-system-matrix-e2e-secret} \
+	ASTRA_BACKEND_SERVICE_KEY=$${ASTRA_BACKEND_SERVICE_KEY:-test-service-key-e2e} \
+	ASTRA_LLM_RETRY_BASE_MS=$${ASTRA_LLM_RETRY_BASE_MS:-10} \
+	ASTRA_DEFAULT_RETRY_AFTER_MS=$${ASTRA_DEFAULT_RETRY_AFTER_MS:-10} \
+	ASTRA_BCRYPT_COST=$${ASTRA_BCRYPT_COST:-4} \
+	RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 	ASTRA_DB_POOL_MAX_CONNECTIONS=$${ASTRA_DB_POOL_MAX_CONNECTIONS:-5} \
 	ASTRA_DB_GLOBAL_MAX_CONNECTIONS=$${ASTRA_DB_GLOBAL_MAX_CONNECTIONS:-10000} \
 	CARGO_INCREMENTAL=0 cargo llvm-cov test $(CARGO_MANIFEST_FLAG) \
 		--no-report --ignore-run-fail \
 		-p astra-runtime \
-		--features bridge-e2e-hooks \
+		--features e2e-hooks \
 		--test system_matrix_http_e2e \
 		-- --ignored e2e_matrix_saas_ --test-threads=1; \
 	RUNTIME_EXIT=$$?; \
@@ -1351,8 +1515,8 @@ test-live-llm:
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline
 test-sdk-offline:
-	@echo "Running @astra/sdk offline (typecheck, Jest with coverage + Mode A E2E, build)..."
-	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@echo "Running @astra/sdk offline (typecheck, Vitest with coverage + Mode A E2E, build)..."
+	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@cd packages/sdk && npm run typecheck
 	@cd packages/sdk && ASTRA_SDK_E2E=1 npm run test:coverage
 	@cd packages/sdk && npm run build
@@ -1363,11 +1527,11 @@ test-web-offline: test-sdk-offline
 	@cd web && npm ci
 	@cd web && npm run ci
 
-# @astra/sdk — Jest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
+# @astra/sdk — Vitest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
 .PHONY: test-sdk-online
 test-sdk-online:
-	@echo "Running @astra/sdk online (Jest integration + test:online) — ensure API is up (e.g. make dev-start)..."
-	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@echo "Running @astra/sdk online (Vitest integration + test:online) — ensure API is up (e.g. make dev-start)..."
+	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
 		export ASTRA_SDK_E2E=1; \
 		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}}"; \
@@ -1436,6 +1600,20 @@ test-harness:
 	[ -n "$${SUMMARIZE_MODEL:-}" ] && ARGS="$$ARGS --summarize-model $${SUMMARIZE_MODEL}"; \
 	./target/release/astra-test $$ARGS
 
+.PHONY: test-harness-capabilities
+test-harness-capabilities: validate-capability-matrix ## Audit typed anchors, then run model capability probes and prompt variants with DeepSeek Flash
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release --bin astra
+	@mkdir -p target/astra-test-harness/capabilities
+	@./target/release/astra-test --suite crates/astra-test-harness/cases --audit-capabilities
+	@./target/release/astra-test --suite crates/astra-test-harness/cases \
+		--capability-probes --force-model deepseek-v4-flash \
+		--prompt-variants --judger-model deepseek-v4-flash \
+		--artifacts-dir target/astra-test-harness/capabilities/artifacts \
+		--report-file target/astra-test-harness/capabilities/report.json \
+		--eval-file target/astra-test-harness/capabilities/eval.json \
+		--parallel "$${PARALLEL:-1}" --runs "$${RUNS:-1}"
+
 # ============================================================================
 # Code Quality
 # ============================================================================
@@ -1499,29 +1677,20 @@ check-web:
 # ============================================================================
 
 .PHONY: memoria-start
-memoria-start:
-	@echo "Starting Memoria..."
-	@docker compose -f memoria/docker-compose.yml up -d
-	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
+memoria-start: dev-deps-up
+	@echo "Memoria API: http://localhost:8100  Swagger: http://localhost:8100/docs"
 
 .PHONY: memoria-stop
 memoria-stop:
-	@docker compose -f memoria/docker-compose.yml down
+	@$(DEPS_COMPOSE) stop memoria
 
 .PHONY: memoria-logs
 memoria-logs:
-	@docker compose -f memoria/docker-compose.yml logs -f api
+	@$(DEPS_COMPOSE) logs -f memoria
 
 .PHONY: memoria-status
 memoria-status:
-	@docker compose -f memoria/docker-compose.yml ps
-
-.PHONY: memoria-clean
-memoria-clean:
-	@echo "Stopping and removing Memoria (including data)..."
-	@docker compose -f memoria/docker-compose.yml down
-	@rm -rf memoria/data/
-	@echo "Done."
+	@$(DEPS_COMPOSE) ps memoria
 
 # ============================================================================
 # Database
@@ -1549,3 +1718,15 @@ db-reset:
 .PHONY: test-mysql-client
 test-mysql-client:
 	@bash scripts/dev/test-mysql-client.sh
+
+.PHONY: test-memoria-databases
+test-memoria-databases:
+	@bash scripts/dev/test-memoria-databases.sh
+
+.PHONY: test-memoria-owner
+test-memoria-owner:
+	@bash scripts/dev/test-memoria-owner-contract.sh
+
+.PHONY: test-stack-bootstrap
+test-stack-bootstrap:
+	@bash scripts/dev/test-stack-bootstrap-contract.sh

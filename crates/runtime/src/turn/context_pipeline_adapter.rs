@@ -40,12 +40,12 @@ pub(crate) fn build_external_sources(
 
     let effort_hint = {
         let mut hint = String::new();
-        if let Some(ref effort) = state.skills.effort {
+        if let Some(ref effort) = state.skills.execution.effort {
             hint.push_str(&format!(
                 "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. Adjust thoroughness accordingly.",
             ));
         }
-        if let Some(ref agent_type) = state.skills.agent_type {
+        if let Some(ref agent_type) = state.skills.execution.agent_type {
             hint.push_str(&format!(
                 "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
             ));
@@ -75,8 +75,21 @@ pub(crate) fn build_external_sources(
         }
     };
 
-    let (tool_guidance_text, _signals) =
+    let (mut tool_guidance_text, _signals) =
         crate::prompts::tool_round_guidance_trace(&state.messages, state.llm_rounds_completed);
+    if !state.suppress_execution_slice_guidance() {
+        let slice_guidance = crate::prompts::execution_slice_guidance(
+            state.remaining_turns,
+            state.max_turns,
+            super::agentic_loop::lifecycle::adaptive_budget_is_renewable(state),
+        );
+        if !slice_guidance.is_empty() {
+            if !tool_guidance_text.is_empty() {
+                tool_guidance_text.push_str("\n\n");
+            }
+            tool_guidance_text.push_str(&slice_guidance);
+        }
+    }
     let tool_guidance = (!tool_guidance_text.is_empty()).then_some(tool_guidance_text);
 
     // ── Memory entries (structured, non-section) ──
@@ -96,36 +109,23 @@ pub(crate) fn build_external_sources(
 
     // ── Framework+Policy: ContextChannelProvider assembly ──
     // Every prompt section is produced by a typed provider. The assembler
-    // collects from all registered providers, partitions by cache scope,
-    // and returns (stable_sections, dynamic_sections). No channel can be
-    // "forgotten" — the compiler guarantees every provider is iterated.
-
-    let cwd_str = edge_profile
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(|s| format!("cwd: {s}"))
-        .unwrap_or_default();
+    // walks the registered providers in deterministic registration order,
+    // applies policy, and partitions output by the provider-declared scope.
 
     let mut providers: Vec<Box<dyn astra_turn_core::context_sources::ContextChannelProvider>> =
         Vec::new();
 
-    // Self-model: tool-dependent capabilities hint
-    if !tool_names.is_empty() {
-        providers.push(Box::new(SelfModelProvider {
-            tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
-        }));
-    }
-
-    // Tool-conditional: cross-tool admission protocol. The exact visible
-    // surface versions the bytes, so it is reusable until that surface changes.
+    // Tool-conditional: cross-tool admission protocol. Guidance is keyed by
+    // typed capability classes, not the exact schema order, so an equivalent
+    // edge/server surface hand-off keeps the same cache prefix.
     if !tool_names.is_empty() {
         providers.push(Box::new(ToolConditionalProvider {
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd_str.clone(),
         }));
     }
 
-    // Environment static (Platform/Shell/CWD/Home)
+    // Environment static (Platform/Shell/manifests/Home). Typed CWD is owned
+    // by RuntimeIdentity and must not be repeated in this free-form section.
     if let Some(text) = edge_profile
         .get("environment_static")
         .and_then(Value::as_str)
@@ -173,15 +173,26 @@ pub(crate) fn build_external_sources(
         }));
     }
 
-    // Skill listing (session-stable, from state.skills.listing_message)
-    if let Some(listing) = state.skills.listing_message.as_ref() {
-        if let Some(content) = listing.get("content").and_then(Value::as_str) {
-            if !content.is_empty() {
-                providers.push(Box::new(SkillListingProvider {
-                    content: content.to_string(),
-                }));
-            }
-        }
+    // One catalog authority per topology. Interactive clients carry a typed
+    // edge catalog that has already been validated; server-only sessions use
+    // the resolver-owned listing.
+    let skill_listing = edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+        .or_else(|| {
+            state
+                .skills
+                .listing_message
+                .as_ref()
+                .and_then(|listing| listing.get("content"))
+                .and_then(Value::as_str)
+                .filter(|content| !content.is_empty())
+        });
+    if let Some(content) = skill_listing {
+        providers.push(Box::new(SkillListingProvider {
+            content: content.to_string(),
+        }));
     }
 
     // Provider policy comes after the ordered Binding Instructions so it can
@@ -237,44 +248,17 @@ pub(crate) fn build_external_sources(
 //
 // Every provider below replaces an ad-hoc `edge_profile` key read +
 // manual `push` to `extra_stable_sections`/`extra_dynamic_sections`.
-// The assembler iterates all registered providers; the compiler
-// guarantees no channel can be forgotten.
-
-/// Self-model: tool-dependent capabilities hint.
-/// Injects when tools are visible. Dynamic scope (per-turn).
-struct SelfModelProvider {
-    tool_names: Vec<String>,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for SelfModelProvider {
-    fn channel_id(&self) -> &'static str {
-        "self_model"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::None
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::BasePersona
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        let tool_names: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
-        let text = crate::prompts::self_model_section(&tool_names);
-        if text.is_empty() {
-            None
-        } else {
-            Some(PromptSection::dynamic(text, PromptTokenBucket::BasePersona))
-        }
-    }
-}
+// The assembler iterates all registered providers in registration order; the
+// typed provider boundary keeps channel ownership explicit.
 
 /// Tool-conditional: cross-tool admission protocol.
 ///
-/// The section is reconstructed from the exact visible tool set each turn.
-/// Equal surfaces reuse the session prefix; a changed surface emits different
-/// bytes and naturally starts a new cache epoch.
+/// The section is reconstructed from the typed capability classes of the
+/// visible surface. Exact schemas remain authoritative, while this stable
+/// contract explains admission/lifecycle semantics. It must stay cacheable:
+/// strict-history providers suppress ordinary volatile prose.
 struct ToolConditionalProvider {
     tool_names: Vec<String>,
-    cwd: String,
 }
 
 impl astra_turn_core::context_sources::ContextChannelProvider for ToolConditionalProvider {
@@ -289,11 +273,11 @@ impl astra_turn_core::context_sources::ContextChannelProvider for ToolConditiona
     }
     fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
         let tool_names: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
-        let text = crate::prompts::tool_conditional_section(&tool_names, &self.cwd);
+        let text = crate::prompts::tool_conditional_section(&tool_names);
         if text.is_empty() {
             None
         } else {
-            Some(PromptSection::stable(text, CacheScope::Session))
+            Some(PromptSection::dynamic(text, PromptTokenBucket::Environment))
         }
     }
 }
@@ -575,10 +559,6 @@ pub(crate) fn build_turn_state(state: &AgenticLoopState, user_content: &str) -> 
         // tokenizer result.
         tokens: TokenAccounting::default(),
         active_skills: vec![],
-        recent_file_reads: std::collections::HashMap::new(),
-        // Pull the real per-turn budget from the host state instead of a 20
-        // hardcode. Planner uses this to decide when to escalate compaction.
-        remaining_turns: state.remaining_turns as u32,
         turn_index: state.llm_rounds_completed,
         // RecoveryState lives on the pipeline session; feeding it freshly
         // here each turn is correct — `run_turn_adaptive` merges it with
@@ -609,12 +589,12 @@ pub(crate) fn build_session_context(
     user_id: Option<&str>,
 ) -> SessionContext {
     let provider_policy =
-        super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
-    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        super::prompt_cache::provider_cache_policy_for(cache_capability, provider);
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_name),
+        provider,
     );
+    let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -678,25 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_state_uses_real_remaining_turns_not_hardcoded_20() {
-        // The adapter used to hardcode remaining_turns=20 regardless of the
-        // actual host budget. That broke the planner's "about to exhaust
-        // budget" heuristic and fed wrong signals into compaction escalation.
-        let mut state = make_state();
-        state.remaining_turns = 7;
-        let ts = build_turn_state(&state, "hi");
-        assert_eq!(
-            ts.remaining_turns, 7,
-            "adapter must pass host's remaining_turns through verbatim, \
-             not hardcode a default"
-        );
-
-        state.remaining_turns = 0;
-        let ts = build_turn_state(&state, "hi");
-        assert_eq!(ts.remaining_turns, 0, "exhausted budget must surface as 0");
-    }
-
-    #[test]
     fn turn_state_tokens_do_not_reuse_cumulative_session_cost_as_request_pressure() {
         let mut state = make_state();
         state.total_prompt = 100_000;
@@ -741,6 +702,12 @@ mod tests {
     #[test]
     fn session_context_picks_anthropic_policy_for_bedrock_provider() {
         let ep = serde_json::Map::new();
+        let declared_cache_capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        };
         let ctx = build_session_context(
             "sid",
             None,
@@ -749,12 +716,13 @@ mod tests {
             &ep,
             "bedrock",
             None,
-            None,
+            Some(declared_cache_capability),
             "2026-05-25",
             None,
         );
-        // Bedrock Claude translates cache_control → cachePoint downstream,
-        // so the pipeline still emits Anthropic-style markers.
+        // Bedrock multiplexes model families, so the provider name alone is
+        // insufficient. A deployment-declared cachePoint capability selects
+        // the Anthropic-style pipeline markers translated by the adapter.
         assert!(
             ctx.provider_policy.max_markers > 0,
             "bedrock must use anthropic policy — Bedrock Converse translates cache_control \
@@ -863,6 +831,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -1012,7 +981,7 @@ mod tests {
         assert_eq!(
             tool_section.scope,
             crate::prompts::CacheScope::Session,
-            "surface-derived guidance is cacheable until the visible tool surface changes"
+            "surface-derived guidance must version the reusable session prefix"
         );
         assert_eq!(
             tool_section.token_bucket,
@@ -1063,10 +1032,51 @@ mod tests {
 
         assert_ne!(
             first, second,
-            "a changed visible surface must rebuild exact cache-prefix bytes"
+            "a changed visible surface must rebuild exact cache-epoch guidance bytes"
         );
         assert!(first.contains("tool_search(query=\"select:NAME\")"));
         assert!(!second.contains("tool_search(query=\"select:NAME\")"));
+    }
+
+    #[test]
+    fn equivalent_edge_server_surfaces_reuse_identical_cacheable_guidance() {
+        let ep = serde_json::Map::new();
+        let state = make_state();
+        let edge = build_external_sources(
+            &ep,
+            &state,
+            &["bash", "glob", "grep", "read_file", "tool_search"],
+            None,
+            None,
+        );
+        let server = build_external_sources(
+            &ep,
+            &state,
+            &[
+                "tool_search",
+                "read_file",
+                "bash",
+                "grep",
+                "glob",
+                "log_search",
+            ],
+            None,
+            None,
+        );
+        let stable_text = |sources: &astra_turn_core::context_sources::ExternalSources| {
+            sources
+                .extra_stable_sections
+                .iter()
+                .find(|section| section.text.contains("Tool Availability Protocol"))
+                .expect("tool guidance")
+                .text
+                .clone()
+        };
+        assert_eq!(
+            stable_text(&edge),
+            stable_text(&server),
+            "equivalent capability classes must preserve the stable prompt prefix"
+        );
     }
 
     #[test]
@@ -1075,6 +1085,107 @@ mod tests {
         let state = make_state();
         let sources = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(sources.memory_entries.is_empty());
+    }
+
+    #[test]
+    fn external_sources_projects_low_slice_horizon_only_outside_settlement() {
+        let ep = serde_json::Map::new();
+        let mut state = make_state();
+        state.max_turns = 40;
+        state.remaining_turns = 4;
+
+        let sources = build_external_sources(&ep, &state, &["bash"], None, None);
+        let guidance = sources.tool_guidance.expect("low-slice guidance");
+        assert!(guidance.contains("\"available_model_boundaries_including_current\":5"));
+        assert!(guidance.contains("\"authority\":\"advisory_only\""));
+
+        state.hooks.completion_settlement.work_settlement_only = true;
+        let settlement_sources = build_external_sources(&ep, &state, &["bash"], None, None);
+        assert!(
+            settlement_sources
+                .tool_guidance
+                .as_deref()
+                .is_none_or(|guidance| !guidance.contains("<execution-slice>")),
+            "typed settlement guidance must remain the only execution authority"
+        );
+
+        state.hooks.completion_settlement.work_settlement_only = false;
+        state.budget_wrapup_injected = true;
+        let token_rail_sources = build_external_sources(&ep, &state, &["bash"], None, None);
+        assert!(
+            token_rail_sources
+                .tool_guidance
+                .as_deref()
+                .is_none_or(|guidance| !guidance.contains("<execution-slice>")),
+            "token-rail wrap-up must not advertise ordinary execution headroom"
+        );
+    }
+
+    #[test]
+    fn external_sources_keep_one_decisive_action_at_a_renewable_final_boundary() {
+        let ep = serde_json::Map::new();
+        let mut state = make_state();
+        state.max_turns = 32;
+        state.remaining_turns = 0;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
+        state.agentic_turn_budget.extension_turns = 12;
+
+        let guidance = build_external_sources(&ep, &state, &["bash"], None, None)
+            .tool_guidance
+            .expect("renewable final-boundary guidance");
+        assert!(
+            guidance.contains("adaptive review checkpoint"),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains("one smallest decisive action"),
+            "{guidance}"
+        );
+        assert!(!guidance.contains("Do not call any tool"), "{guidance}");
+    }
+
+    #[test]
+    fn external_sources_keep_no_tool_final_boundary_when_renewal_is_blocked() {
+        let ep = serde_json::Map::new();
+        let mut state = make_state();
+        state.max_turns = 32;
+        state.remaining_turns = 0;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(32);
+        state.agentic_turn_budget.extension_turns = 12;
+
+        let nonrenewable = build_external_sources(&ep, &state, &["bash"], None, None)
+            .tool_guidance
+            .expect("nonrenewable final-boundary guidance");
+        assert!(
+            nonrenewable.contains("Do not call any tool"),
+            "{nonrenewable}"
+        );
+
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
+        state.stall.verdict_events.push(
+            astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
+                turn: 1,
+                severity: "critical".into(),
+                injections: vec![],
+                avoid_tools: vec![],
+                health_avoidance_tools: vec![],
+                advisory_threshold_reached: true,
+                nudge_count: 1,
+                interaction_mode: "auto".into(),
+                recent_error_pressure: 0,
+                recent_timeout_pressure: 0,
+                total_errors: 0,
+                health_avoidance_count: 0,
+                total_timeouts: 0,
+                timeout_dominant_tools: vec![],
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+        );
+        let critical = build_external_sources(&ep, &state, &["bash"], None, None)
+            .tool_guidance
+            .expect("renewable boundary despite historical critical advice");
+        assert!(!critical.contains("Do not call any tool"), "{critical}");
     }
 
     #[test]
@@ -1089,6 +1200,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -1224,6 +1336,48 @@ mod tests {
             .unwrap();
         assert!(identity_pos < runtime_id_pos);
         assert!(runtime_id_pos < volatile_pos);
+    }
+
+    #[test]
+    fn composite_edge_profile_renders_typed_cwd_once() {
+        let profile = astra_turn_core::chat_turn_edge_profile::build_base_edge_profile_value(
+            "/tmp/proj",
+            Some("main".into()),
+            serde_json::json!({}),
+        );
+        let ep = profile
+            .as_object()
+            .expect("base edge profile must be an object");
+        let state = make_state();
+        let ci = build_composite_inputs(&state, ep, "anthropic", "claude-sonnet-4-6", "hello");
+
+        let mut sess = PipelineSession::new(PipelineConfig {
+            provider_policy: ci.session.provider_policy.clone(),
+        });
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &ci.statics,
+                agent: &ci.agent,
+                session: &ci.session,
+                turn: &ci.turn,
+                external: &ci.external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "agentic_loop",
+            })
+            .expect("adapter-built inputs must not abort the pipeline");
+        let rendered = output
+            .serialized
+            .system_blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            rendered.matches("CWD: /tmp/proj").count(),
+            1,
+            "typed RuntimeIdentity must be the sole CWD projection: {rendered}"
+        );
     }
 
     #[test]
@@ -1382,6 +1536,99 @@ mod tests {
     }
 
     #[test]
+    fn composite_cross_turn_changes_stay_out_of_the_cacheable_prefix() {
+        // A new turn may update volatile workspace observations, but those
+        // bytes must stay after the Session→None boundary.  Compare the
+        // provider-facing result rather than only the provider structs: this
+        // is the exact shape used for cache diagnostics and wire dispatch.
+        let mut first_profile = serde_json::Map::new();
+        first_profile.insert("cwd".into(), Value::String("/tmp/proj".into()));
+        first_profile.insert("git_branch".into(), Value::String("main".into()));
+        first_profile.insert(
+            "environment_volatile".into(),
+            Value::String("git: clean".into()),
+        );
+        let first_state = make_state();
+        let first = build_composite_inputs(
+            &first_state,
+            &first_profile,
+            "anthropic",
+            "claude-sonnet-4-6",
+            "first",
+        );
+
+        let mut second_profile = first_profile.clone();
+        second_profile.insert(
+            "environment_volatile".into(),
+            Value::String("git: dirty (1 file changed)".into()),
+        );
+        let mut second_state = make_state();
+        second_state.llm_rounds_completed = 1;
+        let second = build_composite_inputs(
+            &second_state,
+            &second_profile,
+            "anthropic",
+            "claude-sonnet-4-6",
+            "second",
+        );
+
+        let run = |input: &CompositeInputs| {
+            let mut session = PipelineSession::new(PipelineConfig {
+                provider_policy: input.session.provider_policy.clone(),
+            });
+            session
+                .run_turn_adaptive(AdaptiveTurnInput {
+                    statics: &input.statics,
+                    agent: &input.agent,
+                    session: &input.session,
+                    turn: &input.turn,
+                    external: &input.external,
+                    model_id: "claude-sonnet-4-6",
+                    query_source: "agentic_loop",
+                })
+                .expect("adapter-built inputs must not abort")
+        };
+        let first_output = run(&first);
+        let second_output = run(&second);
+
+        let stable_blocks = |output: &astra_turn_core::pipeline_session::TurnOutput| {
+            output
+                .serialized
+                .system_blocks
+                .iter()
+                .filter(|block| block.scope != CacheScope::None)
+                .map(|block| (block.kind, block.scope, block.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stable_blocks(&first_output),
+            stable_blocks(&second_output),
+            "volatile workspace updates must not rewrite the cacheable system prefix"
+        );
+        assert_eq!(
+            first_output.serialized.tool_schemas, second_output.serialized.tool_schemas,
+            "unchanged capabilities must keep the tool-schema prefix byte-stable"
+        );
+        assert_ne!(
+            first_output
+                .serialized
+                .system_blocks
+                .iter()
+                .filter(|block| block.scope == CacheScope::None)
+                .map(|block| block.text.clone())
+                .collect::<Vec<_>>(),
+            second_output
+                .serialized
+                .system_blocks
+                .iter()
+                .filter(|block| block.scope == CacheScope::None)
+                .map(|block| block.text.clone())
+                .collect::<Vec<_>>(),
+            "the volatile tail should still carry the new workspace observation"
+        );
+    }
+
+    #[test]
     fn composite_memory_section_appears_iff_typed_memory_entries_exist() {
         // With memory present → Memory section is planned and bound.
         // Without memory → Memory section is absent (planner skips it so
@@ -1452,49 +1699,12 @@ mod tests {
 
     // ── ContextChannelProvider unit tests ─────────────────────────────────
 
-    // ── SelfModelProvider ──
-
-    #[test]
-    fn self_model_provider_returns_none_when_tool_list_empty() {
-        let p = super::SelfModelProvider { tool_names: vec![] };
-        assert!(p.provide(0).is_none(), "empty tool list should yield None");
-    }
-
-    #[test]
-    fn self_model_provider_returns_none_when_self_model_section_empty() {
-        // self_model_section currently returns empty string for any input
-        let p = super::SelfModelProvider {
-            tool_names: vec!["bash".into()],
-        };
-        // The provider guards on text.is_empty(), not tool_names.is_empty()
-        let result = p.provide(0);
-        // self_model_section returns "" → provider returns None
-        assert!(result.is_none(), "empty self_model_section output → None");
-    }
-
-    #[test]
-    fn self_model_provider_channel_id_is_stable() {
-        let p = super::SelfModelProvider {
-            tool_names: vec!["bash".into()],
-        };
-        assert_eq!(p.channel_id(), "self_model");
-    }
-
-    #[test]
-    fn self_model_provider_cache_scope_is_none() {
-        let p = super::SelfModelProvider {
-            tool_names: vec!["bash".into()],
-        };
-        assert_eq!(p.cache_scope(), CacheScope::None);
-    }
-
     // ── ToolConditionalProvider ──
 
     #[test]
     fn tool_conditional_provider_emits_protocol_for_visible_tools() {
         let p = super::ToolConditionalProvider {
             tool_names: vec!["bash".into(), "read_file".into()],
-            cwd: "cwd: /test".into(),
         };
         let section = p.provide(0).expect("should emit for non-empty tools");
         assert!(section.text.contains("Tool Availability Protocol"));
@@ -1507,10 +1717,7 @@ mod tests {
 
     #[test]
     fn tool_conditional_provider_returns_none_when_no_tools() {
-        let p = super::ToolConditionalProvider {
-            tool_names: vec![],
-            cwd: String::new(),
-        };
+        let p = super::ToolConditionalProvider { tool_names: vec![] };
         // tool_conditional_section returns "" for empty tool_names
         let result = p.provide(0);
         assert!(
@@ -1523,7 +1730,6 @@ mod tests {
     fn tool_conditional_provider_includes_tool_search_hint_when_tool_search_visible() {
         let p = super::ToolConditionalProvider {
             tool_names: vec!["tool_search".into(), "bash".into()],
-            cwd: String::new(),
         };
         let section = p.provide(0).expect("should emit");
         assert!(section.text.contains("tool_search(query=\"select:NAME\")"));
@@ -1533,7 +1739,6 @@ mod tests {
     fn tool_conditional_provider_cache_scope_tracks_surface_epoch() {
         let p = super::ToolConditionalProvider {
             tool_names: vec!["bash".into()],
-            cwd: String::new(),
         };
         assert_eq!(p.cache_scope(), CacheScope::Session);
     }
@@ -1854,6 +2059,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_skill_catalog_is_the_single_listing_for_client_topology() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT.into(),
+            Value::String("edge catalog sentinel".into()),
+        );
+        let mut state = make_state();
+        state.skills.listing_message = Some(serde_json::json!({
+            "role": "system",
+            "content": "server fallback sentinel"
+        }));
+
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+        let stable = sources
+            .extra_stable_sections
+            .iter()
+            .filter(|section| section.text.contains("catalog sentinel"))
+            .collect::<Vec<_>>();
+        assert_eq!(stable.len(), 1, "catalog must not be injected twice");
+        assert_eq!(stable[0].text, "edge catalog sentinel");
+        assert!(
+            sources
+                .extra_stable_sections
+                .iter()
+                .all(|section| !section.text.contains("server fallback sentinel")),
+            "server fallback must not become a second prompt authority"
+        );
+    }
+
+    #[test]
     fn external_sources_tool_conditional_only_when_tools_present() {
         let ep = serde_json::Map::new();
         let state = make_state();
@@ -1864,7 +2099,14 @@ mod tests {
                 .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Tool Availability Protocol")),
-            "tool_conditional emits in the cacheable surface epoch when tools are present"
+            "tool-conditional contract must be present in the cacheable surface epoch"
+        );
+        assert!(
+            !with_tools
+                .extra_dynamic_sections
+                .iter()
+                .any(|s| s.text.contains("Tool Availability Protocol")),
+            "tool-conditional contract must not enter the suppressible volatile lane"
         );
 
         let without_tools = build_external_sources(&ep, &state, &[], None, None);
@@ -1880,8 +2122,8 @@ mod tests {
     #[test]
     fn external_sources_effort_hint_flows_to_typed_field_not_section() {
         let mut state = make_state();
-        state.skills.effort = Some(astra_skills::EffortLevel::High);
-        state.skills.agent_type = Some("code-review".into());
+        state.skills.execution.effort = Some(astra_skills::EffortLevel::High);
+        state.skills.execution.agent_type = Some("code-review".into());
 
         let ep = serde_json::Map::new();
         let sources = build_external_sources(&ep, &state, &[], None, None);
@@ -2078,7 +2320,7 @@ mod tests {
             sources
                 .extra_stable_sections
                 .iter()
-                .map(|section| section.text.as_str())
+                .map(|section| section.text.clone())
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -2098,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_runtime_volatile_text_accepts_single_string() {
+    fn external_sources_runtime_volatile_text_rejects_non_array_shape() {
         let mut ep = serde_json::Map::new();
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.into(),
@@ -2117,7 +2359,8 @@ mod tests {
             sources
                 .extra_dynamic_sections
                 .iter()
-                .any(|section| section.text.contains("\"mode\":\"single\""))
+                .all(|section| !section.text.contains("\"mode\":\"single\"")),
+            "the canonical multi-producer lane requires an array"
         );
     }
 
@@ -2143,7 +2386,7 @@ mod tests {
                 serde_json::json!([turn_context]),
             );
             let sources = build_external_sources(&ep, &state, &["bash"], None, None);
-            crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
+            crate::turn::prompt_cache::assemble_ephemeral_pipeline_outcome(
                 &["bash"],
                 &[],
                 &sources.extra_stable_sections,
@@ -2243,8 +2486,15 @@ mod tests {
 
         let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(
+            sources
+                .tool_guidance
+                .as_deref()
+                .is_some_and(|guidance| guidance.contains("<execution-slice>")),
+            "low execution horizon must reach the model through the volatile lane"
+        );
+        assert!(
             !sources
-                .extra_dynamic_sections
+                .extra_stable_sections
                 .iter()
                 .any(|s| s.text.contains("Turn Budget")),
             "turn budget remains structured runtime state instead of prompt text"
@@ -2263,6 +2513,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -2290,6 +2541,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: None,
             }),
         );

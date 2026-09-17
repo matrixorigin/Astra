@@ -2,8 +2,9 @@
 name = "astra-pipeline"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish = false
 description = "Astra agent learning pipeline — calibration, routing, patterns"
-license = "MIT"
 
 [features]
 default = []
@@ -14,6 +15,7 @@ astra-services.workspace = true
 astra-text-utils.workspace = true
 astra-turn-types.workspace = true
 async-trait.workspace = true
+fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 regex.workspace = true

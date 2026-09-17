@@ -52,20 +52,19 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
     // classify `ls -la`. We do not hash the env here (caller handles
     // that), so changes to those assignments would hit the cache
     // with a different env fingerprint. Separately correct.
-    let mut tokens = cmd.split_whitespace().peekable();
-    while let Some(tok) = tokens.peek() {
-        if is_env_assignment(tok) {
-            tokens.next();
-        } else {
-            break;
-        }
+    let mut words = cmd.split_whitespace().collect::<Vec<_>>();
+    while words.first().is_some_and(|tok| is_env_assignment(tok)) {
+        words.remove(0);
     }
 
-    let Some(first) = tokens.next() else {
+    let Some(first) = words.first().copied() else {
         return false;
     };
-
-    let second = tokens.next();
+    let second = words.get(1).copied();
+    if known_mutating_shape(&words, first, second) {
+        return false;
+    }
+    let mut trailing = words.iter().skip(2).copied().peekable();
 
     // Hyphenated tool heads (`git`, `cargo`, etc.) use the first
     // subcommand to disambiguate — `git log` is safe, `git commit`
@@ -91,7 +90,8 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
         "node" | "npm" | "pnpm" | "yarn" | "python" | "python3" | "pip" | "pip3" | "ruby"
         | "go" | "deno" | "bun" | "rustc" | "rustup" | "java" | "javac" | "mvn" | "gradle"
         | "kubectl" | "docker" | "podman"
-            if (second == Some("--version") || second == Some("-V")) && tokens.next().is_none() =>
+            if (second == Some("--version") || second == Some("-V"))
+                && trailing.next().is_none() =>
         {
             true
         }
@@ -135,7 +135,7 @@ pub fn bash_command_is_cache_safe(command: &str) -> bool {
             | Some("pkgid")
             | Some("locate-project")
             | Some("search") => true,
-            Some("-V") | Some("-v") | Some("--version") => tokens.next().is_none(),
+            Some("-V") | Some("-v") | Some("--version") => trailing.next().is_none(),
             _ => false,
         },
 
@@ -162,13 +162,72 @@ fn is_env_assignment(tok: &str) -> bool {
     saw_eq
 }
 
+/// A small, provider-neutral supplement to the command-family allowlist.
+/// Some tools are read-only only for a particular option shape; treating the
+/// family name alone as safe would both replay stale output and skip the
+/// executor's mutation observation window. Unknown shapes remain unsafe.
+fn known_mutating_shape(words: &[&str], first: &str, second: Option<&str>) -> bool {
+    match first {
+        "env" => words.len() > 1,
+        "find" | "fd" | "fdfind" => words.iter().skip(1).any(|word| {
+            matches!(
+                *word,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+                    | "-x"
+                    | "--exec"
+                    | "--exec-batch"
+            )
+        }),
+        "git" => match second {
+            Some("stash") => !matches!(words.get(2).copied(), Some("list" | "show")),
+            Some("config") => {
+                let args = &words[2..];
+                if args.is_empty() {
+                    true
+                } else if args.iter().any(|arg| {
+                    matches!(
+                        *arg,
+                        "--get"
+                            | "--get-all"
+                            | "--get-regexp"
+                            | "--list"
+                            | "-l"
+                            | "--show-origin"
+                            | "--show-scope"
+                            | "--name-only"
+                    )
+                }) {
+                    false
+                } else {
+                    args.len() > 1
+                }
+            }
+            Some("branch") => words.get(2).is_some_and(|arg| !arg.starts_with('-')),
+            Some("tag") => words.get(2).is_some_and(|arg| !arg.starts_with('-')),
+            Some("remote") => words.get(2).is_some_and(|arg| {
+                !matches!(*arg, "-v" | "--verbose" | "show" | "get-url" | "get")
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Extra sieve for git subcommands: even within the read-only
 /// subcommand list, some combinations actively mutate state (e.g.
 /// `git stash push`, `git config --set`). Returns true on any
 /// detected mutation marker.
 fn git_subcommand_is_dangerous(lower: &str) -> bool {
-    // `git stash` alone is a list; `git stash push` / `save` / `pop`
-    // are mutations.
+    // `git stash list/show` are observations; bare `git stash` defaults to
+    // push, and the other subcommands mutate.
     if lower.starts_with("git stash ")
         && !lower.starts_with("git stash list")
         && !lower.starts_with("git stash show")
@@ -330,12 +389,20 @@ mod tests {
             "git stash pop",
             "git stash save msg",
             "git config --set user.name X",
+            "git config user.name X",
             "git remote add origin url",
             "git remote remove origin",
             "git branch -d feat",
             "git branch --delete feat",
             "git tag v1",
             "git tag -d v1",
+            "git branch new-feature",
+            "git stash",
+            "find . -delete",
+            "find . -exec touch {} \\;",
+            "fd -x rm {}",
+            "env find . -delete",
+            "env python3 -c 'open(\"out\", \"w\").write(\"x\")'",
             // compound/redirect commands
             "ls && cat foo",
             "ls || echo fail",

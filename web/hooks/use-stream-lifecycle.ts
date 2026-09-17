@@ -1,10 +1,12 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { appendExplainFact, markExplainGap, beginExplainRepair, finishExplainRepair } from "@/lib/explain-analyze-observation";
 import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
@@ -14,11 +16,13 @@ import {
   getChatWorkSurface,
   getChatWorkSurfaceRun,
   queueChatRunInput,
+  respondChatRunApproval,
   resumeChatRun,
   stopChatRun,
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
+  type PendingRunApproval,
 } from "@/lib/api/chats";
 import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
@@ -179,6 +183,9 @@ export interface UseStreamLifecycleParams {
 }
 
 export interface UseStreamLifecycleReturn {
+  pendingApproval: PendingRunApproval | null;
+  approvalResponsePending: boolean;
+  respondToApproval: (decision: "allow" | "deny") => Promise<void>;
   nextStreamAbortSignal: () => AbortSignal;
   applyWorkSurfaceStreamEvent: (event: WorkSurfaceEvent) => void;
   resetWorkSurfaceRun: (
@@ -269,8 +276,22 @@ export function useStreamLifecycle(
     }
   });
   const runControlMutationRef = useRef(false);
+  const [pendingApproval, setPendingApproval] = useState<PendingRunApproval | null>(null);
+  const [approvalResponsePending, setApprovalResponsePending] = useState(false);
+  const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
+    setPendingApproval(approval);
+  }, []);
+  const clearPendingInteraction = useCallback(() => {
+    setPendingApproval(null);
+  }, []);
   const workSurfaceRepairInFlightRef = useRef(false);
   const workSurfaceRepairPendingRef = useRef(false);
+  const explainGapRepairRef = useRef(
+    new Map<
+      string,
+      { assistantMessageId: string; nextEventIndex: number; pending: boolean }
+    >(),
+  );
 
   // -- Stream signal helpers --
   const nextStreamAbortSignal = useCallback(() => {
@@ -439,11 +460,140 @@ export function useStreamLifecycle(
   const applyWorkSurfaceStreamEvent = useCallback(
     (event: WorkSurfaceEvent) => {
       setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
+      if (
+        event.type === "stream_gap" &&
+        event.explain_analyze_recovered !== true
+      ) {
+        setDetail((current) => {
+          const activeAssistantId =
+            current.activeRun?.runId === event.run_id
+              ? current.activeRun.assistantMessageId
+              : undefined;
+          const fallbackAssistantId = [...current.messages]
+            .reverse()
+            .find((message) => message.role === "assistant" && message.status === "streaming")
+            ?.id;
+          const targetId = activeAssistantId ?? fallbackAssistantId;
+          if (!targetId) return current;
+          return {
+            ...current,
+            messages: current.messages.map((message) =>
+              message.id === targetId
+                ? markExplainGap(message, event.explain_analyze_recovered === false)
+                : message,
+            ),
+          };
+        });
+      }
       if (event.type === "agent_live_gap" || event.type === "stream_gap") {
         repairWorkSurfaceFromDurable();
       }
     },
-    [repairWorkSurfaceFromDurable, setWorkSurface],
+    [repairWorkSurfaceFromDurable, setDetail, setWorkSurface],
+  );
+
+  const applyArtifactPublication = useCallback(
+    (assistantMessageId: string, event: import("@astra/sdk").ArtifactPublicationV1) => {
+      setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+        message.id === assistantMessageId ? { ...message, artifactPublication: event } : message) }));
+    }, [setDetail],
+  );
+
+  const applyExplainAnalyzeEvent = useCallback(
+    (assistantMessageId: string, event: import("@astra/sdk").ExplainAnalyzeEventV1) => {
+      setDetail((current) => ({
+        ...current,
+        messages: current.messages.map((message) => {
+          if (message.id !== assistantMessageId) return message;
+          return appendExplainFact(message, event);
+        }),
+      }));
+    },
+    [setDetail],
+  );
+
+  const markExplainAnalyzeInvalid = useCallback((assistantMessageId: string) => {
+    setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+      message.id === assistantMessageId ? markExplainGap(message, true) : message,
+    ) }));
+  }, [setDetail]);
+
+  const repairExplainAnalyzeFromDurable = useCallback(
+    (
+      assistantMessageId: string,
+      runId: string,
+      nextEventIndex: number,
+    ) => {
+      const existing = explainGapRepairRef.current.get(runId);
+      if (existing) {
+        existing.assistantMessageId = assistantMessageId;
+        existing.nextEventIndex = Math.min(existing.nextEventIndex, nextEventIndex);
+        existing.pending = true;
+        return;
+      }
+
+      const repair = { assistantMessageId, nextEventIndex, pending: false };
+      explainGapRepairRef.current.set(runId, repair);
+      void (async () => {
+        let unrepairedGap = false;
+        try {
+          do {
+            repair.pending = false;
+            let pageHasUnrepairedGap = false;
+            let sawExplainFact = false;
+            const repairToken = crypto.randomUUID();
+            setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+              message.id === repair.assistantMessageId ? beginExplainRepair(message, repairToken) : message) }));
+            await streamExistingChatRun(
+              detail.chat.id,
+              runId,
+              {
+                onArtifactPublication: (event) => applyArtifactPublication(repair.assistantMessageId, event),
+                onExplainAnalyzeEvent: (event) => {
+                  sawExplainFact = true;
+                  applyExplainAnalyzeEvent(repair.assistantMessageId, event);
+                },
+                onExplainAnalyzeInvalid: () => { pageHasUnrepairedGap = true; markExplainAnalyzeInvalid(repair.assistantMessageId); },
+                onWorkSurfaceEvent: (event) => {
+                  if (
+                    event.type === "stream_gap" &&
+                    event.explain_analyze_recovered === false
+                  ) {
+                    pageHasUnrepairedGap = true;
+                    markExplainAnalyzeInvalid(repair.assistantMessageId);
+                  }
+                },
+              },
+              {
+                assistantMessageId: repair.assistantMessageId,
+                // Repair all outstanding delivery gaps for this message. A
+                // suffix alone cannot prove earlier missing facts were restored.
+                nextEventIndex: 0,
+                replayOnly: true,
+              },
+            );
+            unrepairedGap ||= pageHasUnrepairedGap;
+            if (sawExplainFact && !unrepairedGap) {
+              setDetail((current) => ({ ...current, messages: current.messages.map((message) =>
+                message.id === repair.assistantMessageId ? finishExplainRepair(message, repairToken) : message) }));
+            }
+          } while (repair.pending);
+
+        } catch {
+          setDetail((current) => ({
+            ...current,
+            messages: current.messages.map((message) =>
+              message.id === repair.assistantMessageId
+                ? markExplainGap(message)
+                : message,
+            ),
+          }));
+        } finally {
+          explainGapRepairRef.current.delete(runId);
+        }
+      })();
+    },
+    [applyArtifactPublication, applyExplainAnalyzeEvent, markExplainAnalyzeInvalid, detail.chat.id, setDetail],
   );
 
   const loadAgentRunProjection = useCallback(
@@ -486,6 +636,18 @@ export function useStreamLifecycle(
         {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
+          onExplainAnalyzeEvent: (event) =>
+            applyExplainAnalyzeEvent(assistantMessageId, event),
+          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
+          onStreamGap: (gap) =>
+            repairExplainAnalyzeFromDurable(
+              assistantMessageId,
+              gap.runId,
+              gap.nextEventIndex,
+            ),
+          onApprovalRequired: handleApprovalRequired,
+          onInteractionResolved: clearPendingInteraction,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -597,6 +759,12 @@ export function useStreamLifecycle(
     },
     [
       applyWorkSurfaceStreamEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
+      markExplainAnalyzeInvalid,
+      repairExplainAnalyzeFromDurable,
+      clearPendingInteraction,
+      handleApprovalRequired,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -715,6 +883,18 @@ export function useStreamLifecycle(
         await streamChatMessage(detail.chat.id, streamPayload, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onArtifactPublication: (event) => applyArtifactPublication(currentAssistantId, event),
+          onExplainAnalyzeEvent: (event) =>
+            applyExplainAnalyzeEvent(currentAssistantId, event),
+          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(currentAssistantId),
+          onStreamGap: (gap) =>
+            repairExplainAnalyzeFromDurable(
+              currentAssistantId,
+              gap.runId,
+              gap.nextEventIndex,
+            ),
+          onApprovalRequired: handleApprovalRequired,
+          onInteractionResolved: clearPendingInteraction,
           onLocalMessages: ({
             userMessage: localUserMessage,
             assistantMessage: localAssistantMessage,
@@ -939,6 +1119,12 @@ export function useStreamLifecycle(
     },
     [
       applyWorkSurfaceStreamEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
+      markExplainAnalyzeInvalid,
+      repairExplainAnalyzeFromDurable,
+      clearPendingInteraction,
+      handleApprovalRequired,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1006,6 +1192,18 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
+            onExplainAnalyzeEvent: (event) =>
+              applyExplainAnalyzeEvent(assistantMessageId, event),
+          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
+            onStreamGap: (gap) =>
+              repairExplainAnalyzeFromDurable(
+                assistantMessageId,
+                gap.runId,
+                gap.nextEventIndex,
+              ),
+            onApprovalRequired: handleApprovalRequired,
+            onInteractionResolved: clearPendingInteraction,
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
@@ -1159,6 +1357,12 @@ export function useStreamLifecycle(
     [
       addToast,
       applyWorkSurfaceStreamEvent,
+      applyArtifactPublication,
+    applyExplainAnalyzeEvent,
+      markExplainAnalyzeInvalid,
+      repairExplainAnalyzeFromDurable,
+      clearPendingInteraction,
+      handleApprovalRequired,
       chatListHref,
       claimAttachedRun,
       clearAttachedRun,
@@ -1384,6 +1588,18 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onArtifactPublication: (event) => applyArtifactPublication(assistantMessageId, event),
+            onExplainAnalyzeEvent: (event) =>
+              applyExplainAnalyzeEvent(assistantMessageId, event),
+          onExplainAnalyzeInvalid: () => markExplainAnalyzeInvalid(assistantMessageId),
+            onStreamGap: (gap) =>
+              repairExplainAnalyzeFromDurable(
+                assistantMessageId,
+                gap.runId,
+                gap.nextEventIndex,
+              ),
+            onApprovalRequired: handleApprovalRequired,
+            onInteractionResolved: clearPendingInteraction,
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
@@ -1558,6 +1774,12 @@ export function useStreamLifecycle(
   }, [
     addToast,
     applyWorkSurfaceStreamEvent,
+    applyArtifactPublication,
+    applyExplainAnalyzeEvent,
+    markExplainAnalyzeInvalid,
+    repairExplainAnalyzeFromDurable,
+    clearPendingInteraction,
+    handleApprovalRequired,
     canResumeRun,
     chatListHref,
     claimAttachedRun,
@@ -1603,6 +1825,35 @@ export function useStreamLifecycle(
     [detail.chat.id, detail.chat.model, setDetail],
   );
 
+  const respondToApproval = useCallback(
+    async (decision: "allow" | "deny") => {
+      if (!pendingApproval || approvalResponsePending) return;
+      const approval = pendingApproval;
+      setApprovalResponsePending(true);
+      try {
+        await respondChatRunApproval(detail.chat.id, approval, decision);
+        setPendingApproval((current) =>
+          current?.requestId === approval.requestId ? null : current,
+        );
+      } catch (error) {
+        addToast(
+          error instanceof Error
+            ? error.message
+            : "Failed to submit the approval decision.",
+          "error",
+        );
+      } finally {
+        setApprovalResponsePending(false);
+      }
+    },
+    [
+      addToast,
+      approvalResponsePending,
+      detail.chat.id,
+      pendingApproval,
+    ],
+  );
+
   // -- Cleanup on unmount --
   useEffect(() => {
     const stopReconcile = stopReconcileRef.current;
@@ -1628,6 +1879,9 @@ export function useStreamLifecycle(
   ]);
 
   return {
+    pendingApproval,
+    approvalResponsePending,
+    respondToApproval,
     nextStreamAbortSignal,
     applyWorkSurfaceStreamEvent,
     resetWorkSurfaceRun,

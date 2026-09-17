@@ -31,10 +31,24 @@ pub enum ToolEngineRegistrationError {
 /// `args` prevents internal runtime identity from violating strict provider
 /// schemas or changing the semantic identity of a tool call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolInvocationAdmissionSource {
+    #[default]
+    Policy,
+    ImplicitPolicy,
+    ParentApproval,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolInvocationMetadata<'a> {
+    pub task_resolution_authority:
+        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
+    pub admission_source: Option<ToolInvocationAdmissionSource>,
+    /// Durable user-intent epoch used by the invocation's atomic action
+    /// admission. Provider arguments cannot populate this field.
+    pub expected_control_epoch: Option<i64>,
 }
 
 #[async_trait]
@@ -383,6 +397,7 @@ mod tests {
                     "run_id": invocation.run_id,
                     "turn_chain_id": invocation.turn_chain_id,
                     "tool_call_id": invocation.tool_call_id,
+                    "admission_source": format!("{:?}", invocation.admission_source),
                 })
                 .to_string(),
             )
@@ -422,9 +437,12 @@ mod tests {
                 &TestContext { prefix: "ctx" },
                 &args,
                 ToolInvocationMetadata {
+                    task_resolution_authority: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),
+                    admission_source: Some(ToolInvocationAdmissionSource::Policy),
+                    expected_control_epoch: None,
                 },
                 None,
             )
@@ -436,6 +454,7 @@ mod tests {
         assert_eq!(output["run_id"], "run-1");
         assert_eq!(output["turn_chain_id"], "turn-1");
         assert_eq!(output["tool_call_id"], "call-1");
+        assert_eq!(output["admission_source"], "Some(Policy)");
         assert!(output["arguments"].get("_run_id").is_none());
         assert!(output["arguments"].get("_turn_chain_id").is_none());
         assert!(output["arguments"].get("_tool_call_id").is_none());

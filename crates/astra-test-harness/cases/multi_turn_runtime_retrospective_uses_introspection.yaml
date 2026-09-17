@@ -1,0 +1,56 @@
+name: multi_turn_runtime_retrospective_uses_introspection
+description: |
+  **What**: Ask for an ordinary answer, then request a systemic retrospective of the session's
+  runtime state and tool behavior without naming any internal observation tool.
+  **Tests**: Natural-language observability intent causes evidence acquisition instead of a prose-only
+  claim that snapshots or traces were inspected.
+  **Why**: A retrospective that skips introspection can hallucinate tool counts, lifecycle state,
+  or trace facts from assistant prose and lossy session memory.
+  **Pass means**: The retrospective calls introspect before runtime claims, keeps observation
+  bounded, and avoids a redundant shell-based journal workflow.
+  **Fail means**: The model answers from conversation history alone, fabricates telemetry provenance,
+  or churns observation calls.
+prompt: |
+  请用一句话解释：代码 review 和修改代码有什么区别？不要使用工具。
+models:
+  - deepseek-v4-flash
+capability: "custom:multi_turn_runtime_retrospective_uses_introspection"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 180
+debug_log: true
+steps:
+  - prompt: |
+      现在系统性反省这段 session 的实际运行状态：用了哪些工具、有没有异常 trace、
+      回答依据来自哪里，以及为什么形成刚才的行为。请基于运行证据分析，不要修改任何东西。
+    criteria:
+      - type: tool_called
+        name: introspect
+      - type: judger
+        question: |
+          The user requested a read-only, evidence-based retrospective of this session's runtime
+          state, tool use, traces, provenance, and behavior. Score 1.0 if the answer grounds claims
+          in the introspect result, labels uncertainty or source boundaries, distinguishes the
+          introspect snapshot cutoff from diagnostic calls made afterward, and makes no claim that
+          unsupported telemetry was inspected. Score 0.0 if it is merely a prose self-critique,
+          contradicts the journal-visible diagnostic tool count, or claims snapshot/trace evidence
+          without a matching tool result.
+        threshold: 0.8
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 4
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 3
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: turn_rounds_between
+    min: 1
+    max: 6

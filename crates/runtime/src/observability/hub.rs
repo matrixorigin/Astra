@@ -426,19 +426,21 @@ pub fn latest_context_trace_signal(session: &ObservabilitySession) -> Option<Con
         });
     let memory = (!trace.memory.query.trim().is_empty()
         || !trace.memory.memories_selected.is_empty()
-        || trace.memory.candidates_considered > 0)
-        .then(|| ContextTraceMemorySignal {
-            query: trace.memory.query.trim().chars().take(160).collect(),
-            candidates_considered: trace.memory.candidates_considered,
-            selected_memory_ids: trace
-                .memory
-                .memories_selected
-                .iter()
-                .map(|memory| memory.memory_id.clone())
-                .collect(),
-            total_tokens: trace.memory.total_tokens,
-            latency_ms: trace.memory.retrieval_latency_ms,
-        });
+        || trace.memory.candidates_considered > 0
+        || trace.memory.outcome.was_attempted())
+    .then(|| ContextTraceMemorySignal {
+        outcome: trace.memory.outcome,
+        query: trace.memory.query.trim().chars().take(160).collect(),
+        candidates_considered: trace.memory.candidates_considered,
+        selected_memory_ids: trace
+            .memory
+            .memories_selected
+            .iter()
+            .map(|memory| memory.memory_id.clone())
+            .collect(),
+        total_tokens: trace.memory.total_tokens,
+        latency_ms: trace.memory.retrieval_latency_ms,
+    });
     let history = (trace.history.total_turns_available > 0
         || !trace.history.turns_retained.is_empty()
         || !trace.history.turns_compressed.is_empty()

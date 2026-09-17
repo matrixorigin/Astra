@@ -317,7 +317,7 @@ pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
     match format.as_str() {
         "" | "text" | "txt" => {
             let rendered = render_text(&root);
-            print!("{rendered}");
+            stdout_print!("{rendered}");
             if skipped > 0 {
                 eprintln!(
                     "[journal tree] note: skipped {skipped}/{total} events (unattachable SubRunCompleted, etc.)"
@@ -333,7 +333,7 @@ pub(crate) fn run_tree(args: &cli_args::JournalTreeArgs) -> Result<(), String> {
                 "skipped_events": skipped,
                 "root": root,
             });
-            println!(
+            stdout_println!(
                 "{}",
                 serde_json::to_string_pretty(&body).unwrap_or_default()
             );

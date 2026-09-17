@@ -2,11 +2,49 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
 use crate::tool::categories::registry;
-use crate::tool::result::semantics::tool_dedup_signature;
+use crate::tool::result::semantics::canonical_tool_identity_parts;
+
+/// A stall-equivalence key, not an execution identity or permission to reuse a
+/// result. Producers retain their own argument normalization rules; retained
+/// detector state never needs the original arguments.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StallSignature {
+    tool_name: String,
+    digest: [u8; 32],
+}
+
+impl StallSignature {
+    pub fn new(tool_name: &str, canonical_bytes: &[u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"astra.stall.signature.v1\0");
+        hash.update((tool_name.len() as u64).to_be_bytes());
+        hash.update(tool_name.as_bytes());
+        hash.update(canonical_bytes);
+        Self {
+            tool_name: tool_name.to_owned(),
+            digest: hash.finalize().into(),
+        }
+    }
+
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    /// Diagnostic projection only; never parse this back into detector state.
+    pub fn display_hint(&self) -> String {
+        let digest: String = self.digest[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{}:{digest}", self.tool_name)
+    }
+}
 
 /// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -39,7 +77,7 @@ pub const CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD: usize = 5;
 /// full `name+args` signature set. Used to decide whether we've crossed
 /// the [`CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD`] threshold.
 #[must_use]
-pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<String>]) -> usize {
+pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<crate::stall::StallSignature>]) -> usize {
     let Some(last) = turn_sigs.last() else {
         return 0;
     };
@@ -76,7 +114,7 @@ pub fn canonical_tool_args(raw: &str) -> String {
     }
 }
 
-pub fn server_tool_call_signature(tool_calls: &[Value]) -> BTreeSet<String> {
+pub fn server_tool_call_signature(tool_calls: &[Value]) -> BTreeSet<crate::stall::StallSignature> {
     tool_calls
         .iter()
         .map(|tool_call| {
@@ -105,13 +143,13 @@ pub fn server_tool_call_signature(tool_calls: &[Value]) -> BTreeSet<String> {
                         .unwrap_or_default();
                     (n.to_string(), a)
                 };
-            format!("{name}:{}", canonical_tool_args(&arguments))
+            StallSignature::new(&name, canonical_tool_args(&arguments).as_bytes())
         })
         .collect()
 }
 
 pub fn record_server_tool_signatures(
-    tool_sigs: &mut Vec<BTreeSet<String>>,
+    tool_sigs: &mut Vec<BTreeSet<crate::stall::StallSignature>>,
     tool_calls: &[Value],
     window: usize,
 ) {
@@ -128,7 +166,7 @@ pub fn record_server_tool_signatures(
 
 /// Detect exact-repetition stall: same tool calls with same args repeated N times.
 pub fn detect_server_stall(
-    tool_sigs: &[BTreeSet<String>],
+    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
     window: usize,
 ) -> Result<bool, StallDetectionError> {
     if window == 0 {
@@ -153,13 +191,18 @@ pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
 pub const ACTIVE_REWARD_HACKING_RISK_THRESHOLD: f64 = 0.5;
 
 /// Per-round signature set and tool-name set for astra flat `tool_calls` rows (`name` + `arguments` JSON).
-pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>, HashSet<String>) {
-    let sig_set: BTreeSet<String> = tool_calls
+pub fn round_tool_call_sig_and_names(
+    tool_calls: &[Value],
+) -> (BTreeSet<crate::stall::StallSignature>, HashSet<String>) {
+    let sig_set: BTreeSet<crate::stall::StallSignature> = tool_calls
         .iter()
         .map(|tc| {
             let name = tool_call_name(tc).unwrap_or("");
             let args = tool_call_arguments_value(tc);
-            tool_dedup_signature(name, &args)
+            let (name, normalized) = canonical_tool_identity_parts(name, &args);
+            let canonical =
+                serde_json::to_vec(&normalized).expect("JSON values serialize without failure");
+            StallSignature::new(&name, &canonical)
         })
         .collect();
     let name_set: HashSet<String> = tool_calls
@@ -177,7 +220,7 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
 /// the general fix: progress comes from *arguments changing*, not from
 /// avoiding any particular tool.
 pub fn detect_cli_tool_sig_stall(
-    turn_sigs: &[BTreeSet<String>],
+    turn_sigs: &[BTreeSet<crate::stall::StallSignature>],
     window: usize,
 ) -> Result<bool, StallDetectionError> {
     detect_server_stall(turn_sigs, window)
@@ -196,7 +239,8 @@ pub enum DivergenceStatus {
     Diverging(usize),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RewardHackingAssessment {
     pub risk: f64,
     pub flags: Vec<String>,
@@ -373,12 +417,12 @@ pub const NOVELTY_FLOOR: f32 = 0.34;
 
 /// Total number of individual tool-call signatures across the last
 /// `window` rounds. Used as the denominator for novelty rate.
-fn total_sig_count(rounds: &[BTreeSet<String>]) -> usize {
+fn total_sig_count(rounds: &[BTreeSet<crate::stall::StallSignature>]) -> usize {
     rounds.iter().map(|r| r.len()).sum()
 }
 
 /// Union of all signatures across the last `window` rounds.
-fn distinct_sig_count(rounds: &[BTreeSet<String>]) -> usize {
+fn distinct_sig_count(rounds: &[BTreeSet<crate::stall::StallSignature>]) -> usize {
     let mut seen = BTreeSet::new();
     for r in rounds {
         for s in r {
@@ -392,7 +436,7 @@ fn distinct_sig_count(rounds: &[BTreeSet<String>]) -> usize {
 /// judge by which tools are used, only by whether the signature stream
 /// is repeating or stagnating.
 pub fn assess_progress(
-    tool_sigs: &[BTreeSet<String>],
+    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
     window: usize,
 ) -> Result<ProgressStatus, StallDetectionError> {
     if window == 0 {
@@ -433,13 +477,13 @@ pub fn assess_progress(
 /// `LowNovelty` maps to `Exploring` (surfaced as a hint, not a correction),
 /// and `Healthy` maps to `Healthy`.
 pub fn detect_divergence(
-    tool_sigs: &[BTreeSet<String>],
+    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
 ) -> Result<DivergenceStatus, StallDetectionError> {
     detect_divergence_with_window(tool_sigs, MAX_EXPLORATION_ROUNDS)
 }
 
 pub fn detect_divergence_with_window(
-    tool_sigs: &[BTreeSet<String>],
+    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
     exploration_round_window: usize,
 ) -> Result<DivergenceStatus, StallDetectionError> {
     match assess_progress(tool_sigs, exploration_round_window)? {
@@ -468,7 +512,8 @@ or take a different action (a different tool, or the same tool with different ar
 /// Structured analysis of a stall condition — replaces the flat STALL_NUDGE.
 /// Examines the tool call history to diagnose WHY the agent is stuck and
 /// suggest specific corrective actions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StallReflection {
     /// What happened: description of the stall pattern.
     pub what_happened: String,
@@ -486,7 +531,7 @@ impl StallReflection {
     /// Format as a nudge message for injection into the conversation.
     pub fn to_nudge_message(&self) -> String {
         let mut parts = vec![
-            format!("⚠ REFLECTION — Agent appears stuck.\n"),
+            "⚠ REFLECTION — Agent appears stuck.\n".to_string(),
             format!("What happened: {}\n", self.what_happened),
             format!("Why: {}\n", self.why),
             format!("What to try: {}", self.what_to_try),
@@ -503,11 +548,11 @@ impl StallReflection {
 
 /// Analyze stall history and build a structured reflection.
 ///
-/// `tool_sigs`: per-turn tool signatures (name:args sets).
+/// `tool_sigs`: per-turn opaque stall-equivalence signature sets.
 /// `error_tools`: tools that have active health avoidance due to repeated errors.
 /// `nudge_count`: how many nudges have been sent already (escalation).
 pub fn build_stall_reflection(
-    tool_sigs: &[BTreeSet<String>],
+    tool_sigs: &[BTreeSet<crate::stall::StallSignature>],
     error_tools: &[&str],
     nudge_count: usize,
 ) -> StallReflection {
@@ -518,7 +563,7 @@ pub fn build_stall_reflection(
     let mut tool_counts: HashMap<String, usize> = HashMap::new();
     for sigs in recent {
         for sig in sigs {
-            let name = sig.split(':').next().unwrap_or("").to_string();
+            let name = sig.tool_name().to_owned();
             if !name.is_empty() {
                 *tool_counts.entry(name).or_default() += 1;
             }
@@ -658,6 +703,7 @@ pub fn detect_nudge_ignored(
 /// when corrections have been ineffective (window widens to reduce false
 /// positives).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdaptiveStallThresholds {
     /// Repetition window for stall detection (default: SERVER_STALL_WINDOW).
     pub stall_window: usize,
@@ -694,10 +740,107 @@ impl AdaptiveStallThresholds {
 mod tests {
     use super::*;
 
-    fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<String>> {
+    #[test]
+    fn stall_signature_retains_equivalence_without_retaining_arguments() {
+        let signature = StallSignature::new("bash", b"private-argument-sentinel");
+        assert_eq!(signature.tool_name(), "bash");
+        assert_eq!(
+            signature,
+            StallSignature::new("bash", b"private-argument-sentinel")
+        );
+        assert_ne!(signature, StallSignature::new("bash", b"different"));
+        assert_ne!(
+            signature,
+            StallSignature::new("read_file", b"private-argument-sentinel")
+        );
+        // Length framing prevents ambiguity between the name and argument bytes.
+        assert_ne!(
+            StallSignature::new("ab", b"c"),
+            StallSignature::new("a", b"bc")
+        );
+        let wire = serde_json::to_value(&signature).unwrap();
+        assert!(!wire.to_string().contains("private-argument-sentinel"));
+        assert_eq!(
+            serde_json::from_value::<StallSignature>(wire.clone()).unwrap(),
+            signature
+        );
+        for field in ["tool_name", "digest"] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<StallSignature>(missing).is_err());
+        }
+        let mut unknown = wire;
+        unknown["arguments"] = serde_json::json!("unexpected");
+        assert!(serde_json::from_value::<StallSignature>(unknown).is_err());
+    }
+
+    #[test]
+    fn typed_stall_producers_preserve_old_equivalence_classes() {
+        let calls = [
+            serde_json::json!({"name":"read_file","arguments":{"path":"private-argument-sentinel","limit":1}}),
+            serde_json::json!({"function":{"name":"read_file","arguments":"{\"limit\":1,\"path\":\"private-argument-sentinel\"}"}}),
+            serde_json::json!({"name":"read_file","arguments":{"path":"different","limit":1}}),
+            serde_json::json!({"name":"bash","arguments":{"command":"git diff -- src/"}}),
+            serde_json::json!({"name":"git_diff","arguments":{"path":"src","ref":"HEAD"}}),
+            serde_json::json!({}),
+        ];
+        // Literal oracle from the old server representation, independent of the
+        // new key constructor. In particular the server does NOT fold aliases.
+        let server_old = [
+            r#"read_file:{"limit":1,"path":"private-argument-sentinel"}"#,
+            r#"read_file:{"limit":1,"path":"private-argument-sentinel"}"#,
+            r#"read_file:{"limit":1,"path":"different"}"#,
+            r#"bash:{"command":"git diff -- src/"}"#,
+            r#"git_diff:{"path":"src","ref":"HEAD"}"#,
+            ":",
+        ];
+        let server_new: Vec<_> = calls
+            .iter()
+            .map(|call| server_tool_call_signature(std::slice::from_ref(call)))
+            .collect();
+        let round_new: Vec<_> = calls
+            .iter()
+            .map(|call| round_tool_call_sig_and_names(std::slice::from_ref(call)).0)
+            .collect();
+        let round_old: Vec<_> = calls
+            .iter()
+            .map(|call| {
+                crate::tool::result::semantics::tool_dedup_signature(
+                    tool_call_name(call).unwrap_or(""),
+                    &tool_call_arguments_value(call),
+                )
+            })
+            .collect();
+        for a in 0..calls.len() {
+            for b in 0..calls.len() {
+                assert_eq!(
+                    server_old[a] == server_old[b],
+                    server_new[a] == server_new[b]
+                );
+                assert_eq!(round_old[a] == round_old[b], round_new[a] == round_new[b]);
+            }
+        }
+        assert!(
+            !serde_json::to_string(&server_new)
+                .unwrap()
+                .contains("private-argument-sentinel")
+        );
+        assert!(
+            !serde_json::to_string(&round_new)
+                .unwrap()
+                .contains("private-argument-sentinel")
+        );
+    }
+
+    fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<crate::stall::StallSignature>> {
         rounds
             .iter()
-            .map(|tools| tools.iter().map(|t| format!("{}:{{}}", t)).collect())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| StallSignature::new(t, b"{}"))
+                    .collect()
+            })
             .collect()
     }
 
@@ -749,31 +892,32 @@ mod tests {
     // ── CLI agentic: sig/name helpers + name-only stall ──
 
     #[test]
-    fn round_tool_call_sig_and_names_shapes() {
-        // Flat shape
-        let c1 = vec![serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}})];
-        let (sigs, names) = round_tool_call_sig_and_names(&c1);
-        assert!(
-            sigs.iter()
-                .any(|s| s.contains("read_file") && s.contains("a.rs"))
-        );
-        assert!(names.contains("read_file"));
-
-        // Canonical (OpenAI) shape
-        let c2 = vec![serde_json::json!({
+    fn round_tool_call_sig_and_names_records_exact_canonical_calls() {
+        let c1 = vec![serde_json::json!({
             "id": "call_1", "type": "function",
             "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
+        let (sigs, names) = round_tool_call_sig_and_names(&c1);
+        assert_eq!(
+            sigs,
+            BTreeSet::from([StallSignature::new("read_file", br#"{"path":"a.rs"}"#)])
+        );
+        assert!(names.contains("read_file"));
+
+        let c2 = vec![serde_json::json!({
+            "id": "call_2", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}
+        })];
         let (sigs, names) = round_tool_call_sig_and_names(&c2);
-        assert!(
-            sigs.iter()
-                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+        assert_eq!(
+            sigs,
+            BTreeSet::from([StallSignature::new("read_file", br#"{"path":"b.rs"}"#)])
         );
         assert!(names.contains("read_file"));
     }
 
     #[test]
-    fn round_tool_call_sig_canonicalizes_equivalent_diff_tools() {
+    fn round_tool_call_sig_canonicalizes_equivalent_shell_diff_commands() {
         let bash = vec![serde_json::json!({
             "id": "call_bash",
             "type": "function",
@@ -786,8 +930,8 @@ mod tests {
             "id": "call_git_diff",
             "type": "function",
             "function": {
-                "name": "git_diff",
-                "arguments": "{\"path\":\"src\",\"ref\":\"HEAD\"}"
+                "name": "bash",
+                "arguments": "{\"command\":\"git --no-pager diff -- src\"}"
             }
         })];
 
@@ -796,13 +940,18 @@ mod tests {
 
         assert_eq!(bash_sigs, structured_sigs);
         assert!(bash_names.contains("bash"));
-        assert!(structured_names.contains("git_diff"));
+        assert!(structured_names.contains("bash"));
     }
 
     // ── assess_progress (general progress-aware stall) ──
 
-    fn sig_set(s: &[&str]) -> BTreeSet<String> {
-        s.iter().map(|x| x.to_string()).collect()
+    fn sig_set(s: &[&str]) -> BTreeSet<crate::stall::StallSignature> {
+        s.iter()
+            .map(|x| {
+                let (name, args) = x.split_once(':').unwrap_or((x, ""));
+                StallSignature::new(name, args.as_bytes())
+            })
+            .collect()
     }
 
     #[test]
@@ -1031,10 +1180,10 @@ mod tests {
     #[test]
     fn reward_hacking_ignores_same_tool_different_args() {
         let tool_calls = vec![
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "a.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "b.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "a.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "b.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}}),
         ];
         let assessment = assess_reward_hacking(&tool_calls, 0.5, None).unwrap();
         assert!(
@@ -1053,9 +1202,9 @@ mod tests {
     #[test]
     fn reward_hacking_avoid_tools_prefers_repeated_or_exploration_tools() {
         let tool_calls = vec![
-            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            serde_json::json!({"name": "grep", "arguments": {"pattern": "TurnGuard"}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "grep", "arguments": {"pattern": "TurnGuard"}}}),
         ];
 
         assert_eq!(
@@ -1233,13 +1382,9 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(
-            sig.starts_with("read_file:"),
-            "expected read_file prefix, got: {sig}"
-        );
-        assert!(
-            sig.contains("main.rs"),
-            "expected main.rs in sig, got: {sig}"
+        assert_eq!(
+            sig,
+            &StallSignature::new("read_file", br#"{"path":"src/main.rs"}"#)
         );
     }
 
@@ -1253,13 +1398,9 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(
-            sig.starts_with("read_file:"),
-            "expected read_file prefix, got: {sig}"
-        );
-        assert!(
-            sig.contains("main.rs"),
-            "expected main.rs in sig, got: {sig}"
+        assert_eq!(
+            sig,
+            &StallSignature::new("read_file", br#"{"path":"src/main.rs"}"#)
         );
     }
 
@@ -1306,7 +1447,7 @@ mod tests {
     #[test]
     fn no_false_stall_with_flat_format_different_args() {
         // Simulate 4 rounds of read_file with different paths (flat format)
-        let mut tool_sigs: Vec<BTreeSet<String>> = Vec::new();
+        let mut tool_sigs: Vec<BTreeSet<crate::stall::StallSignature>> = Vec::new();
         let window = SERVER_STALL_WINDOW.max(MAX_EXPLORATION_ROUNDS) + 2;
 
         // Round 1: read_file(Cargo.toml)
@@ -1354,7 +1495,7 @@ mod tests {
     /// Verify that ACTUAL stall (same tool, same args) is still detected with flat format
     #[test]
     fn real_stall_detected_with_flat_format() {
-        let mut tool_sigs: Vec<BTreeSet<String>> = Vec::new();
+        let mut tool_sigs: Vec<BTreeSet<crate::stall::StallSignature>> = Vec::new();
         let window = SERVER_STALL_WINDOW.max(MAX_EXPLORATION_ROUNDS) + 2;
 
         // Same exact call 3x in a row (SERVER_STALL_WINDOW=3)
@@ -1445,10 +1586,7 @@ mod tests {
         let sigs = server_tool_call_signature(&tool_calls);
         assert_eq!(sigs.len(), 1);
         let sig = sigs.iter().next().unwrap();
-        assert!(
-            sig.starts_with(':'),
-            "missing name should produce empty prefix"
-        );
+        assert_eq!(sig.tool_name(), "");
     }
 
     #[test]
@@ -1456,7 +1594,7 @@ mod tests {
         let tool_calls = vec![serde_json::json!({"function": {"name": "bash"}})];
         let sigs = server_tool_call_signature(&tool_calls);
         let sig = sigs.iter().next().unwrap();
-        assert!(sig.starts_with("bash:"));
+        assert_eq!(sig.tool_name(), "bash");
     }
 
     #[test]
@@ -1466,7 +1604,7 @@ mod tests {
         assert_eq!(sigs.len(), 1);
         // Falls through to flat branch: empty name, empty args
         let sig = sigs.iter().next().unwrap();
-        assert!(sig.starts_with(':'));
+        assert_eq!(sig.tool_name(), "");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1475,7 +1613,7 @@ mod tests {
 
     #[test]
     fn record_sigs_empty_tool_calls_preserves_history() {
-        let mut sigs = vec![BTreeSet::from(["bash:{}".to_string()])];
+        let mut sigs = vec![BTreeSet::from([StallSignature::new("bash", b"{}")])];
         record_server_tool_signatures(&mut sigs, &[], 5);
         assert_eq!(
             sigs.len(),
@@ -1486,7 +1624,7 @@ mod tests {
 
     #[test]
     fn record_sigs_window_trims_oldest() {
-        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let mut sigs: Vec<BTreeSet<crate::stall::StallSignature>> = Vec::new();
         let calls = vec![serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}})];
         for _ in 0..5 {
             record_server_tool_signatures(&mut sigs, &calls, 3);
@@ -1496,16 +1634,16 @@ mod tests {
 
     #[test]
     fn record_sigs_single_call() {
-        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let mut sigs: Vec<BTreeSet<crate::stall::StallSignature>> = Vec::new();
         let calls = vec![serde_json::json!({"name": "grep", "arguments": {"pattern": "foo"}})];
         record_server_tool_signatures(&mut sigs, &calls, 5);
         assert_eq!(sigs.len(), 1);
-        assert!(sigs[0].iter().any(|s| s.contains("grep")));
+        assert!(sigs[0].iter().any(|s| s.tool_name() == "grep"));
     }
 
     #[test]
     fn record_sigs_exactly_at_window_no_trim() {
-        let mut sigs: Vec<BTreeSet<String>> = Vec::new();
+        let mut sigs: Vec<BTreeSet<crate::stall::StallSignature>> = Vec::new();
         let calls = vec![serde_json::json!({"name": "bash", "arguments": {}})];
         for _ in 0..3 {
             record_server_tool_signatures(&mut sigs, &calls, 3);
@@ -1538,21 +1676,30 @@ mod tests {
     #[test]
     fn stall_multi_tool_identical_rounds() {
         // Multi-tool rounds that are identical
-        let round: BTreeSet<String> = ["bash:{}".to_string(), "grep:{}".to_string()]
-            .into_iter()
-            .collect();
+        let round: BTreeSet<crate::stall::StallSignature> = [
+            StallSignature::new("bash", b"{}"),
+            StallSignature::new("grep", b"{}"),
+        ]
+        .into_iter()
+        .collect();
         let sigs = vec![round.clone(), round.clone(), round];
         assert!(detect_server_stall(&sigs, 3).unwrap());
     }
 
     #[test]
     fn stall_multi_tool_one_round_differs() {
-        let round_a: BTreeSet<String> = ["bash:{}".to_string(), "grep:{}".to_string()]
-            .into_iter()
-            .collect();
-        let round_b: BTreeSet<String> = ["bash:{}".to_string(), "list_dir:{}".to_string()]
-            .into_iter()
-            .collect();
+        let round_a: BTreeSet<crate::stall::StallSignature> = [
+            StallSignature::new("bash", b"{}"),
+            StallSignature::new("grep", b"{}"),
+        ]
+        .into_iter()
+        .collect();
+        let round_b: BTreeSet<crate::stall::StallSignature> = [
+            StallSignature::new("bash", b"{}"),
+            StallSignature::new("list_dir", b"{}"),
+        ]
+        .into_iter()
+        .collect();
         let sigs = vec![round_a.clone(), round_b, round_a];
         assert!(!detect_server_stall(&sigs, 3).unwrap());
     }
@@ -1879,9 +2026,9 @@ mod tests {
     #[test]
     fn reward_hacking_assessment_high_risk_on_identical_calls() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
         ];
         let assessment = assess_reward_hacking(&calls, 0.9, None).unwrap();
         assert!(
@@ -1897,9 +2044,9 @@ mod tests {
     #[test]
     fn no_reward_hacking_on_same_tool_different_args() {
         let calls = vec![
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
         ];
         let assessment = assess_reward_hacking(&calls, 0.8, None).unwrap();
         assert!(
@@ -1914,8 +2061,8 @@ mod tests {
     #[test]
     fn low_user_feedback_amplifies_reward_hacking_risk() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
         ];
         let without_feedback = assess_reward_hacking(&calls, 0.5, None).unwrap();
         let with_low_feedback = assess_reward_hacking(&calls, 0.5, Some(20)).unwrap();

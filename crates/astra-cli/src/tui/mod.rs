@@ -14,10 +14,8 @@ mod bg_task_proxy;
 pub(crate) mod bg_task_rendering;
 mod board_pin;
 mod bottom_pane;
-mod cancel_fanout;
 mod config_edit_router;
 mod context_panel;
-mod resume_summary;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
 // `docs/design/tui-refactor.md`.
@@ -85,12 +83,24 @@ mod task_list;
 mod task_status;
 mod terminal;
 mod terminal_palette;
+mod terminal_startup;
 mod theme;
+
 mod timeline;
 pub(crate) mod turn_event;
 pub(crate) mod ui_adapter;
+pub(crate) mod work_board_projection;
 mod worktrees;
 mod wrapping;
+
+#[cfg(test)]
+pub(crate) use app_event::TuiAppEvent;
+#[cfg(test)]
+pub(crate) use stream_bridge::{create_channels, create_controlled_per_turn_bridge};
+
+// Shared terminal palette for CLI output rendered outside the TUI.
+pub(crate) use custom_terminal::to_crossterm_color;
+pub(crate) use theme::current_stderr as current_stderr_theme;
 
 pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 

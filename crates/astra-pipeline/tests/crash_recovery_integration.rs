@@ -37,9 +37,11 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         messages: vec![],
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
+        run_execution_budget: None,
+        run_execution_control: None,
         blocked_tools: vec![],
         recent_tools: vec![],
-        activated_deferred_tool_names: vec![],
+        deferred_tool_activations: vec![],
         memory_context: None,
         delegation_id: None,
         delegation_pattern: None,
@@ -50,6 +52,7 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         pipeline_state: None,
         compaction_state: None,
         config_version_id: None,
+        workspace_observation_quarantine: None,
     }));
 
     write_step_checkpoint(TEST_USER_ID, session_id, 1, &checkpoint).unwrap();
@@ -75,6 +78,7 @@ fn make_step_event(
 ) -> StepEvent {
     StepEvent {
         event_id: event_id.to_string(),
+        run_id: "test-run".into(),
         canonical_event_id: None,
         step_id: step_id.to_string(),
         event_type,
@@ -352,6 +356,7 @@ fn failed_side_effect_tool_requires_user_input() {
         &[
             StepEvent {
                 event_id: "ev-1".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "session-turn-2-step-1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
@@ -362,6 +367,7 @@ fn failed_side_effect_tool_requires_user_input() {
             },
             StepEvent {
                 event_id: "ev-2".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "session-turn-2-step-1".to_string(),
                 event_type: StepEventType::ToolCallFailed,

@@ -226,5 +226,5 @@ pub async fn run_team_http_db_fidelity() {
     .await;
     let (_, _) = delete_json(&ctx.app, &path_detail, Some(auth)).await;
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

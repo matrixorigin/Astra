@@ -26,8 +26,8 @@ pub struct SkillAutoRouteJudgeContext {
 pub enum SkillAutoRouteJudgeError {
     #[error("Prompt encoding failure: {0}")]
     PromptEncoding(String),
-    #[error("LLM transport failure: {0}")]
-    Transport(String),
+    #[error("Inference failed: {0}")]
+    Inference(astra_core::ClassifiedError),
     #[error("LLM returned malformed response: {raw}")]
     Malformed { raw: String },
     #[error("LLM rejected: {0}")]

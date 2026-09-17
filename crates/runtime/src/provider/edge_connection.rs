@@ -269,7 +269,7 @@ mod tests {
         assert!(!caps.is_empty());
         assert!(caps.contains(&ToolCapability::Named("bash".into())));
         assert!(caps.contains(&ToolCapability::Named("read_file".into())));
-        assert!(caps.contains(&ToolCapability::Named("git".into())));
+        assert!(caps.contains(&ToolCapability::Named("worktree".into())));
         assert!(!caps.contains(&ToolCapability::Named("memory".into())));
     }
 
@@ -435,6 +435,7 @@ mod tests {
                 _user_id: &str,
                 _edge_agent_id: &str,
                 _edge_id_header: &str,
+                _registration_claim_id: Option<&str>,
             ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
                 Ok(())
             }

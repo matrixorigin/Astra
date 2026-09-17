@@ -27,7 +27,7 @@ use crate::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
     HistorySelectionTrace, MemoryRetrievalTrace, ModelRequestTraceIdentity, SystemPromptBreakdown,
     TokenBudgetTrace, ToolSurfaceTrace, build_history_trace_from_compression,
-    build_memory_trace_from_retrieval, build_tool_surface_trace,
+    build_memory_trace_from_entries, build_memory_trace_from_retrieval, build_tool_surface_trace,
     build_tool_surface_trace_with_deferred,
 };
 
@@ -181,6 +181,19 @@ impl TurnTraceCollector {
     ) {
         let trace =
             build_memory_trace_from_retrieval(query, candidates_count, ranked_results, latency_ms);
+        let mut state = recover_rwlock_write(&self.inner);
+        state.memory = Some(trace);
+    }
+
+    /// Record the exact prompt-memory entries admitted by the runtime owner.
+    pub fn record_prompt_memory_retrieval(
+        &self,
+        query: &str,
+        outcome: astra_turn_types::MemoryRetrievalOutcome,
+        entries: &[crate::context_sources::MemoryEntry],
+        latency_ms: u64,
+    ) {
+        let trace = build_memory_trace_from_entries(query, outcome, entries, latency_ms);
         let mut state = recover_rwlock_write(&self.inner);
         state.memory = Some(trace);
     }

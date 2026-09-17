@@ -8,14 +8,13 @@ pub const MEMORY_ACTIONS: &[&str] = &[
     "expand",
     "forget",
     "update",
-    "focus",
     "reflect",
     "profile",
     "feedback",
 ];
 
 pub const MEMORY_ACTIONS_DISPLAY: &str =
-    "remember, recall, session_audit, expand, forget, update, focus, reflect, profile, feedback";
+    "remember, recall, session_audit, expand, forget, update, reflect, profile, feedback";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryAction {
@@ -25,7 +24,6 @@ pub enum MemoryAction {
     Expand,
     Forget,
     Update,
-    Focus,
     Reflect,
     Profile,
     Feedback,
@@ -40,7 +38,6 @@ impl MemoryAction {
             Self::Expand => "expand",
             Self::Forget => "forget",
             Self::Update => "update",
-            Self::Focus => "focus",
             Self::Reflect => "reflect",
             Self::Profile => "profile",
             Self::Feedback => "feedback",
@@ -71,7 +68,6 @@ pub fn memory_action_from_args(args: &Value) -> Result<MemoryAction, String> {
             "expand" => Ok(MemoryAction::Expand),
             "forget" => Ok(MemoryAction::Forget),
             "update" => Ok(MemoryAction::Update),
-            "focus" => Ok(MemoryAction::Focus),
             "reflect" => Ok(MemoryAction::Reflect),
             "profile" => Ok(MemoryAction::Profile),
             "feedback" => Ok(MemoryAction::Feedback),
@@ -118,5 +114,10 @@ mod tests {
         let unknown =
             memory_action_from_args(&json!({"action": "store"})).expect_err("unknown must fail");
         assert!(unknown.contains("unknown `memory` action 'store'"));
+
+        let removed = memory_action_from_args(&json!({"action": "focus"}))
+            .expect_err("an action without a backend contract must not remain callable");
+        assert!(removed.contains("unknown `memory` action 'focus'"));
+        assert!(!removed.contains("focus, reflect"));
     }
 }

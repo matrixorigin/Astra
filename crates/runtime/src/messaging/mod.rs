@@ -22,6 +22,6 @@ pub use astra_messaging::{
     InProcessMetrics, InProcessTransport, LatencySnapshot, LatencyTracker, MailboxError,
     MessagePayload, MessageStream, MessageTarget, MessageTransport, MessagingEvent,
     MessagingEventHandler, MessagingMetrics, MetricsSnapshot, PendingAckTracker, PermissionOutcome,
-    RequestType, SendResult, StderrEventHandler, SubRunInfo,
+    RequestType, StderrEventHandler, SubRunInfo,
 };
 pub use astra_messaging::{db_transport, in_process, metrics, router, transport, types};

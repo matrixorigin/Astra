@@ -25,6 +25,13 @@ pub enum BackgroundActivity {
     /// attempted — not for the rule-based fallback, which is fast enough
     /// to not warrant a UI signal.
     Started { session_id: String, turn: u32 },
+    /// The selector completed successfully and confirmed that the canonical
+    /// sparse memory patch is empty, so no persistence was necessary.
+    NoChange {
+        session_id: String,
+        turn: u32,
+        duration_ms: u64,
+    },
     /// Extraction finished (success or fallback). `source` says which
     /// path produced the written content; `duration_ms` is the full
     /// wall-clock time from `maybe_spawn` to write.
@@ -101,7 +108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriber_sees_started_and_finished_in_order() {
+    async fn subscriber_sees_started_and_terminal_outcome_in_order() {
         let b = BackgroundActivityBroker::new();
         let mut rx = b.subscribe();
         b.emit(BackgroundActivity::Started {
@@ -120,5 +127,20 @@ mod tests {
         assert!(
             matches!(second, BackgroundActivity::Finished { duration_ms, .. } if duration_ms == 700)
         );
+
+        b.emit(BackgroundActivity::NoChange {
+            session_id: "s".to_string(),
+            turn: 2,
+            duration_ms: 300,
+        });
+        let third = rx.recv().await.unwrap();
+        assert!(matches!(
+            third,
+            BackgroundActivity::NoChange {
+                turn: 2,
+                duration_ms: 300,
+                ..
+            }
+        ));
     }
 }

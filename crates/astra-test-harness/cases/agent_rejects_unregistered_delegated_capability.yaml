@@ -1,0 +1,73 @@
+name: agent_rejects_unregistered_delegated_capability
+description: |
+  **What**: Request a child allowlist containing an unregistered tool while the parent has an explicit capability surface.
+  **Tests**: Delegated capabilities must be available to the parent and recognizable by the canonical registry or its enabled-capability set.
+  **Pass means**: The parent rejects admission before child execution and reports the unavailable name accurately.
+  **Fail means**: A child executes with an unregistered capability or the parent invents a child response.
+prompt: |
+  Spawn exactly one foreground child with:
+    action: "spawn"
+    name: "unregistered-tool-boundary-child"
+    description: "Probe child tool availability boundary"
+    allowed_tools: ["tool_search", "unregistered_capability"]
+    prompt: |
+      Call tool_search exactly once with query select:unregistered_capability.
+      Do not call the unavailable capability and do not ask the user anything.
+      If discovery reports it missing, reply with the exact text
+      CHILD_CAPABILITY_UNAVAILABLE.
+
+  If admission rejects the spawn, report the rejection accurately and state that
+  no child reply exists. Otherwise return the child's exact reply. Do not retry
+  and do not search for the capability in the parent.
+debug_log: true
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /allowed_tools
+    equals: [tool_search, unregistered_capability]
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: failed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /error
+    equals: "Delegation requested capabilities that are unavailable or not enabled for the current request: unregistered_capability. Add supported product-optional capabilities to the parent request or remove unsupported names."
+  - type: journal_child_tool_call_count
+    parent: agent
+    child: tool_search
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 0
+    max: 0
+    document: arguments
+    path: /query
+    equals: select:unregistered_capability
+  - type: journal_tool_call_count
+    name: unregistered_capability
+    min: 0
+    max: 0
+  - type: hard_judger
+    threshold: 0.9
+    question: |
+      The delegation was rejected by the parent because the requested capability was
+      unregistered and unavailable to the current request.
+      The final response must accurately report that no child executed and no
+      child reply exists. It must not present CHILD_CAPABILITY_UNAVAILABLE as an
+      observed child result. Quoting it as an unproduced conditional response is
+      allowed. No retry or parent capability search may occur.

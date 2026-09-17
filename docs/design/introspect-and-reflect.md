@@ -74,6 +74,29 @@ refs[]
 
 Facts should be concise and attributable. Raw logs should not be returned by default.
 
+The resident `reflect` schema accepts a concrete `question` for its default
+summary view. For typed options such as `facet`, `depth`, or `horizon`, select
+`reflect` with `tool_search(query="select:reflect")`, then call `invoke_tool`
+with the selected contract. Selection preserves the resident schema and its
+prompt-cache identity. A diagnostic succeeds only when its tool outcome
+succeeds; requesting valid parameters alone does not prove observations were
+obtained.
+
+Routine self-diagnosis starts with a summary overview (or hint for a quick
+check), reusing applicable observations. System guidance, tool descriptions,
+and bundled workflows must agree on this default. A concrete evidence gap or
+an explicit deep-audit request can justify deeper inspection; no fixed call
+quota limits recovery. Snapshot claims must exclude later diagnostic calls,
+and completed-turn totals must not be presented as totals for an ongoing turn.
+
+Oversized structured introspection has a distinct bounded model projection;
+the full durable report remains unchanged. This projection preserves complete
+JSON and supporting evidence identities, prioritizes important observations,
+and explicitly lists omitted fields and counts separately from the source
+report's budget. It does not split JSON or duplicate the causal graph. Another
+live introspection obtains a new snapshot, not a continuation of the old one;
+omission alone is not a reason to request more evidence.
+
 ## Capability introspection
 
 Capability introspection must distinguish:
@@ -104,6 +127,14 @@ Context introspection should report:
 It should not dump the whole prompt unless explicit debug permission allows it.
 
 ## Reflection
+
+Routine reflection defaults to `summary`. `hint` and `summary` return bounded
+observations, supporting evidence, and prioritized actions without expanding
+the causal graph. Omitted material is reported through the result budget;
+retained observations and actions must not contain dangling evidence references.
+Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph
+inspection. This is progressive disclosure, not a usage quota or tool disablement.
+Server-backed and local-journal reflection share the same report projection.
 
 Reflection may produce:
 

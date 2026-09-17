@@ -35,17 +35,19 @@ criteria:
   - type: turn_rounds_between
     min: 1
     max: 3
-  - type: judger
+  - type: hard_judger
     question: |
       Evaluate based on the tool calls and text output only — do not read
       files yourself. The user asked the agent to read three files in
       parallel within a single turn and report one fact from each. Files
       A, B, C contain the literal facts: A→"the first letter is A",
       B→"the second letter is B", C→"the third letter is G".
-      Score 1.0 if the agent issued multiple read tool calls in one turn
-      AND surfaced a paraphrase of all three facts (A=A, B=B, C=G)
+      Score 1.0 if the agent issued all three read tool calls together
+      in the SAME LLM response/tool-call batch (same run, turn, and round),
+      not merely within the same user turn, AND surfaced a paraphrase of all three facts (A=A, B=B, C=G)
       without fabrication. Score 0.5 if all three facts appear but reads
-      were serialized over multiple turns. Score 0.0 if any fact is
+      were serialized over multiple rounds. Missing run/round identity cannot
+      establish batching and must not earn a passing score. Score 0.0 if any fact is
       missing or fabricated, or if the response includes a forced "you
       should batch" corrective injected mid-turn.
     threshold: 0.6

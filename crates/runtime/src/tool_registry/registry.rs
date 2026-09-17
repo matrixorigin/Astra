@@ -70,10 +70,18 @@ impl ToolRegistry {
             .into_iter()
             .filter(|schema| tool_schema_name(schema).is_some())
             .collect();
-        let measured_costs = Self::measure_all_schemas(&all_schemas);
+        let mut measured_costs = Self::measure_all_schemas(&all_schemas);
         let schema_index = Self::build_schema_index(&all_schemas);
         let always_load_schemas =
             Self::resolve_always_load(&all_schemas, &schema_index, surface_cfg);
+        // `always_load_schemas` is the projected wire surface, not the full
+        // catalog. Budget pressure, telemetry, and cache diagnostics must
+        // account for exactly what the provider receives; charging the full
+        // catalog schema here overstated the resident surface by several
+        // thousand tokens and could trigger premature compaction.
+        for (name, schema) in &always_load_schemas {
+            measured_costs.insert(name.clone(), Self::measure_schema_tokens(schema));
+        }
         let mut always_load_sorted: Vec<Value> =
             always_load_schemas.iter().map(|(_, s)| s.clone()).collect();
         sort_schemas_by_name(&mut always_load_sorted);
@@ -515,12 +523,12 @@ mod tests {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
-            sample_schema("github"),
+            sample_schema("web_search"),
             sample_schema("tool_search"),
             sample_schema("skill"),
         ];
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["github".into()],
+            pinned_tools: vec!["web_search".into()],
         };
 
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
@@ -530,7 +538,7 @@ mod tests {
             .map(|(name, _)| name.clone())
             .collect();
 
-        assert!(always_load_names.iter().any(|name| name == "github"));
+        assert!(always_load_names.iter().any(|name| name == "web_search"));
         assert!(
             always_load_names.iter().any(|name| name == "grep"),
             "default always_load declarations must stay in the resolved runtime surface"

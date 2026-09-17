@@ -1,41 +1,10 @@
-//! Phase-R10 adversarial contract pins for skill sub-run scaffolding.
+//! Adversarial contract pin for skill sub-run terminal projection.
 //!
-//! Locks in:
-//!   * Server-side `SUBRUN_MAX_TURNS` (30) and
-//!     `SUBRUN_MAX_CUMULATIVE_TOKENS` (500_000) — asymmetric-by-design
-//!     vs CLI ceilings, so drift on either side is surfaced.
-//!   * `SubRunResult` carries a typed terminal outcome independently from
-//!     partial text output.
-//!
-//! The CLI-side `SUBRUN_MAX_TURNS` / `SUBRUN_MAX_CUMULATIVE_TOKENS` are
-//! pinned inside `astra_cli::cli::skill_subrun`'s own `#[cfg(test)]` mod
-//! (the CLI is a binary crate, so its private consts are not visible
-//! from an integration test).
+//! `SubRunResult` carries a typed terminal outcome independently from partial
+//! text output. Execution bounds come from the shared adaptive runtime policy,
+//! not surface-specific constants.
 
-use astra_runtime::server::server_skill_subrun::{
-    SUBRUN_MAX_CUMULATIVE_TOKENS as SERVER_SUBRUN_MAX_TOKENS,
-    SUBRUN_MAX_TURNS as SERVER_SUBRUN_MAX_TURNS,
-};
 use astra_runtime::skills::executor::isolated::{SubRunOutcome, SubRunResult};
-
-#[test]
-fn server_subrun_max_turns_is_exactly_30() {
-    assert_eq!(SERVER_SUBRUN_MAX_TURNS, 30usize);
-}
-
-#[test]
-fn server_subrun_max_tokens_is_exactly_500_000() {
-    assert_eq!(SERVER_SUBRUN_MAX_TOKENS, 500_000u64);
-}
-
-#[test]
-fn server_subrun_tokens_strictly_exceeds_cli_subrun_tokens() {
-    // CLI ceiling is 120_000 (pinned in astra-cli's skill_subrun tests).
-    // Server ceiling intentionally larger; pin the inequality so a
-    // refactor unifying the two constants trips this guard at compile
-    // time (const block) rather than test time.
-    const _: () = assert!(SERVER_SUBRUN_MAX_TOKENS > 120_000);
-}
 
 #[test]
 fn subrun_result_preserves_typed_terminal_outcome() {

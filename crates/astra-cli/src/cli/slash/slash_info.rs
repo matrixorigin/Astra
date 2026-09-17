@@ -2,7 +2,6 @@ use crate::cli::surface::health_status_surface::api_probe_is_healthy;
 use crate::cli::{
     chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
     cli_config::cli_utils::truncate_str,
-    durable_bridge,
     permission_manager::PermissionManager,
     session::session_state::SessionState,
     stream::stream_render,
@@ -572,17 +571,17 @@ fn build_review_prompt(arg: &str) -> String {
     format!(
         "Review target: {target_line}\n\
 \n\
-Step 1: Fetch the diff.\n\
-- HEAD → `git(action=\"show\", revision=\"HEAD\")` (or parallel with `revision=\"HEAD~1\"` for last 2 commits)\n\
-- WORKING_TREE → `git(action=\"diff\")`\n\
-- Range/rev → `git(action=\"show\", revision=\"<rev>\")` or `git(action=\"diff\", ref=\"...\")`\n\
+Step 1: Fetch the diff through admitted tools; use Bash for these Git commands when available.\n\
+- HEAD → `git show HEAD` (use `git show HEAD~1` for the preceding commit)\n\
+- WORKING_TREE → `git diff HEAD`\n\
+- Range/rev → `git show <rev>` or `git diff <range>`\n\
 \n\
 Step 2: Review the diff. Write findings. Stop.\n\
 \n\
 Hard constraints:\n\
 - Do NOT call `read_file` on any file. The diff is sufficient.\n\
 - Exception: if a specific line is ambiguous, use `read_file` with `start_line`/`end_line` for ≤15 lines max. At most 2 such calls total.\n\
-- Do NOT call `grep`, `glob`, or `bash` unless the diff references an external file not shown.\n\
+- Use Bash for the requested Git diff reads. Do NOT call `grep`, `glob`, or unrelated Bash commands unless the diff references an external file not shown.\n\
 - Do NOT re-fetch the same commit twice.\n\
 \n\
 Output:\n\
@@ -1261,7 +1260,13 @@ pub(crate) async fn handle_info_command(
                 ),
                 GrepRequest::Files(pattern) => (
                     format!("Workspace glob · {pattern}"),
-                    executor.glob(&serde_json::json!({"pattern": pattern, "path": "."})),
+                    astra_tools::ToolExecutor::execute_with_metadata(
+                        &executor,
+                        "glob",
+                        &serde_json::json!({"pattern": pattern, "path": "."}),
+                    )
+                    .await
+                    .output,
                 ),
                 GrepRequest::Review(pattern) => {
                     let title = format!("Review grep · {pattern}");
@@ -1340,6 +1345,7 @@ pub(crate) async fn handle_info_command(
                 input_runtime_volatile_texts: &[],
                 input_work_unit_observations: &[],
                 semantic_query_override: None,
+                deferred_tool_activations: None,
                 session_id: state.session_id.as_deref(),
                 offering_id: None,
                 model: state.model.as_deref(),
@@ -1352,7 +1358,6 @@ pub(crate) async fn handle_info_command(
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(&state.cli_context),
                 recent_tools: &state.recent_tools,
-                activated_deferred_tool_names: None,
                 tool_health_entries: &state.tool_health_entries,
                 resume_restricted_tools: &state.resume_restricted_tools,
                 session_lessons: &state.session_lessons,
@@ -1363,10 +1368,13 @@ pub(crate) async fn handle_info_command(
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                execution_time_budget: None,
                 run_control: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
+                explain_analyze_terminal_degraded: None,
                 stream_json_emitter: None,
                 agent_live_event_sink: None,
                 approval_request_tx: None,
@@ -1384,12 +1392,9 @@ pub(crate) async fn handle_info_command(
                 file_journal: None,
                 file_state: None,
                 database_snapshot_journal: None,
-                git_stash_journal: None,
-                git_commit_journal: None,
+
                 git_worktree_journal: None,
                 session_state_journal: None,
-                task_manager: None,
-                task_notify_tx: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -1397,10 +1402,10 @@ pub(crate) async fn handle_info_command(
                 pipeline_state: None,
                 compaction_state: None,
                 consecutive_context_window_errors: 0,
+                workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
                 idempotency_cache: None,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
-                session_memory_extractor: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(state.harness_sink.clone()),
                 #[cfg(feature = "harness")]
@@ -2002,7 +2007,10 @@ pub(crate) async fn handle_info_command(
         }
 
         "/version" => {
-            eprintln!("{}", "  astra version 0.1.0 (Rust)".bold());
+            eprintln!(
+                "{}",
+                format!("  astra version {} (Rust)", env!("CARGO_PKG_VERSION")).bold()
+            );
         }
 
         "/info" | "/whoami" => {
@@ -2103,27 +2111,6 @@ pub(crate) async fn handle_info_command(
                         format!("  ✓ Rewound to turn {target}. Removed {removed} turn(s).").green()
                     );
                 }
-            }
-        }
-
-        "/report" => {
-            // Check active durable task state first, then fallback to last saved report
-            let report = state
-                .durable_task_state
-                .as_ref()
-                .and_then(|d| d.last_report.as_ref())
-                .or(state.last_delivery_report.as_ref());
-
-            if let Some(report) = report {
-                durable_bridge::display_delivery_report(report);
-                if arg.trim() == "save" || arg.trim() == "json" {
-                    durable_bridge::save_delivery_report_json(report);
-                }
-            } else {
-                eprintln!(
-                    "{}",
-                    "  No delivery report available. Complete a plan with /plan first.".dim()
-                );
             }
         }
 
@@ -2648,7 +2635,7 @@ mod tests {
     fn build_review_prompt_defaults_to_head() {
         let prompt = build_review_prompt("");
         assert!(prompt.contains("Review target: HEAD"));
-        assert!(prompt.contains("git(action=\"show\""));
+        assert!(prompt.contains("git show HEAD"));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 
@@ -2656,7 +2643,7 @@ mod tests {
     fn build_review_prompt_supports_working_tree() {
         let prompt = build_review_prompt("working");
         assert!(prompt.contains("Review target: WORKING_TREE"));
-        assert!(prompt.contains("git(action=\"diff\")"));
+        assert!(prompt.contains("git diff HEAD"));
         assert!(prompt.contains("Do NOT call `read_file`"));
     }
 

@@ -1,12 +1,11 @@
-//! Service-level error types for the durable task system.
+//! Shared service-level error types.
 //!
 //! Replaces `Result<_, String>` with structured errors so callers can branch
 //! on failure categories instead of parsing display strings.
 
 use std::fmt;
 
-/// Error returned by service-level operations such as
-/// [`DurableTaskLifecycle`](crate::durable_task::DurableTaskLifecycle).
+/// Error returned by service-level operations.
 ///
 /// Each variant carries a machine-readable `kind` tag and a human-readable
 /// `message`. The `source` field preserves the underlying error when available

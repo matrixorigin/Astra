@@ -14,6 +14,8 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,6 +25,52 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_REGISTRY_UNREGISTER_ATTEMPTS: usize = 3;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
+const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
+const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+type EdgeRegistryReleaseReconciliation = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+fn reconcile_edge_registry_release(
+    registry: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    lease: astra_services::multi_agent::EdgeRegistrationLease,
+) -> EdgeRegistryReleaseReconciliation {
+    Box::pin(async move {
+        let mut retry_delay = EDGE_REGISTRY_RELEASE_RETRY_BASE;
+        loop {
+            match tokio::time::timeout(
+                EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT,
+                registry.release_registration(&lease),
+            )
+            .await
+            {
+                Ok(Ok(settled)) => return settled,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %lease.current.user_id,
+                        edge_agent_id = %lease.current.edge_agent_id,
+                        %error,
+                        "edge WebSocket: durable registration publication remains unresolved"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %lease.current.user_id,
+                        edge_agent_id = %lease.current.edge_agent_id,
+                        timeout_ms = EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT.as_millis(),
+                        "edge WebSocket: durable registration publication attempt timed out"
+                    );
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(EDGE_REGISTRY_RELEASE_RETRY_MAX);
+        }
+    })
+}
 
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -119,11 +167,35 @@ async fn handle_edge_connection(
                 match serde_json::from_str::<EdgeClientMessage>(&text) {
                     Ok(EdgeClientMessage::Auth {
                         edge_agent_id,
+                        materialization_id,
+                        interaction_api_major,
                         hostname,
                         workspace_dir,
                         capabilities,
                     }) => {
-                        return Some((edge_agent_id, hostname, workspace_dir, capabilities));
+                        if interaction_api_major
+                            != astra_server_types::AGENT_INTERACTION_API_MAJOR
+                        {
+                            let _ = send_edge_msg(
+                                &ws_sink,
+                                EdgeServerMessage::AuthError {
+                                    message: format!(
+                                        "incompatible interaction contract: expected {}, received {}",
+                                        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                                        interaction_api_major,
+                                    ),
+                                },
+                            )
+                            .await;
+                            return None;
+                        }
+                        return Some((
+                            edge_agent_id,
+                            materialization_id,
+                            hostname,
+                            workspace_dir,
+                            capabilities,
+                        ));
                     }
                     _ => {
                         let _ = send_edge_msg(
@@ -142,34 +214,38 @@ async fn handle_edge_connection(
     })
     .await;
 
-    let (edge_agent_id, hostname, workspace_dir, capabilities) = match auth_result {
-        Ok(Some(auth)) => auth,
-        _ => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                "edge WebSocket auth timeout or closed before edge_auth"
-            );
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "auth timeout or connection closed".into(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
+    let (edge_agent_id, materialization_id, hostname, workspace_dir, capabilities) =
+        match auth_result {
+            Ok(Some(auth)) => auth,
+            _ => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    "edge WebSocket auth timeout or closed before edge_auth"
+                );
+                let _ = send_edge_msg(
+                    &ws_sink,
+                    EdgeServerMessage::AuthError {
+                        message: "auth timeout or connection closed".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
 
-    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id) {
+    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id)
+        || materialization_id.len() > 128
+        || !astra_runtime_env::is_valid_provider_id(&materialization_id)
+    {
         tracing::warn!(
             target: "astra_runtime::edge_ws",
             edge_agent_id = %edge_agent_id,
-            "edge WebSocket auth failed: invalid edge_agent_id"
+            "edge WebSocket auth failed: invalid edge or materialization identity"
         );
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
-                message: "invalid edge_agent_id".into(),
+                message: "invalid edge or materialization identity".into(),
             },
         )
         .await;
@@ -297,7 +373,19 @@ async fn handle_edge_connection(
     // fabricate tool names or claim capabilities it doesn't possess.
     // We validate against the server-side registry and strip anything
     // that doesn't check out.
-    let capabilities = validate_edge_capabilities(capabilities, &edge_agent_id, &user_id);
+    let capabilities = match validate_edge_capabilities(capabilities, &edge_agent_id, &user_id) {
+        Ok(capabilities) => Some(capabilities),
+        Err(message) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_ws",
+                edge_agent_id = %edge_agent_id,
+                error = %message,
+                "edge WebSocket capability admission failed"
+            );
+            let _ = send_edge_msg(&ws_sink, EdgeServerMessage::AuthError { message }).await;
+            return;
+        }
+    };
 
     tracing::info!(
         user_id = %user_id,
@@ -363,15 +451,18 @@ async fn handle_edge_connection(
     // replaced by this connection. Its DB implementation uses an edge_id CAS,
     // so this predecessor remains correct even when another pod reconnects the
     // same edge concurrently.
-    let mut registration = Box::pin(edge_registry.register_or_update_with_lease(
-        &user_id,
-        &edge_agent_id,
-        &edge_id_for_registry,
-        hostname.as_deref(),
-        workspace_dir.as_deref(),
-        capabilities.clone(),
-        workspace_id.as_deref(),
-    ));
+    let mut registration = Box::pin(
+        edge_registry.register_or_update_with_lease_and_materialization(
+            &user_id,
+            &edge_agent_id,
+            &edge_id_for_registry,
+            hostname.as_deref(),
+            workspace_dir.as_deref(),
+            capabilities.clone(),
+            workspace_id.as_deref(),
+            Some(&materialization_id),
+        ),
+    );
     let mut socket_closed_during_registration = false;
     let registration_result = loop {
         tokio::select! {
@@ -540,6 +631,7 @@ async fn handle_edge_connection(
         &ws_sink,
         EdgeServerMessage::AuthOk {
             user_id: user_id.clone(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         },
     )
     .await
@@ -588,56 +680,29 @@ async fn handle_edge_connection(
     // Only after DB success and with the forward loop already running: the new
     // sender becomes selectable inheriting the pending map. Release the reconnect
     // lock immediately afterward so it never spans the connection's lifetime.
-    let pool_generation = state.edge_connection_pool.commit_reconnect(
-        reconnect,
-        &user_id,
-        &edge_agent_id,
-        hostname.clone(),
-        workspace_dir.clone(),
-        capabilities,
-        workspace_id.clone(),
-        pool_tx,
-    );
-    match edge_registry
-        .release_registration(&registration_lease)
-        .await
-    {
-        Ok(false) if registration_lease.claim_id.is_some() => {
-            // A definite claim mismatch means another pod already owns the
-            // durable generation. Fail closed instead of publishing a local
-            // connection that cross-pod routing cannot consistently target.
-            state.edge_connection_pool.unregister_generation(
-                &user_id,
-                &edge_agent_id,
-                pool_generation,
-            );
-            forward_task.abort();
-            drop(reconnect_guard);
-            state
-                .edge_connection_pool
-                .gc_reconnect_lock(&user_id, &edge_agent_id);
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "edge registry registration claim lost".into(),
-                },
-            )
-            .await;
-            return;
-        }
-        Err(error) => {
-            // The claim has a DB-side expiry, so an outcome-unknown release
-            // delays another cross-pod reconnect but cannot fence this healthy
-            // connection forever.
-            tracing::error!(
-                target: "astra_runtime::edge_ws",
-                user_id = %user_id,
-                edge_agent_id = %edge_agent_id,
-                %error,
-                "edge WebSocket: failed to release durable registration claim"
-            );
-        }
-        _ => {}
+    let pool_generation = state
+        .edge_connection_pool
+        .commit_reconnect_with_registry_and_materialization_id(
+            reconnect,
+            &user_id,
+            &edge_agent_id,
+            hostname.clone(),
+            workspace_dir.clone(),
+            capabilities,
+            workspace_id.clone(),
+            Some(registration_lease.current.registry_id.clone()),
+            registration_lease.current.materialization_id.clone(),
+            pool_tx,
+        );
+    // Independently poll publication and its deadline even while a message or
+    // heartbeat handler awaits database resources. JoinSet aborts on owner drop;
+    // normal teardown also joins cancellation before durable unregister.
+    let mut registration_release = tokio::task::JoinSet::new();
+    if registration_lease.claim_id.is_some() {
+        registration_release.spawn(reconcile_edge_registry_release(
+            edge_registry.clone(),
+            registration_lease.clone(),
+        ));
     }
     drop(reconnect_guard);
     // Release the per-key reconnect lock entry now that the reconnect is done.
@@ -652,6 +717,8 @@ async fn handle_edge_connection(
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
     let dispatch_sink = ws_sink.clone();
     let dispatch_inflight = inflight_dispatches.clone();
+    let relay_registry_id = registration_lease.current.registry_id.clone();
+    let relay_materialization_id = registration_lease.current.materialization_id.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let mut dispatch_wakeup = dispatch_svc
         .subscribe_pending_wakeup(&dispatch_user_id, &dispatch_agent_id)
@@ -708,6 +775,22 @@ async fn handle_edge_connection(
                                 continue;
                             }
                         };
+                        if let Err(reason) = validate_relay_attestation(
+                            &msg,
+                            &relay_registry_id,
+                            relay_materialization_id.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %row.user_id,
+                                edge_agent_id = %row.edge_agent_id,
+                                request_id = %row.request_id,
+                                reason,
+                                "Edge dispatch relay rejected workspace attestation for this materialization"
+                            );
+                            fail_claimed_edge_dispatch(dispatch_svc.as_ref(), row, reason).await;
+                            continue;
+                        }
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),
@@ -790,7 +873,7 @@ async fn handle_edge_connection(
                                     output,
                                     is_error,
                                     duration_ms,
-                                    tool_result_fields,
+                                    mut tool_result_fields,
                                 }) => {
                                     if request_id != identity.storage_key() {
                                         tracing::warn!(
@@ -802,7 +885,14 @@ async fn handle_edge_connection(
                                         );
                                         continue;
                                     }
-                                    let inflight = read_inflight.remove(&request_id).await;
+                                    // Edge result fields are client input.  In particular an
+                                    // external-state postimage receipt cannot become durable
+                                    // completion evidence until the protocol carries a
+                                    // server-issued, single-use executor attestation.  Failing
+                                    // closed here prevents forged or replayed JSON from crossing
+                                    // the transport boundary as trusted metadata.
+                                    strip_untrusted_external_effect_fields(&mut tool_result_fields);
+                                    let inflight = read_inflight.get(&request_id).await;
                                     let direct_result = EdgeToolResult {
                                         output: output.clone(),
                                         is_error,
@@ -884,6 +974,11 @@ async fn handle_edge_connection(
                                         }
                                     };
                                     if durable_accepted {
+                                        // Consume only after the exact authenticated dispatch
+                                        // result has crossed the durable boundary.  A malformed
+                                        // or mismatched message must not be able to cancel the
+                                        // legitimate in-flight invocation.
+                                        read_inflight.remove(&request_id).await;
                                         // A direct same-pod waiter is released only after the
                                         // exact outcome is durable. Returning it earlier would
                                         // recreate a caller-visible result with no ACK authority.
@@ -926,8 +1021,8 @@ async fn handle_edge_connection(
                                         );
                                     }
                                 }
-                                Ok(EdgeClientMessage::Ping) => {
-                                    let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong).await;
+                                Ok(EdgeClientMessage::Ping {}) => {
+                                    let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
                                 }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
@@ -953,14 +1048,19 @@ async fn handle_edge_connection(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong).await.is_err() {
+                    if send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await.is_err() {
                         break;
                     }
                     // B3: update last_heartbeat_at in DB registry, guarded by
                     // edge_id so a stale connection cannot refresh a row that a
                     // newer connection has already claimed.
                     match edge_registry
-                        .heartbeat(&user_id, &edge_agent_id, &edge_id_for_registry)
+                        .heartbeat(
+                            &user_id,
+                            &edge_agent_id,
+                            &edge_id_for_registry,
+                            registration_lease.claim_id.as_deref(),
+                        )
                         .await
                     {
                         Ok(()) => consecutive_heartbeat_storage_failures = 0,
@@ -1000,6 +1100,51 @@ async fn handle_edge_connection(
                         }
                     }
                 }
+                released = registration_release.join_next(), if !registration_release.is_empty() => {
+                    let released = match released {
+                        Some(Ok(released)) => released,
+                        Some(Err(error)) => {
+                            tracing::error!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %user_id,
+                                edge_agent_id = %edge_agent_id,
+                                %error,
+                                "edge WebSocket: registration publication task failed"
+                            );
+                            let _ = send_edge_msg(
+                                &ws_sink_write,
+                                EdgeServerMessage::Closing {
+                                    reason: "edge registry publication unavailable".into(),
+                                },
+                            ).await;
+                            break;
+                        }
+                        None => unreachable!("publication task exists while join is enabled"),
+                    };
+                    if released {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            user_id = %user_id,
+                            edge_agent_id = %edge_agent_id,
+                            "edge WebSocket: reconciled durable registration publication"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            user_id = %user_id,
+                            edge_agent_id = %edge_agent_id,
+                            "edge WebSocket: durable registration was superseded during publication reconciliation"
+                        );
+                        let _ = send_edge_msg(
+                            &ws_sink_write,
+                            EdgeServerMessage::Closing {
+                                reason: "edge registry registration claim lost".into(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
             }
         }
     };
@@ -1007,6 +1152,9 @@ async fn handle_edge_connection(
     read_loop.await;
 
     // ── Cleanup ──────────────────────────────────────────────────────
+    // Aborting alone only schedules cancellation. Joining guarantees the
+    // publication future has dropped its transaction/connection first.
+    registration_release.shutdown().await;
     forward_task.abort();
     // Drop cancel sender so the dispatch task can break its loop cleanly.
     drop(dispatch_cancel_tx);
@@ -1097,7 +1245,7 @@ async fn unregister_durable_edge_generation(
     Err(last_error.unwrap_or_else(|| "durable edge unregister failed".to_string()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InflightEdgeDispatch {
     identity: astra_services::multi_agent::EdgeDispatchIdentity,
     edge_agent_id: String,
@@ -1136,6 +1284,10 @@ impl InflightEdgeDispatchTracker {
 
     async fn remove(&self, request_id: &str) -> Option<InflightEdgeDispatch> {
         self.inner.lock().await.dispatches.remove(request_id)
+    }
+
+    async fn get(&self, request_id: &str) -> Option<InflightEdgeDispatch> {
+        self.inner.lock().await.dispatches.get(request_id).cloned()
     }
 
     async fn close_to_new_dispatches(&self) {
@@ -1203,6 +1355,41 @@ fn decode_relay_edge_dispatch_payload(
     serde_json::from_str(payload_json)
 }
 
+/// A cross-pod workspace attestation carries the durable registration and
+/// checkout identities inside the existing args object. The relay checks them
+/// against the authenticated socket before delivery; ordinary tool requests
+/// without this private marker are unaffected.
+fn validate_relay_attestation(
+    message: &EdgeServerMessage,
+    registry_id: &str,
+    materialization_id: Option<&str>,
+) -> Result<(), &'static str> {
+    let EdgeServerMessage::ToolRequest { tool, args, .. } = message else {
+        return Ok(());
+    };
+    let Some(marker) = args.get("__astra_attestation") else {
+        return Ok(());
+    };
+    if tool != "bash" {
+        return Err("edge_attestation_tool_mismatch");
+    }
+    let Some(marker) = marker.as_object() else {
+        return Err("edge_attestation_marker_invalid");
+    };
+    if marker
+        .get("registry_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(registry_id)
+        || marker
+            .get("materialization_id")
+            .and_then(serde_json::Value::as_str)
+            != materialization_id
+    {
+        return Err("edge_attestation_materialization_mismatch");
+    }
+    Ok(())
+}
+
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
 async fn send_edge_msg(
     sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
@@ -1255,6 +1442,16 @@ async fn fail_inflight_edge_dispatches(
     failed
 }
 
+fn strip_untrusted_external_effect_fields(
+    fields: &mut Option<serde_json::Map<String, serde_json::Value>>,
+) {
+    if let Some(fields) = fields.as_mut() {
+        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD);
+        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD);
+        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD);
+    }
+}
+
 #[cfg(test)]
 mod inflight_dispatch_tracker_tests {
     use super::*;
@@ -1304,6 +1501,40 @@ mod inflight_dispatch_tracker_tests {
 
         tracker.close_to_new_dispatches().await;
         assert!(tracker.remove("req-2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tracker_inspection_does_not_consume_authenticated_dispatch() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(dispatch("req-1")).await.is_ok());
+
+        let observed = tracker.get("req-1").await.expect("tracked dispatch");
+        assert_eq!(observed.identity.request_id, "req-1");
+        assert!(
+            tracker.get("req-1").await.is_some(),
+            "rejecting an invalid result must leave the real invocation live"
+        );
+        assert!(tracker.remove("req-1").await.is_some());
+    }
+
+    #[test]
+    fn edge_client_cannot_inject_external_completion_receipt() {
+        let mut fields = Some(serde_json::json!({
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD: true,
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD: "declared_external_state",
+            astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD: {"schema": "external_effect_receipt.v1"},
+            "exit_code": 0,
+        }).as_object().expect("object").clone());
+        strip_untrusted_external_effect_fields(&mut fields);
+        let fields = fields.expect("preserve unrelated fields");
+        assert_eq!(fields.get("exit_code"), Some(&serde_json::json!(0)));
+        assert!(
+            !fields.contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
+        );
+        assert!(
+            !fields
+                .contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
+        );
     }
 }
 
@@ -1362,14 +1593,14 @@ async fn fail_claimed_edge_dispatches(
 /// (a malicious edge could fabricate them) and ensures the executor type
 /// is consistent with an edge connection.
 ///
-/// Returns the sanitized capabilities JSON, or `None` if the edge claimed
-/// no valid tools.
+/// Returns the sanitized capabilities JSON. Invalid, mismatched, absent, or
+/// unusable advertisements fail the handshake before registration.
 fn validate_edge_capabilities(
     capabilities: Option<serde_json::Value>,
     edge_agent_id: &str,
     _user_id: &str,
-) -> Option<serde_json::Value> {
-    let capabilities = capabilities?;
+) -> Result<serde_json::Value, String> {
+    let capabilities = capabilities.ok_or_else(|| "edge capabilities are required".to_string())?;
     let runtime_process_authorization_v1 =
         astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
             &capabilities,
@@ -1380,49 +1611,26 @@ fn validate_edge_capabilities(
     >(capabilities.clone())
     {
         Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                edge_agent_id = %edge_agent_id,
-                error = %e,
-                "edge sent unparseable capabilities; accepting with empty capabilities"
-            );
-            return None;
-        }
+        Err(error) => return Err(format!("invalid edge capabilities: {error}")),
     };
 
     // Reject schema versions we don't understand.
     if advert.schema_version != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            edge_agent_id = %edge_agent_id,
-            claimed = advert.schema_version,
-            expected = astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
-            "edge sent unknown schema version; accepting with empty capabilities"
-        );
-        return None;
+        return Err(format!(
+            "unsupported edge capability schema version {}; expected {}",
+            advert.schema_version,
+            astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
+        ));
     }
 
     // Ensure the executor is actually an edge agent (not a cloud executor
     // or local CLI masquerading as edge).
     if !advert.binding.executor.is_edge_agent() {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            edge_agent_id = %edge_agent_id,
-            executor = ?advert.binding.executor,
-            "edge sent non-edge executor binding; accepting with empty capabilities"
-        );
-        return None;
+        return Err("edge capabilities must declare an edge-agent executor".to_string());
     }
 
     if advert.binding.executor.executor_id != edge_agent_id {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            edge_agent_id = %edge_agent_id,
-            advertised_executor_id = %advert.binding.executor.executor_id,
-            "edge sent executor id that does not match authenticated edge id; accepting with empty capabilities"
-        );
-        return None;
+        return Err("edge capability executor id does not match authenticated edge id".to_string());
     }
 
     // Cross-reference tool names against the edge provider contract. Strip
@@ -1458,8 +1666,12 @@ fn validate_edge_capabilities(
             "edge advertised tools outside edge provider ownership — stripped"
         );
     }
+    if advert.binding.tool_surface.tool_names.is_empty() {
+        return Err("edge capabilities contain no admissible edge tools".to_string());
+    }
 
-    let mut sanitized = serde_json::to_value(&advert).ok()?;
+    let mut sanitized = serde_json::to_value(&advert)
+        .map_err(|error| format!("edge capabilities could not be serialized: {error}"))?;
     if runtime_process_authorization_v1 {
         let mut accepted = serde_json::Map::new();
         accepted.insert(
@@ -1469,7 +1681,7 @@ fn validate_edge_capabilities(
         );
         sanitized["protocol_capabilities"] = serde_json::Value::Object(accepted);
     }
-    Some(sanitized)
+    Ok(sanitized)
 }
 
 #[cfg(test)]
@@ -1504,6 +1716,7 @@ mod tests {
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
+            _registration_claim_id: Option<&str>,
         ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             unreachable!("heartbeat is not used by unregister retry tests")
         }
@@ -1674,6 +1887,91 @@ mod tests {
         serde_json::to_value(advert).expect("edge advertisement serializes")
     }
 
+    fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
+        EdgeServerMessage::ToolRequest {
+            request_id: "dispatch-request".to_string(),
+            identity: Box::new(
+                astra_turn_types::ToolInvocationIdentity::new(
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    "chain-1",
+                    "invocation-1",
+                )
+                .expect("test invocation identity"),
+            ),
+            delivery_generation: 1,
+            tool: tool.to_string(),
+            args,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn relay_attestation_accepts_exact_authenticated_materialization() {
+        let message = relay_tool_request(
+            serde_json::json!({
+                "command": "pwd",
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "materialization-1"
+                }
+            }),
+            "bash",
+        );
+
+        assert_eq!(
+            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn relay_attestation_rejects_topology_or_materialization_mismatch() {
+        let wrong_materialization = relay_tool_request(
+            serde_json::json!({
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "other-materialization"
+                }
+            }),
+            "bash",
+        );
+        assert_eq!(
+            validate_relay_attestation(
+                &wrong_materialization,
+                "registry-1",
+                Some("materialization-1")
+            ),
+            Err("edge_attestation_materialization_mismatch")
+        );
+
+        let wrong_tool = relay_tool_request(
+            serde_json::json!({
+                "__astra_attestation": {
+                    "registry_id": "registry-1",
+                    "materialization_id": "materialization-1"
+                }
+            }),
+            "read_file",
+        );
+        assert_eq!(
+            validate_relay_attestation(&wrong_tool, "registry-1", Some("materialization-1")),
+            Err("edge_attestation_tool_mismatch")
+        );
+    }
+
+    #[test]
+    fn relay_attestation_marker_is_optional_for_ordinary_tool_requests() {
+        let message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
+        assert_eq!(
+            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            Ok(())
+        );
+    }
+
     #[test]
     fn validate_edge_capabilities_strips_non_edge_provider_tools() {
         let capabilities = edge_advertisement_with_tools(&[
@@ -1747,9 +2045,26 @@ mod tests {
         let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1");
 
         assert!(
-            sanitized.is_none(),
+            sanitized.is_err(),
             "edge advertisement executor id must match authenticated edge id before tools become offers"
         );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_rejects_absent_malformed_and_unknown_schema() {
+        assert!(validate_edge_capabilities(None, "edge-agent", "user-1").is_err());
+        assert!(
+            validate_edge_capabilities(
+                Some(serde_json::json!({"schema_version": 1})),
+                "edge-agent",
+                "user-1"
+            )
+            .is_err()
+        );
+
+        let mut unknown_schema = edge_advertisement_with_tools(&["read_file"]);
+        unknown_schema["schema_version"] = serde_json::json!(u32::MAX);
+        assert!(validate_edge_capabilities(Some(unknown_schema), "edge-agent", "user-1").is_err());
     }
 
     #[tokio::test]

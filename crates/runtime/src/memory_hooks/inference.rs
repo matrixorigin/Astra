@@ -70,6 +70,8 @@ where
 /// Server-only direct-provider implementation of [`MemoryInferencePort`].
 #[derive(Clone)]
 pub(crate) struct DirectMemoryInferenceClient {
+    pub(crate) fixed_temperature: Option<f64>,
+    pub(crate) thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) model_name: String,
@@ -84,6 +86,8 @@ pub(crate) struct DirectMemoryInferenceClient {
 impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            fixed_temperature: self.fixed_temperature,
+            thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
             api_key: &self.api_key,
@@ -98,59 +102,85 @@ impl DirectMemoryInferenceClient {
 }
 
 pub(crate) struct DurableMemoryInferenceClient {
-    direct: DirectMemoryInferenceClient,
-    ledger: crate::turn::llm::durable::DurableInferenceLedger,
+    offering_id: String,
+    model_name: String,
+    shared_pool: astra_core::SharedPool,
+    encryptor: Arc<astra_services::FernetTokenEncryptor>,
+    user_id: String,
 }
 
 impl DurableMemoryInferenceClient {
-    pub(crate) fn from_offering(
-        offering: astra_services::ResolvedModelOffering,
+    pub(crate) fn new(
+        offering_id: String,
+        model_name: String,
         shared_pool: astra_core::SharedPool,
+        encryptor: Arc<astra_services::FernetTokenEncryptor>,
         user_id: impl Into<String>,
-    ) -> Result<Self, String> {
-        let admitted_execution =
-            astra_services::AdmittedModelExecution::from_offering(offering.clone())?;
-        let model = offering.model;
-        let header_overrides = model.execution_header_overrides()?;
-        Ok(Self {
-            direct: DirectMemoryInferenceClient {
-                base_url: model.base_url,
-                api_key: model.api_key,
-                model_name: model.model_name,
-                wire_model_name: model.wire_model_name,
-                provider: model.provider,
-                header_overrides,
-                request_body_overrides: model.request_body_overrides,
-                completions_url_override: None,
-                request_timeout: None,
-            },
-            ledger: crate::turn::llm::durable::DurableInferenceLedger::new(
-                shared_pool,
-                user_id,
-                admitted_execution,
-            ),
-        })
+    ) -> Self {
+        Self {
+            offering_id,
+            model_name,
+            shared_pool,
+            encryptor,
+            user_id: user_id.into(),
+        }
     }
 }
 
 impl std::fmt::Debug for DurableMemoryInferenceClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.direct.fmt(f)
+        f.debug_struct("DurableMemoryInferenceClient")
+            .field("offering_id", &self.offering_id)
+            .field("model_name", &self.model_name)
+            .finish()
     }
 }
 
 #[async_trait]
 impl MemoryInferencePort for DurableMemoryInferenceClient {
     fn model_name(&self) -> &str {
-        &self.direct.model_name
+        &self.model_name
     }
 
     async fn complete(
         &self,
         request: MemoryInferenceRequest<'_>,
     ) -> Result<String, astra_core::ClassifiedError> {
-        let result = self
-            .ledger
+        // Reuse the run/completion admission contract for every background
+        // provider attempt. Never retain stale plaintext routes in the client.
+        let execution = astra_services::revalidate_admitted_model_execution(
+            self.shared_pool.settings(),
+            &self.encryptor,
+            &self.user_id,
+            &self.offering_id,
+            Some(self.shared_pool.get()),
+        )
+        .await
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::PolicyDenied,
+                format!("Memory model admission failed: {error}"),
+            )
+        })?;
+        let direct = DirectMemoryInferenceClient {
+            fixed_temperature: execution.fixed_temperature,
+            thinking_protocol: execution.thinking_protocol,
+            base_url: execution.base_url.clone(),
+            api_key: execution.api_key.clone(),
+            model_name: execution.model_name.clone(),
+            wire_model_name: execution.wire_model_name.clone(),
+            provider: execution.provider.clone(),
+            header_overrides: execution.header_overrides.clone(),
+            request_body_overrides: execution.request_body_overrides.clone(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let ledger = crate::turn::llm::durable::DurableInferenceLedger::new(
+            self.shared_pool.clone(),
+            &self.user_id,
+            execution,
+        );
+        let result = ledger
             .execute_nonstream(
                 global_llm_client(),
                 request.invocation_scope.clone(),
@@ -159,7 +189,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                     messages: request.messages,
                     tools: &[],
                     cache_capability: None,
-                    route: self.direct.execution_route(),
+                    route: direct.execution_route(),
                     max_output_tokens: Some(request.max_output_tokens),
                     temperature: Some(request.temperature),
                     has_fallback: false,
@@ -167,7 +197,8 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 },
                 request.deadline,
             )
-            .await?;
+            .await
+            .into_result()?;
         Ok(result.full_text)
     }
 }
@@ -230,6 +261,8 @@ mod tests {
 
     fn direct_client() -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            fixed_temperature: None,
+            thinking_protocol: None,
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-test".into(),
             model_name: "qwen-flash".into(),

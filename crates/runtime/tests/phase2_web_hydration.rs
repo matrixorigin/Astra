@@ -1,3 +1,5 @@
+mod test_support;
+
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
@@ -148,7 +150,7 @@ fn revision_hash(
     ))
 }
 
-#[tokio::test]
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_14_cold_start_known_zero_with_active_run_requires_replay() {
     let pool = setup_pool().await;
@@ -195,7 +197,9 @@ async fn l2_14_cold_start_known_zero_with_active_run_requires_replay() {
     assert!(replay_required);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_13_revoke_and_auto_expire_events_have_symmetric_payload_shape() {
     let pool = setup_pool().await;
@@ -286,7 +290,9 @@ async fn l2_13_revoke_and_auto_expire_events_have_symmetric_payload_shape() {
     }
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_15_revision_hash_changes_when_device_fingerprint_changes() {
     let session_id = format!("session-{}", Uuid::new_v4());
@@ -299,7 +305,9 @@ async fn l2_15_revision_hash_changes_when_device_fingerprint_changes() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_16_device_trust_transition_is_active_lease_cas_guarded() {
     let pool = setup_pool().await;
@@ -330,7 +338,9 @@ async fn l2_16_device_trust_transition_is_active_lease_cas_guarded() {
     assert_eq!(updated, 1);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_17_revoke_api_cas_is_idempotent_after_first_write() {
     let pool = setup_pool().await;
@@ -374,7 +384,9 @@ async fn l2_17_revoke_api_cas_is_idempotent_after_first_write() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_4_s03_four_device_switches_restore_ordered_transcript() {
     let pool = setup_pool().await;
@@ -410,7 +422,9 @@ async fn l3_4_s03_four_device_switches_restore_ordered_transcript() {
     assert_eq!(seqs, [1, 2, 3, 4]);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_5_s04_t09_double_tab_uses_max_watermark_without_rollback() {
     let session_id = format!("session-{}", Uuid::new_v4());
@@ -422,7 +436,9 @@ async fn l3_5_s04_t09_double_tab_uses_max_watermark_without_rollback() {
     assert_ne!(tab_a_hash, tab_b_hash);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_6_s03_t8_passive_expiry_records_auto_expire_event() {
     let pool = setup_pool().await;
@@ -474,4 +490,5 @@ async fn l3_6_s03_t8_passive_expiry_records_auto_expire_event() {
     .try_get::<String, _>("reason")
     .unwrap();
     assert_eq!(reason, "auto_expire");
+}
 }

@@ -10,11 +10,8 @@ import {
   parseWorkSurfaceEvent,
   type WorkSurfaceEvent,
 } from "@/lib/work-surface";
+import { AstraApiError } from "@astra/sdk";
 import type { ExecutorBinding, WorkspaceBinding } from "@astra/sdk";
-
-type RuntimeTodosResponse = {
-  tasks?: Array<Record<string, unknown>>;
-};
 
 type RuntimeRunProjectionResponse = {
   run_id?: string;
@@ -141,7 +138,8 @@ export async function GET(
     return NextResponse.json({
       sessionId: null,
       runId: activeRunId,
-      tasks: [],
+      workBinding: null,
+      taskGraph: null,
       events: [],
       generatedAt: new Date().toISOString(),
     });
@@ -153,38 +151,22 @@ export async function GET(
       operation: "load web work surface",
     });
     const warnings: string[] = [];
-    const [runTree, todos] = sessionId
-      ? await Promise.all([
-          runtime
-            .get<RuntimeSessionRunTreeResponse>(
-              `/sessions/${encodeURIComponent(sessionId)}/runs?limit=${WORK_SURFACE_RUN_TREE_LIMIT}`,
-              {
-                auth: "required",
-                operation: "load durable session run tree for web work surface",
-              },
-            )
-            .catch((error: unknown) => {
-              warnings.push(
-                `Agent history is temporarily unavailable: ${runtimeErrorDetail(error)}`,
-              );
-              return null;
-            }),
-          runtime
-            .get<RuntimeTodosResponse>(
-              `/sessions/${encodeURIComponent(sessionId)}/todos`,
-              {
-                auth: "required",
-                operation: "load session todos for web work surface",
-              },
-            )
-            .catch((error: unknown) => {
-              warnings.push(
-                `Tasks are temporarily unavailable: ${runtimeErrorDetail(error)}`,
-              );
-              return { tasks: [] };
-            }),
-        ])
-      : [null, { tasks: [] }];
+    const runTree = sessionId
+      ? await runtime
+          .get<RuntimeSessionRunTreeResponse>(
+            `/sessions/${encodeURIComponent(sessionId)}/runs?limit=${WORK_SURFACE_RUN_TREE_LIMIT}`,
+            {
+              auth: "required",
+              operation: "load durable session run tree for web work surface",
+            },
+          )
+          .catch((error: unknown) => {
+            warnings.push(
+              `Agent history is temporarily unavailable: ${runtimeErrorDetail(error)}`,
+            );
+            return null;
+          })
+      : null;
     if (runTree?.truncated) {
       warnings.push(
         `Agent history reached the ${WORK_SURFACE_RUN_TREE_LIMIT}-run display limit.`,
@@ -213,24 +195,33 @@ export async function GET(
           })
       : null;
     const resolvedSessionId = sessionId ?? projection?.session_id ?? null;
-    const resolvedTodos = sessionId
-      ? todos
-      : resolvedSessionId
-        ? await runtime
-            .get<RuntimeTodosResponse>(
-              `/sessions/${encodeURIComponent(resolvedSessionId)}/todos`,
-              {
-                auth: "required",
-                operation: "load session todos for web work surface",
-              },
-            )
-            .catch((error: unknown) => {
-              warnings.push(
-                `Tasks are temporarily unavailable: ${runtimeErrorDetail(error)}`,
-              );
-              return { tasks: [] };
-            })
-        : { tasks: [] };
+    const workBinding = resolvedSessionId
+      ? await runtime.sdk.getWorkSessionBinding(resolvedSessionId).catch((error: unknown) => {
+          if (error instanceof AstraApiError && error.status === 404) return null;
+          warnings.push(
+            `Work plan is temporarily unavailable: ${runtimeErrorDetail(error)}`,
+          );
+          return null;
+        })
+      : null;
+    const taskGraph = workBinding
+      ? await runtime.sdk
+          .getWorkTaskGraph(workBinding.work_id, workBinding.branch_id, {
+            cursor: {
+              graph_revision: workBinding.graph_revision,
+              item_offset: 0,
+              dependency_offset: 0,
+            },
+            itemLimit: 8,
+            dependencyLimit: 128,
+          })
+          .catch((error: unknown) => {
+            warnings.push(
+              `Work plan is temporarily unavailable: ${runtimeErrorDetail(error)}`,
+            );
+            return null;
+          })
+      : null;
     const bindingProjection = bindingProjectionEvent(projection);
     const recentEvents = (projection?.recent_events ?? [])
       .map(parseWorkSurfaceEvent)
@@ -249,7 +240,8 @@ export async function GET(
       executor: projection?.executor ?? null,
       transport: projection?.transport ?? null,
       fallbackPolicy: projection?.fallback_policy ?? null,
-      tasks: Array.isArray(resolvedTodos.tasks) ? resolvedTodos.tasks : [],
+      workBinding,
+      taskGraph,
       events,
       warnings,
       generatedAt: new Date().toISOString(),

@@ -9,7 +9,7 @@ prompt: |
   A farmer has a fox, a chicken, and a bag of grain. He needs to cross
   a river in a boat that can only carry him and one item. If left alone,
   the fox will eat the chicken, and the chicken will eat the grain.
-  What is the minimum number of crossings needed? Just give the number.
+  What is the minimum number of crossings needed? Just give the number. Do not use tools.
 capability: reasoning
 difficulty: 3
 weight: 1.0
@@ -17,19 +17,16 @@ timeout_seconds: 60
 criteria:
   - type: exit_code
     code: 0
-  - type: text_contains
-    needle: "7"
+  - type: text_equals
+    expected: "7"
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 0
+        max: 0
   - type: tokens_between
     min: 1
     max: 40000
   - type: turn_rounds_between
     min: 1
     max: 5
-  - type: judger
-    question: |
-      The correct answer to the fox-chicken-grain river crossing puzzle
-      is 7 crossings. Did the agent output exactly 7 (not 17, 27, 70,
-      or any other number containing 7)?
-      Score 1.0 if the answer is clearly 7.
-      Score 0.0 if the answer is wrong or ambiguous.
-    threshold: 0.7

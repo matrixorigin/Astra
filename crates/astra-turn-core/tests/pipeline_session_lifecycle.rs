@@ -4,10 +4,7 @@
 //! - Session accumulates stats across turns
 //! - Feedback loop updates cache hit ratio and response token estimates
 //! - Recovery state escalates and resets correctly
-//! - Shadow mode produces clean diffs when pipeline is deterministic
 //! - Warm start preserves cross-session continuity
-
-use std::collections::HashMap;
 
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_sources::{
@@ -65,8 +62,6 @@ fn make_turn_state(turn_index: u32, message_count: usize) -> TurnState {
         tool_results: vec![],
         tokens: TokenAccounting::default(),
         active_skills: vec!["code-review".into()],
-        recent_file_reads: HashMap::new(),
-        remaining_turns: 20 - turn_index,
         turn_index,
         recovery: RecoveryState::default(),
         last_user_message: format!("Turn {} message", turn_index),
@@ -191,53 +186,6 @@ fn ptl_error_recovery_and_abort() {
 }
 
 #[test]
-fn shadow_mode_produces_deterministic_output() {
-    let config = PipelineConfig {
-        provider_policy: ProviderCachePolicy::anthropic(),
-    };
-    let mut sess = PipelineSession::new(config);
-    let statics = StaticSections::test_default();
-    let agent = AgentContext::default();
-    let session = make_session_context();
-    let turn = make_turn_state(1, 4);
-    let external = ExternalSources {
-        memory_entries: vec![MemoryEntry::new("test memory")],
-        spill_dir: None,
-        ..Default::default()
-    };
-    let limits = OptimizeLimits::default();
-
-    let input1 = TurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        optimize_limits: &limits,
-        model_id: "claude-sonnet-4-6",
-        query_source: "repl",
-    };
-    let output1 = sess.run_turn(input1).unwrap();
-
-    let input2 = TurnInput {
-        statics: &statics,
-        agent: &agent,
-        session: &session,
-        turn: &turn,
-        external: &external,
-        optimize_limits: &limits,
-        model_id: "claude-sonnet-4-6",
-        query_source: "repl",
-    };
-    let shadow = sess.run_turn_shadow(input2, &output1.optimized).unwrap();
-    assert!(
-        shadow.diff.is_clean(),
-        "deterministic pipeline should produce clean shadow diff: {:?}",
-        shadow.diff.alerts
-    );
-}
-
-#[test]
 fn response_token_estimator_improves_over_turns() {
     let config = PipelineConfig::default();
     let mut sess = PipelineSession::new(config);
@@ -287,7 +235,7 @@ fn full_lifecycle_with_emergent_and_latches() {
     };
     let session = make_session_context();
     let external = ExternalSources {
-        memory_entries: vec![MemoryEntry::new("User works on astra-engine.")],
+        memory_entries: vec![MemoryEntry::new("User works on Astra.")],
         spill_dir: None,
         ..Default::default()
     };

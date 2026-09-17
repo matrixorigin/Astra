@@ -1,9 +1,11 @@
 //! Slash command fallback routing for the interactive session.
 
 use astra_runtime::prompts;
-use astra_services::{ModelListItemResponse, session_journal};
+use astra_services::{
+    ModelListCursor, ModelListItemResponse, ModelListPageResponse, session_journal,
+};
 use crossterm::style::Stylize;
-use std::{io::IsTerminal, path::PathBuf};
+use std::{collections::HashSet, io::IsTerminal, path::PathBuf};
 
 use crate::cli::slash::{
     slash_account::handle_account_command,
@@ -19,14 +21,14 @@ use crate::cli::slash::{
 use crate::cli::{
     cli_config::{
         cli_output,
-        cli_utils::{self, interactive_select, map_thin_err},
+        cli_utils::{self, interactive_select},
     },
     command_registry, command_usage, diff_presenter,
     project_instructions::discover_project_instructions,
     session::{session_checkpointing, session_runtime, session_state::SessionState},
     slash::{
         slash_agent, slash_cache, slash_config, slash_inspect, slash_mcp, slash_profile,
-        slash_session, slash_stats, slash_sync, slash_task, slash_team, slash_telemetry,
+        slash_session, slash_stats, slash_sync, slash_team, slash_telemetry,
     },
     theme,
 };
@@ -121,9 +123,10 @@ pub(crate) async fn handle_slash_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(false);
             };
-            let body = api.get_models_text(tok).await.map_err(map_thin_err)?;
             {
-                let models = parse_model_catalog(&body).map_err(|error| error.to_string())?;
+                let models = fetch_model_catalog(api, Some(tok))
+                    .await
+                    .map_err(|error| error.to_string())?;
 
                 let items: Vec<(String, String)> = models
                     .iter()
@@ -225,19 +228,8 @@ pub(crate) async fn handle_slash_command(
             let mut selected_model_name: Option<String> = None;
             let mut context_window = None;
             if let Some(tok) = token {
-                match api.get_models_text(tok).await {
-                    Ok(body) => {
-                        let models = match parse_model_catalog(&body) {
-                            Ok(models) => models,
-                            Err(err) => {
-                                eprintln!(
-                                    "{}",
-                                    format!("  Failed to parse model list response: {err}")
-                                        .yellow()
-                                );
-                                return Ok(false);
-                            }
-                        };
+                match fetch_model_catalog(api, Some(tok)).await {
+                    Ok(models) => {
                         if models.is_empty() {
                             eprintln!("{}", "  No models returned by the server.".yellow());
                             return Ok(false);
@@ -276,10 +268,34 @@ pub(crate) async fn handle_slash_command(
                             })
                             .collect();
 
+                        let mut exact_lookup_error = None;
+                        if matched_entry.is_none() {
+                            // The catalog has already been fully drained. A
+                            // missing entry is therefore a definitive
+                            // admission failure, not a first-page omission.
+                            match session_runtime::resolve_server_model_selection_from_catalog(
+                                api, tok, arg, &models,
+                            )
+                            .await
+                            {
+                                Ok(selection) => {
+                                    selected_offering_id = Some(selection.offering_id);
+                                    selected_model_name = Some(arg.to_string());
+                                    context_window = selection.context_window;
+                                }
+                                Err(error) => exact_lookup_error = Some(error),
+                            }
+                        }
+
                         let model_exists = matched_entry.is_some()
+                            || selected_offering_id.is_some()
                             || available.iter().any(|m| m.eq_ignore_ascii_case(arg));
 
                         if !model_exists && !available.is_empty() {
+                            if let Some(error) = exact_lookup_error {
+                                eprintln!("  {}", error.yellow());
+                                return Ok(false);
+                            }
                             let suggestions = cli_output::suggest_models(arg, &available);
                             let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
                             cli_output::format_not_found_error(
@@ -302,10 +318,7 @@ pub(crate) async fn handle_slash_command(
                         }
                     }
                     Err(err) => {
-                        eprintln!(
-                            "{}",
-                            format!("  Failed to list models: {}", map_thin_err(err)).yellow()
-                        );
+                        eprintln!("{}", format!("  Failed to list models: {err}").yellow());
                         return Ok(false);
                     }
                 }
@@ -376,7 +389,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/info" | "/whoami" | "/rewind" | "/report" => {
+        | "/version" | "/info" | "/whoami" | "/rewind" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
@@ -397,7 +410,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/messaging" => {
-            handle_messaging_command(arg, state);
+            handle_messaging_command(arg, state).await;
         }
 
         "/agent" => {
@@ -498,10 +511,6 @@ pub(crate) async fn handle_slash_command(
                 .await?;
         }
 
-        "/task" => {
-            slash_task::handle_task_command(arg, state, api, profile, token).await;
-        }
-
         "/resume" => {
             slash_session::handle_resume_command(arg, profile, api, state).await;
         }
@@ -597,6 +606,8 @@ pub(crate) enum ModelCatalogError {
     Request(#[from] astra_thin_client::ThinClientError),
     #[error("invalid model catalog JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    #[error("invalid model catalog protocol: {0}")]
+    Protocol(String),
 }
 
 impl ModelCatalogError {
@@ -614,8 +625,12 @@ impl ModelCatalogError {
     }
 }
 
-fn parse_model_catalog(body: &str) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
+fn parse_model_catalog_page(body: &str) -> Result<ModelListPageResponse, ModelCatalogError> {
     Ok(serde_json::from_str(body)?)
+}
+
+fn parse_model_catalog(body: &str) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
+    Ok(parse_model_catalog_page(body)?.items)
 }
 
 /// Fetch the exact public model catalog. Only active Offerings reach the
@@ -625,11 +640,80 @@ pub(crate) async fn fetch_model_catalog(
     token: Option<&str>,
 ) -> Result<Vec<ModelCatalogEntry>, ModelCatalogError> {
     let tok = token.ok_or(ModelCatalogError::NotAuthenticated)?;
-    let body = api.get_models_text(tok).await?;
-    Ok(parse_model_catalog(&body)?
-        .into_iter()
-        .filter(model_list_entry_is_active)
-        .collect())
+    let mut cursor: Option<ModelListCursor> = None;
+    let mut all = Vec::new();
+    let mut total = None;
+    let mut revision = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        if let Some(current) = &cursor {
+            if !seen_cursors.insert(current.clone()) {
+                return Err(ModelCatalogError::Protocol(
+                    "model catalog cycled its continuation cursor".to_string(),
+                ));
+            }
+        }
+        let cursor_tuple = cursor.as_ref().map(|value| {
+            (
+                value.provider.as_str(),
+                value.model_name.as_str(),
+                value.model_id.as_str(),
+            )
+        });
+        let response = api
+            .get_models_page_response_timeout(tok, std::time::Duration::from_secs(3), cursor_tuple)
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelCatalogError::Request(
+                astra_thin_client::ThinClientError::Api { status, body },
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| ModelCatalogError::Request(error.into()))?;
+        let page = parse_model_catalog_page(&body)?;
+        if page.limit == 0 || page.limit > 200 {
+            return Err(ModelCatalogError::Protocol(
+                "invalid model catalog page limit".to_string(),
+            ));
+        }
+        if total.get_or_insert(page.total) != &page.total {
+            return Err(ModelCatalogError::Protocol(
+                "model catalog total changed during pagination".to_string(),
+            ));
+        }
+        if revision.get_or_insert_with(|| page.catalog_revision.clone()) != &page.catalog_revision {
+            return Err(ModelCatalogError::Protocol(
+                "model catalog revision changed during pagination".to_string(),
+            ));
+        }
+        let page_had_items = !page.items.is_empty();
+        all.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            if all.len() != page.total as usize {
+                return Err(ModelCatalogError::Protocol(format!(
+                    "model catalog returned {} items but advertised {}",
+                    all.len(),
+                    page.total
+                )));
+            }
+            return Ok(all.into_iter().filter(model_list_entry_is_active).collect());
+        };
+        if !page_had_items {
+            return Err(ModelCatalogError::Protocol(
+                "model catalog returned a cursor without items".to_string(),
+            ));
+        }
+        if cursor.as_ref() == Some(&next) {
+            return Err(ModelCatalogError::Protocol(
+                "model catalog repeated its continuation cursor".to_string(),
+            ));
+        }
+        cursor = Some(next);
+    }
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -675,7 +759,8 @@ mod model_list_json_tests {
     };
 
     fn canonical_catalog_json() -> serde_json::Value {
-        serde_json::json!([{
+        serde_json::json!({
+            "items": [{
             "offering_id": "offer-coding",
             "access_id": "self-hosted",
             "access_kind": "self_hosted",
@@ -689,7 +774,12 @@ mod model_list_json_tests {
             "max_completion_tokens": 8192,
             "architecture": null,
             "thinking_capability": "both"
-        }])
+            }],
+            "next_cursor": null,
+            "limit": 50,
+            "total": 1,
+            "catalog_revision": "sha256:test-catalog"
+        })
     }
 
     #[test]
@@ -726,7 +816,7 @@ mod model_list_json_tests {
 
     #[test]
     fn obsolete_catalog_shapes_are_rejected_at_the_boundary() {
-        let item = canonical_catalog_json()[0].clone();
+        let item = canonical_catalog_json()["items"][0].clone();
         let envelope = serde_json::json!({"models": [item.clone()]});
         parse_model_catalog(&envelope.to_string()).expect_err("envelopes are not the contract");
 

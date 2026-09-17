@@ -136,7 +136,7 @@ impl ToolCell {
         }
         self.output_summary = non_empty_tool_text(output_summary);
         self.output = non_empty_tool_text(output);
-        self.ensure_failure_details();
+        self.ensure_incomplete_terminal_details();
     }
 
     /// Resume constructor. Duration is restored verbatim; the
@@ -178,12 +178,12 @@ impl ToolCell {
             progress_bytes: 0,
             ctrl_b_background_hint: false,
         };
-        cell.ensure_failure_details();
+        cell.ensure_incomplete_terminal_details();
         Some(cell)
     }
 
-    fn ensure_failure_details(&mut self) {
-        if self.status != ToolStatus::Failed {
+    fn ensure_incomplete_terminal_details(&mut self) {
+        if !matches!(self.status, ToolStatus::Uncertain | ToolStatus::Failed) {
             return;
         }
         if self
@@ -197,7 +197,8 @@ impl ToolCell {
         {
             return;
         }
-        let fallback = failure_detail_fallback(&self.name, &self.description);
+        let fallback =
+            incomplete_terminal_detail_fallback(self.status, &self.name, &self.description);
         self.output_summary = Some(fallback.clone());
         self.output = Some(fallback);
     }
@@ -622,7 +623,8 @@ impl ToolCell {
         // Output summary — diff renderer for +/- content,
         // plain truncated preview otherwise.
         if missing_failure_details {
-            let fallback = failure_detail_fallback(&self.name, &self.description);
+            let fallback =
+                incomplete_terminal_detail_fallback(self.status, &self.name, &self.description);
             let detail = sanitize_terminal_text(&fallback);
             let detail_lines: Vec<&str> = detail.lines().collect();
             for (i, detail_line) in detail_lines.iter().enumerate() {
@@ -746,20 +748,18 @@ impl HistoryCell for ToolCell {
     }
 
     fn finalize(&mut self) {
-        // `complete()` is the canonical terminal transition. If
-        // `finalize()` fires on a still-Running cell (e.g. turn
-        // got interrupted mid-tool), mark it Failed so the
-        // persisted record reflects the outcome rather than
-        // silently dropping.
+        // `complete()` is the canonical terminal transition. If only a start
+        // was observed, the execution outcome is unknown: a turn/transport
+        // boundary is not evidence that the tool itself failed.
         if self.status == ToolStatus::Running {
-            self.status = ToolStatus::Failed;
+            self.status = ToolStatus::Uncertain;
             if self.duration_ms.is_none() {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
             }
         }
         self.output_summary = non_empty_tool_text(self.output_summary.take());
         self.output = non_empty_tool_text(self.output.take());
-        self.ensure_failure_details();
+        self.ensure_incomplete_terminal_details();
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -951,21 +951,41 @@ fn structured_tool_result(text: &str) -> Option<serde_json::Value> {
     })
 }
 
-fn failure_detail_fallback(name: &str, description: &str) -> String {
+fn incomplete_terminal_detail_fallback(
+    status: ToolStatus,
+    name: &str,
+    description: &str,
+) -> String {
     let label = friendly_tool_display_name_for_context(name, description);
     if name == "agent_fanout" {
-        return "Fanout did not return a usable launch receipt.\nThe launch outcome is unconfirmed; Shift+↓ shows observed background work.".into();
+        return if status == ToolStatus::Uncertain {
+            "Fanout did not return a usable launch receipt.\nThe launch outcome is unconfirmed; Shift+↓ inspects any observed background work.".into()
+        } else {
+            "Fanout reported failure without a usable launch receipt.\nNo diagnostic details were provided; Shift+↓ inspects any observed background work.".into()
+        };
     }
     let description = description.trim();
-    if description.is_empty() {
+    if status == ToolStatus::Uncertain {
+        if description.is_empty() {
+            format!(
+                "{label} ended without a result payload.\n\
+                 The execution outcome could not be confirmed."
+            )
+        } else {
+            format!(
+                "{label} ended without a result payload: {description}.\n\
+                 The execution outcome could not be confirmed."
+            )
+        }
+    } else if description.is_empty() {
         format!(
-            "{label} ended without a result payload.\n\
-             The execution outcome could not be confirmed."
+            "{label} reported failure without an error payload.\n\
+             The failure was confirmed, but diagnostic details were not provided."
         )
     } else {
         format!(
-            "{label} ended without a result payload: {description}.\n\
-             The execution outcome could not be confirmed."
+            "{label} reported failure without an error payload: {description}.\n\
+             The failure was confirmed, but diagnostic details were not provided."
         )
     }
 }
@@ -1008,7 +1028,6 @@ fn friendly_tool_display_name(name: &str) -> String {
         "str_replace" => "Replace text".into(),
         "grep" | "glob" => "Search".into(),
         "list_dir" => "List directory".into(),
-        "task_board" => "Task".into(),
         "memory" => "Memory".into(),
         "tool_search" => "Tool search".into(),
         _ => humanize_tool_name(name),
@@ -1215,12 +1234,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_demotes_stuck_running_to_failed() {
-        // If a turn aborts mid-tool, finalize should still produce
-        // a persistable record rather than silently losing the row.
+    fn finalize_marks_stuck_running_as_uncertain() {
+        // If a turn aborts mid-tool, retain the row without inventing a tool
+        // failure that no terminal receipt established.
         let mut t = ToolCell::new_running("bash", "slow op");
         t.finalize();
-        assert_eq!(t.status, ToolStatus::Failed);
+        assert_eq!(t.status, ToolStatus::Uncertain);
         assert!(t.duration_ms.is_some(), "duration snapshotted on finalize");
         assert_eq!(
             t.output_summary.as_deref(),
@@ -1404,7 +1423,7 @@ mod tests {
         let t = err_tool("read", "Reading: missing.txt", 10);
         let out = render(&t, 80, 4);
         assert!(
-            out.contains("Read ended without a result payload: Reading: missing.txt"),
+            out.contains("Read reported failure without an error payload: Reading: missing.txt"),
             "{out}"
         );
         assert!(!out.contains("No details returned"), "{out}");
@@ -1416,17 +1435,17 @@ mod tests {
         t.complete("failed", 1200, String::new(), None, None);
         let summary = t.output_summary.as_deref().unwrap();
         assert!(
-            summary.contains("Bash ended without a result payload: $ make check 2>&1"),
+            summary.contains("Bash reported failure without an error payload: $ make check 2>&1"),
             "{summary}"
         );
-        assert!(
-            summary.contains("outcome could not be confirmed"),
-            "{summary}"
-        );
+        assert!(summary.contains("failure was confirmed"), "{summary}");
         assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         let out = render(&t, 100, 4);
-        assert!(out.contains("Bash ended without a result payload"), "{out}");
-        assert!(out.contains("outcome could not be confirmed"), "{out}");
+        assert!(
+            out.contains("Bash reported failure without an error payload"),
+            "{out}"
+        );
+        assert!(out.contains("failure was confirmed"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
     }
 
@@ -1437,7 +1456,7 @@ mod tests {
 
         let out = render(&t, 100, 4);
         assert!(
-            out.contains("Fanout did not return a usable launch receipt"),
+            out.contains("Fanout reported failure without a usable launch receipt"),
             "{out}"
         );
         assert!(out.contains("Shift+↓"), "{out}");
@@ -1561,13 +1580,11 @@ mod tests {
         );
         let summary = t.output_summary.as_deref().unwrap();
         assert!(
-            summary.contains("Read ended without a result payload: Reading: src/main.rs"),
+            summary
+                .contains("Read reported failure without an error payload: Reading: src/main.rs"),
             "{summary}"
         );
-        assert!(
-            summary.contains("outcome could not be confirmed"),
-            "{summary}"
-        );
+        assert!(summary.contains("failure was confirmed"), "{summary}");
         assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
     }
 

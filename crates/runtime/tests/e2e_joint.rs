@@ -10,8 +10,10 @@ use astra_runtime::{
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use astra_services::runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunInteractionKind,
-    DurableRunInteractionResolveOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
+    AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
+    AtomicRunInteractionWaitRequest, CancelRunRecord, ChatRequestData, ChatRunRecord,
+    ChatStreamRecord, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
+    DurableRunInteractionWaitOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
     RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, RunUserIntentData,
     RunUserIntentRecord,
 };
@@ -294,11 +296,65 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         model_offering_id: None,
         resolved_model_name: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![json!({"event_type": "run_started", "data": {"source": "joint_e2e"}})],
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     }
+}
+
+fn owned_durable_record(
+    run_id: &str,
+    session_id: &str,
+    user_id: &str,
+    owner_pod_id: &str,
+) -> DurableRunRecord {
+    let mut record = durable_record(run_id, session_id, user_id);
+    record.owner_pod_id = Some(owner_pod_id.to_string());
+    record.owner_lease_expires_at =
+        Some((chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339());
+    record
+}
+
+async fn register_durable_interaction_wait(
+    store: &DatabaseRunStateStore,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    request_id: &str,
+    kind: DurableRunInteractionKind,
+    required_event: Value,
+) {
+    assert!(matches!(
+        store
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+                events: std::slice::from_ref(&required_event),
+            })
+            .await
+            .expect("register immutable interaction authority"),
+        AtomicRunInteractionBatchRegistration::Registered
+    ));
+    assert!(matches!(
+        store
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                request_id,
+                kind,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .expect("open durable interaction wait"),
+        DurableRunInteractionWaitOutcome::Waiting
+    ));
 }
 
 #[derive(Clone)]
@@ -545,6 +601,7 @@ impl RunLifecycleService for JointRunLifecycle {
             return Err(forbidden("run belongs to another user"));
         }
         Ok(RunStatusRecord {
+            artifact_publication: None,
             run_id,
             session_id: run.session_id,
             parent_run_id: run.parent_run_id,
@@ -556,6 +613,7 @@ impl RunLifecycleService for JointRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 
@@ -596,13 +654,21 @@ impl RunLifecycleService for JointRunLifecycle {
         &self,
         run_id: String,
         user_id: String,
+        expected_session_id: String,
         request_id: String,
         kind: DurableRunInteractionKind,
         response_data: Value,
     ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
-            .await
-            .resolve_run_interaction(&user_id, &run_id, &request_id, kind, response_data)
+        let store = self.store().await;
+        store
+            .resolve_run_interaction(
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &request_id,
+                kind,
+                response_data,
+            )
             .await
             .map_err(service_unavailable)
     }
@@ -612,14 +678,20 @@ impl RunLifecycleService for JointRunLifecycle {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
+        let store = self.store().await;
+        let run = store
+            .load_run(&user_id, &run_id)
             .await
-            .update_run_status(&user_id, &run_id, "cancelled", None, None)
+            .map_err(service_unavailable)?
+            .ok_or_else(|| not_found("run not found"))?;
+        store
+            .update_run_status(&user_id, &run.session_id, &run_id, "cancelled", None, None)
             .await
             .map_err(service_unavailable)?;
         Ok(CancelRunRecord {
             run_id,
             status: "cancelled".to_string(),
+            execution_settled: true,
         })
     }
 
@@ -664,6 +736,7 @@ impl RunLifecycleService for JointRunLifecycle {
             store
                 .append_event(
                     &user_id,
+                    &run.session_id,
                     &run_id,
                     json!({
                         "event_type": "user_intent",
@@ -682,6 +755,7 @@ impl RunLifecycleService for JointRunLifecycle {
             intent_id,
             status: astra_turn_types::UserIntentStatus::AcceptedRemote,
             duplicate,
+            event_index: 0,
         })
     }
 
@@ -690,9 +764,21 @@ impl RunLifecycleService for JointRunLifecycle {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
+        let store = self.store().await;
+        let run = store
+            .load_run(&user_id, &run_id)
             .await
-            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
+            .map_err(service_unavailable)?
+            .ok_or_else(|| not_found("run not found"))?;
+        store
+            .update_run_status(
+                &user_id,
+                &run.session_id,
+                &run_id,
+                "waiting",
+                Some("user"),
+                None,
+            )
             .await
             .map_err(service_unavailable)?;
         Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
@@ -1371,6 +1457,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         store
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({
                     "event_type": "assistant_delta",
@@ -1409,12 +1496,20 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             let approval_id = id("approval");
             let store = shared_store.read().await.clone();
             store
-                .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
+                .update_run_status(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "waiting",
+                    Some("approval"),
+                    None,
+                )
                 .await
                 .expect("S04 approval pause must persist waiting status");
             store
                 .append_event(
                     &user_id,
+                    &session_id,
                     &run_id,
                     json!({
                         "event_type": "approval_request",
@@ -1449,13 +1544,14 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S04 final run_finished event must persist");
     store
-        .update_run_status(&user_id, &run_id, "completed", None, None)
+        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
         .await
         .expect("S04 final completed status must persist");
     absorb_sse_events(
@@ -1533,43 +1629,38 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
         insert_session(&pool, &user_id, session_id).await;
     }
 
-    let owner_store =
-        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-owner-pod");
+    let owner_pod_id = "server-only-owner-pod";
+    let owner_store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner_pod_id);
     owner_store
-        .insert_run(durable_record(
+        .insert_run(owned_durable_record(
             &approval_run_id,
             &approval_session_id,
             &user_id,
+            owner_pod_id,
         ))
         .await
         .expect("owner pod inserts approval run");
-    owner_store
-        .append_event(
-            &user_id,
-            &approval_run_id,
-            json!({
-                "event_type": "approval_required",
-                "data": {
-                    "request_id": approval_request_id,
-                    "tool": "bash",
-                    "args": {"command": "git status"},
-                    "approval_kind": "standard",
-                    "delivery": "durable",
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists approval request");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &approval_run_id,
-            "waiting",
-            Some("tool_approval"),
-            None,
-        )
-        .await
-        .expect("owner pod persists approval wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &approval_session_id,
+        &approval_run_id,
+        &approval_request_id,
+        DurableRunInteractionKind::Approval,
+        json!({
+            "event_type": "approval_required",
+            "idempotency_key": format!("approval:{approval_request_id}:required"),
+            "data": {
+                "request_id": approval_request_id,
+                "session_id": approval_session_id,
+                "tool": "bash",
+                "args": {"command": "git status"},
+                "approval_kind": "standard",
+                "delivery": "durable",
+            }
+        }),
+    )
+    .await;
 
     let owner_app = build_joint_app(
         pool.clone(),
@@ -1689,43 +1780,43 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     assert_eq!(status, StatusCode::CONFLICT);
 
     owner_store
-        .insert_run(durable_record(&prompt_run_id, &prompt_session_id, &user_id))
+        .insert_run(owned_durable_record(
+            &prompt_run_id,
+            &prompt_session_id,
+            &user_id,
+            owner_pod_id,
+        ))
         .await
         .expect("owner pod inserts ask_user run");
-    owner_store
-        .append_event(
-            &user_id,
-            &prompt_run_id,
-            json!({
-                "event_type": "ask_user_prompted",
-                "data": {
-                    "request_id": prompt_request_id,
-                    "prompt": {
-                        "context": "Server-only durable question",
-                        "questions": [{
-                            "header": "Scope",
-                            "question": "Continue?",
-                            "options": [],
-                            "multi_select": false,
-                            "allow_freeform": true
-                        }],
-                        "timeout_ms": null
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists ask_user prompt");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &prompt_run_id,
-            "waiting",
-            Some("user_input"),
-            None,
-        )
-        .await
-        .expect("owner pod persists ask_user wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &prompt_session_id,
+        &prompt_run_id,
+        &prompt_request_id,
+        DurableRunInteractionKind::AskUser,
+        json!({
+            "event_type": "ask_user_prompted",
+            "idempotency_key": format!("ask_user:{prompt_request_id}:required"),
+            "data": {
+                "request_id": prompt_request_id,
+                "session_id": prompt_session_id,
+                "prompt": {
+                    "context": "Server-only durable question",
+                    "questions": [{
+                        "header": "Scope",
+                        "question": "Continue?",
+                        "options": [],
+                        "multi_select": false,
+                        "allow_freeform": true
+                    }],
+                    "timeout_ms": null
+                },
+                "delivery": "durable"
+            }
+        }),
+    )
+    .await;
     let prompt_body = json!({
         "request_id": prompt_request_id,
         "session_id": prompt_session_id,
@@ -1813,43 +1904,39 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     assert_eq!(cancel_status, StatusCode::CONFLICT);
 
     owner_store
-        .insert_run(durable_record(
+        .insert_run(owned_durable_record(
             &expired_run_id,
             &expired_session_id,
             &user_id,
+            owner_pod_id,
         ))
         .await
         .expect("owner pod inserts expiring approval run");
-    owner_store
-        .append_event(
-            &user_id,
-            &expired_run_id,
-            json!({
-                "event_type": "approval_required",
-                "data": {
-                    "request_id": expired_request_id,
-                    "tool": "bash",
-                    "args": {"command": "git status"},
-                    "approval_kind": "standard",
-                    "delivery": "durable"
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists expiring approval request");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &expired_run_id,
-            "waiting",
-            Some("tool_approval"),
-            None,
-        )
-        .await
-        .expect("owner pod persists expiring approval wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &expired_session_id,
+        &expired_run_id,
+        &expired_request_id,
+        DurableRunInteractionKind::Approval,
+        json!({
+            "event_type": "approval_required",
+            "idempotency_key": format!("approval:{expired_request_id}:required"),
+            "data": {
+                "request_id": expired_request_id,
+                "session_id": expired_session_id,
+                "tool": "bash",
+                "args": {"command": "git status"},
+                "approval_kind": "standard",
+                "delivery": "durable"
+            }
+        }),
+    )
+    .await;
     owner_store
         .resolve_run_interaction(
             &user_id,
+            &expired_session_id,
             &expired_run_id,
             &expired_request_id,
             DurableRunInteractionKind::Approval,
@@ -1915,13 +2002,21 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 durable run insert must succeed");
     store
-        .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
+        .update_run_status(
+            &user_id,
+            &session_id,
+            &run_id,
+            "waiting",
+            Some("approval"),
+            None,
+        )
         .await
         .expect("S07 approval waiting status must persist");
     let approval_id = id("approval");
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({
                 "event_type": "approval_request",
@@ -2039,8 +2134,9 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     let final_store = shared_store.read().await.clone();
     final_store
         .append_event(
-                    &user_id,
-                    &run_id,
+            &user_id,
+            &session_id,
+            &run_id,
             json!({"event_type": "pre_execute_check", "data": {"approval_id": approval_id, "condition_passed": true}}),
         )
         .await
@@ -2048,13 +2144,14 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     final_store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S07 run_finished must persist");
     final_store
-        .update_run_status(&user_id, &run_id, "completed", None, None)
+        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
         .await
         .expect("S07 completed status must persist");
 
@@ -2447,6 +2544,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "assistant_delta", "data": {"text": "active replay"}}),
         )

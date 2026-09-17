@@ -18,7 +18,9 @@ impl Default for TurnCompletionFacts {
 }
 
 impl TurnCompletionFacts {
-    pub fn from_tool_signatures(tool_signatures: &[std::collections::BTreeSet<String>]) -> Self {
+    pub fn from_tool_signatures(
+        tool_signatures: &[std::collections::BTreeSet<crate::stall::StallSignature>],
+    ) -> Self {
         let stall_detected =
             crate::stall::detect_server_stall(tool_signatures, crate::stall::SERVER_STALL_WINDOW)
                 .unwrap_or(false);

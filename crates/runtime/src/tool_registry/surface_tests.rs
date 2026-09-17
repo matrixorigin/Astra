@@ -19,7 +19,8 @@
 #![cfg(test)]
 
 use crate::tool_registry::surface::{
-    DeferredEntry, ToolSurface, default_always_load_names, missing_always_load_schema_names,
+    DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET, DeferredEntry, ToolSurface, default_always_load_names,
+    missing_always_load_schema_names,
 };
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -60,6 +61,75 @@ fn schema_name_set() -> std::collections::BTreeSet<String> {
     names(&catalog_schemas()).into_iter().collect()
 }
 
+fn assert_no_resident_property_descriptions(value: &Value, path: &str) {
+    match value {
+        Value::Object(object) => {
+            assert!(
+                !object.contains_key("description"),
+                "resident property {path} must not carry catalog prose"
+            );
+            for (key, child) in object {
+                assert_no_resident_property_descriptions(child, &format!("{path}.{key}"));
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                assert_no_resident_property_descriptions(child, &format!("{path}[{index}]"));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn without_descriptions(mut value: Value) -> Value {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("description");
+                for child in object.values_mut() {
+                    strip(child);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(strip),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
+fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash: &Value) {
+    let description = resident_bash["function"]["description"]
+        .as_str()
+        .expect("resident Bash description");
+    for cue in [
+        "Before external mutations",
+        "smallest absolute external roots",
+        "owned foreground delta",
+        "Omit for workspace-only or read-only work",
+    ] {
+        assert!(
+            description.contains(cue),
+            "resident Bash must retain external-state cue {cue:?}: {description}"
+        );
+    }
+    assert!(
+        !description.contains("tool_search for artifact preservation or external-effect evidence"),
+        "resident external_state_paths must not require deferred discovery: {description}"
+    );
+
+    let resident_external =
+        &resident_bash["function"]["parameters"]["properties"]["external_state_paths"];
+    let canonical_external =
+        &canonical_bash["function"]["parameters"]["properties"]["external_state_paths"];
+    assert_ne!(resident_external, &Value::Null);
+    assert_eq!(
+        without_descriptions(resident_external.clone()),
+        without_descriptions(canonical_external.clone()),
+        "resident Bash must preserve the complete executable external_state_paths schema"
+    );
+}
+
 // ── 1. Defaults ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -68,6 +138,533 @@ fn every_default_always_load_has_a_schema_in_the_canonical_pool() {
     assert!(
         missing.is_empty(),
         "default always_load ToolSpec contains tools missing from the canonical schema pool: {missing:?}"
+    );
+}
+
+#[test]
+fn default_always_load_surface_has_a_fixed_schema_budget() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let bytes = serde_json::to_vec(&surface.always_load_schemas())
+        .expect("default tool surface must serialize")
+        .len();
+    let without_hot_work = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec![
+                "-start_work".to_string(),
+                "-run_next_work_item".to_string(),
+                "-settle_work_item".to_string(),
+            ],
+        },
+        &[],
+    );
+    let base_bytes = serde_json::to_vec(&without_hot_work.always_load_schemas())
+        .expect("base tool surface must serialize")
+        .len();
+    const SAFETY_MARGIN_BYTES: usize = 256;
+    assert!(
+        bytes.saturating_add(SAFETY_MARGIN_BYTES) <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
+        "default always-load schemas use {bytes} bytes, leaving less than the {SAFETY_MARGIN_BYTES}-byte fixed-prefix safety margin (budget={} bytes); defer a non-primitive workflow or simplify its schema",
+        DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
+    );
+    assert!(
+        bytes > base_bytes,
+        "hot Work lifecycle schemas must be included in the default resident surface"
+    );
+}
+
+#[test]
+fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let always_load: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    for name in [
+        "ask_user",
+        "tool_search",
+        "introspect",
+        "memory",
+        "bash",
+        "read_file",
+        "write_file",
+    ] {
+        assert!(
+            always_load.contains(name),
+            "first-round primitive {name} must remain in T1"
+        );
+    }
+    for name in [
+        "agent_fanout",
+        "agent",
+        "glob",
+        "worktree",
+        "inspect_work_plan",
+        "propose_work_plan",
+        "inspect_work_criteria",
+        "propose_work_criteria",
+    ] {
+        assert!(
+            deferred.contains(name),
+            "optional workflow {name} must remain discoverable in T2"
+        );
+        assert!(
+            !always_load.contains(name),
+            "optional workflow {name} must not tax every request"
+        );
+    }
+}
+
+#[test]
+fn specialized_glob_is_deferred_without_losing_its_canonical_contract() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let resident_names: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    assert!(!resident_names.contains("glob"));
+
+    let manifest = surface
+        .deferred_manifest_with_context_window(Some(200_000))
+        .expect("default deferred catalog");
+    assert!(manifest.names.iter().any(|name| name == "glob"));
+    assert!(manifest.text.contains("\nglob\n"));
+    assert!(!manifest.text.contains("<parameters>"));
+
+    let canonical = catalog_schemas();
+    let glob = canonical
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("glob"))
+        .expect("glob canonical schema");
+    assert_eq!(
+        glob["function"]["parameters"]["properties"]["pattern"]["type"], "string",
+        "deferred selection must retain the complete canonical glob contract"
+    );
+}
+
+#[test]
+fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
+    let canonical = catalog_schemas();
+    let resident = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[])
+        .always_load_schemas();
+    for name in ["start_work", "run_next_work_item", "settle_work_item"] {
+        let full = canonical
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .unwrap_or_else(|| panic!("canonical schema {name}"));
+        let compact = resident
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .unwrap_or_else(|| panic!("resident schema {name}"));
+        let mut full_structure = without_descriptions(full.clone());
+        if name == "start_work" {
+            assert!(
+                full_structure["function"]["parameters"]["x-astra-discovery-summary"].is_string()
+            );
+            full_structure["function"]["parameters"]
+                .as_object_mut()
+                .unwrap()
+                .remove("x-astra-discovery-summary");
+        }
+        assert_eq!(
+            without_descriptions(compact.clone()),
+            full_structure,
+            "resident {name} may remove prose but must preserve every executable structural field"
+        );
+    }
+    let start = resident
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("start_work"))
+        .expect("resident start_work schema");
+    let description = start["function"]["description"]
+        .as_str()
+        .expect("resident start_work description");
+    let full_start = canonical
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("start_work"))
+        .expect("canonical start_work");
+    let task_description =
+        &full_start["function"]["parameters"]["properties"]["tasks"]["description"];
+    assert!(
+        task_description
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert_eq!(
+        start["function"]["parameters"]["properties"]["tasks"]["description"], *task_description,
+        "resident projection must retain the canonical distinction between outcomes and procedural steps"
+    );
+    assert!(description.contains("one canonical Work graph"));
+    assert!(description.contains("never call start_work again"));
+    assert!(description.contains("revision-pinned proposal"));
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "start_work",
+        &json!({
+            "goal": "Deliver two ordered outcomes", "activation": "start",
+            "tasks": [
+                {"objective": "First outcome", "expected_result": "First evidence"},
+                {"objective": "Second outcome", "expected_result": "Second evidence", "after_initial_tasks": [1]}
+            ]
+        }),
+        start,
+    ).expect("resident schema must retain explicit task precedence");
+}
+
+#[test]
+fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape() {
+    let resident = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[])
+        .always_load_schemas();
+    let settle = resident
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("settle_work_item"))
+        .expect("resident settlement schema");
+
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "settle_work_item",
+        &json!({"outcome":"delivered","summary":"Verified requested evidence"}),
+        settle,
+    )
+    .expect("valid first-attempt direct settlement");
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "settle_work_item",
+            &json!({
+                "item_id":"model-selected-item",
+                "verification":{"status":"passed"},
+                "outcome":"delivered",
+                "summary":"done"
+            }),
+            settle,
+        )
+        .is_err(),
+        "stale item_id/verification settlement shape must fail before dispatch"
+    );
+}
+
+#[test]
+fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let resident = surface.always_load_schemas();
+    let full = catalog_schemas();
+    fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+        schemas
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .expect("schema")
+    }
+    let bash = find(&resident, "bash");
+    let bash_properties = bash["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("bash properties");
+    eprintln!(
+        "ordinary resident Bash schema bytes: {}",
+        serde_json::to_vec(bash)
+            .expect("ordinary resident Bash must serialize")
+            .len()
+    );
+    assert_eq!(
+        bash_properties
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "command",
+            "external_state_paths",
+            "force",
+            "mode",
+            "timeout",
+            "workdir"
+        ]
+        .into_iter()
+        .collect(),
+        "ordinary resident Bash must retain its exact foreground call shape"
+    );
+
+    let replace = find(&resident, "str_replace");
+    let replace_properties = replace["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("str_replace properties");
+    assert!(replace_properties.contains_key("old_str"));
+    assert!(!replace_properties.contains_key("edits"));
+
+    let memory = find(&resident, "memory");
+    assert_eq!(
+        memory["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    let memory_properties = memory["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("memory properties");
+    assert_eq!(
+        memory_properties["action"]["enum"],
+        serde_json::json!(["remember", "recall"])
+    );
+    assert!(memory_properties.contains_key("content"));
+    assert!(memory_properties.contains_key("query"));
+    assert_eq!(
+        memory_properties["scope"]["enum"],
+        serde_json::json!(["all", "session"])
+    );
+    assert!(!memory_properties.contains_key("memory_id"));
+
+    let ask_user = find(&resident, "ask_user");
+    assert_eq!(
+        ask_user["function"]["parameters"]["properties"]["questions"]["items"]["additionalProperties"],
+        false
+    );
+    let question_properties =
+        ask_user["function"]["parameters"]["properties"]["questions"]["items"]["properties"]
+            .as_object()
+            .expect("ask_user resident question properties");
+    assert!(question_properties.contains_key("question"));
+    assert!(!question_properties.contains_key("options"));
+    assert!(!question_properties.contains_key("multi_select"));
+
+    let full_bash = find(&full, "bash");
+    assert_resident_external_state_contract(bash, full_bash);
+    assert!(
+        full_bash["function"]["parameters"]["properties"]
+            .get("source_artifacts")
+            .is_some()
+    );
+    let full_replace = find(&full, "str_replace");
+    assert!(
+        full_replace["function"]["parameters"]["properties"]
+            .get("edits")
+            .is_some()
+    );
+    let full_memory = find(&full, "memory");
+    assert!(
+        full_memory["function"]["parameters"]["properties"]
+            .get("memory_id")
+            .is_some()
+    );
+    let full_ask_user = find(&full, "ask_user");
+    assert!(
+        full_ask_user["function"]["parameters"]["properties"]["questions"]["items"]["properties"]
+            .get("options")
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
+    let mut edge_catalog = astra_tools::schemas::all_tool_schemas();
+    astra_tools::schemas::enable_managed_background_bash_schema(&mut edge_catalog);
+    let canonical_bash = edge_catalog
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("canonical managed edge Bash")
+        .clone();
+    let surface = ToolSurface::build(edge_catalog, &ToolSurfaceConfig::default(), &[]);
+    let bash = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("managed edge Bash must remain resident");
+    let properties = bash["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("Bash properties");
+    eprintln!(
+        "managed resident Bash schema bytes: {}",
+        serde_json::to_vec(&bash)
+            .expect("managed resident Bash must serialize")
+            .len()
+    );
+    assert_eq!(
+        properties
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "background_ttl",
+            "command",
+            "external_state_paths",
+            "force",
+            "mode",
+            "ready_check",
+            "run_in_background",
+            "timeout",
+            "workdir",
+        ]
+        .into_iter()
+        .collect(),
+        "managed resident Bash must retain its exact supported call shape"
+    );
+    assert_resident_external_state_contract(&bash, &canonical_bash);
+    assert!(
+        bash["function"]["description"]
+            .as_str()
+            .expect("Bash description")
+            .contains("run_in_background")
+    );
+    assert!(
+        bash["function"]["description"]
+            .as_str()
+            .expect("Bash description")
+            .contains("neither supplies the foreground delta")
+    );
+    assert!(properties["run_in_background"]["description"].is_string());
+    assert!(properties["ready_check"]["description"].is_string());
+    assert!(properties["background_ttl"]["description"].is_string());
+}
+
+#[test]
+fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_them() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let resident = surface.always_load_schemas();
+    let full = catalog_schemas();
+    fn find<'a>(schemas: &'a [Value], name: &str) -> &'a Value {
+        schemas
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .unwrap_or_else(|| panic!("missing schema {name}"))
+    }
+
+    let advanced_memory = json!({
+        "action": "remember",
+        "content": "durable preference",
+        "visibility": "team",
+        "team_id": "team-1"
+    });
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "memory",
+            &advanced_memory,
+            find(&resident, "memory"),
+        )
+        .is_err(),
+        "advanced memory fields require explicit selection of the canonical schema"
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "memory",
+        &advanced_memory,
+        find(&full, "memory"),
+    )
+    .expect("the deferred canonical memory contract retains advanced fields");
+
+    let forget = json!({"action": "forget", "memory_id": "owned-memory", "reason": "user request"});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "memory",
+            &forget,
+            find(&resident, "memory"),
+        )
+        .is_err()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "memory",
+        &forget,
+        find(&full, "memory"),
+    )
+    .expect("forget requires the selected full memory contract");
+    let description = find(&resident, "memory")["function"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(description.contains("forget/update"));
+    assert!(description.contains("tool_search select:memory; invoke_tool"));
+
+    let resident_reflect = json!({
+        "question": "What durable evidence explains the last failed turn?"
+    });
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "reflect",
+        &resident_reflect,
+        find(&resident, "reflect"),
+    )
+    .expect("the resident reflect entrypoint accepts its ordinary question shape");
+    let advanced_reflect = json!({
+        "topic": "runtime",
+        "facet": "performance",
+        "depth": "forensic",
+        "horizon": "session",
+        "source_policy": "durable_first",
+        "last_n": 10
+    });
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "reflect",
+            &advanced_reflect,
+            find(&resident, "reflect"),
+        )
+        .is_err(),
+        "advanced reflect fields require explicit selection of the canonical schema"
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "reflect",
+        &advanced_reflect,
+        find(&full, "reflect"),
+    )
+    .expect("the canonical reflect contract retains advanced fields");
+
+    let advanced_question = json!({
+        "questions": [{
+            "question": "Choose a mode",
+            "options": ["safe", "fast"],
+            "multi_select": true
+        }]
+    });
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "ask_user",
+            &advanced_question,
+            find(&resident, "ask_user"),
+        )
+        .is_err(),
+        "advanced question fields require explicit selection of the canonical schema"
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "ask_user",
+        &advanced_question,
+        find(&full, "ask_user"),
+    )
+    .expect("the deferred canonical ask_user contract retains advanced fields");
+}
+
+#[test]
+fn resident_schemas_keep_structure_but_drop_catalog_prose() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    for schema in surface.always_load_schemas() {
+        let name = tool_schema_name(&schema).expect("resident schema name");
+        let function = schema["function"].as_object().expect("function object");
+        assert_eq!(
+            function["parameters"]["additionalProperties"], false,
+            "resident schema {name} must be an exact closed provider contract"
+        );
+        let description = function["description"]
+            .as_str()
+            .expect("resident schema description");
+        assert!(
+            description.len() < 220,
+            "resident schema {name} should use a short operation summary, got {} bytes",
+            description.len()
+        );
+        let properties = function["parameters"]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("resident schema {name} properties"));
+        for (field, property) in properties {
+            let mut compact_property = property.clone();
+            if name == "start_work" && field == "tasks" {
+                compact_property
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("description");
+            }
+            assert_no_resident_property_descriptions(&compact_property, &format!("{name}.{field}"));
+        }
+    }
+
+    // Projection is only a prompt-surface optimization: the canonical pool
+    // still carries the richer introspection contract for explicit selection.
+    let full_introspect = catalog_schemas()
+        .into_iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .expect("full introspect schema");
+    assert!(
+        full_introspect["function"]["parameters"]["properties"]["topic"]["description"].is_string()
     );
 }
 
@@ -142,6 +739,24 @@ fn surface_build_rejects_internal_builtin_schemas_from_any_pool() {
 }
 
 #[test]
+fn surface_build_reserves_the_deferred_invocation_carrier_name() {
+    let carrier = astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER;
+    let surface = ToolSurface::build(
+        vec![plugin_schema(carrier, "Untrusted collision attempt.")],
+        &ToolSurfaceConfig {
+            pinned_tools: vec![carrier.to_string()],
+        },
+        &[],
+    );
+
+    assert!(names(&surface.always_load_schemas()).is_empty());
+    assert!(
+        surface.deferred().is_empty(),
+        "the runtime-owned carrier is never discoverable as a plugin capability"
+    );
+}
+
+#[test]
 fn server_builtin_inventory_is_public_schema_backed() {
     let schema_names = schema_name_set();
     let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -206,18 +821,52 @@ fn always_load_default_candidates_follow_tool_spec_load_policy() {
 }
 
 #[test]
+fn hot_work_lifecycle_is_resident_while_graph_maintenance_stays_deferred() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let always_load: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    for essential in ["start_work", "run_next_work_item", "settle_work_item"] {
+        assert!(
+            always_load.contains(essential) && !deferred.contains(essential),
+            "hot Work lifecycle schema must be directly callable: {essential}"
+        );
+    }
+    for core in [
+        "inspect_work_plan",
+        "propose_work_plan",
+        "inspect_work_criteria",
+        "propose_work_criteria",
+    ] {
+        assert!(
+            !always_load.contains(core) && deferred.contains(core),
+            "durable Work graph maintenance must remain discoverable without taxing every request: {core}"
+        );
+    }
+}
+
+#[test]
 fn web_without_file_environment_provider_filters_workspace_executor_candidates() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let candidate_names: std::collections::BTreeSet<String> =
         names(&surface.always_load_schemas()).into_iter().collect();
 
-    for candidate in ["bash", "read_file", "write_file", "git"] {
+    for candidate in ["bash", "read_file", "write_file"] {
         assert!(
             candidate_names.contains(candidate),
             "{candidate} remains a declaration-level T1 candidate"
         );
     }
+    assert!(
+        !candidate_names.contains("git"),
+        "the large Git action union must remain deferred until selected"
+    );
 
     let filtered =
         crate::server::tool_binding_projection::capability_filter_tool_schemas_for_binding(
@@ -233,12 +882,17 @@ fn web_without_file_environment_provider_filters_workspace_executor_candidates()
         );
     let final_names: std::collections::BTreeSet<String> = names(&filtered).into_iter().collect();
 
-    for visible in ["ask_user", "tool_search", "introspect", "reflect"] {
+    for visible in ["ask_user", "memory", "tool_search"] {
         assert!(
             final_names.contains(visible),
             "{visible} should remain visible without a file-environment provider"
         );
     }
+    let deferred = "agent_fanout";
+    assert!(
+        !final_names.contains(deferred),
+        "{deferred} should be activated only when its workflow is needed"
+    );
     for hidden in ["bash", "read_file", "write_file", "git"] {
         assert!(
             !final_names.contains(hidden),
@@ -281,16 +935,59 @@ fn surface_snapshot_exposes_visible_tools_and_tier_counts() {
 #[test]
 fn config_always_load_tools_additive_appends_to_defaults() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["github".into(), "memory".into()],
+        pinned_tools: vec!["web_search".into(), "memory".into()],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
     let always_load = names(&surface.always_load_schemas());
-    assert!(always_load.iter().any(|n| n == "github"));
+    assert!(always_load.iter().any(|n| n == "web_search"));
     assert!(always_load.iter().any(|n| n == "memory"));
     // Defaults still there
     assert!(always_load.iter().any(|n| n == "bash"));
     assert!(always_load.iter().any(|n| n == "tool_search"));
+}
+
+#[test]
+fn config_can_defer_a_default_and_repin_it_in_declaration_order() {
+    let cfg = ToolSurfaceConfig {
+        pinned_tools: vec![
+            "-grep".into(),
+            "web_search".into(),
+            "grep".into(),
+            "-bash".into(),
+        ],
+    };
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let always_load = names(&surface.always_load_schemas());
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    assert!(always_load.contains(&"grep".to_string()));
+    assert!(always_load.contains(&"web_search".to_string()));
+    assert!(!always_load.contains(&"bash".to_string()));
+    assert!(deferred.contains("bash"));
+}
+
+#[test]
+fn config_cannot_defer_the_deferred_activation_protocol_floor() {
+    let cfg = ToolSurfaceConfig {
+        pinned_tools: vec!["-tool_search".into(), "-bash".into()],
+    };
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+    let always_load = names(&surface.always_load_schemas());
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    assert!(always_load.contains(&"tool_search".to_string()));
+    assert!(!deferred.contains("tool_search"));
+    assert!(!always_load.contains(&"bash".to_string()));
+    assert!(deferred.contains("bash"));
 }
 
 #[test]
@@ -322,15 +1019,15 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
             "-".into(),
             "--foo".into(),
             "  ".into(),
-            " github".into(),
+            " web_search".into(),
         ],
     };
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
     assert!(!always_load.iter().any(|n| n == "foo"));
-    assert!(always_load.iter().any(|n| n == "github"));
+    assert!(always_load.iter().any(|n| n == "web_search"));
     assert!(
-        !always_load.iter().any(|n| n == " github"),
+        !always_load.iter().any(|n| n == " web_search"),
         "stored tool names must stay canonical"
     );
     // Defaults survive all this malformed input.
@@ -342,12 +1039,20 @@ fn empty_and_malformed_config_entries_are_ignored_not_panic() {
 #[test]
 fn unknown_tool_name_in_config_is_ignored_not_panic() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["not_a_real_tool".into(), "-also_not_real".into()],
+        pinned_tools: vec![
+            "not_a_real_tool".into(),
+            "-also_not_real".into(),
+            "git".into(),
+            "github".into(),
+        ],
     };
     // Should not panic; unknown names simply do nothing.
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let always_load = names(&surface.always_load_schemas());
-    assert!(!always_load.iter().any(|n| n == "not_a_real_tool"));
+    for name in ["not_a_real_tool", "git", "github"] {
+        assert!(!always_load.iter().any(|n| n == name));
+        assert!(!surface.deferred().iter().any(|entry| entry.name == name));
+    }
     assert!(always_load.iter().any(|n| n == "grep"));
     // Defaults preserved.
     assert!(always_load.iter().any(|n| n == "bash"));
@@ -386,7 +1091,7 @@ fn surface_partitions_static_tools_and_excludes_request_scoped_tools() {
 }
 
 #[test]
-fn observation_tools_are_always_load_and_not_deferred() {
+fn observation_recovery_and_reflection_are_eager() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
@@ -398,30 +1103,98 @@ fn observation_tools_are_always_load_and_not_deferred() {
         .map(|entry| entry.name.clone())
         .collect();
 
-    for tool in ["introspect", "reflect"] {
+    assert!(always_load.contains("introspect"));
+    assert!(!deferred.contains("introspect"));
+    assert!(always_load.contains("reflect"));
+    assert!(!deferred.contains("reflect"));
+
+    let introspect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| schema["function"]["name"] == "introspect")
+        .expect("introspect recovery schema must be eager");
+    let properties = &introspect["function"]["parameters"]["properties"];
+    for field in ["artifact", "offset", "max_bytes"] {
         assert!(
-            always_load.contains(tool),
-            "{tool} must be visible without deferred activation"
-        );
-        assert!(
-            !deferred.contains(tool),
-            "{tool} must not also appear in deferred discovery"
+            properties.get(field).is_some(),
+            "eager introspect schema must expose artifact recovery field {field}"
         );
     }
+
+    let reflect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| schema["function"]["name"] == "reflect")
+        .expect("reflect observation schema must be eager");
+    let description = reflect["function"]["description"].as_str().unwrap();
+    assert!(description.contains("tool_search select:reflect"));
+    assert!(description.contains("invoke_tool"));
+    let reflect_properties = reflect["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("resident reflect properties");
+    assert_eq!(
+        reflect_properties.keys().collect::<Vec<_>>(),
+        vec!["question"]
+    );
 
     let manifest = surface
         .deferred_manifest_with_context_window(Some(200_000))
         .expect("default surface should still have other deferred tools");
-    for tool in ["introspect", "reflect"] {
-        assert!(
-            !manifest.names.iter().any(|name| name == tool),
-            "{tool} must not be advertised as deferred"
-        );
-        assert!(
-            !manifest.text.contains(&format!("\n{tool}\n")),
-            "{tool} must not be rendered in the deferred prompt block"
+    assert!(!manifest.names.iter().any(|name| name == "introspect"));
+    assert!(!manifest.names.iter().any(|name| name == "reflect"));
+}
+
+#[test]
+fn artifact_recovery_shape_survives_aggressive_pressure() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let introspect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| schema["function"]["name"] == "introspect")
+        .expect("introspect recovery schema must be eager");
+    let pressured = astra_turn_core::tool_schema_prune::prune_tool_schemas(
+        std::slice::from_ref(&introspect),
+        astra_turn_core::compaction_types::CompactionTier::AggressivePrune,
+    );
+
+    let original_parameters = introspect["function"]["parameters"]
+        .as_object()
+        .expect("introspect parameters must be an object");
+    let pressured_parameters = pressured[0]["function"]["parameters"]
+        .as_object()
+        .expect("pressured introspect parameters must remain an object");
+    let original_properties = original_parameters["properties"]
+        .as_object()
+        .expect("introspect properties must be an object");
+    let pressured_properties = pressured_parameters["properties"]
+        .as_object()
+        .expect("pressured introspect properties must remain an object");
+
+    assert_eq!(
+        original_properties.keys().collect::<Vec<_>>(),
+        pressured_properties.keys().collect::<Vec<_>>(),
+        "pressure must not remove any admitted introspect parameter"
+    );
+    for (name, original) in original_properties {
+        let mut expected = original.clone();
+        if let Some(property) = expected.as_object_mut() {
+            property.remove("description");
+        }
+        assert_eq!(
+            pressured_properties.get(name),
+            Some(&expected),
+            "pressure may remove only the description annotation from `{name}`"
         );
     }
+
+    let mut original_shape = original_parameters.clone();
+    let mut pressured_shape = pressured_parameters.clone();
+    original_shape.remove("properties");
+    pressured_shape.remove("properties");
+    assert_eq!(
+        original_shape, pressured_shape,
+        "pressure must preserve parameter-level schema constraints"
+    );
 }
 
 #[test]
@@ -651,40 +1424,6 @@ fn deferred_entries_are_name_plus_short_desc_capped() {
             entry.short_desc.chars().count()
         );
     }
-}
-
-#[test]
-fn deferred_agent_summaries_keep_load_bearing_constraints() {
-    let cfg = ToolSurfaceConfig::default();
-    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-
-    let deferred = surface
-        .deferred()
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry.short_desc.as_str()))
-        .collect::<std::collections::HashMap<_, _>>();
-
-    let agent = deferred
-        .get("agent")
-        .expect("agent should be deferred by default");
-    assert!(
-        agent.contains("description+prompt")
-            && agent.contains("agent_id")
-            && agent.contains("foreground")
-            && agent.contains("run_chain"),
-        "agent deferred summary must keep spawn/get_result/run_chain constraints: {agent}"
-    );
-
-    let fanout = deferred
-        .get("agent_fanout")
-        .expect("agent_fanout should be deferred by default");
-    assert!(
-        fanout.contains("exactly that many slots")
-            && fanout.contains("description+prompt")
-            && fanout.contains("never embed diffs")
-            && fanout.contains("no brief/agents/background"),
-        "agent_fanout deferred summary must keep current count, slot-shape, and shared-workspace constraints: {fanout}"
-    );
 }
 
 #[test]

@@ -9,6 +9,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
+import type { WorkTaskGraphPageV2 } from "@astra/sdk";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { ChatActionsMenu } from "@/components/app/chat-actions-menu";
@@ -43,11 +44,16 @@ import {
   agentInterruptionPresentation,
   createEmptyWorkSurface,
   type AgentSurfaceItem,
-  type SessionTask,
   type ToolSurfaceItem,
 } from "@/lib/work-surface";
 import { cn } from "@/lib/utils/cn";
 import { useToast } from "@/components/ui/toast";
+import {
+  isWorkTaskOpen,
+  workTaskCounts,
+  workTaskNeedsAttention,
+  workTaskPresentation,
+} from "@/lib/work-task-presentation";
 
 // ── ChatView ─────────────────────────────────────────────────────────────────
 
@@ -145,9 +151,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         activeRunStatus === "blocked" ||
         activeRunStatus === "waiting"),
   );
-  const openTaskCount = workSurface.tasks.filter(
-    (task) => !isTerminalTaskStatus(task.status),
-  ).length;
+  const taskItems = workSurface.taskGraph?.items.entries ?? [];
+  const taskCounts = workTaskCounts(taskItems);
+  const openTaskCount = taskCounts.open;
+  const taskAttentionCount = taskCounts.attention;
   const activeAgentCount = workSurface.agents.filter((agent) =>
     ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
   ).length;
@@ -178,15 +185,17 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     workSurface.hydrated &&
     (activeRunIsVisibleActivity ||
       taskBoardIntervention ||
+      taskAttentionCount > 0 ||
       openTaskCount > 0 ||
       agentSignalCount > 0 ||
       toolAttentionCount > 0) &&
-    (workSurface.tasks.length > 0 ||
+    (taskItems.length > 0 ||
       workSurface.agents.length > 0 ||
       workSurface.tools.length > 0);
   const conversationActivityKey = showConversationActivityStrip
     ? [
         openTaskCount,
+        taskAttentionCount,
         workSurface.agents.length,
         workSurface.tools.length,
         agentSignalCount,
@@ -439,7 +448,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             ))}
             {showConversationActivityStrip ? (
               <ConversationWorkCard
-                tasks={workSurface.tasks}
+                taskGraph={workSurface.taskGraph}
                 agents={workSurface.agents}
                 tools={workSurface.tools}
                 activeToolCount={activeToolCount}
@@ -484,6 +493,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               </div>
             ) : (
               <>
+                {stream.pendingApproval ? (
+                  <RunApprovalCard
+                    approval={stream.pendingApproval}
+                    busy={stream.approvalResponsePending}
+                    onDecision={stream.respondToApproval}
+                  />
+                ) : null}
                 <Composer
                   disabled={composerDisabled}
                   placeholder={composerPlaceholder}
@@ -644,6 +660,58 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 }
 
+function RunApprovalCard({
+  approval,
+  busy,
+  onDecision,
+}: {
+  approval: import("@/lib/api/chats").PendingRunApproval;
+  busy: boolean;
+  onDecision: (decision: "allow" | "deny") => Promise<void>;
+}) {
+  const isPlanReview = approval.tool === "exit_plan_mode";
+  return (
+    <section
+      aria-label={isPlanReview ? "Plan review" : "Tool approval"}
+      className="mb-3 rounded-[18px] border border-accent/35 bg-surface px-4 py-3 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.08)]"
+    >
+      <div className="flex items-start gap-3">
+        <ClipboardList className="mt-0.5 size-4 shrink-0 text-accent" />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold text-text">
+            {isPlanReview
+              ? "Review the plan before Astra continues"
+              : approval.displayLabel ?? `Approve ${approval.tool}`}
+          </p>
+          {approval.detail ? (
+            <pre className="mt-2 max-h-44 overflow-auto whitespace-pre-wrap rounded-xl bg-surface-muted px-3 py-2 font-mono text-xs leading-5 text-text">
+              {approval.detail}
+            </pre>
+          ) : null}
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void onDecision("allow")}
+              className="rounded-control bg-text px-3 py-1.5 text-xs font-semibold text-white transition-opacity disabled:opacity-50"
+            >
+              {busy ? "Submitting…" : isPlanReview ? "Approve and continue" : "Allow once"}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void onDecision("deny")}
+              className="rounded-control border border-border px-3 py-1.5 text-xs font-medium text-text-muted transition-colors hover:text-text disabled:opacity-50"
+            >
+              {isPlanReview ? "Keep planning" : "Deny"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function chatHeaderRunState(status: string | null) {
   const normalized = status?.trim().toLowerCase();
   if (
@@ -692,7 +760,7 @@ function chatHeaderRunState(status: string | null) {
 }
 
 function ConversationWorkCard({
-  tasks,
+  taskGraph,
   agents,
   tools,
   activeToolCount,
@@ -702,7 +770,7 @@ function ConversationWorkCard({
   active,
   onOpen,
 }: {
-  tasks: SessionTask[];
+  taskGraph: WorkTaskGraphPageV2 | null;
   agents: AgentSurfaceItem[];
   tools: ToolSurfaceItem[];
   activeToolCount: number;
@@ -712,7 +780,9 @@ function ConversationWorkCard({
   active: boolean;
   onOpen: (tab: WorkSurfaceTab) => void;
 }) {
-  const openTasks = tasks.filter((task) => !isTerminalTaskStatus(task.status));
+  const tasks = taskGraph?.items.entries ?? [];
+  const openTasks = tasks.filter(isWorkTaskOpen);
+  const attentionTasks = tasks.filter(workTaskNeedsAttention);
   const activeAgents = agents.filter((agent) =>
     ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
   );
@@ -723,7 +793,8 @@ function ConversationWorkCard({
     (tool) => tool.blocked || tool.status === "error",
   );
   const activeTools = tools.filter((tool) => isActiveToolStatus(tool.status));
-  const primaryTask = openTasks[0] ?? tasks[0];
+  const primaryTask = attentionTasks[0] ?? openTasks[0] ?? tasks[0];
+  const primaryTaskState = primaryTask ? workTaskPresentation(primaryTask) : null;
   const primaryAgent = signalAgents[0] ?? activeAgents[0] ?? agents[0];
   const primaryTool = issueTools[0] ?? activeTools[0] ?? tools[0];
   const agentDangerCount = agents.filter(isDangerAgent).length;
@@ -731,7 +802,7 @@ function ConversationWorkCard({
   const cardTone: ConversationTone =
     toolAttentionCount > 0 || agentDangerCount > 0
       ? "danger"
-      : taskBoardIntervention || agentWarningCount > 0
+      : taskBoardIntervention || attentionTasks.length > 0 || agentWarningCount > 0
         ? "warning"
         : active
           ? "running"
@@ -740,6 +811,8 @@ function ConversationWorkCard({
     ? "Needs direction"
     : cardTone === "danger"
       ? "Needs attention"
+      : attentionTasks.length > 0
+        ? "Needs attention"
       : cardTone === "warning"
         ? "Waiting"
       : active
@@ -759,12 +832,13 @@ function ConversationWorkCard({
       tab: "tasks",
       icon: ClipboardList,
       label: "Tasks",
-      count: tasks.length,
+      count: taskGraph?.items.total ?? 0,
       activeCount: openTasks.length,
       highlightCount: taskBoardIntervention
         ? openTasks.length || tasks.length
-        : 0,
-      tone: taskBoardIntervention ? "warning" : undefined,
+        : attentionTasks.length,
+      tone:
+        taskBoardIntervention || attentionTasks.length > 0 ? "warning" : undefined,
     },
     {
       tab: "agents",
@@ -792,20 +866,22 @@ function ConversationWorkCard({
   ];
   const actions = actionCandidates.filter((action) => action.count > 0);
   const rows = [
-    primaryTask
+    primaryTask && primaryTaskState
       ? {
           key: "tasks",
           tab: "tasks" as WorkSurfaceTab,
           icon: ClipboardList,
-          title: primaryTask.title,
+          title: primaryTask.objective,
           meta:
             taskBoardIntervention && openTasks.length > 1
               ? `${openTasks.length} open tasks`
-              : statusLabel(primaryTask.status),
+              : primaryTaskState.label,
           status: taskBoardIntervention
             ? "Needs direction"
-            : statusLabel(primaryTask.status),
-          tone: taskBoardIntervention ? ("warning" as const) : undefined,
+            : primaryTaskState.label,
+          tone: taskBoardIntervention
+            ? ("warning" as const)
+            : conversationTaskTone(primaryTaskState.tone),
         }
       : null,
     primaryAgent
@@ -845,6 +921,9 @@ function ConversationWorkCard({
       ? rows.find((row) => row.tab === "tools")
       : undefined) ??
     (taskBoardIntervention
+      ? rows.find((row) => row.tab === "tasks")
+      : undefined) ??
+    (attentionTasks.length > 0
       ? rows.find((row) => row.tab === "tasks")
       : undefined) ??
     (agentSignalCount > 0
@@ -1089,17 +1168,13 @@ function conversationActionToneClass(tone: ConversationTone) {
   }
 }
 
-function isTerminalTaskStatus(status: string) {
-  return [
-    "completed",
-    "complete",
-    "done",
-    "cancelled",
-    "canceled",
-    "failed",
-    "skipped",
-    "archived",
-  ].includes(status.toLowerCase());
+function conversationTaskTone(
+  tone: ReturnType<typeof workTaskPresentation>["tone"],
+): ConversationTone | undefined {
+  if (tone === "danger") return "danger";
+  if (tone === "warning") return "warning";
+  if (tone === "running") return "running";
+  return undefined;
 }
 
 function isActiveToolStatus(status: string) {

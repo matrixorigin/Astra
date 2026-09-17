@@ -9,7 +9,7 @@ use crate::cli::stream::stream_render::{
 use astra_runtime::prompts;
 
 #[test]
-fn dispatch_turn_event_collects_explain_events() {
+fn generic_explain_payload_does_not_create_explain_analyze_facts() {
     let mut result = TurnResult::new();
     let block = "data: {\"type\":\"explain\",\"total_ms\":7,\"tool_calls\":1,\"tools_available\":2,\"first_tool_call\":null,\"first_tool_call_fallback\":null,\"steps\":[]}\n\n";
     let mut render = StreamRenderState::new();
@@ -20,11 +20,7 @@ fn dispatch_turn_event_collects_explain_events() {
         RenderPolicy::Stream,
         &mut vec![],
     );
-    assert_eq!(result.explain_turns.len(), 1);
-    assert_eq!(
-        result.explain_turns[0].get("type").and_then(|v| v.as_str()),
-        Some("explain")
-    );
+    assert!(result.core.explain_analyze_events.is_empty());
 }
 
 #[test]

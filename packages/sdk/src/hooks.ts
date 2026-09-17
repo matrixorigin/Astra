@@ -381,6 +381,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   const toolCallMapRef = useRef(new Map<string, ToolCall>());
   const assistantIdRef = useRef(0);
   const streamGenerationRef = useRef(0);
+  const usageRef = useRef<TokenUsage>({ ...emptyUsage });
+  const turnUsageBaseRef = useRef<TokenUsage>({ ...emptyUsage });
 
   // Reset on session change
   useEffect(() => {
@@ -463,6 +465,18 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         dispatch({ type: "SET_RUN_STATUS", status: "paused" });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
         break;
 
       case "run_resumed":
@@ -483,6 +497,18 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           type: "SET_RUN_STATUS",
           status: projection.status,
           waitingFor: projection.waitingFor,
+        });
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
         });
         break;
       }
@@ -545,6 +571,27 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
               return [
                 ...prev.slice(0, -1),
                 { ...last, content: accumulatedTextRef.current },
+              ];
+            }
+            return prev;
+          },
+        });
+        break;
+
+      case "text_done":
+        // `text_done.full_text` is an authoritative replacement boundary.
+        // Output-cap retries can legitimately diverge from the first streamed
+        // prefix; appending here would leave the UI showing text that differs
+        // from the durable assistant message.
+        accumulatedTextRef.current = event.full_text;
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant") {
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: event.full_text },
               ];
             }
             return prev;
@@ -646,8 +693,10 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
         upsertToolCall(event.call_id, (existing) => ({
           ...existing,
           callId: event.call_id,
-          tool: existing?.tool ?? "tool",
-          result: event.result,
+          tool: event.tool ?? existing?.tool ?? "tool",
+          arguments:
+            valueToToolString(event.arguments) ?? existing?.arguments,
+          result: valueToToolString(event.result) ?? existing?.result,
           status: toolTerminalStatus(event),
           startedAt: existing?.startedAt ?? Date.now(),
           finishedAt: Date.now(),
@@ -678,19 +727,38 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       }
 
       case "usage":
-        dispatch({
-          type: "SET_USAGE",
-          usage: (prev) => ({
-            promptTokens: prev.promptTokens + event.prompt_tokens,
-            completionTokens: prev.completionTokens + event.completion_tokens,
-            totalTokens:
-              prev.totalTokens + event.prompt_tokens + event.completion_tokens,
-            cacheCreationTokens:
-              prev.cacheCreationTokens + (event.cache_creation_tokens ?? 0),
-            cacheReadTokens:
-              prev.cacheReadTokens + (event.cache_read_tokens ?? 0),
-          }),
-        });
+        {
+          const next = {
+            promptTokens: event.prompt_tokens,
+            completionTokens: event.completion_tokens,
+            totalTokens: event.prompt_tokens + event.completion_tokens,
+            cacheCreationTokens: event.cache_creation_tokens ?? 0,
+            cacheReadTokens: event.cache_read_tokens ?? 0,
+          };
+          // Live request usage is an incremental observation. The terminal
+          // run aggregate is authoritative for this turn, but the public hook
+          // keeps session usage cumulative, so restore the pre-turn base first
+          // instead of discarding prior completed turns.
+          const base = turnUsageBaseRef.current;
+          const previous = usageRef.current;
+          usageRef.current =
+            event.usage_scope === "run_total"
+              ? {
+                  promptTokens: base.promptTokens + next.promptTokens,
+                  completionTokens: base.completionTokens + next.completionTokens,
+                  totalTokens: base.totalTokens + next.totalTokens,
+                  cacheCreationTokens: base.cacheCreationTokens + next.cacheCreationTokens,
+                  cacheReadTokens: base.cacheReadTokens + next.cacheReadTokens,
+                }
+              : {
+                  promptTokens: previous.promptTokens + next.promptTokens,
+                  completionTokens: previous.completionTokens + next.completionTokens,
+                  totalTokens: previous.totalTokens + next.totalTokens,
+                  cacheCreationTokens: previous.cacheCreationTokens + next.cacheCreationTokens,
+                  cacheReadTokens: previous.cacheReadTokens + next.cacheReadTokens,
+                };
+          dispatch({ type: "SET_USAGE", usage: usageRef.current });
+        }
         break;
 
       case "plan_created":
@@ -755,9 +823,45 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
       case "error":
         dispatch({ type: "SET_ERROR", error: event.message });
+        // A retryable transport error keeps the stream alive while
+        // `SSEClient` reconnects. A non-retryable protocol/server error is a
+        // terminal failure; close the provisional assistant message so the
+        // UI cannot remain in a permanently streaming state after EOF.
+        if (event.retryable === true) break;
+        dispatch({ type: "SET_STREAMING", isStreaming: false });
+        dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
+        dispatch({ type: "SET_RUN_STATUS", status: "failed", waitingFor: null });
+        dispatch({
+          type: "SET_MESSAGES",
+          messages: (prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.role === "assistant" && last.streaming) {
+              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            }
+            return prev;
+          },
+        });
         break;
 
       case "turn_complete":
+        if (event.assistant_text !== undefined) {
+          // The server-owned terminal projection is the final authoritative
+          // text even when the live stream began with a provisional retry.
+          accumulatedTextRef.current = event.assistant_text;
+          dispatch({
+            type: "SET_MESSAGES",
+            messages: (prev) => {
+              const last = prev[prev.length - 1];
+              if (last?.role === "assistant") {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...last, content: event.assistant_text! },
+                ];
+              }
+              return prev;
+            },
+          });
+        }
         dispatch({ type: "SET_STREAMING", isStreaming: false });
         dispatch({ type: "SET_CONNECTION_STATE", state: "idle" });
         dispatch({
@@ -839,6 +943,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       };
 
       // Create placeholder assistant message
+      turnUsageBaseRef.current = { ...usageRef.current };
       accumulatedTextRef.current = "";
       accumulatedThinkingRef.current = "";
       toolCallMapRef.current.clear();
@@ -961,6 +1066,8 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
     streamGenerationRef.current += 1;
     controllerRef.current?.abort();
     dispatch({ type: "RESET" });
+    usageRef.current = { ...emptyUsage };
+    turnUsageBaseRef.current = { ...emptyUsage };
     accumulatedTextRef.current = "";
     accumulatedThinkingRef.current = "";
     toolCallMapRef.current.clear();

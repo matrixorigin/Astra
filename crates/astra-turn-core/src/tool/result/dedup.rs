@@ -1,7 +1,7 @@
 //! Tool-result deduplication cache (gap #4).
 //!
 //! For repeated, side-effect-free tool calls (e.g. `read_file`, `grep`,
-//! `git(action="show")` on the same arguments within a short window), returning a
+//! `read_file` on the same arguments within a short window), returning a
 //! previously-computed result avoids wasted latency and provider spend.
 //!
 //! This module is **pure** and **in-memory**. It defines a

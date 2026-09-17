@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use super::turn_cancellation::apply_user_cancelled_turn;
 use super::turn_entry::TurnContext;
-use super::turn_failure_reporting::report_turn_failure;
+use super::turn_failure_reporting::{
+    reconcile_and_report_turn_failure, report_admission_rejection,
+};
 use super::turn_success::apply_turn_success_async;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
@@ -18,7 +20,7 @@ pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) input_active_system_skills: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
     pub(crate) token: &'a str,
-    pub(crate) session_id: Option<&'a str>,
+    pub(crate) session_id: &'a str,
     pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) turn_start: Instant,
     pub(crate) ui: &'a mut dyn crate::cli::ui_adapter::ReplUiAdapter,
@@ -62,19 +64,26 @@ pub(crate) async fn settle_successful_turn(
     clear_recovery_scoped_turn_restrictions(state);
 }
 
-pub(crate) fn settle_failed_turn(
+pub(crate) async fn settle_failed_turn(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
-    failure: &crate::TurnFailure,
+    failure: &mut crate::TurnFailure,
 ) {
-    report_turn_failure(
+    if failure.partial.admission_rejected {
+        report_admission_rejection(state, failure, dispatch.ui);
+        clear_recovery_scoped_turn_restrictions(state);
+        return;
+    }
+    reconcile_and_report_turn_failure(
         state,
+        dispatch.ctx.api,
         dispatch.ctx.profile,
         dispatch.line,
         failure,
         dispatch.turn_start,
         dispatch.ui,
-    );
+    )
+    .await;
     clear_recovery_scoped_turn_restrictions(state);
 }
 
@@ -96,6 +105,7 @@ mod tests {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
@@ -112,7 +122,7 @@ mod tests {
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             token: "token",
-            session_id: None,
+            session_id: "session-1",
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
@@ -130,13 +140,14 @@ mod tests {
         assert_eq!(state.history.len(), 1);
     }
 
-    #[test]
-    fn settle_failed_turn_consumes_resume_restricted_tools() {
+    #[tokio::test]
+    async fn settle_failed_turn_consumes_resume_restricted_tools() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let ctx = TurnContext {
             api: &api,
             profile: None,
             post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
@@ -152,22 +163,75 @@ mod tests {
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             token: "token",
-            session_id: None,
+            session_id: "session-1",
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
         };
-        let failure = crate::TurnFailure {
+        let mut failure = crate::TurnFailure {
             error: "boom".into(),
             partial: crate::PartialTurnData::default(),
         };
 
-        settle_failed_turn(&mut state, &mut dispatch, &failure);
+        settle_failed_turn(&mut state, &mut dispatch, &mut failure).await;
 
         assert!(state.resume_restricted_tools.is_empty());
         assert_eq!(
             state.turn, 1,
             "failed settlement must advance the local turn cursor"
         );
+    }
+
+    #[tokio::test]
+    async fn admission_rejection_does_not_consume_a_turn_or_poll_a_run() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let mut state = SessionState {
+            session_id: Some("session-current".into()),
+            ..SessionState::default()
+        };
+        let mut dispatch = TurnDispatch {
+            ctx: &ctx,
+            line: "hi",
+            effective_line: "hi",
+            user_intent: "hi",
+            input_runtime_required_texts: &[],
+            input_active_system_skills: &[],
+            input_runtime_volatile_texts: &[],
+            token: "token",
+            session_id: "session-current",
+            semantic_query_override: None,
+            turn_start: Instant::now(),
+            ui: &mut ui,
+        };
+        let mut failure = crate::TurnFailure {
+            error: "[invalid_request] This checkout is already attached to another Session".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("execution_workspace_claimed".into()),
+                error_metadata: Some(serde_json::json!({
+                    "admission_state": "rejected",
+                    "owner_session_id": "session-owner",
+                })),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+
+        settle_failed_turn(&mut state, &mut dispatch, &mut failure).await;
+
+        assert_eq!(state.turn, 0);
+        assert_eq!(state.session_id.as_deref(), Some("session-current"));
+        assert_eq!(state.pending_recovery.as_deref(), Some("session-owner"));
+        assert!(state.last_turn_event.is_none());
+        assert_eq!(ui.errors.len(), 1);
+        assert!(ui.errors[0].contains("Workspace unavailable"));
+        assert!(ui.errors[0].contains("/resume session-owner"));
+        assert!(ui.errors[0].contains("no model or tool ran"));
     }
 }

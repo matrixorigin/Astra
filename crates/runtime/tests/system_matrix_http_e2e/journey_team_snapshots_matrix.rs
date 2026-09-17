@@ -110,5 +110,5 @@ pub async fn run_team_snapshots_db() {
     let (st_team_del, _) = delete_json(&ctx.app, &path_team, Some(auth)).await;
     assert_eq!(st_team_del, StatusCode::OK);
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

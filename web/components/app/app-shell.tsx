@@ -3,6 +3,7 @@
 import {
   FolderKanban,
   Home,
+  ListTodo,
   MessageSquare,
   Search,
   Workflow,
@@ -46,10 +47,10 @@ export function AppShell({ children }: { children: ReactNode }) {
     useCallback(
       (event) => {
         event.preventDefault();
-        router.push("/");
+        router.push("/works");
         window.setTimeout(() => {
           document
-            .querySelector<HTMLTextAreaElement>('[data-composer-input="true"]')
+            .querySelector<HTMLTextAreaElement>('[aria-label="Work goal"]')
             ?.focus();
         }, 50);
       },
@@ -76,7 +77,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <header className="flex h-[52px] shrink-0 items-center gap-3 border-b border-border bg-surface px-3 md:hidden">
             <Link
-              href="/"
+              href="/now"
               className="inline-flex min-w-0 items-center gap-2 text-sm font-semibold"
               aria-label="Astra home"
             >
@@ -99,14 +100,20 @@ export function AppShell({ children }: { children: ReactNode }) {
             {children}
           </main>
           <nav
-            className="grid h-14 shrink-0 grid-cols-4 border-t border-border bg-surface px-1 md:hidden"
+            className="grid h-14 shrink-0 grid-cols-5 border-t border-border bg-surface px-1 md:hidden"
             aria-label="Mobile primary navigation"
           >
             <MobileNavItem
-              href="/"
-              label="New"
+              href="/now"
+              label="Now"
               icon={Home}
-              active={pathname === "/"}
+              active={pathname === "/now"}
+            />
+            <MobileNavItem
+              href="/works"
+              label="Work"
+              icon={ListTodo}
+              active={pathname === "/works" || pathname.startsWith("/works/")}
             />
             <MobileNavItem
               href="/chats"

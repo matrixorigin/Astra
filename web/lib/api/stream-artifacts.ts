@@ -1,4 +1,6 @@
+import type { RuntimeArtifactResponse } from "@astra/sdk";
 import type { ChatArtifactRef } from "@/lib/api/types";
+import type { WebRuntimeClient } from "@/lib/runtime-client/server";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -167,4 +169,71 @@ export function mergeChatArtifacts(
     }
   }
   return merged;
+}
+
+const INTERNAL_ARTIFACT_KINDS = new Set(["composite_snapshot_index"]);
+const INTERNAL_ARTIFACT_SOURCES = new Set(["composite_snapshot_index"]);
+const CHAT_VISIBLE_ARTIFACT_SOURCES = new Set(["publish_artifact"]);
+const CHAT_VISIBLE_ARTIFACT_NORMALIZE_VERSIONS = new Set([
+  "artifact_file_v1",
+]);
+
+function isChatVisibleRuntimeArtifact(
+  source: string | null,
+  kind: string,
+  metadata: JsonRecord | null,
+) {
+  if (
+    INTERNAL_ARTIFACT_KINDS.has(kind) ||
+    (source && INTERNAL_ARTIFACT_SOURCES.has(source))
+  ) {
+    return false;
+  }
+
+  const normalizeVersion = stringField(metadata?.normalize_version);
+  return Boolean(
+    source &&
+    CHAT_VISIBLE_ARTIFACT_SOURCES.has(source) &&
+    normalizeVersion &&
+    CHAT_VISIBLE_ARTIFACT_NORMALIZE_VERSIONS.has(normalizeVersion),
+  );
+}
+
+export function artifactFromRuntime(
+  artifact: RuntimeArtifactResponse,
+): ChatArtifactRef | null {
+  const content = record(artifact.content);
+  const metadata = record(artifact.metadata);
+  const id = stringField(artifact.artifact_id);
+  const kind = stringField(artifact.artifact_kind, content?.kind);
+  const source = stringField(artifact.source);
+  if (!id || !kind || !content) {
+    return null;
+  }
+  if (!isChatVisibleRuntimeArtifact(source, kind, metadata)) {
+    return null;
+  }
+  return {
+    id,
+    kind,
+    source,
+    title: stringField(content.title, metadata?.title, content.filename),
+    filename: stringField(content.filename, metadata?.download_filename),
+    sizeBytes: numberField(content.byte_size, metadata?.byte_size),
+    contentType: stringField(content.content_type, metadata?.content_type),
+    renderer: stringField(content.renderer, metadata?.renderer),
+    downloadFilename: stringField(metadata?.download_filename),
+    content,
+    createdAt: artifact.created_at ?? null,
+  };
+}
+
+export async function fetchSessionArtifacts(
+  client: WebRuntimeClient,
+  sessionId: string,
+) {
+  const body = await client.sdk.listSessionArtifacts(sessionId, { limit: 50 });
+  return (body.artifacts ?? [])
+    .map(artifactFromRuntime)
+    .filter((artifact): artifact is ChatArtifactRef => Boolean(artifact));
 }

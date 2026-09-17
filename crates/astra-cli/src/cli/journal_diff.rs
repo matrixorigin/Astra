@@ -293,11 +293,11 @@ pub(crate) fn run_diff(args: &cli_args::JournalDiffArgs) -> Result<(), String> {
     let format = args.format.trim().to_ascii_lowercase();
     match format.as_str() {
         "" | "text" | "txt" => {
-            print!("{}", render_text(&diff));
+            stdout_print!("{}", render_text(&diff));
             Ok(())
         }
         "json" => {
-            println!(
+            stdout_println!(
                 "{}",
                 serde_json::to_string_pretty(&diff).unwrap_or_default()
             );

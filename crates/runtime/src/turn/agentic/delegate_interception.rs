@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use astra_services::session_journal::ToolCallRecord;
+use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use serde_json::Value;
 
 use super::headless_round::HeadlessStderrStyle;
@@ -20,11 +20,16 @@ pub(crate) const REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY: &str =
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
+    pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) intercepted_any: bool,
 }
 
 pub(crate) fn tool_call_name(tool_call: &Value) -> Option<&str> {
-    astra_turn_core::tool_call_shape::tool_call_name(tool_call)
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .and_then(astra_core::canonical_names::normalize_name)
 }
 
 pub(crate) fn tool_call_arguments_value(tool_call: &Value) -> Value {
@@ -35,15 +40,7 @@ pub(crate) fn is_delegation_call(tool_call: &Value) -> bool {
     tool_call_name(tool_call) == Some(DELEGATE_TOOL_NAME)
 }
 
-fn source_agent_alias_candidates(source_agent_id: &str) -> impl Iterator<Item = &str> {
-    std::iter::once(source_agent_id).chain(match source_agent_id {
-        "orchestrator" => Some("main"),
-        "main" => Some("orchestrator"),
-        _ => None,
-    })
-}
-
-async fn execute_delegation_with_source_agent_alias(
+async fn execute_delegation(
     engine: &crate::server::delegation::engine::DelegationEngine,
     request: astra_services::coordination::DelegationRequest,
     source_agent_id: &str,
@@ -51,20 +48,10 @@ async fn execute_delegation_with_source_agent_alias(
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
-    // `main` and `orchestrator` are identity aliases at the runtime boundary.
-    // Resolve them from the typed registry before execution; never retry based
-    // on presentation text from a validation error.
-    let source_agent_id = {
-        let registry = engine.registry().read().await;
-        source_agent_alias_candidates(source_agent_id)
-            .find(|candidate| registry.get(candidate).is_some())
-            .unwrap_or(source_agent_id)
-            .to_string()
-    };
     engine
         .execute_with_forward_headers_and_live_events(
             request,
-            &source_agent_id,
+            source_agent_id,
             None,
             forward_headers.clone(),
             admitted_model_execution.cloned(),
@@ -76,15 +63,14 @@ async fn execute_delegation_with_source_agent_alias(
 pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_result: &HostTurnResult,
+    tool_calls: &[Value],
     quiet: bool,
     valid_tool_names: &HashSet<String>,
 ) -> DelegationInterceptionResult {
-    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
-        && !valid_tool_names.contains(DELEGATE_TOOL_NAME)
-    {
+    if tool_calls.iter().any(is_delegation_call) && !valid_tool_names.contains(DELEGATE_TOOL_NAME) {
         return DelegationInterceptionResult {
-            effective_tool_calls: turn_result.accum.tool_calls.clone(),
+            effective_tool_calls: tool_calls.to_vec(),
+            pre_resolved_results: Vec::new(),
             intercepted_any: false,
         };
     }
@@ -92,7 +78,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     // Per-turn delegation limit: prevent runaway delegation loops where the
     // parent agent keeps delegating without synthesizing results.
     const MAX_DELEGATIONS_PER_TURN: u32 = 3;
-    if turn_result.accum.tool_calls.iter().any(is_delegation_call)
+    if tool_calls.iter().any(is_delegation_call)
         && state.delegations_this_turn >= MAX_DELEGATIONS_PER_TURN
     {
         if !quiet {
@@ -103,70 +89,42 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 ),
             );
         }
-        // Return delegate calls as errors so the model sees the refusal.
-        let mut effective = Vec::new();
-        for tc in &turn_result.accum.tool_calls {
-            if is_delegation_call(tc) {
-                // Skip delegation calls — they'll be returned as error tool_results below.
-            } else {
-                effective.push(tc.clone());
-            }
-        }
-        // Inject error tool_results for the refused delegate calls.
-        let delegate_calls: Vec<&Value> = turn_result
-            .accum
-            .tool_calls
+        // Keep every provider call in its original round. The headless round
+        // owns the one assistant carrier and one terminal tool result for each
+        // call ID; removing calls here made the later paired-round join put
+        // them back into the executable queue and also duplicated history.
+        // Provider identities were validated before this interceptor, so a
+        // refusal may use the original ID without minting a synthetic one.
+        let pre_resolved_results = tool_calls
             .iter()
-            .filter(|tc| is_delegation_call(tc))
-            .collect();
-        if !delegate_calls.is_empty() {
-            let tc_entries: Vec<Value> = delegate_calls
-                .iter()
-                .map(|tc| {
-                    let id = tc
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": DELEGATE_TOOL_NAME,
-                            "arguments": "{}",
-                        }
+            .filter(|tool_call| is_delegation_call(tool_call))
+            .filter_map(|tool_call| {
+                tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| {
+                        HeadlessPreResolvedToolResult::new(
+                            id.to_string(),
+                            format!(
+                                "ERROR: Delegation limit reached ({} delegations already executed this turn). \
+                                 You must synthesize the results from previous delegations and respond to the user directly. \
+                                 Do NOT delegate again.",
+                                state.delegations_this_turn
+                            ),
+                            astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
+                        )
                     })
-                })
-                .collect();
-            let assistant_msg = serde_json::json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": tc_entries,
-            });
-            state.push_prompt_history_message(assistant_msg);
-            for tc in &delegate_calls {
-                let id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                let tool_msg = serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": format!(
-                        "ERROR: Delegation limit reached ({} delegations already executed this turn). \
-                         You must synthesize the results from previous delegations and respond to the user directly. \
-                         Do NOT delegate again.",
-                        state.delegations_this_turn
-                    ),
-                });
-                state.push_prompt_history_message(tool_msg);
-            }
-        }
+            })
+            .collect();
         return DelegationInterceptionResult {
-            effective_tool_calls: effective,
+            effective_tool_calls: tool_calls.to_vec(),
+            pre_resolved_results,
             intercepted_any: true,
         };
     }
 
-    let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
+    let (delegation_results, _remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
     {
         let adaptive_delegation_context =
             state
@@ -180,7 +138,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                         state.telemetry.observability_hub.as_deref(),
                     )
                 });
-        if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
+        if tool_calls.iter().any(is_delegation_call) {
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -197,7 +155,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             .await;
         }
         partition_and_execute_delegations(
-            &turn_result.accum.tool_calls,
+            tool_calls,
             engine,
             state.current_run_id.as_deref().unwrap_or("unknown"),
             state.current_session_id.as_deref().unwrap_or("unknown"),
@@ -210,10 +168,15 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
             host.agent_live_event_sink(),
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.workspace_mutation)
+                .unwrap_or_default(),
         )
         .await
     } else {
-        (Vec::new(), turn_result.accum.tool_calls.clone())
+        (Vec::new(), tool_calls.to_vec())
     };
 
     if let Some(hub) = &state.telemetry.observability_hub {
@@ -233,81 +196,6 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                     host.emit_headless_line(*style, line.clone());
                 }
             }
-        }
-        let delegate_tool_calls: Vec<&Value> = turn_result
-            .accum
-            .tool_calls
-            .iter()
-            .filter(|tc| is_delegation_call(tc))
-            .collect();
-        if !delegate_tool_calls.is_empty() {
-            let tc_entries: Vec<Value> = delegate_tool_calls
-                .iter()
-                .map(|tc| {
-                    let id = tc
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    let name = tool_call_name(tc).unwrap_or(DELEGATE_TOOL_NAME);
-                    let args = tool_call_arguments_value(tc);
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(&args)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        }
-                    })
-                })
-                .collect();
-            let mut assistant_msg = serde_json::json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": tc_entries,
-            });
-            let rc = &turn_result.accum.reasoning_content;
-            if !rc.is_empty() {
-                assistant_msg["reasoning_content"] = Value::String(rc.clone());
-                let sig = &turn_result.accum.reasoning_signature;
-                if !sig.is_empty() {
-                    assistant_msg["reasoning_signature"] = Value::String(sig.clone());
-                }
-            } else if astra_turn_core::edge_ledger::history_has_reasoning(&state.messages) {
-                assistant_msg["reasoning_content"] = Value::String(String::new());
-            }
-            state.push_prompt_history_message(assistant_msg);
-        }
-        for result in &delegation_results {
-            let summary_for_model =
-                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
-                    DELEGATE_TOOL_NAME,
-                    &result.summary,
-                );
-            let tool_msg = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.call_id,
-                "content": summary_for_model,
-            });
-            state.push_prompt_history_message(tool_msg.clone());
-            state.tool_results.push(tool_msg);
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: DELEGATE_TOOL_NAME.to_string(),
-                ok: !result.summary.starts_with("Delegation failed:")
-                    && !result.summary.starts_with("Invalid delegation request:"),
-                ms: 0,
-                error: None,
-                input_bytes: None,
-                output_bytes: Some(result.summary.len() as u32),
-                args_preview: Some(result.call_id.clone()),
-                result_preview: Some(result.summary.chars().take(500).collect::<String>()),
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            });
         }
         if !quiet {
             host.emit_headless_line(
@@ -339,12 +227,34 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         }
     }
 
+    let pre_resolved_results = delegation_results
+        .iter()
+        .map(|result| {
+            HeadlessPreResolvedToolResult::new(
+                result.call_id.clone(),
+                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
+                    DELEGATE_TOOL_NAME,
+                    &result.summary,
+                ),
+                if result
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.succeeded)
+                {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
+                } else {
+                    astra_turn_core::tool_result_semantics::ToolResultStatus::Failed
+                },
+            )
+        })
+        .collect();
     DelegationInterceptionResult {
-        effective_tool_calls: if delegation_results.is_empty() {
-            turn_result.accum.tool_calls.clone()
-        } else {
-            remaining_tool_calls
-        },
+        // Intercepted calls remain in the canonical round and close through
+        // the same pre-resolved terminal lane as every other runtime-owned
+        // control result. This preserves one assistant carrier and one tool
+        // terminal per provider call without dispatching delegation twice.
+        effective_tool_calls: tool_calls.to_vec(),
+        pre_resolved_results,
         intercepted_any: !delegation_results.is_empty(),
     }
 }
@@ -619,7 +529,7 @@ pub(crate) fn pattern_from_name(
                 astra_services::coordination::CoordinationPattern::Fork {
                     agent_id: agent.clone(),
                     tasks: tasks.into_iter().map(ToString::to_string).collect(),
-                    max_turns: 10,
+                    max_turns: default_fork_max_turns(agent),
                     aggregation: astra_services::coordination::AggregationStrategy::AllResults,
                     timeout_sec: timeout,
                 }
@@ -766,7 +676,8 @@ pub(crate) fn parse_coordination_pattern(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let max_turns = optional_u64_arg(args, "max_turns")?.unwrap_or(10);
+            let max_turns = optional_u64_arg(args, "max_turns")?
+                .unwrap_or_else(|| u64::from(default_fork_max_turns(&agents[0])));
             if max_turns == 0 {
                 return Err("delegate max_turns must be greater than zero".to_string());
             }
@@ -801,6 +712,26 @@ pub(crate) fn parse_coordination_pattern(
             "unknown delegate pattern '{unknown}'; expected sequential, fan_out, pipeline, adversarial, fork, or auto"
         )),
     }
+}
+
+/// Resolve the implicit fork budget from the selected agent profile instead
+/// of imposing one global ten-turn ceiling on every task. An explicit
+/// `max_turns` remains caller authority; unknown/custom agent IDs use the
+/// bounded task profile as the generic execution default.
+fn default_fork_max_turns(agent_id: &str) -> u32 {
+    let definitions = astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types();
+    definitions
+        .iter()
+        .find(|definition| definition.agent_type.eq_ignore_ascii_case(agent_id.trim()))
+        .map(|definition| definition.max_turns)
+        .or_else(|| {
+            definitions
+                .iter()
+                .find(|definition| definition.agent_type == "task")
+                .map(|definition| definition.max_turns)
+        })
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Splice an allowlist into the cross-process delegation context as a sorted
@@ -850,6 +781,24 @@ pub(crate) fn merge_workspace_hint_into_delegation_request(
     c.insert("cwd".to_string(), Value::String(root.to_string()));
 }
 
+pub(crate) fn merge_workspace_mutation_into_delegation_request(
+    request: &mut astra_services::coordination::DelegationRequest,
+    workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
+) {
+    // Runtime authority always wins, including Unknown: a model cannot smuggle
+    // a stronger or weaker effect policy through its free-form context.
+    request
+        .context
+        .remove(crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY);
+    if workspace_mutation != astra_config::user_profile::WorkspaceMutationIntent::Unknown {
+        request.context.insert(
+            crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY.to_string(),
+            serde_json::to_value(workspace_mutation)
+                .expect("workspace mutation intent has a closed JSON representation"),
+        );
+    }
+}
+
 pub(crate) async fn partition_and_execute_delegations(
     tool_calls: &[Value],
     engine: &crate::server::delegation::engine::DelegationEngine,
@@ -864,6 +813,7 @@ pub(crate) async fn partition_and_execute_delegations(
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
     let source_agent_id = self_agent_id;
     let mut delegation_results = Vec::new();
@@ -885,6 +835,13 @@ pub(crate) async fn partition_and_execute_delegations(
                 adaptive_context,
             ) {
                 Ok(mut request) => {
+                    // This key is runtime-owned. Never let model-authored
+                    // delegation context widen or contradict the root effect
+                    // boundary.
+                    merge_workspace_mutation_into_delegation_request(
+                        &mut request,
+                        workspace_mutation,
+                    );
                     // Inherit parent's delegation chain and append source agent_id
                     // to enable circular delegation detection across hops.
                     request.delegation_chain = parent_delegation_chain.to_vec();
@@ -920,7 +877,7 @@ pub(crate) async fn partition_and_execute_delegations(
                                     .and_then(|v| v.as_str().map(String::from))
                                     .unwrap_or_else(|| format!("{s:?}").to_lowercase())
                             });
-                    match execute_delegation_with_source_agent_alias(
+                    match execute_delegation(
                         engine,
                         request,
                         source_agent_id,
@@ -1176,13 +1133,56 @@ mod tests {
     }
 
     #[test]
-    fn is_delegation_call_accepts_legacy_top_level_shape() {
+    fn runtime_workspace_mutation_authority_overwrites_model_context() {
+        let mut request = astra_services::coordination::DelegationRequest {
+            delegation_id: "delegation-1".into(),
+            session_id: "session-1".into(),
+            parent_run_id: "run-1".into(),
+            task: "inspect the repository".into(),
+            pattern: astra_services::coordination::CoordinationPattern::Sequential {
+                agent_ids: vec!["reviewer".into()],
+                stop_on_success: true,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: std::collections::HashMap::from([(
+                crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY.to_string(),
+                json!("must_mutate"),
+            )]),
+            execution_metadata: None,
+        };
+
+        merge_workspace_mutation_into_delegation_request(
+            &mut request,
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+        );
+        assert_eq!(
+            crate::orchestration::workspace_mutation_from_context(&request.context),
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        );
+
+        merge_workspace_mutation_into_delegation_request(
+            &mut request,
+            astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+        );
+        assert!(
+            !request
+                .context
+                .contains_key(crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY),
+            "unknown authority must remove an untrusted model-provided value"
+        );
+    }
+
+    #[test]
+    fn is_delegation_call_rejects_flat_provider_shape() {
         let delegate = json!({
-            "id": "call_legacy",
+            "id": "call_flat",
             "name": "delegate",
             "arguments": {"task": "review"}
         });
-        assert!(is_delegation_call(&delegate));
+        assert!(!is_delegation_call(&delegate));
     }
 
     #[test]
@@ -1313,6 +1313,35 @@ mod tests {
                 timeout_sec: 30,
                 ..
             } if tasks == ["inspect storage", "inspect TUI"] && agent_id == "coder"
+        ));
+    }
+
+    #[test]
+    fn fork_default_budget_follows_agent_profile() {
+        for (agent, expected) in [("explore", 20), ("code-review", 12), ("task", 30)] {
+            let pattern = parse_coordination_pattern(&json!({
+                "pattern": "fork",
+                "agents": [agent],
+                "tasks": ["first", "second"]
+            }))
+            .expect("fork should parse");
+            assert!(matches!(
+                pattern,
+                astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                    if max_turns == expected
+            ));
+        }
+
+        let custom = parse_coordination_pattern(&json!({
+            "pattern": "fork",
+            "agents": ["custom-agent"],
+            "tasks": ["first", "second"]
+        }))
+        .expect("custom fork should use the generic task profile");
+        assert!(matches!(
+            custom,
+            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                if max_turns == 30
         ));
     }
 
@@ -1624,6 +1653,18 @@ mod tests {
             }
             _ => panic!("expected Pipeline"),
         }
+    }
+
+    #[test]
+    fn pattern_from_name_fork_uses_agent_profile_budget() {
+        let agents = vec!["code-review".to_string()];
+        let args = json!({"tasks": ["inspect", "verify"]});
+        let pattern = pattern_from_name("fork", &agents, &args).unwrap();
+        assert!(matches!(
+            pattern,
+            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                if max_turns == 12
+        ));
     }
 
     #[test]
@@ -1964,7 +2005,7 @@ mod tests {
             "test-run",
             "test-session",
             0,
-            "orchestrator",
+            "main",
             None,
             &std::collections::HashMap::new(),
             None,
@@ -1972,6 +2013,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -1984,7 +2026,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_all_delegate_calls() {
-        let engine = make_partition_engine("orchestrator", &["coder", "reviewer"]);
+        let engine = make_partition_engine("main", &["coder", "reviewer"]);
         let tool_calls = vec![
             json!({
                 "id": "d1",
@@ -2010,6 +2052,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -2031,7 +2074,7 @@ mod tests {
             "run-1",
             "sess-1",
             0,
-            "orchestrator",
+            "main",
             None,
             &std::collections::HashMap::new(),
             None,
@@ -2039,6 +2082,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -2052,10 +2096,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_preserves_target_error_after_typed_source_alias_resolution() {
+    async fn partition_preserves_target_error_with_exact_source_identity() {
         let engine = make_partition_engine("main", &[]);
         let tool_calls = vec![json!({
             "id": "missing_target",
+            "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
+        })];
+
+        let (delegation_results, remaining) = partition_and_execute_delegations(
+            &tool_calls,
+            &engine,
+            "run-1",
+            "sess-1",
+            0,
+            "main",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            &RequestConstraints::default(),
+            None,
+            &[],
+            None,
+            Default::default(),
+        )
+        .await;
+
+        assert_eq!(delegation_results.len(), 1);
+        assert!(remaining.is_empty());
+        assert!(
+            delegation_results[0]
+                .summary
+                .contains("target agent 'coder' not registered"),
+            "{:?}",
+            delegation_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_rejects_retired_root_agent_alias() {
+        let engine = make_partition_engine("main", &["coder"]);
+        let tool_calls = vec![json!({
+            "id": "retired_source",
             "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
         })];
 
@@ -2073,15 +2154,15 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
         assert_eq!(delegation_results.len(), 1);
         assert!(remaining.is_empty());
         assert!(
-            delegation_results[0]
-                .summary
-                .contains("target agent 'coder' not registered"),
+            delegation_results[0].summary.contains("orchestrator")
+                && delegation_results[0].summary.contains("not registered"),
             "{:?}",
             delegation_results[0]
         );
@@ -2112,9 +2193,14 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(
             !result.intercepted_any,
@@ -2131,7 +2217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intercept_delegations_resolves_root_agent_alias_from_registry() {
+    async fn intercept_delegations_uses_exact_root_agent_identity() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));
@@ -2155,21 +2241,27 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(result.intercepted_any);
-        assert!(result.effective_tool_calls.is_empty());
-        assert_eq!(state.tool_results.len(), 1);
+        assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
+        assert_eq!(result.pre_resolved_results.len(), 1);
+        assert_eq!(result.pre_resolved_results[0].call_id, "call_delegate");
         assert!(
-            state.tool_results[0]["content"]
-                .as_str()
-                .unwrap_or_default()
+            result.pre_resolved_results[0]
+                .content
                 .contains("Delegation"),
             "{:?}",
-            state.tool_results
+            result.pre_resolved_results
         );
+        assert!(state.tool_results.is_empty());
     }
 
     #[tokio::test]
@@ -2199,20 +2291,25 @@ mod tests {
         };
 
         let valid_tool_names = host.valid_tool_names().clone();
-        let result =
-            intercept_delegations(&mut host, &mut state, &turn_result, true, &valid_tool_names)
-                .await;
+        let result = intercept_delegations(
+            &mut host,
+            &mut state,
+            &turn_result.accum.tool_calls,
+            true,
+            &valid_tool_names,
+        )
+        .await;
 
         assert!(result.intercepted_any);
-        // Delegate call should NOT be in effective_tool_calls.
-        assert!(result.effective_tool_calls.is_empty());
-        // Error message injected into messages.
-        let last_msg = state.messages.last().unwrap();
-        let content = last_msg["content"].as_str().unwrap_or_default();
+        assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
+        assert_eq!(result.pre_resolved_results.len(), 1);
+        assert_eq!(result.pre_resolved_results[0].call_id, "call_4th");
+        let content = &result.pre_resolved_results[0].content;
         assert!(
             content.contains("Delegation limit reached"),
             "expected refusal message, got: {content}"
         );
+        assert!(state.messages.is_empty(), "headless owns round history");
         // Counter should NOT have incremented (delegation was refused).
         assert_eq!(state.delegations_this_turn, 3);
     }

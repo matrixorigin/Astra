@@ -1,0 +1,97 @@
+{
+  "schema_version": 2,
+  "scope": "declared_work",
+  "basis": {
+    "work_id": "work-1",
+    "work_revision": 1,
+    "goal_revision": 1,
+    "goal": "Ship a bounded planning context.",
+    "criteria_set_revision": 1,
+    "criteria_member_count": 0,
+    "criteria_manifest_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "branch_id": "branch-1",
+    "branch_revision": 1,
+    "branch_goal_revision": 1,
+    "branch_criteria_set_revision": 1,
+    "branch_basis_graph_revision": 1,
+    "graph_revision": 1,
+    "graph_item_count": 2,
+    "graph_edge_count": 1,
+    "graph_manifest_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "cursor": {
+    "graph_revision": 1,
+    "item_offset": 0,
+    "dependency_offset": 0
+  },
+  "next_cursor": {
+    "graph_revision": 1,
+    "item_offset": 1,
+    "dependency_offset": 1
+  },
+  "items": {
+    "offset": 0,
+    "limit": 1,
+    "total": 2,
+    "entries": [
+      {
+        "item_id": "task-a",
+        "revision": 1,
+        "kind": "task",
+        "objective": "Implement task-a",
+        "expected_result": "Verify task-a",
+        "declaration_state": "active",
+        "execution": {
+          "status": "completed",
+          "terminal": true,
+          "run": {
+            "run_id": "run-1",
+            "attempt_id": "attempt-1",
+            "graph_revision": 1,
+            "run_generation": 2,
+            "last_event_idx": 5,
+            "updated_at": "2026-08-01T12:00:00Z"
+          }
+        },
+        "delivery": {
+          "status": "delivered",
+          "summary": "migration applied",
+          "blocker_kind": null,
+          "unavailable_capabilities": []
+        },
+        "verification": {
+          "status": "evidence_available",
+          "latest_check": {
+            "check_run_id": "check-1",
+            "criterion": {
+              "criterion_id": "criterion-1",
+              "revision": 1
+            },
+            "criterion_set_revision": 1,
+            "graph_revision": 1,
+            "verifier_kind": "test",
+            "outcome": "passed",
+            "coverage": "complete",
+            "subject_revision": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "evidence_ref_count": 1,
+            "produced_at": "2026-08-01T12:00:00Z",
+            "expires_at": null,
+            "freshness": "current"
+          }
+        }
+      }
+    ]
+  },
+  "dependencies": {
+    "offset": 0,
+    "limit": 1,
+    "total": 1,
+    "entries": [
+      {
+        "predecessor_item_id": "task-a",
+        "successor_item_id": "task-b",
+        "kind": "dependency"
+      }
+    ]
+  }
+}

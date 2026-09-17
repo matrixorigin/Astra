@@ -15,7 +15,7 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
     turn_index: usize,
     server_tool_calls: &[Value],
     edge_round: &[T],
-    turn_sigs: &mut Vec<BTreeSet<String>>,
+    turn_sigs: &mut Vec<BTreeSet<crate::stall::StallSignature>>,
     turn_tool_names: &mut Vec<HashSet<String>>,
     stall_events: &mut Vec<(String, u32)>,
     turn_guard: &mut TurnGuard,
@@ -29,11 +29,6 @@ pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
         stall_events,
         turn_guard,
     });
-}
-
-/// Append server `explain_turn` JSON values into the session accumulator.
-pub fn append_explain_turn_batch(dst: &mut Vec<Value>, src: &[Value]) {
-    dst.extend(src.iter().cloned());
 }
 
 #[cfg(test)]
@@ -62,7 +57,11 @@ mod tests {
 
     #[test]
     fn stall_preflight_records_canonical_tool_calls() {
-        let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
+        let server = vec![json!({
+            "id": "1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
         let edge: Vec<Row> = vec![];
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
@@ -80,12 +79,5 @@ mod tests {
         assert_eq!(turn_sigs.len(), 1);
         assert_eq!(turn_sigs[0].len(), 1);
         assert!(turn_tool_names[0].contains("bash"));
-    }
-
-    #[test]
-    fn append_explain_batch_extends() {
-        let mut v = vec![json!(1)];
-        append_explain_turn_batch(&mut v, &[json!(2), json!(3)]);
-        assert_eq!(v.len(), 3);
     }
 }

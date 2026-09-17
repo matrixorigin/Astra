@@ -123,8 +123,8 @@ fn pipeline_consistency_bash_no_args() {
 // ── Scenario 2: Mixed bash batch — real-world agentic turn ──────────────
 
 /// Simulate an agentic investigation turn: the LLM emits 6 tool calls
-/// in one batch — 3 read-only bash, 1 read_file, 1 mutating bash, 1 edit.
-/// The partition must be 4 parallel + 2 sequential.
+/// in one batch. Build commands stay sequential because project-controlled
+/// build scripts, plugins, and proc macros may execute even for `check`.
 #[test]
 fn mixed_agentic_batch_partition() {
     let calls = vec![
@@ -138,20 +138,16 @@ fn mixed_agentic_batch_partition() {
 
     let (ro, mut_) = partition_tool_calls(&calls);
 
-    assert_eq!(
-        ro.len(),
-        4,
-        "git status + read_file + cargo check + git diff"
-    );
-    assert_eq!(mut_.len(), 2, "cargo build + str_replace");
+    assert_eq!(ro.len(), 3, "git status + read_file + git diff");
+    assert_eq!(mut_.len(), 3, "cargo check + cargo build + str_replace");
 
     // Verify indices
     assert_eq!(ro[0].0, 0); // bash git status
     assert_eq!(ro[1].0, 1); // read_file
-    assert_eq!(ro[2].0, 2); // bash cargo check
-    assert_eq!(ro[3].0, 3); // bash git diff
-    assert_eq!(mut_[0].0, 4); // bash cargo build
-    assert_eq!(mut_[1].0, 5); // str_replace
+    assert_eq!(ro[2].0, 3); // bash git diff
+    assert_eq!(mut_[0].0, 2); // bash cargo check
+    assert_eq!(mut_[1].0, 4); // bash cargo build
+    assert_eq!(mut_[2].0, 5); // str_replace
 }
 
 /// Same batch but with object-style arguments (not JSON strings).
@@ -200,7 +196,7 @@ async fn bash_read_only_commands_run_in_parallel() {
     let calls = vec![
         tc_bash("1", "git status"),
         tc_bash("2", "ls -la"),
-        tc_bash("3", "cargo check 2>&1"),
+        tc_bash("3", "git diff HEAD 2>&1"),
         tc_bash("4", "grep -r TODO ."),
     ];
 
@@ -366,14 +362,24 @@ fn cd_prefixed_bash_pipeline() {
     assert!(!c.approval_required, "cd && ls should skip approval");
 }
 
-/// Piped read-only commands: `cargo check 2>&1 | head -50`
+/// Piped read-only commands remain parallelizable when every stage is
+/// observational.
 #[test]
 fn piped_read_only_bash_pipeline() {
-    let args = json!({"command": "cargo check 2>&1 | head -50"});
+    let args = json!({"command": "rg TODO . 2>&1 | head -50"});
     let c = classify("bash", Some(&args));
     assert!(c.parallelizable);
     assert!(!c.approval_required);
     assert!(c.exploration);
+}
+
+#[test]
+fn build_command_piped_to_reader_still_requires_approval() {
+    let args = json!({"command": "cargo check 2>&1 | head -50"});
+    let c = classify("bash", Some(&args));
+    assert_eq!(c.category, ToolCategory::Shell);
+    assert!(!c.parallelizable);
+    assert!(c.approval_required);
 }
 
 /// Dangerous pipe: `ls | xargs rm` is mutating despite starting with ls.

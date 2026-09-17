@@ -1,6 +1,5 @@
 {
-  "dashboard": {
-    "title": "astra Runtime Capacity",
+    "title": "Astra Runtime Capacity",
     "tags": ["astra", "runtime", "capacity"],
     "timezone": "browser",
     "refresh": "10s",
@@ -297,12 +296,12 @@
         "gridPos": {"h": 8, "w": 12, "x": 0, "y": 77},
         "targets": [
           {
-            "expr": "rate(astra_interaction_approval_journal_lookup_total[5m])",
+            "expr": "rate(astra_interaction_approval_lookup_total[5m])",
             "legendFormat": "approval lookup {{event}} {{outcome}}"
           },
           {
-            "expr": "rate(astra_interaction_approval_journal_write_total[5m])",
-            "legendFormat": "approval write {{outcome}}"
+            "expr": "rate(astra_interaction_approval_resolution_total[5m])",
+            "legendFormat": "approval resolution {{outcome}}"
           },
           {
             "expr": "rate(astra_interaction_ask_user_journal_lookup_total[5m])",
@@ -315,18 +314,10 @@
         ]
       },
       {
-        "title": "Interaction Wait And Ledger",
+        "title": "Interaction Wait And Cleanup",
         "type": "graph",
         "gridPos": {"h": 8, "w": 12, "x": 12, "y": 77},
         "targets": [
-          {
-            "expr": "rate(astra_interaction_approval_ledger_insert_total[5m])",
-            "legendFormat": "approval ledger {{outcome}}"
-          },
-          {
-            "expr": "rate(astra_interaction_ask_user_ledger_insert_total[5m])",
-            "legendFormat": "ask_user ledger {{outcome}}"
-          },
           {
             "expr": "rate(astra_interaction_ask_user_wait_total[5m])",
             "legendFormat": "ask_user wait {{source}} {{outcome}}"
@@ -334,21 +325,6 @@
           {
             "expr": "rate(astra_interaction_ask_user_ledger_cleanup_total[5m])",
             "legendFormat": "ask_user cleanup {{outcome}}"
-          }
-        ]
-      },
-      {
-        "title": "Nonstream Fallback",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 69},
-        "targets": [
-          {
-            "expr": "rate(astra_llm_nonstream_fallback_attempts_total[5m])",
-            "legendFormat": "{{trigger}} {{outcome}}"
-          },
-          {
-            "expr": "rate(astra_llm_nonstream_fallback_errors_total[5m])",
-            "legendFormat": "{{trigger}} {{class}}"
           }
         ]
       },
@@ -429,5 +405,4 @@
         ]
       }
     ]
-  }
 }

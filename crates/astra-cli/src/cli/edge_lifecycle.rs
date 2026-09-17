@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::cli::chat_stream::edge_executor_instance_id;
+use crate::cli::chat_stream::try_edge_executor_instance_id;
 use crate::cli::session::session_runtime::{attempt_token_refresh, current_access_token};
 use astra_thin_client::edge::edge_runtime_environment_capabilities;
 use astra_thin_client::{
@@ -31,7 +31,6 @@ struct EdgeLifecycleContext {
 struct HeartbeatReconciliationSignature {
     replay_policy: astra_thin_client::EdgeHeartbeatReplayPolicy,
     unresolved_request_ids: Vec<String>,
-    legacy_pending_request_ids: Vec<String>,
 }
 
 impl EdgeLifecycleContext {
@@ -85,20 +84,11 @@ impl EdgeLifecycleContext {
         let mut unresolved_request_ids = response.unresolved_request_ids.clone();
         unresolved_request_ids.sort();
         unresolved_request_ids.dedup();
-        let mut legacy_pending_request_ids: Vec<String> = response
-            .legacy_pending_requests
-            .iter()
-            .map(|request| request.request_id.clone())
-            .collect();
-        legacy_pending_request_ids.sort();
-        legacy_pending_request_ids.dedup();
-
         let next = response
             .requires_reconciliation()
             .then_some(HeartbeatReconciliationSignature {
                 replay_policy: response.replay_policy,
                 unresolved_request_ids,
-                legacy_pending_request_ids,
             });
         let Ok(mut previous) = self.last_reconciliation_signature.lock() else {
             // A poisoned diagnostics lock must not hide a correctness warning.
@@ -267,9 +257,15 @@ pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), Thi
     if !edge_cloud_registry_enabled() {
         return Ok(());
     }
-    let transport_id = edge_executor_instance_id();
+    let transport_id = try_edge_executor_instance_id().map_err(ThinClientError::InvalidInput)?;
     let mut body = EdgeRegisterRequest::new(transport_id);
     enrich_register_body(&mut body);
+    if let Some(worktree_path) = body.worktree_path.as_deref() {
+        body.materialization_id = Some(
+            astra_runtime_env::load_or_create_materialization_id(Path::new(worktree_path))
+                .map_err(ThinClientError::InvalidInput)?,
+        );
+    }
     attach_runtime_environment_capabilities(&mut body);
     api.post_agents_edge_register(Some(token), Some(transport_id), &body)
         .await?;
@@ -283,7 +279,8 @@ async fn send_heartbeat(
     if !edge_cloud_registry_enabled() {
         return Ok(None);
     }
-    let id = edge_executor_instance_id();
+    let id = try_edge_executor_instance_id()
+        .map_err(|error| ThinClientError::InvalidInput(error.to_string()))?;
     let hb = EdgeHeartbeatRequest {
         edge_agent_id: id.to_string(),
         pending_request_count: edge_lifecycle().pending_tool_request_count(),
@@ -313,16 +310,10 @@ pub fn spawn_edge_heartbeat(
                 Ok(Some(reconciliation)) => {
                     failures = 0;
                     if reconciliation.requires_reconciliation() {
-                        let legacy_pending_request_ids: Vec<&str> = reconciliation
-                            .legacy_pending_requests
-                            .iter()
-                            .map(|request| request.request_id.as_str())
-                            .collect();
                         if edge_lifecycle().reconciliation_changed(&reconciliation) {
                             tracing::error!(
                                 target: "astra.edge.reconnect",
                                 unresolved_request_ids = ?reconciliation.unresolved_request_ids,
-                                legacy_pending_request_ids = ?legacy_pending_request_ids,
                                 replay_policy = ?reconciliation.replay_policy,
                                 "edge heartbeat reported unresolved invocations; automatic tool re-execution is forbidden without durable result evidence"
                             );
@@ -330,7 +321,6 @@ pub fn spawn_edge_heartbeat(
                             tracing::trace!(
                                 target: "astra.edge.reconnect",
                                 unresolved_count = reconciliation.unresolved_request_ids.len(),
-                                legacy_pending_count = legacy_pending_request_ids.len(),
                                 "edge heartbeat reconciliation state is unchanged"
                             );
                         }
@@ -437,7 +427,7 @@ mod tests {
     };
     use astra_thin_client::{
         ASTRA_EDGE_ID_HEADER, EdgeHeartbeatReplayPolicy, EdgeHeartbeatResponse,
-        EdgeRegisterRequest, LegacyEdgePendingRequest, ThinClient,
+        EdgeRegisterRequest, ThinClient,
     };
     use serial_test::serial;
     use std::sync::atomic::Ordering;
@@ -673,30 +663,20 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_reconciliation_never_treats_pending_payloads_as_replay_authority() {
+    fn heartbeat_reconciliation_requires_durable_identity() {
         let reconciliation = EdgeHeartbeatResponse {
             ok: true,
             user_id: "user-1".to_string(),
             edge_id: "transport-1".to_string(),
             edge_agent_id: "edge-1".to_string(),
             unresolved_request_ids: vec!["invocation-new".to_string()],
-            replay_policy:
-                EdgeHeartbeatReplayPolicy::LegacyPendingPayloadRequiresManualReconciliation,
+            replay_policy: EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired,
             ack_request_ids: Vec::new(),
-            legacy_pending_requests: vec![LegacyEdgePendingRequest {
-                request_id: "legacy-request".to_string(),
-            }],
         };
 
         assert_eq!(
             reconciliation.unresolved_request_ids,
             vec!["invocation-new"]
-        );
-        assert_eq!(
-            reconciliation.legacy_pending_requests,
-            vec![LegacyEdgePendingRequest {
-                request_id: "legacy-request".to_string(),
-            }]
         );
         assert!(reconciliation.requires_reconciliation());
     }
@@ -712,7 +692,6 @@ mod tests {
             unresolved_request_ids: vec!["invocation-2".to_string(), "invocation-1".to_string()],
             replay_policy: EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired,
             ack_request_ids: Vec::new(),
-            legacy_pending_requests: Vec::new(),
         };
 
         assert!(ctx.reconciliation_changed(&unresolved));

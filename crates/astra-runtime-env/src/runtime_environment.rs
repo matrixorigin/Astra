@@ -1225,7 +1225,7 @@ mod tests {
         );
         assert_eq!(
             outcome.metadata[TOOL_RESULT_RUNTIME_SESSION]["resources"]["max_execution_secs"],
-            300.0
+            session.policy.intent.resources.max_execution_secs.unwrap()
         );
         assert_eq!(
             outcome.metadata[TOOL_RESULT_RUNTIME_SESSION]["resources"]["max_output_bytes"],

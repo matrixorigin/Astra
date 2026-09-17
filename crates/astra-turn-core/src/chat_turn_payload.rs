@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use crate::chat_turn_edge_profile::build_base_edge_profile_value;
 use crate::chat_turn_explain_wire::chat_turn_explain_field_json;
 use crate::edge_prompt_context::detect_workspace_context;
-use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
 
 /// Inputs for [`chat_turn_base_payload`] (keeps the arity aligned with the JSON body without a 9-arg function).
 pub struct ChatTurnBasePayloadInput<'a> {
@@ -89,6 +88,37 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     payload
 }
 
+/// Attach the producer-owned identity for one turn chain as an atomic tuple.
+///
+/// The server deliberately rejects partial identity. Keeping that invariant at
+/// the shared payload boundary prevents alternate hosts from forwarding a
+/// chain id without the matching turn number or user-query event id.
+#[must_use]
+pub fn attach_turn_identity(
+    payload: &mut Value,
+    session_turn: u32,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> bool {
+    let Some(turn_chain_id) = turn_chain_id.filter(|value| {
+        !value.is_empty() && value.trim() == *value && !value.chars().any(char::is_control)
+    }) else {
+        return false;
+    };
+    let Some(user_query_event_id) = user_query_event_id.filter(|value| {
+        !value.is_empty() && value.trim() == *value && !value.chars().any(char::is_control)
+    }) else {
+        return false;
+    };
+    let Some(root) = payload.as_object_mut().filter(|_| session_turn > 0) else {
+        return false;
+    };
+    root.insert("session_turn".into(), json!(session_turn));
+    root.insert("turn_chain_id".into(), json!(turn_chain_id));
+    root.insert("user_query_event_id".into(), json!(user_query_event_id));
+    true
+}
+
 /// Project producer-owned system skill identities into `edge_profile.active_skills`.
 pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills: &[String]) {
     if active_skills.is_empty() {
@@ -143,13 +173,25 @@ pub fn set_payload_edge_tools(payload: &mut Value, schemas: Vec<Value>) {
     }
 }
 
-/// Drop schemas whose `function.name` is in `restricted_tools`, then set `edge_tools` on the payload.
+/// Drop schemas whose `function.name` is in `restricted_tools`, then set
+/// `edge_tools` on the payload. The runtime-owned deferred invocation carrier
+/// is a protocol primitive rather than a provider capability, so it remains
+/// available whenever the caller assembled it; otherwise a visible
+/// `tool_search` plus a deferred manifest would have no executable next step.
 pub fn attach_filtered_edge_tools(
     payload: &mut Value,
     turn_schemas: Vec<Value>,
     restricted_tools: &HashSet<String>,
 ) {
-    let final_schemas = filter_tool_schemas_by_excluded_names(turn_schemas, restricted_tools);
+    let final_schemas = turn_schemas
+        .into_iter()
+        .filter(|schema| {
+            crate::tool::schema::tool_schema_name(schema).is_none_or(|name| {
+                name == crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+                    || !restricted_tools.contains(name)
+            })
+        })
+        .collect();
     set_payload_edge_tools(payload, final_schemas);
 }
 
@@ -186,10 +228,10 @@ fn canonical_tool_result_wire_row(row: &Value) -> Value {
                 _ => "failed",
             },
             Some(_) => "failed",
-            None if !output.is_string() => "failed",
-            None => crate::tool_result_semantics::cloud_tool_result_status_label(
-                output.as_str().expect("string checked above"),
-            ),
+            // A result body is model/user content, not execution control.
+            // Missing status is an incomplete envelope and fails closed
+            // instead of guessing from arbitrary output text.
+            None => "failed",
         }
     };
     wire.insert("request_id".to_string(), request_id);
@@ -288,6 +330,31 @@ mod tests {
         assert_eq!(p["agent_id"], Value::Null);
         assert_eq!(p["interaction_mode"], Value::Null);
         assert_eq!(p["explain"], json!("verbose"));
+    }
+
+    #[test]
+    fn turn_provenance_identity_is_attached_only_as_a_complete_tuple() {
+        let mut complete = json!({});
+        assert!(attach_turn_identity(
+            &mut complete,
+            1,
+            Some("child-run"),
+            Some("child-query")
+        ));
+        assert_eq!(complete["session_turn"], 1);
+        assert_eq!(complete["turn_chain_id"], "child-run");
+        assert_eq!(complete["user_query_event_id"], "child-query");
+
+        for (turn, chain, query) in [
+            (0, Some("child-run"), Some("child-query")),
+            (1, None, Some("child-query")),
+            (1, Some("child-run"), None),
+            (1, Some(" child-run"), Some("child-query")),
+        ] {
+            let mut incomplete = json!({"stable": true});
+            assert!(!attach_turn_identity(&mut incomplete, turn, chain, query));
+            assert_eq!(incomplete, json!({"stable": true}));
+        }
     }
 
     #[test]
@@ -418,6 +485,7 @@ mod tests {
             &[json!({
                 "tool_call_id": "1",
                 "name": "read_file",
+                "status": "completed",
                 "result": "contents",
             })],
         );
@@ -441,6 +509,8 @@ mod tests {
                 json!({"request_id": "canonical", "status": "skipped", "output": "deduped"}),
                 json!({"tool_call_id": "legacy-status", "status": "success", "result": "ok"}),
                 json!({"tool_call_id": "error", "result": "Error: denied"}),
+                json!({"request_id": "error-content", "status": "completed", "output": "Error: this is file content"}),
+                json!({"request_id": "json-content", "status": "completed", "output": r#"{"status":"failed","error":"quoted log record"}"#}),
                 json!({"request_id": "conflict", "status": "completed", "output": "ok", "error": "denied"}),
                 json!({"request_id": "object-output", "output": {"ok": true}}),
                 Value::String("bad".to_string()),
@@ -449,9 +519,11 @@ mod tests {
         assert_eq!(payload["tool_results"][0]["status"], "skipped");
         assert_eq!(payload["tool_results"][1]["status"], "failed");
         assert_eq!(payload["tool_results"][2]["status"], "failed");
-        assert_eq!(payload["tool_results"][3]["status"], "failed");
-        assert_eq!(payload["tool_results"][4]["status"], "failed");
+        assert_eq!(payload["tool_results"][3]["status"], "completed");
+        assert_eq!(payload["tool_results"][4]["status"], "completed");
         assert_eq!(payload["tool_results"][5]["status"], "failed");
+        assert_eq!(payload["tool_results"][6]["status"], "failed");
+        assert_eq!(payload["tool_results"][7]["status"], "failed");
     }
 
     #[test]
@@ -474,5 +546,26 @@ mod tests {
         let arr = p["edge_tools"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["function"]["name"], "bash");
+    }
+
+    #[test]
+    fn attach_filtered_edge_tools_keeps_runtime_carrier_outside_capability_restrictions() {
+        let mut p = json!({});
+        let carrier = crate::tool::deferred_activation::deferred_tool_invocation_carrier_schema();
+        let schemas = vec![json!({"function": {"name": "tool_search"}}), carrier];
+        let restricted = HashSet::from([
+            "tool_search".to_string(),
+            crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
+        ]);
+
+        attach_filtered_edge_tools(&mut p, schemas, &restricted);
+
+        let names = p["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(crate::tool::schema::tool_schema_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["invoke_tool"]);
     }
 }

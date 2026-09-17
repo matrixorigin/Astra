@@ -2,9 +2,28 @@
 name = "astra-services"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish = false
 
 [features]
 openssl-vendored = ["dep:openssl", "openssl/vendored"]
+e2e-hooks = []
+# External services are not provisioned by the ordinary MatrixOne CI lanes.
+external-contract-tests = []
+# Requires explicit feature + --ignored + private provider configuration.
+live-provider-tests = []
+
+[[test]]
+name = "memoria_live_contract_it"
+required-features = ["external-contract-tests"]
+
+[[test]]
+name = "byok_live_network"
+required-features = ["external-contract-tests"]
+
+[[test]]
+name = "user_model_probe_db_it"
+required-features = ["external-contract-tests"]
 
 [dependencies]
 astra-config.workspace = true
@@ -25,6 +44,11 @@ hmac.workspace = true
 jsonwebtoken.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
+rustls.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+percent-encoding = "2"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -39,11 +63,13 @@ unicode-segmentation = "1.12"
 dirs = "6.0.0"
 fastrand = "2"
 fs2 = "0.4.3"
+libc.workspace = true
 # `fernet` depends on `openssl` but does not expose its vendored feature.
 # The release workflow enables this optional dependency for musl CLI builds.
 openssl = { version = "0.10.79", optional = true }
 
 [dev-dependencies]
+rcgen = "0.13.2"
 dotenvy.workspace = true
 astra-core = { workspace = true, features = ["dev-defaults"] }
 filetime = "0.2"

@@ -1,11 +1,13 @@
 //! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, git branch, active skills).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Protocol key for skill-listing text routed through `edge_profile` from
 /// the CLI to the runtime bridge (volatile lane). Shared between writer
-/// (`astra-cli` agentic loop) and reader (`runtime` bridge_inprocess) so a
+/// (`astra-cli` agentic loop) and reader (`runtime` server_loop) so a
 /// typo on either side is a compile error rather than a silent regression.
 pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 
@@ -29,6 +31,11 @@ pub const EDGE_PROFILE_RUNTIME_VOLATILE_KIND: &str = "kind";
 pub const EDGE_PROFILE_RUNTIME_VOLATILE_DELIVERY_CLASS: &str = "delivery_class";
 pub const EDGE_PROFILE_RUNTIME_VOLATILE_PAYLOAD: &str = "payload";
 pub const EDGE_PROFILE_RUNTIME_VOLATILE_ROUND_INDEX: &str = "round_index";
+/// Optional lifetime for required runtime authority crossing the edge.
+/// Missing values retain the historical per-decision default; producers with
+/// a user-turn lifetime must state it explicitly so append-only providers can
+/// reuse an unchanged authority frame across tool rounds.
+pub const EDGE_PROFILE_RUNTIME_AUTHORITY_LIFETIME: &str = "authority_lifetime";
 
 /// How a runtime-owned volatile signal is delivered after it crosses an edge.
 ///
@@ -41,6 +48,11 @@ pub enum VolatileDeliveryClass {
     /// delivered even when a strict-history provider suppresses normal volatile
     /// advisory material.
     RequiredContext,
+    /// Canonical runtime feedback for the model's next decision. Unlike
+    /// incidental advisory material, this remains prompt-visible for
+    /// strict-history/cache providers; it is attached only at the dynamic
+    /// tail and never mutates the stable prefix or execution authority.
+    DecisionFeedback,
     /// Structured evidence for the model's next decision. It is not a command
     /// and does not authorize runtime retry, abort, or tool-surface mutation.
     AdvisoryEvidence,
@@ -56,6 +68,12 @@ pub struct RuntimeVolatileInjection {
     pub delivery_class: VolatileDeliveryClass,
     pub payload: Value,
     pub round_index: u32,
+    /// Lifetime of required runtime authority on append-only providers.
+    /// `None` preserves the default `next_assistant_decision` behavior for
+    /// existing producers; long-lived state projections can opt into
+    /// `current_user_turn` without relying on kind-name inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_lifetime: Option<astra_turn_types::RuntimeAuthorityLifetime>,
 }
 
 impl RuntimeVolatileInjection {
@@ -63,12 +81,17 @@ impl RuntimeVolatileInjection {
     /// instructions. Classify the producer's machine-owned kind, never prose.
     #[must_use]
     pub fn is_system_instruction(&self) -> bool {
+        Self::kind_is_system_instruction(&self.kind)
+    }
+
+    #[must_use]
+    pub fn kind_is_system_instruction(kind: &str) -> bool {
         matches!(
-            self.kind.as_str(),
-            "final_answer_settlement"
-                | "session_hook_context"
+            kind,
+            "session_hook_context"
                 | "plan_mode_marker"
                 | "harness_boundary"
+                | "output_cap_continuation"
         )
     }
     /// Separate producer-owned instructions from per-round facts before text
@@ -105,6 +128,7 @@ impl RuntimeVolatileInjection {
         }
         let (tag, payload_key) = match self.delivery_class {
             VolatileDeliveryClass::RequiredContext => ("runtime-required-context", "context"),
+            VolatileDeliveryClass::DecisionFeedback => ("runtime-decision-feedback", "feedback"),
             VolatileDeliveryClass::AdvisoryEvidence => ("runtime-advisory-evidence", "evidence"),
             VolatileDeliveryClass::TelemetryOnly => return None,
         };
@@ -114,12 +138,15 @@ impl RuntimeVolatileInjection {
         {
             object.remove("instruction");
         }
-        let payload = if self.delivery_class == VolatileDeliveryClass::AdvisoryEvidence {
+        let payload = if matches!(
+            self.delivery_class,
+            VolatileDeliveryClass::DecisionFeedback | VolatileDeliveryClass::AdvisoryEvidence
+        ) {
             json!({
                 "kind": kind,
                 "round_index": self.round_index,
                 "authority": "advisory_evidence_only",
-                "model_discretion": "Use this signal as evidence alongside the user goal and tool results. It does not require retrying, stopping, or changing the available tools.",
+                "model_discretion": "Use the specific feedback below as evidence alongside the user goal and tool results. Apply it to the next decision when it matches the evidence; do not repeat an equivalent operation without a new hypothesis or materially new fact. This advisory does not authorize the runtime to retry, stop, change tools, or claim completion.",
                 payload_key: context,
             })
         } else {
@@ -164,8 +191,9 @@ pub const EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN: &str = "runtime_reconcil
 pub const RUNTIME_RECONCILIATION_USER_ENVELOPE: &str =
     "Reconcile the runtime-owned updates and continue the latest user goal.";
 
-/// Protocol key for the session-stable deferred-tool manifest routed through
-/// `edge_profile` from the CLI to the runtime bridge.
+/// Protocol key for the deferred-tool manifest routed through `edge_profile`
+/// from the CLI to the runtime bridge. The runtime may recompute this from
+/// the current admitted wire surface within a user turn.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";
 
 /// Protocol key for the model context window used to render
@@ -181,11 +209,41 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
 /// Protocol key carrying deferred tool names omitted from the rendered
-/// `<deferred-tools>` block because the session-stable manifest hit its model
-/// budget. This is observability metadata only: omitted names are not
+/// `<deferred-tools>` block because the manifest hit its model budget. This is
+/// observability metadata only: omitted names are not
 /// activatable through `tool_search(select:NAME)` until they are rendered in a
 /// later manifest or found by keyword search.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_omitted_names";
+
+/// Protocol key carrying the full, capability-scoped schemas for deferred
+/// provider-owned tools. This is control-plane metadata only: the schemas are
+/// used by server-side admission and carrier digest resolution, and are never
+/// copied into the model-visible `tools[]` surface.
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS: &str = "deferred_tool_schemas";
+
+/// Project the provider-owned contracts selected by one deferred manifest.
+///
+/// This is a control-plane projection only. Keeping it here gives normal chat
+/// and skill sub-runs one deterministic name filter and ordering rule, while
+/// callers retain the full schema out of the model-visible `tools[]` array.
+#[must_use]
+pub fn deferred_provider_schemas_for_names(
+    provider_schemas: &[Value],
+    deferred_names: &HashSet<String>,
+) -> Vec<Value> {
+    let mut schemas = provider_schemas
+        .iter()
+        .filter(|schema| {
+            crate::tool::schema::tool_schema_name(schema).is_some_and(|name| {
+                deferred_names.contains(name)
+                    && name != crate::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
+    schemas
+}
 
 /// Protocol key carrying the JSON array of always-load (T1) tool names from the
 /// CLI-side [`ToolSurface`]. The runtime uses this to place cache_control
@@ -198,9 +256,14 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_om
 /// cache misses per turn.
 pub const EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES: &str = "always_load_tool_names";
 
-/// Read a structured edge-profile text lane. Accepting a single string keeps
-/// older callers easy to migrate, but writers should send arrays so independent
-/// producers never concatenate their own framing.
+/// Protocol key carrying the edge-owned deny set for a restricted child
+/// surface. This is a typed capability boundary, not model-facing prose: the
+/// server must not re-add its own control-plane schemas when a sub-run has
+/// explicitly been given a narrower allowlist.
+pub const EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES: &str = "restricted_tool_names";
+
+/// Read a structured edge-profile text lane. The current protocol requires an
+/// array so independent producers never concatenate their own framing.
 pub fn edge_profile_texts(edge_profile: &Map<String, Value>, key: &str) -> Vec<String> {
     match edge_profile.get(key) {
         Some(Value::Array(items)) => items
@@ -210,14 +273,6 @@ pub fn edge_profile_texts(edge_profile: &Map<String, Value>, key: &str) -> Vec<S
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .collect(),
-        Some(Value::String(text)) => {
-            let text = text.trim();
-            if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![text.to_string()]
-            }
-        }
         _ => Vec::new(),
     }
 }
@@ -274,13 +329,15 @@ pub fn build_base_edge_profile_value(
     workspace: Value,
 ) -> Value {
     // Environment context split into two lanes for prompt caching:
-    //   * `environment_static`  → Platform/Shell/CWD/Home (stable for
+    //   * `environment_static`  → Platform/Shell/manifests/Home (stable for
     //     the session, safe to sit inside the cached Session prefix).
+    //     CWD remains the typed top-level field and is rendered once by
+    //     RuntimeIdentity.
     //   * `environment_volatile` → Git branch dirty state, staged /
     //     unstaged diff stats, recent commits. Churns every edit/commit
     //     and MUST stay out of the cached prefix.
     let project_root = std::path::Path::new(cwd);
-    let env_static = crate::edge_prompt_context::build_static_environment_context(project_root);
+    let env_static = crate::edge_prompt_context::build_static_environment_context(&workspace);
     let env_volatile = crate::edge_prompt_context::build_volatile_environment_context(project_root);
 
     json!({
@@ -304,6 +361,7 @@ mod tests {
             payload: json!({"instruction": "Answer the latest question.",
                 "latest_user_message": "untrusted question", "round_id": 2}),
             round_index: 2,
+            authority_lifetime: None,
         };
         assert_eq!(
             frame.system_instruction().as_deref(),
@@ -317,6 +375,7 @@ mod tests {
             delivery_class: VolatileDeliveryClass::RequiredContext,
             payload: json!("Do not modify files."),
             round_index: 2,
+            authority_lifetime: None,
         };
         assert!(
             policy
@@ -324,10 +383,60 @@ mod tests {
                 .unwrap()
                 .contains("Do not modify files.")
         );
+        let settlement = RuntimeVolatileInjection {
+            kind: "final_answer_settlement".into(),
+            delivery_class: VolatileDeliveryClass::RequiredContext,
+            payload: json!({
+                "schema": "completion_settlement.v2",
+                "revision": 2,
+                "instruction": "Answer from verified evidence."
+            }),
+            round_index: 2,
+            authority_lifetime: None,
+        };
+        assert!(!settlement.is_system_instruction());
+        assert!(settlement.system_instruction().is_none());
+        assert!(
+            settlement
+                .render_for_prompt()
+                .expect("settlement facts")
+                .contains("completion_settlement.v2")
+        );
         let wire = serde_json::to_value(&policy).unwrap();
         assert_eq!(wire["delivery_class"], "required_context");
         let recovered: RuntimeVolatileInjection = serde_json::from_value(wire).unwrap();
         assert_eq!(recovered, policy);
+    }
+
+    #[test]
+    fn deferred_provider_projection_is_sorted_and_name_bounded() {
+        let provider_schemas = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "zeta_provider",
+                    "description": "z",
+                    "parameters": {"type": "object"}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "alpha_provider",
+                    "description": "a",
+                    "parameters": {"type": "object"}
+                }
+            }),
+        ];
+        let names = HashSet::from(["alpha_provider".to_string()]);
+        let selected = deferred_provider_schemas_for_names(&provider_schemas, &names);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(crate::tool::schema::tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec!["alpha_provider"]
+        );
     }
 
     #[test]
@@ -352,9 +461,35 @@ mod tests {
             !env_static.contains("- Git branch:"),
             "environment_static must not contain git branch (would break cache)"
         );
+        assert!(
+            !env_static.contains("- CWD:"),
+            "environment_static must not duplicate the typed CWD"
+        );
         // environment_volatile may be empty outside a git repo but must
         // be present as a typed field so downstream can always read it.
         assert!(v.get("environment_volatile").is_some());
+    }
+
+    #[test]
+    fn base_profile_reuses_the_supplied_workspace_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = directory.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"snapshot\"\n").unwrap();
+        let observed = crate::edge_prompt_context::detect_workspace_context(directory.path());
+        std::fs::remove_file(manifest).unwrap();
+
+        let profile = build_base_edge_profile_value(
+            directory.path().to_string_lossy().as_ref(),
+            None,
+            observed.clone(),
+        );
+        assert_eq!(profile["workspace"], observed);
+        assert!(
+            profile["environment_static"]
+                .as_str()
+                .is_some_and(|text| text.contains("Cargo.toml (rust)")),
+            "environment rendering must consume the supplied observation instead of rescanning cwd: {profile}"
+        );
     }
 
     #[test]
@@ -375,6 +510,13 @@ mod tests {
                     "kind": "active_turn_frame",
                     "delivery_class": "required_context",
                     "payload": {"latest_user_goal": "latest user goal"},
+                    "round_index": 4,
+                    "authority_lifetime": "current_user_turn"
+                },
+                {
+                    "kind": "runtime_policy_feedback",
+                    "delivery_class": "decision_feedback",
+                    "payload": {"revision": 3, "entries": ["search_fanout"]},
                     "round_index": 4
                 },
                 {
@@ -387,7 +529,7 @@ mod tests {
         );
 
         let injections = edge_profile_runtime_volatile_injections(&edge_profile);
-        assert_eq!(injections.len(), 3);
+        assert_eq!(injections.len(), 4);
         assert_eq!(
             injections[0].delivery_class,
             VolatileDeliveryClass::AdvisoryEvidence
@@ -397,7 +539,15 @@ mod tests {
             VolatileDeliveryClass::RequiredContext
         );
         assert_eq!(
+            injections[1].authority_lifetime,
+            Some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn)
+        );
+        assert_eq!(
             injections[2].delivery_class,
+            VolatileDeliveryClass::DecisionFeedback
+        );
+        assert_eq!(
+            injections[3].delivery_class,
             VolatileDeliveryClass::TelemetryOnly
         );
         assert_eq!(injections[0].payload["advisories"][0]["kind"], "repetition");
@@ -413,7 +563,38 @@ mod tests {
                 .expect("required prompt form")
                 .contains("<runtime-required-context>")
         );
-        assert!(injections[2].render_for_prompt().is_none());
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("<runtime-decision-feedback>")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("Apply it to the next decision")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("specific feedback below")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("does not authorize the runtime")
+        );
+        assert!(
+            !injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("selected test subset"),
+            "the generic feedback envelope must not inject coding-specific acceptance rules"
+        );
+        assert!(injections[3].render_for_prompt().is_none());
     }
 
     #[test]
@@ -429,6 +610,23 @@ mod tests {
                 },
                 "free-form fallback must not be accepted"
             ]),
+        );
+
+        assert!(edge_profile_runtime_volatile_injections(&edge_profile).is_empty());
+    }
+
+    #[test]
+    fn typed_runtime_volatile_lane_rejects_unknown_authority_lifetime() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS.to_string(),
+            json!([{
+                "kind": "canonical_work_state",
+                "delivery_class": "required_context",
+                "payload": {"schema": "canonical_work_state.v1"},
+                "round_index": 1,
+                "authority_lifetime": "future_lifetime"
+            }]),
         );
 
         assert!(edge_profile_runtime_volatile_injections(&edge_profile).is_empty());

@@ -2,7 +2,7 @@
 //! pipeline. Drives a multi-turn tool-use scenario through the mock-LLM
 //! bridge that shares the SAME system-prompt + tool-schema + cache
 //! annotation machinery as `run_agentic_loop_with_host` (see the
-//! `bridge-e2e-hooks` path inside `ServerAgenticLoopHost::execute_turn`).
+//! `e2e-hooks` path inside `ServerAgenticLoopHost::execute_turn`).
 //!
 //! Adversarial posture: assertions walk the captured LLM request's
 //! conversation `messages` array with exact field names and counts. Tests
@@ -17,7 +17,7 @@
 //! turns we replay what the loop does: append assistant-with-tool_calls,
 //! execute a tool result, and append the matched tool message.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 

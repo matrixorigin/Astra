@@ -1,3 +1,4 @@
+import { parseChatSseFrame, isReplayConnectionError } from "@/lib/api/chat-sse-frame";
 import { NextRequest, NextResponse } from "next/server";
 import {
   PATH_CHAT_STREAM,
@@ -15,8 +16,10 @@ import {
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
+import { fetchSessionArtifacts } from "@/lib/api/stream-artifacts";
 import {
   applyStreamEvent,
+  applyExplainAnalyzeObservation,
   type StreamEventContext,
   type StreamEventState,
 } from "@/lib/api/stream-event-handler";
@@ -43,24 +46,8 @@ function sseFrame(event: unknown) {
   return encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-function eventFromSseFrame(
-  frame: string,
-): import("@astra/sdk").StreamEvent | null {
-  const data = frame
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trim())
-    .join("\n");
-
-  if (!data || data === "[DONE]") {
-    return null;
-  }
-
-  try {
-    return JSON.parse(data) as import("@astra/sdk").StreamEvent;
-  } catch {
-    return null;
-  }
+function eventFromSseFrame(frame: string, strict = false): import("@astra/sdk").StreamEvent | null {
+  return parseChatSseFrame(frame, strict) as import("@astra/sdk").StreamEvent | null;
 }
 
 function normalizedActiveSkills(skills?: string[]) {
@@ -109,6 +96,13 @@ async function readSendMessageRequest(
 
 async function readErrorDetail(response: Response) {
   return readRuntimeErrorDetail(response);
+}
+
+function hasMessagesBeforePendingTurn(
+  chat: NonNullable<ReturnType<typeof getChat>>,
+) {
+  const pendingMessageId = chat.pendingTurn?.messageId;
+  return chat.messages.some((message) => message.id !== pendingMessageId);
 }
 
 function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
@@ -174,23 +168,35 @@ function proxyRunStream(params: {
   ownerUserId: string;
   chatId: string;
   sessionId: string | (() => string);
+  runtime: WebRuntimeClient | (() => Promise<WebRuntimeClient>);
   assistantMessageId: string;
+  knownArtifactIds: Set<string>;
+  replayOnly?: boolean;
+  replayFromOrigin?: boolean;
   localMessages?: {
     userMessage: unknown;
     assistantMessage: unknown;
   };
 }) {
+  const interactionProtocolHeader = "x-astra-agent-interaction-api-major";
+  const expectedInteractionProtocol = "1";
   const {
     backendResponse,
     backendAbortController,
     ownerUserId,
     chatId,
     sessionId,
+    runtime,
     assistantMessageId,
+    knownArtifactIds,
+    replayOnly = false,
+    replayFromOrigin = false,
     localMessages,
   } = params;
   const currentSessionId =
     typeof sessionId === "function" ? sessionId : () => sessionId;
+  const currentRuntime =
+    typeof runtime === "function" ? runtime : () => Promise.resolve(runtime);
 
   let backendReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let clientCancelled = false;
@@ -261,16 +267,18 @@ function proxyRunStream(params: {
             error instanceof RuntimeClientError ? error.status : undefined;
           const code =
             error instanceof RuntimeClientError ? error.code : undefined;
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              content: message,
-              status: "failed",
-            },
-          );
-          setChatActiveRun(ownerUserId, chatId, undefined);
+          if (!replayOnly) {
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                content: message,
+                status: "failed",
+              },
+            );
+            setChatActiveRun(ownerUserId, chatId, undefined);
+          }
           enqueueFrame({ type: "error", message, status, code });
           closeController();
           return;
@@ -283,17 +291,44 @@ function proxyRunStream(params: {
           if (clientCancelled) {
             return;
           }
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              content: detail,
-              status: "failed",
-            },
-          );
-          setChatActiveRun(ownerUserId, chatId, undefined);
+          if (!replayOnly) {
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                content: detail,
+                status: "failed",
+              },
+            );
+            setChatActiveRun(ownerUserId, chatId, undefined);
+          }
           enqueueFrame({ type: "error", message: detail });
+          closeController();
+          return;
+        }
+        const actualInteractionProtocol = resolvedBackendResponse.headers.get(
+          interactionProtocolHeader,
+        );
+        if (actualInteractionProtocol !== expectedInteractionProtocol) {
+          backendAbortController.abort();
+          const message = actualInteractionProtocol
+            ? `Astra Server interaction protocol ${actualInteractionProtocol} is incompatible with Web ${expectedInteractionProtocol}. Restart or upgrade the Server.`
+            : "Astra Server is missing the interaction protocol contract. Restart or upgrade the Server before starting another turn.";
+          if (!replayOnly) {
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              { content: message, status: "failed" },
+            );
+            setChatActiveRun(ownerUserId, chatId, undefined);
+          }
+          enqueueFrame({
+            type: "error",
+            code: "RUNTIME_PROTOCOL_MISMATCH",
+            message,
+          });
           closeController();
           return;
         }
@@ -317,6 +352,17 @@ function proxyRunStream(params: {
           chatId,
           assistantMessageId,
           getSessionId: currentSessionId,
+        };
+
+        const repairToken = replayOnly && replayFromOrigin ? crypto.randomUUID() : null;
+        let sawExplainFact = false;
+        let replayFailed = false;
+        if (repairToken) updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId,
+          { explainAnalyzeRepair: { token: repairToken, complete: false } });
+        const observeReplay = (event: import("@astra/sdk").StreamEvent) => {
+          sawExplainFact ||= event.type === "explain_analyze";
+          replayFailed ||= isReplayConnectionError(event);
+          applyExplainAnalyzeObservation(event, ctx, true);
         };
 
         const state: StreamEventState = {
@@ -345,21 +391,25 @@ function proxyRunStream(params: {
             const frames = buffer.split(/\r?\n\r?\n/);
             buffer = frames.pop() ?? "";
             for (const frame of frames) {
-              const event = eventFromSseFrame(frame);
+              const event = eventFromSseFrame(frame, replayOnly);
               if (event) {
-                applyBackendStreamEvent(event, ctx, state);
+                if (replayOnly) observeReplay(event);
+                else applyBackendStreamEvent(event, ctx, state);
               }
             }
           }
 
-          const tail = decoder.decode();
-          if (tail) {
-            buffer += tail;
-          }
-          if (buffer.trim()) {
-            const event = eventFromSseFrame(buffer);
-            if (event) {
-              applyBackendStreamEvent(event, ctx, state);
+          {
+            const tail = decoder.decode();
+            if (tail) {
+              buffer += tail;
+            }
+            if (buffer.trim()) {
+              const event = eventFromSseFrame(buffer, replayOnly);
+              if (event) {
+                if (replayOnly) observeReplay(event);
+                else applyBackendStreamEvent(event, ctx, state);
+              }
             }
           }
 
@@ -367,7 +417,12 @@ function proxyRunStream(params: {
             return;
           }
 
-          if (state.lastStatus === "streaming") {
+          if (repairToken && sawExplainFact && !replayFailed) {
+            updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId,
+              { explainAnalyzeRepair: { token: repairToken, complete: true } });
+          }
+
+          if (!replayOnly && state.lastStatus === "streaming") {
             if (
               state.runLifecycle === "paused" ||
               state.runLifecycle === "blocked"
@@ -405,6 +460,25 @@ function proxyRunStream(params: {
             }
           }
 
+          if (!replayOnly && state.lastStatus === "complete") {
+            const runtimeClient = await currentRuntime();
+            const artifacts = (
+              await fetchSessionArtifacts(runtimeClient, currentSessionId())
+            ).filter((artifact) => !knownArtifactIds.has(artifact.id));
+            if (clientCancelled) {
+              return;
+            }
+            if (artifacts.length > 0) {
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                { artifacts },
+              );
+              enqueueFrame({ type: "artifacts", artifacts });
+            }
+          }
+
         } catch (error) {
           if (clientCancelled) {
             return;
@@ -413,16 +487,20 @@ function proxyRunStream(params: {
           await Promise.resolve(reader.cancel()).catch(() => undefined);
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
-          setChatActiveRun(ownerUserId, chatId, undefined);
-          updateStreamingAssistantMessage(
-            ownerUserId,
-            chatId,
-            assistantMessageId,
-            {
-              content: state.assistantText || message,
-              status: "failed",
-            },
-          );
+          if (!replayOnly) {
+            setChatActiveRun(ownerUserId, chatId, undefined);
+            updateStreamingAssistantMessage(
+              ownerUserId,
+              chatId,
+              assistantMessageId,
+              {
+                content: state.assistantText || message,
+                status: "failed",
+              },
+            );
+          }
+          if (replayOnly) updateStreamingAssistantMessage(ownerUserId, chatId, assistantMessageId,
+            { explainAnalyzeDegraded: true });
           enqueueFrame({ type: "error", message });
         } finally {
           backendReader = null;
@@ -530,6 +608,7 @@ export async function POST(
   }
 
   let runtimeSessionId = chatId;
+  const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
   const started = beginStreamingMessage(ownerUserId, chatId, {
     ...body,
@@ -539,6 +618,7 @@ export async function POST(
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
   const backendAbortController = new AbortController();
+  const knownArtifactIds = new Set<string>();
 
   return proxyRunStream({
     backendResponse: async (emit) => {
@@ -581,6 +661,15 @@ export async function POST(
         chat_id: chatId,
         session_id: runtimeSessionId,
       });
+      if (hasPriorMessages) {
+        const existingArtifacts = await fetchSessionArtifacts(
+          runtime,
+          runtimeSessionId,
+        );
+        for (const artifact of existingArtifacts) {
+          knownArtifactIds.add(artifact.id);
+        }
+      }
       return runtime.fetchResponse(PATH_CHAT_STREAM, {
         method: "POST",
         auth: "required",
@@ -624,7 +713,9 @@ export async function POST(
     ownerUserId,
     chatId,
     sessionId: () => runtimeSessionId,
+    runtime: getStreamRuntime,
     assistantMessageId: started.assistantMessage.id,
+    knownArtifactIds,
     localMessages: {
       userMessage: started.userMessage,
       assistantMessage: started.assistantMessage,
@@ -669,6 +760,7 @@ export async function GET(
       { status: 409 },
     );
   }
+  const replayOnly = request.nextUrl.searchParams.get("replay_only") === "true";
 
   let runtime: WebRuntimeClient;
   try {
@@ -681,12 +773,29 @@ export async function GET(
   }
 
   const sessionId = chat.session?.backendSessionId ?? chatId;
+  const knownArtifactIds = new Set<string>();
+  if (!replayOnly) {
+    try {
+      const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
+      for (const artifact of existingArtifacts) {
+        knownArtifactIds.add(artifact.id);
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to load artifacts.";
+      return NextResponse.json({ error: message }, { status: 502 });
+    }
+  }
+
   const backendAbortController = new AbortController();
   const lastIndex = normalizedLastIndex(
     request.nextUrl.searchParams.get("last_index"),
   );
   const backendStreamPath = `${chatRunStreamPath(runId)}${buildQueryString(
-    lastIndex === null ? {} : { last_index: lastIndex },
+    {
+      ...(lastIndex === null ? {} : { last_index: lastIndex }),
+      ...(replayOnly ? { replay_only: "true" } : {}),
+    },
   )}`;
 
   return proxyRunStream({
@@ -701,6 +810,10 @@ export async function GET(
     ownerUserId,
     chatId,
     sessionId,
+    runtime,
     assistantMessageId,
+    knownArtifactIds,
+    replayOnly,
+    replayFromOrigin: lastIndex === null || lastIndex === 0,
   });
 }

@@ -267,6 +267,9 @@ fn objective_context_from_entries(entries: &[PromptEntry]) -> Vec<ObjectiveConte
 fn prompt_entries(messages: &[Value]) -> Result<Vec<PromptEntry>, UserTurnSemanticsError> {
     let mut entries = Vec::new();
     for message in messages {
+        if astra_turn_types::is_runtime_owned_message(message) {
+            continue;
+        }
         let Some(role) = message.get("role").and_then(Value::as_str) else {
             continue;
         };

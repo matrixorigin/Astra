@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::turn_failure_reporting::report_turn_failure;
+use super::turn_failure_reporting::reconcile_and_report_turn_failure;
 use super::turn_success::apply_turn_success_async;
 use crate::StreamResult;
 use crate::cli::session::session_state::SessionState;
@@ -22,7 +22,9 @@ fn fabricate_user_cancel_failure(
             completion_tokens: snap.completion_tokens,
             cache_read_tokens: snap.cache_read_tokens,
             cache_creation_tokens: snap.cache_creation_tokens,
-            tool_calls_count: snap.tool_call_records.len() as u32,
+            tool_calls_count: snap.tool_calls_count,
+            llm_rounds: snap.llm_rounds,
+            token_usage_coverage: snap.token_usage_coverage,
             tool_call_records: snap.tool_call_records,
             tools_used: snap.tools_used,
             partial_text: snap.partial_text,
@@ -107,13 +109,16 @@ pub(crate) async fn apply_user_cancelled_turn(
         }
         Err(mut failure) => {
             failure.error = "[cancelled] user_interrupted (Ctrl+C)".to_string();
-            report_turn_failure(state, profile, line, &failure, turn_start, &mut SilentUi);
-            if failure.partial.partial_text.is_empty() {
-                state.history.push((
-                    line.to_string(),
-                    "[Interrupted by user before any response was produced]".to_string(),
-                ));
-            }
+            reconcile_and_report_turn_failure(
+                state,
+                api,
+                profile,
+                line,
+                &mut failure,
+                turn_start,
+                &mut SilentUi,
+            )
+            .await;
         }
     }
 }
@@ -139,7 +144,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn user_cancelled_turn_with_partial_text_preserves_user_line_in_history() {
+    async fn user_cancelled_turn_with_partial_text_keeps_partial_out_of_canonical_history() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-user-cancel-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
@@ -172,7 +177,14 @@ mod tests {
         assert_eq!(state.history.len(), 1, "user line must be in history");
         assert_eq!(state.history[0].0, "explain LoopDispatcher");
         assert!(state.history[0].1.contains("user_interrupted"));
-        assert!(state.history[0].1.contains("The first half of the answer"));
+        assert!(
+            !state.history[0].1.contains("The first half of the answer"),
+            "unsettled assistant text is diagnostic evidence, not canonical conversation"
+        );
+        assert_eq!(
+            state.last_response.as_deref(),
+            Some("The first half of the answer")
+        );
         assert!(state.last_turn_interrupted);
         assert_eq!(
             state.turn, 1,
@@ -262,11 +274,7 @@ mod tests {
             "user line must be pushed to history"
         );
         assert_eq!(state.history[0].0, "what's in run_lifecycle.rs");
-        assert!(
-            state.history[0]
-                .1
-                .contains("Interrupted by user before any response"),
-        );
+        assert!(state.history[0].1.contains("user_interrupted"),);
         assert!(state.last_turn_interrupted);
         assert_eq!(
             state.turn, 1,

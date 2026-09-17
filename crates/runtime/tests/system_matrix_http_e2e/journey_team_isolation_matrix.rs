@@ -90,5 +90,5 @@ pub async fn run_team_cross_user_isolation() {
     let (st_del_a, _) = delete_json(&ctx.app, &path_t, Some(auth_a)).await;
     assert_eq!(st_del_a, StatusCode::OK);
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

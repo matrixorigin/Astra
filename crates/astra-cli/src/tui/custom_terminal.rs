@@ -609,6 +609,13 @@ fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
 where
     I: Iterator<Item = DrawCommand>,
 {
+    draw_with_colors(writer, commands, std::env::var_os("NO_COLOR").is_none())
+}
+
+fn draw_with_colors<I>(writer: &mut impl Write, commands: I, emit_colors: bool) -> io::Result<()>
+where
+    I: Iterator<Item = DrawCommand>,
+{
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;
     let mut modifier = Modifier::empty();
@@ -633,7 +640,7 @@ where
                     diff.queue(writer)?;
                     modifier = cell.modifier;
                 }
-                if cell.fg != fg || cell.bg != bg {
+                if emit_colors && (cell.fg != fg || cell.bg != bg) {
                     queue!(
                         writer,
                         SetColors(Colors::new(
@@ -641,28 +648,34 @@ where
                             to_crossterm_color(cell.bg)
                         ))
                     )?;
-                    fg = cell.fg;
-                    bg = cell.bg;
                 }
+                fg = cell.fg;
+                bg = cell.bg;
 
                 queue!(writer, Print(cell.symbol()))?;
             }
             DrawCommand::ClearToEnd { bg: clear_bg, .. } => {
                 queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
                 modifier = Modifier::empty();
-                queue!(writer, SetBackgroundColor(to_crossterm_color(clear_bg)))?;
+                if emit_colors {
+                    queue!(writer, SetBackgroundColor(to_crossterm_color(clear_bg)))?;
+                }
                 bg = clear_bg;
                 queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
             }
         }
     }
 
-    queue!(
-        writer,
-        SetForegroundColor(crossterm::style::Color::Reset),
-        SetBackgroundColor(crossterm::style::Color::Reset),
-        SetAttribute(crossterm::style::Attribute::Reset),
-    )?;
+    if emit_colors {
+        queue!(
+            writer,
+            SetForegroundColor(crossterm::style::Color::Reset),
+            SetBackgroundColor(crossterm::style::Color::Reset),
+            SetAttribute(crossterm::style::Attribute::Reset),
+        )?;
+    } else {
+        queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
+    }
 
     Ok(())
 }
@@ -791,5 +804,24 @@ mod tests {
     fn display_width_ignores_osc8_payload_terminated_by_st() {
         let linked = "\x1b]8;;file:///tmp/example.rs\x1b\\example.rs\x1b]8;;\x1b\\";
         assert_eq!(display_width(linked), "example.rs".width());
+    }
+
+    #[test]
+    fn no_color_does_not_emit_empty_sgr_parameters() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(0, 0, "ok", Style::default());
+        let mut output = Vec::new();
+
+        draw_with_colors(
+            &mut output,
+            diff_buffers(&Buffer::empty(area), &buffer).into_iter(),
+            false,
+        )
+        .expect("draw without colors");
+
+        assert!(!output.windows(4).any(|window| window == b"\x1b[;m"));
+        assert!(!output.windows(3).any(|window| window == b"\x1b[m"));
+        assert!(String::from_utf8_lossy(&output).contains("ok"));
     }
 }

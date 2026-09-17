@@ -106,7 +106,6 @@ describe("chat work surface route", () => {
           ],
         };
       }
-      if (path === "/sessions/session-1/todos") return { tasks: [] };
       if (path.startsWith("/chat/runs/root-new/projection")) {
         return {
           run_id: "root-new",
@@ -124,7 +123,19 @@ describe("chat work surface route", () => {
       }
       throw new Error(`unexpected runtime path: ${path}`);
     });
-    mockRequireRuntimeClient.mockResolvedValue({ get } as never);
+    const workBinding = {
+      schema_version: 1,
+      work_id: "work-1",
+      branch_id: "branch-1",
+      graph_revision: 4,
+    };
+    const taskGraph = { schema_version: 2, scope: "declared_work" };
+    const getWorkSessionBinding = vi.fn().mockResolvedValue(workBinding);
+    const getWorkTaskGraph = vi.fn().mockResolvedValue(taskGraph);
+    mockRequireRuntimeClient.mockResolvedValue({
+      get,
+      sdk: { getWorkSessionBinding, getWorkTaskGraph },
+    } as never);
 
     const { GET } = await import(
       "@/app/api/chats/[chatId]/work-surface/route"
@@ -140,6 +151,8 @@ describe("chat work surface route", () => {
       sessionId: "session-1",
       runId: "root-new",
       status: "cancelled",
+      workBinding,
+      taskGraph,
       warnings: [],
     });
     expect(payload.events).toEqual(
@@ -167,6 +180,12 @@ describe("chat work surface route", () => {
     expect(
       get.mock.calls.some(([path]) => String(path).includes("root-old/projection")),
     ).toBe(false);
+    expect(get.mock.calls.some(([path]) => String(path).includes("/todos"))).toBe(false);
+    expect(getWorkTaskGraph).toHaveBeenCalledWith("work-1", "branch-1", {
+      cursor: { graph_revision: 4, item_offset: 0, dependency_offset: 0 },
+      itemLimit: 8,
+      dependencyLimit: 128,
+    });
   });
 
   it("projects a running root and child without fabricating lifecycle events", async () => {
@@ -217,7 +236,6 @@ describe("chat work surface route", () => {
           ],
         };
       }
-      if (path === "/sessions/session-1/todos") return { tasks: [] };
       if (path.startsWith("/chat/runs/root-live/projection")) {
         return {
           run_id: "root-live",
@@ -247,7 +265,11 @@ describe("chat work surface route", () => {
       }
       throw new Error(`unexpected runtime path: ${path}`);
     });
-    mockRequireRuntimeClient.mockResolvedValue({ get } as never);
+    const getWorkSessionBinding = vi.fn().mockResolvedValue(null);
+    mockRequireRuntimeClient.mockResolvedValue({
+      get,
+      sdk: { getWorkSessionBinding },
+    } as never);
 
     const { GET } = await import(
       "@/app/api/chats/[chatId]/work-surface/route"

@@ -74,6 +74,17 @@ When Edge/CLI and Server both provide `web_fetch`, Edge/CLI wins by default. Ser
 
 Unknown executor-gated capability defaults to `Unsupported`.
 
+For workspace-bound shell execution, the workspace root is the capability and
+observation boundary. A Bash invocation may select an existing directory
+within that root through its call-scoped `workdir`; this changes only the
+subprocess starting directory and never persists as session state. Resolution
+and symlink confinement happen at the CLI/User Runner executor before spawn,
+and, on Unix process paths with pinned-cwd support, a root-relative no-symlink
+directory-handle walk pins the identity used by policy, source capture, cache,
+execution, and evidence. Executors that cannot consume that pinned subdirectory
+identity (including the current managed mount boundary and non-Unix process
+path) fail closed instead of falling back to path-based execution.
+
 ## Routes
 
 | Route | Meaning |
@@ -94,6 +105,31 @@ Tool schema order must be deterministic:
 3. deferred tools through the same decision pool.
 
 Dynamic provider state should change compact availability facts, not invalidate the stable prompt prefix.
+
+The built-in default always-load surface is a bounded first-request primitive
+set, not a catalog of every useful workflow. Artifact-result recovery through
+`introspect` and the ordinary persisted-causality entrypoint through `reflect`
+remain eager as compact read-only observation operations. Their resident
+projections expose only the ordinary call shape; advanced reflection fields
+remain available through explicit typed `tool_search`/`invoke_tool` selection.
+Fan-out, advanced memory operations, and graph-maintenance schemas remain
+discoverable through the deferred surface. The resident compact-JSON schema
+projection has an 8 KiB regression budget with a safety margin; explicit user-
+pinned tools may exceed it. Ordinary workspace navigation (`read_file`,
+`list_dir`, and `grep`) stays resident, while the specialized `glob` query is
+deferred and remains fully reachable through explicit selection. Deferred
+entries carry only compact discovery metadata and are activated through the
+typed protocol, so a selected full schema never silently re-enters the
+repeated provider `tools[]` prefix. This bounds the fixed provider prefix
+without making cache reuse or capability reachability a correctness
+dependency.
+
+Projection must preserve argument meaning as well as structural validation.
+The resident `start_work.tasks` field retains its canonical acceptance-unit
+definition; procedural steps serving one outcome are not separate outcomes.
+Its duplicate discovery-only annotation stays in the catalog, not the resident
+wire schema. This does not change the schema byte budget or Work admission
+authority, and preserving the definition is not proof of model compliance.
 
 ## Skills
 

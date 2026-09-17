@@ -1,13 +1,7 @@
-use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
 use super::*;
 use crate::server::{
-    model_execution_admission::{
-        ModelExecutionAdmissionAuthority, admit_model_execution_from_body,
-    },
-    provider_runtime_context::{
-        inject_effective_runtime_context, inject_effective_runtime_context_body,
-    },
+    provider_runtime_context::inject_effective_runtime_context,
     run::handlers::transform_stream_run_events_for_client,
 };
 use axum::Extension;
@@ -128,17 +122,6 @@ pub(super) async fn validate_conversation_authority(
     Ok(())
 }
 
-/// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
-#[allow(clippy::result_large_err)]
-fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
-    HeaderValue::from_str(value).map_err(|_| {
-        sse_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Invalid header value: contains non-visible ASCII".to_string(),
-        )
-    })
-}
-
 #[cfg(test)]
 pub(super) async fn resolve_or_create_chat_session_id(
     state: &AppState,
@@ -153,6 +136,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
         requested_session_id,
         agent_id,
         session_id_is_trusted,
+        false,
     )
     .await
     .map(|resolved| resolved.session_id)
@@ -169,16 +153,24 @@ pub(super) async fn resolve_or_create_chat_session(
     requested_session_id: Option<String>,
     agent_id: Option<String>,
     session_id_is_trusted: bool,
+    provider_authorized: bool,
 ) -> Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)> {
     match requested_session_id {
         Some(session_id) => {
             validate_requested_chat_session_id(&session_id)?;
 
-            match state
-                .session_service
-                .get_session(session_id.clone(), user.user_id.clone())
-                .await
-            {
+            let session = if provider_authorized {
+                state
+                    .session_service
+                    .get_session_for_provider_request(session_id.clone(), user.user_id.clone())
+                    .await
+            } else {
+                state
+                    .session_service
+                    .get_session(session_id.clone(), user.user_id.clone())
+                    .await
+            };
+            match session {
                 Ok(session) => Ok(ResolvedChatSession {
                     session_id: Some(session_id),
                     full_llm_capture:
@@ -192,7 +184,7 @@ pub(super) async fn resolve_or_create_chat_session(
                         full_llm_capture: false,
                     })
                 }
-                Err(error) => Err(normalize_chat_turn_session_error(error, &session_id)),
+                Err(error) => Err(normalize_chat_session_error(error)),
             }
         }
         None => {
@@ -257,6 +249,25 @@ pub(super) fn is_session_service_unconfigured_error(
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
+fn normalize_chat_session_error(
+    error: (StatusCode, Json<ErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    let (status, detail) = error;
+    if status == StatusCode::NOT_FOUND {
+        if detail.0.error_code.as_deref() == Some("session_not_found") {
+            error_response_coded(
+                StatusCode::NOT_FOUND,
+                "Session not found",
+                "session_not_found",
+            )
+        } else {
+            error_response(StatusCode::NOT_FOUND, "Session not found")
+        }
+    } else {
+        (status, detail)
+    }
+}
+
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     method: Method,
@@ -281,6 +292,10 @@ pub(super) async fn chat_handler(
         chat_data.session_id.take(),
         chat_data.agent_id.clone(),
         false,
+        matches!(
+            &principal.origin,
+            astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+        ),
     )
     .await?;
     chat_data.session_id = resolved.session_id;
@@ -361,6 +376,10 @@ pub(super) async fn chat_stream_handler(
             requested_session_id.clone(),
             requested_agent_id,
             false,
+            matches!(
+                &principal.origin,
+                astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
+            ),
         ),
         inject_effective_runtime_context(&state, &principal, &mut chat_data),
     );
@@ -448,336 +467,6 @@ pub(super) async fn chat_stream_handler(
     }
 }
 
-pub(super) async fn chat_turn_handler(
-    State(state): State<AppState>,
-    trace: Option<Extension<RequestTrace>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let request_id = trace
-        .as_ref()
-        .map(|Extension(trace)| trace.request_id.clone());
-    let principal = match state
-        .auth_service
-        .current_principal_for_request(
-            &headers,
-            external_request_descriptor(&method, &uri, &headers, "/chat/turn", &body),
-        )
-        .await
-    {
-        Ok(principal) => principal,
-        Err((status, error)) => {
-            return sse_error_response_from_error_with_request_id(
-                status,
-                error.0,
-                request_id.as_deref(),
-            );
-        }
-    };
-    let body = match inject_effective_runtime_context_body(&state, &principal, body).await {
-        Ok(body) => body,
-        Err((status, error)) => {
-            return sse_error_response_from_error_with_request_id(
-                status,
-                error.0,
-                request_id.as_deref(),
-            );
-        }
-    };
-    let model_execution_authority = if principal.is_provider_authorized_request() {
-        ModelExecutionAdmissionAuthority::ProviderRuntime
-    } else {
-        ModelExecutionAdmissionAuthority::Catalog
-    };
-    dispatch_chat_turn_bridge(
-        &state,
-        &principal.user,
-        &headers,
-        body,
-        model_execution_authority,
-        request_id.as_deref(),
-    )
-    .await
-}
-
-pub(super) async fn dispatch_chat_turn_bridge(
-    state: &AppState,
-    user: &AuthUserRecord,
-    source_headers: &HeaderMap,
-    body: Bytes,
-    model_execution_authority: ModelExecutionAdmissionAuthority,
-    request_id: Option<&str>,
-) -> Response {
-    let admitted_model_execution = match admit_model_execution_from_body(
-        &state.model_service,
-        &body,
-        model_execution_authority,
-    )
-    .await
-    {
-        Ok(execution) => execution,
-        Err((status, error)) => {
-            return sse_error_response_from_error_with_request_id(status, error.0, request_id);
-        }
-    };
-    let mut bridge_headers = HeaderMap::new();
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-bridge-secret"),
-        match safe_header_value(&state.chat_turn_bridge_secret) {
-            Ok(v) => v,
-            Err(r) => return r,
-        },
-    );
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-user-id"),
-        match safe_header_value(&user.user_id) {
-            Ok(v) => v,
-            Err(r) => return r,
-        },
-    );
-    let username_b64 = URL_SAFE.encode(user.username.as_bytes());
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-username-b64"),
-        match safe_header_value(&username_b64) {
-            Ok(v) => v,
-            Err(r) => return r,
-        },
-    );
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-bridge-capabilities"),
-        HeaderValue::from_static("state-sync-v1"),
-    );
-    if let Some(auth) = source_headers.get("authorization").cloned() {
-        bridge_headers.insert(HeaderName::from_static("authorization"), auth);
-    }
-
-    let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
-        Ok(result) => result,
-        Err((status, error)) => {
-            return sse_error_response_from_error_with_request_id(status, error.0, request_id);
-        }
-    };
-    if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-session-id"),
-            match safe_header_value(trusted_session_id) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if prepared.full_llm_capture == Some(true) {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-full-llm-capture"),
-            HeaderValue::from_static("1"),
-        );
-    }
-    if let Some(session_turn) = prepared.session_turn.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-session-turn"),
-            match safe_header_value(session_turn) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if let Some(turn_chain_id) = prepared.turn_chain_id.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-turn-chain-id"),
-            match safe_header_value(turn_chain_id) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if let Some(user_query_event_id) = prepared.user_query_event_id.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-user-query-event-id"),
-            match safe_header_value(user_query_event_id) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if let Some(tools_changed) = prepared.tools_changed {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-tools-changed"),
-            HeaderValue::from_static(if tools_changed { "1" } else { "0" }),
-        );
-    }
-    if let Some(user_query_b64) = prepared.user_query_b64.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-user-query-b64"),
-            match safe_header_value(user_query_b64) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if let Some(routing_meta_b64) = prepared.routing_meta_b64.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-routing-meta-b64"),
-            match safe_header_value(routing_meta_b64) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    if let Some(execution_state_b64) = prepared.execution_state_b64.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-execution-state-b64"),
-            match safe_header_value(execution_state_b64) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
-    // Bridge E2E hooks (`bridge-e2e-hooks`): in-process bridge reads this header with env
-    // `ASTRA_TEST_BRIDGE_SECRET`; harmless if unset or header absent.
-    if let Some(v) = source_headers.get("x-mo-bridge-test-secret").cloned() {
-        bridge_headers.insert(HeaderName::from_static("x-mo-bridge-test-secret"), v);
-    }
-
-    let client_disconnect = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
-
-    let bridge = match state.chat_turn_bridge.as_ref() {
-        Some(b) => b,
-        None => {
-            return sse_error_response_with_retryable_and_context(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "chat turn bridge disabled. Configure the runtime with an in-process bridge.",
-                true,
-                SseErrorContext {
-                    request_id,
-                    session_id: prepared.trusted_session_id.as_deref(),
-                    ..SseErrorContext::default()
-                },
-            );
-        }
-    };
-    match bridge
-        .forward(
-            &bridge_headers,
-            prepared.body,
-            admitted_model_execution,
-            state.turn_persistence.core_event_writer.clone(),
-            state.turn_persistence.tool_event_writer.clone(),
-            state.turn_persistence.hook_db_writer.clone(),
-            state.turn_persistence.reflection_state_store.clone(),
-            state.turn_persistence.reflection_lesson_writer.clone(),
-            state.turn_persistence.observer_worker.clone(),
-            state.turn_persistence.auxiliary_event_writer.clone(),
-            state.turn_persistence.session_activity_writer.clone(),
-            Some(client_disconnect),
-        )
-        .await
-    {
-        Ok(response) => response,
-        Err((status, error)) => {
-            let context = if status.is_server_error() {
-                "Chat turn bridge unavailable"
-            } else {
-                "Chat turn bridge rejected request"
-            };
-            sse_error_response_with_retryable_and_context(
-                status,
-                format!("{context}: {error}"),
-                status == StatusCode::CONFLICT || status_to_sse_retryable(status),
-                SseErrorContext {
-                    request_id,
-                    session_id: prepared.trusted_session_id.as_deref(),
-                    ..SseErrorContext::default()
-                },
-            )
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bridge_header_names_are_valid() {
-        let headers = [
-            "x-mo-bridge-secret",
-            "x-mo-user-id",
-            "x-mo-username-b64",
-            "x-mo-bridge-capabilities",
-            "x-mo-session-id",
-            "x-mo-full-llm-capture",
-            "x-mo-turn-chain-id",
-            "x-mo-user-query-event-id",
-            "x-mo-tools-changed",
-            "x-mo-user-query-b64",
-            "x-mo-routing-meta-b64",
-            "x-mo-execution-state-b64",
-            "x-mo-bridge-test-secret",
-        ];
-        for name in headers {
-            assert!(
-                HeaderName::from_static(name).as_str() == name,
-                "invalid header name: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn username_b64_encoding() {
-        let username = "alice";
-        let encoded = URL_SAFE.encode(username.as_bytes());
-        let decoded = URL_SAFE.decode(&encoded).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), "alice");
-
-        // CJK username
-        let cjk = "张三";
-        let encoded_cjk = URL_SAFE.encode(cjk.as_bytes());
-        let decoded_cjk = URL_SAFE.decode(&encoded_cjk).unwrap();
-        assert_eq!(String::from_utf8(decoded_cjk).unwrap(), "张三");
-    }
-
-    #[test]
-    fn bridge_capabilities_header_value() {
-        let hv = HeaderValue::from_static("state-sync-v1");
-        assert_eq!(hv.to_str().unwrap(), "state-sync-v1");
-    }
-
-    #[test]
-    fn tools_changed_header_values() {
-        let true_val = if true { "1" } else { "0" };
-        let false_val = if false { "1" } else { "0" };
-        assert_eq!(true_val, "1");
-        assert_eq!(false_val, "0");
-        // Ensure they are valid header values
-        assert!(HeaderValue::from_static("1").to_str().is_ok());
-        assert!(HeaderValue::from_static("0").to_str().is_ok());
-    }
-
-    #[test]
-    fn header_value_from_str_handles_special_chars() {
-        // UUID format
-        assert!(HeaderValue::from_str("550e8400-e29b-41d4-a716-446655440000").is_ok());
-        // Base64 with padding
-        assert!(HeaderValue::from_str("dXNlcm5hbWU=").is_ok());
-        // Base64 URL-safe
-        assert!(HeaderValue::from_str("aGVsbG8td29ybGQ").is_ok());
-    }
-
-    #[test]
-    fn dispatch_header_count() {
-        // Base headers: 4 (secret, user-id, username-b64, capabilities)
-        // + authorization passthrough: 1
-        // + optional from prepared: 9 (session-id, full-llm-capture, session-turn, turn-chain-id,
-        //   user-query-event-id, tools-changed, user-query-b64, routing-meta-b64,
-        //   execution-state-b64)
-        // + bridge E2E test-secret passthrough: 1
-        // Total possible: 15
-        assert_eq!(4 + 1 + 9 + 1, 15);
-    }
-}
-
 #[cfg(test)]
 mod session_resolution_tests {
     use std::sync::Arc;
@@ -793,6 +482,40 @@ mod session_resolution_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn session_error_normalization_preserves_only_confirmed_missing_code() {
+        for (status, code, expected_code) in [
+            (
+                StatusCode::NOT_FOUND,
+                Some("session_not_found"),
+                Some("session_not_found"),
+            ),
+            (StatusCode::NOT_FOUND, None, None),
+            (StatusCode::NOT_FOUND, Some("resource_not_found"), None),
+            (
+                StatusCode::FORBIDDEN,
+                Some("permission_denied"),
+                Some("permission_denied"),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("storage_unavailable"),
+                Some("storage_unavailable"),
+            ),
+        ] {
+            let error = match code {
+                Some(code) => error_response_coded(status, "private lookup detail", code),
+                None => error_response(status, "private lookup detail"),
+            };
+            let normalized = normalize_chat_session_error(error);
+            assert_eq!(normalized.0, status);
+            assert_eq!(normalized.1.0.error_code.as_deref(), expected_code);
+            if status == StatusCode::NOT_FOUND {
+                assert_eq!(normalized.1.0.detail, "Session not found");
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -901,6 +624,26 @@ mod session_resolution_tests {
             })
         }
 
+        async fn get_session_for_provider_request(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id)
+                .await
+                .map_err(|error| {
+                    if error.0 == StatusCode::NOT_FOUND {
+                        error_response_coded(
+                            StatusCode::NOT_FOUND,
+                            "confirmed absence",
+                            "session_not_found",
+                        )
+                    } else {
+                        error
+                    }
+                })
+        }
+
         async fn update_session(
             &self,
             session_id: String,
@@ -997,6 +740,35 @@ mod session_resolution_tests {
 
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert_eq!(error.1.0.detail, "Session not found");
+        assert_eq!(error.1.0.error_code, None);
+    }
+
+    #[tokio::test]
+    async fn provider_missing_session_is_reported_without_creating_a_replacement() {
+        let session_service = RecordingSessionService::default();
+        session_service.mark_missing("missing-session").await;
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let error = match resolve_or_create_chat_session(
+            &state,
+            &test_user(),
+            Some("missing-session".to_string()),
+            None,
+            false,
+            true,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing session must fail before run creation"),
+        };
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.1.0.error_code.as_deref(), Some("session_not_found"));
+        assert!(session_service.created_requests().await.is_empty());
+        assert_eq!(
+            session_service.looked_up_session_ids().await,
+            vec!["missing-session"]
+        );
     }
 
     #[tokio::test]
@@ -1083,6 +855,14 @@ mod chat_stream_lifecycle_tests {
         SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
         SessionRecord, SessionService, SessionUpdateRequestData, build_app,
     };
+
+    fn sse_json_events(body: &str) -> Vec<serde_json::Value> {
+        body.split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("SSE data must be JSON"))
+            .collect()
+    }
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -1883,7 +1663,7 @@ mod chat_stream_lifecycle_tests {
             post(|| async {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "upstream echoed Bearer abc and abc".to_string(),
+                    "upstream echoed Bearer astra-chat-runtime-secret-9f3c1d and astra-chat-runtime-secret-9f3c1d".to_string(),
                 )
             }),
         );
@@ -1919,7 +1699,7 @@ mod chat_stream_lifecycle_tests {
                                 "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391"
                             },
                             "runtime_auth": {
-                                "authorization": "Bearer abc"
+                                "authorization": "Bearer astra-chat-runtime-secret-9f3c1d"
                             }
                         }"#,
                     ))
@@ -1934,10 +1714,13 @@ mod chat_stream_lifecycle_tests {
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("\"error_code\":\"agent_binding_discovery_failed\""));
+        assert!(
+            text.contains("\"error_code\":\"agent_binding_discovery_failed\""),
+            "unexpected SSE body: {text}"
+        );
         assert!(text.contains("[REDACTED]"));
-        assert!(!text.contains("Bearer abc"));
-        assert!(!text.contains("abc"));
+        assert!(!text.contains("Bearer astra-chat-runtime-secret-9f3c1d"));
+        assert!(!text.contains("astra-chat-runtime-secret-9f3c1d"));
         assert!(!text.contains("\"type\":\"session_info\""));
         server.abort();
     }
@@ -1969,14 +1752,26 @@ mod chat_stream_lifecycle_tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"session_info\""));
-        assert!(text.contains("\"run_id\":\"run-live\""));
-        assert!(text.contains("\"type\":\"usage\""));
-        assert!(text.contains("\"prompt_tokens\":7"));
-        assert!(text.contains("\"completion_tokens\":3"));
-        assert!(text.contains("\"type\":\"run_finished\""));
-        assert!(text.contains("\"status\":\"failed\""));
-        assert!(text.contains("\"error\":\"boom\""));
+        let events = sse_json_events(&text);
+        assert!(
+            events
+                .iter()
+                .any(|event| { event["type"] == "session_info" && event["run_id"] == "run-live" })
+        );
+        let usage = events
+            .iter()
+            .find(|event| event["type"] == "usage")
+            .expect("terminal usage event");
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 10);
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+        assert!(events.iter().any(|event| {
+            event["type"] == "run_finished"
+                && event["status"] == "failed"
+                && event["error"] == "boom"
+        }));
     }
 
     #[tokio::test]
@@ -2085,14 +1880,24 @@ mod chat_stream_lifecycle_tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"session_info\""));
-        assert!(text.contains("\"run_id\":\"run-live-stream\""));
-        assert!(text.contains("\"type\":\"usage\""));
-        assert!(text.contains("\"prompt_tokens\":11"));
-        assert!(text.contains("\"completion_tokens\":4"));
-        assert!(text.contains("\"type\":\"run_finished\""));
-        assert!(text.contains("\"status\":\"failed\""));
-        assert!(text.contains("\"error\":\"live boom\""));
+        let events = sse_json_events(&text);
+        assert!(events.iter().any(|event| {
+            event["type"] == "session_info" && event["run_id"] == "run-live-stream"
+        }));
+        let usage = events
+            .iter()
+            .find(|event| event["type"] == "usage")
+            .expect("terminal usage event");
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 15);
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+        assert!(events.iter().any(|event| {
+            event["type"] == "run_finished"
+                && event["status"] == "failed"
+                && event["error"] == "live boom"
+        }));
     }
 
     #[tokio::test]

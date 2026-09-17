@@ -1,0 +1,42 @@
+name: Supersede stale PR runs
+
+on:
+  pull_request_target:
+    branches: [main, develop]
+    types: [synchronize]
+
+# This controller runs from its trusted workflow revision. It must never check out
+# or execute the pull request head while holding permission to cancel runs.
+permissions:
+  actions: write
+  contents: read
+
+# Do not add concurrency here. Every synchronize event owns one before -> after
+# transition; dropping an intermediate controller could leave its prior head
+# running after several rapid pushes.
+
+jobs:
+  cancel-stale-runs:
+    name: Cancel superseded PR runs
+    if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Cancel runs for earlier PR heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          REPOSITORY: ${{ github.repository }}
+          SUPERSEDED_HEAD_SHA: ${{ github.event.before }}
+        run: >-
+          python3 scripts/ci/cancel_stale_pr_runs.py
+          --repository="$REPOSITORY"
+          --head-repository-id="$HEAD_REPOSITORY_ID"
+          --head-ref="$HEAD_REF"
+          --superseded-head-sha="$SUPERSEDED_HEAD_SHA"

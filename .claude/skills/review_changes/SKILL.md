@@ -15,7 +15,6 @@ allowed_tools:
   - read_file
   - grep
   - glob
-  - git
 ---
 
 # Review Changes
@@ -57,6 +56,12 @@ Target resolution:
 | `commit:<sha>`            | `git show --stat <sha>` then `git show <sha>`                                   |
 | `commits:<N>`             | `git log --oneline -N`, then `git show` for every one of the N commits          |
 | `pr:<number>` / PR URL    | `gh pr diff` if `gh` is installed and authenticated; otherwise ask for the diff |
+
+For a commit, take file/add/delete totals from Git's canonical summary:
+`git show --shortstat --format= <sha>`. If a bounded file map needs `--numstat`,
+also pass `--format=` so commit headers cannot be coerced into numeric totals by
+an `awk`/parser pipeline. Do not replace Git's shortstat with hand-summed raw
+`git show --numstat` output.
 
 If the diff is empty after checking staged and unstaged changes, report "No changes found."
 

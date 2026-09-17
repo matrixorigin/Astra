@@ -19,8 +19,10 @@ mod shell_hardening;
 // Re-export TrustTier from astra-skills
 pub use astra_skills::manifest::TrustTier;
 
+pub use bash_ast::{parse_plain_bash_commands, strip_benign_bash_redirects};
 pub use command::{
     CommandRisk, SandboxCommandError, analyze_command_risks, analyze_command_risks_in_workspace,
+    analyze_command_risks_in_workspace_from, analyze_command_risks_with_resolver,
     filter_environment, is_rm_catastrophic_rm_path, sandbox_command, wrap_command_with_limits,
 };
 pub use git_safety::{
@@ -32,7 +34,10 @@ pub use policy::{
     is_sensitive_system_dir,
 };
 pub use process_isolation::{
-    CgroupGuard, IsolatedOutput, IsolationConfig, apply_cgroup, execute_isolated,
+    BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
+    ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope, execute_isolated,
+    execute_isolated_with_cancel, invocation_supervisor_is_requested, process_scope_available,
+    run_invocation_supervisor_if_requested,
 };
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, InternalPathKind, SENSITIVE_ENV_VARS, ShellHardeningConfig,
@@ -40,3 +45,12 @@ pub use shell_hardening::{
     is_dangerous_read_path, is_internal_safe_path, is_session_tool_result_artifact_reference,
     is_shell_home_path, is_windows_drive_path, scrub_secrets_from_env,
 };
+
+mod workspace_inspection;
+#[cfg(unix)]
+pub use workspace_inspection::{
+    OpenedWorkspaceFile, PinnedWorkspaceInspection, open_directory_beneath,
+};
+
+mod sync_process;
+pub use sync_process::{SyncProcessError, SyncProcessOutput, run_sync_process};

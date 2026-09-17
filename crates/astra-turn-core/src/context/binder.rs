@@ -142,7 +142,9 @@ fn bind_project_context(sources: &ContextSources<'_>) -> String {
     )
 }
 
-/// Bind the session-stable deferred-tools discovery block.
+/// Bind the current deferred-tools discovery block. The planner places this
+/// section in the admitted capability epoch; a changed admission surface
+/// naturally changes the stable prefix and starts a new cache epoch.
 fn bind_deferred_tools(sources: &ContextSources<'_>) -> String {
     sources.session.deferred_tools_block.clone()
 }
@@ -168,7 +170,11 @@ fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String
         return String::new();
     }
 
-    let mut entries = sources.external.memory_entries.clone();
+    // Sort borrowed entries rather than cloning every memory payload. The
+    // planner already bounds what can reach the prompt; cloning the complete
+    // candidate set here made each long-session bind pay an avoidable
+    // history-sized allocation before that budget was applied.
+    let mut entries = sources.external.memory_entries.iter().collect::<Vec<_>>();
     entries.sort_by(|a, b| {
         compare_score_desc(a.relevance_score, b.relevance_score)
             .then_with(|| b.freshness_turn.cmp(&a.freshness_turn))
@@ -185,7 +191,7 @@ fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String
         if entry.content.trim().is_empty() || !seen.insert(entry.content_hash) {
             continue;
         }
-        let prompt_content = render_prompt_memory_entry(&entry);
+        let prompt_content = render_prompt_memory_entry(entry);
         let estimate = entry
             .token_estimate
             .max(estimate_text_tokens(&prompt_content))
@@ -285,6 +291,20 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     // Agent version: compile-time constant, truly session-stable.
     parts.push(format!("Astra v{}", env!("CARGO_PKG_VERSION")));
 
+    // Put the caller-composed stable guidance before session-specific identity
+    // facts. OpenAI-compatible providers with automatic prefix caching can
+    // reuse a common prefix across sessions only until the first differing
+    // byte. CWD, branch, date, and user are intentionally session-specific;
+    // emitting them before the large capability/deferred guidance block used
+    // to cap that reusable prefix at roughly 2.3K tokens. The guidance still
+    // remains in the same RuntimeIdentity section and therefore keeps the
+    // exact Session cache scope and model-visible semantics.
+    for section in &ext.extra_stable_sections {
+        if !section.text.is_empty() {
+            parts.push(section.text.clone());
+        }
+    }
+
     // Current date (session-stable: computed once at session creation)
     let current_date = &sources.session.current_date;
     parts.push(format!("Date: {current_date}"));
@@ -301,23 +321,16 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
         parts.push(format!("Branch: {branch}"));
     }
 
-    // Session-stable dynamic fragments. Order matches the legacy
-    // `bind_runtime_identity` emission order for byte stability across
-    // refactors.
-
+    // A caller override is deliberately last: it remains after canonical
+    // runtime facts and stable capability guidance, so an explicit override
+    // can still refine them without moving the shared cache prefix behind a
+    // session-specific value.
     if let Some(ref text) = ext.system_override {
         parts.push(text.clone());
     }
 
-    // Bridge stable escape hatch: session-stable pre-composed fragments
-    // (skill_hint, self_awareness, etc.). Binder appends
-    // them here so they inherit RuntimeIdentity's Session scope → cached
-    // behind the 2nd marker like the typed fragments above.
-    for section in &ext.extra_stable_sections {
-        if !section.text.is_empty() {
-            parts.push(section.text.clone());
-        }
-    }
+    // The bridge stable escape hatch is emitted above, before session-varying
+    // identity, to keep common guidance reusable across sessions.
 
     parts.join("\n")
 }
@@ -343,8 +356,6 @@ fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     // value the model never references is net loss. If a downstream
     // audit mechanism ever needs it visible to the model, reintroduce
     // here (keep volatile-only, never stable).
-    let _session_id_unused = &sources.session.session_id;
-
     if let Some(ref text) = ext.effort_hint {
         parts.push(text.clone());
     }
@@ -420,10 +431,10 @@ mod tests {
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
+    use crate::section_types::{CacheScope, PromptSection};
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
     use crate::working_memory::WorkingMemoryState;
-    use std::collections::HashMap;
 
     struct TestSources {
         statics: StaticSections,
@@ -484,8 +495,6 @@ mod tests {
                 tool_results: vec![],
                 tokens: TokenAccounting::default(),
                 active_skills: vec!["code_review".into()],
-                recent_file_reads: HashMap::new(),
-                remaining_turns: 10,
                 turn_index: 1,
                 recovery: RecoveryState::default(),
                 last_user_message: "hello".into(),
@@ -607,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_session_sections() {
+    fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_sections() {
         let mut fixture = test_sources();
         fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.deferred_tools_block = "<deferred-tools>x</deferred-tools>".to_string();
@@ -645,10 +654,10 @@ mod tests {
             kinds,
             vec![
                 SectionKind::ProjectContext,
-                SectionKind::DeferredTools,
                 SectionKind::AvailableSkills,
+                SectionKind::DeferredTools,
             ],
-            "session-stable discovery blocks must remain independently traceable and ordered"
+            "discovery blocks must remain independently traceable and ordered"
         );
         assert_eq!(
             bound.sections[0].artifact.text().unwrap(),
@@ -656,11 +665,11 @@ mod tests {
         );
         assert_eq!(
             bound.sections[1].artifact.text().unwrap(),
-            "<deferred-tools>x</deferred-tools>"
+            "<available_skills>y</available_skills>"
         );
         assert_eq!(
             bound.sections[2].artifact.text().unwrap(),
-            "<available_skills>y</available_skills>"
+            "<deferred-tools>x</deferred-tools>"
         );
     }
 
@@ -689,6 +698,35 @@ mod tests {
             "core binder must not decide model identity cache placement: {content}"
         );
         assert!(content.contains("main")); // git branch
+    }
+
+    #[test]
+    fn bind_runtime_identity_puts_shared_stable_guidance_before_session_facts() {
+        let mut fixture = test_sources();
+        fixture.external.extra_stable_sections = vec![PromptSection::stable(
+            "## Tool Availability Protocol\nvisible capability contract",
+            CacheScope::Session,
+        )];
+        fixture.session.current_date = "2026-09-08".to_string();
+        fixture.session.edge_profile.cwd = Some("/workspace/session-a".to_string());
+        fixture.session.edge_profile.git_branch = Some("main".to_string());
+
+        let sources = fixture.context();
+        let content = bind_runtime_identity(&sources);
+        let guidance = content
+            .find("## Tool Availability Protocol")
+            .expect("stable guidance should be emitted");
+        let date = content
+            .find("Date: 2026-09-08")
+            .expect("date should be emitted");
+        let cwd = content
+            .find("CWD: /workspace/session-a")
+            .expect("cwd should be emitted");
+
+        assert!(
+            guidance < date && date < cwd,
+            "shared stable guidance must precede session-specific facts for prefix reuse: {content}"
+        );
     }
 
     #[test]

@@ -98,7 +98,17 @@ impl TerminalGuard {
         let early_guard = RawModeGuard;
 
         let backend = CrosstermBackend::new(stdout());
-        let terminal = CustomTerminal::with_options(backend)?;
+        let mut terminal = CustomTerminal::with_options(backend)?;
+        // Startup diagnostics and the banner are printed before the TUI takes
+        // ownership of the terminal.  A terminal that reports its cursor at
+        // the origin cannot safely preserve that inline output: the first
+        // viewport would overwrite only changed cells and leave stale
+        // characters behind.  Clear that ambiguous origin case once, while
+        // retaining the normal inline banner for terminals that report a
+        // non-zero cursor row.
+        if terminal.viewport_area.top() == 0 {
+            terminal.clear_visible_screen()?;
+        }
 
         let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
         let guard = Self {
@@ -111,13 +121,8 @@ impl TerminalGuard {
         // the event loop to blit on a paused screen instead of writing bytes the
         // render loop would paint over. Cleared in Drop.
         astra_tools::display_sixel::set_tui_active(true);
-        // Probe sixel support once, now — raw mode is on and the event-loop input
-        // reader hasn't started, so it's safe to read the DA1 reply directly.
-        // Cached so display_sixel skips the image (with a message) on terminals
-        // that would only show a blank box.
-        astra_tools::display_sixel::set_sixel_supported(
-            astra_tools::display_sixel::probe_sixel_support(),
-        );
+        // Startup queried DA1 together with terminal colors through crossterm.
+        // Do not open another reader here: it could consume keys or late OSC replies.
         std::mem::forget(early_guard);
         Ok(guard)
     }
@@ -510,7 +515,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
-        let _ = println!();
+        let _ = stdout_println!();
     }
 }
 

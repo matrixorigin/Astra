@@ -22,7 +22,7 @@ pub fn protected_head_end(messages: &[Message]) -> usize {
     }
     messages[sys_count..]
         .iter()
-        .position(|m| m.role == "user")
+        .position(Message::is_plain_user_task)
         .map(|i| sys_count + i + 1)
         .unwrap_or(sys_count)
 }

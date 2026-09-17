@@ -32,7 +32,9 @@
 //!    ([`set_sixel_supported`] / [`cached_sixel_support`]); when the cached result
 //!    says unsupported, `display_sixel` reports "not displayed" instead of opening
 //!    a blank modal. If the capability was never probed (e.g. headless/scripting,
-//!    where stdout is the real terminal) the tool simply attempts to render.
+//!    where stdout is the real terminal) the tool can probe before rendering.
+//!    In an active TUI, a query timeout stays unknown and never starts a second
+//!    input reader; a late DA1 response may update the cached capability.
 
 use std::io::Write;
 use std::path::Path;
@@ -55,13 +57,13 @@ static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SIXEL_CAP: AtomicU8 = AtomicU8::new(0);
 
 /// Record the probed sixel capability of the terminal. Called by the CLI's
-/// `TerminalGuard` at startup.
+/// startup query or event adapter when a late DA1 response arrives.
 pub fn set_sixel_supported(supported: bool) {
     SIXEL_CAP.store(if supported { 1 } else { 2 }, Ordering::SeqCst);
 }
 
-/// Read the cached sixel capability, or `None` if it has not been probed yet.
-fn cached_sixel_support() -> Option<bool> {
+/// Read the cached sixel capability, or `None` without a conclusive response.
+pub fn cached_sixel_support() -> Option<bool> {
     match SIXEL_CAP.load(Ordering::SeqCst) {
         1 => Some(true),
         2 => Some(false),
@@ -214,7 +216,18 @@ pub fn display_sixel(path: &str) -> ToolResult {
     // 2. Bail early if the terminal can't render sixel — better a clear message
     //    than a blank modal. Use the value the TUI probed at startup; in headless
     //    mode there's no cached value, so probe now (safe: no concurrent reader).
-    let supported = cached_sixel_support().unwrap_or_else(probe_sixel_support);
+    let supported = match cached_sixel_support() {
+        Some(supported) => supported,
+        None if TUI_ACTIVE.load(Ordering::SeqCst) => {
+            // The shared TUI reader may still receive a late DA1 response.
+            // Never race it with a second /dev/tty reader or cache a timeout.
+            return ToolResult::text(format!(
+                "display_sixel: terminal sixel support has not been confirmed, \
+                 so the image was not displayed ({path})."
+            ));
+        }
+        None => probe_sixel_support(),
+    };
     if !supported {
         return ToolResult::text(format!(
             "display_sixel: this terminal does not support sixel graphics, \

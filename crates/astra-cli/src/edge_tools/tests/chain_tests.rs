@@ -75,6 +75,50 @@ async fn chain_stops_on_error() {
 }
 
 #[tokio::test]
+async fn chain_preserves_shell_outcome_independently_of_display_text() {
+    use astra_turn_core::tool_registry_chain::ToolChain;
+
+    for (command, expected_success, expected_steps) in [
+        ("printf 'Error: example diagnostic\\n'", true, 2),
+        ("printf 'ordinary output\\n'; exit 7", false, 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        let chain = ToolChain::new("shell_outcome", "Preserve executor status")
+            .step("bash", json!({"command": command}))
+            .step("list_dir", json!({}));
+
+        let output = executor.execute_chain(&chain, json!({})).await;
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["steps"][0]["success"], expected_success, "{result}");
+        assert_eq!(result["steps_executed"], expected_steps, "{result}");
+    }
+}
+
+#[tokio::test]
+async fn chain_failure_remains_failed_at_agent_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let executor =
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
+    let args = json!({
+        "action": "run_chain",
+        "name": "failed_validation",
+        "description": "Keep a failed step visible",
+        "steps": [
+            {"tool": "read_file", "args": {"path": "missing.txt"}},
+            {"tool": "list_dir", "args": {}}
+        ]
+    });
+
+    let result = executor.execute_with_metadata("agent", &args).await;
+    assert!(result.is_error, "{}", result.output);
+    let body: serde_json::Value = serde_json::from_str(&result.output)
+        .unwrap_or_else(|error| panic!("{error}: {}", result.output));
+    assert_eq!(body["steps_executed"], 1, "{body}");
+    assert_eq!(body["steps"][0]["success"], false, "{body}");
+}
+
+#[tokio::test]
 async fn chain_rollback_on_failure_reverts_bounded_file_edits() {
     use astra_turn_core::tool_registry_chain::ToolChain;
 

@@ -1,7 +1,7 @@
 # Edge-cloud execution
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-03.
 
 Edge-cloud execution defines how cloud backbone state and user-local capacity compose into one agent experience.
 
@@ -79,6 +79,38 @@ Server fallback is allowed only when policy permits it and must be recorded in t
 | Server fallback denied | Block affected capability, not the whole session. |
 | Sync degraded | Continue only for safe operations and expose sync state. |
 
+## Edge connection identity and lifecycle
+
+An Edge connection is a capability-provider binding, not merely an authenticated
+socket. Registration credentials and ordinary runtime-request credentials are
+distinct authorities. Admission must bind the authenticated principal to the
+declared user, workspace, and Edge identity; a self-reported identity cannot
+override the authenticated binding.
+
+Connection publication follows these invariants:
+
+- authentication succeeds and its acknowledgement is delivered before the
+  connection becomes dispatchable;
+- durable registration failure leaves no active in-memory route;
+- reconnect uses a generation-fenced handoff so stale cleanup cannot remove a
+  newer connection;
+- heartbeats and disconnect cleanup are scoped to the exact connection
+  identity and generation;
+- an Edge is not eligible for unsafe local dispatch until registration and
+  capability binding are both complete.
+
+These rules apply to native User Runners and externally provisioned workspace
+runtimes. Provider-specific token formats belong to authentication
+configuration, not this execution contract.
+
 ## Durable sync dependency
 
 Edge-originated facts that must survive reconnect require durable outbox semantics. A local journal or in-memory ingestion channel is not enough for cloud-edge correctness.
+
+## Test obligations
+
+- reject a registration whose authenticated and declared Edge identities do
+  not match;
+- prove that failed durable registration cannot leave a dispatchable route;
+- exercise overlapping reconnect and stale-disconnect ordering;
+- verify workspace-scoped dispatch and offline/degraded behavior.

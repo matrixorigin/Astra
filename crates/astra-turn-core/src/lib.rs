@@ -46,7 +46,6 @@ pub mod emergent_context;
 pub mod error_recovery;
 pub mod evaluation;
 pub mod execution_state;
-pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod followup_suggestion;
@@ -83,7 +82,6 @@ pub mod safety_middleware;
 pub mod section_types;
 pub mod semantic_read_cache;
 pub mod session_latches;
-pub mod shadow_diff;
 pub mod spill_backend;
 pub mod sse;
 pub mod stall;
@@ -99,14 +97,18 @@ pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;
 pub mod tool_allowlist;
+pub mod tool_ledger_receipt;
 pub mod trace_alert;
 pub mod turn_event_sink;
 pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
-pub mod bridge;
+pub mod circuit_breaker;
 pub mod contracts;
+pub mod e2e_hooks;
+pub mod rate_limit_cooldown;
+pub mod sse_events;
 pub mod stream_events;
 pub mod turn_guard;
 pub mod ws_approval_gate;
@@ -121,7 +123,6 @@ pub mod result_quality {
 pub mod complete;
 pub mod hydrate_reflect;
 pub mod loop_circuit_breaker;
-pub mod persist;
 pub mod retrieval;
 pub mod trace_event;
 pub mod turn_trace_collector;
@@ -233,12 +234,6 @@ pub use sse::blocks as sse_blocks;
 pub use sse::data_lines as sse_data_lines;
 pub use sse::edge_stderr_lines as sse_edge_stderr_lines;
 pub use sse::stream_host as sse_stream_host;
-
-// Re-exports: bridge_* → bridge::*
-pub use bridge::circuit_breaker as bridge_circuit_breaker;
-pub use bridge::e2e_hooks as bridge_e2e_hooks;
-pub use bridge::rate_limit_cooldown as bridge_rate_limit_cooldown;
-pub use bridge::sse_events as bridge_sse_events;
 
 // Re-exports: stop_hooks_* → stop_hooks::*
 pub use stop_hooks::stop_hooks_yaml;

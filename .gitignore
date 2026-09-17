@@ -3,12 +3,14 @@
 
 .astra/
 
-# Kiro local state (MCP config + per-machine permission cache)
-.kiro/
+# Kiro project steering is tracked; ignore per-machine state and caches.
+.kiro/*
+!.kiro/steering/
+.kiro/steering/*
+!.kiro/steering/project-rules.md
 
 # Docker volumes (local data)
 deployment/all-in-one/data/
-memoria/data/
 
 # Python
 __pycache__/
@@ -31,9 +33,6 @@ htmlcov/
 *.manifest
 .models.yaml*
 !.models.yaml.example
-
-# Poetry
-# poetry.lock is tracked — required for reproducible CI builds and Docker images.
 
 # Node
 node_modules/
@@ -64,9 +63,16 @@ Thumbs.db
 
 # Env and secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.pypirc
+.netrc
 *.pem
+*.key
+*.p12
+*.pfx
 .secrets*
 *.yaml.bak
 
@@ -89,12 +95,13 @@ mo-data/
 trustmem_cloud_v1/data/
 
 feedback_export.jsonl
+/backups/
 
+# Local reviews and task plans may contain private investigation details.
+# Keep durable, shareable decisions in docs/ instead.
 review/
 /plans/
 
-# VCR cassettes (optional - commit them for CI)
-# fixtures/vcr_cassettes/*.yaml
 *.spec
 .mo-session/
 budget-app/

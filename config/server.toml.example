@@ -21,8 +21,8 @@ min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CON
 # jwt_algorithm = "HS256"               # HS256, HS384, HS512
 # access_ttl_minutes = 10080            # Access token TTL (default: 7 days)
 # refresh_ttl_days = 30                 # Refresh token TTL
-# bridge_secret = "CHANGE-ME"           # Bridge HMAC secret (≥32 chars)
-# token_encryption_key = ""             # Fernet key for LLM API key encryption
+# runtime_root_secret = "CHANGE-ME"           # Runtime root secret (≥32 chars)
+# token_encryption_key = ""             # Secret used to derive Fernet encryption for LLM API keys
 # provider_request_auth = [
 #   { provider = "moi", type = "hmac", key = "${ASTRA_PROVIDER_HMAC_KEY}" }
 # ]
@@ -30,6 +30,6 @@ min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CON
 
 # ── HTTP API Server ──────────────────────────────────────────────────────────
 [api]
-host = "0.0.0.0"               # Listen address (env: ASTRA_API_HOST)
+host = "127.0.0.1"             # Loopback by default; use 0.0.0.0 only behind controlled ingress
 port = 17001                    # Listen port (env: ASTRA_API_PORT)
 # cors_origins = []            # Allowed CORS origins (empty = no restriction)

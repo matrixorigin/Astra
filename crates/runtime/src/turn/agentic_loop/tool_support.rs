@@ -5,12 +5,19 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use super::host::AgenticLoopState;
 
 pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "completed" | "skipped" => Some(0),
-        "failed" | "partial_failure" | "denied" | "rejected" | "cancelled" | "timeout"
-        | "timed_out" => Some(1),
-        _ => None,
-    }
+    astra_thin_client::tool_result_status_is_error(status)
+        .map(|is_error| if is_error { 1 } else { 0 })
+}
+
+/// Process exit semantics cannot erase a failure of the enclosing tool
+/// contract (for example a missing executor verification receipt).
+pub(crate) fn has_typed_executor_failure(fields: &Map<String, Value>) -> bool {
+    fields
+        .get("error_kind")
+        .is_some_and(|value| serde_json::from_value::<astra_core::ErrorKind>(value.clone()).is_ok())
+        || fields.get("recovery_evidence").is_some_and(|value| {
+            serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).is_ok()
+        })
 }
 
 fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32> {
@@ -43,6 +50,14 @@ fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32>
 }
 
 fn edge_tool_observability_exit_code(edge_result: &EdgeToolExecResult) -> Option<i32> {
+    if edge_tool_status_exit_code(&edge_result.status) == Some(1)
+        && edge_result
+            .tool_result_fields
+            .as_ref()
+            .is_some_and(has_typed_executor_failure)
+    {
+        return Some(1);
+    }
     structured_edge_exit_code(edge_result.tool_result_fields.as_ref())
         .or_else(|| edge_tool_status_exit_code(&edge_result.status))
 }
@@ -129,7 +144,7 @@ pub(crate) fn delegate_tool_schema() -> Value {
                     "max_turns": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum turns for each explicit fork task (default: 10)."
+                        "description": "Maximum turns for each explicit fork task. If omitted, the selected agent profile supplies the bounded default; set this explicitly when a different hard limit is intended."
                     },
                     "timeout": {
                         "type": "integer",
@@ -175,19 +190,25 @@ mod tests {
     #[test]
     fn edge_tool_status_exit_code_maps_common_statuses() {
         assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
-        assert_eq!(edge_tool_status_exit_code("skipped"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("success"), None);
+        assert_eq!(edge_tool_status_exit_code("ok"), None);
+        assert_eq!(edge_tool_status_exit_code("skipped"), None);
         assert_eq!(edge_tool_status_exit_code("failed"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("error"), None);
         assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
         assert_eq!(edge_tool_status_exit_code("rejected"), Some(1));
-        assert_eq!(edge_tool_status_exit_code("ok"), None);
-        assert_eq!(edge_tool_status_exit_code("success"), None);
-        assert_eq!(edge_tool_status_exit_code("error"), None);
+        assert_eq!(edge_tool_status_exit_code("interrupted"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("timeout"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("unexpected"), None);
         assert_eq!(edge_tool_status_exit_code("unknown"), None);
+        assert_eq!(edge_tool_status_exit_code(" OK "), None);
+        assert_eq!(edge_tool_status_exit_code("SUCCESS"), None);
     }
 
     #[test]
     fn edge_tool_observability_exit_code_uses_structured_exit_semantics() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-1".into(),
             tool: "bash".into(),
             args: json!({"command": "grep needle haystack.txt"}),
@@ -206,6 +227,7 @@ mod tests {
     #[test]
     fn edge_tool_observability_exit_code_structured_error_overrides_status() {
         let result = EdgeToolExecResult {
+            execution_completion: None,
             request_id: "call-1".into(),
             tool: "bash".into(),
             args: json!({"command": "exit 7"}),
@@ -218,6 +240,25 @@ mod tests {
             duration_ms: 10,
         };
 
+        assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
+    }
+
+    #[test]
+    fn executor_failure_remains_visible_after_successful_process_exit() {
+        let result = EdgeToolExecResult {
+            execution_completion: None,
+            request_id: "verify-unavailable".into(),
+            tool: "bash".into(),
+            args: json!({"command": "true", "mode": "verify"}),
+            output: String::new(),
+            tool_result_fields: Some(Map::from_iter([
+                ("exit_semantics".into(), json!("success")),
+                ("exit_code".into(), json!(0)),
+                ("error_kind".into(), json!("tool_unavailable")),
+            ])),
+            status: "failed".into(),
+            duration_ms: 1,
+        };
         assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
     }
 

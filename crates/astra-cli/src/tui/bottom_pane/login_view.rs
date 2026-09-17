@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -132,13 +132,14 @@ impl BottomPaneView for LoginView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let theme = crate::tui::theme::current();
         let outer = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme.dim))
             .title(Line::from(Span::styled(
                 self.mode.title(),
                 Style::default()
-                    .fg(crate::tui::theme::current().accent)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
         let inner = outer.inner(area);
@@ -151,15 +152,16 @@ impl BottomPaneView for LoginView {
             let caret = if focused { "▸" } else { " " };
             let value = self.rendered_value(index);
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {caret} "),
-                    Style::default().fg(crate::tui::theme::current().accent),
-                ),
-                Span::styled(field.label, Style::default().fg(Color::Gray)),
+                Span::styled(format!("  {caret} "), Style::default().fg(theme.accent)),
+                Span::styled(field.label, Style::default().fg(theme.fg)),
                 Span::raw("  "),
                 Span::styled(
                     value,
-                    Style::default().fg(if focused { Color::White } else { Color::Gray }),
+                    Style::default().fg(theme.fg).add_modifier(if focused {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
             ]));
         }
@@ -167,13 +169,13 @@ impl BottomPaneView for LoginView {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 format!("  {error}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             )));
         }
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             self.hint_text(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )));
 
         Paragraph::new(lines).render(inner, buf);
@@ -285,6 +287,21 @@ mod tests {
 
     fn ck(c: char, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), mods)
+    }
+
+    #[test]
+    fn focused_input_inherits_terminal_foreground_and_remains_bold() {
+        let mut view = LoginView::new(LoginMode::Login);
+        view.handle_key(ck('X', KeyModifiers::NONE));
+        let buf = draw_widget(W(&view), 100, 10);
+        let cell = buf
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "X")
+            .unwrap();
+        assert_eq!(cell.fg, ratatui::style::Color::Reset);
+        assert_eq!(cell.bg, ratatui::style::Color::Reset);
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
     }
 
     #[test]

@@ -2,28 +2,12 @@
 pub enum FollowupSuggestionKind {
     Validate,
     Commit,
-    Push,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowupSuggestion {
     pub text: String,
     pub kind: FollowupSuggestionKind,
-}
-
-pub fn tool_marker(tool_name: &str, args_json: Option<&str>) -> String {
-    let action = args_json
-        .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
-        .and_then(|args| {
-            args.get("action")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
-    match (tool_name, action.as_deref()) {
-        ("git", Some(action)) => format!("git:{action}"),
-        ("github", Some(action)) => format!("github:{action}"),
-        _ => tool_name.to_string(),
-    }
 }
 
 pub fn suggest_followup(
@@ -43,23 +27,15 @@ pub fn suggest_followup(
     let lexicon = suggestion_lexicon(trimmed, assistant_text);
     let edited = tool_markers.iter().any(|tool| is_edit_tool(tool));
     let validated = tool_markers.iter().any(|tool| is_validation_tool(tool));
-    let committed = tool_markers.iter().any(|tool| is_commit_tool(tool));
 
     if let Some(question_reply) =
-        suggest_reply_to_assistant_question(assistant_text, edited, validated, committed, &lexicon)
+        suggest_reply_to_assistant_question(assistant_text, edited, validated, &lexicon)
     {
         return Some(question_reply);
     }
 
     if assistant_requests_reply(assistant_text) {
         return None;
-    }
-
-    if committed {
-        return Some(FollowupSuggestion {
-            text: lexicon.push.to_string(),
-            kind: FollowupSuggestionKind::Push,
-        });
     }
 
     if edited && validated {
@@ -82,7 +58,6 @@ pub fn suggest_followup(
 struct SuggestionLexicon {
     validate: &'static str,
     commit: &'static str,
-    push: &'static str,
 }
 
 fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
@@ -90,13 +65,11 @@ fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
         SuggestionLexicon {
             validate: "跑一下测试",
             commit: "提交一下",
-            push: "推上去",
         }
     } else {
         SuggestionLexicon {
             validate: "run the tests",
             commit: "commit this",
-            push: "push it",
         }
     }
 }
@@ -111,10 +84,6 @@ fn is_edit_tool(tool: &str) -> bool {
         tool,
         "write_file" | "str_replace" | "multi_edit" | "create_file" | "delete_file" | "move_file"
     )
-}
-
-fn is_commit_tool(tool: &str) -> bool {
-    tool == "git:commit"
 }
 
 fn is_validation_tool(tool: &str) -> bool {
@@ -149,7 +118,6 @@ fn suggest_reply_to_assistant_question(
     full_text: &str,
     edited: bool,
     validated: bool,
-    committed: bool,
     lexicon: &SuggestionLexicon,
 ) -> Option<FollowupSuggestion> {
     if !assistant_requests_reply(full_text) {
@@ -157,12 +125,6 @@ fn suggest_reply_to_assistant_question(
     }
 
     let lower = full_text.to_ascii_lowercase();
-    if committed && mentions_push_question(&lower, full_text) {
-        return Some(FollowupSuggestion {
-            text: lexicon.push.to_string(),
-            kind: FollowupSuggestionKind::Push,
-        });
-    }
 
     if edited && validated && mentions_commit_question(&lower, full_text) {
         return Some(FollowupSuggestion {
@@ -193,10 +155,6 @@ fn mentions_test_question(lower: &str, full_text: &str) -> bool {
 
 fn mentions_commit_question(lower: &str, full_text: &str) -> bool {
     lower.contains("commit") || full_text.contains("提交")
-}
-
-fn mentions_push_question(lower: &str, full_text: &str) -> bool {
-    lower.contains("push") || full_text.contains("推上去") || full_text.contains("推到远端")
 }
 
 fn assistant_looks_incomplete(full_text: &str) -> bool {
@@ -237,31 +195,6 @@ mod tests {
         )
         .expect("suggestion");
         assert_eq!(suggestion.text, "跑一下测试");
-    }
-
-    #[test]
-    fn marker_extracts_consolidated_git_action() {
-        assert_eq!(
-            tool_marker("git", Some(r#"{"action":"commit","message":"ship"}"#)),
-            "git:commit"
-        );
-        assert_eq!(tool_marker("git", Some(r#"{"action":"diff"}"#)), "git:diff");
-        assert_eq!(
-            tool_marker("read_file", Some(r#"{"path":"a.rs"}"#)),
-            "read_file"
-        );
-    }
-
-    #[test]
-    fn suggests_push_after_consolidated_git_action_commit_marker() {
-        let suggestion = suggest_followup(
-            "commit it",
-            "Committed the changes.",
-            &["git:commit".to_string()],
-        )
-        .expect("suggestion");
-        assert_eq!(suggestion.text, "push it");
-        assert_eq!(suggestion.kind, FollowupSuggestionKind::Push);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::server::tool_session_history;
 
 pub(crate) type SessionToolFuture<'a> =
     Pin<Box<dyn Future<Output = astra_tools::ToolResult> + Send + 'a>>;
+pub(crate) type SessionConfigFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 
 pub(crate) struct SessionToolRuntimeContext<'a> {
     pub(crate) user_id: &'a str,
@@ -26,7 +27,7 @@ pub(crate) async fn execute_session_tool<'a, Config, Sleep>(
     sleep: Sleep,
 ) -> astra_tools::ToolResult
 where
-    Config: FnOnce(&Value) -> String,
+    Config: FnOnce(&'a Value) -> SessionConfigFuture<'a>,
     Sleep: FnOnce(&'a Value) -> SessionToolFuture<'a>,
 {
     let action = match session_action_from_args(args) {
@@ -43,7 +44,7 @@ where
     };
 
     match action {
-        SessionAction::Config => tool_result_from_output(config(args)),
+        SessionAction::Config => tool_result_from_output(config(args).await),
         SessionAction::Sleep => sleep(args).await,
         SessionAction::HistoryPage => {
             tool_session_history::history_page(session_history_context(), args).await
@@ -70,7 +71,7 @@ pub(super) async fn execute_with_executor(
             context_manifest_pool: executor.context_manifest_pool.as_ref(),
         },
         args,
-        |args| executor.adjust_config(args),
+        |args| Box::pin(executor.adjust_config(args)),
         |args| Box::pin(executor.default_executor.execute("sleep", args)),
     )
     .await
@@ -89,7 +90,7 @@ mod tests {
         }
     }
 
-    fn unreachable_text_action(_: &Value) -> String {
+    fn unreachable_text_action(_: &Value) -> SessionConfigFuture<'_> {
         panic!("session text action should not be called")
     }
 

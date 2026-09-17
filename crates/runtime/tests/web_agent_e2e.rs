@@ -1,11 +1,11 @@
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 //! Web agent mode E2E tests — incremental SSE streaming, edge tool delivery via ledger.
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
 //! using `test_llm_rounds` injected into the host to mock LLM responses.
 //!
 //! ```text
-//! cargo test -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks
+//! cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 //! ```
 
 mod test_support;
@@ -27,16 +27,21 @@ use astra_services::skills::{
     SkillRecord, SkillService, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_services::{
-    AgentBindingCreateRequestData, AgentBindingPayload, AgentBindingService,
-    AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService, ModelCreateRequestData,
-    ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData, ProviderRequestDescriptor,
-    ResolvedActiveLlmModel, ResolvedModelOffering,
+    AgentBindingCreateRequestData, AgentBindingOwnerScope, AgentBindingPayload,
+    AgentBindingService, AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService,
+    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    ProviderRequestDescriptor, ResolvedActiveLlmModel, ResolvedModelOffering,
+};
+use astra_turn_core::chat_turn_sse_dispatch::{
+    ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
 };
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{self, Body},
     http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::post,
 };
 use futures_util::StreamExt;
@@ -52,6 +57,7 @@ use crate::test_support::{
 const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
 const PROVIDER_TOKEN: &str = "Bearer web-agent-e2e-provider-token";
+const PROVIDER_ID: &str = "test-provider";
 const USER_ID: &str = "web-agent-e2e-user";
 const DEFAULT_MODEL_OFFERING_ID: &str = "model-test-model";
 const DEFAULT_TEST_EDGE_AGENT_ID: &str = "web-agent-e2e-edge";
@@ -148,7 +154,7 @@ fn unmatched_tool_result_identity() -> ToolResultIdentity {
 
 fn init_env() {
     SECRET_INIT.get_or_init(|| unsafe {
-        std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", SECRET);
+        std::env::set_var("ASTRA_TEST_E2E_SECRET", SECRET);
     });
 }
 
@@ -200,7 +206,7 @@ impl AuthService for StubAuth {
         if authorization == Some(PROVIDER_TOKEN) {
             return Ok(AuthPrincipal {
                 user: AuthUserRecord {
-                    user_id: "provider_authorized:moi:web-agent-e2e-user".to_string(),
+                    user_id: format!("provider_authorized:{PROVIDER_ID}:web-agent-e2e-user"),
                     username: "web-agent-e2e-user".to_string(),
                     email: String::new(),
                     display_name: None,
@@ -208,7 +214,7 @@ impl AuthService for StubAuth {
                 session_id: None,
                 origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     AuthProviderAuthorizedRequestContext {
-                        provider_id: "moi".to_string(),
+                        provider_id: PROVIDER_ID.to_string(),
                         external_subject: "web-agent-e2e-user".to_string(),
                         provider_scope_id: "web-agent-e2e-workspace".to_string(),
                         request_authorization_id: "web-agent-e2e-authorization".to_string(),
@@ -547,6 +553,8 @@ impl ModelService for TestModelService {
                 fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
+                fixed_temperature: None,
+                thinking_protocol: None,
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(128_000),
@@ -715,7 +723,11 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
             json!({
                 "kind": "edge_workspace",
                 "display_name": "web-agent-e2e",
-                "cwd": "/tmp/astra-web-agent-e2e-edge",
+                "root": "/tmp/astra-web-agent-e2e-edge",
+                "source": {
+                    "kind": "edge_path",
+                    "path": "/tmp/astra-web-agent-e2e-edge"
+                },
                 "authority": "read_write",
             })
         });
@@ -776,7 +788,7 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -797,7 +809,7 @@ async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value
         .uri("/chat/stream")
         .header("authorization", PROVIDER_TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -817,6 +829,24 @@ async fn create_e2e_agent_binding(
 ) -> String {
     AgentBindingService::create_binding(
         service,
+        AgentBindingOwnerScope::from_principal(&AuthPrincipal {
+            user: AuthUserRecord {
+                user_id: format!("provider_authorized:{PROVIDER_ID}:agent-binding-registrar"),
+                username: "agent-binding-registrar".to_string(),
+                email: String::new(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                AuthProviderAuthorizedRequestContext {
+                    provider_id: PROVIDER_ID.to_string(),
+                    external_subject: "agent-binding-registrar".to_string(),
+                    provider_scope_id: "agent-binding-registry".to_string(),
+                    request_authorization_id: "agent-binding-registration".to_string(),
+                    edge_agent_id: None,
+                },
+            ),
+        }),
         AgentBindingCreateRequestData {
             idempotency_key: format!("web-agent-e2e-{binding_name}"),
             binding: AgentBindingPayload {
@@ -971,7 +1001,8 @@ fn agent_binding_chat_payload(
                 "type": "model_gateway",
                 "transport": "http",
                 "endpoint_url": capability_endpoint,
-                "protocol": "openai_chat_completions"
+                "protocol": "openai_chat_completions",
+                "model_context_window": 128000
             },
             "mcp": {
                 "id": "moi-tools",
@@ -1161,10 +1192,18 @@ async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Resp
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
+}
+
+async fn inject_test_llm_authority(mut request: Request<Body>, next: Next) -> Response {
+    request.headers_mut().insert(
+        "x-astra-e2e-test-secret",
+        SECRET.parse().expect("static test secret header"),
+    );
+    next.run(request).await
 }
 
 /// POST /tools/result
@@ -1233,7 +1272,18 @@ async fn post_tool_result_with_identity(
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    app.clone().oneshot(req).await.unwrap().status()
+    let response = app.clone().oneshot(req).await.unwrap();
+    let response_status = response.status();
+    if !response_status.is_success() {
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("tool result error response body");
+        eprintln!(
+            "tool result callback failed: status={response_status}, body={}",
+            String::from_utf8_lossy(&response_body)
+        );
+    }
+    response_status
 }
 
 #[derive(Debug, Clone)]
@@ -1350,11 +1400,27 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
                 "test_llm_rounds": [
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-reviewer", "agent", json!({
-                                "action": "spawn",
-                                "description": "structured child review",
-                                "prompt": "Review src/lib.rs and summarize one issue.",
-                                "agent_type": "code-review"
+                            tool_call(
+                                "call-select-agent",
+                                "tool_search",
+                                json!({"query": "select:agent"})
+                            )
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            // `agent` is a deferred capability.  Discovery binds
+                            // its exact contract, while execution stays on the
+                            // resident carrier so the provider tool prefix does
+                            // not change between rounds.
+                            tool_call("call-spawn-reviewer", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "structured child review",
+                                    "prompt": "Review src/lib.rs and summarize one issue.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },
@@ -1488,36 +1554,135 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
 }
 
 #[tokio::test]
-async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
+async fn web_agent_parallel_fanout_without_work_authority_fails_closed() {
     init_env();
     let (app, _ledger) = build_test_app();
 
     let events = chat_stream_collect(
         &app,
         json!({
+            "message": "Use two independent child agents and combine their findings.",
+            "context": {
+                "test_llm_rounds": [
+                    {
+                        "tool_calls": [
+                            tool_call(
+                                "call-select-agent-parallel",
+                                "tool_search",
+                                json!({"query": "select:agent_fanout"})
+                            )
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            tool_call("call-fanout", "invoke_tool", json!({
+                                "name": "agent_fanout",
+                                "arguments": {
+                                    "action": "start",
+                                    "target_count": 2,
+                                    "slots": [
+                                        {
+                                            "id": "concern-a",
+                                            "description": "parallel child A",
+                                            "prompt": "Review one independent concern.",
+                                            "agent_type": "code-review"
+                                        },
+                                        {
+                                            "id": "concern-b",
+                                            "description": "parallel child B",
+                                            "prompt": "Review another independent concern.",
+                                            "agent_type": "code-review"
+                                        }
+                                    ]
+                                }
+                            }))
+                        ]
+                    },
+                    {"full_text": "combined findings from both children"}
+                ],
+                "test_spawn_child_llm_rounds": [
+                    {"full_text": "child review completed"}
+                ]
+            }
+        }),
+    )
+    .await;
+
+    let serialized = serde_json::to_string(&events).expect("serialize parallel spawn events");
+    let result = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"].as_str() == Some("call-fanout"))
+        .and_then(|event| event["result"].as_str())
+        .and_then(|result| serde_json::from_str::<Value>(result).ok())
+        .unwrap_or_else(|| panic!("fanout must return a terminal structured result: {serialized}"));
+    assert_eq!(result["status"], "rejected", "{serialized}");
+    assert_eq!(
+        result["error_kind"], "parallel_topology_admission_unavailable",
+        "{serialized}"
+    );
+    assert!(
+        find_events(&events, "text_delta")
+            .iter()
+            .any(|event| event["content"].as_str() == Some("combined findings from both children")),
+        "the parent should recover from the rejected fanout without hidden topology: {serialized}"
+    );
+    assert!(
+        find_events(&events, "agent_spawned").is_empty(),
+        "{serialized}"
+    );
+    assert!(
+        find_events(&events, "agent_completed").is_empty(),
+        "{serialized}"
+    );
+}
+
+#[tokio::test]
+async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
+    init_env();
+    let (app, _ledger) = build_test_app();
+
+    let response = chat_stream_start(
+        &app,
+        json!({
             "message": "Use a child agent to review the edge workspace.",
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
+                "source": {
+                    "kind": "edge_path",
+                    "path": "/workspace/astra"
+                },
                 "authority": "read_write",
             },
             "executor_binding": {
                 "kind": "edge_agent",
-                "executor_id": "edge-macbook-1",
+                "executor_id": DEFAULT_TEST_EDGE_AGENT_ID,
                 "display_name": "MacBook Pro",
-                "transport": "edge_ws",
+                "transport": "edge_ledger",
                 "status": "online"
             },
             "context": {
                 "test_llm_rounds": [
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-edge-reviewer", "agent", json!({
-                                "action": "spawn",
-                                "description": "edge child review",
-                                "prompt": "Review src/lib.rs in the inherited edge workspace.",
-                                "agent_type": "code-review"
+                            tool_call(
+                                "call-select-edge-agent",
+                                "tool_search",
+                                json!({"query": "select:agent"})
+                            )
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            tool_call("call-spawn-edge-reviewer", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "edge child review",
+                                    "prompt": "Review src/lib.rs in the inherited edge workspace.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },
@@ -1527,13 +1692,41 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                 ],
                 "test_spawn_child_llm_rounds": [
                     {
-                        "full_text": "edge child review result: no critical issues"
+                        "tool_calls": [
+                            tool_call(
+                                "call-child-read-file",
+                                "read_file",
+                                json!({"path": "/workspace/astra/src/lib.rs"})
+                            )
+                        ]
+                    },
+                    {
+                        "full_text": "edge child reviewed concrete file evidence: pub fn run()"
                     }
                 ]
             }
         }),
     )
     .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let child_request = wait_for_sse(&mut rx, "tool_request", 5).await;
+    assert_eq!(child_request["tool"], "read_file");
+    assert_eq!(child_request["request_id"], "call-child-read-file");
+    assert_eq!(
+        post_tool_result_from_event(
+            &app,
+            &child_request,
+            "pub fn run() -> Result<()> { Ok(()) }",
+            "completed",
+        )
+        .await,
+        StatusCode::OK
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("edge child stream timed out")
+        .expect("edge child stream reader failed");
 
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
@@ -1543,8 +1736,8 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         "parent should synthesize after edge-bound child spawn: {serialized}"
     );
     assert!(
-        serialized.contains("edge child review result: no critical issues"),
-        "the structured edge child result should remain visible in the stream: {serialized}"
+        serialized.contains("edge child reviewed concrete file evidence: pub fn run()"),
+        "the child must synthesize after receiving real workspace evidence: {serialized}"
     );
     let spawn_result = find_events(&events, "tool_call_end")
         .into_iter()
@@ -1554,16 +1747,16 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .unwrap_or_else(|| panic!("edge spawn must return a canonical result: {serialized}"));
     assert_eq!(spawn_result["status"], "completed", "{serialized}");
     assert_eq!(
-        spawn_result["result"], "edge child review result: no critical issues",
+        spawn_result["result"], "edge child reviewed concrete file evidence: pub fn run()",
         "{serialized}"
     );
 
     let workspace = find_event(&events, "workspace_bound")
         .unwrap_or_else(|| panic!("expected workspace_bound event: {serialized}"));
     assert_eq!(workspace["workspace"]["kind"], "edge_workspace");
-    assert_eq!(workspace["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(workspace["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(workspace["executor"]["kind"], "edge_agent");
-    assert_eq!(workspace["transport"], "edge_ws");
+    assert_eq!(workspace["transport"], "edge_ledger");
 
     let routing = find_events(&events, "tool_routing_decision")
         .into_iter()
@@ -1582,19 +1775,19 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .find(|event| {
             event["event_kind"].as_str() == Some("output_delta")
                 && event["content"].as_str()
-                    == Some("edge child review result: no critical issues")
+                    == Some("edge child reviewed concrete file evidence: pub fn run()")
         })
         .unwrap_or_else(|| {
             panic!("edge-bound dynamic spawn should stream child output into agent_live_event: {serialized}")
         });
     assert_eq!(live_output["workspace"]["kind"], "edge_workspace");
-    assert_eq!(
-        live_output["workspace"]["cwd"],
-        "/Users/xupeng/github/astra"
-    );
+    assert_eq!(live_output["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(live_output["executor"]["kind"], "edge_agent");
-    assert_eq!(live_output["executor"]["executor_id"], "edge-macbook-1");
-    assert_eq!(live_output["transport"], "edge_ws");
+    assert_eq!(
+        live_output["executor"]["executor_id"],
+        DEFAULT_TEST_EDGE_AGENT_ID
+    );
+    assert_eq!(live_output["transport"], "edge_ledger");
 
     let spawned = find_event_type(&events, "agent_spawned");
     assert!(
@@ -1602,10 +1795,50 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         "edge-bound dynamic spawn should emit agent_spawned progress: {serialized}"
     );
     assert_eq!(spawned[0]["workspace"]["kind"], "edge_workspace");
-    assert_eq!(spawned[0]["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(spawned[0]["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
-    assert_eq!(spawned[0]["executor"]["executor_id"], "edge-macbook-1");
-    assert_eq!(spawned[0]["transport"], "edge_ws");
+    assert_eq!(
+        spawned[0]["executor"]["executor_id"],
+        DEFAULT_TEST_EDGE_AGENT_ID
+    );
+    assert_eq!(spawned[0]["transport"], "edge_ledger");
+    let child_run_id = spawned[0]["run_id"].as_str().expect("agent_spawned run_id");
+    assert_eq!(
+        find_events(&events, "tool_call_end")
+            .into_iter()
+            .filter(|event| event["call_id"].as_str() == Some("call-child-read-file"))
+            .count(),
+        0,
+        "the client-owned callback lane must not be duplicated onto the attached parent stream"
+    );
+    let (child_replay_status, child_replay) = get_run_stream(&app, child_run_id, 0).await;
+    assert_eq!(child_replay_status, StatusCode::OK);
+    let child_terminal_index = child_replay
+        .iter()
+        .position(|event| {
+            event["type"].as_str() == Some("tool_call_end")
+                && event["call_id"].as_str() == Some("call-child-read-file")
+        })
+        .unwrap_or_else(|| panic!("child replay lost its durable tool terminal: {child_replay:?}"));
+    let child_finished_index = child_replay
+        .iter()
+        .position(|event| event["type"].as_str() == Some("run_finished"))
+        .unwrap_or_else(|| panic!("child replay lost run_finished: {child_replay:?}"));
+    assert!(
+        child_terminal_index < child_finished_index,
+        "child tool terminal must commit before run_finished: {child_replay:?}"
+    );
+    assert_eq!(
+        child_replay
+            .iter()
+            .filter(|event| {
+                event["type"].as_str() == Some("tool_call_end")
+                    && event["call_id"].as_str() == Some("call-child-read-file")
+            })
+            .count(),
+        1,
+        "child replay must expose exactly one durable terminal occurrence"
+    );
 
     let completed = find_event_type(&events, "agent_completed");
     assert!(
@@ -1614,7 +1847,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     );
     assert_eq!(completed[0]["workspace"]["kind"], "edge_workspace");
     assert_eq!(completed[0]["executor"]["kind"], "edge_agent");
-    assert_eq!(completed[0]["transport"], "edge_ws");
+    assert_eq!(completed[0]["transport"], "edge_ledger");
 }
 
 // ── Event-driven synchronization helpers ─────────────────────────────────────
@@ -1667,7 +1900,28 @@ async fn wait_for_sse(
                 }
                 seen.push(event);
             }
-            Ok(None) => panic!("stream ended without '{event_type}' event; seen={seen:#?}"),
+            Ok(None) => {
+                let summary = seen
+                    .iter()
+                    .map(|event| {
+                        json!({
+                            "type": event.get("type"),
+                            "call_id": event.get("call_id"),
+                            "request_id": event.get("request_id"),
+                            "event_kind": event.get("event_kind"),
+                            "status": event.get("status"),
+                            "content": event.get("content"),
+                            "result": event.get("result"),
+                            "error": event.get("error"),
+                            "error_code": event.get("error_code"),
+                            "details": event.get("details"),
+                            "tool": event.get("tool"),
+                            "tool_call": event.get("tool_call"),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                panic!("stream ended without '{event_type}' event; seen={summary:#?}")
+            }
             Err(_) => {
                 panic!(
                     "timed out ({timeout_secs}s) waiting for '{event_type}' event; seen={seen:#?}"
@@ -1733,7 +1987,7 @@ async fn execute_mock_tool_turn(
             case_name,
             step.request_id
         );
-        let status = post_tool_result(app, step.request_id, step.result_output, "success").await;
+        let status = post_tool_result(app, step.request_id, step.result_output, "completed").await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1744,7 +1998,7 @@ async fn execute_mock_tool_turn(
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
-        .expect("stream timed out")
+        .unwrap_or_else(|_| panic!("{case_name}: stream timed out"))
         .expect("reader task failed");
     assert!(
         find_events(&events, "text_delta")
@@ -1822,6 +2076,7 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
         &app,
         json!({
             "message": &case.message,
+            "interactive_client": case.steps.iter().any(|step| step.requires_approval),
             "context": {
                 "test_llm_rounds": [
                     { "tool_calls": tool_calls },
@@ -2059,14 +2314,25 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     let tool_call = find_event(&events, "tool_call")
         .unwrap_or_else(|| panic!("expected tool_call event: {events:?}"));
     assert_eq!(tool_call["tool_call"]["id"], "call-bash-binding");
-    assert_eq!(tool_call["workspace"]["kind"], "server_sandbox");
-    assert_eq!(tool_call["executor"]["kind"], "server_local");
-    assert_eq!(tool_call["transport"], "server_local");
+    // The provider event is an intent, not an execution receipt.  It must not
+    // claim the host's default owner before admission selects a route.
+    assert!(tool_call.get("workspace").is_none());
+    assert!(tool_call.get("executor").is_none());
+    assert!(tool_call.get("transport").is_none());
+
+    // Route-owned lifecycle events are the authoritative execution evidence.
+    let tool_end = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"] == "call-bash-binding")
+        .unwrap_or_else(|| panic!("expected routed tool_call_end event: {events:?}"));
+    assert_eq!(tool_end["workspace"]["kind"], "server_sandbox");
+    assert_eq!(tool_end["executor"]["kind"], "server_local");
+    assert_eq!(tool_end["transport"], "server_local");
     assert!(
-        tool_call["workspace"]["cwd"].as_str().is_some_and(|cwd| {
+        tool_end["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
         }),
-        "tool_call should carry the actual provisioned workspace: {tool_call:?}"
+        "tool_call_end should carry the actual provisioned workspace: {tool_end:?}"
     );
 }
 
@@ -2082,7 +2348,11 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
+                "source": {
+                    "kind": "edge_path",
+                    "path": "/workspace/astra"
+                },
                 "authority": "read_write",
             },
             "executor_binding": {
@@ -2147,7 +2417,11 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
+                "source": {
+                    "kind": "edge_path",
+                    "path": "/workspace/astra"
+                },
                 "authority": "read_write",
             },
             "executor_binding": {
@@ -2161,11 +2435,23 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                 "test_llm_rounds": [
                     {
                         "tool_calls": [
-                            tool_call("call-spawn-offline-child", "agent", json!({
-                                "action": "spawn",
-                                "description": "edge child command",
-                                "prompt": "Run a command in the inherited edge workspace.",
-                                "agent_type": "code-review"
+                            tool_call(
+                                "call-select-offline-child-agent",
+                                "tool_search",
+                                json!({"query": "select:agent"})
+                            )
+                        ]
+                    },
+                    {
+                        "tool_calls": [
+                            tool_call("call-spawn-offline-child", "invoke_tool", json!({
+                                "name": "agent",
+                                "arguments": {
+                                    "action": "spawn",
+                                    "description": "edge child command",
+                                    "prompt": "Run a command in the inherited edge workspace.",
+                                    "agent_type": "code-review"
+                                }
                             }))
                         ]
                     },
@@ -2365,7 +2651,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
     wait_for_sse(&mut rx, "tool_request", 5).await;
 
     // Post tool result to the ledger.
-    let status = post_tool_result(&app, "tc-read-1", "hello world", "ok").await;
+    let status = post_tool_result(&app, "tc-read-1", "hello world", "completed").await;
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the stream to complete.
@@ -2389,7 +2675,7 @@ async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
 #[tokio::test]
 async fn multiple_tool_calls_in_single_round() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
 
     let payload = json!({
         "message": "Read two files",
@@ -2399,10 +2685,9 @@ async fn multiple_tool_calls_in_single_round() {
                     "tool_calls": [
                         {
                             "id": "tc-1",
-                            "type": "function",
                             "function": {
                                 "name": "read_file",
-                                "arguments": "{\"path\": \"/tmp/a.txt\"}"
+                                "arguments": "{ \"path\": \"/tmp/a.txt\" }"
                             }
                         },
                         {
@@ -2410,7 +2695,7 @@ async fn multiple_tool_calls_in_single_round() {
                             "type": "function",
                             "function": {
                                 "name": "read_file",
-                                "arguments": "{\"path\": \"/tmp/b.txt\"}"
+                                "arguments": "{\n \"path\": \"/tmp/b.txt\"\n}"
                             }
                         }
                     ]
@@ -2441,9 +2726,9 @@ async fn multiple_tool_calls_in_single_round() {
     // Wait for tool_request before posting results for both tool calls.
     wait_for_sse(&mut rx, "tool_request", 5).await;
 
-    let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "ok").await;
+    let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "completed").await;
     assert_eq!(s1, StatusCode::OK);
-    let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "ok").await;
+    let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "completed").await;
     assert_eq!(s2, StatusCode::OK);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -2462,6 +2747,41 @@ async fn multiple_tool_calls_in_single_round() {
     // Verify final text.
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty());
+
+    poll_until(
+        || {
+            let observer_worker = observer_worker.clone();
+            async move { !observer_worker.requests.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+    let requests = observer_worker.requests.lock().await;
+    let messages = &requests
+        .first()
+        .expect("the completed turn must be observable")
+        .messages;
+    let assistant_batch = messages
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .expect("second provider request must retain the assistant tool batch");
+    assert_eq!(assistant_batch.len(), 2);
+    assert_eq!(assistant_batch[0]["id"], "tc-1");
+    assert_eq!(assistant_batch[1]["id"], "tc-2");
+    let result_ids = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(result_ids, vec!["tc-1", "tc-2"]);
+    assert!(messages.iter().all(|message| {
+        message.get("role").and_then(Value::as_str) != Some("assistant")
+            || message.get("content") != Some(&Value::Null)
+            || message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+    }));
 }
 
 // ── Multi-round: tools → results → more LLM → final text ────────────────────
@@ -2532,11 +2852,11 @@ async fn multi_round_tool_execution() {
 
     // Post results as tool_request events are emitted.
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-read", "fn main() {}", "ok").await;
+    let st = post_tool_result(&app, "tc-read", "fn main() {}", "completed").await;
     assert_eq!(st, 200, "tc-read POST failed");
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "ok").await;
+    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "completed").await;
     assert_eq!(st, 200, "tc-list POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -2610,6 +2930,74 @@ async fn custom_session_id_preserved() {
 }
 
 // ── Error scenario: empty test_llm_rounds ────────────────────────────────────
+
+#[tokio::test]
+async fn budget_interruption_streams_one_authoritative_paused_terminal() {
+    init_env();
+    let (app, _) = build_test_app();
+    let payload = json!({
+        "message": "Produce a deterministic partial result",
+        "context": {
+            "test_llm_rounds": [{
+                "error": {
+                    "kind": "budget_exhausted",
+                    "message": "provider budget",
+                    "details": {"partial_full_text": "partial"}
+                }
+            }]
+        }
+    });
+
+    let response = chat_stream_start(&app, payload).await;
+    let body = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .expect("SSE body");
+    let wire = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+    let events = parse_sse_events(&wire);
+    let run_id = find_event(&events, "session_info")
+        .and_then(|event| event["run_id"].as_str())
+        .expect("root run id");
+
+    let interrupted = events
+        .iter()
+        .position(|event| event["type"] == "run_interrupted")
+        .expect("typed interruption");
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "run_finished")
+        .expect("durable terminal");
+    let complete = events
+        .iter()
+        .position(|event| event["type"] == "turn_complete")
+        .expect("authoritative completion");
+    assert!(interrupted < finished && finished < complete, "{events:#?}");
+    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
+    assert_eq!(events[finished]["status"], "paused");
+    assert_eq!(events[complete]["continuation_owner"], "server");
+    assert_eq!(
+        events[complete]["execution_state"]["interruption_kind"],
+        "budget_exhausted"
+    );
+    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
+    assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
+
+    let mut accum = ChatTurnSseAccum::default();
+    let mut edge_pending = Vec::new();
+    for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
+        dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
+    }
+    assert!(accum.server_loop_terminal);
+    assert_eq!(accum.error_kind, None);
+    let summary = accum
+        .server_execution_summary
+        .expect("CLI accepts authoritative interrupted summary");
+    assert_eq!(summary.llm_rounds, 1);
+    assert_eq!(summary.runtime_feedback, None);
+
+    let (status, durable) = get_run_status(&app, run_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(durable["status"], "paused");
+}
 
 #[tokio::test]
 async fn empty_test_llm_rounds_completes_gracefully() {
@@ -2698,6 +3086,109 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
             .any(|event| event["content"].as_str() == Some("I used the skill instructions.")),
         "final LLM round should continue after skill interception"
     );
+}
+
+#[tokio::test]
+async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loop() {
+    init_env();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
+    let app = app.layer(middleware::from_fn(inject_test_llm_authority));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CLI + Server journey listener");
+    let address = listener.local_addr().expect("journey listener address");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("serve CLI + Server journey");
+    });
+
+    let payload = normalize_chat_stream_payload(json!({
+        "message": "Use the test skill and report the result",
+        "context": {
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        tool_call(
+                            "tc-cli-server-skill",
+                            "skill",
+                            json!({"skill_name": "test-skill"})
+                        )
+                    ]
+                },
+                { "full_text": "The server completed the skill round." }
+            ]
+        }
+    }));
+    let client = astra_thin_client::ThinClient::new(&format!("http://{address}"), None)
+        .expect("construct CLI thin client");
+    let response = client
+        .post_developer_loop(
+            TOKEN.strip_prefix("Bearer ").expect("test bearer token"),
+            &payload,
+        )
+        .await
+        .expect("single developer-loop admission");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(std::time::Duration::from_secs(10), response.text())
+        .await
+        .expect("CLI + Server stream timed out")
+        .expect("read CLI + Server stream");
+    let events = parse_sse_events(&body);
+
+    assert_eq!(
+        find_events(&events, "session_info").len(),
+        1,
+        "one admission must establish one canonical run: {events:?}"
+    );
+    assert!(
+        find_events(&events, "tool_request").is_empty(),
+        "a server-owned skill must not be delegated back to the CLI: {events:?}"
+    );
+    assert!(
+        find_events(&events, "text_delta").iter().any(|event| {
+            event["content"].as_str() == Some("The server completed the skill round.")
+        }),
+        "the same Server admission must execute the post-tool LLM round: {events:?}"
+    );
+    let terminals = find_events(&events, "turn_complete");
+    assert_eq!(
+        terminals.len(),
+        1,
+        "one user turn has one terminal: {events:?}"
+    );
+    assert_eq!(terminals[0]["continuation_owner"], "server");
+    assert_eq!(terminals[0]["tool_calls_count"], 1);
+    assert_eq!(terminals[0]["tools_used"], json!(["skill"]));
+    assert_eq!(terminals[0]["llm_rounds"], 2);
+    assert!(
+        terminals[0]["observation_tool_calls_count"]
+            .as_u64()
+            .is_some_and(|count| count <= 1),
+        "terminal must carry a bounded observation count: {:?}",
+        terminals[0]
+    );
+
+    let requests = observer_worker.requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "one Server loop should emit one observation"
+    );
+    assert!(requests[0].messages.iter().any(|message| {
+        message.get("tool_call_id").and_then(Value::as_str) == Some("tc-cli-server-skill")
+    }));
+    drop(requests);
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("CLI + Server test server shutdown timed out")
+        .expect("CLI + Server test server join failed");
 }
 
 /// Full resolve round-trip: verify the resolved skill *instructions body*
@@ -3101,7 +3592,7 @@ async fn tool_call_with_error_result_continues() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-err-1", "status=error: file not found", "error").await;
+    post_tool_result(&app, "tc-err-1", "status=error: file not found", "failed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3123,6 +3614,7 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     // write_file requires approval before tool_request is emitted.
     let payload = json!({
         "message": "Write a file",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -3164,7 +3656,7 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     assert_eq!(st, 200, "approval POST failed");
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-approve-1", "written", "ok").await;
+    let st = post_tool_result(&app, "tc-approve-1", "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3198,6 +3690,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 
     let payload = json!({
         "message": "Read first, then write both files",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -3272,7 +3765,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
         Some("tc-read-first"),
         "earlier read-only call should execute before later approval-gated block"
     );
-    let st = post_tool_result(&app, "tc-read-first", "read-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-read-first", "read-ok", "completed").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
     let st = post_approval_respond(&app, &approval_identity, "tc-write-a", "allow").await;
@@ -3282,12 +3775,12 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
-    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
     let write_request_b = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
-    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "ok").await;
+    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3328,6 +3821,7 @@ async fn approval_denied_skips_tool_and_continues() {
 
     let payload = json!({
         "message": "Write a file",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -3488,7 +3982,7 @@ async fn cancel_mid_stream_stops_further_rounds() {
                     cancelled = true;
 
                     // Post tool result to unblock the ledger wait.
-                    post_tool_result_from_event(&app, &v, "file contents", "ok").await;
+                    post_tool_result_from_event(&app, &v, "file contents", "completed").await;
                 }
             }
         }
@@ -3573,7 +4067,7 @@ async fn invalid_auth_token_returns_unauthorized() {
         .uri("/chat/stream")
         .header("authorization", "Bearer invalid-token")
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(json!({"message": "hi"}).to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -3620,7 +4114,7 @@ async fn missing_message_field_returns_sse_error() {
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(
             json!({
                 "model_selection": { "offering_id": DEFAULT_MODEL_OFFERING_ID },
@@ -3642,11 +4136,13 @@ async fn missing_message_field_returns_sse_error() {
 }
 
 #[tokio::test]
-async fn tool_call_with_empty_id_gets_auto_assigned() {
+async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() {
     init_env();
     let (app, _) = build_test_app();
 
-    // Tool call with no ID — ensure_tool_call_ids should auto-generate one.
+    // Execution identity belongs to the provider. The runtime must not mint
+    // one because doing so makes replay, callback, and durable pairing
+    // ambiguous.
     let payload = json!({
         "message": "auto-id test",
         "context": {
@@ -3678,24 +4174,24 @@ async fn tool_call_with_empty_id_gets_auto_assigned() {
     });
 
     let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+    let (_rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    // Wait for tool_request and discover the auto-generated ID from the event.
-    let tool_req_event = wait_for_sse(&mut rx, "tool_request", 5).await;
-    let auto_id = tool_req_event["request_id"]
-        .as_str()
-        .unwrap_or_else(|| tool_req_event["tool_call_id"].as_str().unwrap_or(""));
-
-    // Post tool result using the discovered ID (if available).
-    if !auto_id.is_empty() {
-        post_tool_result(&app, auto_id, "content", "ok").await;
-    }
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(8), reader).await;
-
-    // The stream may time out if we couldn't discover the right ID,
-    // but it should not panic. The important thing is no crash.
-    assert!(events.is_ok() || events.is_err(), "should not panic");
+    let events = tokio::time::timeout(std::time::Duration::from_secs(8), reader)
+        .await
+        .expect("stream should fail closed without waiting for a callback")
+        .expect("SSE reader should not panic");
+    assert!(
+        find_events(&events, "tool_request").is_empty(),
+        "invalid provider identity must not reach edge delivery: {events:?}"
+    );
+    assert!(
+        find_events(&events, "run_error")
+            .iter()
+            .any(|event| event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("provider tool-call protocol violation"))),
+        "the identity contract failure must remain observable: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -3704,7 +4200,7 @@ async fn tool_result_for_unknown_run_is_rejected_without_side_effects() {
     let (app, ledger) = build_test_app();
 
     // Authentication alone must not authorize an arbitrary callback identity.
-    let st = post_unmatched_tool_result(&app, "nonexistent-id-12345", "output", "ok").await;
+    let st = post_unmatched_tool_result(&app, "nonexistent-id-12345", "output", "completed").await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert!(
         ledger.lock().await.is_empty(),
@@ -3798,7 +4294,7 @@ async fn many_tool_calls_in_single_round() {
     wait_for_sse(&mut rx, "tool_request", 5).await;
     for i in 0..5 {
         let id = format!("tc-many-{i}");
-        post_tool_result(&app, &id, &format!("content of file{i}"), "ok").await;
+        post_tool_result(&app, &id, &format!("content of file{i}"), "completed").await;
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -3867,7 +4363,7 @@ async fn three_sequential_rounds_all_with_tools() {
         ("tc-r3", "file content here"),
     ] {
         wait_for_sse(&mut rx, "tool_request", 5).await;
-        post_tool_result(&app, id, output, "ok").await;
+        post_tool_result(&app, id, output, "completed").await;
     }
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
@@ -3932,7 +4428,7 @@ async fn tool_call_with_complex_json_arguments() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-complex", "file content", "ok").await;
+    let st = post_tool_result(&app, "tc-complex", "file content", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3981,7 +4477,7 @@ async fn text_then_tool_then_text_interleaved() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-mixed", "info content", "ok").await;
+    post_tool_result(&app, "tc-mixed", "info content", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4034,7 +4530,7 @@ async fn reasoning_tokens_with_tool_calls() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-think", "file data", "ok").await;
+    post_tool_result(&app, "tc-think", "file data", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4088,7 +4584,7 @@ async fn multiple_usage_events_accumulate() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-usage", "file1\nfile2", "ok").await;
+    post_tool_result(&app, "tc-usage", "file1\nfile2", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4192,7 +4688,7 @@ async fn tool_result_with_large_output() {
     // Post a large tool result (~50KB).
     let large_output = "y".repeat(50_000);
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-large", &large_output, "ok").await;
+    let st = post_tool_result(&app, "tc-large", &large_output, "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4215,6 +4711,7 @@ async fn approval_allow_session_approves_tool() {
     // Test "allow_session" decision (alternative to "allow").
     let payload = json!({
         "message": "Session-wide approval",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -4247,7 +4744,7 @@ async fn approval_allow_session_approves_tool() {
     assert_eq!(st, 200);
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-session-approve", "ok", "ok").await;
+    let st = post_tool_result(&app, "tc-session-approve", "ok", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4382,13 +4879,9 @@ async fn a1_run_status_all_fields_text_only() {
         events_count > 0,
         "events_count should be > 0, got {events_count}"
     );
-    assert_eq!(body["workspace"]["kind"].as_str(), Some("none"));
-    assert_eq!(body["executor"]["kind"].as_str(), Some("server_local"));
-    assert_eq!(
-        body["executor"]["executor_id"].as_str(),
-        Some("server-control-plane")
-    );
-    assert_eq!(body["transport"].as_str(), Some("server_local"));
+    assert!(body["workspace"].is_null());
+    assert!(body["executor"].is_null());
+    assert!(body["transport"].is_null());
 }
 
 #[tokio::test]
@@ -4417,7 +4910,7 @@ async fn a1_run_status_all_fields_after_tool_round() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    let st = post_tool_result(&app, "tc-a1", "file contents", "ok").await;
+    let st = post_tool_result(&app, "tc-a1", "file contents", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4482,7 +4975,7 @@ async fn a2_transition_running_to_completed_after_tool_rounds() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-a2-tool", "file.rs", "ok").await;
+    post_tool_result(&app, "tc-a2-tool", "file.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4539,7 +5032,7 @@ async fn a2_transition_running_to_cancelled() {
     assert_eq!(cancel_status, StatusCode::OK);
 
     // Also post the tool result so the stream can terminate.
-    post_tool_result(&app, "tc-a2-cancel", "cancelled", "ok").await;
+    post_tool_result(&app, "tc-a2-cancel", "cancelled", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4605,23 +5098,64 @@ async fn a3_event_replay_partial_from_middle() {
     let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
     poll_run_status(&app, &run_id, "completed", 5).await;
 
-    // Get all events first.
+    // Get all externally visible events first. The cursor is over the
+    // durable event log, so the public projection may legitimately skip
+    // internal-only rows and return a first visible index greater than the
+    // requested cursor.
     let (_, all_events) = get_run_stream(&app, &run_id, 0).await;
-    let total = all_events.len();
-    assert!(total >= 2, "need at least 2 events for partial replay");
-
-    // Replay from index 1 — should skip the first event.
-    let (_, partial_events) = get_run_stream(&app, &run_id, 1).await;
-    assert_eq!(
-        partial_events.len(),
-        total - 1,
-        "partial from index 1 should have {expected} events, got {actual}",
-        expected = total - 1,
-        actual = partial_events.len()
+    assert!(
+        all_events.len() >= 2,
+        "need at least 2 events for partial replay"
     );
 
-    // First event in partial should have index 1.
-    assert_eq!(partial_events[0]["index"], 1);
+    // Replay from durable index 1 — this deliberately exercises a cursor
+    // that may land on an internal-only row. The public projection must still
+    // contain exactly the visible events whose durable index is at least 1.
+    let (_, partial_events) = get_run_stream(&app, &run_id, 1).await;
+    let expected_partial: Vec<_> = all_events
+        .iter()
+        .filter(|event| event["index"].as_u64().is_some_and(|index| index >= 1))
+        .cloned()
+        .collect();
+    assert_eq!(
+        partial_events, expected_partial,
+        "replay from a durable cursor must preserve the visible event projection and ordering"
+    );
+    assert!(
+        partial_events
+            .iter()
+            .all(|event| event["index"].as_u64().is_some_and(|index| index >= 1)),
+        "replay must not return an event below the requested durable cursor"
+    );
+
+    // A cursor taken from a known visible event distinguishes durable-cursor
+    // semantics from the incorrect "skip one already-projected event"
+    // implementation. The event at the cursor must remain the first result.
+    let visible_cursor = all_events[1]["index"]
+        .as_u64()
+        .expect("second visible replay event should carry a durable index");
+    assert!(
+        visible_cursor > 0,
+        "visible cursor must advance past index zero"
+    );
+    let (_, from_visible_cursor) = get_run_stream(&app, &run_id, visible_cursor as u32).await;
+    let expected_from_visible_cursor: Vec<_> = all_events
+        .iter()
+        .filter(|event| {
+            event["index"]
+                .as_u64()
+                .is_some_and(|index| index >= visible_cursor)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(from_visible_cursor, expected_from_visible_cursor);
+    assert_eq!(
+        from_visible_cursor
+            .first()
+            .and_then(|event| event["index"].as_u64()),
+        Some(visible_cursor),
+        "inclusive durable cursor must retain the visible event at the cursor"
+    );
 }
 
 #[tokio::test]
@@ -4732,7 +5266,7 @@ async fn a4_ledger_empty_after_tool_run_completes() {
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc-a4-ledger", "content", "ok").await;
+    post_tool_result(&app, "tc-a4-ledger", "content", "completed").await;
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -4793,13 +5327,22 @@ async fn a4_ledger_empty_after_cancelled_run() {
     let running = runs
         .iter()
         .find(|r| r["status"].as_str() == Some("running"));
-    if let Some(r) = running {
-        let run_id = r["run_id"].as_str().unwrap();
-        cancel_run(&app, run_id).await;
-    }
+    let running = running.expect("tool_request must have a corresponding running run");
+    let run_id = running["run_id"]
+        .as_str()
+        .expect("running run should expose run_id");
+    assert_eq!(
+        cancel_run(&app, run_id).await,
+        StatusCode::OK,
+        "cancelling the tool-waiting run should succeed"
+    );
 
     // Post tool result so the stream can finish even if cancel didn't interrupt.
-    post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "ok").await;
+    assert_eq!(
+        post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "completed").await,
+        StatusCode::OK,
+        "the cancellation cleanup callback should be accepted"
+    );
 
     let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -5193,7 +5736,7 @@ async fn hook_db_decision_audit_with_tools() {
 
     // Deliver tool results for tc1.
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "success").await;
+    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -5337,11 +5880,11 @@ async fn hook_db_multiple_tools_selected() {
 
     // Deliver tool results for round 1 (tc1).
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "success").await;
+    post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
 
     // Deliver tool results for round 2 (tc2).
     wait_for_sse(&mut rx, "tool_request", 5).await;
-    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "success").await;
+    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "completed").await;
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
         .await
@@ -5477,13 +6020,17 @@ async fn mock_llm_tool_flow_scenario_matrix() {
         },
     ];
 
-    for case in cases {
-        run_mock_tool_scenario(case).await;
+    // These are independent user/session fixtures. Exercise isolation with
+    // bounded concurrency rather than adding every scenario's latency into
+    // one serial deadline or flooding the shared test executor all at once.
+    // Each scenario retains its own event, stream, and persistence deadlines.
+    for pair in cases.chunks(2) {
+        futures_util::future::join_all(pair.iter().cloned().map(run_mock_tool_scenario)).await;
     }
 }
 
 #[tokio::test]
-async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
+async fn mock_llm_memory_followup_preserves_session_binding_without_observer_relearning() {
     let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
     let sid = format!("memory-state-{}", uuid::Uuid::new_v4());
 
@@ -5558,23 +6105,26 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
     );
 
     let hw = hook_writer.clone();
-    let ow = observer_worker.clone();
     poll_until(
         move || {
             let hw = hw.clone();
-            let ow = ow.clone();
-            async move { hw.plans.lock().await.len() >= 2 && ow.requests.lock().await.len() >= 2 }
+            async move { hw.plans.lock().await.len() >= 2 }
         },
         5,
     )
     .await;
 
     let requests = observer_worker.requests.lock().await;
-    assert_eq!(requests.len(), 2, "expected one observer call per turn");
-    assert_eq!(requests[0].session_id, sid);
-    assert_eq!(requests[1].session_id, sid);
-    assert!(requests[0].turn_count >= 1);
-    assert!(requests[1].turn_count >= requests[0].turn_count);
+    // Memory operations are already handled by the dedicated memory tool.
+    // Sending their user-turn segments to the cross-session observer would
+    // re-learn the request, tool result, and confirmation as new knowledge.
+    // Keep this at zero so the test protects the shared anti-feedback-loop
+    // boundary while the hook assertions below prove both turns stayed
+    // durable and attributable to this session.
+    assert!(
+        requests.is_empty(),
+        "structural memory operation turns must not reach the observer"
+    );
     drop(requests);
 
     let hook_plans = hook_writer.plans.lock().await;
@@ -5583,12 +6133,14 @@ async fn mock_llm_memory_followup_preserves_session_local_and_cloud_state() {
         .skill_selection
         .as_ref()
         .expect("store turn skill selection");
+    assert_eq!(store_skill.session_id, sid);
     assert!(store_skill.selected_skills.contains(&"memory".to_string()));
     assert!(store_skill.user_query.contains("记住我喜欢 Rust"));
     let search_skill = hook_plans[1]
         .skill_selection
         .as_ref()
         .expect("search turn skill selection");
+    assert_eq!(search_skill.session_id, sid);
     assert!(search_skill.selected_skills.contains(&"memory".to_string()));
     assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
 }
@@ -5665,7 +6217,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
     ] {
         let request = wait_for_sse(&mut rx, "tool_request", 5).await;
         assert_eq!(request["request_id"].as_str(), Some(id));
-        let status = post_tool_result(&app, id, result, "success").await;
+        let status = post_tool_result(&app, id, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -5759,7 +6311,8 @@ async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetit
             .as_str()
             .expect("tool_request.request_id")
             .to_string();
-        let status = post_tool_result(&app, &request_id, "src/lib.rs:12:// TODO", "success").await;
+        let status =
+            post_tool_result(&app, &request_id, "src/lib.rs:12:// TODO", "completed").await;
         assert_eq!(status, StatusCode::OK);
         callback_request_ids.push(request_id);
     }
@@ -5845,14 +6398,14 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     let first = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r1", "module contents", "success").await,
+        post_tool_result(&app, "tc-budget-r1", "module contents", "completed").await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "success").await,
+        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "completed").await,
         StatusCode::OK
     );
 
@@ -5894,7 +6447,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
                     {
                         "tool_calls": [tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
                     },
-                    { "full_text": "Should never run." }
+                    { "full_text": "Final answer after the hard limit." }
                 ],
                 "edge_tools": [
                     tool_schema("read_file"),
@@ -5909,20 +6462,7 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let first = wait_for_sse(&mut rx, "tool_request", 5).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "success").await,
-        StatusCode::OK
-    );
-
-    let second = wait_for_sse(&mut rx, "tool_request", 5).await;
-    assert_eq!(second["request_id"].as_str(), Some("tc-hard-limit-r2"));
-    assert_eq!(
-        post_tool_result(
-            &app,
-            "tc-hard-limit-r2",
-            "src/lib.rs\nsrc/main.rs",
-            "success"
-        )
-        .await,
+        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "completed").await,
         StatusCode::OK
     );
 
@@ -5935,13 +6475,51 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
         .filter_map(|event| event["content"].as_str().map(str::to_string))
         .collect();
     assert!(
-        text.contains("Turn budget exhausted after 2 agentic turn(s)"),
-        "hard limit should terminate with exhaustion text, got: {text}"
+        text.contains("Final answer after the hard limit."),
+        "hard limit should preserve the text-only settlement boundary, got: {text}"
     );
-    assert!(
-        !text.contains("Should never run."),
-        "hard limit should prevent post-budget final text, got: {text}"
+    let tool_requests = find_events(&events, "tool_request");
+    assert_eq!(
+        tool_requests.len(),
+        1,
+        "hard limit must dispatch exactly one tool request before text-only settlement"
     );
+    assert_eq!(
+        tool_requests[0]["request_id"].as_str(),
+        Some("tc-hard-limit-r1")
+    );
+    let rejected = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"] == "tc-hard-limit-r2")
+        .expect("the denied second provider attempt must have one terminal projection");
+    assert_eq!(rejected["status"], "rejected");
+    assert_eq!(rejected["success"], false);
+
+    let terminal = find_events(&events, "turn_complete")
+        .into_iter()
+        .next()
+        .expect("bounded synthesis must emit one terminal aggregate");
+    assert_eq!(terminal["tool_calls_count"], 2);
+    assert_eq!(terminal["tool_ledger_receipt"]["attempted"], 2);
+    assert_eq!(terminal["tool_ledger_receipt"]["terminal"], 2);
+    assert_eq!(
+        terminal["tool_ledger_receipt"]["result_classes"]["rejected"],
+        1
+    );
+    assert_eq!(terminal["tool_ledger_receipt"]["unresolved"], 0);
+    assert_eq!(terminal["tool_ledger_receipt"]["consistent"], true);
+    let run_finished = find_events(&events, "run_finished")
+        .into_iter()
+        .next()
+        .expect("run terminal");
+    assert_eq!(terminal["execution_state"]["status"], "interrupted");
+    assert_eq!(
+        terminal["execution_state"]["interruption_kind"],
+        "budget_exhausted"
+    );
+    assert_eq!(run_finished["status"], "paused");
+    assert_eq!(run_finished["interruption_kind"], "budget_exhausted");
+    assert_eq!(run_finished["resumable"], true);
 }
 
 #[tokio::test]
@@ -5980,7 +6558,7 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
             "message": "explore the codebase and investigate the root cause",
             "execution_budget": {
                 "initial_turns": 2,
-                "hard_turn_limit": 2
+                "hard_turn_limit": 4
             },
             "context": {
                 "test_llm_rounds": [

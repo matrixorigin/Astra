@@ -191,6 +191,7 @@ mod tests {
                     spawn_tool_call_id: None,
                     execution_metadata: None,
                     delegation_chain: Vec::new(),
+                    workspace_mutation: Default::default(),
                 },
             )
             .await;

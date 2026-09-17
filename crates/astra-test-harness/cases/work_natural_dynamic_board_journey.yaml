@@ -1,0 +1,69 @@
+name: work_natural_dynamic_board_journey
+description: |
+  **What**: Exercise dynamic task-board steering from an ordinary user request that names desired
+  product behavior but no internal Work tools or graph protocol.
+  **Tests**: Semantic decomposition retains a later cancellation/addition as typed lifecycle work;
+  settlement cannot silently skip it; the replacement is executed in the same uninterrupted turn.
+  **Why**: A harness that tells the model which lifecycle tools to call only proves prompt following.
+  This case proves that natural product language reaches the same durable graph authority.
+  **Pass means**: One initial two-item Work is created, the first item is delivered, the original
+  second item is retired before execution, one replacement is accepted and delivered, and no
+  routine user decision is requested.
+  **Fail means**: Both original items run, cancellation/addition exists only in prose, the proposal
+  remains pending, a second Work is created, or the turn closes with unsettled work.
+prompt: |
+  帮我实际演示一下动态任务板。先放两个串行任务：第一个确认根目录 README 的第一行，
+  第二个确认根 Cargo.toml 里的 workspace/package 名称。第一个完成后不要再执行第二个，
+  把第二个取消掉；然后临时追加一个查询当前提交短 SHA 的新任务并完成。全过程直接推进，
+  不要让我审批普通的任务调整，最后简洁总结任务板实际发生的变化。
+models:
+  - deepseek-v4-flash
+capability: "custom:work_natural_dynamic_board_journey"
+difficulty: 5
+weight: 4.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_work_graph_patch
+    require_addition: true
+    require_retired_revision: true
+    require_cancelled_revision: true
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 0
+    max: 0
+    document: result
+    path: /item_id
+    equals: task-2
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: all_of
+    criteria:
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+  - type: tools_count_between
+    min: 6
+    max: 18
+  - type: turn_rounds_between
+    min: 5
+    max: 20

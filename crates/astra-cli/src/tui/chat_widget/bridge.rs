@@ -132,22 +132,35 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::TurnError(msg) => Some(AppEvent::wire(WireEvent::TurnError(msg))),
         TuiAppEvent::SystemWarning(msg) => Some(AppEvent::wire(WireEvent::SystemWarning(msg))),
         TuiAppEvent::SystemInfo(msg) => Some(AppEvent::wire(WireEvent::SystemInfo(msg))),
-        TuiAppEvent::ExplainReport(items) => Some(AppEvent::wire(WireEvent::ExplainReport(items))),
+        TuiAppEvent::ExplainAnalyze(fact) => Some(AppEvent::wire(WireEvent::ExplainAnalyze(fact))),
+        TuiAppEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        } => Some(AppEvent::wire(WireEvent::ExplainAnalyzeSnapshot {
+            events,
+            delivery_degraded,
+        })),
+        TuiAppEvent::ExplainAnalyzeGap => Some(AppEvent::wire(WireEvent::ExplainAnalyzeGap)),
         TuiAppEvent::VerdictReport(items) => Some(AppEvent::wire(WireEvent::VerdictReport(items))),
         TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
+        | TuiAppEvent::SessionBound(_)
+        | TuiAppEvent::RunBound(_)
+        | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
         | TuiAppEvent::ContextSystemPromptTokens(_)
         | TuiAppEvent::ContextWindowMeasured(_)
         | TuiAppEvent::RequestTokenUsage(_)
         | TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
+        | TuiAppEvent::TurnProjectionDrained
         | TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
         | TuiAppEvent::StatusLine(_)
         | TuiAppEvent::UserIntentApplied { .. }
+        | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }

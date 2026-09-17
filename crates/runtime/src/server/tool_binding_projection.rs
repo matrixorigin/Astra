@@ -53,7 +53,7 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
         astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
     let mut seen_mcp_tool_names = HashSet::new();
     schemas
-        .into_iter()
+        .iter()
         .filter(|schema| {
             let Some(tool_name) = tool_schema_name(schema) else {
                 return false;
@@ -72,8 +72,9 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
             {
                 return false;
             }
-            let admission = resolve_tool_visibility_for_providers_with_context(
+            let admission = resolve_tool_visibility_for_providers_with_context_and_schemas(
                 tool_name,
+                &schemas,
                 workspace,
                 executor,
                 runtime,
@@ -83,6 +84,7 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
             );
             admission.visible
         })
+        .cloned()
         .collect()
 }
 
@@ -103,8 +105,9 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
         registry,
         &admission_context,
     );
-    resolve_tool_visibility_for_providers_with_context(
+    resolve_tool_visibility_for_providers_with_context_and_schemas(
         tool_name,
+        schemas,
         workspace,
         executor,
         runtime,
@@ -114,8 +117,9 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
     )
 }
 
-pub(crate) fn resolve_tool_visibility_for_providers_with_context(
+fn resolve_tool_visibility_for_providers_with_context_and_schemas(
     tool_name: &str,
+    schemas: &[Value],
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
@@ -135,12 +139,14 @@ pub(crate) fn resolve_tool_visibility_for_providers_with_context(
     if admission.visible
         && !runtime_surface_allows_selected_decision(
             &admission,
+            schemas,
             workspace,
             executor,
             runtime,
             &ToolPolicySnapshot::default(),
             providers,
             registry,
+            admission_context,
         )
     {
         admission.visible = false;
@@ -151,14 +157,41 @@ pub(crate) fn resolve_tool_visibility_for_providers_with_context(
 
 fn runtime_surface_allows_selected_decision(
     admission: &ToolAdmissionDecision,
+    schemas: &[Value],
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
     policy: &ToolPolicySnapshot,
     providers: &[astra_runtime_env::CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
+    context: &ToolAdmissionContext,
 ) -> bool {
     let tool_name = admission.tool_name.as_str();
+    // A capability-scoped runtime provider may own a schema that is not in the
+    // server builtin registry. It is admitted only when the exact full schema
+    // carried by the provider matches the digest bound into the selected
+    // runtime declaration. A selected offer or tool name by itself is not an
+    // authorization bypass.
+    if registry.get(tool_name).is_none() {
+        if let Some(expected_digest) = context.runtime_declared_tool_schema_digests.get(tool_name) {
+            let schema_matches = schemas.iter().any(|schema| {
+                tool_schema_name(schema) == Some(tool_name)
+                    && astra_runtime_env::canonical_tool_schema_digest(schema) == *expected_digest
+            });
+            if !schema_matches
+                || !admission.selected_offer.as_ref().is_some_and(|offer| {
+                    offer.provider_type.is_runtime_executor()
+                        && !matches!(offer.route, ToolExecutionRouteKind::Unsupported)
+                        && providers
+                            .iter()
+                            .any(|provider| provider.provider_id == offer.provider_id)
+                })
+            {
+                return false;
+            }
+            return true;
+        }
+    }
     // Validate the surface against the provider selected by admission, not
     // against the request's original executor. Shared tools can legitimately
     // select server service while the workspace executor is edge-bound, and
@@ -888,14 +921,14 @@ mod tests {
                 schema("read_file"),
                 schema("write_file"),
                 schema("bash"),
-                schema("git"),
+                schema("glob"),
             ],
             &WorkspaceBinding::server_sandbox("/workspace"),
             &ExecutorBinding::server_local(),
             None,
         ));
 
-        for expected in ["ask_user", "read_file", "write_file", "bash", "git"] {
+        for expected in ["ask_user", "read_file", "write_file", "bash", "glob"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible for a read-write server sandbox runtime"
@@ -925,7 +958,7 @@ mod tests {
             "read_file",
             "write_file",
             "str_replace",
-            "git",
+            "glob",
             "run_script",
             "symbols",
         ] {
@@ -952,7 +985,7 @@ mod tests {
             "read_file",
             "write_file",
             "bash",
-            "git",
+            "glob",
         ] {
             assert!(
                 names.contains(expected),
@@ -981,7 +1014,7 @@ mod tests {
                 "{expected} should remain visible from server/control-plane providers"
             );
         }
-        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "glob"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must be invisible when workspace and executor provider ownership disagree"
@@ -1007,7 +1040,7 @@ mod tests {
                 "{expected} should remain visible from server/control-plane providers"
             );
         }
-        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "glob"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must be invisible when the explicit runtime binding is offline"
@@ -1089,7 +1122,6 @@ mod tests {
 
         for expected in [
             "ask_user",
-            "task_board",
             "session",
             "tool_search",
             "memory",
@@ -1097,7 +1129,7 @@ mod tests {
             "bash",
             "read_file",
             "write_file",
-            "git",
+            "glob",
         ] {
             assert!(
                 names.contains(expected),
@@ -1116,7 +1148,7 @@ mod tests {
     fn binding_projection_hides_control_plane_tools_when_provider_is_unbound() {
         let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
             vec![
-                schema("task_board"),
+                schema("session"),
                 schema("introspect"),
                 schema("reflect"),
                 schema("agent_fanout"),
@@ -1147,13 +1179,7 @@ mod tests {
 
         assert!(names.contains("read_file"), "{names:?}");
         assert!(names.contains("bash"), "{names:?}");
-        for hidden in [
-            "task_board",
-            "introspect",
-            "reflect",
-            "agent_fanout",
-            "memory",
-        ] {
+        for hidden in ["session", "introspect", "reflect", "agent_fanout", "memory"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must not be prompt-visible without a bound provider: {names:?}"
@@ -1416,7 +1442,6 @@ mod tests {
         ));
 
         for expected in [
-            "task_board",
             "session",
             "introspect",
             "reflect",
@@ -1443,6 +1468,56 @@ mod tests {
                 "{hidden} must not be visible in ordinary production server+edge surface: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_projection_preserves_only_matching_dynamic_provider_contract() {
+        let tool = schema("custom_inspect");
+        let workspace =
+            WorkspaceBinding::edge_workspace("edge", "/workspace", WorkspaceAuthority::ReadWrite);
+        let executor = ExecutorBinding {
+            kind: ExecutorBindingKind::EdgeAgent,
+            executor_id: "edge-ledger".into(),
+            display_name: "edge".into(),
+            transport: ToolTransportKind::EdgeLedger,
+            status: ExecutorStatus::Online,
+        };
+        let context = ToolAdmissionContext {
+            runtime_declared_tool_names: Some(["custom_inspect".to_string()].into_iter().collect()),
+            runtime_declared_tool_schema_digests: [(
+                "custom_inspect".to_string(),
+                astra_runtime_env::canonical_tool_schema_digest(&tool),
+            )]
+            .into_iter()
+            .collect(),
+            runtime_declared_tool_native_ids: [(
+                "custom_inspect".to_string(),
+                "custom.inspect".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let projected = capability_filter_tool_schemas_for_binding_with_context(
+            vec![tool.clone()],
+            &workspace,
+            &executor,
+            None,
+            context.clone(),
+        );
+        assert_eq!(projected, vec![tool.clone()]);
+        let mut changed = tool;
+        changed["function"]["description"] = serde_json::json!("changed contract");
+        assert!(
+            capability_filter_tool_schemas_for_binding_with_context(
+                vec![changed],
+                &workspace,
+                &executor,
+                None,
+                context
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1527,7 +1602,7 @@ mod tests {
             Some(&runtime),
         ));
 
-        for expected in ["bash", "read_file", "write_file", "git"] {
+        for expected in ["bash", "read_file", "write_file", "glob"] {
             assert!(
                 names.contains(expected),
                 "{expected} must remain visible when the runtime is ready and isolated even if it does not support long sessions"
@@ -1547,7 +1622,7 @@ mod tests {
             Some(&runtime),
         ));
 
-        for expected in ["bash", "read_file", "write_file", "git"] {
+        for expected in ["bash", "read_file", "write_file", "glob"] {
             assert!(
                 !names.contains(expected),
                 "{expected} must be hidden when runtime topology lacks an enforceable isolation backend"
@@ -1694,7 +1769,15 @@ mod provider_decision_projection_tests {
         policy.network_policy = Some("disabled".to_string());
         assert!(
             !runtime_surface_allows_selected_decision(
-                &admission, &workspace, &executor, None, &policy, &providers, &registry,
+                &admission,
+                &[],
+                &workspace,
+                &executor,
+                None,
+                &policy,
+                &providers,
+                &registry,
+                &ToolAdmissionContext::default(),
             ),
             "route selection must not bypass runtime capability or policy checks"
         );

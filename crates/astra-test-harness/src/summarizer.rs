@@ -33,10 +33,33 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                 })
                 .collect();
             let output_preview: String = r.outcome.text.chars().take(300).collect();
+            let attempts: Vec<serde_json::Value> = r
+                .attempts
+                .iter()
+                .map(|attempt| {
+                    let outcome = &attempt.outcome;
+                    let stderr_preview: String = outcome.stderr.chars().take(300).collect();
+                    serde_json::json!({
+                        "attempt_index": attempt.attempt_index,
+                        "exit_code": outcome.exit_code,
+                        "final_state": outcome.final_state,
+                        "session_id": outcome.session_id,
+                        "run_id": outcome.run_id,
+                        "tokens": outcome.prompt_tokens + outcome.completion_tokens,
+                        "duration_ms": outcome.duration_ms,
+                        "tool_calls": outcome.tool_calls_count,
+                        "tools_used": outcome.tools_used,
+                        "stderr_preview": stderr_preview,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "case": r.case_name,
-                "model": crate::report::normalize_model_display(&r.model),
-                "passed": r.passed,
+                "model": &r.model,
+                "status": r.status,
+                "passed": r.is_passed(),
+                "unavailable": r.is_unavailable(),
+                "cancelled": r.is_cancelled(),
                 "has_warnings": r.has_warnings,
                 "capability": r.capability.as_ref().map(|c| c.to_string()),
                 "difficulty": r.difficulty,
@@ -47,6 +70,33 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                 "tool_calls": r.outcome.tool_calls_count,
                 "tools_used": r.outcome.tools_used,
                 "failure_class": r.failure_class.as_ref().map(|c| c.to_string()),
+                "execution": r.execution.as_ref().map(|execution| serde_json::json!({
+                    "scope": match execution.scope {
+                        crate::pipeline_analysis::ExecutionTraceScope::Session => "session",
+                        crate::pipeline_analysis::ExecutionTraceScope::CaseAttempts => "case_attempts",
+                    },
+                    "expected_capture_count": execution.expected_capture_count,
+                    "captured_capture_count": execution.captured_capture_count,
+                    "total_tool_calls": execution.total_tool_calls,
+                    "executed_tool_calls": execution.executed_tool_calls,
+                    "successful_tool_calls": execution.successful_tool_calls,
+                    "failed_tool_calls": execution.failed_tool_calls,
+                    "rejected_tool_calls": execution.rejected_tool_calls,
+                    "reused_tool_calls": execution.reused_tool_calls,
+                    "suppressed_tool_calls": execution.suppressed_tool_calls,
+                    "deferred_tool_calls": execution.deferred_tool_calls,
+                    "unknown_outcome_tool_calls": execution.unknown_outcome_tool_calls,
+                    "unknown_disposition_tool_calls": execution.unknown_disposition_tool_calls,
+                    "settlement_attempts": execution.settlement_attempts,
+                    "successful_settlements": execution.successful_settlements,
+                    "rejected_settlements": execution.rejected_settlements,
+                    "runtime_rejection_reasons": execution.runtime_rejection_reasons,
+                    "evidence_complete": execution.evidence_complete,
+                    "skipped_lines": execution.skipped_lines,
+                    "dropped_lines": execution.dropped_lines,
+                    "integrity_errors": execution.integrity_errors,
+                })),
+                "attempts": attempts,
                 "criteria": criteria,
                 "output_preview": output_preview,
             })
@@ -56,13 +106,16 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
     let models: std::collections::BTreeSet<&str> = report
         .runs
         .iter()
-        .map(|r| crate::report::normalize_model_display(&r.model))
+        .filter(|r| r.is_evidence())
+        .map(|r| r.model.as_str())
         .collect();
 
     serde_json::json!({
         "total": report.total(),
         "passed": report.passed(),
         "failed": report.failed(),
+        "cancelled": report.cancelled(),
+        "unavailable": report.unavailable(),
         "warnings": report.runs.iter().filter(|r| r.has_warnings).count(),
         "wall_time_ms": report.wall_time_ms,
         "models_tested": models,
@@ -167,10 +220,21 @@ pub async fn summarize(
         .map_err(|e| format!("summarizer wait: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let text = serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
-        .unwrap_or_else(|| stdout.trim().to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "summarizer exited {}: {}",
+            output.status,
+            stderr.chars().take(500).collect::<String>()
+        ));
+    }
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("summarizer stdout is not valid JSON: {error}"))?;
+    let text = envelope
+        .get("text")
+        .and_then(|value| value.as_str())
+        .ok_or("summarizer stdout missing string 'text' field")?
+        .to_string();
 
     if text.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -186,7 +250,8 @@ pub async fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{CaseRunReport, SuiteReport};
+    use crate::pipeline_analysis::ExecutionTraceReport;
+    use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, SuiteReport};
     use crate::runner::RunOutcome;
 
     #[test]
@@ -195,7 +260,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "c1".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: Some(crate::case::Capability::ToolUse),
                 weight: 2.0,
@@ -211,7 +276,16 @@ mod tests {
                 },
                 criteria: vec![],
                 steps: vec![],
+                attempts: Vec::new(),
                 session: None,
+                session_captures: Vec::new(),
+                execution: Some(ExecutionTraceReport {
+                    total_tool_calls: 3,
+                    executed_tool_calls: 1,
+                    successful_tool_calls: 1,
+                    suppressed_tool_calls: 2,
+                    ..Default::default()
+                }),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -231,9 +305,85 @@ mod tests {
         assert!(run.get("criteria").is_some());
         assert!(run.get("output_preview").is_some());
         assert!(run.get("has_warnings").is_some());
+        assert_eq!(run["execution"]["executed_tool_calls"], 1);
+        assert_eq!(run["execution"]["successful_tool_calls"], 1);
+        assert_eq!(run["execution"]["suppressed_tool_calls"], 2);
         // Must NOT contain large fields
         assert!(run.get("stderr").is_none());
         assert!(run.get("session").is_none());
+    }
+
+    #[test]
+    fn summary_payload_excludes_cancelled_only_models_from_tested_models() {
+        let mut cancelled = CaseRunReport {
+            case_name: "c1".into(),
+            model: "m".into(),
+            status: CaseRunStatus::Cancelled,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            attempts: Vec::new(),
+            session: None,
+            session_captures: Vec::new(),
+            execution: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: None,
+            has_warnings: false,
+        };
+        cancelled.outcome.text = "not executed".into();
+        let payload = build_summary_payload(&SuiteReport {
+            runs: vec![cancelled],
+            ..Default::default()
+        });
+        assert_eq!(payload["cancelled"], 1);
+        assert_eq!(payload["models_tested"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["runs"][0]["cancelled"], true);
+    }
+
+    #[test]
+    fn summary_attempts_are_bounded_projections() {
+        let mut first = RunOutcome::new("m");
+        first.text = "x".repeat(200_000);
+        first.stderr = "y".repeat(200_000);
+        let report = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "retry".into(),
+                model: "m".into(),
+                status: CaseRunStatus::Passed,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: RunOutcome::new("m"),
+                criteria: vec![],
+                steps: vec![],
+                attempts: vec![AttemptRecord {
+                    attempt_index: 0,
+                    outcome: first,
+                }],
+                session: None,
+                session_captures: Vec::new(),
+                execution: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+                failure_class: None,
+                has_warnings: true,
+            }],
+            ..Default::default()
+        };
+        let payload = build_summary_payload(&report);
+        let attempt = &payload["runs"][0]["attempts"][0];
+        assert!(attempt.get("text").is_none());
+        assert!(attempt.get("stderr").is_none());
+        assert!(attempt["stderr_preview"].as_str().unwrap().len() <= 300);
+        assert!(serde_json::to_vec(&payload).unwrap().len() < 10_000);
     }
 
     #[test]
@@ -245,5 +395,40 @@ mod tests {
         assert!(prompt.contains("Astra Agent Issues"));
         assert!(prompt.contains("Case Design Issues"));
         assert!(prompt.contains("Model Capability Comparison"));
+    }
+
+    #[tokio::test]
+    async fn summarizer_rejects_text_emitted_by_failed_subprocess() {
+        use crate::test_support::write_executable_shim;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(
+            &shim,
+            "#!/bin/sh\necho '{\"text\":\"fabricated summary\"}'\necho 'model failed' 1>&2\nexit 17\n",
+        )
+        .expect("write shim");
+
+        let error = summarize(&shim, None, "summary-model", &SuiteReport::default(), 5)
+            .await
+            .expect_err("non-zero summarizer must not become a successful narrative");
+        assert!(error.contains("summarizer exited"), "{error}");
+        assert!(error.contains("model failed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn summarizer_rejects_raw_text_from_successful_subprocess() {
+        use crate::test_support::write_executable_shim;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(&shim, "#!/bin/sh\nprintf '%s\\n' 'raw summary'\n")
+            .expect("write shim");
+
+        let error = summarize(&shim, None, "summary-model", &SuiteReport::default(), 5)
+            .await
+            .expect_err("raw stdout is not the typed summary envelope");
+        assert!(error.contains("not valid JSON"), "{error}");
     }
 }

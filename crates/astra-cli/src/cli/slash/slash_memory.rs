@@ -158,7 +158,7 @@ pub(crate) async fn handle_memory_domain_command(
                                 hint.as_ref().map(|h| h.summary.as_str()),
                                 Some(&status),
                             );
-                            println!("{out}");
+                            stdout_println!("{out}");
                         }
                         Err(error) => {
                             eprintln!("  {} {}", theme::icon_err(), error.red());
@@ -184,10 +184,18 @@ pub(crate) async fn handle_memory_domain_command(
                                 print_json_or_raw(&body);
                             }
                         }
-                        Ok(r) => eprintln!(
-                            "{}",
-                            format!("  ✗ Memory search failed ({})", r.status()).red()
-                        ),
+                        Ok(r) => {
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            eprintln!(
+                                "  ✗ Memory search failed: {}",
+                                crate::cli::cli_config::cli_utils::read_api_error(
+                                    status.as_u16(),
+                                    &body
+                                )
+                                .red()
+                            );
+                        }
                         Err(e) => eprintln!("{}", format!("  ✗ Memory unreachable: {e}").red()),
                     }
                 }
@@ -209,7 +217,18 @@ pub(crate) async fn handle_memory_domain_command(
                                 print_json_or_raw(&body);
                             }
                         }
-                        Ok(r) => eprintln!("{}", format!("  ✗ Failed ({})", r.status()).red()),
+                        Ok(r) => {
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            eprintln!(
+                                "  ✗ Memory list failed: {}",
+                                crate::cli::cli_config::cli_utils::read_api_error(
+                                    status.as_u16(),
+                                    &body
+                                )
+                                .red()
+                            );
+                        }
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
                 }
@@ -348,7 +367,16 @@ pub(crate) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("{}", format!("  ✗ Search failed ({})", r.status()).red())
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            eprintln!(
+                                "  ✗ Search failed: {}",
+                                crate::cli::cli_config::cli_utils::read_api_error(
+                                    status.as_u16(),
+                                    &body
+                                )
+                                .red()
+                            );
                         }
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }
@@ -592,7 +620,16 @@ pub(crate) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("{}", format!("  ✗ Stats failed ({})", r.status()).red())
+                            let status = r.status();
+                            let body = r.text().await.unwrap_or_default();
+                            eprintln!(
+                                "  ✗ Stats failed: {}",
+                                crate::cli::cli_config::cli_utils::read_api_error(
+                                    status.as_u16(),
+                                    &body
+                                )
+                                .red()
+                            );
                         }
                         Err(e) => eprintln!("{}", format!("  ✗ Unreachable: {e}").red()),
                     }

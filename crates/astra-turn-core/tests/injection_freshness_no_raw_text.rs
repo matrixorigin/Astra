@@ -73,7 +73,7 @@ fn injection_freshness_event_carries_no_raw_text_keys() {
     dispatch(&mut accum, allowed_event);
 
     let bundle = accum
-        .bridge_injection_fingerprints
+        .injection_fingerprints
         .as_ref()
         .expect("fingerprint bundle not populated");
     assert_eq!(bundle.channels.len(), 2);
@@ -102,7 +102,7 @@ fn missing_bridge_event_leaves_fingerprints_none_not_empty_default() {
     // that the observation pipe itself failed. Field stays `None`.
     let accum = ChatTurnSseAccum::default();
     assert!(
-        accum.bridge_injection_fingerprints.is_none(),
+        accum.injection_fingerprints.is_none(),
         "missing bridge observation must remain None (untracked), not be defaulted to empty"
     );
 }

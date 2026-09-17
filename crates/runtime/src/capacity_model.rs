@@ -194,6 +194,46 @@ impl CapacityInput {
             decision,
         }
     }
+
+    /// Return the durable admission budget that backs one deployment.
+    ///
+    /// `ASTRA_RUN_CONCURRENCY_LIMIT` is the capacity of one server process,
+    /// while `ASTRA_CAPACITY_POD_COUNT` describes how many equivalent server
+    /// processes share the same durable admission domain.  Keeping the
+    /// provider-slot budget derived from those same inputs prevents a local
+    /// semaphore from advertising capacity that the cross-pod admission gate
+    /// will immediately reject.
+    pub(crate) fn distributed_admission_limits(&self) -> astra_services::WeightedAdmissionLimits {
+        let global_provider_slots = self.pod_count.saturating_mul(self.run_slots_per_pod).max(1);
+        let per_owner_provider_slots = self
+            .pod_count
+            .saturating_mul(self.run_slots_per_pod)
+            .saturating_mul(4)
+            .saturating_div(5)
+            .max(1)
+            .min(global_provider_slots);
+
+        astra_services::WeightedAdmissionLimits {
+            global: astra_services::AdmissionWork {
+                resident_bytes: 8 * 1024 * 1024 * 1024,
+                context_tokens: 8_000_000,
+                provider_slots: global_provider_slots,
+                cpu_units: 8 * 1024 * 1024 * 1024,
+                io_bytes: 8 * 1024 * 1024 * 1024,
+            },
+            per_owner: astra_services::AdmissionWork {
+                resident_bytes: 6 * 1024 * 1024 * 1024,
+                context_tokens: 6_000_000,
+                provider_slots: per_owner_provider_slots,
+                cpu_units: 6 * 1024 * 1024 * 1024,
+                io_bytes: 6 * 1024 * 1024 * 1024,
+            },
+        }
+    }
+
+    pub(crate) fn run_concurrency_limit(&self) -> usize {
+        self.run_slots_per_pod as usize
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -496,6 +536,36 @@ mod tests {
         assert_eq!(plan.total_tool_slots, 30);
         assert_eq!(plan.total_endpoint_rpc_slots, 384);
         assert_eq!(plan.estimated_control_poll_qps, 300.0);
+    }
+
+    #[test]
+    fn distributed_admission_follows_per_pod_and_pod_count_capacity() {
+        let limits = CapacityInput {
+            pod_count: 3,
+            run_slots_per_pod: 100,
+            ..input()
+        }
+        .distributed_admission_limits();
+
+        assert_eq!(limits.global.provider_slots, 300);
+        assert_eq!(limits.per_owner.provider_slots, 240);
+        assert!(limits.per_owner.provider_slots < limits.global.provider_slots);
+    }
+
+    #[test]
+    fn zero_capacity_environment_values_fail_closed_to_safe_defaults() {
+        let _lock = env_test_lock().lock().expect("env test lock poisoned");
+        let _pods = EnvVarGuard::set(ENV_POD_COUNT, "0");
+        let _runs = EnvVarGuard::set(ENV_RUN_LIMIT, "0");
+
+        let input = CapacityInput::from_env();
+
+        assert_eq!(input.pod_count, DEFAULT_POD_COUNT);
+        assert_eq!(input.run_slots_per_pod, DEFAULT_RUN_SLOTS_PER_POD);
+        assert_eq!(
+            input.run_concurrency_limit(),
+            DEFAULT_RUN_SLOTS_PER_POD as usize
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! semantics. This in-memory implementation is the executable contract used
 //! by unit tests and local runtimes; it is not a semantic result cache.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use astra_turn_types::{
     DispatchCertainty, ToolInvocationCompletionSource, ToolInvocationDecision,
@@ -17,6 +17,8 @@ use thiserror::Error;
 #[derive(Default)]
 pub struct InMemoryInvocationLedger {
     entries: BTreeMap<ToolInvocationIdentity, ToolInvocationRecord>,
+    run_members: BTreeMap<(String, String), BTreeSet<ToolInvocationIdentity>>,
+    terminal_order: VecDeque<ToolInvocationIdentity>,
 }
 
 impl InMemoryInvocationLedger {
@@ -47,6 +49,10 @@ impl InMemoryInvocationLedger {
             outcome: None,
             completion_source: None,
         };
+        self.run_members
+            .entry((identity.user_id.clone(), identity.run_id.clone()))
+            .or_default()
+            .insert(identity.clone());
         self.entries.insert(identity, entry.clone());
         Ok(ToolInvocationPrepareOutcome::Prepared(entry))
     }
@@ -59,7 +65,21 @@ impl InMemoryInvocationLedger {
         identity: &ToolInvocationIdentity,
         lease: ToolInvocationDispatchLease,
     ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
-        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+        let candidate = self.dispatch_claim_candidate(identity, lease)?;
+        self.commit_dispatch_claim(candidate)
+    }
+
+    /// Validate one dispatch transition without mutating the authoritative
+    /// map. Process-local run admission uses this single-record candidate so
+    /// a failed control fence leaves neither a claimed invocation nor a
+    /// stranded admission grant; cloning the full ledger would make every
+    /// tool dispatch O(total process history).
+    pub fn dispatch_claim_candidate(
+        &self,
+        identity: &ToolInvocationIdentity,
+        lease: ToolInvocationDispatchLease,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let mut entry = self.entries.get(identity).cloned().ok_or_else(|| {
             InvocationLedgerError::MissingInvocation {
                 identity: identity.clone(),
             }
@@ -75,7 +95,40 @@ impl InMemoryInvocationLedger {
         entry.dispatch_certainty = DispatchCertainty::Dispatched;
         entry.attempt_count = entry.attempt_count.saturating_add(1);
         entry.dispatch_lease = Some(lease);
-        Ok(entry.clone())
+        Ok(entry)
+    }
+
+    /// Publish a candidate produced by [`Self::dispatch_claim_candidate`].
+    /// The caller must serialize this with the candidate read. Revalidation
+    /// remains fail-closed so accidental unlocked use cannot overwrite a
+    /// concurrent terminal or dispatch owner.
+    pub fn commit_dispatch_claim(
+        &mut self,
+        candidate: ToolInvocationRecord,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let identity = candidate.identity.clone();
+        let current = self.entries.get(&identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if current.state != ToolInvocationState::Prepared {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity,
+                expected: ToolInvocationState::Prepared,
+                actual: current.state,
+            });
+        }
+        if candidate.state != ToolInvocationState::Dispatched
+            || !current
+                .fingerprint
+                .same_tool_and_arguments(&candidate.fingerprint)
+            || current.decision != candidate.decision
+        {
+            return Err(InvocationLedgerError::IdentityConflict { identity });
+        }
+        self.entries.insert(identity, candidate.clone());
+        Ok(candidate)
     }
 
     pub fn renew_dispatch(
@@ -128,7 +181,9 @@ impl InMemoryInvocationLedger {
         }
         entry.state = ToolInvocationState::OutcomeUnknown;
         entry.dispatch_certainty = DispatchCertainty::Unknown;
-        Ok(entry.clone())
+        let completed = entry.clone();
+        self.terminal_order.push_back(identity.clone());
+        Ok(completed)
     }
 
     pub fn mark_outcome_unknown(
@@ -139,7 +194,9 @@ impl InMemoryInvocationLedger {
         let entry = self.dispatched_entry_for_owner(identity, owner_id)?;
         entry.state = ToolInvocationState::OutcomeUnknown;
         entry.dispatch_certainty = DispatchCertainty::Unknown;
-        Ok(entry.clone())
+        let completed = entry.clone();
+        self.terminal_order.push_back(identity.clone());
+        Ok(completed)
     }
 
     pub fn compare_and_complete(
@@ -181,7 +238,9 @@ impl InMemoryInvocationLedger {
         entry.dispatch_certainty = DispatchCertainty::Dispatched;
         entry.outcome = Some(outcome);
         entry.completion_source = None;
-        Ok(entry.clone())
+        let completed = entry.clone();
+        self.terminal_order.push_back(identity.clone());
+        Ok(completed)
     }
 
     /// Atomically complete a prepared invocation from a trusted semantic read
@@ -211,11 +270,76 @@ impl InMemoryInvocationLedger {
         entry.outcome = Some(ToolInvocationTerminalOutcome::Succeeded { result });
         entry.completion_source = Some(completion_source);
         entry.validate()?;
-        Ok(entry.clone())
+        let completed = entry.clone();
+        self.terminal_order.push_back(identity.clone());
+        Ok(completed)
     }
 
     pub fn get(&self, identity: &ToolInvocationIdentity) -> Option<&ToolInvocationRecord> {
         self.entries.get(identity)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// A terminal run may retire prepared and completed records, but it must
+    /// retain any invocation that crossed dispatch or whose outcome remains
+    /// uncertain so late acknowledgements can still reconcile safely.
+    pub fn has_unsettled_dispatch(&self) -> bool {
+        self.entries.values().any(|record| {
+            matches!(
+                record.state,
+                ToolInvocationState::Dispatched | ToolInvocationState::OutcomeUnknown
+            )
+        })
+    }
+
+    /// Return one terminal candidate for lifecycle-aware retirement. The
+    /// runtime must prove the owning run is terminal or gone before removal;
+    /// terminal tool results inside an active/paused run remain replay truth.
+    pub fn take_oldest_terminal_candidate(&mut self) -> Option<ToolInvocationIdentity> {
+        while let Some(identity) = self.terminal_order.pop_front() {
+            if self
+                .entries
+                .get(&identity)
+                .is_some_and(|record| record.state.is_terminal())
+            {
+                return Some(identity);
+            }
+        }
+        None
+    }
+
+    pub fn defer_terminal_candidate(&mut self, identity: ToolInvocationIdentity) {
+        if self
+            .entries
+            .get(&identity)
+            .is_some_and(|record| record.state.is_terminal())
+        {
+            self.terminal_order.push_back(identity);
+        }
+    }
+
+    pub fn remove_run(&mut self, user_id: &str, run_id: &str) -> usize {
+        let Some(identities) = self
+            .run_members
+            .remove(&(user_id.to_string(), run_id.to_string()))
+        else {
+            return 0;
+        };
+        let removed = identities.len();
+        for identity in identities {
+            self.entries.remove(&identity);
+        }
+        // Stale terminal queue entries are discarded incrementally by
+        // `take_oldest_terminal_candidate`; avoiding a full queue retain here
+        // keeps lifecycle retirement proportional to this run's own history.
+        removed
     }
 
     fn dispatched_entry_for_owner(

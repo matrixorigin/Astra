@@ -3,7 +3,7 @@
     "status": 200,
     "json": {
       "name": "Agent Engine API",
-      "version": "0.1.0",
+      "version": "<dynamic-package-version>",
       "docs": ""
     }
   },
@@ -14,8 +14,8 @@
         "status": "healthy",
         "database": "connected",
         "memoria": "disabled",
-        "persist_ok": 0,
-        "persist_fail": 0
+        "interaction_api_major": "3",
+        "build_git_sha": "<dynamic-build-git-sha>"
       }
     },
     "unhealthy": {
@@ -24,8 +24,8 @@
         "status": "unhealthy",
         "database": "unavailable",
         "memoria": "disabled",
-        "persist_ok": 0,
-        "persist_fail": 0
+        "interaction_api_major": "3",
+        "build_git_sha": "<dynamic-build-git-sha>"
       }
     }
   },

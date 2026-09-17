@@ -23,6 +23,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { SkillMentionText } from "@/components/app/skill-mention-text";
+import { ExplainAnalyzePanel } from "@/components/app/explain-analyze-panel";
 import { IconButton } from "@/components/ui/icon-button";
 import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
@@ -198,7 +199,9 @@ export const MessageBubble = memo(function MessageBubble({
     message.status !== "streaming" &&
     !content.trim() &&
     !hasReasoning &&
-    !hasArtifacts;
+    !hasArtifacts &&
+    !message.explainAnalyzeEvents?.length &&
+    !message.explainAnalyzeDegraded;
   const { addToast } = useToast();
   const [copied, setCopied] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -278,6 +281,20 @@ export const MessageBubble = memo(function MessageBubble({
       ) : (
         <MarkdownContent content={content} />
       )}
+      {message.explainAnalyzeEvents?.length || message.explainAnalyzeDegraded ? (
+        <ExplainAnalyzePanel
+          events={message.explainAnalyzeEvents ?? []}
+          degraded={message.explainAnalyzeDegraded}
+          live={assistantStillStreaming}
+        />
+      ) : null}
+      {message.artifactPublication ? (
+        <div role="status" className={`mt-2 rounded-md border px-3 py-2 text-xs ${message.artifactPublication.status === "unavailable" ? "border-amber-500/30 text-amber-600" : "border-border text-muted-foreground"}`}>
+          {message.artifactPublication.status === "published" ? (
+            <><p>Explain report saved · available to the agent</p><code className="mt-1 block break-all select-all">{message.artifactPublication.handle}</code></>
+          ) : <p>Explain report unavailable · {message.artifactPublication.message}</p>}
+        </div>
+      ) : null}
       {hasArtifacts ? <ArtifactList artifacts={artifacts} /> : null}
       {message.status !== "streaming" ? (
         <div className="mt-3 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">

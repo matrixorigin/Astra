@@ -1,0 +1,61 @@
+name: multi_turn_tool_pairing_integrity
+description: |
+  **What**: Interleave tool calls with text responses over many rounds, then verify
+  the session completes without tool_use/tool_result pairing errors.
+  **Tests**: The message pairing invariant across ordinary multi-turn continuation.
+  **Why**: Every tool_use block must retain a matching tool_result before the next
+  provider request, independently of any optional compaction policy.
+  **Pass means**: multiple real tool calls across 3+ turns complete without 400/500
+  pairing errors; the exact number of calls is provider-controlled.
+  **Fail means**: The provider rejects an unpaired conversation or the runtime loses work.
+prompt: |
+  Do these in separate tool calls, one at a time:
+  1. Run: echo "step-1-marker"
+  2. Run: echo "step-2-marker"
+  3. Read file: Cargo.toml (first 10 lines)
+  Then say "phase-1-complete".
+capability: tool_use
+difficulty: 2
+weight: 1.5
+timeout_seconds: 180
+steps:
+  - prompt: |
+      Continue with more tool calls:
+      4. Run: echo "step-4-marker"
+      5. Run: echo "step-5-marker"
+      6. Read file: Makefile (first 10 lines)
+      Then say "phase-2-complete".
+    criteria:
+      - type: text_contains
+        needle: phase-2-complete
+      - type: tool_called
+        name: bash
+  - prompt: |
+      One final batch:
+      7. Run: echo "step-7-marker"
+      8. Run: echo "step-8-final"
+      Then answer with exactly `ECHO_COUNT: 6` and nothing else.
+    criteria:
+      - type: text_equals
+        expected: "ECHO_COUNT: 6"
+      - type: tool_called
+        name: bash
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: bash
+  - type: tool_called
+    name: read_file
+  - type: text_contains
+    needle: phase-1-complete
+  - type: journal_tool_called
+    name: bash
+  - type: journal_tool_called
+    name: read_file
+  - type: tools_count_between
+    min: 6
+    max: 40
+  - type: turn_rounds_between
+    min: 3
+    max: 40

@@ -6,8 +6,8 @@
 //!
 //! - [`Judger`] trait — injectable scoring backend. Tests use
 //!   `FakeJudger`; production uses [`AstraCliJudger`].
-//! - [`AstraCliJudger`] — shells out to `astra chat -m <prompt>
-//!   --model <m> --json --quiet` and parses the response.
+//! - [`AstraCliJudger`] — shells out to `astra session judge -m <prompt>
+//!   --model <m>` and parses the JSON response.
 //! - [`parse_score_from_response`] — pure parser for `SCORE: <f>`.
 //!   Separated so a flaky judger response can be debugged without
 //!   re-invoking the provider.
@@ -15,8 +15,9 @@
 //! ## Why a subprocess judger?
 //!
 //! No new HTTP client, no new auth surface — the judger inherits the
-//! same tool-restriction gate as the regular CLI, so it can't
-//! accidentally spawn sub-agents or mutate state while scoring.
+//! canonical profile authentication and Offering admission as the CLI. The
+//! governed auxiliary completion has no tools or agent lifecycle to execute
+//! the quoted task while scoring it.
 
 use std::path::PathBuf;
 
@@ -61,7 +62,7 @@ pub struct JudgerConfig {
     /// Default model to use when a Judger criterion doesn't
     /// specify its own.
     pub default_model: String,
-    /// Timeout for each judger call.
+    /// Server-owned provider deadline for each built-in judgment (1–120s).
     pub timeout_seconds: u64,
 }
 
@@ -74,6 +75,13 @@ impl JudgerConfig {
             timeout_seconds: 120,
         }
     }
+}
+
+pub fn validate_builtin_judger_timeout(seconds: u64) -> Result<(), String> {
+    if !(1..=120).contains(&seconds) {
+        return Err("built-in --judger-timeout must be between 1 and 120 seconds".into());
+    }
+    Ok(())
 }
 
 /// Injectable scoring backend. Tests use a fake impl; production uses
@@ -152,8 +160,8 @@ pub async fn evaluate_judger(
             criterion: criterion.clone(),
             severity: crate::criteria::criterion_severity(criterion),
             passed: false,
-            detail: format!("judger call failed: {e}"),
-            full_detail: None,
+            detail: format!("judger call failed: {}", truncate_for_judger(&e, 200)),
+            full_detail: Some(format!("judger call failed: {e}")),
             score: None,
         }),
     }
@@ -182,9 +190,23 @@ impl Judger for AstraCliJudger {
             .unwrap_or(self.cfg.default_model.as_str())
             .to_string();
         let prompt = build_judger_prompt(question, outcome);
-        run_judger_call(&self.cfg, &judger_model, &prompt).await
+        match run_judger_call(&self.cfg, &judger_model, &prompt).await {
+            Err(error) if error.starts_with("no complete SCORE: line") => {
+                // Preserve the line-anchored parser: accepting an inline
+                // marker would let untrusted agent output masquerade as a
+                // judge result. One bounded re-evaluation repairs model
+                // formatting drift without weakening that trust boundary.
+                let repair_prompt = format!(
+                    "{prompt}\n\nYour previous response violated the required output format. Re-evaluate the same evidence. End with a standalone final line exactly matching `SCORE: <float between 0.0 and 1.0>`."
+                );
+                run_judger_call(&self.cfg, &judger_model, &repair_prompt).await
+            }
+            result => result,
+        }
     }
 }
+
+pub(crate) const JUDGER_STDERR_CAP: usize = 8_000;
 
 /// Assemble the judger prompt. Structured as: (1) rubric + anti-gaming
 /// language, (2) what the agent produced (tool calls + final text),
@@ -192,7 +214,7 @@ impl Judger for AstraCliJudger {
 /// explicit about claim-vs-evidence because the common judger failure
 /// mode is scoring an agent high for *claiming* a task was done when
 /// no supporting evidence exists in the tool calls or text.
-fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
+pub(crate) fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
     // Data sections are fenced + length-bounded + declared as data
     // (not instructions). This mitigates prompt-injection from the
     // agent's own output — e.g. a captured stdout text containing a
@@ -200,10 +222,9 @@ fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
     // Anything inside a `data:` fence must be treated as untrusted
     // input; the judger's answer comes after the question, not from
     // the data.
-    const STDERR_CAP: usize = 8_000;
     const TEXT_CAP: usize = 8_000;
     let text = truncate_for_judger(&outcome.text, TEXT_CAP);
-    let stderr = truncate_for_judger(&outcome.stderr, STDERR_CAP);
+    let stderr = truncate_for_judger(&outcome.stderr, JUDGER_STDERR_CAP);
     format!(
         "You are a strict, skeptical test judge scoring an agent's run.\n\
          \n\
@@ -263,7 +284,7 @@ fn build_judger_prompt(question: &str, outcome: &RunOutcome) -> String {
 /// recent lines usually hold the `[fork-cache]` / `[selector]`
 /// events. A middle-truncation with an explicit marker beats a
 /// pure head-truncation for our use.
-fn truncate_for_judger(s: &str, max: usize) -> String {
+pub(crate) fn truncate_for_judger(s: &str, max: usize) -> String {
     let len = s.chars().count();
     if len <= max {
         return s.to_string();
@@ -286,18 +307,20 @@ async fn run_judger_call(
     use std::time::Duration;
     use tokio::process::Command;
 
+    validate_builtin_judger_timeout(cfg.timeout_seconds)?;
+
     let mut cmd = Command::new(&cfg.astra_bin);
     if let Some(profile) = &cfg.profile {
         cmd.arg("--profile").arg(profile);
     }
-    cmd.arg("chat")
+    cmd.arg("session")
+        .arg("judge")
         .arg("-m")
         .arg(prompt)
-        .arg("--no-resume")
         .arg("--model")
         .arg(model)
-        .arg("--json")
-        .arg("--quiet")
+        .arg("--timeout-seconds")
+        .arg(cfg.timeout_seconds.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Capture stderr too (was previously discarded to Stdio::null)
@@ -308,7 +331,9 @@ async fn run_judger_call(
         .kill_on_drop(true);
 
     let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
-    let timeout = Duration::from_secs(cfg.timeout_seconds);
+    // The Server owns the inference deadline. Leave transport, profile/model
+    // resolution and session closure room to settle before this process watchdog.
+    let timeout = Duration::from_secs(cfg.timeout_seconds.saturating_add(60));
 
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
@@ -318,6 +343,12 @@ async fn run_judger_call(
     let stdout_body = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr_body = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_code = output.status.code();
+    if !output.status.success() {
+        return Err(format!(
+            "judger subprocess failed (exit_code={exit_code:?})\n{}",
+            judger_failure_output(&stdout_body, &stderr_body)
+        ));
+    }
     parse_score_from_response(&stdout_body).map_err(|parse_err| {
         // Carry the subprocess's stderr + exit code into the error
         // the reviewer sees. Without this, "model refused" and
@@ -333,72 +364,77 @@ async fn run_judger_call(
     })
 }
 
+/// Failed processes can put their typed interruption in stdout. Preserve it as
+/// diagnostic data, never parse a score from a non-successful subprocess.
+fn judger_failure_output(stdout: &str, stderr: &str) -> String {
+    let envelope = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    let mut identity = serde_json::Map::new();
+    if let Some(envelope) = envelope {
+        for key in [
+            "session_id",
+            "run_id",
+            "completion_id",
+            "final_state",
+            "interruption_kind",
+        ] {
+            if let Some(value) = envelope.get(key).filter(|v| v.is_string()) {
+                identity.insert(
+                    key.into(),
+                    serde_json::Value::String(truncate_for_judger(value.as_str().unwrap(), 300)),
+                );
+            }
+        }
+    }
+    format!(
+        "subprocess identity (data): {}\nsubprocess stdout (data):\n{}\nsubprocess stderr (data):\n{}",
+        serde_json::Value::Object(identity),
+        truncate_for_judger(stdout.trim(), 4_000),
+        truncate_for_judger(stderr.trim(), 1_500),
+    )
+}
+
 /// Extract `SCORE: <f>` from a judger response. We parse the
 /// astra CLI's JSON envelope first and scan its `text` field.
 pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore, String> {
     let trimmed = stdout_body.trim();
-    // astra chat --json returns an object with text; fall back to
-    // raw body if parse fails.
-    let text = serde_json::from_str::<serde_json::Value>(trimmed)
-        .ok()
-        .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
-        .unwrap_or_else(|| trimmed.to_string());
+    // The latest CLI contract is a typed JSON envelope. A successful process
+    // with raw text is still a protocol failure, not a compatibility mode.
+    let envelope: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("judger response is not valid JSON: {error}"))?;
+    let text = envelope
+        .get("text")
+        .and_then(|value| value.as_str())
+        .ok_or("judger response missing string 'text' field")?;
 
-    // Scan for the last line matching "SCORE: <f>". Last-line wins
-    // in case the model repeats itself.
-    let re = regex::Regex::new(r"(?i)SCORE:\s*([0-9]+(?:\.[0-9]+)?)")
+    // Scan for the last complete line matching "SCORE: <f>". Anchoring the
+    // line prevents prose such as "SCORE: 1.0 was suggested" from becoming
+    // a score, and the latest complete line wins if the model repeats itself.
+    let re = regex::Regex::new(r"(?im)^\s*SCORE:\s*([0-9]+(?:\.[0-9]+)?)\s*$")
         .map_err(|e| format!("regex compile: {e}"))?;
-    let captured = match re.captures_iter(&text).last().and_then(|c| c.get(1)) {
+    let captured = match re.captures_iter(text).last().and_then(|c| c.get(1)) {
         Some(m) => m,
         None => {
-            // Fallback: some models output a bare float on the last
-            // line (e.g. "0.85") without the SCORE: prefix. Try to
-            // parse the last non-empty line as a float in [0,1].
-            let fallback = text
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .and_then(|l| l.trim().parse::<f64>().ok())
-                .filter(|&v| (0.0..=1.0).contains(&v));
-            if let Some(score) = fallback {
-                eprintln!(
-                    "[astra-test] WARNING: judger omitted SCORE: prefix; \
-                     inferred {score} from last line"
-                );
-                let rationale = text.trim().to_string();
-                return Ok(JudgerScore {
-                    score,
-                    rationale: rationale.chars().take(200).collect(),
-                    full_rationale: rationale,
-                    votes: Vec::new(),
-                });
-            }
-            return Err(format!("no SCORE: line in judger response; text={text:?}"));
+            return Err(format!(
+                "no complete SCORE: line in judger response; text={text:?}"
+            ));
         }
     };
     let score: f64 = captured
         .as_str()
         .parse()
         .map_err(|e| format!("parse score {:?}: {e}", captured.as_str()))?;
-    // Clamp to [0.0, 1.0] — a judger returning 2.0 has misread the
-    // rubric (maybe confused 0–10 scale), and silently capping at
-    // 1.0 would make a miscalibrated run look like a clean pass.
-    // Surface the anomaly on stderr so the suite operator notices.
-    if !(0.0..=1.0).contains(&score) {
-        eprintln!(
-            "[astra-test] WARNING: judger returned out-of-range score {score}; \
-             clamped to [0.0, 1.0]. This usually means the judger model \
-             misread the rubric (e.g. scored on 0-10 instead of 0-1)."
-        );
+    if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+        return Err(format!(
+            "judger score {score} is outside the required finite range [0,1]"
+        ));
     }
-    let clamped = score.clamp(0.0, 1.0);
     // Rationale = everything before the SCORE line, last sentence.
     let rationale = text
         .rsplit_once("SCORE:")
         .map(|(prefix, _)| prefix.trim().to_string())
         .unwrap_or_default();
     Ok(JudgerScore {
-        score: clamped,
+        score,
         rationale: rationale.chars().take(200).collect(),
         full_rationale: rationale,
         // Single judge call — no votes to expose.
@@ -517,7 +553,8 @@ fn aggregate_scores(scores: &[f64], agg: QuorumAgg) -> f64 {
         QuorumAgg::Max => scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
         QuorumAgg::Median => {
             let mut s = scores.to_vec();
-            // NaN shouldn't appear (parser clamps + rejects), but total_cmp
+            // NaN should never appear (the parser rejects non-finite scores),
+            // but total_cmp
             // defends against future callers.
             s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mid = s.len() / 2;
@@ -693,31 +730,26 @@ impl Judger for ExternalCmdJudger {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let v: serde_json::Value = serde_json::from_str(stdout.trim())
-            .map_err(|e| format!("judger-cmd stdout not valid JSON: {e}"))?;
-
-        let raw_score = v
-            .get("score")
-            .and_then(|s| s.as_f64())
-            .ok_or("judger-cmd output missing numeric 'score' field")?;
-        if !(0.0..=1.0).contains(&raw_score) {
-            eprintln!(
-                "[astra-test] WARNING: external judger returned out-of-range score {raw_score}; \
-                 clamped to [0.0, 1.0]"
-            );
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ExternalJudgerResponse {
+            score: f64,
+            rationale: String,
         }
-        let score = raw_score.clamp(0.0, 1.0);
-        let rationale = v
-            .get("rationale")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
+        let response: ExternalJudgerResponse = serde_json::from_str(stdout.trim())
+            .map_err(|e| format!("judger-cmd stdout not valid JSON typed envelope: {e}"))?;
+        if !response.score.is_finite() || !(0.0..=1.0).contains(&response.score) {
+            return Err(format!(
+                "external judger score {} is outside the required finite range [0,1]",
+                response.score
+            ));
+        }
 
         Ok(JudgerScore {
-            score,
-            rationale: rationale.clone(),
-            full_rationale: rationale,
-            votes: vec![score],
+            score: response.score,
+            rationale: response.rationale.clone(),
+            full_rationale: response.rationale,
+            votes: vec![response.score],
         })
     }
 }
@@ -735,10 +767,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_score_clamps_above_one() {
+    fn parse_score_rejects_above_one() {
         let body = r#"{"text":"OK\nSCORE: 1.5"}"#;
-        let s = parse_score_from_response(body).unwrap();
-        assert!((s.score - 1.0).abs() < 1e-9);
+        let error = parse_score_from_response(body).unwrap_err();
+        assert!(error.contains("range"), "{error}");
     }
 
     #[test]
@@ -757,10 +789,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_score_bare_float_fallback() {
+    fn parse_score_rejects_bare_float_without_score_marker() {
         let body = r#"{"text":"The agent did well.\n0.85"}"#;
-        let s = parse_score_from_response(body).unwrap();
-        assert!((s.score - 0.85).abs() < 1e-9);
+        assert!(parse_score_from_response(body).is_err());
     }
 
     #[test]
@@ -770,12 +801,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_score_accepts_raw_body_without_json_envelope() {
-        // Judger model might print raw text for some reason. Don't
-        // fail — just scan the raw body.
+    fn parse_score_rejects_raw_body_without_json_envelope() {
         let body = "whatever\nSCORE: 0.55";
-        let s = parse_score_from_response(body).unwrap();
-        assert!((s.score - 0.55).abs() < 1e-9);
+        let error = parse_score_from_response(body).unwrap_err();
+        assert!(error.contains("not valid JSON"), "{error}");
     }
 
     #[tokio::test]
@@ -805,13 +834,11 @@ mod tests {
         let err = j
             .score("question", None, &dummy_outcome())
             .await
-            .expect_err("shim exits non-zero, so parse will fail");
-        // The original parse-failure message is preserved.
+            .expect_err("shim exits non-zero, so the score must fail closed");
         assert!(
-            err.contains("no SCORE:"),
-            "base parse error preserved: {err}"
+            err.contains("judger subprocess failed"),
+            "subprocess status must be authoritative: {err}"
         );
-        // New surface: stderr from subprocess AND exit code.
         assert!(
             err.contains("rate limit exceeded"),
             "subprocess stderr must flow into the error: {err}"
@@ -819,6 +846,65 @@ mod tests {
         assert!(
             err.contains("exit_code=Some(42)"),
             "subprocess exit code must appear: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_judge_preserves_stdout_identity_but_never_accepts_its_score() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("fake-astra");
+        crate::test_support::write_executable_shim(&shim,
+            "#!/bin/sh\nprintf '%s\\n' '{\"session_id\":\"judge-session\",\"run_id\":\"judge-run\",\"interruption_kind\":\"execution_incomplete\",\"text\":\"SCORE: 1.0\"}'\nexit 5\n").unwrap();
+        let judger = AstraCliJudger::new(JudgerConfig::new(shim, "judge-model"));
+        let criterion = Criterion::Judger {
+            question: "Did the task finish?".into(),
+            threshold: 0.8,
+            model: None,
+        };
+        let result = evaluate_judger(&judger, &criterion, &dummy_outcome())
+            .await
+            .unwrap();
+        assert!(!result.passed);
+        assert!(result.score.is_none());
+        let detail = result.full_detail.unwrap();
+        assert!(detail.contains("exit_code=Some(5)"));
+        assert!(detail.contains("judge-session"));
+        assert!(detail.contains("execution_incomplete"));
+        assert!(detail.contains("subprocess stdout (data)"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn judger_repairs_only_a_score_line_format_failure_once() {
+        use crate::test_support::write_executable_shim;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("calls");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(
+            &shim,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then\n  printf 'x\\n' >> '{}'\n  printf '%s\\n' '{{\"text\":\"Evidence remains sufficient.\\nSCORE: 1.0\"}}'\nelse\n  printf 'x\\n' > '{}'\n  printf '%s\\n' '{{\"text\":\"Evidence is sufficient. SCORE: 1.0\"}}'\nfi\n",
+                state.display(),
+                state.display(),
+                state.display(),
+            ),
+        )
+        .expect("write shim");
+
+        let score = AstraCliJudger::new(JudgerConfig::new(shim, "judge-model"))
+            .score("question", None, &dummy_outcome())
+            .await
+            .expect("one formatting repair should recover a valid judgment");
+        assert_eq!(score.score, 1.0);
+        assert_eq!(
+            std::fs::read_to_string(state)
+                .expect("call log")
+                .lines()
+                .count(),
+            2,
+            "format repair must be bounded to one retry"
         );
     }
 
@@ -848,7 +934,9 @@ mod tests {
         assert_eq!(score.score, 1.0);
         let args = std::fs::read_to_string(log).unwrap();
         assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
-        assert!(args.contains("--no-resume\n"), "{args}");
+        assert!(args.contains("session\njudge\n"), "{args}");
+        assert!(args.contains("--timeout-seconds\n120\n"), "{args}");
+        assert!(!args.lines().any(|arg| arg == "chat"), "{args}");
     }
 
     fn dummy_outcome() -> RunOutcome {
@@ -1035,12 +1123,13 @@ mod tests {
 
     #[test]
     fn parse_score_preserves_full_rationale() {
-        let body = "short\nvery long rationale that exceeds the 200 character \
+        let text = "short\nvery long rationale that exceeds the 200 character \
                     truncation limit for the inline detail line, containing important \
                     debugging detail about what the judge actually observed so this \
                     must survive into full_rationale even when rationale is clipped.\n\
                     SCORE: 0.42";
-        let s = parse_score_from_response(body).unwrap();
+        let body = serde_json::json!({"text": text}).to_string();
+        let s = parse_score_from_response(&body).unwrap();
         // Inline field must be ≤ 200 chars for report compactness.
         assert!(s.rationale.chars().count() <= 200);
         // Full text must survive truncation — failing FAIL reports without
@@ -1278,14 +1367,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_judger_clamps_out_of_range_score() {
+    async fn external_judger_rejects_out_of_range_score() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
         let script = r#"echo '{"score": 1.5, "rationale": "overconfident"}'"#;
         let j = ExternalCmdJudger::new(script, 10);
-        let s = j.score("q", None, &dummy_outcome()).await.unwrap();
-        assert!((s.score - 1.0).abs() < 1e-9, "score must be clamped to 1.0");
+        let error = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("out-of-range score must fail closed");
+        assert!(error.contains("range"), "{error}");
     }
 
     #[tokio::test]
@@ -1338,6 +1430,19 @@ mod tests {
             .await
             .expect_err("missing score field must fail");
         assert!(err.contains("score"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_missing_rationale_field_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let j = ExternalCmdJudger::new(r#"echo '{"score": 0.8}'"#, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("missing rationale must fail closed");
+        assert!(err.contains("rationale"), "{err}");
     }
 
     #[tokio::test]

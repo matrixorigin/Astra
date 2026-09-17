@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 use super::ToolExecutor;
 
 impl ToolExecutor {
-    #[allow(unused_assignments)]
     pub(super) fn adjust_config(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => p.trim(),
@@ -19,14 +18,17 @@ impl ToolExecutor {
         let Some(obs) = self.observability_session.as_ref() else {
             return json!({"error": "No observability session available"}).to_string();
         };
-        let mut session = match obs.write() {
-            Ok(g) => g,
-            Err(_) => {
-                return json!({"error": "Failed to acquire observability session"}).to_string();
-            }
+        let (turn, session_snapshot, observed_config) = {
+            let session = match obs.read() {
+                Ok(session) => session,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (
+                session.turn_number,
+                session.rollback_snapshot(),
+                session.config.clone(),
+            )
         };
-
-        let turn = session.turn_number;
         let constraints = ConstraintSet::default();
         let mut counter = match self.self_mod_mutation_counter.lock() {
             Ok(c) => c,
@@ -46,195 +48,162 @@ impl ToolExecutor {
         }
 
         let ceiling = constraints.config_drift_ceiling;
-        let session_snapshot = session.rollback_snapshot();
-        let old_value: Option<Value>;
-        let new_value: Option<Value>;
-        let mut drift: Option<f64> = None;
-
-        let parse_u32 = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
-        let parse_f64 = |v: &Value| v.as_f64();
-
-        match path {
-            "compression.compression_threshold" => {
-                let Some(new) = parse_f64(value) else {
-                    return json!({"error": "value must be a number"}).to_string();
-                };
-                if !(0.5..=0.98).contains(&new) {
-                    return json!({"error": "compression.compression_threshold must be within [0.5, 0.98]"}).to_string();
-                }
-                let old = session.config.compression.compression_threshold;
-                if let Some(d) = bounded_drift(old, new, 0.5, 0.98) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
+        let active_session_id = self.active_session_id();
+        let (old_value, new_value, drift, durable_revision, audit_recorded, audit_warning) =
+            if let Some(session_id) = active_session_id.as_deref() {
+                let (receipt, drift) =
+                    match crate::cli::self_command::persist_governed_config_override(
+                        session_id,
+                        path,
+                        value.clone(),
+                        force,
+                        ceiling,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(crate::cli::self_command::GovernedConfigMutationError::Rejected(
+                            rejection,
+                        )) => return rejection.to_string(),
+                        Err(
+                            crate::cli::self_command::GovernedConfigMutationError::Persistence(
+                                error,
+                            ),
+                        ) => {
+                            return json!({
+                                "error": "failed_to_persist_config_override",
+                                "path": path,
+                                "detail": error,
+                            })
+                            .to_string();
+                        }
+                        Err(
+                            crate::cli::self_command::GovernedConfigMutationError::OutcomeUnknown(
+                                unknown,
+                            ),
+                        ) => {
+                            let projection_warning = match unknown.observed_config {
+                                Some(config) => match obs.write() {
+                                    Ok(mut session) => {
+                                        session.config = config;
+                                        None
+                                    }
+                                    Err(_) => Some(
+                                        "observability config projection lock poisoned".to_string(),
+                                    ),
+                                },
+                                None => Some("workspace config readback unavailable".to_string()),
+                            };
+                            counter.1 += 1;
+                            let rollback_recorded = unknown.retry_revision.is_some();
+                            if let Some(owner_revision) = unknown.retry_revision {
+                                self.record_adjust_config_rollback(
+                                    path.to_string(),
+                                    unknown.preview.old_value.clone(),
+                                    session_snapshot,
+                                    Some(owner_revision),
+                                );
+                            }
+                            return json!({
+                                "error": "config_commit_outcome_unknown",
+                                "path": path,
+                                "old": unknown.preview.old_value,
+                                "new": unknown.preview.new_value,
+                                "drift": unknown.drift,
+                                "proposed_revision": unknown.proposed_revision,
+                                "observed_revision": unknown.observed_revision,
+                                "retry_revision": unknown.retry_revision,
+                                "side_effects_maybe": true,
+                                "mutations_this_turn": counter.1,
+                                "rollback_recorded": rollback_recorded,
+                                "audit_recorded": false,
+                                "projection_recorded": projection_warning.is_none(),
+                                "projection_warning": projection_warning,
+                                "detail": unknown.reason.chars().take(240).collect::<String>(),
+                            })
+                            .to_string();
+                        }
+                    };
+                let projection_warning = match obs.write() {
+                    Ok(mut session) => {
+                        session.config = receipt.committed_config;
+                        None
                     }
-                    drift = Some(d);
-                }
-                session.config.compression.compression_threshold = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            "memory.retrieval_top_k" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
+                    Err(_) => Some("observability config projection lock poisoned"),
                 };
-                if !(1..=20).contains(&new) {
-                    return json!({"error": "memory.retrieval_top_k must be within [1, 20]"})
-                        .to_string();
-                }
-                let old = session.config.memory.retrieval_top_k;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 1.0, 20.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.memory.retrieval_top_k = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            "token_budget.max_turn_input_tokens" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(8_000..=200_000).contains(&new) {
-                    return json!({"error": "token_budget.max_turn_input_tokens must be within [8000, 200000]"}).to_string();
-                }
-                let old = session.config.token_budget.max_turn_input_tokens;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 8_000.0, 200_000.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.token_budget.max_turn_input_tokens = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            "token_budget.tools_reserve" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(1_000..=40_000).contains(&new) {
-                    return json!({"error": "token_budget.tools_reserve must be within [1000, 40000]"}).to_string();
-                }
-                let old = session.config.token_budget.tools_reserve;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 1_000.0, 40_000.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.token_budget.tools_reserve = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            "verification.strictness" => {
-                let Some(new) = parse_f64(value) else {
-                    return json!({"error": "value must be a number"}).to_string();
-                };
-                if !(0.2..=0.95).contains(&new) {
-                    return json!({"error": "verification.strictness must be within [0.2, 0.95]"})
-                        .to_string();
-                }
-                let old = session.config.verification.strictness;
-                if let Some(d) = bounded_drift(old, new, 0.2, 0.95) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.verification.strictness = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            _ => {
+                counter.1 += 1;
+                self.record_adjust_config_rollback(
+                    path.to_string(),
+                    receipt.preview.old_value.clone(),
+                    session_snapshot,
+                    Some(receipt.config_revision),
+                );
                 return json!({
-                    "error": "Unsupported config path",
+                    "status": "completed",
                     "path": path,
-                    "supported_paths": [
-                        "compression.compression_threshold",
-                        "memory.retrieval_top_k",
-                        "token_budget.max_turn_input_tokens",
-                        "token_budget.tools_reserve",
-                        "verification.strictness"
-                    ]
+                    "old": receipt.preview.old_value,
+                    "new": receipt.preview.new_value,
+                    "turn": turn,
+                    "mutations_this_turn": counter.1,
+                    "max_mutations_per_turn": constraints.max_mutations_per_turn,
+                    "drift": drift,
+                    "drift_ceiling": ceiling,
+                    "config_revision": receipt.config_revision,
+                    "audit_recorded": receipt.audit_recorded,
+                    "audit_warning": receipt.audit_warning,
+                    "projection_recorded": projection_warning.is_none(),
+                    "projection_warning": projection_warning,
                 })
                 .to_string();
-            }
-        }
-
-        if let Some(session_id) = self.active_session_id()
-            && let Some(ref persisted_value) = new_value
-            && let Err(error) = crate::cli::self_command::persist_config_override(
-                &session_id,
-                path,
-                persisted_value.clone(),
-            )
-        {
-            session.restore_rollback_snapshot(&session_snapshot);
-            return json!({
-                "error": "failed_to_persist_config_override",
-                "path": path,
-                "detail": error,
-            })
-            .to_string();
-        }
+            } else {
+                let (preview, candidate_config, drift) =
+                    match crate::cli::self_command::prepare_governed_config_mutation(
+                        "ephemeral",
+                        path,
+                        value.clone(),
+                        &observed_config,
+                        force,
+                        ceiling,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(rejection) => return rejection.to_string(),
+                    };
+                let mut session = match obs.write() {
+                    Ok(session) => session,
+                    Err(_) => {
+                        return json!({"error": "Failed to acquire observability session"})
+                            .to_string();
+                    }
+                };
+                session.config = candidate_config;
+                (
+                    preview.old_value,
+                    preview.new_value,
+                    drift,
+                    None,
+                    true,
+                    None::<String>,
+                )
+            };
 
         counter.1 += 1;
-        let path_owned = path.to_string();
-        if let Some(old_value) = old_value.clone() {
-            self.record_adjust_config_rollback(path_owned, old_value, session_snapshot);
-        }
+        self.record_adjust_config_rollback(
+            path.to_string(),
+            old_value.clone(),
+            session_snapshot,
+            durable_revision,
+        );
         json!({
             "status": "completed",
             "path": path,
-            "old": old_value.unwrap_or(Value::Null),
-            "new": new_value.unwrap_or(Value::Null),
+            "old": old_value,
+            "new": new_value,
             "turn": turn,
             "mutations_this_turn": counter.1,
             "max_mutations_per_turn": constraints.max_mutations_per_turn,
             "drift": drift,
-            "drift_ceiling": ceiling
+            "drift_ceiling": ceiling,
+            "audit_recorded": audit_recorded,
+            "audit_warning": audit_warning,
+            "projection_recorded": true,
         })
         .to_string()
     }
@@ -289,12 +258,4 @@ impl ToolExecutor {
         })
         .to_string()
     }
-}
-
-fn bounded_drift(old: f64, new: f64, min: f64, max: f64) -> Option<f64> {
-    let span = max - min;
-    if span <= f64::EPSILON {
-        return None;
-    }
-    Some((new - old).abs() / span)
 }

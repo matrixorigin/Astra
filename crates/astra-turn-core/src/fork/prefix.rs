@@ -114,10 +114,9 @@ pub enum ProviderKind {
 impl ProviderKind {
     /// Infer a [`ProviderKind`] from a provider-or-model hint string.
     ///
-    /// Mirrors the shape of
-    /// `microcompact::ProviderCacheStrategy::from_provider_hint`, but
-    /// produces fine-grained variants instead of a binary
-    /// cache-capability classification.
+    /// This legacy identity parser produces fine-grained provider variants for
+    /// fork-prefix bookkeeping. It is not a prompt-cache capability source;
+    /// cache behavior comes from explicit deployment metadata.
     ///
     /// Known mappings (case-insensitive):
     /// - `"claude*"` / `"anthropic*"`                  → Anthropic

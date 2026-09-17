@@ -351,7 +351,13 @@ mod enabled {
                 Json(ErrorResponse::new("not enough snapshots for diff yet")),
             ));
         }
-        Ok(Json(SnapshotDiff::between(&history[1], &history[0])))
+        // The other harness reads are metadata-only for non-admin callers.
+        // Apply the same projection before computing a diff; otherwise
+        // `new_tools` (and any future sensitive snapshot fields) would leak
+        // through this otherwise owner-checked endpoint.
+        let from = sanitize_snapshot(history[1].clone());
+        let to = sanitize_snapshot(history[0].clone());
+        Ok(Json(SnapshotDiff::between(&from, &to)))
     }
 
     #[cfg(test)]

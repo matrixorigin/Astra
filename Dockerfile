@@ -1,42 +1,35 @@
 # Keep this aligned with rust-toolchain.toml. The cargo-chef and final build
 # stages must use the same compiler or the cooked dependency artifacts cannot
-# be reused.
+# be reused. The digest pins the current multi-architecture image index.
 ARG RUST_VERSION=1.97.0-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
-ARG CARGO_REGISTRY=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
-ARG DEBIAN_MIRROR=https://mirrors.aliyun.com
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE_DIRTY=true
+# Optional build accelerators for restricted or regional networks. Public
+# builds use the upstream Cargo and Debian sources by default.
+ARG CARGO_REGISTRY
+ARG DEBIAN_MIRROR
 
-FROM rust:${RUST_VERSION} AS chef
+FROM rust:${RUST_VERSION}@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS chef
 
 ARG CARGO_CHEF_VERSION
 ARG CARGO_REGISTRY
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
 
-# Promote proxy build args to environment variables so apt, cargo, and git can
-# consume them in this base stage and all stages derived from it.
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
-ENV NO_PROXY=${NO_PROXY}
+# Docker exposes standard proxy build arguments to RUN instructions without an
+# ARG declaration. Do not redeclare or promote them to ENV: proxy URLs may
+# contain credentials, and declared values can persist in build metadata.
 
 WORKDIR /app
 
 RUN set -eux; \
-    if [ -n "${CARGO_REGISTRY}" ]; then \
+    if [ -n "${CARGO_REGISTRY:-}" ]; then \
         mkdir -p "${CARGO_HOME}"; \
         printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" > "${CARGO_HOME}/config.toml"; \
     fi
 
 RUN set -eux; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
         case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
@@ -55,27 +48,45 @@ FROM chef AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
+FROM chef AS dependency-inputs
 
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
+# Keep patched path dependencies available while cooking the workspace skeleton.
+# Their source also participates in the dependency cache key.
+COPY vendor ./vendor
+# CI and the real builder share this filesystem. Full dependency resolution
+# validates every path dependency, including patches outside workspace members;
+# cargo-chef prepare's --no-deps metadata alone cannot do that.
+RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json --no-build && \
+    cargo metadata --locked --format-version 1 > /dev/null
+
+FROM dependency-inputs AS builder
+
+ARG IMAGE_REVISION
+ARG IMAGE_SOURCE_DIRTY
+
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
-RUN cargo chef cook --release --no-default-features --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --no-default-features \
+COPY vendor ./vendor
+RUN ASTRA_BUILD_SOURCE_GIT_SHA="${IMAGE_REVISION}" \
+    ASTRA_BUILD_SOURCE_GIT_DIRTY="${IMAGE_SOURCE_DIRTY}" \
+    cargo build --release --locked --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \
     cp target/release/astra-server target/release/astra /out/
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
@@ -83,25 +94,18 @@ ARG IMAGE_BRANCH=unknown
 
 LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.description="Astra API server and CLI runtime image" \
-      org.opencontainers.image.source="https://github.com/matrixorigin/astra" \
+      org.opencontainers.image.url="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.source="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.documentation="https://github.com/matrixorigin/Astra#readme" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="MatrixOrigin" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
 
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
-ENV NO_PROXY=${NO_PROXY}
+# Standard proxy build arguments remain available to apt during RUN without
+# being copied into the final image configuration.
 
 WORKDIR /app
 RUN set -eux; \
@@ -111,7 +115,7 @@ RUN set -eux; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
             | xargs -0 -r sed -i -E "s#${from_regex}#${to_base}#g"; \
     }; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
         case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         mirror_host="${mirror#http://}"; \
@@ -123,7 +127,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         if [ "${mirror}" != "${bootstrap_mirror}" ]; then \
             replace_apt_sources "https?://${mirror_host_regex}" "${mirror}"; \
             apt-get update; \
@@ -131,14 +135,17 @@ RUN set -eux; \
     fi; \
     apt-get install -y --no-install-recommends curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
-    groupadd -r appgroup; \
-    useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
+    groupadd --gid 10001 appgroup; \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/appuser --shell /usr/sbin/nologin appuser
 COPY --from=builder /out/astra-server /usr/local/bin/astra-server
 COPY --from=builder /out/astra /usr/local/bin/astra
-# WORKDIR writable for appgroup; K8s runAsUser overrides should add supplementalGroups: [appgroup GID].
+COPY LICENSE /usr/share/licenses/astra/LICENSE
+# WORKDIR is writable by the fixed non-root runtime identity.
 # Prefer mounted volumes for real data rather than writing to /app at runtime.
-RUN chown root:appgroup /app && chmod 0770 /app
-USER appuser
+RUN chown root:appgroup /app && \
+    chmod 0770 /app && \
+    chmod 0444 /usr/share/licenses/astra/LICENSE
+USER 10001:10001
 
 EXPOSE 17001
 ENV HOME=/home/appuser

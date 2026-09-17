@@ -53,9 +53,7 @@ pub fn emit_headless_tool_body_preview(
         "read_file" => emit_read_file_preview(term, result_str),
         "write_file" => emit_write_file_diff_preview(term, result_str),
         "str_replace" => emit_str_replace_or_dry_run_diff_preview(term, result_str),
-        "git" if result_looks_like_unified_diff(result_str) => {
-            emit_plain_diffish_preview(term, result_str)
-        }
+
         "multi_edit" => {
             emit_str_replace_or_dry_run_diff_preview(term, result_str);
             if !result_str.contains(STR_REPLACE_DIFF_START) && !result_str.contains("--- a/") {
@@ -415,30 +413,6 @@ mod tests {
         let mut term = MockTerminal::new();
         emit_headless_tool_body_preview(&mut term, false, "unknown_tool", "output", false);
         assert!(term.lines.is_empty());
-    }
-
-    #[test]
-    fn preview_git_emits_only_diff_like_output() {
-        let mut term = MockTerminal::new();
-        emit_headless_tool_body_preview(
-            &mut term,
-            false,
-            "git",
-            "--- a/f.rs\n+++ b/f.rs\n-old\n+new",
-            false,
-        );
-        assert!(!term.lines.is_empty());
-        assert!(term.lines[0].1.contains("diff"));
-
-        let mut non_diff = MockTerminal::new();
-        emit_headless_tool_body_preview(
-            &mut non_diff,
-            false,
-            "git",
-            "On branch main\nnothing to commit",
-            false,
-        );
-        assert!(non_diff.lines.is_empty());
     }
 
     #[test]

@@ -1,0 +1,85 @@
+name: task_resolution_schema_correction
+description: |
+  A matching task-resolution submission that fails runtime provider-schema
+  validation before dispatch gets exactly one bounded correction, and the
+  corrected assessment can complete the same reconciliation boundary.
+prompt: |
+  Tell me the exact first line of README.md in this workspace.
+  First run `astra_missing_reader_probe_827 README.md` once in Bash. If the
+  command is unavailable, do not retry it or install anything; read the first
+  line directly with read_file in a later turn.
+  Before the runtime explicitly emits its typed
+  outcome_reconciliation_required.v1 boundary and supplies the task-resolution
+  schema, gather evidence only; do not attempt a task-resolution submission
+  early. At that boundary, use the supplied carrier call_shape for
+  submit_task_resolution directly. Put the target's flat arguments object under
+  invoke_tool's arguments field, copy the evidence call IDs from the runtime
+  hint, and omit scope and boundary because the runtime binds them. Do not run
+  tool_search in this boundary; its runtime hint supplies the exact schema and
+  invocation authority. Deliberately make this first boundary submission
+  invalid by setting remaining_gaps to an array containing only a string
+  longer than 256 characters. Use exactly the 257-character string
+  "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx". Wait for the runtime's explicit one-time schema-correction instruction, change only the remaining_gaps field to [] because the direct read resolves the request, and submit once more under the same active boundary. Do not make any workspace changes.
+  In the final answer, report the
+  observed first line and distinguish the failed command attempt from the
+  successful direct read.
+models:
+  - deepseek-v4-flash
+capability: tool_use
+difficulty: 3
+weight: 1.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_outcome_count
+    name: bash
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: read_file
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: submit_task_resolution
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: submit_task_resolution
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: arguments
+    path: /remaining_gaps/0
+    equals: "OVERLENGTH:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: runtime_metadata
+    path: /pre_dispatch_rejection
+    equals: provider_schema_validation
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: runtime_metadata
+    path: /disposition
+    equals: rejected
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: result
+    path: /conclusion
+    equals: supported
+  - type: journal_tool_json
+    name: submit_task_resolution
+    document: arguments
+    path: /remaining_gaps
+    equals: []
+  - type: turn_rounds_between
+    min: 4
+    max: 12
+  - type: text_not_contains
+    needle: "The bounded completion action was not executed"

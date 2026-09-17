@@ -27,6 +27,13 @@ pub const DEFAULT_SOURCE: &str = "main";
 /// At cap=10 that's negligible; raising this above ~64 should switch
 /// `source_order` to `VecDeque` or an indexed linked structure.
 const MAX_TRACKED_SOURCES: usize = 10;
+const MAX_TRACKED_PROVIDER_ATTEMPTS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAttemptCacheIdentity {
+    pub request_id: String,
+    pub attempt: u32,
+}
 pub const MAX_WARM_CACHE_READ_SHARE_DROP: f64 = 0.05;
 
 /// Rollout gate derived from provider-reported warm-cache read share.
@@ -227,9 +234,70 @@ pub struct PromptStateSnapshot {
     pub timestamp_secs: u64,
     /// Total estimated cache-eligible tokens (system + tools).
     pub cache_eligible_tokens: usize,
+    /// Provider-final component identity captured from the immutable body
+    /// receipt.  This is optional only for backward-compatible restoration of
+    /// snapshots written before provider-final receipts existed.
+    #[serde(default)]
+    pub provider_final_fingerprint: Option<ProviderFinalPromptFingerprint>,
+}
+
+/// Content-free identity of the exact provider payload components.
+///
+/// The transport computes these hashes from the same sanitized JSON value it
+/// serializes for HTTP.  They deliberately do not carry provider body content
+/// or infer semantics from provider/model labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFinalPromptFingerprint {
+    pub message_sequence_sha256: String,
+    pub system_sequence_sha256: String,
+    pub cache_key_system_sha256: String,
+    pub conversation_sequence_sha256: String,
+    pub tool_schema_sequence_sha256: String,
+    pub cache_key_tool_schema_sequence_sha256: String,
+    #[serde(default)]
+    pub cache_capability: crate::cache_placement::CacheCapability,
+    #[serde(default)]
+    pub cache_key_tool_schema_items: Vec<ProviderFinalToolFingerprint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFinalToolFingerprint {
+    pub name: Option<String>,
+    pub sha256: String,
 }
 
 impl PromptStateSnapshot {
+    /// Attach the immutable provider-final fingerprint that owns structural
+    /// cache-break attribution for this snapshot.  Planned hashes remain only
+    /// as human-readable attribution detail when the final receipt proves a
+    /// component changed.
+    pub fn attach_provider_final_fingerprint(
+        &mut self,
+        fingerprint: ProviderFinalPromptFingerprint,
+    ) {
+        self.provider_final_fingerprint = Some(fingerprint);
+    }
+
+    /// Replace candidate tool fingerprints with the exact provider-wire
+    /// schemas after runtime stabilization and cache annotation.
+    ///
+    /// Prompt assembly may prune or retain schemas after the context pipeline
+    /// has produced its candidate set. Diagnostics must describe the request
+    /// that was actually sent, otherwise lifecycle projection appears as a
+    /// cache break even when the wire prefix stayed byte-stable.
+    pub fn replace_tool_schemas(&mut self, tool_schemas: &[serde_json::Value]) {
+        let replacement = Self::capture_with_hashes(
+            self.system_prompt_hash,
+            self.system_blocks.clone(),
+            tool_schemas,
+            &self.provider,
+            &self.model,
+            self.cache_eligible_tokens,
+        );
+        self.tools_hash = replacement.tools_hash;
+        self.per_tool_hashes = replacement.per_tool_hashes;
+    }
+
     /// Create a snapshot from the current prompt state.
     pub fn capture(
         system_prompt_text: &str,
@@ -332,6 +400,7 @@ impl PromptStateSnapshot {
             model: model.to_string(),
             timestamp_secs: now,
             cache_eligible_tokens,
+            provider_final_fingerprint: None,
         }
     }
 }
@@ -383,10 +452,42 @@ pub fn prompt_snapshot_from_messages(
     model: &str,
     cache_eligible_tokens: usize,
 ) -> Option<PromptStateSnapshot> {
+    prompt_snapshot_from_messages_with_cache_capability(
+        messages,
+        tool_schemas,
+        provider,
+        model,
+        cache_eligible_tokens,
+        None,
+    )
+}
+
+/// Build a cache snapshot using the same provider capability that shaped the
+/// final message list.
+///
+/// The caller must pass the final provider message shape. Every remaining
+/// The cache-keyed system identity follows the final resolved wire shape.
+/// Prefix providers fingerprint only the contiguous leading system header;
+/// strict-history shapes that fold system context fingerprint every system
+/// block; marker protocols fingerprint through their last explicit marker.
+/// Deployments that require append-only runtime control project it as a typed
+/// runtime-owned conversation frame, so it never becomes a system mutation.
+pub fn prompt_snapshot_from_messages_with_cache_capability(
+    messages: &[serde_json::Value],
+    tool_schemas: &[serde_json::Value],
+    provider: &str,
+    model: &str,
+    cache_eligible_tokens: usize,
+    explicit_cache_capability: Option<crate::cache_placement::CacheCapability>,
+) -> Option<PromptStateSnapshot> {
+    let cache_capability = crate::cache_placement::CacheCapability::from_explicit_or_provider(
+        explicit_cache_capability,
+        provider,
+    );
     let system_prompt_text = prompt_snapshot_system_text_from_messages(messages);
     let snapshot = PromptStateSnapshot::capture_with_hashes(
         hash_str(&system_prompt_text),
-        prompt_snapshot_fingerprint_system_blocks(messages),
+        prompt_snapshot_fingerprint_system_blocks(messages, cache_capability),
         tool_schemas,
         provider,
         model,
@@ -449,11 +550,49 @@ fn prompt_snapshot_content_value_text(value: &serde_json::Value) -> String {
 
 fn prompt_snapshot_fingerprint_system_blocks(
     messages: &[serde_json::Value],
+    cache_capability: crate::cache_placement::CacheCapability,
 ) -> Vec<SystemBlockFingerprint> {
-    prompt_snapshot_selected_message_contents(messages)
-        .into_iter()
-        .flat_map(prompt_snapshot_content_value_blocks)
-        .collect()
+    use crate::cache_placement::{CacheProtocol, VolatilePlacement};
+
+    let mut out = Vec::new();
+    let mut leading_system_prefix_open = true;
+    for message in messages {
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+            leading_system_prefix_open = false;
+            continue;
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let mut blocks = prompt_snapshot_content_value_blocks(content);
+        let visible = match cache_capability.volatile_placement {
+            VolatilePlacement::CurrentUserOnly => true,
+            VolatilePlacement::MarkerIsolated => true,
+            VolatilePlacement::TailSuffix | VolatilePlacement::AppendOnlyUserTail => {
+                leading_system_prefix_open
+            }
+            VolatilePlacement::Free => false,
+        };
+        if !visible {
+            for block in &mut blocks {
+                block.scope = "None".to_string();
+            }
+        }
+        out.extend(blocks);
+    }
+
+    if matches!(
+        cache_capability.protocol,
+        CacheProtocol::MarkerExplicit | CacheProtocol::BedrockCachePoint
+    ) {
+        let last_marker = out.iter().rposition(|block| block.cache_control_hash != 0);
+        for (index, block) in out.iter_mut().enumerate() {
+            if last_marker.is_none_or(|last_marker| index > last_marker) {
+                block.scope = "None".to_string();
+            }
+        }
+    }
+    out
 }
 
 fn prompt_snapshot_content_value_blocks(value: &serde_json::Value) -> Vec<SystemBlockFingerprint> {
@@ -553,10 +692,18 @@ const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheBreakDetectorState {
     pub per_source: HashMap<String, PromptStateSnapshot>,
+    /// Last usage-bearing provider attempt per source. `None` denotes a
+    /// pre-field snapshot; restoration seeds it from the legacy turn baseline.
+    #[serde(default)]
+    pub usage_per_source: Option<HashMap<String, PromptStateSnapshot>>,
     pub source_order: Vec<String>,
     pub stats: CacheStats,
     #[serde(default)]
     pub diff_seq: u32,
+    /// Recently consumed durable provider-attempt identities. Persisting this
+    /// bounded set makes receipt ingestion idempotent across session restore.
+    #[serde(default)]
+    pub observed_provider_attempts: VecDeque<ProviderAttemptCacheIdentity>,
 }
 
 /// In-memory cache-break detector for prompt caching systems.
@@ -577,6 +724,11 @@ pub struct CacheBreakDetector {
     /// `source_order` vector tracks insertion/refresh order (back = most
     /// recent); eviction drops the front.
     per_source: HashMap<String, PromptStateSnapshot>,
+    /// Attribution baseline advances only when the provider supplied usage.
+    /// It is intentionally separate from the last-dispatched structural
+    /// baseline so an unavailable retry cannot erase the cause later reported
+    /// by a usage-bearing terminal.
+    usage_per_source: HashMap<String, PromptStateSnapshot>,
     /// Insertion/refresh order for LRU eviction. Kept in sync with
     /// `per_source`: every write to a source appends/refreshes its key
     /// here; eviction pops from the front.
@@ -592,6 +744,7 @@ pub struct CacheBreakDetector {
     /// cache just break?" without re-running the session.
     diff_dir: Option<std::path::PathBuf>,
     diff_seq: u32,
+    observed_provider_attempts: VecDeque<ProviderAttemptCacheIdentity>,
 }
 
 /// Running cache hit/miss statistics.
@@ -623,12 +776,17 @@ impl CacheBreakDetector {
 
     #[must_use]
     pub fn from_state(state: CacheBreakDetectorState) -> Self {
+        let usage_per_source = state
+            .usage_per_source
+            .unwrap_or_else(|| state.per_source.clone());
         Self {
             per_source: state.per_source,
+            usage_per_source,
             source_order: state.source_order,
             stats: state.stats,
             diff_dir: None,
             diff_seq: state.diff_seq,
+            observed_provider_attempts: state.observed_provider_attempts,
         }
     }
 
@@ -636,10 +794,88 @@ impl CacheBreakDetector {
     pub fn snapshot_state(&self) -> CacheBreakDetectorState {
         CacheBreakDetectorState {
             per_source: self.per_source.clone(),
+            usage_per_source: Some(self.usage_per_source.clone()),
             source_order: self.source_order.clone(),
             stats: self.stats.clone(),
             diff_seq: self.diff_seq,
+            observed_provider_attempts: self.observed_provider_attempts.clone(),
         }
+    }
+
+    /// Record one dispatched physical provider attempt from its immutable
+    /// final-body receipt.
+    ///
+    /// An attempt without provider usage still advances the structural
+    /// baseline, because the body crossed the dispatch boundary, but does not
+    /// fabricate a cache hit or miss. Returns `(accepted, event)`; duplicate
+    /// durable attempt identities are ignored idempotently.
+    pub fn record_provider_attempt_for_source(
+        &mut self,
+        source: &str,
+        attempt_identity: &ProviderAttemptCacheIdentity,
+        current: PromptStateSnapshot,
+        actual_cache_read_tokens: Option<u64>,
+    ) -> (bool, Option<CacheBreakEvent>) {
+        if self
+            .observed_provider_attempts
+            .iter()
+            .any(|observed| observed == attempt_identity)
+        {
+            return (false, None);
+        }
+        self.observed_provider_attempts
+            .push_back(attempt_identity.clone());
+        while self.observed_provider_attempts.len() > MAX_TRACKED_PROVIDER_ATTEMPTS {
+            self.observed_provider_attempts.pop_front();
+        }
+
+        let structural_previous = self.per_source.get(source).cloned();
+        let structural_event = structural_previous
+            .as_ref()
+            .and_then(|previous| self.detect_break(previous, &current, None));
+        let usage_previous =
+            actual_cache_read_tokens.and_then(|_| self.usage_per_source.get(source).cloned());
+        let event = if let Some(cache_read_tokens) = actual_cache_read_tokens {
+            usage_previous
+                .as_ref()
+                .and_then(|previous| self.detect_break(previous, &current, Some(cache_read_tokens)))
+        } else {
+            structural_event
+        };
+
+        if actual_cache_read_tokens.is_some() {
+            self.stats.total_turns = self.stats.total_turns.saturating_add(1);
+            if usage_previous.is_none() || event.is_some() {
+                self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
+            } else {
+                self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+            }
+            if let Some(event) = event.as_ref() {
+                self.stats.total_miss_tokens = self
+                    .stats
+                    .total_miss_tokens
+                    .saturating_add(event.estimated_token_impact);
+                self.stats.recent_breaks.push_back(event.clone());
+                if self.stats.recent_breaks.len() > 10 {
+                    self.stats.recent_breaks.pop_front();
+                }
+                if let Some(dir) = self.diff_dir.clone() {
+                    self.diff_seq = self.diff_seq.wrapping_add(1);
+                    spawn_diff_artifact_write(
+                        dir,
+                        self.diff_seq,
+                        usage_previous,
+                        current.clone(),
+                        event.clone(),
+                    );
+                }
+            }
+            self.usage_per_source
+                .insert(source.to_string(), current.clone());
+        }
+
+        self.write_source_snapshot(source, current);
+        (true, event)
     }
 
     /// Enable per-break diagnostic artifact emission to `dir`. The directory
@@ -723,6 +959,8 @@ impl CacheBreakDetector {
             self.stats.cache_hits += 1;
         }
 
+        self.usage_per_source
+            .insert(source.to_string(), current.clone());
         self.write_source_snapshot(source, current);
         event
     }
@@ -731,6 +969,7 @@ impl CacheBreakDetector {
     /// event such as compaction or native provider history clearing.
     pub fn reset_all_sources(&mut self) {
         self.per_source.clear();
+        self.usage_per_source.clear();
         self.source_order.clear();
     }
 
@@ -747,6 +986,7 @@ impl CacheBreakDetector {
         while self.source_order.len() > MAX_TRACKED_SOURCES {
             let evicted = self.source_order.remove(0);
             self.per_source.remove(&evicted);
+            self.usage_per_source.remove(&evicted);
         }
     }
 
@@ -788,46 +1028,132 @@ impl CacheBreakDetector {
             });
         }
 
-        // 2. System prompt change
-        if effective_prefix_system_prompt_hash(prev) != effective_prefix_system_prompt_hash(curr) {
+        // 2. System prompt change. Once both sides have immutable provider
+        // receipts, only the exact post-projection component identity owns
+        // this decision. A mixed legacy/exact pair is an authority migration,
+        // not evidence that the provider-visible prefix changed.
+        let system_changed = match (
+            prev.provider_final_fingerprint.as_ref(),
+            curr.provider_final_fingerprint.as_ref(),
+        ) {
+            (Some(prev), Some(curr)) => {
+                prev.cache_key_system_sha256 != curr.cache_key_system_sha256
+            }
+            (None, None) => {
+                effective_prefix_system_prompt_hash(prev)
+                    != effective_prefix_system_prompt_hash(curr)
+            }
+            _ => false,
+        };
+        if system_changed {
             reasons.push(CacheBreakReason::SystemPromptChanged);
         }
 
         // 2b. Cache-control / stable-boundary change
-        if prev.cache_control_hash != curr.cache_control_hash {
+        // Provider-final system/tool component identities already include
+        // their protocol-native cache markers. Detailed cache-control
+        // attribution is available only to the legacy typed block projection;
+        // never scan arbitrary JSON keys to guess marker semantics.
+        let cache_control_changed = match (
+            prev.provider_final_fingerprint.as_ref(),
+            curr.provider_final_fingerprint.as_ref(),
+        ) {
+            (Some(prev), Some(curr)) => {
+                prev.cache_capability.protocol != curr.cache_capability.protocol
+            }
+            (None, None) => prev.cache_control_hash != curr.cache_control_hash,
+            _ => false,
+        };
+        if cache_control_changed {
             reasons.push(CacheBreakReason::CacheControlChanged);
         }
 
         // 3. Tool schemas change — diff which tools changed
-        if prev.tools_hash != curr.tools_hash {
-            let prev_map: std::collections::HashMap<&str, u64> = prev
-                .per_tool_hashes
-                .iter()
-                .map(|(n, h)| (n.as_str(), *h))
-                .collect();
-            let curr_map: std::collections::HashMap<&str, u64> = curr
-                .per_tool_hashes
-                .iter()
-                .map(|(n, h)| (n.as_str(), *h))
-                .collect();
-
-            let mut added: Vec<String> = curr_map
-                .keys()
-                .filter(|n| !prev_map.contains_key(*n))
-                .map(|s| s.to_string())
-                .collect();
-            let mut removed: Vec<String> = prev_map
-                .keys()
-                .filter(|n| !curr_map.contains_key(*n))
-                .map(|s| s.to_string())
-                .collect();
-            let mut changed: Vec<String> = curr_map
-                .iter()
-                .filter_map(|(n, h)| match prev_map.get(n) {
-                    Some(prev_h) if prev_h != h => Some(n.to_string()),
-                    _ => None,
-                })
-                .collect();
+        let exact_tool_pair = prev
+            .provider_final_fingerprint
+            .as_ref()
+            .zip(curr.provider_final_fingerprint.as_ref());
+        let tools_changed = match exact_tool_pair {
+            Some((prev, curr)) => {
+                prev.cache_key_tool_schema_sequence_sha256
+                    != curr.cache_key_tool_schema_sequence_sha256
+            }
+            None if prev.provider_final_fingerprint.is_none()
+                && curr.provider_final_fingerprint.is_none() =>
+            {
+                prev.tools_hash != curr.tools_hash
+            }
+            None => false,
+        };
+        if tools_changed {
+            let (mut added, mut removed, mut changed) = if let Some((prev, curr)) = exact_tool_pair
+            {
+                let prev_map: std::collections::HashMap<&str, &str> = prev
+                    .cache_key_tool_schema_items
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.name
+                            .as_deref()
+                            .map(|name| (name, tool.sha256.as_str()))
+                    })
+                    .collect();
+                let curr_map: std::collections::HashMap<&str, &str> = curr
+                    .cache_key_tool_schema_items
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.name
+                            .as_deref()
+                            .map(|name| (name, tool.sha256.as_str()))
+                    })
+                    .collect();
+                let added: Vec<String> = curr_map
+                    .keys()
+                    .filter(|name| !prev_map.contains_key(*name))
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let removed: Vec<String> = prev_map
+                    .keys()
+                    .filter(|name| !curr_map.contains_key(*name))
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let changed: Vec<String> = curr_map
+                    .iter()
+                    .filter_map(|(name, hash)| match prev_map.get(name) {
+                        Some(previous) if previous != hash => Some((*name).to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                (added, removed, changed)
+            } else {
+                let prev_map: std::collections::HashMap<&str, u64> = prev
+                    .per_tool_hashes
+                    .iter()
+                    .map(|(name, hash)| (name.as_str(), *hash))
+                    .collect();
+                let curr_map: std::collections::HashMap<&str, u64> = curr
+                    .per_tool_hashes
+                    .iter()
+                    .map(|(name, hash)| (name.as_str(), *hash))
+                    .collect();
+                let added: Vec<String> = curr_map
+                    .keys()
+                    .filter(|name| !prev_map.contains_key(*name))
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let removed: Vec<String> = prev_map
+                    .keys()
+                    .filter(|name| !curr_map.contains_key(*name))
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let changed: Vec<String> = curr_map
+                    .iter()
+                    .filter_map(|(name, hash)| match prev_map.get(name) {
+                        Some(previous) if previous != hash => Some((*name).to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                (added, removed, changed)
+            };
             added.sort();
             removed.sort();
             changed.sort();
@@ -837,6 +1163,22 @@ impl CacheBreakDetector {
                 removed,
                 changed,
             });
+        }
+
+        // Fingerprint drift identifies a possible invalidation cause, not an
+        // observed cache miss. Provider usage is the stronger authority: if
+        // this request reports at least as many cached tokens as the entire
+        // prefix tracked by this snapshot, attributing a cache break (and the
+        // corresponding token impact) would contradict the measured result.
+        // Keep partial/absent usage fail-closed so real or unobservable
+        // structural losses are still diagnosed.
+        if !reasons.is_empty()
+            && actual_cache_read.is_some_and(|cache_read| {
+                curr.cache_eligible_tokens == 0
+                    || cache_read >= u64::try_from(curr.cache_eligible_tokens).unwrap_or(u64::MAX)
+            })
+        {
+            return None;
         }
 
         // 4. If hashes match but API says cache miss → TTL expiry / unexplained cold start.
@@ -1450,6 +1792,181 @@ mod tests {
         s
     }
 
+    fn exact_fingerprint(system: &str, tools: &[(&str, &str)]) -> ProviderFinalPromptFingerprint {
+        ProviderFinalPromptFingerprint {
+            message_sequence_sha256: format!("messages-{system}"),
+            system_sequence_sha256: format!("raw-system-{system}"),
+            cache_key_system_sha256: format!("cache-system-{system}"),
+            conversation_sequence_sha256: "conversation".to_string(),
+            tool_schema_sequence_sha256: tools
+                .iter()
+                .map(|(name, hash)| format!("{name}:{hash}"))
+                .collect::<Vec<_>>()
+                .join("|"),
+            cache_key_tool_schema_sequence_sha256: tools
+                .iter()
+                .map(|(name, hash)| format!("{name}:{hash}"))
+                .collect::<Vec<_>>()
+                .join("|"),
+            cache_capability: crate::cache_placement::CacheCapability {
+                protocol: crate::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+                volatile_placement: crate::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+                reuse_scope: Some(crate::cache_placement::CacheReuseScope::ConversationTurns),
+            },
+            cache_key_tool_schema_items: tools
+                .iter()
+                .map(|(name, hash)| ProviderFinalToolFingerprint {
+                    name: Some((*name).to_string()),
+                    sha256: (*hash).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn provider_final_receipt_owns_structure_and_names_changed_tools() {
+        let mut detector = CacheBreakDetector::new();
+        let mut first = snap("planned-system-one", &make_tools(&["planned-a"]), "m");
+        first.attach_provider_final_fingerprint(exact_fingerprint("stable", &[("bash", "v1")]));
+        let first_identity = ProviderAttemptCacheIdentity {
+            request_id: "request-1".to_string(),
+            attempt: 0,
+        };
+        let (accepted, event) =
+            detector.record_provider_attempt_for_source("main", &first_identity, first, Some(0));
+        assert!(accepted);
+        assert!(event.is_none());
+
+        let mut metadata_only = snap("different-planned-system", &make_tools(&["planned-b"]), "m");
+        let mut metadata_only_fingerprint = exact_fingerprint("stable", &[("bash", "v1")]);
+        metadata_only_fingerprint.cache_capability.reuse_scope =
+            Some(crate::cache_placement::CacheReuseScope::IntraTurnRounds);
+        metadata_only.attach_provider_final_fingerprint(metadata_only_fingerprint);
+        let second_identity = ProviderAttemptCacheIdentity {
+            request_id: "request-2".to_string(),
+            attempt: 0,
+        };
+        let (_, event) = detector.record_provider_attempt_for_source(
+            "main",
+            &second_identity,
+            metadata_only,
+            Some(20_000),
+        );
+        assert!(
+            event.is_none(),
+            "planned-only drift cannot override an equal provider-final receipt"
+        );
+
+        let mut changed = snap("same-planned-system", &make_tools(&["planned-b"]), "m");
+        changed.attach_provider_final_fingerprint(exact_fingerprint("stable", &[("bash", "v2")]));
+        let third_identity = ProviderAttemptCacheIdentity {
+            request_id: "request-3".to_string(),
+            attempt: 0,
+        };
+        let (_, event) =
+            detector.record_provider_attempt_for_source("main", &third_identity, changed, Some(0));
+        let event = event.expect("final tool schema change");
+        assert!(matches!(
+            event.reason,
+            CacheBreakReason::ToolSchemasChanged {
+                ref changed,
+                ref added,
+                ref removed
+            } if changed == &["bash"] && added.is_empty() && removed.is_empty()
+        ));
+    }
+
+    #[test]
+    fn provider_attempt_without_usage_advances_baseline_without_counting_or_duplication() {
+        let mut detector = CacheBreakDetector::new();
+        let mut first = snap("planned", &[], "m");
+        first.attach_provider_final_fingerprint(exact_fingerprint("stable", &[]));
+        let identity = ProviderAttemptCacheIdentity {
+            request_id: "request-no-usage".to_string(),
+            attempt: 2,
+        };
+        let (accepted, event) =
+            detector.record_provider_attempt_for_source("main", &identity, first, None);
+        assert!(accepted);
+        assert!(event.is_none());
+        assert_eq!(detector.stats.total_turns, 0);
+        let mut duplicate = snap("different", &[], "m");
+        duplicate.attach_provider_final_fingerprint(exact_fingerprint("changed", &[]));
+        let (accepted, event) =
+            detector.record_provider_attempt_for_source("main", &identity, duplicate, Some(0));
+        assert!(!accepted);
+        assert!(event.is_none());
+        assert_eq!(detector.stats.total_turns, 0);
+        assert_eq!(
+            detector
+                .snapshot_for_source("main")
+                .and_then(|snapshot| snapshot.provider_final_fingerprint.as_ref())
+                .map(|fingerprint| fingerprint.cache_key_system_sha256.as_str()),
+            Some("cache-system-stable")
+        );
+    }
+
+    #[test]
+    fn retry_usage_compares_with_last_usage_baseline_and_trusts_full_hit() {
+        for (terminal_cache_read, expected_reason, expected_misses, expected_hits) in [
+            (0, Some(CacheBreakReason::SystemPromptChanged), 2_u64, 0_u64),
+            (20_000, None, 1_u64, 1_u64),
+        ] {
+            let mut detector = CacheBreakDetector::new();
+
+            let mut baseline = snap("planned-a", &[], "m");
+            baseline.attach_provider_final_fingerprint(exact_fingerprint("a", &[]));
+            let (_, first_event) = detector.record_provider_attempt_for_source(
+                "main",
+                &ProviderAttemptCacheIdentity {
+                    request_id: format!("request-a-{terminal_cache_read}"),
+                    attempt: 0,
+                },
+                baseline,
+                Some(0),
+            );
+            assert!(first_event.is_none());
+
+            let mut retry_without_usage = snap("planned-b", &[], "m");
+            retry_without_usage.attach_provider_final_fingerprint(exact_fingerprint("b", &[]));
+            let (_, dispatch_event) = detector.record_provider_attempt_for_source(
+                "main",
+                &ProviderAttemptCacheIdentity {
+                    request_id: format!("request-b-{terminal_cache_read}"),
+                    attempt: 0,
+                },
+                retry_without_usage,
+                None,
+            );
+            assert!(matches!(
+                dispatch_event.map(|event| event.reason),
+                Some(CacheBreakReason::SystemPromptChanged)
+            ));
+            assert_eq!(detector.stats.total_turns, 1);
+
+            let mut terminal_retry = snap("planned-b", &[], "m");
+            terminal_retry.attach_provider_final_fingerprint(exact_fingerprint("b", &[]));
+            let (_, terminal_event) = detector.record_provider_attempt_for_source(
+                "main",
+                &ProviderAttemptCacheIdentity {
+                    request_id: format!("request-b-{terminal_cache_read}"),
+                    attempt: 1,
+                },
+                terminal_retry,
+                Some(terminal_cache_read),
+            );
+            assert_eq!(
+                terminal_event.map(|event| event.reason),
+                expected_reason,
+                "usage must compare to the prior usage-bearing request, never the unavailable retry"
+            );
+            assert_eq!(detector.stats.total_turns, 2);
+            assert_eq!(detector.stats.cache_misses, expected_misses);
+            assert_eq!(detector.stats.cache_hits, expected_hits);
+        }
+    }
+
     #[test]
     fn prompt_snapshot_from_messages_prefers_system_role_and_flattens_structured_content() {
         let messages = vec![
@@ -1512,6 +2029,99 @@ mod tests {
         assert_eq!(snapshot.model, "claude");
         assert_eq!(snapshot.cache_eligible_tokens, 42);
         assert_eq!(snapshot.system_prompt_hash, hash_str("Prompt"));
+    }
+
+    #[test]
+    fn auto_prefix_snapshot_excludes_post_history_system_tail_from_leading_identity() {
+        let messages = |runtime: &str| {
+            vec![
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "do the work"}),
+                json!({"role": "assistant", "content": "working"}),
+                json!({"role": "system", "content": runtime}),
+            ]
+        };
+        let first = prompt_snapshot_from_messages(
+            &messages("completion settlement revision 1"),
+            &[],
+            "openai",
+            "deepseek-v4-flash",
+            42,
+        )
+        .expect("first snapshot");
+        let second = prompt_snapshot_from_messages(
+            &messages("completion settlement revision 2"),
+            &[],
+            "openai",
+            "deepseek-v4-flash",
+            42,
+        )
+        .expect("second snapshot");
+
+        assert_ne!(first.system_prompt_hash, second.system_prompt_hash);
+        assert_eq!(
+            effective_prefix_system_prompt_hash(&first),
+            effective_prefix_system_prompt_hash(&second),
+            "a preserved post-history system tail diverges after the leading cache prefix"
+        );
+        assert_eq!(first.system_blocks[0].scope, "provider_visible");
+        assert_eq!(first.system_blocks[1].scope, "None");
+
+        let mut detector = CacheBreakDetector::default();
+        assert!(detector.record_turn(first, None).is_none());
+        let event = detector.record_turn(second, None);
+        assert!(
+            event
+                .as_ref()
+                .is_none_or(|event| event.reason != CacheBreakReason::SystemPromptChanged),
+            "a post-history system suffix is outside the leading cache identity: {event:?}"
+        );
+    }
+
+    #[test]
+    fn strict_history_snapshot_keeps_runtime_system_change_in_cache_identity() {
+        let capability = crate::cache_placement::CacheCapability {
+            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let messages = |runtime: &str| {
+            vec![
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "do the work"}),
+                json!({"role": "system", "content": runtime}),
+            ]
+        };
+        let first = prompt_snapshot_from_messages_with_cache_capability(
+            &messages("authority 1"),
+            &[],
+            "openai",
+            "gateway-alias",
+            42,
+            Some(capability),
+        )
+        .expect("first snapshot");
+        let second = prompt_snapshot_from_messages_with_cache_capability(
+            &messages("authority 2"),
+            &[],
+            "openai",
+            "gateway-alias",
+            42,
+            Some(capability),
+        )
+        .expect("second snapshot");
+
+        assert_ne!(
+            effective_prefix_system_prompt_hash(&first),
+            effective_prefix_system_prompt_hash(&second)
+        );
+        assert!(
+            first
+                .system_blocks
+                .iter()
+                .all(|block| block.scope != "None")
+        );
     }
 
     #[test]
@@ -1622,6 +2232,32 @@ mod tests {
             }
             other => panic!("expected ToolSchemasChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_cache_read_covering_tracked_prefix_disproves_structural_break() {
+        let baseline = snap("prompt", &make_tools(&["bash"]), "claude");
+        let changed = snap(
+            "prompt",
+            &make_tools(&["bash", "inspect_work_plan"]),
+            "claude",
+        );
+        let tracked_prefix = changed.cache_eligible_tokens as u64;
+
+        let mut warm = CacheBreakDetector::new();
+        warm.record_turn(baseline.clone(), None);
+        assert!(
+            warm.record_turn(changed.clone(), Some(tracked_prefix))
+                .is_none(),
+            "measured cache reuse covering the tracked prefix must outrank a structural hypothesis"
+        );
+
+        let mut cold = CacheBreakDetector::new();
+        cold.record_turn(baseline, None);
+        assert!(matches!(
+            cold.record_turn(changed, Some(0)).map(|event| event.reason),
+            Some(CacheBreakReason::ToolSchemasChanged { .. })
+        ));
     }
 
     #[test]
@@ -2025,6 +2661,30 @@ mod tests {
     }
 
     #[test]
+    fn replacing_candidate_tools_makes_diagnostics_match_provider_wire() {
+        let candidate = vec![json!({
+            "type": "function",
+            "function": {"name": "candidate", "parameters": {"type": "object"}}
+        })];
+        let wire = vec![json!({
+            "type": "function",
+            "function": {"name": "wire", "parameters": {"type": "object"}}
+        })];
+        let mut snapshot = PromptStateSnapshot::capture("system", &candidate, "model", 100);
+        let system_hash = snapshot.system_prompt_hash;
+
+        snapshot.replace_tool_schemas(&wire);
+
+        assert_eq!(snapshot.system_prompt_hash, system_hash);
+        assert_eq!(snapshot.per_tool_hashes.len(), 1);
+        assert_eq!(snapshot.per_tool_hashes[0].0, "wire");
+        assert_eq!(
+            snapshot.tools_hash,
+            PromptStateSnapshot::capture("system", &wire, "model", 100).tools_hash
+        );
+    }
+
+    #[test]
     fn capture_serialized_matches_plain_hashing_contract() {
         use crate::section_types::{CacheScope, SectionKind};
 
@@ -2286,7 +2946,7 @@ mod tests {
         let mut det = CacheBreakDetector::new();
 
         for _ in 0..5 {
-            det.record_turn_for_source("bridge_inprocess", snap("prompt", &tools, "claude"), None);
+            det.record_turn_for_source("server_loop", snap("prompt", &tools, "claude"), None);
         }
 
         let hint = det.compression_hint(20, 2);
@@ -2306,8 +2966,8 @@ mod tests {
 
         det.record_turn_for_source(DEFAULT_SOURCE, main.clone(), None);
         det.record_turn_for_source(DEFAULT_SOURCE, main, None);
-        det.record_turn_for_source("bridge_inprocess", bridge.clone(), None);
-        det.record_turn_for_source("bridge_inprocess", bridge, None);
+        det.record_turn_for_source("server_loop", bridge.clone(), None);
+        det.record_turn_for_source("server_loop", bridge, None);
 
         let hint = det.compression_hint_for_source(DEFAULT_SOURCE, 20, 2);
         assert_eq!(hint.protected_token_estimate, 7_000);

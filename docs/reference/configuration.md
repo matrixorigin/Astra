@@ -15,7 +15,9 @@ Use these files as the canonical configuration references:
 
 - `MATRIXONE_HOST`, `MATRIXONE_PORT`, `MATRIXONE_USER`, `MATRIXONE_PASSWORD`
 - `ASTRA_MYSQL_TLS_MODE` (optional) — endpoint TLS policy used by `scripts/dev/mysql-client.sh`: `auto` (default; local endpoints may probe then fall back to plaintext, remote endpoints require TLS), `required`, or `disabled`. The adapter selects the supported MySQL/MariaDB client flag; callers should not pass client-specific `--ssl-mode`/`--skip-ssl` values through configuration.
-- `ASTRA_TUI_THEME` (optional) — terminal rendering profile: `auto` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain`. Use an ANSI profile for terminals or multiplexers that do not reliably render truecolor; `NO_COLOR=1` also selects `plain`.
+- `ASTRA_TUI_THEME` (optional) — terminal rendering profile: `auto` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain`. Use an ANSI profile for terminals or multiplexers that do not reliably render truecolor; `NO_COLOR=1` also selects `plain`. Welcome-panel accents, conversation surfaces, syntax highlighting, and the exit resume hint follow the selected profile. CLI text written to stderr uses stderr's color capability, independently of redirected stdout.
+  Auto queries the terminal foreground/background once at startup with OSC 10/11 on interactive macOS/Linux terminals, sharing a 300 ms response budget with the existing capability query.
+  An explicit theme, `NO_COLOR`, or a valid `ASTRA_TERMINAL_BG` skips color queries; redirected input/output and `TERM=dumb` are not queried. Color precedence is per channel: `ASTRA_TERMINAL_FG`/`ASTRA_TERMINAL_BG`, then the queried color, then `COLORFGBG`. A background response alone is sufficient. A valid manual background intentionally skips both color queries because theme selection only needs the background; the foreground then uses `ASTRA_TERMINAL_FG`, `COLORFGBG`, or the terminal default. Setting only a foreground still allows querying the background. When the background is unknown, ordinary text and surfaces inherit terminal defaults while headings, the logo, status, and syntax keep terminal-defined ANSI colours. Unknown background does not select `plain`. Other platforms retain environment hints and explicit profiles. The selected theme stays fixed for the session; restart Astra after changing the terminal background. During the bounded startup query, a split Esc prefix may wait up to 40 ms; normal-session Esc handling is unchanged. A malformed, unterminated color response is discarded until its terminator or a new Esc sequence; press Esc to recover input if the terminator never arrives. Sixel query timeouts remain unknown, and late capability replies are consumed by the existing reader without a second terminal query.
 - `ASTRA_TUI_GLYPHS` (optional) — `unicode` (default) or `ascii`. Select `ascii` for terminals or fonts that do not reliably render box-drawing and state glyphs; all state labels and actions remain available.
 - `ASTRA_DATABASE` — logical database name
 - `ASTRA_DATABASE_PREFIX` (optional) — effective name = `{PREFIX}{ASTRA_DATABASE}`
@@ -26,10 +28,15 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_ALLOW_INSECURE_DEFAULTS` — dev-only opt-in for bundled defaults on required keys
 - `RUST_LOG` — standard tracing filter (e.g. `warn,astra_runtime=info`)
+- `NO_COLOR` — when present, disables styles in CLI streaming Markdown, including code blocks and tables. `astra chat --no-color` also enables this behavior. Without it, Markdown bold, italic, and headings inherit the terminal foreground and use emphasis attributes so they remain readable on light and dark backgrounds.
 
 ### API server
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
+
+`ASTRA_API_HOST` defaults to `127.0.0.1`. Container deployments set
+`0.0.0.0` explicitly inside the container and control external exposure at the
+Compose, Kubernetes Service, or ingress boundary.
 
 `ASTRA_API_PORT` defaults to `17001` across source, Docker API, and all-in-one
 stack modes. In the all-in-one compose stack, this value controls the
@@ -64,8 +71,8 @@ select optional tools separately.
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
-- `ASTRA_BRIDGE_SECRET`
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (high-entropy secret from which Astra derives Fernet encryption; changing it makes existing provider credentials undecryptable)
+- `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth
 
@@ -109,30 +116,57 @@ check_endpoint = "http://moi-catalog:8081/api/v1/astra/edge-tokens/check"
 LLM models are **not** configured via env vars. Use the admin CLI:
 
 ```bash
-astra admin model add <name> <provider> --api-key ... --base-url ...
+astra admin model add <name> <provider> --api-key ... --context-window 128000 --base-url ...
 astra admin model check <name>                    # probe + activate
-astra admin model list                            # see all configured models
+astra admin model list                            # drains the authoritative paginated catalog
 astra admin config set reasoning_offering_id <id> # optional: pin the judge/summary Offering
 ```
 
-If `reasoning_offering_id` is not set, the server applies its governed default and currently selects the cheapest active Offering by `pricing.completion`. Obtain Offering IDs from `astra admin model list`; model names do not select execution routes.
+If `reasoning_offering_id` is not set, the server applies its governed default and currently selects the cheapest active Offering by `pricing.completion`. `astra admin model list` follows the server's seek-paginated catalog until completion; model names do not select execution routes, and clients must use the exact Offering ID from that complete projection.
 
 ### Memoria
 
-- `MEMORIA_BASE_URL`, `MEMORIA_MASTER_KEY`
+- `MEMORIA_BASE_URL`, `MEMORIA_MASTER_KEY` — Memoria endpoint and deployment master secret. Configuring the secret alone does not grant end-user memory access.
+- `MEMORIA_SELF_HOSTED_MASTER_ACCESS` — exact value `1` explicitly allows active local password accounts with no scoped binding or retained Memoria identity to use owner-scoped master authentication when `MEMORIA_WEB_URL` is unset. Existing scoped owner/consent always wins; disconnect, inactive/deleted accounts and lookup errors never fall back. Requires a Memoria release containing `matrixorigin/Memoria#250` (available in 0.5.2, not 0.5.1). The Server default remains disabled; the self-hosted all-in-one example explicitly enables it with a compatible pinned image. Existing env files are not automatically upgraded.
+- `MEMORIA_ISSUER` — stable identity issuer URL; defaults to normalized `MEMORIA_BASE_URL`. Changing the issuer creates a different identity namespace. Keep it stable when changing only the service transport address.
+- `MEMORIA_WEB_URL` — Server-owned browser sign-in website, advertised through `GET /auth/methods`. Unset preserves password login. Requires HTTPS except for explicit loopback development URLs. The CLI does not read this environment variable.
+- `MEMORIA_LEGACY_ISSUER` — explicit administrator assertion of the issuer that owned pre-issuer Memoria identities. Migration is allowed only when it equals the configured issuer, after fresh key verification. Leave unset unless the provenance of the old database is known.
 - `MEMORIA_EMBEDDING_PROVIDER`, `MEMORIA_EMBEDDING_MODEL`, `MEMORIA_EMBEDDING_DIM`, `MEMORIA_EMBEDDING_API_KEY`, `MEMORIA_EMBEDDING_BASE_URL`
+
+Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, extraction and session-end governance. Self-hosted master access is an explicit per-user fallback on those same paths, never a replacement for a scoped binding or failed lookup. Runtime builders receive this policy from composition rather than independently reading environment variables. See [authentication](../design/authentication.md).
 
 ### Runtime tuning (optional)
 
-- `ASTRA_MAX_TURNS`, `ASTRA_PLAN_SUBTASK_MAX_TURNS`, `ASTRA_TURN_TIMEOUT_S`
+- `ASTRA_MAX_TURNS` — optional positive ordinary execution-round cap. Bounded settlement/closing allowances remain separate, so this is not an absolute cap on all model calls or cost. Unset means renewable slices without an implicit round cap; it does not disable cancellation, execution-health checks, or individual operation timeouts.
+- `ASTRA_PLAN_SUBTASK_MAX_TURNS` — optional positive plan-subtask cap; unset inherits `ASTRA_MAX_TURNS`. Explicit zero or malformed round caps are rejected, not treated as unlimited.
+- `ASTRA_TURN_TIMEOUT_S`
 - `ASTRA_GLOBAL_OUTPUT_LIMIT`, `ASTRA_TOOL_OUTPUT_LIMIT`
 - `ASTRA_MAX_TOOL_RETRIES`, `ASTRA_RETRY_BASE_MS`
 - `ASTRA_MAX_RETRIEVED`, `ASTRA_MAX_HISTORY_TOKENS`, `ASTRA_COMPRESSION_THRESHOLD`
 - `ASTRA_RETRIEVAL_TOP_K`, `ASTRA_MAX_TURN_INPUT_TOKENS`
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
-- `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
+- `ASTRA_LLM_CONNECT_TIMEOUT_S`, `ASTRA_LLM_NONSTREAM_TIMEOUT_S`, `ASTRA_LLM_TOTAL_BUDGET_S`, `ASTRA_LLM_ACTION_PROGRESS_TIMEOUT_S` — provider transport/progress bounds. The `300s` total-budget default is per provider call including retries, not an end-to-end session limit; turn profiles and resource policy still bound the overall run. Interactive resource policy is 30s for a single tool execution, while long-session profiles explicitly allow 300s.
+- `ASTRA_AUX_LLM_POLICY` — policy for bounded auxiliary LLM calls. When unset, Astra uses `capacity_aware`: every eligible primary turn receives one bounded Work-admission decision, while provider admission accounts for its quota like any other inference; unrelated optional judges remain capacity-gated. Set `boundary_only` when a deployment deliberately prefers admission only at an executable boundary. An unavailable auxiliary decision is recorded as typed degradation and does not discard a primary response that already passed the canonical tool/lifecycle boundary; an explicitly `disabled` policy under Auto still fails closed before action or completion, and a client that deliberately omits classification must explicitly request `FixedDefault`. Set `always` to require all eligible auxiliary calls regardless of capacity policy.
 - `ASTRA_CAPTURE_TRACES`
+- `ASTRA_RUN_CONCURRENCY_LIMIT` — positive agentic loop slots per Astra Server process. For a multi-server deployment, set `ASTRA_CAPACITY_POD_COUNT` to the number of equivalent server processes sharing the same durable admission scope; the cross-pod weighted budget is derived from both values and is fenced when a server presents a different capacity snapshot. Change the declared budget only after active reservations have drained, and use one snapshot across all participating servers.
+- `ASTRA_CAPACITY_POD_COUNT` — positive server process count used for the cluster capacity model and durable canonical-turn admission. This is an operator declaration, not service discovery; keep it identical across pods that share a database.
+
+### Explain Analyze presentation
+
+The TUI keeps the live Explain Analyze tree in a compact status lane so it
+does not hide the conversation. Configure the row budget in
+`~/.astra/config/runtime.toml` (or the project override):
+
+```toml
+[explain]
+live_rows = 5 # 1–5, default 5
+```
+
+The same setting is available in the `/config` editor as **Live Explain
+Analyze rows (1–5)** and takes effect for the next live capture immediately.
+The settled Explain cell and the local Markdown report are not truncated by
+this live-row setting.
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
 
@@ -147,7 +181,7 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 ### CLI overrides (optional)
 
 - `ASTRA_CLI_SESSION_ID`, `ASTRA_CLI_SESSION_NAME`
-- `ASTRA_CLI_AUTO_APPROVE`, `ASTRA_CLI_MAX_TURNS`
+- `ASTRA_CLI_AUTO_APPROVE`
 - `ASTRA_CLI_ALLOWED_TOOLS`, `ASTRA_CLI_DISALLOWED_TOOLS`, `ASTRA_CLI_ADD_DIRS`
 - `ASTRA_CLI_CREDENTIALS_DIR`
 
@@ -157,7 +191,7 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 
 ### Testing
 
-- `ASTRA_TEST_DB_IT`, `ASTRA_TEST_DB_IT_TEST_THREADS`, `ASTRA_TEST_BRIDGE_SECRET`
+- `ASTRA_TEST_DB_IT`, `ASTRA_TEST_DB_IT_TEST_THREADS`, `ASTRA_TEST_E2E_SECRET`
 - `ASTRA_TEST_PROMPT_CACHE_DISABLED`, `ASTRA_TEST_DB_URL`
 - `ASTRA_TEST_SDK_E2E`, `ASTRA_TEST_SDK_ONLINE_E2E`, `ASTRA_TEST_SDK_BASE_URL`
 

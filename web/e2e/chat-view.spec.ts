@@ -1,5 +1,44 @@
 import { expect, test, type Page } from '@playwright/test';
 
+function canonicalTaskGraph() {
+  return {
+    schema_version: 2,
+    scope: 'declared_work',
+    basis: {
+      work_id: 'work-1', work_revision: 1, goal_revision: 1,
+      goal: 'Investigate transport routing', criteria_set_revision: 1,
+      criteria_member_count: 0, criteria_manifest_hash: `sha256:${'a'.repeat(64)}`,
+      branch_id: 'branch-1', branch_revision: 1, branch_goal_revision: 1,
+      branch_criteria_set_revision: 1, branch_basis_graph_revision: 1,
+      graph_revision: 1, graph_item_count: 1, graph_edge_count: 0,
+      graph_manifest_hash: `sha256:${'b'.repeat(64)}`,
+    },
+    cursor: { graph_revision: 1, item_offset: 0, dependency_offset: 0 },
+    next_cursor: null,
+    items: {
+      offset: 0, limit: 8, total: 1,
+      entries: [{
+        item_id: 'root', revision: 1, kind: 'milestone',
+        objective: 'Investigate transport routing',
+        expected_result: 'A reviewable transport diagnosis',
+        declaration_state: 'active',
+        execution: {
+          status: 'running',
+          terminal: false,
+          run: {
+            run_id: 'run-e2e', attempt_id: 'run-e2e', graph_revision: 1,
+            run_generation: 1, last_event_idx: 1,
+            updated_at: '2026-06-07T00:00:00.000Z',
+          },
+        },
+        delivery: { status: 'unreported', summary: null, blocker_kind: null, unavailable_capabilities: [] },
+        verification: { status: 'unknown', latest_check: null },
+      }],
+    },
+    dependencies: { offset: 0, limit: 128, total: 0, entries: [] },
+  };
+}
+
 async function mockChatApis(page: Page, options: {
   queueDelayMs?: number;
   stopDelayMs?: number;
@@ -33,7 +72,7 @@ async function mockChatApis(page: Page, options: {
       json: options.workSurface ?? {
         sessionId: 'chat-e2e',
         runId: 'run-e2e',
-        tasks: [],
+        taskGraph: null,
         events: [],
         generatedAt: '2026-06-07T00:00:00.000Z',
       },
@@ -242,22 +281,14 @@ test('thinking transcript allows manual scrollback while streaming', async ({ pa
   );
 });
 
-test('activity panel shows live work without main-chat metric chips', async ({ page }) => {
+test('conversation activity opens live task, agent, and tool details', async ({ page }) => {
   await mockChatApis(page, {
     activeRunStatus: 'running',
     streamDelayMs: 20_000,
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [
-        {
-          id: 'task-1',
-          title: 'Investigate transport routing',
-          status: 'in_progress',
-          created_at: '2026-06-07T00:00:00.000Z',
-          updated_at: '2026-06-07T00:00:00.000Z',
-        },
-      ],
+      taskGraph: canonicalTaskGraph(),
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -280,30 +311,22 @@ test('activity panel shows live work without main-chat metric chips', async ({ p
     },
   });
   await page.goto('/e2e/chat-view?status=running&assistant=empty-streaming');
-  const surface = workSurfacePanel(page);
+  const activity = page.getByRole('region', { name: 'Background work' });
 
+  await activity.getByRole('button', { name: /Open tasks activity/i }).click();
   await expect(
-    page.getByRole('button', { name: /Open agents activity/i }),
-  ).not.toBeVisible();
-  await expect(
-    page.getByRole('button', { name: /Open tasks activity/i }),
-  ).not.toBeVisible();
-  await expect(
-    page.getByRole('button', { name: /Open tools activity/i }),
-  ).not.toBeVisible();
+    workSurfacePanel(page).getByText('Investigate transport routing'),
+  ).toBeVisible();
+  await closeMobileWorkSurfaceIfOpen(page);
 
-  await surface.getByRole('button', { name: /Agents/ }).click();
+  await activity.getByRole('button', { name: /Open agents activity/i }).click();
   await expect(
     workSurfacePanel(page).getByText('Review transport routing').first(),
   ).toBeVisible();
   await closeMobileWorkSurfaceIfOpen(page);
 
-  await surface.getByRole('button', { name: /Tools/ }).click();
+  await activity.getByRole('button', { name: /Open tools activity/i }).click();
   await expect(workSurfacePanel(page).getByText('git status --short')).toBeVisible();
-  await closeMobileWorkSurfaceIfOpen(page);
-
-  await surface.getByRole('button', { name: /Tasks/ }).click();
-  await expect(workSurfacePanel(page).getByText('Investigate transport routing')).toBeVisible();
 });
 
 test('stop immediately clears the visible run while cancellation is slow', async ({ page }) => {
@@ -322,7 +345,7 @@ test('activity panel hides environment internals before work runs', async ({ pag
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [],
+      taskGraph: null,
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -362,7 +385,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [],
+      taskGraph: null,
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -370,7 +393,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -397,7 +420,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -419,7 +442,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
 
   await expect(surface.getByRole('heading', { name: 'bash' })).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('Connection', { exact: true })).toBeVisible();
   await expect(surface.getByText('edge ledger', { exact: true })).toBeVisible();
   await expect(surface.getByText('Policy', { exact: true })).toBeVisible();
@@ -431,7 +454,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [],
+      taskGraph: null,
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -439,7 +462,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -466,7 +489,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -488,7 +511,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
   await expect(
     surface.getByText('Execution environment is offline. Reconnect it or choose another environment.'),
   ).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('policy disabled')).toBeVisible();
 });
 
@@ -497,7 +520,7 @@ test('activity distinguishes transport disconnect from executor offline', async 
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [],
+      taskGraph: null,
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -505,7 +528,7 @@ test('activity distinguishes transport disconnect from executor offline', async 
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -532,7 +555,7 @@ test('activity distinguishes transport disconnect from executor offline', async 
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -562,7 +585,7 @@ test('agent cards expand into live child run details with runtime metadata', asy
   const workspace = {
     kind: 'edge_workspace',
     display_name: 'MacBook Pro',
-    cwd: '/Users/xupeng/github/astra',
+    cwd: '/workspace/astra',
     authority: 'read_write',
     fallback_policy: 'disabled',
   };
@@ -577,7 +600,7 @@ test('agent cards expand into live child run details with runtime metadata', asy
     workSurface: {
       sessionId: 'chat-e2e',
       runId: 'run-e2e',
-      tasks: [],
+      taskGraph: null,
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -650,7 +673,7 @@ test('agent cards expand into live child run details with runtime metadata', asy
   await expect(surface.getByText('Running bash').first()).toBeVisible();
   await expect(surface.getByText('child bash output: inspected src/lib.rs')).toBeVisible();
   await expect(surface.getByText('live child review finding')).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
   await expect(surface.getByText('Connection', { exact: true }).first()).toBeVisible();
   await expect(surface.getByText('edge ws').first()).toBeVisible();

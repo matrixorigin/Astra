@@ -19,6 +19,10 @@ pub enum ThinClientError {
     },
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    #[error(
+        "incompatible Astra Server interaction protocol (client requires {expected}, server returned {actual}); restart or upgrade the Server before starting another turn"
+    )]
+    IncompatibleRuntime { expected: String, actual: String },
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("expected JSON object in SSE data line, got: {0}")]

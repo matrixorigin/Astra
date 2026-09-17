@@ -13,6 +13,11 @@ pub struct SessionTrace {
     pub ended_at_unix_millis: Option<u64>,
     pub total_turns: u32,
     pub outcome: TraceOutcome,
+    /// Number of oldest records evicted by the bounded recorder. A non-zero
+    /// value makes it explicit that this trace cannot prove whole-session
+    /// ordering invariants.
+    #[serde(default)]
+    pub dropped_records: u64,
     pub records: VecDeque<DecisionRecord>,
 }
 
@@ -20,6 +25,7 @@ pub struct SessionTrace {
 pub enum TraceOutcome {
     InProgress,
     Completed,
+    Interrupted,
     Blocked,
     Error,
 }
@@ -33,6 +39,7 @@ impl SessionTrace {
             ended_at_unix_millis: None,
             total_turns: 0,
             outcome: TraceOutcome::InProgress,
+            dropped_records: 0,
             records: VecDeque::new(),
         }
     }
@@ -249,7 +256,7 @@ impl RecordingKernel {
     }
 
     pub fn with_max_records(mut self, max: usize) -> Self {
-        self.max_records = max;
+        self.max_records = max.max(1);
         self
     }
 
@@ -309,10 +316,17 @@ impl HarnessKernel for RecordingKernel {
                 }
                 if record.point == HookPoint::SessionEnd {
                     trace.ended_at_unix_millis = Some(record.wall_time_unix_millis);
+                    if !matches!(trace.outcome, TraceOutcome::Blocked | TraceOutcome::Error) {
+                        trace.outcome = match record.snapshot.final_state.as_deref() {
+                            Some("completed") => TraceOutcome::Completed,
+                            Some("interrupted") => TraceOutcome::Interrupted,
+                            _ => TraceOutcome::Error,
+                        };
+                    }
                 }
-                trace.total_turns = trace.total_turns.max(record.turn + 1);
-                if trace.records.len() >= self.max_records {
-                    trace.records.pop_front();
+                trace.total_turns = trace.total_turns.max(record.turn.saturating_add(1));
+                if trace.records.len() >= self.max_records && trace.records.pop_front().is_some() {
+                    trace.dropped_records = trace.dropped_records.saturating_add(1);
                 }
                 trace.records.push_back(record.clone());
             }
@@ -608,12 +622,46 @@ mod tests {
 
         kernel.on_record(&make_record("test-session", 0, HookPoint::SessionStart));
         kernel.on_record(&make_record("test-session", 1, HookPoint::PostTurn));
-        kernel.on_record(&make_record("test-session", 1, HookPoint::SessionEnd));
+        let mut end = make_record("test-session", 1, HookPoint::SessionEnd);
+        end.snapshot.final_state = Some("completed".into());
+        end.snapshot.has_final_text = true;
+        kernel.on_record(&end);
 
         let trace = kernel.trace();
         let trace = trace.read().unwrap();
         assert_eq!(trace.started_at_unix_millis, 1_000_000);
         assert!(trace.ended_at_unix_millis.is_some());
+        assert_eq!(trace.outcome, TraceOutcome::Completed);
+    }
+
+    #[test]
+    fn recording_kernel_preserves_interrupted_terminal_outcome() {
+        let (kernel, _sink) = make_recording_kernel();
+        kernel.on_record(&make_record("test-session", 0, HookPoint::SessionStart));
+        let mut end = make_record("test-session", 1, HookPoint::SessionEnd);
+        end.snapshot.final_state = Some("interrupted".into());
+        end.snapshot.interruption_kind = Some("budget_exhausted".into());
+        kernel.on_record(&end);
+
+        assert_eq!(kernel.into_trace().outcome, TraceOutcome::Interrupted);
+    }
+
+    #[test]
+    fn recording_kernel_reports_bounded_history_eviction() {
+        let sink = InMemorySnapshotSink::arc();
+        let inner = Arc::new(StandardKernel::new(sink as Arc<dyn SnapshotSink>, vec![]));
+        let kernel = RecordingKernel::new(inner, Some("bounded".into())).with_max_records(2);
+        kernel.on_record(&make_record("bounded", 0, HookPoint::SessionStart));
+        kernel.on_record(&make_record("bounded", 1, HookPoint::PreLlmRequest));
+        kernel.on_record(&make_record("bounded", 1, HookPoint::PostLlmResponse));
+
+        let trace = kernel.into_trace();
+        assert_eq!(trace.record_count(), 2);
+        assert_eq!(trace.dropped_records, 1);
+        assert_eq!(
+            trace.records.front().unwrap().point,
+            HookPoint::PreLlmRequest
+        );
     }
 
     #[test]

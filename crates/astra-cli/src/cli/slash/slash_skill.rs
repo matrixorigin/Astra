@@ -9,7 +9,6 @@ use crate::cli::{
 };
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
-use std::io::Write;
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
@@ -586,29 +585,7 @@ Follow these steps:
                 eprintln!("  Input: {}", json_args.magenta());
             }
 
-            // Try API first
-            let api_ok = if let Some(tok) = token {
-                let payload = serde_json::json!({
-                    "skill_id": name,
-                    "args": if json_args.is_empty() {
-                        serde_json::Value::Object(serde_json::Map::new())
-                    } else {
-                        serde_json::from_str(json_args).unwrap_or(serde_json::Value::String(json_args.to_string()))
-                    }
-                });
-                match api.post_skills_test_json(tok, &payload).await {
-                    Ok(body) => {
-                        eprintln!("  {}", "\u{2713} API test result:".green());
-                        eprintln!("  {}", body.dim());
-                        true
-                    }
-                    Err(_) => false,
-                }
-            } else {
-                false
-            };
-
-            if !api_ok {
+            {
                 let skill_dir = match resolve_skill_dir_on_disk(name) {
                     Some(p) => p,
                     None => {
@@ -1198,7 +1175,7 @@ Follow these steps:
         }
 
         "uninstall" | "remove" => {
-            uninstall_local_skill(sub_arg.trim(), state).await;
+            uninstall_skill_from_marketplace(sub_arg.trim(), api, token).await;
         }
 
         "pack" => {
@@ -1993,9 +1970,9 @@ mod tests {
     mod marketplace_tests {
         use super::super::{
             browse_marketplace, default_skill_category, fetch_marketplace_version,
-            list_installed_marketplace, trending_marketplace,
+            list_installed_marketplace, trending_marketplace, uninstall_skill_from_marketplace,
         };
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_json, header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         fn make_client(server_uri: &str) -> astra_thin_client::ThinClient {
@@ -2172,20 +2149,21 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn uninstall_removes_skill_directory() {
-            let tmp = tempfile::tempdir().unwrap();
-            let skill_dir = tmp.path().join(".astra/skills/removable-skill");
-            std::fs::create_dir_all(&skill_dir).unwrap();
-            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: removable\n---").unwrap();
-            assert!(skill_dir.exists());
+        async fn uninstall_uses_marketplace_account_protocol() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/marketplace/uninstall"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_json(
+                    serde_json::json!({"skill_name": "removable-skill"}),
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&srv)
+                .await;
 
-            // uninstall_skill_from_marketplace needs SessionState; test the core logic directly
-            // without mutating process-global cwd, which would race with other unit tests.
-            let target = tmp.path().join(".astra/skills/removable-skill");
-            assert!(target.exists());
-            std::fs::remove_dir_all(&target).unwrap();
-
-            assert!(!skill_dir.exists(), "skill dir should be removed");
+            let client = make_client(&srv.uri());
+            uninstall_skill_from_marketplace("removable-skill", &client, Some("tok")).await;
         }
 
         // ── Versioning / upgrade tests ─────────────────────────────────
@@ -2396,243 +2374,61 @@ pub(crate) async fn maybe_upload_quality_on_exit(
 
 // ── Marketplace install/publish/uninstall ─────────────────────────────────
 
-/// Install a skill from the marketplace into `.astra/skills/<name>/`.
+/// Install a marketplace skill for the authenticated Astra user.
 async fn install_skill_from_marketplace(
     name: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &mut SessionState,
+    _state: &mut SessionState,
 ) {
     if name.is_empty() {
-        eprintln!("{}", "  Usage: /skill install <name>[@version]".yellow());
+        eprintln!("{}", "  Usage: /skill install <name>".yellow());
+        eprintln!("{}", "  Installs a marketplace skill for this user.".dim());
+        return;
+    }
+    if name.contains('@') {
         eprintln!(
             "{}",
-            "  Downloads a skill from the marketplace to .astra/skills/.".dim()
+            "  Exact-version install is not part of the marketplace protocol; use /skill rollback after installation."
+                .yellow()
         );
         return;
     }
 
     let tok = token.unwrap_or("");
-    let mut installed_names: Vec<String> = Vec::new();
-    let constraint = astra_skills::version::VersionConstraint::default(); // Any
-
-    install_skill_recursive(name, &constraint, api, tok, state, &mut installed_names, 0).await;
-
-    if installed_names.len() > 1 {
-        eprintln!(
-            "  {} Installed {} skills total: {}",
-            theme::icon_ok(),
-            installed_names.len(),
-            installed_names.join(", ").dim()
-        );
-    }
+    let _ = install_single_skill(name, api, tok).await;
     eprintln!();
 }
 
-const MAX_DEP_INSTALL_DEPTH: u32 = 5;
-
-/// Recursively install a skill and its dependencies, checking version constraints.
-fn install_skill_recursive<'a>(
-    name: &'a str,
-    constraint: &'a astra_skills::version::VersionConstraint,
-    api: &'a astra_thin_client::ThinClient,
-    tok: &'a str,
-    state: &'a mut SessionState,
-    installed: &'a mut Vec<String>,
-    depth: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-    Box::pin(async move {
-        if depth > MAX_DEP_INSTALL_DEPTH {
-            eprintln!(
-                "  {} Dependency depth limit ({}) reached for '{}'",
-                theme::icon_warn(),
-                MAX_DEP_INSTALL_DEPTH,
-                name.magenta()
-            );
-            return;
-        }
-
-        // Parse name@version (explicit version override takes precedence over constraint)
-        let (skill_name, explicit_version) = if let Some(idx) = name.find('@') {
-            (&name[..idx], Some(&name[idx + 1..]))
-        } else {
-            (name, None)
-        };
-
-        // Skip if already installed in this session (avoid cycles)
-        if installed.iter().any(|n| n == skill_name) {
-            return;
-        }
-
-        // Check if skill is already available locally and satisfies the constraint
-        if depth > 0 {
-            let all = state.unified_skill_registry.all_manifests();
-            if let Some(existing) = all.iter().find(|m| m.name == skill_name) {
-                if constraint.matches(&existing.version) {
-                    return; // Already available and satisfies constraint
-                }
-                // Version constraint not satisfied — will re-install
-                eprintln!(
-                    "  {} '{}' v{} does not satisfy {}, upgrading…",
-                    theme::icon_warn(),
-                    skill_name.magenta(),
-                    existing.version.to_string().dim(),
-                    constraint.to_string().yellow()
-                );
-            }
-        }
-
-        let constraint_label = if constraint.is_any() {
-            String::new()
-        } else {
-            format!(" ({})", constraint)
-        };
-
-        if depth == 0 {
-            eprintln!(
-                "  {} {}{}",
-                "Installing".magenta(),
-                skill_name.magenta().bold(),
-                explicit_version
-                    .map(|v| format!("@{v}"))
-                    .unwrap_or(constraint_label)
-                    .dim()
-            );
-        } else {
-            eprintln!(
-                "  {} {}{} (dependency)",
-                "Installing".magenta(),
-                skill_name.magenta(),
-                constraint_label.dim()
-            );
-        }
-
-        // Try bundle endpoint first, fall back to legacy JSON
-        let success = install_single_skill(skill_name, explicit_version, api, tok, state).await;
-
-        if success {
-            installed.push(skill_name.to_string());
-
-            // Refresh registry to pick up newly installed skill
-            let _ = state.unified_skill_registry.discover_all().await;
-
-            // Validate the installed version satisfies the constraint
-            if !constraint.is_any() {
-                let all = state.unified_skill_registry.all_manifests();
-                if let Some(m) = all.iter().find(|m| m.name == skill_name) {
-                    if !constraint.matches(&m.version) {
-                        eprintln!(
-                            "  {} Installed '{}' v{} does not satisfy constraint {}",
-                            theme::icon_warn(),
-                            skill_name.magenta(),
-                            m.version.to_string().dim(),
-                            constraint.to_string().yellow()
-                        );
-                    }
-                }
-            }
-
-            // Check dependencies of the newly installed skill
-            let deps = {
-                let all = state.unified_skill_registry.all_manifests();
-                all.iter()
-                    .find(|m| m.name == skill_name)
-                    .map(|m| m.dependencies.clone())
-                    .unwrap_or_default()
-            };
-
-            let skill_deps: Vec<_> = deps
-                .into_iter()
-                .filter(|d| d.dep_type == astra_skills::version::DependencyType::Skill)
-                .collect();
-
-            if !skill_deps.is_empty() {
-                eprintln!(
-                    "  {} {} has {} dependencies",
-                    "→".dim(),
-                    skill_name.magenta(),
-                    skill_deps.len()
-                );
-
-                for dep in &skill_deps {
-                    install_skill_recursive(
-                        &dep.name,
-                        &dep.version,
-                        api,
-                        tok,
-                        state,
-                        installed,
-                        depth + 1,
-                    )
-                    .await;
-                }
-            }
-        }
-    }) // close Box::pin(async move { ... })
-}
-
-/// Install a single skill (no dependency resolution). Returns true on success.
+/// Install a single skill through the current marketplace protocol.
 async fn install_single_skill(
     skill_name: &str,
-    version: Option<&str>,
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    _state: &mut SessionState,
 ) -> bool {
-    let bundle_path = format!("/skills/{}/bundle", skill_name);
-    let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
-        vec![("version", v.to_string())]
-    } else {
-        vec![]
-    };
-
+    let request = serde_json::json!({"skill_name": skill_name});
     match api
-        .get_bearer_path_query_text(tok, &bundle_path, &query_pairs)
+        .post_bearer_path_json_text(tok, "/marketplace/install", &request)
         .await
     {
         Ok(text) => {
-            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim()) {
-                Ok(bytes) => {
-                    let install_dir = std::env::current_dir()
-                        .unwrap_or_default()
-                        .join(".astra")
-                        .join("skills");
-
-                    match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
-                        Ok((installed, manifest)) => {
-                            eprintln!(
-                                "  {} Installed {} v{} to {}",
-                                theme::icon_ok(),
-                                manifest.name.magenta(),
-                                manifest.version.dim(),
-                                installed.display().to_string().dim()
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  {} {}",
-                                "Bundle unpack failed:".red(),
-                                format!("{e}").dim()
-                            );
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  {} {}",
-                        "Bundle response was not valid base64:".red(),
-                        format!("{e}").dim()
-                    );
-                    false
-                }
-            }
+            let version =
+                serde_json::from_str::<astra_services::marketplace::InstallationResponse>(&text)
+                    .ok()
+                    .map(|response| response.skill_version)
+                    .unwrap_or_else(|| "unknown".to_string());
+            eprintln!(
+                "  {} Installed {} v{} for this user",
+                theme::icon_ok(),
+                skill_name.magenta(),
+                version.dim()
+            );
+            true
         }
         Err(e) => {
             eprintln!(
                 "  {} {}",
-                "Bundle download failed:".red(),
+                "Marketplace install failed:".red(),
                 format!("{e}").dim()
             );
             false
@@ -2640,7 +2436,7 @@ async fn install_single_skill(
     }
 }
 
-/// Publish a local skill to the marketplace (as a bundle).
+/// Publish a local skill through the current typed marketplace contract.
 async fn publish_skill_to_marketplace(
     name: &str,
     api: &astra_thin_client::ThinClient,
@@ -2649,10 +2445,7 @@ async fn publish_skill_to_marketplace(
 ) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill publish <name>".yellow());
-        eprintln!(
-            "{}",
-            "  Publishes a local skill to the marketplace as a bundle.".dim()
-        );
+        eprintln!("{}", "  Publishes a local skill to the marketplace.".dim());
         return;
     }
 
@@ -2678,17 +2471,6 @@ async fn publish_skill_to_marketplace(
         }
     };
 
-    // Find skill directory to pack
-    let search_paths = astra_skills::loader::skill_search_paths();
-    let mut skill_dir: Option<std::path::PathBuf> = None;
-    for base in &search_paths {
-        let candidate = base.join(name);
-        if candidate.join("SKILL.md").exists() {
-            skill_dir = Some(candidate);
-            break;
-        }
-    }
-
     eprintln!(
         "  {} {} v{}...",
         "Publishing".magenta(),
@@ -2697,59 +2479,6 @@ async fn publish_skill_to_marketplace(
     );
     let category = default_skill_category(manifest.category.as_deref());
 
-    // Try bundle publish if we have a local directory
-    if let Some(ref dir) = skill_dir {
-        match astra_skills::pack::pack_skill_to_bytes(dir) {
-            Ok((bundle_bytes, bundle_manifest)) => {
-                let encoded = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &bundle_bytes,
-                );
-                let request = serde_json::json!({
-                    "name": bundle_manifest.name,
-                    "version": bundle_manifest.version,
-                    "description": bundle_manifest.description,
-                    "category": category,
-                    "tags": manifest.tags,
-                    "bundle": encoded,
-                    "bundle_sha256": bundle_manifest.skill_md_sha256,
-                });
-
-                match api
-                    .post_bearer_path_json_text(tok, "/skills/publish", &request)
-                    .await
-                {
-                    Ok(_) => {
-                        eprintln!(
-                            "  {} Published {} v{} ({} bundle)",
-                            theme::icon_ok(),
-                            name.magenta(),
-                            manifest.version.to_string().dim(),
-                            format_bytes(bundle_bytes.len() as u64).dim()
-                        );
-                        eprintln!();
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  {} {}",
-                            "✗ Bundle publish failed:".yellow(),
-                            format!("{e}").dim()
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} {}",
-                    "✗ Bundle creation failed:".yellow(),
-                    format!("{e}").dim()
-                );
-            }
-        }
-    }
-
-    // Fallback: publish raw manifest + instructions
     let loaded = match registry.load(name).await {
         Ok(l) => l,
         Err(e) => {
@@ -2762,9 +2491,13 @@ async fn publish_skill_to_marketplace(
         "name": manifest.name,
         "version": manifest.version.to_string(),
         "description": manifest.description,
-        "dependencies": manifest.dependencies,
-        "manifest": loaded.instructions,
+        "dependencies": null,
+        "manifest": {
+            "instructions": loaded.instructions,
+        },
+        "skill_type": "local",
         "category": category,
+        "priority": 5,
     });
 
     match api
@@ -2790,80 +2523,32 @@ async fn publish_skill_to_marketplace(
     eprintln!();
 }
 
-/// Remove a locally installed skill.
-async fn uninstall_local_skill(name: &str, state: &mut SessionState) {
+/// Uninstall a marketplace skill for the authenticated Astra user.
+async fn uninstall_skill_from_marketplace(
+    name: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill uninstall <name>".yellow());
-        eprintln!("{}", "  Removes a locally installed skill.".dim());
+        eprintln!(
+            "{}",
+            "  Uninstalls a marketplace skill for this user.".dim()
+        );
         return;
     }
 
-    // Search for the skill in local paths
-    let search_paths = astra_skills::loader::skill_search_paths();
-    let mut found_dir: Option<std::path::PathBuf> = None;
-
-    for base in &search_paths {
-        let candidate = base.join(name);
-        if candidate.join("SKILL.md").exists() {
-            found_dir = Some(candidate);
-            break;
-        }
-    }
-
-    match found_dir {
-        Some(dir) => {
-            use std::io::IsTerminal;
-            if !std::io::stdin().is_terminal() {
-                eprintln!(
-                    "  {} {}",
-                    theme::icon_warn(),
-                    "Cannot confirm in non-interactive mode.".yellow()
-                );
-                return;
-            }
-            eprintln!(
-                "  {} Remove skill '{}' from {}?",
-                theme::icon_warn(),
-                name.magenta(),
-                dir.display().to_string().dim()
-            );
-            eprint!("  Confirm [y/N]: ");
-            let _ = std::io::stderr().flush();
-            let mut answer = String::new();
-            if std::io::stdin().read_line(&mut answer).is_err()
-                || !answer.trim().eq_ignore_ascii_case("y")
-            {
-                eprintln!("  {}", "Cancelled.".dim());
-                return;
-            }
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    eprintln!(
-                        "  {} Removed skill '{}' from {}",
-                        theme::icon_ok(),
-                        name.magenta(),
-                        dir.display().to_string().dim()
-                    );
-                    // Refresh registry
-                    let _ = state.unified_skill_registry.discover_all().await;
-                    eprintln!("  {}", "Skill registry refreshed.".dim());
-                }
-                Err(e) => {
-                    eprintln!("  {} {}", "✗ Failed to remove:".red(), e);
-                }
-            }
-        }
-        None => {
-            eprintln!(
-                "  {} Skill '{}' not found in local paths.",
-                "✗".yellow(),
-                name.magenta()
-            );
-            eprintln!("  {}", "Searched:".dim());
-            for p in &search_paths {
-                eprintln!("    {}", p.display().to_string().dim());
-            }
-        }
+    let request = serde_json::json!({"skill_name": name});
+    match api
+        .post_bearer_path_json_text(token.unwrap_or(""), "/marketplace/uninstall", &request)
+        .await
+    {
+        Ok(_) => eprintln!(
+            "  {} Uninstalled {} for this user",
+            theme::icon_ok(),
+            name.magenta()
+        ),
+        Err(error) => eprintln!("  {} {}", "✗ Uninstall failed:".red(), error),
     }
     eprintln!();
 }
@@ -3214,82 +2899,19 @@ async fn upgrade_skill(
         return;
     }
 
-    // Check local version
-    let local = read_local_skill_version(skill_name);
-    let (local_path, local_ver) = match local {
-        Some((p, v)) => (p, v),
-        None => {
-            eprintln!(
-                "  {} Skill '{}' not found locally. Use '/skill install {}' first.",
-                "✗".yellow(),
-                skill_name.magenta(),
-                skill_name
-            );
-            eprintln!();
-            return;
-        }
-    };
-
-    // Fetch latest from marketplace
-    let remote_str = match fetch_marketplace_version(skill_name, api, tok).await {
-        Some(v) => v,
-        None => {
-            eprintln!(
-                "  {} Skill '{}' not found in marketplace.",
-                "✗".yellow(),
-                skill_name.magenta()
-            );
-            eprintln!();
-            return;
-        }
-    };
-
-    let remote_ver = match remote_str.parse::<astra_skills::version::Version>() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "  {} Cannot parse marketplace version '{}'.",
-                "✗".yellow(),
-                remote_str
-            );
-            eprintln!();
-            return;
-        }
-    };
-
-    if remote_ver <= local_ver {
-        eprintln!(
-            "  {} '{}' is already at v{} (latest).",
-            theme::icon_ok(),
-            skill_name.magenta(),
-            local_ver
-        );
-        eprintln!();
-        return;
-    }
-
     eprintln!(
-        "  {} Upgrading '{}': {} → {}",
+        "  {} Upgrading '{}' through marketplace",
         "⬆".magenta(),
-        skill_name.magenta(),
-        local_ver.to_string().dim(),
-        remote_ver.to_string().green()
+        skill_name.magenta()
     );
 
-    // Remove old and re-install latest
-    let _ = std::fs::remove_dir_all(&local_path);
-    let ok = install_single_skill(skill_name, None, api, tok, state).await;
-
-    if ok {
-        // Notify server
-        let body = serde_json::json!({ "skill_name": skill_name });
-        let _ = api
-            .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
-            .await;
-
-        // Refresh registry
-        let _ = state.unified_skill_registry.discover_all().await;
-        eprintln!("  {}", "Skill registry refreshed.".dim());
+    let body = serde_json::json!({ "skill_name": skill_name });
+    match api
+        .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
+        .await
+    {
+        Ok(_) => eprintln!("  {} Upgrade completed", theme::icon_ok()),
+        Err(error) => eprintln!("  {} {}", "✗ Upgrade failed:".red(), error),
     }
     eprintln!();
 }
@@ -3298,7 +2920,7 @@ async fn upgrade_skill(
 async fn upgrade_all_skills(
     api: &astra_thin_client::ThinClient,
     tok: &str,
-    state: &mut SessionState,
+    _state: &mut SessionState,
 ) {
     eprintln!(
         "\n  {}",
@@ -3342,62 +2964,28 @@ async fn upgrade_all_skills(
     }
 
     let mut upgraded = 0u32;
-    let mut up_to_date = 0u32;
+    let mut failed = 0u32;
 
     for inst in &installed {
         let skill_name = inst.skill_name.as_str();
-        let local = read_local_skill_version(skill_name);
-
-        let remote_str = match fetch_marketplace_version(skill_name, api, tok).await {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let remote_ver = match remote_str.parse::<astra_skills::version::Version>() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        match local {
-            Some((local_path, local_ver)) if remote_ver > local_ver => {
-                eprintln!(
-                    "  {} Upgrading '{}': {} → {}",
-                    "⬆".magenta(),
-                    skill_name.magenta(),
-                    local_ver.to_string().dim(),
-                    remote_ver.to_string().green()
-                );
-                let _ = std::fs::remove_dir_all(&local_path);
-                let ok = install_single_skill(skill_name, None, api, tok, state).await;
-                if ok {
-                    let body = serde_json::json!({ "skill_name": skill_name });
-                    let _ = api
-                        .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
-                        .await;
-                    upgraded += 1;
-                }
-            }
-            Some(_) => {
-                up_to_date += 1;
-            }
-            None => {
-                // Installed on server but not locally — skip
-                up_to_date += 1;
+        let body = serde_json::json!({ "skill_name": skill_name });
+        match api
+            .post_bearer_path_json_text(tok, "/marketplace/upgrade", &body)
+            .await
+        {
+            Ok(_) => upgraded += 1,
+            Err(error) => {
+                failed += 1;
+                eprintln!("  {} {}: {}", "✗".red(), skill_name, error);
             }
         }
     }
 
-    if upgraded > 0 {
-        // Refresh registry once after all upgrades
-        let _ = state.unified_skill_registry.discover_all().await;
-        eprintln!("  {}", "Skill registry refreshed.".dim());
-    }
-
     eprintln!(
-        "\n  {} {} upgraded, {} up to date",
+        "\n  {} {} upgraded, {} failed",
         "Done:".bold(),
         upgraded.to_string().green(),
-        up_to_date.to_string().dim()
+        failed.to_string().dim()
     );
     eprintln!();
 }
@@ -3407,7 +2995,7 @@ async fn rollback_skill(
     name: &str,
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
-    state: &mut SessionState,
+    _state: &mut SessionState,
 ) {
     if name.is_empty() {
         eprintln!("{}", "  Usage: /skill rollback <name>".yellow());
@@ -3463,22 +3051,6 @@ async fn rollback_skill(
         target_version.as_str().dim()
     );
 
-    // Remove local copy and re-install the specific version
-    let search_paths = astra_skills::loader::skill_search_paths();
-    for base in &search_paths {
-        let skill_dir = base.join(name);
-        if skill_dir.exists() {
-            let _ = std::fs::remove_dir_all(&skill_dir);
-            break;
-        }
-    }
-
-    let ok = install_single_skill(name, Some(target_version.as_str()), api, tok, state).await;
-
-    if ok {
-        let _ = state.unified_skill_registry.discover_all().await;
-        eprintln!("  {}", "Skill registry refreshed.".dim());
-    }
     eprintln!();
 }
 

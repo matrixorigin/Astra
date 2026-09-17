@@ -79,12 +79,18 @@ pub struct RestoredSession {
     pub budget_remaining_tokens: u64,
     /// Remaining turn rounds
     pub budget_remaining_rounds: u32,
-    /// Tools currently blocked (from stall/health tracking)
+    /// Accounting only; the run owner must authorize same-run reconstruction.
+    pub run_execution_budget: Option<crate::step_protocol::RunExecutionBudget>,
+    pub run_execution_control: Option<crate::step_protocol::RunExecutionControl>,
+    /// Legacy checkpoint tool restriction snapshot. This is diagnostic input
+    /// only; owning runtimes must re-derive hard policy from the current
+    /// request/capability boundary rather than restore this unscoped list.
     pub blocked_tools: Vec<String>,
     /// Recently used tools (for selection context)
     pub recent_tools: Vec<String>,
     /// Deferred schemas materialized in the retained prompt context.
-    pub activated_deferred_tool_names: Vec<String>,
+    /// Schema-addressed deferred selections usable by the stable carrier.
+    pub deferred_tool_activations: Vec<astra_turn_types::DeferredToolActivation>,
     /// Turn number to resume from
     pub resume_turn: u32,
     /// Protocol version of the checkpoint
@@ -104,6 +110,10 @@ pub struct RestoredSession {
     pub compaction_state: Option<serde_json::Value>,
     /// Serialized context pipeline state for warm-start on resume.
     pub pipeline_state: Option<serde_json::Value>,
+    /// Durable workspace-observation quarantine carried by the checkpoint.
+    /// This is advisory safety state, never replay authority.
+    pub workspace_observation_quarantine:
+        Option<crate::step_protocol::WorkspaceObservationQuarantineV1>,
     /// Explicit account of completed-event rows rejected as execution cache
     /// authority during recovery.
     pub cache_restore_report: CacheRestoreReport,
@@ -178,6 +188,13 @@ fn build_restored_session(
     session_id: &str,
     heavy: HeavyCheckpoint,
 ) -> Result<Option<RestoredSession>, RestoreError> {
+    if let Some(quarantine) = heavy.workspace_observation_quarantine.as_ref()
+        && !quarantine.is_valid()
+    {
+        return Err(RestoreError::InvalidCheckpoint(
+            "workspace observation quarantine has an unknown reason or scope".to_string(),
+        ));
+    }
     if let Some(cursor) = heavy.conversation_cursor.as_ref() {
         if cursor.session_id != session_id {
             return Err(RestoreError::InvalidCheckpoint(format!(
@@ -209,9 +226,11 @@ fn build_restored_session(
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
+        run_execution_budget: heavy.run_execution_budget,
+        run_execution_control: heavy.run_execution_control,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
-        activated_deferred_tool_names: heavy.activated_deferred_tool_names,
+        deferred_tool_activations: heavy.deferred_tool_activations,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
@@ -220,6 +239,7 @@ fn build_restored_session(
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
         pipeline_state: heavy.pipeline_state,
+        workspace_observation_quarantine: heavy.workspace_observation_quarantine,
         cache_restore_report,
     }))
 }
@@ -357,12 +377,12 @@ fn recover_completed_tool_audit_from_events_with_bounds(
         }
     }
     if cache_restore_report.rejected_unverified_entries > 0 {
-        tracing::warn!(
+        tracing::debug!(
             user_id,
             session_id,
             rejected_unverified_entries = cache_restore_report.rejected_unverified_entries,
             rejected_context_bound_entries = cache_restore_report.rejected_context_bound_entries,
-            "completed tool-event results were retained for audit but rejected as executable replay authority"
+            "completed tool-event audit remained non-executable by design"
         );
     }
 
@@ -516,9 +536,11 @@ mod tests {
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools,
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             memory_context: None,
             delegation_id: None,
             delegation_pattern: None,
@@ -529,6 +551,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }
     }
 
@@ -600,6 +623,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ordinary_restore_rejects_unknown_workspace_observation_quarantine() {
+        let mut heavy = make_heavy_checkpoint(
+            3,
+            vec![serde_json::json!({"role": "user", "content": "resume"})],
+            vec![],
+        );
+        heavy.workspace_observation_quarantine =
+            Some(crate::step_protocol::WorkspaceObservationQuarantineV1 {
+                reason: "future_reason".into(),
+                scope: "bound_workspace".into(),
+                source_tool_call_id: None,
+            });
+
+        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        assert!(
+            matches!(error, RestoreError::InvalidCheckpoint(detail) if detail.contains("quarantine"))
+        );
+    }
+
     // ── Resume turn extraction ──
 
     #[test]
@@ -652,9 +695,11 @@ mod tests {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            run_execution_budget: None,
+            run_execution_control: None,
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
-            activated_deferred_tool_names: Vec::new(),
+            deferred_tool_activations: Vec::new(),
             resume_turn: 3,
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),
@@ -663,6 +708,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_state: None,
             pipeline_state: None,
+            workspace_observation_quarantine: None,
             cache_restore_report: CacheRestoreReport::default(),
         };
 
@@ -691,6 +737,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
         let _ = store.append(StepEvent {
             event_id: "completed-read".to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "step-1".to_string(),
             event_type: StepEventType::ToolCallCompleted,
@@ -734,6 +781,7 @@ mod tests {
         store
             .append(StepEvent {
                 event_id: "completed-stale-read".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "step-1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -773,6 +821,7 @@ mod tests {
             store
                 .append(StepEvent {
                     event_id: format!("completed-{idx}"),
+                    run_id: "test-run".into(),
                     canonical_event_id: None,
                     step_id: "step-1".to_string(),
                     event_type: StepEventType::ToolCallCompleted,
@@ -818,6 +867,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
@@ -828,6 +878,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -853,6 +904,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
@@ -863,6 +915,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallFailed,
@@ -888,6 +941,7 @@ mod tests {
         let events = vec![
             StepEvent {
                 event_id: "e1".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
@@ -898,6 +952,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e2".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallStarted,
@@ -908,6 +963,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e3".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -921,6 +977,7 @@ mod tests {
             },
             StepEvent {
                 event_id: "e4".to_string(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".to_string(),
                 event_type: StepEventType::ToolCallCompleted,

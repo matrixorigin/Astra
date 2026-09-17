@@ -20,9 +20,18 @@ async fn collect_full_sse_stream(
     let mut stream = resp.into_body().into_data_stream();
     let mut acc = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        let chunk = chunk.expect("body chunk");
-        acc.extend_from_slice(&chunk);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(chunk)) => {
+                let chunk = chunk.expect("body chunk");
+                acc.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => panic!(
+                "SSE stream did not terminate within {timeout_secs}s; collected {} bytes",
+                acc.len()
+            ),
+        }
     }
     (status, String::from_utf8_lossy(&acc).into_owned())
 }
@@ -62,7 +71,11 @@ fn is_response_event(event: &Value) -> bool {
 }
 
 async fn wait_for_full_capture_events(user_id: &str, session_id: &str) -> Vec<Value> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    // A preceding stream journey can still be draining its final durable
+    // projection on this two-worker runtime. Keep the assertion strict, but
+    // give the asynchronous journal hand-off the same bounded budget used by
+    // other Matrix-backed durability checks.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let events = read_journal_events(user_id, session_id);
         let llm_full: Vec<_> = events
@@ -87,12 +100,8 @@ async fn wait_for_full_capture_events(user_id: &str, session_id: &str) -> Vec<Va
 }
 
 pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() {
-    let Some(test_secret) = std::env::var("ASTRA_TEST_BRIDGE_SECRET").ok() else {
-        // Bridge journal test requires ASTRA_TEST_BRIDGE_SECRET == ASTRA_BRIDGE_SECRET.
-        // Without it the bridge auth fails and no journal is written.
-        panic!(
-            "ASTRA_TEST_BRIDGE_SECRET not set — set it to the same value as ASTRA_BRIDGE_SECRET to run this test"
-        );
+    let Some(test_secret) = std::env::var("ASTRA_TEST_E2E_SECRET").ok() else {
+        panic!("ASTRA_TEST_E2E_SECRET not set — deterministic inference is fail-closed");
     };
     let temp = tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
@@ -125,7 +134,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         "context": {
             "test_llm_stream_blocks": [
                 "data: {\"type\":\"text_delta\",\"content\":\"Matrix capture verified.\"}\n\n",
-                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"server-e2e-mock\"}\n\n"
             ]
         }
     });
@@ -134,7 +143,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         .uri("/chat/stream")
         .header("authorization", auth)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
+        .header("x-astra-e2e-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
         .expect("stream request");
     let (status, body) = collect_full_sse_stream(app, req, 30).await;
@@ -178,5 +187,5 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
     );
 
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }

@@ -126,8 +126,8 @@ mod tests {
             Some("matrixorigin/astra")
         );
         assert_eq!(
-            github_repo_display(None, Some("matrixorigin/astra")).as_deref(),
-            Some("matrixorigin/astra")
+            github_repo_display(None, Some("matrixorigin/Astra")).as_deref(),
+            Some("matrixorigin/Astra")
         );
         assert_eq!(github_repo_display(Some("matrixorigin"), None), None);
     }

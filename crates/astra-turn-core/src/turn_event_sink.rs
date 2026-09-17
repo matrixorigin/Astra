@@ -6,25 +6,56 @@
 //! stream future is dropped before returning.
 //!
 //! # Design
-//! - Token counts use `AtomicU64` for lock-free writes during hot streaming.
+//! - Token counts and logical telemetry use `AtomicU64` for lock-free writes
+//!   during hot streaming.
 //! - Partial text and tool records use `Mutex<Vec<T>>` — contention is low
 //!   (single writer per field at any point in the SSE parse).
 //! - `snapshot()` takes a non-consuming snapshot, safe on poisoned mutexes.
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 use astra_services::session_journal::ToolCallRecord;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Backpressure cap: oldest records are evicted when this is exceeded.
 const MAX_TOOL_RECORDS: usize = 200;
 
+#[derive(Debug, Default)]
+struct UsageCoverageState {
+    attempts: u32,
+    /// Per-round report status. Keeping this under one per-turn lock makes
+    /// out-of-order feedback corrections atomic with the snapshot.
+    observed_rounds: BTreeMap<u32, bool>,
+    exact_terminal: Option<crate::chat_turn_sse_dispatch::TokenUsageCoverage>,
+}
+
+impl UsageCoverageState {
+    fn snapshot(&self) -> crate::chat_turn_sse_dispatch::TokenUsageCoverage {
+        if let Some(exact) = self.exact_terminal {
+            return exact;
+        }
+        let provider_reported = self
+            .observed_rounds
+            .values()
+            .filter(|reported| **reported)
+            .count()
+            .min(self.attempts as usize) as u32;
+        crate::chat_turn_sse_dispatch::TokenUsageCoverage {
+            attempts: self.attempts,
+            provider_reported,
+            unavailable: self.attempts - provider_reported,
+        }
+    }
+}
+
 /// Incremental turn state shared between the SSE streaming future and the
 /// cancel/drain handler.  All fields are written during streaming and read
 /// on interruption to recover partial data.
 ///
-/// Tool call count is derived from `tool_call_records.len()` — no separate
-/// atomic counter is needed.
+/// Tool call records are intentionally retained in a bounded window. Logical
+/// counters therefore live separately and must never be reconstructed from
+/// that window during cancellation or wall-deadline recovery.
 #[derive(Debug)]
 pub struct IncrementalTurnState {
     /// Prompt tokens consumed so far.
@@ -35,6 +66,13 @@ pub struct IncrementalTurnState {
     pub cache_read_tokens: AtomicU64,
     /// Cache creation tokens.
     pub cache_creation_tokens: AtomicU64,
+    /// Monotonic number of logical provider rounds observed for this turn.
+    pub llm_rounds: AtomicU64,
+    /// Monotonic logical tool-call total. Unlike `tool_call_records`, this is
+    /// not evicted under backpressure.
+    pub total_tool_calls: AtomicU64,
+    /// Per-turn provider usage coverage and out-of-order round ledger.
+    usage_coverage: Mutex<UsageCoverageState>,
     /// Accumulated assistant text (partial or full).
     pub partial_text: Mutex<String>,
     /// Byte length of text already committed via `update_text`.  Used so
@@ -60,6 +98,9 @@ impl Default for IncrementalTurnState {
             completion_tokens: AtomicU64::new(0),
             cache_read_tokens: AtomicU64::new(0),
             cache_creation_tokens: AtomicU64::new(0),
+            llm_rounds: AtomicU64::new(0),
+            total_tool_calls: AtomicU64::new(0),
+            usage_coverage: Mutex::new(UsageCoverageState::default()),
             partial_text: Mutex::new(String::new()),
             partial_text_len: AtomicUsize::new(0),
             tool_call_records: Mutex::new(Vec::new()),
@@ -77,9 +118,17 @@ pub struct TurnIncrementalSnapshot {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Logical provider rounds observed before the snapshot. `None` means no
+    /// authoritative round boundary reached the client yet.
+    pub llm_rounds: Option<u32>,
+    /// Total logical tool calls, independent of the retained record window.
+    pub tool_calls_count: u32,
+    /// Provider usage coverage for the observed logical rounds.
+    pub token_usage_coverage: crate::chat_turn_sse_dispatch::TokenUsageCoverage,
     pub partial_text: String,
     /// Tool call records captured at snapshot time.
-    /// `tool_call_records.len()` gives the tool call count.
+    /// This is a bounded retained window; use `tool_calls_count` for the
+    /// logical total.
     pub tool_call_records: Vec<ToolCallRecord>,
     pub tools_used: Vec<String>,
     pub session_id: Option<String>,
@@ -125,6 +174,98 @@ impl IncrementalTurnState {
     /// Add cache creation tokens.
     pub fn add_cache_creation_tokens(&self, n: u64) {
         self.cache_creation_tokens.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Merge a run-total or request projection without allowing a replayed
+    /// lower value to erase a newer cumulative observation.
+    pub fn merge_token_usage_lower_bound(
+        &self,
+        prompt: u64,
+        completion: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) {
+        self.prompt_tokens.fetch_max(prompt, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_max(completion, Ordering::Relaxed);
+        self.cache_read_tokens
+            .fetch_max(cache_read, Ordering::Relaxed);
+        self.cache_creation_tokens
+            .fetch_max(cache_creation, Ordering::Relaxed);
+    }
+
+    /// Keep the highest observed logical round. Feedback can be replayed or
+    /// arrive out of order across the edge/server boundary, so never regress.
+    pub fn set_llm_rounds(&self, n: u32) {
+        self.llm_rounds.fetch_max(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Keep the highest authoritative logical tool-call total. The retained
+    /// record window may be smaller after eviction or remote execution.
+    pub fn set_tool_calls_count(&self, n: u32) {
+        self.total_tool_calls
+            .fetch_max(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Fold one validated runtime-feedback frame into the cancellation-safe
+    /// counters. Replayed frames for an already-counted round are ignored.
+    /// Missing provider usage is recorded as unavailable rather than silently
+    /// reported as zero.
+    pub fn record_runtime_feedback(&self, frame: &crate::context_feedback::RuntimeFeedbackFrame) {
+        let rounds = frame.progress.llm_rounds_completed;
+        let mut coverage = unwrap_lock(&self.usage_coverage);
+        // An exact server terminal closes this logical run. Do not mix a late
+        // frame from a newer/replayed generation into its terminal snapshot.
+        if coverage.exact_terminal.is_none() {
+            self.set_llm_rounds(rounds);
+            let observed_round = frame
+                .identity
+                .request
+                .as_ref()
+                .map(|request| request.round.saturating_add(1))
+                .filter(|round| *round > 0 && *round <= rounds)
+                .unwrap_or(rounds);
+            if observed_round > 0 {
+                // A reported observation wins over an earlier unavailable
+                // projection for the same round; a replay cannot downgrade it.
+                let reported = frame.request_usage.is_some();
+                coverage
+                    .observed_rounds
+                    .entry(observed_round)
+                    .and_modify(|existing| *existing |= reported)
+                    .or_insert(reported);
+            }
+            coverage.attempts = coverage.attempts.max(rounds);
+        }
+        let exact_terminal = coverage.exact_terminal.is_some();
+        drop(coverage);
+        if exact_terminal {
+            return;
+        }
+        // `run_usage` is a monotonic aggregate and is the only safe source for
+        // totals when a wall deadline interrupts before a terminal event.
+        if let Some(usage) = frame.run_usage {
+            // Feedback can be reordered independently of the provider stream;
+            // never let a stale round overwrite a newer cumulative total.
+            self.merge_token_usage_lower_bound(
+                usage.prompt,
+                usage.completion,
+                usage.cache_read,
+                usage.cache_creation,
+            );
+        }
+    }
+
+    /// Replace coverage with the exact server-owned terminal aggregate.
+    /// Terminal summaries supersede the conservative feedback projection.
+    pub fn set_token_usage_coverage(
+        &self,
+        coverage: crate::chat_turn_sse_dispatch::TokenUsageCoverage,
+    ) {
+        if !coverage.is_valid() {
+            return;
+        }
+        unwrap_lock(&self.usage_coverage).exact_terminal = Some(coverage);
     }
 
     /// Replace the accumulated assistant text with the latest observed snapshot.
@@ -175,7 +316,12 @@ impl IncrementalTurnState {
             .fetch_add(text.len(), Ordering::Relaxed);
     }
 
-    /// Replace the tool-call record collection with the latest authoritative set.
+    /// Replace the retained tool-call record collection with the latest set.
+    ///
+    /// This deliberately does not rewrite `total_tool_calls`: callers may
+    /// already have counted live edge results, while this replacement can be
+    /// a filtered or bounded view of the same logical run. Use
+    /// `set_tool_calls_count` when an independent authoritative total exists.
     pub fn replace_tool_records(&self, records: Vec<ToolCallRecord>) {
         *unwrap_lock(&self.tool_call_records) = records;
     }
@@ -189,6 +335,7 @@ impl IncrementalTurnState {
     /// Backpressure: if the record count exceeds `MAX_TOOL_RECORDS`, the
     /// oldest half is evicted (keeps the cap O(1) amortized).
     pub fn push_tool_record(&self, record: ToolCallRecord) {
+        self.total_tool_calls.fetch_add(1, Ordering::Relaxed);
         let mut guard = unwrap_lock(&self.tool_call_records);
         guard.push(record);
         if guard.len() > MAX_TOOL_RECORDS {
@@ -233,6 +380,15 @@ impl IncrementalTurnState {
             completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
             cache_read_tokens: self.cache_read_tokens.load(Ordering::Relaxed),
             cache_creation_tokens: self.cache_creation_tokens.load(Ordering::Relaxed),
+            llm_rounds: match self.llm_rounds.load(Ordering::Relaxed) {
+                0 => None,
+                value => Some(value.min(u64::from(u32::MAX)) as u32),
+            },
+            tool_calls_count: self
+                .total_tool_calls
+                .load(Ordering::Relaxed)
+                .min(u64::from(u32::MAX)) as u32,
+            token_usage_coverage: unwrap_lock(&self.usage_coverage).snapshot(),
             partial_text: unwrap_lock(&self.partial_text).clone(),
             tool_call_records: unwrap_lock(&self.tool_call_records).clone(),
             tools_used: unwrap_lock(&self.tools_used).clone(),
@@ -322,13 +478,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_count_derived_from_records_len() {
+    fn tool_call_count_is_preserved_as_a_logical_counter() {
         let state = IncrementalTurnState::default();
         state.push_tool_record(tool_record("read_file", true, 42, None));
         state.push_tool_record(tool_record("bash", false, 100, Some("fail")));
         state.push_tool_record(tool_record("grep", true, 10, None));
         let snap = state.snapshot();
-        // Count is derived from records len, not a separate atomic.
+        assert_eq!(snap.tool_calls_count, 3);
         assert_eq!(snap.tool_call_records.len(), 3);
     }
 
@@ -375,6 +531,8 @@ mod tests {
         let snap = state.snapshot();
         assert_eq!(snap.tool_call_records.len(), 1);
         assert_eq!(snap.tool_call_records[0].name, "bash");
+        // Replacing the retained window must not double-count a live record.
+        assert_eq!(snap.tool_calls_count, 1);
         assert_eq!(snap.tools_used, vec!["bash"]);
     }
 
@@ -546,6 +704,7 @@ mod tests {
             snap.tool_call_records[0].name.as_str().starts_with("tool_"),
             "records should survive eviction cycles"
         );
+        assert_eq!(snap.tool_calls_count, 300);
     }
 
     #[test]
@@ -558,5 +717,110 @@ mod tests {
         assert_eq!(snap.tool_call_records.len(), 50);
         assert_eq!(snap.tool_call_records[0].name, "tool_0");
         assert_eq!(snap.tool_call_records[49].name, "tool_49");
+        assert_eq!(snap.tool_calls_count, 50);
+    }
+
+    #[test]
+    fn runtime_feedback_is_monotonic_and_deduplicates_replays() {
+        let state = IncrementalTurnState::default();
+        let frame = crate::introspect::test_runtime_feedback(1, 3, 8);
+        state.record_runtime_feedback(&frame);
+        state.record_runtime_feedback(&frame);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.llm_rounds, Some(3));
+        assert_eq!(snap.token_usage_coverage.attempts, 3);
+        assert_eq!(snap.token_usage_coverage.provider_reported, 1);
+        assert_eq!(snap.token_usage_coverage.unavailable, 2);
+        assert_eq!(snap.prompt_tokens, 42_000);
+        assert_eq!(snap.completion_tokens, 12_000);
+    }
+
+    #[test]
+    fn out_of_order_feedback_reconciles_late_usage_without_downgrading_replays() {
+        let state = IncrementalTurnState::default();
+        let round_one = crate::introspect::test_runtime_feedback(1, 1, 8);
+        let round_two = crate::introspect::test_runtime_feedback(1, 2, 8);
+
+        // Round two can cross the transport before round one. Both requests
+        // eventually reported usage, so the final coverage must be complete.
+        state.record_runtime_feedback(&round_two);
+        state.record_runtime_feedback(&round_one);
+        state.record_runtime_feedback(&round_two);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.llm_rounds, Some(2));
+        assert_eq!(snap.token_usage_coverage.attempts, 2);
+        assert_eq!(snap.token_usage_coverage.provider_reported, 2);
+        assert_eq!(snap.token_usage_coverage.unavailable, 0);
+
+        // A missing usage observation remains unavailable until a later frame
+        // supplies the same round's provider report.
+        let state = IncrementalTurnState::default();
+        state.record_runtime_feedback(&round_two);
+        let mut missing_round_one = round_one.clone();
+        missing_round_one.request_usage = None;
+        state.record_runtime_feedback(&missing_round_one);
+        let snap = state.snapshot();
+        assert_eq!(snap.token_usage_coverage.provider_reported, 1);
+        assert_eq!(snap.token_usage_coverage.unavailable, 1);
+        state.record_runtime_feedback(&round_one);
+        let snap = state.snapshot();
+        assert_eq!(snap.token_usage_coverage.provider_reported, 2);
+        assert_eq!(snap.token_usage_coverage.unavailable, 0);
+
+        // The cumulative run usage must be monotonic as well: a stale round
+        // can carry lower totals than the newer frame that arrived first.
+        let state = IncrementalTurnState::default();
+        let mut newer = crate::introspect::test_runtime_feedback(1, 2, 8);
+        newer.run_usage = Some(crate::token_accounting::TokenAccounting::from_fields(
+            100_000, 200_000, 30_000, 40_000,
+        ));
+        let mut stale = crate::introspect::test_runtime_feedback(1, 1, 8);
+        stale.run_usage = Some(crate::token_accounting::TokenAccounting::from_fields(
+            50_000, 90_000, 10_000, 20_000,
+        ));
+        state.record_runtime_feedback(&newer);
+        state.record_runtime_feedback(&stale);
+        let snap = state.snapshot();
+        assert_eq!(snap.prompt_tokens, 100_000);
+        assert_eq!(snap.cache_read_tokens, 200_000);
+        assert_eq!(snap.cache_creation_tokens, 30_000);
+        assert_eq!(snap.completion_tokens, 40_000);
+    }
+
+    #[test]
+    fn exact_terminal_coverage_supersedes_conservative_feedback() {
+        let state = IncrementalTurnState::default();
+        let frame = crate::introspect::test_runtime_feedback(1, 2, 8);
+        state.record_runtime_feedback(&frame);
+        state.set_token_usage_coverage(crate::chat_turn_sse_dispatch::TokenUsageCoverage {
+            attempts: 2,
+            provider_reported: 2,
+            unavailable: 0,
+        });
+
+        let snap = state.snapshot();
+        assert_eq!(snap.token_usage_coverage.attempts, 2);
+        assert_eq!(snap.token_usage_coverage.provider_reported, 2);
+        assert_eq!(snap.token_usage_coverage.unavailable, 0);
+    }
+
+    #[test]
+    fn late_feedback_cannot_mutate_exact_terminal_coverage() {
+        let state = IncrementalTurnState::default();
+        state.set_llm_rounds(2);
+        state.set_token_usage_coverage(crate::chat_turn_sse_dispatch::TokenUsageCoverage {
+            attempts: 2,
+            provider_reported: 2,
+            unavailable: 0,
+        });
+        state.record_runtime_feedback(&crate::introspect::test_runtime_feedback(1, 3, 8));
+
+        let snap = state.snapshot();
+        assert_eq!(snap.llm_rounds, Some(2));
+        assert_eq!(snap.token_usage_coverage.attempts, 2);
+        assert_eq!(snap.token_usage_coverage.provider_reported, 2);
+        assert_eq!(snap.token_usage_coverage.unavailable, 0);
     }
 }

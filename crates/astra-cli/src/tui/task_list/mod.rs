@@ -1,9 +1,8 @@
 //! TUI rendering for the Tier 1 session task board.
 //!
-//! Renders full current-session tasks and the smaller, truthful
-//! [`OpenTaskSummary`] projection used by cross-session views.
+//! Renders the current session's canonical Work Task Graph projection.
 //!
-//! Rendering rules (matching the reference TUI):
+//! Rendering rules:
 //!
 //! - **Visibility**: hidden when `rows <= 10`.
 //! - **maxDisplay**: `min(10, max(3, rows - 14))`.
@@ -16,13 +15,14 @@
 //! - **Standalone header**: optional `Tasks · K working · M queued
 //!   · J done` line above the list.
 //! - **Truncation** when `tasks.len() > maxDisplay`: prioritize
-//!   in-progress → pending (blocked last within pending) → completed;
+//!   in-progress → pending (blocked last within pending) → paused →
+//!   completed → terminal diagnostics;
 //!   append `· N more: M working, K queued, J done` when any tasks
 //!   are hidden. Recent-completed TTL state lives in the observer.
 //! - **Responsive subject truncation** gated behind available columns.
 
-use astra_tools::task_mgmt::{
-    OpenTaskSummary, SessionTask, SessionTaskStatusKind, unresolved_task_blocker_ids,
+use super::work_board_projection::{
+    SessionTask, SessionTaskStatusKind, unresolved_task_blocker_ids,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -95,35 +95,144 @@ fn status_icon_and_color(
         SessionTaskStatusKind::Completed => ("✔", colors.success),
         SessionTaskStatusKind::InProgress => ("•", colors.accent),
         SessionTaskStatusKind::Paused => ("⏸", colors.warn),
-        SessionTaskStatusKind::Pending
-        | SessionTaskStatusKind::Archived
-        | SessionTaskStatusKind::Deleted
-        | SessionTaskStatusKind::Migrated
-        | SessionTaskStatusKind::Other => ("◻", colors.dim),
+        SessionTaskStatusKind::Pending | SessionTaskStatusKind::Other => ("◻", colors.dim),
         SessionTaskStatusKind::Failed => ("✖", colors.error),
         SessionTaskStatusKind::Cancelled => ("■", colors.warn),
     }
 }
 
-fn is_task_board_tombstone(status: SessionTaskStatusKind) -> bool {
-    matches!(
-        status,
-        SessionTaskStatusKind::Archived
-            | SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Migrated
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkTaskPresentation {
+    Planned,
+    Working,
+    Waiting,
+    Paused,
+    Executed,
+    OutcomeUnreported,
+    Blocked,
+    Verified,
+    NeedsRecheck,
+    CheckFailed,
+    Failed,
+    Cancelled,
+    Replaced,
 }
 
-fn task_is_renderable(task: &SessionTask) -> bool {
-    !is_task_board_tombstone(task.status)
+impl WorkTaskPresentation {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Planned => "Planned",
+            Self::Working => "Working",
+            Self::Waiting => "Waiting",
+            Self::Paused => "Paused",
+            // A delivered result is complete from the user's perspective.
+            // Verification evidence is useful provenance, but its absence is
+            // not a request to resume or repair this task.
+            Self::Executed => "Completed",
+            Self::OutcomeUnreported => "Result not reported",
+            Self::Blocked => "Blocked",
+            Self::Verified => "Verified",
+            Self::NeedsRecheck => "Needs recheck",
+            Self::CheckFailed => "Check failed",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+            Self::Replaced => "Replaced",
+        }
+    }
+
+    const fn board_status(self) -> SessionTaskStatusKind {
+        match self {
+            Self::Planned => SessionTaskStatusKind::Pending,
+            Self::Working => SessionTaskStatusKind::InProgress,
+            Self::Waiting
+            | Self::Paused
+            | Self::OutcomeUnreported
+            | Self::Blocked
+            | Self::NeedsRecheck => SessionTaskStatusKind::Paused,
+            Self::Executed | Self::Verified => SessionTaskStatusKind::Completed,
+            Self::CheckFailed | Self::Failed => SessionTaskStatusKind::Failed,
+            Self::Cancelled | Self::Replaced => SessionTaskStatusKind::Cancelled,
+        }
+    }
 }
 
-fn renderable_tasks(tasks: &[SessionTask]) -> Vec<SessionTask> {
-    tasks
-        .iter()
-        .filter(|task| task_is_renderable(task))
-        .cloned()
-        .collect()
+/// Derive display state only from the canonical Work row namespace and the
+/// typed graph projection. Titles, descriptions, transcript text, and error
+/// strings never participate in task-state inference.
+pub(crate) fn work_task_presentation(task: &SessionTask) -> Option<WorkTaskPresentation> {
+    if !task.id.starts_with("work:") {
+        return None;
+    }
+    let metadata = task.metadata.as_ref()?;
+    if metadata.get("source")?.as_str()? != "work_task_graph" {
+        return None;
+    }
+    match metadata.get("declaration_state")?.as_str()? {
+        "cancelled" => return Some(WorkTaskPresentation::Cancelled),
+        "superseded" => return Some(WorkTaskPresentation::Replaced),
+        "active" => {}
+        _ => return None,
+    }
+    let execution = metadata.get("execution_status")?.as_str()?;
+    if execution != "completed" {
+        return match execution {
+            "not_started" => Some(WorkTaskPresentation::Planned),
+            "running" | "delegated" => Some(WorkTaskPresentation::Working),
+            "waiting" => Some(WorkTaskPresentation::Waiting),
+            "paused" => Some(WorkTaskPresentation::Paused),
+            "failed" => Some(WorkTaskPresentation::Failed),
+            "cancelled" => Some(WorkTaskPresentation::Cancelled),
+            _ => None,
+        };
+    }
+    match metadata.get("delivery_status")?.as_str()? {
+        "unreported" => return Some(WorkTaskPresentation::OutcomeUnreported),
+        "blocked" => return Some(WorkTaskPresentation::Blocked),
+        "failed" => return Some(WorkTaskPresentation::Failed),
+        "delivered" => {}
+        _ => return None,
+    }
+    match metadata.get("verification_status")?.as_str()? {
+        "unknown" => Some(WorkTaskPresentation::Executed),
+        "stale_evidence" => Some(WorkTaskPresentation::NeedsRecheck),
+        "evidence_available" => {
+            let freshness = metadata
+                .get("check_freshness")
+                .and_then(|value| value.as_str());
+            let outcome = metadata
+                .get("check_outcome")
+                .and_then(|value| value.as_str());
+            let coverage = metadata
+                .get("check_coverage")
+                .and_then(|value| value.as_str());
+            let evidence_count = metadata
+                .get("check_evidence_ref_count")
+                .and_then(|value| value.as_u64());
+            match (freshness, outcome, coverage, evidence_count) {
+                (Some("current"), Some("passed"), Some("complete"), Some(count)) if count > 0 => {
+                    Some(WorkTaskPresentation::Verified)
+                }
+                (Some("current"), Some("failed" | "error" | "cancelled"), _, _) => {
+                    Some(WorkTaskPresentation::CheckFailed)
+                }
+                // Once delivery is known, incomplete or malformed evidence can
+                // only prove that verification is still required. It must not
+                // fall through to the raw completed execution status.
+                _ => Some(WorkTaskPresentation::Executed),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn board_status(task: &SessionTask) -> SessionTaskStatusKind {
+    work_task_presentation(task)
+        .map(WorkTaskPresentation::board_status)
+        .unwrap_or(task.status)
+}
+
+pub(crate) fn task_needs_attention(task: &SessionTask) -> bool {
+    board_status(task).is_open_work()
 }
 
 /// Compute how many task lines fit in the given terminal height. Mirrors
@@ -152,22 +261,6 @@ fn owner_badge(task: &SessionTask) -> Option<String> {
     }
     let owner = owner.strip_prefix('@').unwrap_or(owner);
     Some(format!(" (@{})", truncate_to_width(owner, 14)))
-}
-
-/// Display provenance only when both the stable row namespace and typed
-/// metadata agree. Ordinary task metadata is user/model supplied, so metadata
-/// alone must never let a checklist row impersonate a durable plan step.
-fn source_badge(task: &SessionTask) -> Option<&'static str> {
-    let source = task
-        .metadata
-        .as_ref()?
-        .get("source")?
-        .as_str()
-        .map(str::trim)?;
-    match (task.id.starts_with("plan:"), source) {
-        (true, "plan") => Some(" [plan]"),
-        _ => None,
-    }
 }
 
 /// Truncate a string to fit within `max_cols` display columns, adding a
@@ -199,15 +292,25 @@ struct TaskStatusCounts {
     completed: usize,
     in_progress: usize,
     pending: usize,
+    waiting: usize,
+    blocked: usize,
     paused: usize,
     failed: usize,
     cancelled: usize,
     other: usize,
+    needs_check: usize,
+    outcome_unreported: usize,
 }
 
 impl TaskStatusCounts {
     fn open_work(self) -> usize {
-        self.in_progress + self.pending + self.paused
+        self.in_progress
+            + self.pending
+            + self.waiting
+            + self.blocked
+            + self.paused
+            + self.needs_check
+            + self.outcome_unreported
     }
 
     fn status_parts(self) -> Vec<String> {
@@ -218,8 +321,20 @@ impl TaskStatusCounts {
         if self.pending > 0 {
             parts.push(format!("{} queued", self.pending));
         }
+        if self.waiting > 0 {
+            parts.push(format!("{} waiting", self.waiting));
+        }
+        if self.blocked > 0 {
+            parts.push(format!("{} blocked", self.blocked));
+        }
         if self.paused > 0 {
             parts.push(format!("{} paused", self.paused));
+        }
+        if self.needs_check > 0 {
+            parts.push(format!("{} to verify", self.needs_check));
+        }
+        if self.outcome_unreported > 0 {
+            parts.push(format!("{} result not reported", self.outcome_unreported));
         }
         if self.completed > 0 {
             parts.push(format!("{} done", self.completed));
@@ -240,10 +355,30 @@ impl TaskStatusCounts {
 fn counts(tasks: &[SessionTask]) -> TaskStatusCounts {
     let mut counts = TaskStatusCounts::default();
     for task in tasks {
-        if !task_is_renderable(task) {
-            continue;
+        count_task(&mut counts, task);
+    }
+    counts
+}
+
+fn count_task(counts: &mut TaskStatusCounts, task: &SessionTask) {
+    match work_task_presentation(task) {
+        Some(WorkTaskPresentation::Planned) => counts.pending += 1,
+        Some(WorkTaskPresentation::Working) => counts.in_progress += 1,
+        Some(WorkTaskPresentation::Waiting) => counts.waiting += 1,
+        Some(WorkTaskPresentation::Blocked) => counts.blocked += 1,
+        Some(WorkTaskPresentation::Paused) => counts.paused += 1,
+        Some(WorkTaskPresentation::NeedsRecheck) => counts.needs_check += 1,
+        Some(WorkTaskPresentation::OutcomeUnreported) => counts.outcome_unreported += 1,
+        Some(WorkTaskPresentation::Executed | WorkTaskPresentation::Verified) => {
+            counts.completed += 1
         }
-        match task.status {
+        Some(WorkTaskPresentation::CheckFailed | WorkTaskPresentation::Failed) => {
+            counts.failed += 1
+        }
+        Some(WorkTaskPresentation::Cancelled | WorkTaskPresentation::Replaced) => {
+            counts.cancelled += 1
+        }
+        None => match board_status(task) {
             SessionTaskStatusKind::Completed => counts.completed += 1,
             SessionTaskStatusKind::InProgress => counts.in_progress += 1,
             SessionTaskStatusKind::Pending => counts.pending += 1,
@@ -251,12 +386,8 @@ fn counts(tasks: &[SessionTask]) -> TaskStatusCounts {
             SessionTaskStatusKind::Failed => counts.failed += 1,
             SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
             SessionTaskStatusKind::Other => counts.other += 1,
-            SessionTaskStatusKind::Archived
-            | SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Migrated => {}
-        }
+        },
     }
-    counts
 }
 
 /// Aggregate (done, total) over every subtask across `tasks`. Used by
@@ -299,8 +430,16 @@ fn prioritize<'a>(
     tasks: &'a [SessionTask],
     unresolved_by_task: &HashMap<String, Vec<String>>,
 ) -> Vec<&'a SessionTask> {
-    let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
-    let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
+    let in_progress = sort_by_id_asc(
+        tasks
+            .iter()
+            .filter(|task| board_status(task).is_in_progress())
+            .collect(),
+    );
+    let mut pending: Vec<&SessionTask> = tasks
+        .iter()
+        .filter(|task| board_status(task).is_pending())
+        .collect();
     pending.sort_by(|a, b| {
         let a_blocked = unresolved_by_task
             .get(&a.id)
@@ -324,16 +463,21 @@ fn prioritize<'a>(
     let paused = sort_by_id_asc(
         tasks
             .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::Paused)
+            .filter(|task| board_status(task) == SessionTaskStatusKind::Paused)
             .collect(),
     );
-    let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
+    let completed = sort_by_id_asc(
+        tasks
+            .iter()
+            .filter(|task| board_status(task).is_completed())
+            .collect(),
+    );
     let terminal = sort_by_id_asc(
         tasks
             .iter()
             .filter(|t| {
                 matches!(
-                    t.status,
+                    board_status(t),
                     SessionTaskStatusKind::Cancelled | SessionTaskStatusKind::Failed
                 )
             })
@@ -342,7 +486,7 @@ fn prioritize<'a>(
     let diagnostics = sort_by_id_asc(
         tasks
             .iter()
-            .filter(|t| matches!(t.status, SessionTaskStatusKind::Other))
+            .filter(|task| matches!(board_status(task), SessionTaskStatusKind::Other))
             .collect(),
     );
     let mut out: Vec<&SessionTask> = Vec::with_capacity(tasks.len());
@@ -355,29 +499,42 @@ fn prioritize<'a>(
     out
 }
 
+/// Return the stable identity of the first row in the board's actual display
+/// order. Primary-canvas consumers use this to make details and run inspection
+/// immediately available without maintaining a second, subtly different
+/// notion of which task matters first.
+pub(crate) fn preferred_task_id(tasks: &[SessionTask]) -> Option<&str> {
+    let unresolved_by_task: HashMap<String, Vec<String>> = tasks
+        .iter()
+        .map(|task| (task.id.clone(), unresolved_task_blocker_ids(tasks, task)))
+        .collect();
+    prioritize(tasks, &unresolved_by_task)
+        .into_iter()
+        .next()
+        .map(|task| task.id.as_str())
+}
+
 fn render_task_line(
     task: &SessionTask,
     open_blockers: &[String],
     columns: u16,
     colors: TaskBoardColors,
 ) -> Line<'static> {
-    let (icon, color) = status_icon_and_color(&task.status, colors);
-    let is_completed = task.status.is_completed();
-    let is_in_progress = task.status.is_in_progress();
+    let display_status = board_status(task);
+    let presentation = work_task_presentation(task);
+    let (icon, color) = status_icon_and_color(&display_status, colors);
+    let is_completed = display_status.is_completed();
+    let is_in_progress = display_status.is_in_progress();
     let is_blocked = !open_blockers.is_empty();
 
-    let source_badge = source_badge(task);
     let owner_badge = owner_badge(task);
     let subject = truncate_to_width(
         &task.title,
         max_subject_width(columns).saturating_sub(
-            source_badge
+            owner_badge
+                .as_deref()
                 .map(unicode_width::UnicodeWidthStr::width)
-                .unwrap_or(0)
-                + owner_badge
-                    .as_deref()
-                    .map(unicode_width::UnicodeWidthStr::width)
-                    .unwrap_or(0),
+                .unwrap_or(0),
         ),
     );
 
@@ -385,18 +542,16 @@ fn render_task_line(
     // In-progress and completed get BOLD; pending and fallback statuses
     // already map to `colors.dim`, so adding DIM on top of dim would be
     // invisible — skip the modifier in that case.
-    let icon_style = match task.status {
+    let icon_style = match display_status {
         SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed => {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
         }
         SessionTaskStatusKind::Failed => Style::default().fg(color).add_modifier(Modifier::BOLD),
         SessionTaskStatusKind::Cancelled => Style::default().fg(color).add_modifier(Modifier::BOLD),
         SessionTaskStatusKind::Paused => Style::default().fg(color).add_modifier(Modifier::BOLD),
-        SessionTaskStatusKind::Pending
-        | SessionTaskStatusKind::Archived
-        | SessionTaskStatusKind::Deleted
-        | SessionTaskStatusKind::Migrated
-        | SessionTaskStatusKind::Other => Style::default().fg(color).add_modifier(Modifier::DIM),
+        SessionTaskStatusKind::Pending | SessionTaskStatusKind::Other => {
+            Style::default().fg(color).add_modifier(Modifier::DIM)
+        }
     };
     spans.push(Span::styled(format!("{} ", icon), icon_style));
 
@@ -412,10 +567,10 @@ fn render_task_line(
     }
     spans.push(Span::styled(subject, subject_style));
 
-    if let Some(source_badge) = source_badge {
+    if let Some(presentation) = presentation {
         spans.push(Span::styled(
-            source_badge,
-            Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+            format!(" · {}", presentation.label()),
+            Style::default().fg(color),
         ));
     }
 
@@ -493,11 +648,7 @@ fn render_subtask_lines(
             SessionTaskStatusKind::Paused => {
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             }
-            SessionTaskStatusKind::Pending
-            | SessionTaskStatusKind::Archived
-            | SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Migrated
-            | SessionTaskStatusKind::Other => {
+            SessionTaskStatusKind::Pending | SessionTaskStatusKind::Other => {
                 Style::default().fg(color).add_modifier(Modifier::DIM)
             }
         };
@@ -531,21 +682,7 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
     let counts = hidden
         .iter()
         .fold(TaskStatusCounts::default(), |mut counts, task| {
-            if !task_is_renderable(task) {
-                return counts;
-            }
-            match task.status {
-                SessionTaskStatusKind::Completed => counts.completed += 1,
-                SessionTaskStatusKind::InProgress => counts.in_progress += 1,
-                SessionTaskStatusKind::Pending => counts.pending += 1,
-                SessionTaskStatusKind::Paused => counts.paused += 1,
-                SessionTaskStatusKind::Failed => counts.failed += 1,
-                SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
-                SessionTaskStatusKind::Other => counts.other += 1,
-                SessionTaskStatusKind::Archived
-                | SessionTaskStatusKind::Deleted
-                | SessionTaskStatusKind::Migrated => {}
-            }
+            count_task(&mut counts, task);
             counts
         });
     let parts = counts.status_parts();
@@ -630,158 +767,6 @@ where
     .lines
 }
 
-/// Cross-session render. Walks the `per_session` vec produced by
-/// `TaskStore::load_open_task_summaries` and emits a dim header row per
-/// session followed by that session's active tasks. Returns empty
-/// when every session is empty of active work or when the terminal
-/// is too short to fit any tasks.
-pub fn render_multi(
-    per_session: &[(String, Vec<OpenTaskSummary>)],
-    columns: u16,
-    rows: u16,
-) -> Vec<Line<'static>> {
-    render_multi_with_colors(per_session, columns, rows, TaskBoardColors::from_theme())
-}
-
-pub fn render_multi_with_colors(
-    per_session: &[(String, Vec<OpenTaskSummary>)],
-    columns: u16,
-    rows: u16,
-    colors: TaskBoardColors,
-) -> Vec<Line<'static>> {
-    render_multi_with_colors_and_cap(per_session, columns, max_display(rows), colors)
-}
-
-/// Render every already-fetched cross-session row. This is for the primary
-/// task-board canvas, which owns scrolling; compact chat deliberately remains
-/// bounded by terminal height through [`render_multi`].
-pub(crate) fn render_multi_full(
-    per_session: &[(String, Vec<OpenTaskSummary>)],
-    columns: u16,
-) -> Vec<Line<'static>> {
-    render_multi_with_colors_and_cap(
-        per_session,
-        columns,
-        usize::MAX,
-        TaskBoardColors::from_theme(),
-    )
-}
-
-fn render_multi_with_colors_and_cap(
-    per_session: &[(String, Vec<OpenTaskSummary>)],
-    columns: u16,
-    total_cap: usize,
-    colors: TaskBoardColors,
-) -> Vec<Line<'static>> {
-    // Reuse the single-session capacity formula per session: we
-    // render a header line + up to N task lines per group, and cut
-    // the list once we've burned our total row budget.
-    if total_cap == 0 {
-        return Vec::new();
-    }
-
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut rows_used = 0usize;
-    // Track whether we had to drop entire sessions so the caller
-    // can decide to render a trailing "…" marker. Without it, a
-    // row-budget clip looks like the cross-session view is just
-    // showing the first session.
-    let mut overflow = false;
-
-    for (session_id, tasks) in per_session {
-        // Collapse each session's active subset — completed tasks
-        // across sessions are not actionable and would clutter the
-        // cross-session overview. The single-session board still
-        // shows its own completed history.
-        let active: Vec<&OpenTaskSummary> =
-            tasks.iter().filter(|t| t.status.is_open_work()).collect();
-        if active.is_empty() {
-            continue;
-        }
-
-        // Header row: calm session label + working count.
-        let counts = active
-            .iter()
-            .fold(TaskStatusCounts::default(), |mut counts, task| {
-                match task.status {
-                    SessionTaskStatusKind::InProgress => counts.in_progress += 1,
-                    SessionTaskStatusKind::Pending => counts.pending += 1,
-                    SessionTaskStatusKind::Paused => counts.paused += 1,
-                    _ => {}
-                }
-                counts
-            });
-        let header_parts = counts.status_parts();
-        let header_status = if header_parts.is_empty() {
-            format!(" · {} open", active.len())
-        } else {
-            format!(" · {}", header_parts.join(" · "))
-        };
-        let short: String = session_id.chars().take(8).collect();
-        let header = Line::from(vec![
-            Span::styled(
-                format!("Session {short}"),
-                Style::default().fg(colors.dim).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                header_status,
-                Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
-            ),
-        ]);
-        if rows_used >= total_cap {
-            overflow = true;
-            break;
-        }
-        out.push(header);
-        rows_used += 1;
-
-        // One row per active task (up to the remaining budget).
-        for task in active {
-            if rows_used >= total_cap {
-                overflow = true;
-                break;
-            }
-            let (icon, icon_color) = status_icon_and_color(&task.status, colors);
-            let subject_w = (columns as usize).saturating_sub(6);
-            let subject = truncate_to_width(&task.title, subject_w);
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{icon} "),
-                    Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(subject),
-            ]));
-            rows_used += 1;
-        }
-        if overflow {
-            break;
-        }
-    }
-
-    if overflow {
-        // Replace the last row with the "…" marker so the total
-        // footprint stays at total_cap — otherwise one extra line
-        // slips past the budget and the caller's layout math is
-        // off by one on tight terminals.
-        if out.len() >= total_cap
-            && let Some(last) = out.last_mut()
-        {
-            *last = Line::from(vec![Span::styled(
-                "  … more sessions",
-                Style::default().fg(colors.dim),
-            )]);
-        } else {
-            out.push(Line::from(vec![Span::styled(
-                "  … more sessions",
-                Style::default().fg(colors.dim),
-            )]));
-        }
-    }
-
-    out
-}
-
 /// Same as [`render`] but with explicit colours. Separate entry point
 /// so snapshots can pin either preset without mutating the process-wide
 /// `OnceLock` theme.
@@ -849,13 +834,6 @@ fn render_with_colors_and_fresh_predicate<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let filtered_tasks;
-    let tasks = if tasks.iter().all(task_is_renderable) {
-        tasks
-    } else {
-        filtered_tasks = renderable_tasks(tasks);
-        filtered_tasks.as_slice()
-    };
     let cap = task_cap;
     if cap == 0 || tasks.is_empty() {
         return TaskListRender {
@@ -922,6 +900,12 @@ where
             if counts.pending > 0 {
                 parts.push(format!("{} queued", counts.pending));
             }
+            if counts.waiting > 0 {
+                parts.push(format!("{} waiting", counts.waiting));
+            }
+            if counts.blocked > 0 {
+                parts.push(format!("{} blocked", counts.blocked));
+            }
             if counts.paused > 0 {
                 parts.push(format!("{} paused", counts.paused));
             }
@@ -934,6 +918,12 @@ where
             }
             if counts.completed > 0 {
                 parts.push(format!("{} done", counts.completed));
+            }
+            if counts.waiting > 0 {
+                parts.push(format!("{} waiting", counts.waiting));
+            }
+            if counts.blocked > 0 {
+                parts.push(format!("{} blocked", counts.blocked));
             }
             if counts.paused > 0 {
                 parts.push(format!("{} paused", counts.paused));
@@ -959,6 +949,10 @@ where
             },
             if counts.pending > 0 {
                 format!(" · {} queued", counts.pending)
+            } else if counts.waiting > 0 {
+                format!(" · {} waiting", counts.waiting)
+            } else if counts.blocked > 0 {
+                format!(" · {} blocked", counts.blocked)
             } else if counts.paused > 0 {
                 format!(" · {} paused", counts.paused)
             } else {
@@ -1078,13 +1072,6 @@ where
 /// Returns `None` for empty task lists — caller renders nothing in
 /// that case.
 pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
-    let filtered_tasks;
-    let tasks = if tasks.iter().all(task_is_renderable) {
-        tasks
-    } else {
-        filtered_tasks = renderable_tasks(tasks);
-        filtered_tasks.as_slice()
-    };
     if tasks.is_empty() {
         return None;
     }
@@ -1092,19 +1079,20 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     let total = tasks.len();
     let current_task = tasks
         .iter()
-        .find(|t| t.status.is_in_progress())
-        .or_else(|| tasks.iter().find(|t| t.status.is_pending()))
+        .find(|task| board_status(task).is_in_progress())
+        .or_else(|| tasks.iter().find(|task| board_status(task).is_pending()))
         .or_else(|| {
             tasks
                 .iter()
-                .find(|t| t.status == SessionTaskStatusKind::Paused)
+                .find(|task| board_status(task) == SessionTaskStatusKind::Paused)
         });
     let (sub_done, sub_total) = subtask_counts(tasks);
 
     let theme = crate::tui::theme::current();
+    let has_waiting = counts.waiting > 0 || counts.blocked > 0 || counts.paused > 0;
     let icon = if counts.in_progress > 0 {
         "•"
-    } else if counts.paused > 0 {
+    } else if has_waiting {
         "⏸"
     } else if counts.completed == total {
         "✔"
@@ -1113,7 +1101,7 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     };
     let icon_color = if counts.in_progress > 0 {
         theme.accent
-    } else if counts.paused > 0 {
+    } else if has_waiting {
         theme.warn
     } else if counts.completed == total {
         theme.success
@@ -1136,9 +1124,33 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
+    if counts.waiting > 0 {
+        spans.push(Span::styled(
+            format!(" · {} waiting", counts.waiting),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.blocked > 0 {
+        spans.push(Span::styled(
+            format!(" · {} blocked", counts.blocked),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     if counts.paused > 0 {
         spans.push(Span::styled(
             format!(" · {} paused", counts.paused),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.needs_check > 0 {
+        spans.push(Span::styled(
+            format!(" · {} to verify", counts.needs_check),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if counts.outcome_unreported > 0 {
+        spans.push(Span::styled(
+            format!(" · {} result not reported", counts.outcome_unreported),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -1209,7 +1221,7 @@ pub fn render_collapsed_active_summary(
 ) -> Option<Line<'static>> {
     let mut active = tasks
         .iter()
-        .filter(|task| task_is_renderable(task) && task.status.is_open_work())
+        .filter(|task| board_status(task).is_open_work())
         .cloned()
         .collect::<Vec<_>>();
     active.sort_by_key(|task| !unresolved_task_blocker_ids(tasks, task).is_empty());
@@ -1218,12 +1230,12 @@ pub fn render_collapsed_active_summary(
     }
     let selected = active
         .iter()
-        .find(|task| task.status.is_in_progress())
-        .or_else(|| active.iter().find(|task| task.status.is_pending()))
+        .find(|task| board_status(task).is_in_progress())
+        .or_else(|| active.iter().find(|task| board_status(task).is_pending()))
         .or_else(|| {
             active
                 .iter()
-                .find(|task| task.status == SessionTaskStatusKind::Paused)
+                .find(|task| board_status(task) == SessionTaskStatusKind::Paused)
         });
     let blockers = selected
         .map(|task| unresolved_task_blocker_ids(tasks, task))
@@ -1255,7 +1267,7 @@ pub fn render_collapsed_active_summary(
     lifecycle.extend(
         tasks
             .iter()
-            .filter(|task| task_is_renderable(task) && !task.status.is_open_work())
+            .filter(|task| !board_status(task).is_open_work())
             .cloned(),
     );
     let mut line = render_collapsed_summary(&lifecycle, summary_width)?;
@@ -1270,104 +1282,22 @@ pub fn render_collapsed_active_summary(
     Some(line)
 }
 
-/// One-line summary for the typed cross-session projection. Unlike the
-/// full-task variant, this never implies that omitted history or subtasks were
-/// loaded; it reports only the open rows the server confirmed.
-pub fn render_collapsed_multi_summary(
-    tasks: &[OpenTaskSummary],
-    columns: u16,
-) -> Option<Line<'static>> {
-    let tasks: Vec<&OpenTaskSummary> = tasks
-        .iter()
-        .filter(|task| task.status.is_open_work())
-        .collect();
-    if tasks.is_empty() {
-        return None;
-    }
-    let counts = tasks
-        .iter()
-        .fold(TaskStatusCounts::default(), |mut counts, task| {
-            match task.status {
-                SessionTaskStatusKind::InProgress => counts.in_progress += 1,
-                SessionTaskStatusKind::Pending => counts.pending += 1,
-                SessionTaskStatusKind::Paused => counts.paused += 1,
-                _ => {}
-            }
-            counts
-        });
-    let current_task = tasks
-        .iter()
-        .find(|task| task.status.is_in_progress())
-        .or_else(|| tasks.iter().find(|task| task.status.is_pending()))
-        .or_else(|| tasks.first())
-        .copied();
-    let theme = crate::tui::theme::current();
-    let (icon, icon_color) = if counts.in_progress > 0 {
-        ("•", theme.accent)
-    } else if counts.paused > 0 {
-        ("⏸", theme.warn)
-    } else {
-        ("·", theme.dim)
-    };
-    let mut spans = vec![
-        Span::styled(
-            format!("{icon} "),
-            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("Tasks", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            " · all sessions",
-            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-        ),
-    ];
-    for (count, label) in [
-        (counts.in_progress, "working"),
-        (counts.pending, "queued"),
-        (counts.paused, "paused"),
-    ] {
-        if count > 0 {
-            spans.push(Span::styled(
-                format!(" · {count} {label}"),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-    }
-    if let Some(task) = current_task {
-        let used: usize = spans.iter().map(|span| span.content.width()).sum();
-        let separator = " · ";
-        let title_budget = (columns as usize).saturating_sub(used + separator.width());
-        if title_budget > 0 {
-            spans.push(Span::styled(
-                separator,
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            spans.push(Span::raw(truncate_to_width(&task.title, title_budget)));
-        }
-    }
-    let used: usize = spans.iter().map(|span| span.content.width()).sum();
-    if used + TASK_BOARD_TOGGLE_HINT.width() <= columns as usize {
-        spans.push(Span::styled(
-            TASK_BOARD_TOGGLE_HINT,
-            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
-        ));
-    }
-    Some(Line::from(spans))
-}
-
 /// One-line "Focus · <subject>" nudge for use when `expanded_view` is not
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
 pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
     let mut active = tasks
         .iter()
-        .filter(|task| task.status.is_open_work())
+        .filter(|task| board_status(task).is_open_work())
         .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
         .collect::<Vec<_>>();
-    active.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
+    active.sort_by_key(|(task, blockers)| {
+        (board_status(task).active_priority(), !blockers.is_empty())
+    });
     let (candidate, blockers) = active.first()?;
     let label = if !blockers.is_empty() {
         "Waiting · "
-    } else if candidate.status == SessionTaskStatusKind::Paused {
+    } else if board_status(candidate) == SessionTaskStatusKind::Paused {
         "Resume · "
     } else {
         "Focus · "
@@ -1391,12 +1321,11 @@ mod snapshot_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::super::work_board_projection::SessionTask;
     use super::*;
-    use astra_tools::task_mgmt::SessionTask;
 
     fn mk_task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {
-            archived_at: None,
             id: id.into(),
             title: title.into(),
             description: None,
@@ -1412,13 +1341,74 @@ mod tests {
         }
     }
 
-    fn mk_summary(id: &str, title: &str, status: &str) -> OpenTaskSummary {
-        OpenTaskSummary {
-            id: id.into(),
-            title: title.into(),
-            status: status.into(),
-            updated_at: "now".into(),
-        }
+    fn mk_work_task(execution: &str, verification: &str) -> SessionTask {
+        let mut task = mk_task("work:work-7:main:item-1", "migrate state", "completed");
+        task.metadata = Some(serde_json::Map::from_iter([
+            ("source".into(), serde_json::json!("work_task_graph")),
+            ("declaration_state".into(), serde_json::json!("active")),
+            ("execution_status".into(), serde_json::json!(execution)),
+            ("delivery_status".into(), serde_json::json!("delivered")),
+            (
+                "verification_status".into(),
+                serde_json::json!(verification),
+            ),
+        ]));
+        task
+    }
+
+    #[test]
+    fn completed_run_without_typed_settlement_is_not_presented_as_delivery() {
+        let mut task = mk_work_task("completed", "unknown");
+        task.metadata
+            .as_mut()
+            .expect("Work metadata")
+            .insert("delivery_status".into(), serde_json::json!("unreported"));
+
+        assert_eq!(
+            work_task_presentation(&task),
+            Some(WorkTaskPresentation::OutcomeUnreported)
+        );
+        assert!(task_needs_attention(&task));
+
+        let mut blocked = task;
+        let metadata = blocked.metadata.as_mut().expect("Work metadata");
+        metadata.insert("delivery_status".into(), serde_json::json!("blocked"));
+        metadata.insert(
+            "delivery_blocker_kind".into(),
+            serde_json::json!("capability_unavailable"),
+        );
+        metadata.insert(
+            "unavailable_capabilities".into(),
+            serde_json::json!(["web_fetch"]),
+        );
+        assert_eq!(
+            work_task_presentation(&blocked),
+            Some(WorkTaskPresentation::Blocked)
+        );
+        assert!(task_needs_attention(&blocked));
+    }
+
+    #[test]
+    fn canonical_blocker_is_never_summarized_as_paused_or_done() {
+        let mut blocked = mk_work_task("completed", "unknown");
+        blocked.title = "provider capability unavailable".into();
+        blocked
+            .metadata
+            .as_mut()
+            .expect("Work metadata")
+            .insert("delivery_status".into(), serde_json::json!("blocked"));
+
+        let expanded = render(std::slice::from_ref(&blocked), 100, 40, true);
+        let header = spans_text(&expanded[0]);
+        assert!(header.contains("1 blocked"), "{header}");
+        assert!(!header.contains("paused"), "{header}");
+        assert!(!header.contains("done"), "{header}");
+
+        let collapsed = spans_text(
+            &render_collapsed_summary(&[blocked], 100).expect("blocked Work remains visible"),
+        );
+        assert!(collapsed.contains("1 blocked"), "{collapsed}");
+        assert!(!collapsed.contains("paused"), "{collapsed}");
     }
 
     fn spans_text(line: &Line<'static>) -> String {
@@ -1500,27 +1490,70 @@ mod tests {
     }
 
     #[test]
-    fn durable_plan_rows_are_visibly_distinct_from_checklist_rows() {
-        let mut task = mk_task("plan:plan-7:step-1", "migrate state", "in_progress");
-        task.metadata = Some(serde_json::Map::from_iter([(
-            "source".to_string(),
-            serde_json::Value::String("plan".to_string()),
-        )]));
+    fn delivered_work_is_completed_without_verification_evidence() {
+        let task = mk_work_task("completed", "unknown");
 
         let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
-        assert!(spans_text(&line).contains("[plan]"));
+        let text = spans_text(&line);
+        assert!(text.contains("Completed"), "{text}");
+        assert!(!text.contains("Needs verification"), "{text}");
+        assert!(!text.contains("Verified"), "{text}");
+        assert!(!task_needs_attention(&task));
+
+        let task_counts = counts(&[task]);
+        assert_eq!(task_counts.needs_check, 0);
+        assert_eq!(task_counts.completed, 1);
     }
 
     #[test]
-    fn checklist_metadata_cannot_spoof_a_durable_plan_row() {
-        let mut task = mk_task("task-1", "ordinary checklist", "pending");
-        task.metadata = Some(serde_json::Map::from_iter([(
-            "source".to_string(),
-            serde_json::Value::String("plan".to_string()),
-        )]));
+    fn current_complete_pass_is_the_only_verified_presentation() {
+        let mut task = mk_work_task("completed", "evidence_available");
+        let metadata = task.metadata.as_mut().expect("fixture metadata");
+        metadata.insert("check_freshness".into(), serde_json::json!("current"));
+        metadata.insert("check_outcome".into(), serde_json::json!("passed"));
+        metadata.insert("check_coverage".into(), serde_json::json!("complete"));
+        metadata.insert("check_evidence_ref_count".into(), serde_json::json!(1));
 
         let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
-        assert!(!spans_text(&line).contains("[plan]"));
+        assert!(spans_text(&line).contains("Verified"));
+        assert_eq!(counts(&[task]).completed, 1);
+    }
+
+    #[test]
+    fn verification_requires_durable_evidence_not_only_a_pass_claim() {
+        let mut task = mk_work_task("completed", "evidence_available");
+        let metadata = task.metadata.as_mut().expect("fixture metadata");
+        metadata.insert("check_freshness".into(), serde_json::json!("current"));
+        metadata.insert("check_outcome".into(), serde_json::json!("passed"));
+        metadata.insert("check_coverage".into(), serde_json::json!("complete"));
+        metadata.insert("check_evidence_ref_count".into(), serde_json::json!(0));
+
+        assert_eq!(
+            work_task_presentation(&task),
+            Some(WorkTaskPresentation::Executed)
+        );
+        let task_counts = counts(std::slice::from_ref(&task));
+        assert_eq!(task_counts.needs_check, 0);
+        assert_eq!(task_counts.completed, 1);
+
+        task.metadata
+            .as_mut()
+            .expect("fixture metadata")
+            .remove("check_evidence_ref_count");
+        assert_eq!(
+            work_task_presentation(&task),
+            Some(WorkTaskPresentation::Executed)
+        );
+    }
+
+    #[test]
+    fn arbitrary_metadata_cannot_spoof_canonical_work_state() {
+        let mut task = mk_task("task-1", "ordinary checklist", "completed");
+        task.metadata = mk_work_task("completed", "unknown").metadata;
+
+        assert_eq!(work_task_presentation(&task), None);
+        let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
+        assert!(!spans_text(&line).contains("Needs verification"));
     }
 
     #[test]
@@ -1539,6 +1572,20 @@ mod tests {
         assert!(pos("first-in-progress") < pos("first-pending"));
         assert!(pos("first-pending") < pos("first-paused"));
         assert!(pos("first-paused") < pos("first-completed"));
+    }
+
+    #[test]
+    fn preferred_task_matches_first_rendered_canonical_work_row() {
+        let tasks = vec![
+            mk_task("task-1", "done", "completed"),
+            mk_task("task-2", "queued", "pending"),
+            mk_task("task-3", "working", "in_progress"),
+        ];
+
+        assert_eq!(preferred_task_id(&tasks), Some("task-3"));
+        let lines = render_full_focused(&tasks, 80, false, preferred_task_id(&tasks));
+        assert_eq!(lines.selected_line_index, Some(0));
+        assert!(spans_text(&lines.lines[0]).contains("working"));
     }
 
     #[test]
@@ -1573,20 +1620,13 @@ mod tests {
     }
 
     #[test]
-    fn deleted_archived_and_migrated_tasks_do_not_render_as_other() {
-        let tasks = vec![
-            mk_task("task-1", "deleted", "deleted"),
-            mk_task("task-2", "archived", "archived"),
-            mk_task("task-3", "migrated", "migrated"),
-        ];
+    fn unknown_projected_status_remains_visible_but_non_actionable() {
+        let tasks = vec![mk_task("task-1", "future status", "future_status")];
         let lines = render(&tasks, 80, 40, true);
-        assert!(lines.is_empty(), "tombstones must not render: {lines:?}");
-
-        let summary = render_collapsed_summary(&tasks, 80);
-        assert!(
-            summary.is_none(),
-            "tombstones must not render collapsed summary"
-        );
+        assert_eq!(lines.len(), 2, "unknown status must remain diagnosable");
+        assert!(spans_text(&lines[0]).contains("1 other"));
+        assert_eq!(preferred_task_id(&tasks), Some("task-1"));
+        assert!(render_next_hint(&tasks, 80).is_none());
     }
 
     #[test]
@@ -1790,7 +1830,7 @@ mod tests {
 
     #[test]
     fn collapsed_summary_includes_subtask_rollup_when_present() {
-        use astra_tools::task_mgmt::SessionSubtask;
+        use super::super::work_board_projection::SessionSubtask;
         let mut parent = mk_task("task-1", "parent", "in_progress");
         parent.subtasks = vec![
             SessionSubtask {
@@ -1819,7 +1859,7 @@ mod tests {
 
     #[test]
     fn collapsed_summary_never_overflows_columns_with_long_title_and_subtasks() {
-        use astra_tools::task_mgmt::SessionSubtask;
+        use super::super::work_board_projection::SessionSubtask;
         let mut parent = mk_task(
             "task-1",
             "this is a very long current task title that must be clipped before optional suffixes",
@@ -1867,7 +1907,7 @@ mod tests {
     /// state.
     #[test]
     fn subtasks_render_indented_under_parent() {
-        use astra_tools::task_mgmt::SessionSubtask;
+        use super::super::work_board_projection::SessionSubtask;
         let mut parent = mk_task("task-1", "Build expense report system", "in_progress");
         parent.subtasks = vec![
             SessionSubtask {
@@ -1943,7 +1983,7 @@ mod tests {
     #[test]
     fn subtask_global_budget_caps_total_rows() {
         // Many subtasks across multiple parents must be bounded.
-        use astra_tools::task_mgmt::SessionSubtask;
+        use super::super::work_board_projection::SessionSubtask;
         let mut parents: Vec<SessionTask> = (1..=3)
             .map(|i| mk_task(&format!("task-{i}"), &format!("parent-{i}"), "in_progress"))
             .collect();
@@ -1992,156 +2032,6 @@ mod tests {
         let icon_span = running.spans.first().expect("icon span");
         assert_eq!(icon_span.style.fg, Some(Theme::light().accent));
         assert_ne!(icon_span.style.fg, Some(Theme::dark().accent));
-    }
-
-    // ── render_multi: cross-session layout ───────────────────────
-
-    fn fixture_colors() -> TaskBoardColors {
-        TaskBoardColors::from_preset(&crate::tui::theme::Theme::dark())
-    }
-
-    #[test]
-    fn render_multi_empty_input_yields_empty() {
-        let out = render_multi_with_colors(&[], 80, 40, fixture_colors());
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn render_multi_skips_sessions_with_no_open_work() {
-        // All-completed sessions are still open on disk but contribute
-        // nothing actionable; the cross-session view prunes them so
-        // the row budget isn't burned on dim history.
-        let input = vec![(
-            "sess-done".to_string(),
-            vec![mk_summary("task-1", "finished", "completed")],
-        )];
-        let out = render_multi_with_colors(&input, 80, 40, fixture_colors());
-        assert!(
-            out.is_empty(),
-            "all-completed session must be pruned: {:?}",
-            out.iter().map(spans_text).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn render_multi_emits_session_header_then_open_tasks() {
-        let input = vec![(
-            "0123456789ab".to_string(),
-            vec![
-                mk_summary("task-1", "open one", "pending"),
-                mk_summary("task-2", "done one", "completed"),
-                mk_summary("task-3", "busy one", "in_progress"),
-                mk_summary("task-4", "paused one", "paused"),
-            ],
-        )];
-        let out = render_multi_with_colors(&input, 80, 40, fixture_colors());
-        let texts: Vec<String> = out.iter().map(spans_text).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("01234567")),
-            "short session id header missing: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("1 working")
-                && t.contains("1 queued")
-                && t.contains("1 paused")),
-            "open-work counts missing from header: {texts:?}"
-        );
-        assert!(texts.iter().any(|t| t.contains("open one")));
-        assert!(texts.iter().any(|t| t.contains("busy one")));
-        assert!(texts.iter().any(|t| t.contains("paused one")));
-        assert!(
-            !texts.iter().any(|t| t.contains("done one")),
-            "completed task must not appear on cross-session view: {texts:?}"
-        );
-    }
-
-    #[test]
-    fn render_multi_respects_row_budget_across_sessions() {
-        // Small terminal → max_display=3. Two sessions × 2 active
-        // tasks each = 4 task rows + 2 headers = 6 lines, but we
-        // only have 3 slots. Expect truncation with "…" marker.
-        let input = vec![
-            (
-                "sess-a".to_string(),
-                vec![
-                    mk_summary("a1", "a1", "pending"),
-                    mk_summary("a2", "a2", "pending"),
-                ],
-            ),
-            (
-                "sess-b".to_string(),
-                vec![
-                    mk_summary("b1", "b1", "pending"),
-                    mk_summary("b2", "b2", "pending"),
-                ],
-            ),
-        ];
-        let out = render_multi_with_colors(&input, 80, 17, fixture_colors());
-        assert_eq!(
-            out.len(),
-            3,
-            "budget must cap at max_display(17)=3 rows even across sessions: {}",
-            out.len()
-        );
-        // Last row should be the "…" truncation marker so the user
-        // knows there's more.
-        let last = spans_text(out.last().unwrap());
-        assert!(last.contains('…'), "truncation marker missing: {last}");
-    }
-
-    #[test]
-    fn render_multi_full_leaves_viewport_paging_to_the_primary_board() {
-        let input = vec![(
-            "sess-full".to_string(),
-            (1..=12)
-                .map(|id| mk_summary(&format!("task-{id}"), &format!("row-{id:02}"), "pending"))
-                .collect(),
-        )];
-
-        let out = render_multi_full(&input, 80);
-        assert_eq!(
-            out.len(),
-            13,
-            "header plus every open task must be available"
-        );
-        assert!(
-            spans_text(out.last().expect("last task row")).contains("row-12"),
-            "the primary board, not compact chat, owns paging"
-        );
-    }
-
-    #[test]
-    fn render_multi_empty_when_terminal_too_short() {
-        let input = vec![("sess".to_string(), vec![mk_summary("a1", "a", "pending")])];
-        let out = render_multi_with_colors(&input, 80, 8, fixture_colors());
-        assert!(
-            out.is_empty(),
-            "rows<=10 must render nothing (same invariant as single-session)"
-        );
-    }
-
-    // ── render_with_fresh: just-changed row flash ────────────────
-
-    // Collapsed cross-session projection.
-    #[test]
-    fn collapsed_multi_summary_reports_only_confirmed_open_projection() {
-        let tasks = vec![
-            mk_summary("task-1", "current remote work", "in_progress"),
-            mk_summary("task-2", "later remote work", "pending"),
-            mk_summary("task-3", "paused remote work", "paused"),
-            mk_summary("task-4", "historical row", "completed"),
-        ];
-        let line = render_collapsed_multi_summary(&tasks, 120).expect("summary");
-        let text = spans_text(&line);
-        assert!(text.contains("all sessions"), "{text}");
-        assert!(text.contains("1 working"), "{text}");
-        assert!(text.contains("1 queued"), "{text}");
-        assert!(text.contains("1 paused"), "{text}");
-        assert!(text.contains("current remote work"), "{text}");
-        assert!(
-            !text.contains("done") && !text.contains("historical row"),
-            "the open summary must not imply unloaded history: {text}"
-        );
     }
 
     // Render-with-fresh just-changed row flash.

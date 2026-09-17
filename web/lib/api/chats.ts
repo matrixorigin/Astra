@@ -1,5 +1,8 @@
+import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-frame";
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
+import type { ExplainAnalyzeEventV1, ArtifactPublicationV1 } from "@astra/sdk";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
 import {
   artifactsFromToolCallEnd,
@@ -159,6 +162,33 @@ export function resumeChatRun(chatId: string) {
   );
 }
 
+export type PendingRunApproval = {
+  requestId: string;
+  tool: string;
+  detail?: string;
+  displayLabel?: string;
+  sessionId: string;
+  runId: string;
+  approvalKind: "standard" | "explicit";
+};
+
+export function respondChatRunApproval(
+  chatId: string,
+  approval: PendingRunApproval,
+  decision: "allow" | "deny",
+) {
+  return requestJson<{ status: string }>(
+    `/api/chats/${encodeURIComponent(chatId)}/approval`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...approval,
+        decision,
+      }),
+    },
+  );
+}
+
 export type ChatStreamHandlers = {
   signal?: AbortSignal;
   onLocalMessages?: (messages: {
@@ -182,7 +212,13 @@ export type ChatStreamHandlers = {
     status: string;
     error?: string | null;
   }) => void;
+  onApprovalRequired?: (approval: PendingRunApproval) => void;
+  onInteractionResolved?: () => void;
   onWorkSurfaceEvent?: (event: WorkSurfaceEvent) => void;
+  onStreamGap?: (gap: { runId: string; nextEventIndex: number }) => void;
+  onArtifactPublication?: (event: ArtifactPublicationV1) => void;
+  onExplainAnalyzeEvent?: (event: ExplainAnalyzeEventV1) => void;
+  onExplainAnalyzeInvalid?: () => void;
   onCancelled?: (text: string) => void;
   onPaused?: (text: string) => void;
   onDone?: (text: string) => void;
@@ -229,26 +265,7 @@ function runUpdate(
 
 export { splitThinkingTags };
 
-function parseSseFrame(frame: string) {
-  const data = frame
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trim())
-    .join("\n");
-
-  if (!data || data === "[DONE]") {
-    return null;
-  }
-
-  try {
-    return JSON.parse(data) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
 const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
-  "task_board_snapshot",
   "workspace_bound",
   "executor_bound",
   "executor_status_changed",
@@ -314,6 +331,7 @@ function applyStreamEvent(
   handlers: ChatStreamHandlers,
 ) {
   const type = typeof event.type === "string" ? event.type : "";
+  const replayFromEventIndex = state.nextEventIndex ?? 0;
   const eventIndex = normalizeEventIndex(event.index);
   if (eventIndex !== null) {
     state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
@@ -328,6 +346,36 @@ function applyStreamEvent(
       userMessage: event.user_message as ChatMessage,
       assistantMessage: event.assistant_message as ChatMessage,
     });
+    return;
+  }
+
+  if (type === "artifact_publication") {
+    if (isArtifactPublicationV1(event)) handlers.onArtifactPublication?.(event);
+    else throw new Error("Invalid report publication result.");
+    return;
+  }
+
+  if (type === "explain_analyze") {
+    if (isExplainAnalyzeEventV1(event)) {
+      handlers.onExplainAnalyzeEvent?.(event);
+    } else {
+      handlers.onExplainAnalyzeInvalid?.();
+    }
+    return;
+  }
+
+  if (type === "stream_gap") {
+    forwardWorkSurfaceEvent(event, handlers);
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    if (runId) {
+      handlers.onStreamGap?.({
+        runId,
+        nextEventIndex: replayFromEventIndex,
+      });
+    }
     return;
   }
 
@@ -385,6 +433,40 @@ function applyStreamEvent(
         waitingFor: "user_input",
       }),
     );
+    return;
+  }
+
+  if (
+    type === "approval_required" &&
+    typeof event.request_id === "string" &&
+    typeof event.tool === "string"
+  ) {
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    if (runId && typeof event.session_id === "string") {
+      handlers.onApprovalRequired?.({
+        requestId: event.request_id,
+        tool: event.tool,
+        detail: typeof event.detail === "string" ? event.detail : undefined,
+        displayLabel:
+          typeof event.display_label === "string"
+            ? event.display_label
+            : undefined,
+        sessionId: event.session_id,
+        runId,
+        approvalKind:
+          event.approval_kind === "explicit" ? "explicit" : "standard",
+      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: "waiting",
+          waitingFor: "tool_approval",
+        }),
+      );
+    }
     return;
   }
 
@@ -464,6 +546,7 @@ function applyStreamEvent(
     state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     state.paused = false;
+    handlers.onInteractionResolved?.();
     handlers.onRunUpdated?.(
       runUpdate(state, {
         runId: event.run_id,
@@ -607,6 +690,8 @@ function applyStreamEvent(
 async function consumeChatStream(
   response: Response,
   handlers: ChatStreamHandlers,
+  initialNextEventIndex = 0,
+  replayOnly = false,
 ) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
@@ -631,7 +716,12 @@ async function consumeChatStream(
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const state: ChatStreamState = { rawText: "", text: "", reasoning: "" };
+  const state: ChatStreamState = {
+    rawText: "",
+    text: "",
+    reasoning: "",
+    nextEventIndex: initialNextEventIndex,
+  };
   let buffer = "";
   let abortListener: (() => void) | undefined;
 
@@ -658,9 +748,11 @@ async function consumeChatStream(
       const frames = buffer.split(/\r?\n\r?\n/);
       buffer = frames.pop() ?? "";
       for (const frame of frames) {
-        const event = parseSseFrame(frame);
+        const event = parseChatSseFrame(frame, replayOnly);
         if (event) {
-          applyStreamEvent(event, state, handlers);
+          if (!replayOnly || isReplayObservationEvent(event)) {
+            applyStreamEvent(event, state, handlers);
+          }
         }
       }
     }
@@ -670,9 +762,11 @@ async function consumeChatStream(
       buffer += tail;
     }
     if (buffer.trim()) {
-      const event = parseSseFrame(buffer);
+      const event = parseChatSseFrame(buffer, replayOnly);
       if (event) {
-        applyStreamEvent(event, state, handlers);
+        if (!replayOnly || isReplayObservationEvent(event)) {
+          applyStreamEvent(event, state, handlers);
+        }
       }
     }
   } finally {
@@ -721,6 +815,7 @@ export async function streamExistingChatRun(
   options?: {
     nextEventIndex?: number | null;
     assistantMessageId?: string | null;
+    replayOnly?: boolean;
   },
 ) {
   const params = new URLSearchParams({ runId });
@@ -731,11 +826,14 @@ export async function streamExistingChatRun(
   if (options?.assistantMessageId?.trim()) {
     params.set("assistantMessageId", options.assistantMessageId.trim());
   }
+  if (options?.replayOnly) {
+    params.set("replay_only", "true");
+  }
   const response = await fetch(
     `/api/chats/${encodeURIComponent(chatId)}/stream?${params.toString()}`,
     { method: "GET", signal: handlers.signal },
   );
-  return consumeChatStream(response, handlers);
+  return consumeChatStream(response, handlers, nextEventIndex ?? 0, options?.replayOnly);
 }
 
 export function updateChatProject(chatId: string, projectId: string | null) {

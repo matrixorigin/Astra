@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CliContext {
     pub(crate) no_journal_content: bool,
-    pub(crate) max_turns: Option<u32>,
     pub(crate) allowed_tools: Vec<String>,
     pub(crate) disallowed_tools: Vec<String>,
     pub(crate) add_dirs: Vec<PathBuf>,
@@ -17,7 +16,6 @@ impl CliContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_launch_options(
         no_journal_content: bool,
-        max_turns: Option<usize>,
         allowed_tools: &[String],
         disallowed_tools: &[String],
         add_dirs: &[String],
@@ -25,7 +23,6 @@ impl CliContext {
         session_id: Option<String>,
         session_name: Option<String>,
     ) -> Result<Self, String> {
-        let max_turns = resolve_max_turns(max_turns)?;
         let session_id = resolve_optional_env_value(session_id, "ASTRA_CLI_SESSION_ID");
         let session_name = resolve_optional_env_value(session_name, "ASTRA_CLI_SESSION_NAME");
 
@@ -39,7 +36,6 @@ impl CliContext {
 
         Ok(Self {
             no_journal_content,
-            max_turns,
             allowed_tools: resolve_tool_list(allowed_tools, "ASTRA_CLI_ALLOWED_TOOLS"),
             disallowed_tools: resolve_tool_list(disallowed_tools, "ASTRA_CLI_DISALLOWED_TOOLS"),
             add_dirs: resolve_add_dirs(add_dirs),
@@ -54,25 +50,6 @@ impl CliContext {
         self.permission_mode = permission_mode;
         self
     }
-}
-
-fn resolve_max_turns(max_turns: Option<usize>) -> Result<Option<u32>, String> {
-    let raw = match max_turns {
-        Some(value) => Some(value.to_string()),
-        None => std::env::var("ASTRA_CLI_MAX_TURNS")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-    };
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let parsed = raw.parse::<u32>().map_err(|_| {
-        format!(
-            "Error: ASTRA_CLI_MAX_TURNS/--max-turns must be a non-negative integer, got '{raw}'"
-        )
-    })?;
-    Ok(Some(parsed))
 }
 
 fn resolve_optional_env_value(value: Option<String>, env_key: &str) -> Option<String> {
@@ -146,7 +123,6 @@ mod tests {
     fn from_launch_options_normalizes_tool_lists() {
         let ctx = temp_env::with_vars(
             [
-                ("ASTRA_CLI_MAX_TURNS", None::<&str>),
                 ("ASTRA_CLI_SESSION_ID", None::<&str>),
                 ("ASTRA_CLI_SESSION_NAME", None::<&str>),
                 ("ASTRA_CLI_ALLOWED_TOOLS", None::<&str>),
@@ -155,7 +131,6 @@ mod tests {
             || {
                 CliContext::from_launch_options(
                     false,
-                    Some(12),
                     &["bash, view".into(), "rg".into()],
                     &["read_file edit_file".into()],
                     &[],
@@ -167,34 +142,26 @@ mod tests {
             },
         );
 
-        assert_eq!(ctx.max_turns, Some(12));
         assert_eq!(ctx.allowed_tools, vec!["bash", "view", "rg"]);
         assert_eq!(ctx.disallowed_tools, vec!["read_file", "edit_file"]);
     }
 
     #[test]
     fn from_launch_options_rejects_invalid_session_id() {
-        temp_env::with_vars(
-            [
-                ("ASTRA_CLI_MAX_TURNS", None::<&str>),
-                ("ASTRA_CLI_SESSION_ID", None::<&str>),
-            ],
-            || {
-                let err = CliContext::from_launch_options(
-                    false,
-                    None,
-                    &[],
-                    &[],
-                    &[],
-                    false,
-                    Some("not-a-uuid".into()),
-                    None,
-                )
-                .expect_err("invalid session id should fail");
+        temp_env::with_vars([("ASTRA_CLI_SESSION_ID", None::<&str>)], || {
+            let err = CliContext::from_launch_options(
+                false,
+                &[],
+                &[],
+                &[],
+                false,
+                Some("not-a-uuid".into()),
+                None,
+            )
+            .expect_err("invalid session id should fail");
 
-                assert!(err.contains("ASTRA_CLI_SESSION_ID/--session-id must be a valid UUID"));
-            },
-        );
+            assert!(err.contains("ASTRA_CLI_SESSION_ID/--session-id must be a valid UUID"));
+        });
     }
 
     #[test]
@@ -209,7 +176,6 @@ mod tests {
         let joined_paths = std::env::join_paths([add_dir.path()]).expect("join paths");
         temp_env::with_vars(
             [
-                ("ASTRA_CLI_MAX_TURNS", Some("27")),
                 ("ASTRA_CLI_ALLOWED_TOOLS", Some("bash, view rg")),
                 ("ASTRA_CLI_DISALLOWED_TOOLS", Some("write_file edit_file")),
                 (
@@ -220,19 +186,10 @@ mod tests {
             ],
             || {
                 temp_env::with_var("ASTRA_CLI_ADD_DIRS", Some(joined_paths.clone()), || {
-                    let ctx = CliContext::from_launch_options(
-                        false,
-                        None,
-                        &[],
-                        &[],
-                        &[],
-                        false,
-                        None,
-                        None,
-                    )
-                    .expect("cli context");
+                    let ctx =
+                        CliContext::from_launch_options(false, &[], &[], &[], false, None, None)
+                            .expect("cli context");
 
-                    assert_eq!(ctx.max_turns, Some(27));
                     assert_eq!(ctx.allowed_tools, vec!["bash", "view", "rg"]);
                     assert_eq!(ctx.disallowed_tools, vec!["write_file", "edit_file"]);
                     assert_eq!(
@@ -264,7 +221,6 @@ mod tests {
             || {
                 let ctx = CliContext::from_launch_options(
                     false,
-                    None,
                     &["rg".into()],
                     &[],
                     &[],
@@ -283,20 +239,9 @@ mod tests {
     #[test]
     fn from_launch_options_rejects_invalid_env_session_id() {
         temp_env::with_var("ASTRA_CLI_SESSION_ID", Some("not-a-uuid"), || {
-            let err =
-                CliContext::from_launch_options(false, None, &[], &[], &[], false, None, None)
-                    .expect_err("invalid env session id should fail");
+            let err = CliContext::from_launch_options(false, &[], &[], &[], false, None, None)
+                .expect_err("invalid env session id should fail");
             assert!(err.contains("ASTRA_CLI_SESSION_ID/--session-id must be a valid UUID"));
-        });
-    }
-
-    #[test]
-    fn from_launch_options_rejects_invalid_env_max_turns() {
-        temp_env::with_var("ASTRA_CLI_MAX_TURNS", Some("abc"), || {
-            let err =
-                CliContext::from_launch_options(false, None, &[], &[], &[], false, None, None)
-                    .expect_err("invalid env max turns should fail");
-            assert!(err.contains("ASTRA_CLI_MAX_TURNS/--max-turns"));
         });
     }
 }

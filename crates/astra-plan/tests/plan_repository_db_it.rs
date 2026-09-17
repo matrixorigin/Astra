@@ -16,8 +16,10 @@ use astra_core::{MatrixOneSettings, SharedPool};
 use astra_plan::{
     CloudPlanRepository, NewStepRun, PlanListFilter, PlanLoadError, PlanModeState, PlanRepository,
 };
+use astra_plan::{SubtaskPlan, TaskStatus};
 use astra_services::ensure_core_schema;
-use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 // ── Test harness ─────────────────────────────────────────────────────────────
@@ -34,12 +36,40 @@ fn require_db_it_env() -> MatrixOneSettings {
 /// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` costs
 /// ~55ms solo on MatrixOne but serialises under concurrency (16 parallel
 /// callers ≈ 915ms p95), because MatrixOne locks DDL globally during
-/// `CREATE TABLE IF NOT EXISTS`. Every #[ignore] test here calls
-/// `setup_repo` in its prologue; running the 22 tests in parallel (default
-/// nextest) without this cache turned each test's setup into ~1–2s of
-/// schema-lock waiting. Tests are UUID-scoped so sharing the pool is
-/// isolation-safe.
+/// `CREATE TABLE IF NOT EXISTS`. The pool and its sockets must remain owned by
+/// the same long-lived Tokio runtime; sharing a static pool across independent
+/// `#[tokio::test]` runtimes leaves SQLx attached to runtimes that have already
+/// shut down. Cases are UUID-scoped, and the runner serializes their lifecycle
+/// so recovery/cleanup operations cannot affect another case's active rows.
 static SHARED_SETUP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+static SHARED_DB_TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static SHARED_DB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn run_shared_db_test(future: impl Future<Output = ()>) {
+    let _serial = SHARED_DB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHARED_DB_TEST_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .thread_name("astra-plan-db-test")
+                .build()
+                .expect("shared plan database test runtime")
+        })
+        .block_on(future);
+}
+
+macro_rules! matrixone_db_test {
+    ($(#[$meta:meta])* async fn $name:ident() $body:block) => {
+        #[test]
+        $(#[$meta])*
+        fn $name() {
+            run_shared_db_test(async $body);
+        }
+    };
+}
 
 async fn setup_repo() -> (CloudPlanRepository, sqlx::Pool<sqlx::MySql>) {
     let shared = SHARED_SETUP
@@ -120,7 +150,7 @@ fn make_state_with_subtasks(owner: &str, goal: &str, ids: &[&str]) -> PlanModeSt
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     let (repo, pool) = setup_repo().await;
@@ -147,7 +177,9 @@ async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
     let (repo, pool) = setup_repo().await;
@@ -175,7 +207,9 @@ async fn load_owned_returns_not_found_for_wrong_user_no_403_leak() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn same_plan_id_isolated_between_users() {
     let (repo, pool) = setup_repo().await;
@@ -204,7 +238,9 @@ async fn same_plan_id_isolated_between_users() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
     // Regression for the save() race: SELECT ... FOR UPDATE followed by an
@@ -277,7 +313,9 @@ async fn concurrent_saves_at_same_expected_version_have_exactly_one_winner() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_rejects_stale_expected_version_with_conflict() {
     let (repo, pool) = setup_repo().await;
@@ -327,7 +365,9 @@ async fn save_rejects_stale_expected_version_with_conflict() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn set_active_plan_enforces_single_session_invariant() {
     let (repo, pool) = setup_repo().await;
@@ -384,13 +424,20 @@ async fn set_active_plan_enforces_single_session_invariant() {
         repo.active_plan_for_session(&user, &sess_b).await.unwrap(),
         None
     );
+    assert_eq!(
+        repo.load(&user, &plan_id).await.unwrap().session_hint,
+        None,
+        "clearing the active plan must also clear its denormalized session discovery hint"
+    );
 
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess_a, &user).await;
     cleanup_session(&pool, &sess_b, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn step_runs_are_append_only_and_list_in_recency_order() {
     let (repo, pool) = setup_repo().await;
@@ -497,7 +544,9 @@ async fn step_runs_are_append_only_and_list_in_recency_order() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn step_run_unknown_status_fails_closed_on_get_and_list() {
     let (repo, pool) = setup_repo().await;
@@ -560,7 +609,9 @@ async fn step_run_unknown_status_fails_closed_on_get_and_list() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn finalize_step_run_rejects_cross_plan_run_id() {
     // Security regression: finalize_step_run used to filter only on run_id.
@@ -632,7 +683,9 @@ async fn finalize_step_run_rejects_cross_plan_run_id() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_completed_step_run_lands_row_already_finalized() {
     let (repo, pool) = setup_repo().await;
@@ -679,7 +732,9 @@ async fn record_completed_step_run_lands_row_already_finalized() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn delete_cascades_step_runs_and_clears_active_plan_id() {
     let (repo, pool) = setup_repo().await;
@@ -740,7 +795,9 @@ async fn delete_cascades_step_runs_and_clears_active_plan_id() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_for_user_reads_subtask_count_from_denormalized_column_not_plan_json() {
     // Regression / perf: list_for_user previously deserialized every plan_json
@@ -792,7 +849,9 @@ async fn list_for_user_reads_subtask_count_from_denormalized_column_not_plan_jso
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit() {
     // Regression for the enter_plan_mode re-link race: calling save(..., None)
@@ -840,7 +899,9 @@ async fn save_with_none_expected_version_on_existing_row_detects_concurrent_edit
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_maintains_subtask_count_column_on_update() {
     // When subtasks grow/shrink between saves, the column must follow.
@@ -862,15 +923,12 @@ async fn save_maintains_subtask_count_column_on_update() {
     assert_eq!(count, 2);
 
     // Add a third subtask and save again.
-    state
-        .plan
-        .subtasks
-        .push(astra_services::task_orchestrator::SubtaskPlan {
-            id: "c".into(),
-            title: "step c".into(),
-            status: TaskStatus::Pending,
-            ..Default::default()
-        });
+    state.plan.subtasks.push(astra_plan::SubtaskPlan {
+        id: "c".into(),
+        title: "step c".into(),
+        status: TaskStatus::Pending,
+        ..Default::default()
+    });
     let expected = state.version;
     repo.save(&user, &plan_id, &mut state, Some(expected))
         .await
@@ -888,7 +946,9 @@ async fn save_maintains_subtask_count_column_on_update() {
     cleanup_plans(&pool, &plan_id).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_for_user_filters_by_session_and_phase() {
     let (repo, pool) = setup_repo().await;
@@ -978,7 +1038,9 @@ async fn list_for_user_filters_by_session_and_phase() {
     cleanup_session(&pool, &sess_a, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     use astra_plan::plan_resume_hint_for_session;
@@ -1029,7 +1091,9 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
     cleanup_session(&pool, &sess, &user).await;
 }
 
-#[tokio::test]
+}
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_hint_round_trips_through_load() {
     let (repo, pool) = setup_repo().await;
@@ -1054,13 +1118,15 @@ async fn session_hint_round_trips_through_load() {
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
 }
+}
 
 // ── Deep-review regressions (round 2) ────────────────────────────────────────
 
-/// Rewind / redo must not leave step_runs stuck as `in_progress` when the
-/// subtask itself is reset to pending — otherwise the audit chain says "still
-/// running" forever and future `list_step_runs` attempt counting breaks.
-#[tokio::test]
+// Rewind / redo must not leave step_runs stuck as `in_progress` when the
+// subtask itself is reset to pending — otherwise the audit chain says "still
+// running" forever and future `list_step_runs` attempt counting breaks.
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
     let (repo, pool) = setup_repo().await;
@@ -1171,12 +1237,14 @@ async fn abort_open_step_runs_closes_unfinished_attempts_for_subtask() {
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
 }
+}
 
-/// Two simultaneous `record_step_run` calls with the same (plan_id,
-/// subtask_id, attempt) must not both succeed — the tuple is a unique audit
-/// key. Prevents a race in `redo_step` where two concurrent calls compute the
-/// same `next_attempt` and both insert.
-#[tokio::test]
+// Two simultaneous `record_step_run` calls with the same (plan_id,
+// subtask_id, attempt) must not both succeed — the tuple is a unique audit
+// key. Prevents a race in `redo_step` where two concurrent calls compute the
+// same `next_attempt` and both insert.
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
     let (repo, pool) = setup_repo().await;
@@ -1241,11 +1309,13 @@ async fn record_step_run_rejects_duplicate_plan_subtask_attempt_tuple() {
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
 }
+}
 
-/// Pagination stability: with identical `started_at` values, `list_step_runs`
-/// must return rows in a deterministic order so a client scrolling by limit
-/// never sees duplicates or skipped rows. Tiebreaker is `run_id` ascending.
-#[tokio::test]
+// Pagination stability: with identical `started_at` values, `list_step_runs`
+// must return rows in a deterministic order so a client scrolling by limit
+// never sees duplicates or skipped rows. Tiebreaker is `run_id` ascending.
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn list_step_runs_order_is_stable_on_identical_started_at() {
     let (repo, pool) = setup_repo().await;
@@ -1323,11 +1393,13 @@ async fn list_step_runs_order_is_stable_on_identical_started_at() {
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
 }
+}
 
-/// `record_completed_step_run` must also respect the (plan_id, subtask_id,
-/// attempt) uniqueness — otherwise the happy-path shortcut bypasses the new
-/// guard.
-#[tokio::test]
+// `record_completed_step_run` must also respect the (plan_id, subtask_id,
+// attempt) uniqueness — otherwise the happy-path shortcut bypasses the new
+// guard.
+
+matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
     let (repo, pool) = setup_repo().await;
@@ -1382,4 +1454,5 @@ async fn record_completed_step_run_rejects_duplicate_attempt_tuple() {
 
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
+}
 }

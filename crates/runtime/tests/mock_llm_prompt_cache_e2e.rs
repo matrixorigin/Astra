@@ -23,7 +23,7 @@
 //! `with_llm_request_capture(...)` and asserts on the structure of the
 //! captured payloads.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 

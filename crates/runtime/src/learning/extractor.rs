@@ -479,7 +479,7 @@ mod tests {
         use astra_pipeline::tool_health_types::{ToolOutcome, ToolOutcomeCacheEntry};
         let mut entry = health(name, failures, total);
         entry.recent_outcomes = vec![ToolOutcomeCacheEntry {
-            signature: format!("{name} *"),
+            identity: astra_pipeline::ToolHealthIdentity::new(name.to_owned(), b"test-outcome"),
             outcomes: (0..failures)
                 .map(|_| ToolOutcome {
                     success: false,

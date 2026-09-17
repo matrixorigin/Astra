@@ -780,10 +780,10 @@ mod tests {
         .await
         .unwrap();
 
-        let task_request = ToolRequest {
-            capability: ToolCapability::Named("task_board".into()),
-            tool_name: "task_board".into(),
-            tool_call_id: "call-task".into(),
+        let state_request = ToolRequest {
+            capability: ToolCapability::Named("session".into()),
+            tool_name: "session".into(),
+            tool_call_id: "call-session".into(),
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
             storage: None,
@@ -793,8 +793,8 @@ mod tests {
             workspace_id: None,
         };
         assert!(
-            reg.resolve(&task_request).await.is_ok(),
-            "durable task-board tool belongs to state management"
+            reg.resolve(&state_request).await.is_ok(),
+            "session state belongs to state management"
         );
 
         let background_request = ToolRequest {

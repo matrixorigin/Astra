@@ -1,17 +1,6 @@
-use crate::edge_tools::{SessionStateRollbackJournal, TaskManager, ToolExecutor};
+use crate::edge_tools::ToolExecutor;
 use astra_services::{session_journal::JournalDirGuard, session_workspace};
 use serde_json::{Value, json};
-
-/// Parse a task-tool response into JSON, tolerating the human-readable
-/// summary line that `prefix_summary` prepends to success responses.
-fn parse_task_json(response: &str) -> Value {
-    let body = response
-        .find('{')
-        .map(|pos| &response[pos..])
-        .unwrap_or(response);
-    serde_json::from_str(body)
-        .unwrap_or_else(|e| panic!("task response not JSON: {e}; raw: {response}"))
-}
 
 fn executor_with_session() -> (
     ToolExecutor,
@@ -85,6 +74,38 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn adjust_config_rejects_strictness_above_effective_maximum() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.verification.strictness;
+
+    let rejected: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({
+                "path": "verification.strictness",
+                "value": 0.95,
+                "force": true
+            }),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(rejected["error"], "invalid_runtime_config");
+    assert_eq!(rejected["invariant"], "verification_bounds");
+    assert_eq!(
+        session.read().unwrap().config.verification.strictness,
+        baseline
+    );
+    assert_eq!(
+        session_workspace::read_workspace(&session_id)
+            .unwrap()
+            .config_mutation_revision,
+        0
+    );
+}
+
+#[tokio::test]
 async fn self_mod_persists_config() {
     let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
 
@@ -100,9 +121,261 @@ async fn self_mod_persists_config() {
 
     let parsed_adjust: Value = serde_json::from_str(&adjust_out).unwrap();
     assert_eq!(parsed_adjust["status"], "completed");
+    assert_eq!(parsed_adjust["audit_recorded"], true);
 
     let ws = session_workspace::read_workspace(&session_id).unwrap();
     assert!(ws.tuned_config_json.is_some());
+    assert_eq!(
+        parsed_adjust["config_revision"],
+        ws.config_mutation_revision
+    );
+    let config_events = astra_services::session_journal::read_journal(&session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::ConfigChange
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(config_events.len(), 1);
+    assert_eq!(
+        config_events[0]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("config_revision")),
+        Some(&serde_json::json!(ws.config_mutation_revision))
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn durable_config_failure_does_not_change_observability_or_rollback_state() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let changed = (1..=20).find(|value| *value != baseline).unwrap();
+    let lock_path = session_workspace::workspace_dir_for(&session_id).join(".workspace.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+
+    let failed: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(failed["error"], "failed_to_persist_config_override");
+    assert_eq!(
+        session.read().unwrap().config.memory.retrieval_top_k,
+        baseline
+    );
+    let listed: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "list"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(listed["total_entries"], 0);
+
+    std::fs::remove_dir(&lock_path).unwrap();
+    let applied: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(applied["status"], "completed");
+    assert_eq!(applied["mutations_this_turn"], 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn governed_config_validates_against_latest_durable_authority() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let observed = session.read().unwrap().config.memory.retrieval_top_k;
+    assert_ne!(observed, 20);
+    crate::cli::self_command::persist_config_override(
+        &session_id,
+        "memory.retrieval_top_k",
+        json!(20),
+    )
+    .unwrap();
+
+    let rejected: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": observed}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(rejected["error"], "config_drift_ceiling_exceeded");
+    let workspace = session_workspace::read_workspace(&session_id).unwrap();
+    assert_eq!(workspace.config_mutation_revision, 1);
+    let durable: astra_config::RuntimeConfig =
+        serde_json::from_str(workspace.tuned_config_json.as_deref().unwrap()).unwrap();
+    assert_eq!(durable.memory.retrieval_top_k, 20);
+    let listed: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "list"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(listed["total_entries"], 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn projection_failure_preserves_durable_receipt_and_rollback_handle() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let changed = (1..=20).find(|value| *value != baseline).unwrap();
+    let poisoned = session.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = poisoned.write().unwrap();
+        panic!("poison observability projection lock");
+    }));
+
+    let applied: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(applied["status"], "completed");
+    assert_eq!(applied["config_revision"], 1);
+    assert_eq!(applied["projection_recorded"], false);
+    assert!(applied["projection_warning"].is_string());
+    assert_eq!(applied["mutations_this_turn"], 1);
+    let listed: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "list"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(listed["total_entries"], 1);
+
+    let rollback: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "current_turn"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(rollback["success"], true);
+    let workspace = session_workspace::read_workspace(&session_id).unwrap();
+    assert_eq!(workspace.config_mutation_revision, 2);
+    let durable = workspace
+        .tuned_config_json
+        .as_deref()
+        .map(serde_json::from_str::<astra_config::RuntimeConfig>)
+        .transpose()
+        .unwrap()
+        .unwrap_or_else(astra_config::RuntimeConfig::load);
+    assert_eq!(durable.memory.retrieval_top_k, baseline);
+    let listed: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "list"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(listed["total_entries"], 0);
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test]
+#[serial_test::serial]
+async fn post_rename_sync_unknown_projects_readback_and_records_exact_owner() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let changed = (1..=20).find(|value| *value != baseline).unwrap();
+    astra_services::session_workspace::inject_workspace_commit_parent_sync_failure_once();
+
+    let unknown: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(unknown["error"], "config_commit_outcome_unknown");
+    assert_eq!(unknown["side_effects_maybe"], true);
+    assert_eq!(unknown["proposed_revision"], 1);
+    assert_eq!(unknown["observed_revision"], 1);
+    assert_eq!(unknown["retry_revision"], 1);
+    assert_eq!(unknown["projection_recorded"], true);
+    assert_eq!(unknown["mutations_this_turn"], 1);
+    assert_eq!(unknown["rollback_recorded"], true);
+    assert_eq!(
+        session.read().unwrap().config.memory.retrieval_top_k,
+        changed
+    );
+    let listed: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "list"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(listed["total_entries"], 1);
+
+    let rollback: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "current_turn"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(rollback["success"], true);
+    let workspace = session_workspace::read_workspace(&session_id).unwrap();
+    assert_eq!(workspace.config_mutation_revision, 2);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_rollback_rejects_aba_writer_without_overwriting_authority() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.memory.retrieval_top_k;
+    let first = (1..=20).find(|value| *value != baseline).unwrap();
+    let second = (1..=20)
+        .find(|value| *value != baseline && *value != first)
+        .unwrap();
+    let applied: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": first, "force": true}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(applied["status"], "completed");
+    crate::cli::self_command::persist_config_override(
+        &session_id,
+        "memory.retrieval_top_k",
+        json!(first),
+    )
+    .unwrap();
+    crate::cli::self_command::persist_config_override(
+        &session_id,
+        "memory.retrieval_top_k",
+        json!(second),
+    )
+    .unwrap();
+    crate::cli::self_command::persist_config_override(
+        &session_id,
+        "memory.retrieval_top_k",
+        json!(first),
+    )
+    .unwrap();
+
+    let rollback: Value = serde_json::from_str(
+        &exe.execute("rollback_session_state", &json!({"scope": "current_turn"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(rollback["success"], false);
+    assert_eq!(rollback["failed"].as_array().map(Vec::len), Some(1));
+    let workspace = session_workspace::read_workspace(&session_id).unwrap();
+    assert_eq!(workspace.config_mutation_revision, 4);
+    let persisted: astra_config::RuntimeConfig =
+        serde_json::from_str(workspace.tuned_config_json.as_deref().unwrap()).unwrap();
+    assert_eq!(persisted.memory.retrieval_top_k, first);
+    assert_eq!(session.read().unwrap().config.memory.retrieval_top_k, first);
 }
 
 #[tokio::test]
@@ -161,62 +434,6 @@ async fn switching_sessions_clears_session_scoped_self_model_context() {
         after.turn_quality_feedback.is_none(),
         "latest turn quality feedback must not bleed into another session"
     );
-}
-
-#[tokio::test]
-async fn shared_task_manager_and_session_state_journal_survive_across_executors() {
-    let shared_tasks = std::sync::Arc::new(TaskManager::in_memory());
-    let shared_journal =
-        std::sync::Arc::new(std::sync::Mutex::new(SessionStateRollbackJournal::default()));
-
-    let exe_a = ToolExecutor::new(std::env::temp_dir())
-        .with_shared_task_manager(shared_tasks.clone())
-        .with_shared_session_state_journal(shared_journal.clone());
-    let exe_b = ToolExecutor::new(std::env::temp_dir())
-        .with_shared_task_manager(shared_tasks)
-        .with_shared_session_state_journal(shared_journal);
-
-    exe_a
-        .journal_turn_index
-        .store(11, std::sync::atomic::Ordering::Relaxed);
-    exe_b
-        .journal_turn_index
-        .store(11, std::sync::atomic::Ordering::Relaxed);
-
-    let create_out = exe_a
-        .execute(
-            "task_board",
-            &json!({"action": "create", "title": "shared task"}),
-        )
-        .await;
-    let create_json = parse_task_json(&create_out);
-    assert_eq!(create_json["success"], true);
-
-    let listed_via_b = exe_b
-        .execute("task_board", &json!({"action": "list"}))
-        .await;
-    let listed_via_b_json: Value = serde_json::from_str(&listed_via_b).unwrap();
-    assert_eq!(listed_via_b_json["count"], 1);
-
-    let rollback_json: Value = serde_json::from_str(
-        &exe_b
-            .rollback_session_state(&json!({"scope": "turn", "turn_index": 11}))
-            .await,
-    )
-    .unwrap();
-    assert_eq!(rollback_json["success"], true);
-    assert_eq!(
-        rollback_json["restored"]
-            .as_array()
-            .map(|entries| entries.len()),
-        Some(1)
-    );
-
-    let listed_after = exe_a
-        .execute("task_board", &json!({"action": "list"}))
-        .await;
-    let listed_after_json: Value = serde_json::from_str(&listed_after).unwrap();
-    assert_eq!(listed_after_json["count"], 0);
 }
 
 // ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────

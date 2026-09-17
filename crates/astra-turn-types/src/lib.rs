@@ -6,13 +6,23 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
-mod bridge_turn;
+mod artifact_publication;
+pub use artifact_publication::{ArtifactPublicationResult, ArtifactPublicationV1};
 mod canonical_tool_pairing;
+mod completion_settlement;
+#[doc(hidden)]
+pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
+mod deferred_tool;
+mod explain_analyze;
+mod explain_analyze_projection;
+mod explain_wire;
+pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
+mod provider_canonical_transition;
 mod provider_contract;
 mod result_quality;
 mod resume;
@@ -23,23 +33,26 @@ mod session_cursor;
 pub mod session_facts;
 mod session_fork;
 mod session_handoff;
+mod stop_hooks;
+pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
+mod turn_provenance;
 mod user_intent;
+mod verification_frontier;
 
 pub use agent_communication::{
     AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
-    AgentCommunicationParty, AgentCommunicationTarget,
+    AgentCommunicationParty, AgentCommunicationPayloadKind, AgentCommunicationTarget,
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
-pub use bridge_turn::{
-    BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD, BRIDGE_TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
-    BridgeTurnMessageProvenanceError, BridgeTurnMessageProvenanceV1,
-    bridge_turn_message_provenance, clear_bridge_turn_message_provenance, mark_bridge_turn_message,
-};
 pub use canonical_tool_pairing::{CanonicalToolPairingError, validate_canonical_tool_pairing};
+pub use completion_settlement::{
+    BudgetWrapupOrigin, CompletionAction, CompletionActionWindow, CompletionSettlementState,
+    ForegroundFanoutPagination, RuntimeSuccessfulToolCompletion,
+};
 pub use context_identity::{
     ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
     LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES, LlmArtifactEvidenceEntryV1, LlmArtifactEvidenceManifestV1,
@@ -47,17 +60,40 @@ pub use context_identity::{
     PromptCacheInvalidationReason,
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
+pub use deferred_tool::DeferredToolActivation;
+pub use explain_analyze::{
+    EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
+    ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
+    ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
+    ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
+    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
+    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+};
+pub use explain_analyze_projection::{
+    ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
+    ExplainAnalyzeProjectionApplyResultV1, ExplainAnalyzeProjectionDiagnosticCodeV1,
+    ExplainAnalyzeProjectionDiagnosticV1, ExplainAnalyzeProjectionDiagnosticsV1,
+};
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
     client_direct_execution_field,
 };
 pub use memory_ranking::{
-    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
-    is_persistent_type, partition_by_scope, sort_by_retrieval_score,
+    MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
+    freshness_suffix_for, is_persistent_type, partition_by_scope, sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
+};
+pub use provider_canonical_transition::{
+    CanonicalPrefixIdentityV1, MAX_PROVIDER_CANONICAL_RECOVERY_BYTES,
+    MAX_PROVIDER_CANONICAL_TRANSITION_BYTES, MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES,
+    MAX_PROVIDER_CANONICAL_WAL_BYTES, MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
+    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalHistoryIdentityV2,
+    ProviderCanonicalRecoveryModeV2, ProviderCanonicalTransitionApply,
+    ProviderCanonicalTransitionError, ProviderCanonicalTransitionV2, ProviderCanonicalWalBaseV2,
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
@@ -80,12 +116,19 @@ pub use resume::{
     RESUME_BUNDLE_SCHEMA_VERSION, ResumeActivationProjectionV1, ResumeBundleV1, ResumeCandidateV1,
     ResumeCheckpointProjectionV1, ResumeDegradedReasonV1, ResumeDescriptorV1,
     ResumeProjectionSetV1, ResumeProviderProjectionV1, ResumeRepairActionV1, ResumeSelectionError,
-    ResumeSourceV1, ResumeTaskProjectionV1, cursor_relation, legacy_resume_cursor,
-    select_resume_bundle, select_resume_candidate_index,
+    ResumeSourceV1, cursor_relation, select_resume_bundle, select_resume_candidate_index,
 };
 pub use runtime_scaffolding::{
-    RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,
-    mark_runtime_owned_message, runtime_message_delivery, runtime_owned_message,
+    APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
+    ParsedRuntimeAuthorityFrame, RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeAuthorityFrameError,
+    RuntimeAuthorityLifetime, RuntimeMessageDelivery,
+    active_append_only_authority_protected_suffix_start, append_only_runtime_authority_is_active,
+    has_append_only_runtime_authority_policy, is_human_user_message, is_runtime_owned_message,
+    is_runtime_owned_provenance, mark_append_only_required_context,
+    mark_append_only_runtime_authority_policy, mark_runtime_owned_message,
+    parse_append_only_runtime_authority_frame, render_append_only_runtime_authority_frame,
+    runtime_authority_kind, runtime_authority_lifetime, runtime_message_delivery,
+    runtime_message_delivery_from_provenance, runtime_owned_message,
 };
 pub use semantic_read_cache::{
     SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,
@@ -126,6 +169,7 @@ pub use session_handoff::{
     SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
     valid_transition,
 };
+pub use stop_hooks::{StopHook, StopHookObligations};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
@@ -134,14 +178,24 @@ pub use tool_invocation::{
     TOOL_INVOCATION_RESULT_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
     TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH, TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
     TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION,
-    ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
-    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
-    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
-    ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
-    canonical_public_tool_arguments,
+    ToolInvocationCompletionRef, ToolInvocationCompletionSource, ToolInvocationContractError,
+    ToolInvocationDecision, ToolInvocationDispatchLease, ToolInvocationFingerprint,
+    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
+    ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
+    canonical_public_arguments_hash, canonical_public_tool_arguments,
+};
+pub use turn_provenance::{
+    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
+    mark_turn_message, turn_message_provenance,
 };
 pub use user_intent::{
     ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,
     UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
     UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
+};
+pub use verification_frontier::{
+    BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
+    VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
+    WorkspaceObservationProof,
 };

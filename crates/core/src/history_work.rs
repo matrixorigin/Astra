@@ -63,11 +63,9 @@ pub enum HistoryWorkSite {
     CliJournalHistoryHydration,
     CliJournalDigestMaterialization,
     CliJournalDigestSerialization,
-    CliSessionMemoryShutdownMaterialization,
     CliSessionRestoreHydration,
-    CliSlashForkCanonicalHistoryClone,
-    CliSlashForkJournalHistoryClone,
-    CliSlashForkRollbackSnapshot,
+    CliSessionRestoreCanonicalHistoryClone,
+    CliSessionRestoreJournalHistoryClone,
     CliSubrunPromptPayloadClone,
     CliTaskBackgroundHistoryClone,
     CliTaskBackgroundHistoryQueue,
@@ -115,7 +113,7 @@ pub enum HistoryWorkSite {
     ProviderRetryRetention,
     LlmCaptureArtifactClone,
     LlmCaptureArtifactSerialization,
-    BridgePipelineInputMaterialization,
+    EphemeralPipelineInputMaterialization,
     BridgeJournalReplayClone,
     BridgeJournalReplaySerialization,
     BridgeRequestCaptureClone,
@@ -126,7 +124,6 @@ pub enum HistoryWorkSite {
     ServerCompactionFixedContextClone,
     ServerToolPolicySchemaClone,
     ServerToolAdmissionSnapshotClone,
-    ServerToolSchemaEstimationSerialization,
     DelegationContextClone,
     DelegationRetryContextClone,
     DelegationParentMessagesClone,
@@ -176,7 +173,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 156;
+    const COUNT: usize = 153;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::AgenticRequestSnapshot,
@@ -225,11 +222,9 @@ impl HistoryWorkSite {
         Self::CliJournalHistoryHydration,
         Self::CliJournalDigestMaterialization,
         Self::CliJournalDigestSerialization,
-        Self::CliSessionMemoryShutdownMaterialization,
         Self::CliSessionRestoreHydration,
-        Self::CliSlashForkCanonicalHistoryClone,
-        Self::CliSlashForkJournalHistoryClone,
-        Self::CliSlashForkRollbackSnapshot,
+        Self::CliSessionRestoreCanonicalHistoryClone,
+        Self::CliSessionRestoreJournalHistoryClone,
         Self::CliSubrunPromptPayloadClone,
         Self::CliTaskBackgroundHistoryClone,
         Self::CliTaskBackgroundHistoryQueue,
@@ -277,7 +272,7 @@ impl HistoryWorkSite {
         Self::ProviderRetryRetention,
         Self::LlmCaptureArtifactClone,
         Self::LlmCaptureArtifactSerialization,
-        Self::BridgePipelineInputMaterialization,
+        Self::EphemeralPipelineInputMaterialization,
         Self::BridgeJournalReplayClone,
         Self::BridgeJournalReplaySerialization,
         Self::BridgeRequestCaptureClone,
@@ -288,7 +283,6 @@ impl HistoryWorkSite {
         Self::ServerCompactionFixedContextClone,
         Self::ServerToolPolicySchemaClone,
         Self::ServerToolAdmissionSnapshotClone,
-        Self::ServerToolSchemaEstimationSerialization,
         Self::DelegationContextClone,
         Self::DelegationRetryContextClone,
         Self::DelegationParentMessagesClone,
@@ -397,13 +391,13 @@ impl HistoryWorkSite {
             Self::CliJournalHistoryHydration => "cli_journal_history_hydration",
             Self::CliJournalDigestMaterialization => "cli_journal_digest_materialization",
             Self::CliJournalDigestSerialization => "cli_journal_digest_serialization",
-            Self::CliSessionMemoryShutdownMaterialization => {
-                "cli_session_memory_shutdown_materialization"
-            }
             Self::CliSessionRestoreHydration => "cli_session_restore_hydration",
-            Self::CliSlashForkCanonicalHistoryClone => "cli_slash_fork_canonical_history_clone",
-            Self::CliSlashForkJournalHistoryClone => "cli_slash_fork_journal_history_clone",
-            Self::CliSlashForkRollbackSnapshot => "cli_slash_fork_rollback_snapshot",
+            Self::CliSessionRestoreCanonicalHistoryClone => {
+                "cli_session_restore_canonical_history_clone"
+            }
+            Self::CliSessionRestoreJournalHistoryClone => {
+                "cli_session_restore_journal_history_clone"
+            }
             Self::CliSubrunPromptPayloadClone => "cli_subrun_prompt_payload_clone",
             Self::CliTaskBackgroundHistoryClone => "cli_task_background_history_clone",
             Self::CliTaskBackgroundHistoryQueue => "cli_task_background_history_queue",
@@ -451,7 +445,9 @@ impl HistoryWorkSite {
             Self::ProviderRetryRetention => "provider_retry_retention",
             Self::LlmCaptureArtifactClone => "llm_capture_artifact_clone",
             Self::LlmCaptureArtifactSerialization => "llm_capture_artifact_serialization",
-            Self::BridgePipelineInputMaterialization => "bridge_pipeline_input_materialization",
+            Self::EphemeralPipelineInputMaterialization => {
+                "ephemeral_pipeline_input_materialization"
+            }
             Self::BridgeJournalReplayClone => "bridge_journal_replay_clone",
             Self::BridgeJournalReplaySerialization => "bridge_journal_replay_serialization",
             Self::BridgeRequestCaptureClone => "bridge_request_capture_clone",
@@ -462,9 +458,6 @@ impl HistoryWorkSite {
             Self::ServerCompactionFixedContextClone => "server_compaction_fixed_context_clone",
             Self::ServerToolPolicySchemaClone => "server_tool_policy_schema_clone",
             Self::ServerToolAdmissionSnapshotClone => "server_tool_admission_snapshot_clone",
-            Self::ServerToolSchemaEstimationSerialization => {
-                "server_tool_schema_estimation_serialization"
-            }
             Self::DelegationContextClone => "delegation_context_clone",
             Self::DelegationRetryContextClone => "delegation_retry_context_clone",
             Self::DelegationParentMessagesClone => "delegation_parent_messages_clone",
@@ -578,10 +571,8 @@ impl HistoryWorkSite {
             Self::CliJournalDigestMaterialization | Self::CliJournalDigestSerialization => {
                 "cli.journal_digest"
             }
-            Self::CliSessionMemoryShutdownMaterialization => "cli.session_cleanup",
-            Self::CliSlashForkCanonicalHistoryClone
-            | Self::CliSlashForkJournalHistoryClone
-            | Self::CliSlashForkRollbackSnapshot => "cli.slash.session_fork",
+            Self::CliSessionRestoreCanonicalHistoryClone
+            | Self::CliSessionRestoreJournalHistoryClone => "cli.session_restore",
             Self::CliTaskBackgroundHistoryClone | Self::CliTaskBackgroundHistoryQueue => {
                 "cli.slash_task"
             }
@@ -631,7 +622,7 @@ impl HistoryWorkSite {
             Self::LlmCaptureArtifactClone | Self::LlmCaptureArtifactSerialization => {
                 "runtime.turn.llm_capture"
             }
-            Self::BridgePipelineInputMaterialization => "runtime.turn.prompt_cache",
+            Self::EphemeralPipelineInputMaterialization => "runtime.turn.prompt_cache",
             Self::BridgeJournalReplayClone => "runtime.turn.bridge.journal_replay",
             Self::BridgeJournalReplaySerialization => "runtime.turn.bridge.journal_replay",
             Self::BridgeRequestCaptureClone => "runtime.turn.bridge.llm_capture",
@@ -642,9 +633,6 @@ impl HistoryWorkSite {
             Self::ServerCompactionFixedContextClone => "runtime.server.compaction",
             Self::ServerToolPolicySchemaClone => "runtime.server.tool_policy",
             Self::ServerToolAdmissionSnapshotClone => "runtime.server.tool_admission_snapshot",
-            Self::ServerToolSchemaEstimationSerialization => {
-                "runtime.server.tool_schema_estimation"
-            }
             Self::DelegationContextClone
             | Self::DelegationRetryContextClone
             | Self::DelegationParentMessagesClone => "runtime.server.delegation",
@@ -738,9 +726,8 @@ impl HistoryWorkSite {
             | Self::CliForkFrozenToolSchemaClone
             | Self::CliForkPrefixSerialization
             | Self::CliForkToolSchemaSerialization
-            | Self::CliSlashForkCanonicalHistoryClone
-            | Self::CliSlashForkJournalHistoryClone
-            | Self::CliSlashForkRollbackSnapshot
+            | Self::CliSessionRestoreCanonicalHistoryClone
+            | Self::CliSessionRestoreJournalHistoryClone
             | Self::DelegationParentMessagesClone => 5,
             Self::RuntimeContextMaterialization
             | Self::PromptCacheHistoryScan
@@ -759,11 +746,10 @@ impl HistoryWorkSite {
             | Self::CliPromptNormalizationClone
             | Self::CliPromptPayloadClone
             | Self::CliSubrunPromptPayloadClone
-            | Self::BridgePipelineInputMaterialization
+            | Self::EphemeralPipelineInputMaterialization
             | Self::BridgeCompactionFixedContextClone
             | Self::ServerCompactionFixedContextClone
             | Self::ServerToolPolicySchemaClone
-            | Self::ServerToolSchemaEstimationSerialization
             | Self::MemoryExtractionPromptSanitization
             | Self::ToolSchemaCacheStabilizationClone
             | Self::ToolSchemaWireSortSerialization => 6,

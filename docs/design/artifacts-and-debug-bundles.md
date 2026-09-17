@@ -53,6 +53,13 @@ Requirements:
 
 Large or unsafe tool output should be stored as artifact and summarized through the tool result quality firewall.
 
+Artifact possession does not grant read authority. Stored result previews and
+compact projections retain the artifact identity without promising a callable
+reader. The shared request assembler derives bounded recovery guidance from
+the current direct/deferred tool surface and runtime restrictions. This guidance
+does not rewrite result bodies, widen child permissions, or replace semantic
+introspection and reflection. Native tool pagination retains its own contract.
+
 Artifact retention and reachability are separate facts:
 
 - retention policy defines when otherwise-unreachable content becomes eligible

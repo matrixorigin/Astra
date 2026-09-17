@@ -77,7 +77,42 @@ The projection should expose the specific reason and next action.
 
 Stream events are transport projections of durable or near-durable facts. They should carry enough information to repair UI state after reconnect.
 
+Tool terminal projections preserve execution facts independently of display
+previews. `executed` describes this call: `false` means no execution, `true`
+means execution occurred, and explicit `null` means execution cannot be
+confirmed. An absent field supplies no execution fact. A `reused` disposition
+can carry a receipt from an earlier execution without executing this call
+again. Live delivery, replay, and size-bounded projections preserve these
+distinctions. A shortened preview is not an authoritative receipt; control
+identities remain exact or are explicitly omitted, never shortened into a
+different identity.
+
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
+
+## Tool results and runtime guidance
+
+Tool result documents and runtime-authored guidance are distinct evidence.
+Recovery, quality, duplicate-observation, and pre-tool context annotations must
+not be appended to `ToolCallRecord.result_full`: doing so can turn complete JSON
+into an invalid document and break typed consumers or artifact recovery.
+
+The journal retains `runtime_advisories` beside the result. Canonical tool
+messages retain the same per-call guidance in `_astra_tool_result_advisories`,
+including across continuation and compression. Executor-provided metadata cannot
+author this reserved runtime field. Guidance is rendered only on disposable
+provider/display projections; projection consumes the internal marker exactly
+once and canonical-suffix checks use the same projection. Model-facing content
+may contain explanatory prose; the canonical result document remains unchanged.
+This adds no volatile singleton, global cache prefix, or separate replay state.
+
+Oversized guidance uses the same immutable artifact store and bounded
+`introspect(artifact, offset, max_bytes)` recovery as oversized output. Artifact
+identity includes the document kind: ordinary result and runtime guidance for
+the same run/call cannot overwrite one another. Ordinary result handles and
+paths are unchanged. Only result-kind descriptors can authorize `result_full`
+or result compaction. The journal retains `runtime_advisory_artifact` beside
+the bounded guidance preview; full guidance remains in that verified artifact,
+not in every future prompt or journal row.
 
 ## Resume and reconnect
 

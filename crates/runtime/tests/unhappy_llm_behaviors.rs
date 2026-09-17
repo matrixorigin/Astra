@@ -17,11 +17,9 @@
 //!   7. Runaway same-tool-call loop detection at exact window boundary.
 //!   8. Rate-limit cooldown blocks then releases after timeout (429 / 503).
 
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    CooldownReason, RateLimitAction, RateLimitCooldown,
-};
+use astra_turn_core::rate_limit_cooldown::{CooldownReason, RateLimitAction, RateLimitCooldown};
 use astra_turn_core::response_guard::{PROMPT_LEAK_FALLBACK, apply_response_guards};
-use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
+use astra_turn_core::stall::{SERVER_STALL_WINDOW, StallSignature, detect_server_stall};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -29,15 +27,17 @@ use std::collections::BTreeSet;
 
 fn tc(name: &str, args: Value) -> Value {
     json!({
-        "name": name,
-        "arguments": args,
+        "id": format!("call-{name}"),
+        "type": "function",
+        "function": {"name": name, "arguments": args},
     })
 }
 
 fn tc_str_args(name: &str, args: &str) -> Value {
     json!({
-        "name": name,
-        "arguments": args,
+        "id": format!("call-{name}"),
+        "type": "function",
+        "function": {"name": name, "arguments": args},
     })
 }
 
@@ -82,14 +82,17 @@ fn fabricated_tool_names_produce_warning_listing_unknown_tools() {
 fn malformed_json_args_flag_tool_even_when_name_is_valid() {
     let tool_calls = vec![
         tc_str_args("read_file", "{not json"),
-        tc_str_args("bash", "{}"), // valid empty
-        tc_str_args("grep", ""),   // empty string is fine
+        tc_str_args("bash", "{}"),
+        tc_str_args("grep", ""),
     ];
     let allowed = &["read_file", "bash", "grep"];
     let result = apply_response_guards("running tools now", &tool_calls, allowed, "help");
 
     assert!(result.replacement.is_none());
-    assert_eq!(result.quality.malformed_args, vec!["read_file".to_string()]);
+    assert_eq!(
+        result.quality.malformed_args,
+        vec!["read_file".to_string(), "grep".to_string()]
+    );
     assert!(result.quality.hallucinated_tools.is_empty());
 
     let warning = result.quality.to_warning().expect("warning expected");
@@ -191,8 +194,8 @@ fn repetition_loop_advisory_preserves_other_quality_signals() {
 
 #[test]
 fn stall_detector_requires_exactly_window_identical_rounds() {
-    let sig_a = BTreeSet::from(["bash:{\"cmd\":\"ls\"}".to_string()]);
-    let sig_b = BTreeSet::from(["bash:{\"cmd\":\"pwd\"}".to_string()]);
+    let sig_a = BTreeSet::from([StallSignature::new("bash", br#"{"cmd":"ls"}"#)]);
+    let sig_b = BTreeSet::from([StallSignature::new("bash", br#"{"cmd":"pwd"}"#)]);
 
     // Exactly window-1 identical rounds at the tail → not yet a stall.
     let mut history = vec![sig_b.clone()];

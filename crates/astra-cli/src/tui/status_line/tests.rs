@@ -688,8 +688,8 @@ fn bg_footer_keeps_fanout_detail_in_the_task_surface() {
 
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("2 local agents · Ctrl+G agents · Shift+↓ manage"),
-        "the footer should expose one compact task pill and its route; got {plain:?}"
+        plain.contains("2 local agents · Ctrl+T tasks"),
+        "the footer should expose one compact task pill and its primary route; got {plain:?}"
     );
     assert!(
         !plain.contains("review fanout")

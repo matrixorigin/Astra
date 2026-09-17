@@ -42,14 +42,16 @@
 //! `astra-turn-core/tests/fixtures/*_cache_probe.py` and must be run
 //! manually on behavior change — they cost money and can't gate CI.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 
 use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
 use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
 use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
-use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+use astra_turn_core::cache_placement::{
+    CacheCapability, CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy, VolatilePlacement,
+};
 use serde_json::{Value, json};
 
 const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
@@ -155,6 +157,7 @@ struct ProviderCase {
     provider: &'static str,
     model: &'static str,
     is_marker_isolated: bool,
+    cache_capability: Option<CacheCapability>,
 }
 
 /// The five provider shapes we need to keep honest.
@@ -168,42 +171,64 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
         provider: "anthropic",
         model: "claude-sonnet-4",
         is_marker_isolated: true,
+        cache_capability: None,
     },
     ProviderCase {
         label: "bedrock-claude",
         provider: "bedrock",
         model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         is_marker_isolated: true,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::BedrockCachePoint,
+            volatile_placement: VolatilePlacement::MarkerIsolated,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        }),
     },
     ProviderCase {
         label: "deepseek-anthropic",
         provider: "anthropic",
         model: "deepseek-v4-pro-anthropic",
         is_marker_isolated: true,
+        cache_capability: None,
     },
     ProviderCase {
         label: "openai-gpt",
         provider: "openai",
         model: "gpt-4o",
         is_marker_isolated: false,
+        cache_capability: None,
     },
     ProviderCase {
         label: "qwen-openai-compatible",
         provider: "openai",
         model: "qwen-max",
         is_marker_isolated: false,
+        cache_capability: None,
     },
     ProviderCase {
         label: "deepseek-v4-openai-compatible",
         provider: "openai",
         model: "deepseek-v4-pro",
         is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
     },
     ProviderCase {
         label: "minimax",
         provider: "openai",
         model: "MiniMax-M2.7",
         is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
     },
 ];
 
@@ -212,7 +237,7 @@ fn build_host_for(
     rounds: Vec<Value>,
     capture: Arc<Mutex<Vec<CapturedLlmRequest>>>,
 ) -> astra_runtime::server::server_loop_host::ServerAgenticLoopHost {
-    ServerAgenticLoopHostBuilder::new(
+    let builder = ServerAgenticLoopHostBuilder::new(
         mock_matrixone(),
         mock_encryptor(),
         "test-user".to_string(),
@@ -222,12 +247,15 @@ fn build_host_for(
     .with_edge_tools(sample_edge_tools())
     .with_test_llm_rounds(rounds)
     .with_llm_request_capture(capture)
-    .with_mock_provider(case.provider, case.model)
-    .build()
+    .with_mock_provider(case.provider, case.model);
+    match case.cache_capability {
+        Some(capability) => builder.with_mock_cache_capability(capability).build(),
+        None => builder.build(),
+    }
 }
 
 fn cache_capability_for(case: ProviderCase) -> CacheCapability {
-    CacheCapability::for_provider_and_model(case.provider, case.model)
+    CacheCapability::from_explicit_or_provider(case.cache_capability, case.provider)
 }
 
 /// Run a single "user → reply" turn through the mock host. Leaves
@@ -670,10 +698,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
             assert!(!text.contains("<runtime-context-after-tool>"));
         }
 
-        let suppresses_volatile = matches!(
-            cache_capability_for(case).volatile_placement,
-            VolatilePlacement::CurrentUserOnly
-        );
+        let suppresses_volatile = !cache_capability_for(case).should_inject_volatile_on_round(1);
         let r1_runtime_systems = messages_with_role(&r1.messages, "system");
         let r2_runtime_systems = messages_with_role(&r2.messages, "system");
         let r3_runtime_systems = messages_with_role(&r3.messages, "system");
@@ -743,7 +768,8 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         if matches!(
             cache_capability_for(case).volatile_placement,
             VolatilePlacement::TailSuffix
-        ) {
+        ) && !suppresses_volatile
+        {
             let r1_runtime = first_runtime_system_index(&r1.messages)
                 .expect("TailSuffix round 1 must contain runtime system context");
             let r2_runtime = first_runtime_system_index(&r2.messages)
@@ -762,6 +788,291 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn deepseek_required_settlement_keeps_stable_system_prefix() {
+    let case = PROVIDER_MATRIX
+        .iter()
+        .copied()
+        .find(|case| case.label == "deepseek-v4-openai-compatible")
+        .expect("deepseek matrix row");
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let mut host = build_host_for(
+        case,
+        vec![scripted_round("r1"), scripted_round("r2")],
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state.messages.extend([
+        json!({"role": "user", "content": "finish"}),
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "call_1", "content": "done"}),
+    ]);
+
+    let instructions = [
+        "Produce the final answer from the verified evidence.",
+        "Report unresolved outcomes alongside the verified evidence.",
+    ];
+    for revision in 1..=2 {
+        state.push_volatile_payload(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+            json!({
+                "schema": "completion_settlement.v2",
+                "revision": revision,
+                "mode": "text_only",
+                "instruction": instructions[revision - 1]
+            }),
+        );
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+        if revision == 1 {
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": "bounded reply"}));
+        }
+    }
+
+    let guard = capture.lock().unwrap();
+    assert_eq!(guard.len(), 2);
+    let first = &guard[0];
+    let second = &guard[1];
+    assert_eq!(
+        first.system_primary, second.system_primary,
+        "stable system input must stay byte-stable across settlement revisions"
+    );
+    assert_eq!(
+        first.provider_messages[0], second.provider_messages[0],
+        "leading provider system prefix must stay byte-stable when only settlement facts change"
+    );
+    assert!(flatten_content(&first.provider_messages[0]).contains("active_turn_focus_policy.v1"));
+    for instruction in instructions {
+        assert!(
+            !flatten_content(&first.provider_messages[0]).contains(instruction),
+            "boundary-specific instructions must not enter the stable system prefix"
+        );
+    }
+    for (revision, captured) in [(1, first), (2, second)] {
+        let internal_settlement_index = captured
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .get("__astra_runtime_volatile_kind")
+                    .and_then(Value::as_str)
+                    == Some("final_answer_settlement")
+            })
+            .expect("canonical settlement remains in the internal runtime tail");
+        assert_eq!(
+            captured.messages[internal_settlement_index]
+                .get("role")
+                .and_then(Value::as_str),
+            Some("system")
+        );
+        assert!(
+            captured.messages[..internal_settlement_index]
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+            "canonical settlement must follow the complete assistant/tool group"
+        );
+
+        let messages = &captured.provider_messages;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count(),
+            1,
+            "OpenAI-compatible projection must expose one leading system message"
+        );
+        let settlement_index = messages
+            .iter()
+            .position(|message| flatten_content(message).contains("completion_settlement.v2"))
+            .expect("required settlement remains provider-visible");
+        let settlement = &messages[settlement_index];
+        assert!(
+            messages[..settlement_index]
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")),
+            "provider facts must follow the complete assistant/tool group"
+        );
+        assert_eq!(settlement.get("role").and_then(Value::as_str), Some("user"));
+        let text = flatten_content(settlement);
+        assert!(text.contains("completion_settlement.v2"));
+        assert!(text.contains(&format!("\"revision\":{revision}")));
+        assert!(text.contains("boundary_instruction"));
+        assert_eq!(
+            text.matches(instructions[revision - 1]).count(),
+            1,
+            "provider facts must retain the active boundary instruction exactly once"
+        );
+        assert!(
+            !text.contains(instructions[2 - revision]),
+            "a settlement must not retain another revision's boundary instruction"
+        );
+        assert!(
+            settlement.get("__astra_runtime_system_context").is_none(),
+            "internal ownership marker must not reach the provider body"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn append_only_metadata_drives_two_round_provider_prefix_and_canonical_ownership() {
+    let case = ProviderCase {
+        label: "declared-append-only",
+        provider: "openai",
+        model: "deployment-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    };
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let mut host = build_host_for(
+        case,
+        vec![scripted_round("r1"), scripted_round("r2")],
+        capture.clone(),
+    );
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state
+        .messages
+        .push(json!({"role": "user", "content": "finish"}));
+
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 1}),
+    );
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let first_frame = state
+        .messages
+        .iter()
+        .find(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("final_answer_settlement")
+        })
+        .cloned()
+        .expect("first request must commit its append-only authority frame");
+    state.messages.extend([
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "observe-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }]
+        }),
+        json!({"role": "tool", "tool_call_id": "observe-1", "content": "observed"}),
+    ]);
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 2}),
+    );
+    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
+    let guard = capture.lock().unwrap();
+    assert_eq!(guard.len(), 2);
+    assert_eq!(guard[0].tools, guard[1].tools);
+    assert!(
+        guard[1]
+            .provider_messages
+            .starts_with(&guard[0].provider_messages),
+        "round 2 must strictly extend the exact round-1 provider messages"
+    );
+    assert!(guard[0].provider_messages.iter().all(|message| {
+        message
+            .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+            .is_none()
+    }));
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .filter(|message| astra_turn_types::is_human_user_message(message))
+            .count(),
+        1
+    );
+    assert!(state.messages.contains(&first_frame));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn provider_switch_replaces_live_authority_kind_without_leaking_frame_syntax() {
+    let append_case = ProviderCase {
+        label: "append-source",
+        provider: "openai",
+        model: "append-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        }),
+    };
+    let append_capture = Arc::new(Mutex::new(Vec::new()));
+    let mut append_host = build_host_for(append_case, vec![scripted_round("r1")], append_capture);
+    let mut state = make_test_loop_state();
+    state.max_turn_input_tokens = 200_000;
+    state
+        .messages
+        .push(json!({"role": "user", "content": "finish"}));
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 1}),
+    );
+    append_host
+        .run_one_mock_turn_for_test(&mut state)
+        .await
+        .unwrap();
+
+    let tail_case = ProviderCase {
+        label: "tail-destination",
+        provider: "openai",
+        model: "tail-alias",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        }),
+    };
+    let tail_capture = Arc::new(Mutex::new(Vec::new()));
+    let mut tail_host = build_host_for(tail_case, vec![scripted_round("r2")], tail_capture.clone());
+    state.push_volatile_payload(
+        astra_runtime::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+        json!({"schema": "completion_settlement.v2", "revision": 2}),
+    );
+    tail_host
+        .run_one_mock_turn_for_test(&mut state)
+        .await
+        .unwrap();
+
+    let guard = tail_capture.lock().unwrap();
+    let provider_messages = &guard[0].provider_messages;
+    let joined = provider_messages
+        .iter()
+        .map(flatten_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains("<runtime-authority-frame>"));
+    assert!(!joined.contains("\"revision\":1"));
+    assert_eq!(joined.matches("\"revision\":2").count(), 1);
 }
 
 // ── Invariant 5: trailing role=system messages don't claim the cache marker
@@ -851,10 +1162,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
     use astra_runtime::turn::agentic_loop::host::VolatileKind;
 
     for case in PROVIDER_MATRIX.iter().copied() {
-        let suppresses_volatile = matches!(
-            cache_capability_for(case).volatile_placement,
-            VolatilePlacement::CurrentUserOnly
-        );
+        let suppresses_volatile = !cache_capability_for(case).should_inject_volatile_on_round(1);
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
         let mut state = make_test_loop_state();
@@ -908,7 +1216,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
                 !runtime_text.contains("⚠ REFLECTION")
                     && !runtime_text.contains("✓ 2 tools executed")
                     && !runtime_text.contains("runtime behavior evidence"),
-                "[{label}] strict-history providers must suppress optional runtime context while retaining required context; got {runtime_text:?}",
+                "[{label}] required-only delivery must suppress every non-authoritative volatile class; got {runtime_text:?}",
                 label = case.label,
             );
         } else {
@@ -933,10 +1241,6 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 #[serial_test::serial(prompt_cache_env)]
 async fn matrix_runtime_injections_do_not_rewrite_history() {
     for case in PROVIDER_MATRIX.iter().copied() {
-        let suppresses_volatile = matches!(
-            cache_capability_for(case).volatile_placement,
-            VolatilePlacement::CurrentUserOnly
-        );
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
         let mut state = make_test_loop_state();
@@ -980,16 +1284,16 @@ async fn matrix_runtime_injections_do_not_rewrite_history() {
             .map(flatten_content)
             .collect::<Vec<_>>()
             .join("\n");
-        if suppresses_volatile {
+        if cache_capability_for(case).should_inject_volatile_on_round(1) {
             assert!(
-                !runtime_text.contains("runtime evidence: duplicate read"),
-                "[{label}] strict-history providers must suppress optional runtime evidence while retaining required context; got {runtime_text:?}",
+                runtime_text.contains("runtime evidence: duplicate read"),
+                "[{label}] enabled decision feedback must be delivered with system authority; got {runtime_text:?}",
                 label = case.label,
             );
         } else {
             assert!(
-                runtime_text.contains("runtime evidence: duplicate read"),
-                "[{label}] runtime evidence must be delivered with system authority; got {runtime_text:?}",
+                !runtime_text.contains("runtime evidence: duplicate read"),
+                "[{label}] required-only delivery must not leak optional decision feedback; got {runtime_text:?}",
                 label = case.label,
             );
         }

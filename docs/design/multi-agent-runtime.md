@@ -57,7 +57,17 @@ summary
 
 ## Safety
 
-Delegated agents do not inherit unlimited authority. Permission and provider scope must be explicit.
+Delegated agents do not inherit unlimited authority. Capabilities are bounded
+by the delegation request, parent authorization, provider availability, and
+runtime policy. In a wildcard `read_only` delegation, `read_only` blocks
+workspace mutation; it does not by itself block network reads whose canonical
+tool effects declare no workspace writes, credentials, process spawning, or
+external mutation. Those tools remain subject to the parent's enabled-tool
+constraints and the child's actual provider/runtime admission. When the parent
+has an explicit enabled-capability set, a child allowlist may include registered
+core tools or capabilities explicitly enabled by the parent; unknown names are
+rejected before dispatch. Dynamic capabilities must be present in that explicit
+parent set. A legacy unrestricted parent context retains its existing behavior.
 
 ## Result integration
 

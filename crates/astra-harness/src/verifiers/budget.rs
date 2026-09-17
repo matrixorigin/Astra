@@ -23,15 +23,21 @@ impl Verifier for BudgetVerifier {
         let snap = &record.snapshot;
         let mut violations = Vec::new();
 
-        if let Some(max) = self.max_turns
-            && snap.turns_used > max
-        {
-            violations.push(Violation {
-                severity: Severity::Fatal,
-                verifier: self.name().to_string(),
-                message: format!("turn budget exceeded: {} / {}", snap.turns_used, max),
-                recovery_threshold: None,
-            });
+        if let Some(max) = self.max_turns {
+            let effective_max = max.saturating_add(snap.settlement_rounds_reserved.unwrap_or(0));
+            if snap.turns_used > effective_max {
+                violations.push(Violation {
+                    severity: Severity::Fatal,
+                    verifier: self.name().to_string(),
+                    message: format!(
+                        "turn budget exceeded: {} / {}; settlement_allowance_unknown={}",
+                        snap.turns_used,
+                        max,
+                        snap.settlement_rounds_reserved.is_none()
+                    ),
+                    recovery_threshold: None,
+                });
+            }
         }
 
         if let Some(max) = self.max_tokens
@@ -108,6 +114,54 @@ mod tests {
         let violations = v.check(&record_with(11, 0, 0));
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].severity, Severity::Fatal);
+        assert!(violations[0].message.contains("turn budget"));
+    }
+
+    #[test]
+    fn unknown_settlement_allowance_does_not_relax_explicit_limit() {
+        let verifier = BudgetVerifier {
+            max_turns: Some(10),
+            max_tokens: None,
+            max_duration_millis: None,
+        };
+        let mut record = record_with(11, 0, 0);
+        record.snapshot.settlement_rounds_reserved = None;
+        let violations = verifier.check(&record);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].severity, Severity::Fatal);
+        assert!(
+            violations[0]
+                .message
+                .contains("settlement_allowance_unknown=true")
+        );
+    }
+
+    #[test]
+    fn reserved_settlement_round_is_allowed_without_raising_normal_limit() {
+        let v = BudgetVerifier {
+            max_turns: Some(10),
+            max_tokens: None,
+            max_duration_millis: None,
+        };
+        let mut record = record_with(11, 0, 0);
+        record.snapshot.settlement_rounds_reserved = Some(1);
+        assert!(v.check(&record).is_empty());
+    }
+
+    #[test]
+    fn settlement_allowance_is_bounded() {
+        let v = BudgetVerifier {
+            max_turns: Some(10),
+            max_tokens: None,
+            max_duration_millis: None,
+        };
+        let mut record = record_with(12, 0, 0);
+        record.snapshot.settlement_rounds_reserved = Some(2);
+        assert!(v.check(&record).is_empty());
+
+        record.snapshot.turns_used = 13;
+        let violations = v.check(&record);
+        assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("turn budget"));
     }
 

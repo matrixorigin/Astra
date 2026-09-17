@@ -1,13 +1,16 @@
 name: Static Checks
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main, develop, moi-dev]
+    branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -15,37 +18,145 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  check:
+  scope:
+    name: Determine static-check scope
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      sdk: ${{ steps.scope.outputs.sdk }}
+      web: ${{ steps.scope.outputs.web }}
+      harness: ${{ steps.scope.outputs.harness }}
+      script_contracts: ${{ steps.scope.outputs.script_contracts }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A PR merge commit plus both parents is enough for the path diff.
+          # Detection falls back to all scopes if a longer push range is absent.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        run: python3 scripts/ci/ci_scope.py
+
+  docker-dependencies:
+    name: Validate Docker dependency inputs
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # No registry credentials or publication: validate real COPY/.dockerignore
+      # behavior and full dependency resolution on the real builder's base stage.
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: dependency-inputs
+          push: false
+          cache-from: type=gha,scope=ci-docker-dependencies
+          cache-to: type=gha,scope=ci-docker-dependencies,mode=max
+
+  check:
+    # Preserve the existing required check name without serializing compilation.
+    needs: [scope, lint, docker-dependencies]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require static gates
+        shell: bash
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          DOCKER_RESULT: ${{ needs.docker-dependencies.result }}
+          DOCKER_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
+        run: |
+          set -euo pipefail
+          test "${LINT_RESULT}" = success
+          if [ "${DOCKER_REQUIRED}" = true ]; then
+            test "${DOCKER_RESULT}" = success
+          else
+            case "${DOCKER_RESULT}" in success|skipped) ;; *) exit 1 ;; esac
+          fi
+
+  lint:
+    needs: scope
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Validate repository metadata and documentation
+        run: python3 scripts/ci/validate_repository.py
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.25.5
+          cache: false
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Test CI contracts
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - name: Validate Terminal-Bench harness contracts
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.harness == 'true' }}
+        run: |
+          bash -n scripts/harness/local_gateway_contract.sh scripts/harness/test_local_gateway_contract.sh scripts/harness/run_terminal_bench_current.sh
+          python3 -m unittest \
+            scripts.harness.test_benchmark_model_seed \
+            scripts.harness.test_case_history \
+            scripts.harness.test_fresh_database_contract
+          bash scripts/harness/test_local_gateway_contract.sh
+      - name: Validate offline script contracts
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.script_contracts == 'true' }}
+        run: |
+          python3 -m unittest discover -s scripts/load -p 'test_*.py'
+          python3 scripts/schema/test_schema_inventory.py
+          python3 scripts/e2e/validate_capability_matrix.py
       - uses: ./.github/actions/rust-setup
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           shared-key: ci-check
           save-cache: ${{ github.event_name == 'push' }}
           install-nextest: false
       - name: Run clippy
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make lint
       - name: Check formatting
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make format-check
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           tool: cargo-audit@0.22.1
       - name: Fetch RustSec advisory DB
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: |
           rm -rf "$HOME/.cargo/advisory-db"
           git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
       - name: cargo audit (RustSec advisory DB)
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make audit
 
   sdk:
-    name: "@astra/sdk (typecheck, test+coverage, build)"
+    # Mergify reserves a leading '@' for GitHub-App-qualified check names.
+    # Keep this required check name literal and unambiguous for queue injection.
+    name: "Astra SDK (typecheck, test+coverage, build)"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.sdk == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: "20"
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: packages/sdk/package-lock.json
       - name: Install, typecheck, test with coverage gates, build
@@ -58,12 +169,17 @@ jobs:
 
   web:
     name: "web (typecheck, test, build)"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.web == 'true') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: "20"
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: |
             packages/sdk/package-lock.json

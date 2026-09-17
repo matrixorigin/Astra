@@ -65,16 +65,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_uses_invocation_approval_for_git_mutating_action() {
+    async fn preflight_uses_invocation_approval_for_built_in_write() {
         let result = approval_preflight_result(
             "session-1",
             Some(&DenyInvocationGate),
-            "git",
-            &json!({"action": "commit", "message": "ship"}),
+            "write_file",
+            &json!({"path": "file.txt", "content": "ship"}),
         )
         .await;
 
-        let result = result.expect("mutating git action must require approval");
+        let result = result.expect("built-in write must require approval");
         assert!(result.is_error);
         assert!(result.output.contains("blocked by test"));
         let metadata = result.metadata.expect("denial must be machine-readable");
@@ -84,12 +84,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_skips_invocation_approval_for_git_read_only_action() {
+    async fn preflight_skips_invocation_approval_for_built_in_read() {
         let result = approval_preflight_result(
             "session-1",
             Some(&DenyInvocationGate),
-            "git",
-            &json!({"action": "diff"}),
+            "read_file",
+            &json!({"path": "file.txt"}),
         )
         .await;
 

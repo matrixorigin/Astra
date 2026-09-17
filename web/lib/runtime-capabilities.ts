@@ -78,15 +78,3 @@ export function resolveWebAccessAvailability(
     'web access',
   );
 }
-
-export function resolveGitHubAccessAvailability(
-  snapshot: RuntimeCapabilitiesResponse | null,
-  workspace: WorkspaceSelection | null | undefined,
-): WebAccessAvailability {
-  return resolveOptionalToolAvailability(
-    snapshot,
-    workspace,
-    ['github'],
-    'GitHub access',
-  );
-}

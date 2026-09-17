@@ -27,11 +27,13 @@ members = [
     "crates/astra-mcp",
     "crates/astra-memoria",
 ]
+exclude = ["vendor/crossterm"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.4"
 edition = "2024"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
@@ -71,7 +73,7 @@ fs2 = "0.4"
 tar = "0.4"
 futures-util = "0.3.31"
 hmac = "0.12.1"
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream", "socks"] }
@@ -114,6 +116,7 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 ] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
+percent-encoding = "2.3"
 http-body-util = "0.1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -134,3 +137,7 @@ opt-level = 1
 
 [profile.release]
 strip = "symbols"
+
+# Local startup-query prototype; see vendor/crossterm/ASTRA-PATCH.md.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

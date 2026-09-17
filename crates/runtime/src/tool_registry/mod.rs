@@ -72,31 +72,29 @@ mod tests {
             .iter()
             .map(String::as_str)
             .collect();
-        // Runtime default catalog core — file, edit, search, git, memory,
-        // observation, and activation.
+        // Runtime default catalog core — file, edit, search, artifact recovery,
+        // persistent memory, and explicit deferred activation.
         assert!(always_load.contains(&"bash"));
         assert!(always_load.contains(&"read_file"));
         assert!(always_load.contains(&"str_replace"));
         assert!(always_load.contains(&"list_dir"));
-        assert!(
-            always_load.contains(&"memory"),
-            "consolidated memory tool must be always_load — intrinsic capability"
-        );
+        assert!(always_load.contains(&"memory"));
         assert!(
             always_load.contains(&"write_file"),
             "write_file completes the read/edit/write triad"
         );
+        assert!(always_load.contains(&"grep"));
         assert!(
-            always_load.contains(&"grep") && always_load.contains(&"glob"),
-            "grep/glob are near-universal for code navigation"
+            !always_load.contains(&"glob"),
+            "glob is a specialized navigation capability and must stay deferred"
         );
         assert!(
-            always_load.contains(&"git"),
-            "consolidated git tool must be always_load — git ops appear in most coding turns"
+            !always_load.contains(&"git"),
+            "the consolidated Git action union must remain deferred; shell covers ordinary inspection and explicit selection keeps its large schema out of the stable prefix"
         );
         assert!(
             always_load.contains(&"introspect") && always_load.contains(&"reflect"),
-            "observation tools must be always_load — recovery/debug entrypoints cannot require deferred discovery"
+            "the observation plane's introspect and reflect entrypoints must be eager"
         );
         assert!(
             !always_load.contains(&"web_fetch") && !always_load.contains(&"session"),
@@ -116,14 +114,12 @@ mod tests {
     // ── Tool surface contract ──
 
     #[test]
-    fn always_load_memory_always_available_for_recall() {
-        // memory is always_load so memory lifecycle cases always have it available
-        // without an activation round trip.
+    fn core_memory_operations_are_always_load() {
         assert!(
             surface::default_always_load_names()
                 .iter()
                 .any(|name| name == "memory"),
-            "memory must be always_load for reliable memory lifecycle"
+            "ordinary remember/recall must not require a probabilistic discovery round"
         );
     }
 
@@ -320,15 +316,15 @@ mod tests {
     fn measured_cost_uses_real_schema_size() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas.clone());
-        // The real cost should be based on the serialized schema, not the static catalog estimate.
+        // The real cost should be based on the serialized schema sent to the
+        // provider, not the static catalog estimate or an unprojected copy.
         let bash_cost = registry.token_cost("bash");
-        let bash_json = serde_json::to_string(
-            schemas
-                .iter()
-                .find(|schema| tool_schema_name(schema) == Some("bash"))
-                .unwrap(),
-        )
-        .unwrap();
+        let projected = registry.always_load_only();
+        let bash = projected
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .expect("bash should be resident in the mock surface");
+        let bash_json = serde_json::to_string(bash).unwrap();
         let expected = astra_turn_core::section_types::estimate_text_tokens(&bash_json);
         assert_eq!(
             bash_cost, expected,
@@ -352,6 +348,26 @@ mod tests {
         assert_eq!(
             registry.token_cost("unicode_tool"),
             astra_turn_core::section_types::estimate_text_tokens(&schema_json)
+        );
+    }
+
+    #[test]
+    fn resident_surface_cost_matches_projected_wire_schemas() {
+        let registry = ToolRegistry::new(astra_tools::schemas::all_tool_schemas());
+        let projected_cost: u32 = registry
+            .always_load_only()
+            .iter()
+            .map(|schema| {
+                astra_turn_core::section_types::estimate_text_tokens(
+                    &serde_json::to_string(schema).expect("schema serialization"),
+                )
+            })
+            .sum();
+
+        assert_eq!(
+            registry.total_always_load_token_cost(),
+            projected_cost,
+            "resident token accounting must describe the exact provider wire surface"
         );
     }
 

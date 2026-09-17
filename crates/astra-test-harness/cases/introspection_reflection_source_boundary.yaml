@@ -2,9 +2,10 @@ name: introspection_reflection_source_boundary
 description: |
   **What**: In one real session, inspect live execution state and then reflect on durable
   session evidence.
-  **Tests**: The agent can invoke both diagnostic tools, their calls are present in both the
-  CLI envelope and the persisted step-event trace, and the model is asked not to conflate a
-  fresh process snapshot with the session journal.
+  **Tests**: The agent can invoke both diagnostic tools, their calls are present in the
+  canonical durable turn journal even when a deferred tool is selected through the typed
+  discovery/dispatch path, and the model is asked not to conflate a fresh process snapshot
+  with the session journal.
   **Why**: `introspect` and `reflect` answer adjacent but different questions. Treating a
   process-local zero as a durable-session zero hides history and produces misleading diagnosis.
   **Pass means**: Both tools execute in order and their durable tool records are readable after
@@ -14,12 +15,13 @@ description: |
 prompt: |
   Do exactly two read-only diagnostic tool calls, in this order:
 
-  1. Call `introspect` with topic `execution`, facet `trace`, and depth `diagnostic`.
-  2. Call `reflect` with topic `execution`, facet `tools`, and depth `diagnostic`.
+  1. Call `introspect` once with facet `overview`, depth `diagnostic`, and horizon `recent`.
+  2. Call `reflect` once with facet `overview`, depth `diagnostic`, and horizon `session`.
 
   Then give a concise answer that explicitly distinguishes live-process evidence from
   durable-session evidence. Do not say their counts are identical unless the tool outputs
-  establish that. Do not call any other tool.
+  establish that. Necessary typed tool discovery is allowed to expose these two
+  diagnostics; do not perform any other diagnostic or task tool calls.
 capability: "custom:diagnostic_observability"
 difficulty: 4
 weight: 2.0
@@ -28,23 +30,77 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  - type: tool_sequence
+  - type: journal_tool_sequence
     tools: [introspect, reflect]
   - type: tools_count_between
     min: 2
-    max: 2
-  - type: journal_tool_called
+    max: 4
+  - type: journal_tool_call_count
     name: introspect
-  - type: journal_tool_called
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
     name: reflect
-  - type: session_event_count
-    event_type: ToolCallCompleted
-    min: 2
-  - type: judger
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 1
+    document: arguments
+    path: /facet
+    equals: overview
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 1
+    document: arguments
+    path: /depth
+    equals: diagnostic
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 1
+    document: arguments
+    path: /horizon
+    equals: recent
+  - type: journal_tool_call_count
+    name: reflect
+    min: 1
+    max: 1
+    document: arguments
+    path: /facet
+    equals: overview
+  - type: journal_tool_call_count
+    name: reflect
+    min: 1
+    max: 1
+    document: arguments
+    path: /depth
+    equals: diagnostic
+  - type: journal_tool_call_count
+    name: reflect
+    min: 1
+    max: 1
+    document: arguments
+    path: /horizon
+    equals: session
+  - type: journal_tool_outcome_count
+    name: introspect
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: reflect
+    ok: true
+    min: 1
+    max: 1
+  - type: hard_judger
     question: |
       Did the response accurately distinguish the scopes of the two diagnostics?
-      `introspect` is allowed to report only the current process/runtime, while `reflect`
+      `introspect` reports a recent live process/runtime projection, while `reflect`
       may inspect durable session artifacts. Score 1.0 only when the answer states that
-      distinction without inventing equivalence; 0.5 when it is vague but not misleading;
+      distinction without inventing equivalence. If the answer states a depth,
+      it must match the actual result; do not claim diagnostic for summary; 0.5 when it is vague but not misleading;
       0.0 when it asserts a false equivalence or fabricates evidence.
     threshold: 0.8

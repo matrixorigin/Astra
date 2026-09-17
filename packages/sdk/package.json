@@ -1,7 +1,27 @@
 {
   "name": "@astra/sdk",
-  "version": "0.1.0",
+  "version": "0.2.4",
+  "license": "Apache-2.0",
   "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
+  "homepage": "https://github.com/matrixorigin/Astra#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matrixorigin/Astra.git",
+    "directory": "packages/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/matrixorigin/Astra/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "ai-agent",
+    "enterprise-ai",
+    "llm",
+    "sdk",
+    "typescript"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -43,18 +63,19 @@
   },
   "overrides": {
     "esbuild": "^0.28.1",
-    "undici": "7.28.0"
+    "postcss": "^8.5.23",
+    "undici": "7.29.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",
-    "@testing-library/react": "^16.3.2",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^22.14.1",
-    "@types/react": "^19.0.12",
-    "@types/react-dom": "^19.2.3",
-    "@vitest/coverage-v8": "^4.1.8",
-    "jsdom": "^29.1.1",
-    "react": "^19.0.0",
-    "react-dom": "^19.2.5",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitest/coverage-v8": "^4.1.11",
+    "jsdom": "^30.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "tsup": "^8.4.0",
     "typescript": "^5.8.3",
     "vitest": "^4.1.8"

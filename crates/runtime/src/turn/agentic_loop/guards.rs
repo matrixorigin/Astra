@@ -15,16 +15,13 @@
 //! 4. Remove the corresponding inline block from
 //!    `execute_turn_and_ingest_phase`.
 
+use std::collections::HashSet;
+
 use super::execution_phase::{
     cache_waste_advisory_message, cache_wasteful_tools, parallel_batching_advisory_message,
-    redundant_reads_advisory_message, should_emit_cache_waste_advisory,
-    should_emit_parallel_batching_advisory,
+    should_emit_cache_waste_advisory, should_emit_parallel_batching_advisory,
 };
 use super::host::{AgenticLoopState, VolatileKind};
-use astra_turn_core::evaluation::{
-    OnlineProgressDecision, OnlineProgressPolicy, OnlineProgressSignals,
-    count_redundant_overlapping_reads, decide_online_progress,
-};
 use astra_turn_core::headless::body_preview::HeadlessStderrStyle;
 
 // ── Pipeline types ─────────────────────────────────────────────────────
@@ -47,7 +44,6 @@ pub(crate) enum GuardOutcome {
 #[derive(Clone)]
 pub(crate) struct GuardConfig {
     pub parallel_batching_force_streak: usize,
-    pub redundant_reads_threshold: usize,
     pub cache_waste_threshold: usize,
 }
 
@@ -60,13 +56,178 @@ type GuardFn = fn(&mut AgenticLoopState, &GuardConfig) -> GuardOutcome;
 /// (e.g. redundant_reads defers to round_budget_phase1).
 pub(crate) fn default_guards() -> Vec<(&'static str, GuardFn)> {
     vec![
+        ("observation_reuse", check_observation_reuse),
+        ("work_evidence_sufficiency", check_work_evidence_sufficiency),
         (
             "parallel_batching_advisory",
             check_parallel_batching_advisory,
         ),
-        ("redundant_reads", check_redundant_reads),
         ("cache_waste", check_cache_waste),
     ]
+}
+
+/// A normalized, typed identity for a self-diagnosis request.  This is
+/// deliberately separate from the provider's raw JSON/signature: aliases and
+/// omitted defaults that resolve to the same observation are one request, but
+/// different facets, horizons, sources, or questions remain distinct.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ObservationRequestKey {
+    Introspect {
+        topic: String,
+        facet: String,
+        depth: String,
+        horizon: String,
+        source_policy: String,
+        include_context: bool,
+        format_json: bool,
+        run_id: Option<String>,
+    },
+    Reflect {
+        topic: String,
+        facet: String,
+        depth: String,
+        horizon: String,
+        source_policy: String,
+        include_context: bool,
+        last_n: i32,
+        question: String,
+    },
+}
+
+impl ObservationRequestKey {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Introspect { .. } => "introspect",
+            Self::Reflect { .. } => "reflect",
+        }
+    }
+}
+
+/// Parse only the canonical request fields that the observation tools
+/// themselves use.  Failed, rejected, artifact-recovery, and unknown calls
+/// are not classified; a self-diagnosis guard must never infer intent from
+/// display text or a truncated argument preview.
+fn observation_request_key(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> Option<ObservationRequestKey> {
+    if !record.ok || !record.was_executed() {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(record.authoritative_args_full()?).ok()?;
+    match record.name.as_str() {
+        "introspect" if args.get("artifact").is_none() => {
+            let request = astra_turn_core::introspect::IntrospectRequest::from_args(&args);
+            let run_id = args
+                .get("_run_id")
+                .or_else(|| args.get("run_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            Some(ObservationRequestKey::Introspect {
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                depth: request.depth.as_str().to_string(),
+                horizon: request.horizon.as_str().to_string(),
+                source_policy: request.source_policy.as_str().to_string(),
+                include_context: request.include_context,
+                format_json: request.format.is_json(),
+                run_id,
+            })
+        }
+        "reflect" => {
+            let text_arg = |name: &str| {
+                args.get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            };
+            let include_context = args
+                .get("include_context")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let last_n = args
+                .get("last_n")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(20)
+                .clamp(1, 100) as i32;
+            let request =
+                astra_services::reflect::ReflectRequest::from_observation_params_with_source(
+                    text_arg("topic"),
+                    text_arg("facet"),
+                    text_arg("depth"),
+                    text_arg("horizon"),
+                    text_arg("source_policy"),
+                    include_context,
+                    last_n,
+                    args.get("question")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                );
+            Some(ObservationRequestKey::Reflect {
+                topic: request.topic.as_str().to_string(),
+                facet: request.facet.as_str().to_string(),
+                depth: request.depth.as_str().to_string(),
+                horizon: request.horizon.as_str().to_string(),
+                source_policy: request.source_policy.as_str().to_string(),
+                include_context: request.include_context,
+                last_n: request.last_n,
+                question: request.question,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Find duplicate observation requests in the contiguous tail of successful
+/// observation calls.  Any intervening tool call is a state-transition
+/// boundary and makes a fresh observation potentially meaningful.  The scan is
+/// bounded because this is a pre-provider hot-path guard.
+fn repeated_observation_request(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Option<ObservationRequestKey> {
+    const MAX_OBSERVATION_TAIL: usize = 8;
+    let mut seen = HashSet::new();
+    for record in records.iter().rev().take(MAX_OBSERVATION_TAIL) {
+        let Some(key) = observation_request_key(record) else {
+            break;
+        };
+        if !seen.insert(key.clone()) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+fn check_observation_reuse(state: &mut AgenticLoopState, _cfg: &GuardConfig) -> GuardOutcome {
+    if state.stall.observation_reuse_advisory_emitted || state.stall.any_behavior_advisory_emitted()
+    {
+        return GuardOutcome::Pass;
+    }
+    let records = state
+        .stall
+        .tool_call_records
+        .get(state.stall.observation_reuse_record_floor..)
+        .unwrap_or_default();
+    let Some(request) = repeated_observation_request(records) else {
+        return GuardOutcome::Pass;
+    };
+
+    state.stall.observation_reuse_advisory_emitted = true;
+    tracing::info!(
+        target: "astra::loop_guard",
+        tool = request.label(),
+        round = state.llm_rounds_completed,
+        "typed observation reuse advisory observed"
+    );
+    GuardOutcome::Advisory {
+        message: format!(
+            "Observation reuse: the same typed {} request already succeeded without an intervening tool state transition; reuse its evidence or choose one explicitly missing facet. This is advisory only.",
+            request.label()
+        ),
+        kind: VolatileKind::BehaviorAdvisory,
+        hint: None,
+    }
 }
 
 /// Run all registered guards. Model-facing advisory evidence is independent
@@ -106,6 +267,84 @@ pub(crate) fn evaluate_guards(
 // Individual guard implementations
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Number of successful, non-mutating tool executions inside one owned
+/// WorkItem after which the model should explicitly reassess whether its typed
+/// expected result is already supported. The threshold is deliberately above
+/// the ordinary small investigation path and never removes tool authority.
+const WORK_EVIDENCE_REASSESS_CALLS: usize = astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD;
+
+/// Count the current WorkItem's evidence path using only typed execution
+/// records. The reverse scan is strictly bounded, stops at canonical Work
+/// lifecycle boundaries, and declines to classify a path that has mutated the
+/// workspace. That keeps this hot-loop check O(1) per model boundary and avoids
+/// prompt-text or scenario matching.
+fn bounded_read_only_work_evidence_calls(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Option<usize> {
+    let mut successful = 0_usize;
+    for record in records
+        .iter()
+        .rev()
+        .take(WORK_EVIDENCE_REASSESS_CALLS.saturating_mul(2))
+    {
+        if matches!(
+            record.name.as_str(),
+            "start_work" | "run_next_work_item" | "settle_work_item"
+        ) {
+            break;
+        }
+        if !record.was_executed() {
+            continue;
+        }
+        if super::lifecycle::tool_record_is_workspace_mutation(record) {
+            return None;
+        }
+        if record.ok {
+            successful = successful.saturating_add(1);
+            if successful >= WORK_EVIDENCE_REASSESS_CALLS {
+                return Some(successful);
+            }
+        }
+    }
+    Some(successful)
+}
+
+fn check_work_evidence_sufficiency(
+    state: &mut AgenticLoopState,
+    _cfg: &GuardConfig,
+) -> GuardOutcome {
+    if state.stall.any_behavior_advisory_emitted()
+        || state
+            .runtime_tool_executor
+            .as_deref()
+            .is_none_or(|executor| !executor.has_active_primary_work_attempt())
+    {
+        return GuardOutcome::Pass;
+    }
+    let Some(calls) = bounded_read_only_work_evidence_calls(&state.stall.tool_call_records) else {
+        return GuardOutcome::Pass;
+    };
+    if calls < WORK_EVIDENCE_REASSESS_CALLS {
+        return GuardOutcome::Pass;
+    }
+
+    state.stall.work_evidence_advisory_emitted = true;
+    tracing::info!(
+        target: "astra::loop_guard",
+        calls,
+        round = state.llm_rounds_completed,
+        "owned WorkItem evidence-sufficiency advisory observed"
+    );
+    GuardOutcome::Advisory {
+        // Keep decision feedback compact: CurrentUserOnly providers place it
+        // on the uncached tail for one request. The count remains in tracing;
+        // the model needs only the decision boundary on wire.
+        message: "Owned WorkItem: settle_work_item if expected_result is supported; otherwise pursue one specific missing fact.".to_string(),
+        kind: VolatileKind::BehaviorAdvisory,
+        hint: None,
+    }
+}
+
 /// Surface batching evidence when the model has produced a long streak of
 /// single-tool rounds despite prompt-layer guidance. Catches the
 /// "exploratory churn" failure mode (sessions 6566d6a8, bbae8641, 6da9cf8f).
@@ -135,49 +374,161 @@ fn check_parallel_batching_advisory(
     }
 }
 
-/// Detect redundant read-only tool calls (repeated `read_file`/`grep` on
-/// the same paths without intervening edits) and surface advisory evidence.
-///
-/// Defers when a stronger intervention is already active for this round
-/// (budget phase-1, completion soft-stop, exploration-family phase-2) so we
-/// don't stack two advisory messages on top of each other.
-fn check_redundant_reads(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
-    let count = count_redundant_overlapping_reads(&state.stall.tool_call_records);
-    let decision = decide_online_progress(
-        OnlineProgressSignals {
-            tool_calls: state.stall.tool_call_records.len(),
-            redundant_overlapping_reads: count,
-            stronger_advisory_emitted: state.stall.stronger_advisory_emitted(),
-            advisory_already_emitted: state.stall.redundant_reads_advisory_emitted,
-        },
-        OnlineProgressPolicy {
-            redundant_overlapping_reads_threshold: cfg.redundant_reads_threshold,
-            ..OnlineProgressPolicy::default()
-        },
-    );
-    let OnlineProgressDecision::ReuseKnownContext {
-        redundant_overlapping_reads: count,
-    } = decision
-    else {
-        return GuardOutcome::Pass;
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::session_journal::ToolCallRecord;
 
-    state.stall.redundant_reads_advisory_emitted = true;
-    let msg = redundant_reads_advisory_message(count, &state.message);
-    tracing::warn!(
-        target: "astra::loop_guard",
-        tier = "redundant_reads_advisory",
-        count = count,
-        threshold = cfg.redundant_reads_threshold,
-        round = state.llm_rounds_completed,
-        "behavior advisory observed"
-    );
-    GuardOutcome::Advisory {
-        message: msg,
-        kind: VolatileKind::BehaviorAdvisory,
-        hint: Some(format!(
-            "↻ {count} redundant overlapping reads; nudging model to use existing context…"
-        )),
+    fn successful(name: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ..Default::default()
+        }
+    }
+
+    fn successful_observation(name: &str, args: serde_json::Value) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            args_full: Some(args.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn work_evidence_counter_is_bounded_to_current_lifecycle_item() {
+        let mut records = (0..20).map(|_| successful("read_file")).collect::<Vec<_>>();
+        records.push(successful("settle_work_item"));
+        records.extend((0..3).map(|_| successful("grep")));
+
+        assert_eq!(bounded_read_only_work_evidence_calls(&records), Some(3));
+    }
+
+    #[test]
+    fn work_evidence_counter_reaches_threshold_without_text_classification() {
+        let records = (0..WORK_EVIDENCE_REASSESS_CALLS)
+            .map(|index| successful(if index % 2 == 0 { "grep" } else { "read_file" }))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            bounded_read_only_work_evidence_calls(&records),
+            Some(WORK_EVIDENCE_REASSESS_CALLS)
+        );
+    }
+
+    #[test]
+    fn work_evidence_counter_defers_to_mutating_execution_paths() {
+        let mut records = (0..WORK_EVIDENCE_REASSESS_CALLS)
+            .map(|_| successful("read_file"))
+            .collect::<Vec<_>>();
+        records.push(ToolCallRecord {
+            name: "apply_patch".to_string(),
+            ok: true,
+            args_full: Some(r#"{"patch":"*** Begin Patch"}"#.to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(bounded_read_only_work_evidence_calls(&records), None);
+    }
+
+    #[test]
+    fn observation_reuse_normalizes_typed_defaults_and_aliases() {
+        let records = vec![
+            successful_observation(
+                "introspect",
+                serde_json::json!({"topic": "runtime", "facet": "session"}),
+            ),
+            successful_observation("introspect", serde_json::json!({})),
+        ];
+
+        assert!(matches!(
+            repeated_observation_request(&records),
+            Some(ObservationRequestKey::Introspect { .. })
+        ));
+    }
+
+    #[test]
+    fn observation_reuse_stops_at_a_tool_state_transition() {
+        let records = vec![
+            successful_observation("introspect", serde_json::json!({})),
+            successful("read_file"),
+            successful_observation("introspect", serde_json::json!({})),
+        ];
+
+        assert_eq!(repeated_observation_request(&records), None);
+    }
+
+    #[test]
+    fn observation_reuse_keeps_distinct_facets_and_reflection_questions() {
+        let records = vec![
+            successful_observation("introspect", serde_json::json!({"facet": "errors"})),
+            successful_observation("introspect", serde_json::json!({"facet": "recent"})),
+            successful_observation(
+                "reflect",
+                serde_json::json!({"facet": "errors", "question": "what changed?"}),
+            ),
+        ];
+
+        assert_eq!(repeated_observation_request(&records), None);
+    }
+
+    #[test]
+    fn observation_artifact_recovery_is_not_a_diagnostic_reuse() {
+        let records = vec![
+            successful_observation("introspect", serde_json::json!({"artifact": "artifact-1"})),
+            successful_observation("introspect", serde_json::json!({"artifact": "artifact-1"})),
+        ];
+
+        assert_eq!(repeated_observation_request(&records), None);
+    }
+
+    #[test]
+    fn observation_reuse_is_one_shot_advisory_not_tool_restriction() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.stall.tool_call_records = vec![
+            successful_observation("introspect", serde_json::json!({})),
+            successful_observation("introspect", serde_json::json!({})),
+        ];
+        state.restricted_tools.insert("bash".to_string());
+        let cfg = GuardConfig {
+            parallel_batching_force_streak: 8,
+            cache_waste_threshold: 3,
+        };
+
+        assert!(matches!(
+            check_observation_reuse(&mut state, &cfg),
+            GuardOutcome::Advisory { .. }
+        ));
+        assert!(state.stall.observation_reuse_advisory_emitted);
+        assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
+        assert!(matches!(
+            check_observation_reuse(&mut state, &cfg),
+            GuardOutcome::Pass
+        ));
+    }
+
+    #[test]
+    fn observation_reuse_does_not_cross_a_user_turn_boundary() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.stall.tool_call_records = vec![
+            successful_observation("introspect", serde_json::json!({})),
+            successful_observation("introspect", serde_json::json!({})),
+        ];
+        let cfg = GuardConfig {
+            parallel_batching_force_streak: 8,
+            cache_waste_threshold: 3,
+        };
+        assert!(matches!(
+            check_observation_reuse(&mut state, &cfg),
+            GuardOutcome::Advisory { .. }
+        ));
+
+        state.stall.begin_fresh_user_turn();
+        assert!(matches!(
+            check_observation_reuse(&mut state, &cfg),
+            GuardOutcome::Pass
+        ));
     }
 }
 
@@ -187,9 +538,7 @@ fn check_redundant_reads(state: &mut AgenticLoopState, cfg: &GuardConfig) -> Gua
 /// Defers to redundant_reads when both would fire on the same round, and
 /// to the same stronger interventions as `check_redundant_reads`.
 fn check_cache_waste(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
-    if state.stall.stronger_advisory_emitted()
-        || state.stall.redundant_reads_advisory_emitted
-        || state.stall.cache_waste_advisory_emitted
+    if state.stall.cache_waste_advisory_emitted
         || !should_emit_cache_waste_advisory(state, cfg.cache_waste_threshold)
     {
         return GuardOutcome::Pass;

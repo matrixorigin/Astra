@@ -1,16 +1,17 @@
 # Monitoring Stack
 
-Prometheus + Grafana monitoring for astra.
+Prometheus + Grafana monitoring for Astra.
 
 ## Quick Start
 
 ```bash
-# Start monitoring stack
-docker-compose up -d
+cp .env.example .env
+# Set GRAFANA_ADMIN_PASSWORD in .env to a strong, unique value.
+docker compose up -d
 
 # Access services
 open http://localhost:9091  # Prometheus
-open http://localhost:3000  # Grafana (admin/admin)
+open http://localhost:3000  # Grafana
 ```
 
 ## Components
@@ -18,29 +19,35 @@ open http://localhost:3000  # Grafana (admin/admin)
 ### Prometheus
 
 - **Port**: 9091
+- **Default bind address**: `127.0.0.1`
 - **Config**: `prometheus.yml`
 - **Data**: Stored in `prometheus-data` volume
 
 **Metrics collected:**
-- API request rate and latency
-- Database connection pool
-- LLM request metrics
-- System metrics (CPU, memory, disk)
+
+- Astra runtime capacity and admission
+- run control, durable event ingestion, and Edge dispatch health
+- LLM provider admission and rate-limit state
+- host CPU, memory, disk, and network metrics through Node Exporter
+
+Prometheus loads the repository's `monitoring/alert-rules.yml` automatically.
+Those rules use metric names exported by Astra's `/metrics` endpoint.
 
 ### Grafana
 
 - **Port**: 3000
-- **Default credentials**: admin/admin
+- **Default bind address**: `127.0.0.1`
+- **Credentials**: `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`
 - **Dashboards**: Pre-configured in `dashboards/`
 
 **Available dashboards:**
-- API Overview
-- Database Performance
-- System Metrics
+
+- Model & Prompt Overview
+- Runtime Capacity
 
 ### Node Exporter
 
-- **Port**: 9100
+- **Network access**: internal to the monitoring Compose network
 - **Metrics**: System-level metrics (CPU, memory, disk, network)
 
 ## Configuration
@@ -66,37 +73,17 @@ scrape_configs:
 
 ## Metrics Reference
 
-### API Metrics
+### Runtime Metrics
 
 ```promql
-# Request rate
-rate(http_requests_total[5m])
+# Run admission rate
+rate(astra_run_admission_attempts_total[5m])
 
-# Response time (p95)
-histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+# Event ingestion errors
+rate(astra_event_ingestion_errors_total[5m])
 
-# Error rate
-rate(http_requests_total{status=~"5.."}[5m])
-```
-
-### Database Metrics
-
-```promql
-# Active connections
-db_connections_active
-
-# Query duration
-rate(db_query_duration_seconds_sum[5m]) / rate(db_query_duration_seconds_count[5m])
-```
-
-### LLM Metrics
-
-```promql
-# LLM request rate
-rate(llm_requests_total[5m])
-
-# LLM cost
-rate(llm_cost_total[5m])
+# Edge dispatch backlog
+astra_edge_dispatch_pending_rows
 ```
 
 ## Alerting
@@ -132,32 +119,9 @@ alertmanager:
     - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
 ```
 
-### Create Alert Rules
-
-Create `alerts.yml`:
-
-```yaml
-groups:
-  - name: astra
-    rules:
-      - alert: HighErrorRate
-        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected"
-          description: "Error rate is {{ $value }} (threshold: 0.05)"
-
-      - alert: HighResponseTime
-        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High response time"
-          description: "P95 response time is {{ $value }}s"
-```
+The bundled alert rules are evaluated by Prometheus. To route notifications,
+add Alertmanager and configure Prometheus with its endpoint; Prometheus alone
+records alert state but does not send notifications.
 
 ## Troubleshooting
 
@@ -175,7 +139,7 @@ curl http://localhost:17001/metrics
 
 ```bash
 # Check Grafana logs
-docker logs grafana
+docker compose logs grafana
 
 # Verify datasource connection
 # Grafana → Configuration → Data Sources → Prometheus → Test
@@ -188,7 +152,7 @@ docker logs grafana
 --storage.tsdb.retention.time=7d
 
 # Or limit memory
-docker-compose up -d --scale prometheus=1 --memory=2g
+docker compose up -d --scale prometheus=1 --memory=2g
 ```
 
 ## Production Recommendations
@@ -197,7 +161,8 @@ docker-compose up -d --scale prometheus=1 --memory=2g
 2. **Backup**: Regularly backup Prometheus data
 3. **Retention**: Set appropriate retention period (default: 15d)
 4. **Alerting**: Configure Alertmanager for critical alerts
-5. **Security**: Enable authentication and HTTPS
+5. **Security**: Keep the default loopback bindings, or place Prometheus and
+   Grafana behind an authenticated HTTPS reverse proxy before exposing them
 6. **High Availability**: Run multiple Prometheus instances
 
 ## See Also

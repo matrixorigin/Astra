@@ -449,6 +449,7 @@ async fn try_edge_websocket(
                 tool: &request.tool_name,
                 args: &request.args,
                 runtime_process_authorization: plan.runtime_process_authorization(),
+                timeout_secs: plan.execution_timeout_secs(),
                 cancel_token,
             },
         )
@@ -741,21 +742,19 @@ fn delivered_dispatch_result(
     result_json: &str,
     transport: ToolTransportKind,
 ) -> EdgeTransportAttempt {
-    let parsed_result =
-        serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json).ok();
-    let tool_result_fields = parsed_result
-        .as_ref()
-        .and_then(|request| request.tool_result_fields.clone());
-    let (output, is_error) = parsed_result
-        .map(|request| {
-            (
-                request.output,
-                matches!(request.status.as_str(), "error" | "failed"),
-            )
-        })
-        .unwrap_or_else(|| {
-            astra_thin_client::ToolResultRequest::parse_output_and_error(result_json)
-        });
+    let (output, is_error, tool_result_fields) =
+        match serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json) {
+            Ok(request) => {
+                let is_error =
+                    astra_thin_client::tool_result_status_is_error(&request.status).unwrap_or(true);
+                (request.output, is_error, request.tool_result_fields)
+            }
+            Err(error) => (
+                format!("Error: invalid durable Edge tool result protocol: {error}"),
+                true,
+                None,
+            ),
+        };
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         output,
         is_error,

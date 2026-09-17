@@ -4,7 +4,7 @@ use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
 
 pub(crate) struct TurnLearningSnapshot {
-    pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
+    pub eval: astra_turn_core::evaluation::TurnEvaluation,
 }
 
 pub(crate) fn analyze_chat_turn_learning(
@@ -13,9 +13,8 @@ pub(crate) fn analyze_chat_turn_learning(
     recent_tools: &[String],
     result: &StreamResult,
 ) -> TurnLearningSnapshot {
-    use astra_runtime::pipeline::evaluation::{
-        TurnEvaluationTelemetry, current_evaluation_thresholds,
-        evaluate_tool_call_records_with_thresholds_and_telemetry,
+    use astra_turn_core::evaluation::{
+        TurnEvaluationTelemetry, evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
     let latest_user_input = result.latest_user_input(line);
 
@@ -38,14 +37,23 @@ pub(crate) fn analyze_chat_turn_learning(
         if source != Some("agentic_loop") {
             continue;
         }
-        let Some(tokens_in) = event.tokens_in else {
+        let Some(fresh_input_tokens) = event.tokens_in else {
             continue;
         };
-        first_round_prompt_tokens.get_or_insert(tokens_in);
+        // Context-growth diagnostics measure logical prompt size, while the
+        // journal keeps fresh/cache lanes separate for cost accounting. A
+        // cache miss must not look like a sudden context balloon.
+        let logical_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
+            fresh_input_tokens,
+            event.cache_read_tokens.unwrap_or(0),
+            event.cache_creation_tokens.unwrap_or(0),
+        )
+        .total_input_tokens();
+        first_round_prompt_tokens.get_or_insert(logical_prompt_tokens);
         max_round_prompt_tokens = Some(
             max_round_prompt_tokens
-                .map(|current| current.max(tokens_in))
-                .unwrap_or(tokens_in),
+                .map(|current| current.max(logical_prompt_tokens))
+                .unwrap_or(logical_prompt_tokens),
         );
     }
 
@@ -56,7 +64,7 @@ pub(crate) fn analyze_chat_turn_learning(
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
-        current_evaluation_thresholds(),
+        astra_runtime::turn::runtime_policy::configured_evaluation_thresholds(),
         TurnEvaluationTelemetry {
             llm_rounds: result.llm_rounds,
             prompt_tokens: Some(result.prompt_tokens),
@@ -69,19 +77,21 @@ pub(crate) fn analyze_chat_turn_learning(
 
 pub(crate) fn turn_quality_feedback_from_eval(
     turn: u32,
-    eval: &astra_runtime::pipeline::evaluation::TurnEvaluation,
+    eval: &astra_turn_core::evaluation::TurnEvaluation,
 ) -> Option<astra_runtime::self_model::TurnQualityFeedback> {
-    use astra_runtime::pipeline::evaluation::EvalSignal;
+    use astra_turn_core::evaluation::EvalSignal;
     use std::collections::BTreeSet;
 
     let mut findings = Vec::new();
     let mut repeated_tools = BTreeSet::new();
+    let mut saw_repeat_issue = false;
     let mut saw_batching_issue = false;
     let mut saw_stall_issue = false;
 
     for signal in &eval.signals {
         match signal {
             EvalSignal::RepeatToolCall(tool) => {
+                saw_repeat_issue = true;
                 repeated_tools.insert(tool.clone());
             }
             EvalSignal::StallDetected => {
@@ -131,11 +141,7 @@ pub(crate) fn turn_quality_feedback_from_eval(
         return None;
     }
 
-    let recommended_action = match (
-        saw_batching_issue,
-        findings.iter().any(|f| f.contains("Repeated tool calls")),
-        saw_stall_issue,
-    ) {
+    let recommended_action = match (saw_batching_issue, saw_repeat_issue, saw_stall_issue) {
         (true, true, true) => {
             "Batch independent reads/searches, reuse previous tool output before repeating calls, then choose one concrete recovery action."
         }
@@ -167,7 +173,7 @@ mod tests {
     use astra_services::session_journal;
 
     #[test]
-    fn analyze_chat_turn_learning_flags_llm_round_churn() {
+    fn analyze_chat_turn_learning_does_not_infer_churn_from_cost_facts_alone() {
         let llm_round_event = |round: u32, tokens_in: u64| {
             let mut event = session_journal::JournalEvent::base_public(
                 session_journal::JournalEventType::LlmRound,
@@ -204,16 +210,17 @@ mod tests {
         }];
 
         let learning = analyze_chat_turn_learning("review local changes", 2, &[], &result);
+        assert!(
+            !learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_turn_core::evaluation::EvalSignal::LlmRoundChurn { .. }
+            )),
+            "round count and prompt growth alone are not proof of low-yield work: {:?}",
+            learning.eval.signals
+        );
         assert!(learning.eval.signals.iter().any(|signal| matches!(
             signal,
-            astra_runtime::pipeline::evaluation::EvalSignal::LlmRoundChurn {
-                rounds: 9,
-                prompt_tokens: 136_947,
-            }
-        )));
-        assert!(learning.eval.signals.iter().any(|signal| matches!(
-            signal,
-            astra_runtime::pipeline::evaluation::EvalSignal::PromptGrowthChurn {
+            astra_turn_core::evaluation::EvalSignal::PromptGrowthChurn {
                 first_prompt_tokens: 9_401,
                 max_prompt_tokens: 20_954,
                 delta_tokens: 11_553,
@@ -222,10 +229,41 @@ mod tests {
     }
 
     #[test]
-    fn turn_quality_feedback_mentions_batching_repeats_and_stalls() {
-        use astra_runtime::pipeline::evaluation::{
-            EvalSignal, EvaluationThresholds, TurnEvaluation,
+    fn analyze_chat_turn_learning_does_not_mistake_cache_eviction_for_context_growth() {
+        let llm_round_event = |round: u32, fresh_input: u64, cache_read: u64| {
+            let mut event = session_journal::JournalEvent::base_public(
+                session_journal::JournalEventType::LlmRound,
+                Some("sess-1"),
+            );
+            event.turn = Some(1);
+            event.round = Some(round);
+            event.tokens_in = Some(fresh_input);
+            event.cache_read_tokens = Some(cache_read);
+            event.metadata = Some(serde_json::json!({"source": "agentic_loop"}));
+            event
         };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.llm_rounds = Some(4);
+        result.turn_observability_events = vec![
+            // Same logical prompt, served from different cache lanes.
+            llm_round_event(0, 6_524, 25_856),
+            llm_round_event(3, 33_904, 0),
+        ];
+
+        let learning = analyze_chat_turn_learning("continue", 1, &[], &result);
+        assert!(
+            !learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_turn_core::evaluation::EvalSignal::PromptGrowthChurn { .. }
+            )),
+            "a cache-lane transition is cost evidence, not context ballooning: {:?}",
+            learning.eval.signals
+        );
+    }
+
+    #[test]
+    fn turn_quality_feedback_mentions_batching_repeats_and_stalls() {
+        use astra_turn_core::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
 
         let eval = TurnEvaluation {
             success: false,
@@ -273,9 +311,7 @@ mod tests {
 
     #[test]
     fn turn_quality_feedback_ignores_untracked_or_empty_signals() {
-        use astra_runtime::pipeline::evaluation::{
-            EvalSignal, EvaluationThresholds, TurnEvaluation,
-        };
+        use astra_turn_core::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
 
         let eval = TurnEvaluation {
             success: true,

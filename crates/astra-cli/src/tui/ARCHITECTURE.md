@@ -53,6 +53,12 @@ read paths:
 - **Events** arrive as `AppEvent` (translated from the on-the-wire
   `TuiAppEvent` by `chat_widget::bridge::translate`). `ChatWidget::handle_event`
   is a single `match` that mutates `history` / `active_cell`.
+- **Draw notifications** are coalesced presentation wakes, not a second event
+  log. The scheduler keeps at most one pending wake and the next draw reads
+  the reducer's newest state. Runtime and input events use their own durable
+  or backpressured paths, so reducing redraw notifications cannot discard
+  business facts. A delayed scheduler anchors its frame limit to the last
+  successfully delivered wake instead of an obsolete timer deadline.
 - **Agent runs** use the same transcript item browser as the root run. The
   run navigator only selects a conversation; it never substitutes a task
   summary for that run's working record.
@@ -73,7 +79,7 @@ read paths:
 | **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
 | **Composer** | Two-row-minimum editing surface with `› ` prefix. Emacs keybindings, expands for multi-line input. | Always (unless an overlay is active) |
 | **Status** | Model and attention states on the left; workspace identity on the right. Default policy and key tutorials stay hidden. | When no popup/overlay is active |
-| **Slash Popup** | Command list under composer, filters as user types `/…` | Composer text starts with `/` |
+| **Slash Popup** | Full list of TUI-native commands under the composer; featured commands sort first, and typing filters the list. | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
 | **Approval Cell** | `⏸ bash wants to run …` with focused button, rendered above composer. | When an approval is pending. Now a `HistoryCell` (not scrollback-committed; `to_persist` is `None`). |
@@ -82,9 +88,9 @@ read paths:
 
 | Name | Trigger | Description |
 |------|---------|-------------|
-| **ListSelectionView** | `/model`, `/skill`, `/stats` menu | Numbered list with `›` selection |
-| **HelpView** | `/help` | Tabbed command browser |
-| **InfoView** | `/stats` detail, `/whoami`, `/instructions show` | Scrollable key-value display |
+| **ListSelectionView** | `/model` picker, `/stats` selector | Numbered list with `›` selection |
+| **HelpView** | `/help` | Featured commands and the full catalog grouped by task |
+| **InfoView** | `/stats` detail, `/info`, `/instructions show` | Scrollable key-value display |
 | **RootTranscriptView** | `Ctrl+O`, root row in `Ctrl+G` | Canonical root conversation with pagination and labelled local live suffix |
 | **AgentTranscriptView** | `Ctrl+G` → selected run | The same browser for a child/grandchild run, with typed live suffix and pagination |
 | **SessionPickerView** | `/resume` (no args) | Two-pane recent sessions picker |
@@ -168,6 +174,12 @@ slash_dispatch::dispatch("/model", ctx)
         then the compact projection is rebound or replayed only when the
         canonical session identity genuinely changes.
 ```
+
+The bare `/` popup always lists every TUI-native root command. Featured
+commands sort first, but the primary marker never filters the list. `/help`
+opens a Featured tab plus task-group tabs whose combined contents are the full
+TUI catalog. Line-mode-only commands stay out of both discovery surfaces and
+show an unavailable message if typed in the workbench.
 
 ## Resume flow (startup or `/resume`)
 

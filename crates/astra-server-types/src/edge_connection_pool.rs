@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::edge_ws_protocol::{
-    EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeProcessAuthorizationContext,
-    ToolInvocationIdentity,
+    EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
+    MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -32,7 +32,12 @@ const MAX_PENDING_REQUESTS_PER_USER: usize = 100;
 /// being purged by `cleanup_stale`. Set to 3× the edge tool timeout as a
 /// generous safety margin (normal cleanup happens in execute_tool's
 /// success/timeout paths).
-const PENDING_REQUEST_TTL_SECS: u64 = EDGE_TOOL_TIMEOUT_SECS * 3;
+const PENDING_REQUEST_TTL_SECS: u64 =
+    (MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS) * 3;
+
+fn edge_result_wait_timeout(execution_timeout_secs: u64) -> Duration {
+    Duration::from_secs(execution_timeout_secs.saturating_add(EDGE_TOOL_RESULT_GRACE_SECS))
+}
 
 /// Maximum capacity for the channel between the tool router and an edge agent's
 /// WebSocket write loop. When full, senders apply backpressure to prevent OOM.
@@ -52,6 +57,7 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub args: &'a serde_json::Value,
     pub runtime_process_authorization:
         Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
+    pub timeout_secs: u64,
     pub cancel_token: Option<&'a CancellationToken>,
 }
 
@@ -85,6 +91,15 @@ pub struct EdgeConnection {
     /// cross-user lookups: only workspace members may dispatch to a shared
     /// edge agent (e.g. a sandbox edge that connected via a service account).
     pub workspace_id: Option<String>,
+    /// Stable database registration identity for this materialization. This is
+    /// the only durable identity suitable for workspace claims; hostnames and
+    /// executor ids are user-facing labels and may be reused.
+    pub registry_id: Option<String>,
+    /// Stable identity persisted beside the Edge checkout. Unlike a registry
+    /// row or socket generation, this survives reconnects and agent-label
+    /// changes while remaining distinct across independently materialized
+    /// devices.
+    pub materialization_id: Option<String>,
     pub sender: EdgeWsSender,
     pub connected_at: std::time::Instant,
     /// Pending tool call responses: request_id → oneshot sender.
@@ -282,6 +297,62 @@ impl EdgeConnectionPool {
         workspace_id: Option<String>,
         sender: EdgeWsSender,
     ) -> u64 {
+        self.register_with_capabilities_and_registry_id(
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            None,
+            sender,
+        )
+    }
+
+    /// Register a connection with the stable registry row identity that was
+    /// authenticated for this socket. Callers that have completed durable
+    /// registration should use this method so execution claims can distinguish
+    /// two materializations that happen to share a hostname or agent label.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_capabilities_and_registry_id(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        registry_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
+        self.register_with_capabilities_registry_and_materialization_id(
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            registry_id,
+            None,
+            sender,
+        )
+    }
+
+    /// Register a connection with both its durable registry row and the stable
+    /// identity of the local checkout it materializes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_capabilities_registry_and_materialization_id(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        registry_id: Option<String>,
+        materialization_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
         let key = pool_key(user_id, edge_agent_id);
         let generation = self.next_generation();
         let mut connection = self.new_connection(
@@ -292,6 +363,8 @@ impl EdgeConnectionPool {
             workspace_dir,
             capabilities,
             workspace_id,
+            registry_id,
+            materialization_id,
             sender,
         );
         match self.connections.entry(key) {
@@ -325,6 +398,8 @@ impl EdgeConnectionPool {
         workspace_dir: Option<String>,
         capabilities: Option<Value>,
         workspace_id: Option<String>,
+        registry_id: Option<String>,
+        materialization_id: Option<String>,
         sender: EdgeWsSender,
     ) -> EdgeConnection {
         EdgeConnection {
@@ -335,6 +410,8 @@ impl EdgeConnectionPool {
             workspace_dir,
             capabilities,
             workspace_id,
+            registry_id,
+            materialization_id,
             sender,
             connected_at: std::time::Instant::now(),
             pending_results: Arc::new(DashMap::new()),
@@ -393,6 +470,64 @@ impl EdgeConnectionPool {
         workspace_id: Option<String>,
         sender: EdgeWsSender,
     ) -> u64 {
+        self.commit_reconnect_with_registry_id(
+            reservation,
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            None,
+            sender,
+        )
+    }
+
+    /// Commit a reconnect while publishing the stable registry row identity
+    /// authenticated for the new socket.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_reconnect_with_registry_id(
+        &self,
+        reservation: ReconnectReservation,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        registry_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
+        self.commit_reconnect_with_registry_and_materialization_id(
+            reservation,
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            registry_id,
+            None,
+            sender,
+        )
+    }
+
+    /// Commit a reconnect while publishing the authenticated registry row and
+    /// its stable checkout materialization identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_reconnect_with_registry_and_materialization_id(
+        &self,
+        reservation: ReconnectReservation,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        registry_id: Option<String>,
+        materialization_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
         let key = pool_key(user_id, edge_agent_id);
         let generation = self.next_generation();
         let mut connection = self.new_connection(
@@ -403,6 +538,8 @@ impl EdgeConnectionPool {
             workspace_dir,
             capabilities,
             workspace_id,
+            registry_id,
+            materialization_id,
             sender,
         );
         // Inherit the pending map: prefer a live previous connection's map, else
@@ -510,14 +647,58 @@ impl EdgeConnectionPool {
             .map(|entry| {
                 let conn = entry.value();
                 let info = EdgeConnectionInfo {
+                    generation: conn.generation,
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    registry_id: conn.registry_id.clone(),
+                    materialization_id: conn.materialization_id.clone(),
                 };
                 (conn.user_id.clone(), info)
+            })
+    }
+
+    /// Find one live connection owned by this exact user and workspace scope.
+    /// This is the authorization lookup for a native Work execution binding;
+    /// callers must not use the display-oriented all-edges view for it.
+    pub fn find_user_edge_by_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Option<EdgeConnectionInfo> {
+        self.connections
+            .iter()
+            .find(|entry| {
+                let conn = entry.value();
+                if conn.user_id != user_id
+                    || conn.edge_agent_id != edge_agent_id
+                    || conn.sender.is_closed()
+                {
+                    return false;
+                }
+                match (workspace_id, conn.workspace_id.as_deref()) {
+                    (Some(requested), Some(registered)) => requested == registered,
+                    (None, None) => true,
+                    _ => false,
+                }
+            })
+            .map(|entry| {
+                let conn = entry.value();
+                EdgeConnectionInfo {
+                    generation: conn.generation,
+                    edge_agent_id: conn.edge_agent_id.clone(),
+                    hostname: conn.hostname.clone(),
+                    workspace_dir: conn.workspace_dir.clone(),
+                    capabilities: conn.capabilities.clone(),
+                    connected_at: conn.connected_at,
+                    workspace_id: conn.workspace_id.clone(),
+                    registry_id: conn.registry_id.clone(),
+                    materialization_id: conn.materialization_id.clone(),
+                }
             })
     }
 
@@ -531,12 +712,15 @@ impl EdgeConnectionPool {
             .map(|entry| {
                 let conn = entry.value();
                 EdgeConnectionInfo {
+                    generation: conn.generation,
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    registry_id: conn.registry_id.clone(),
+                    materialization_id: conn.materialization_id.clone(),
                 }
             })
             .collect()
@@ -569,12 +753,15 @@ impl EdgeConnectionPool {
             .map(|entry| {
                 let conn = entry.value();
                 EdgeConnectionInfo {
+                    generation: conn.generation,
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    registry_id: conn.registry_id.clone(),
+                    materialization_id: conn.materialization_id.clone(),
                 }
             })
             .collect()
@@ -598,6 +785,7 @@ impl EdgeConnectionPool {
                 tool,
                 args,
                 runtime_process_authorization: None,
+                timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
                 cancel_token,
             },
         )
@@ -615,6 +803,16 @@ impl EdgeConnectionPool {
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
     ) -> Option<EdgeToolResult> {
+        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+            invocation,
+        )
+        .await
+    }
+
+    async fn execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+        &self,
+        invocation: DurablyAdmittedEdgeInvocation<'_>,
+    ) -> Option<EdgeToolResult> {
         let DurablyAdmittedEdgeInvocation {
             connection_user_id,
             identity,
@@ -622,11 +820,16 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_process_authorization,
+            timeout_secs,
             cancel_token,
         } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
+        // Public callers include server integrations outside the runtime plan.
+        // Clamp defensively here too so a malformed policy can neither create
+        // a zero-duration invocation nor outlive the callback custody window.
+        let timeout_secs = timeout_secs.clamp(1, MAX_EDGE_TOOL_TIMEOUT_SECS);
         let key = pool_key(connection_user_id, edge_agent_id);
         let (pending_results, sender) = {
             let Some(entry) = self.connections.get(&key) else {
@@ -677,7 +880,7 @@ impl EdgeConnectionPool {
                 })
             }),
             runtime_process_authorization_required: runtime_process_authorization.is_some(),
-            timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
+            timeout_secs,
         };
 
         // Store in dispatched set for reconnection dedup
@@ -719,7 +922,11 @@ impl EdgeConnectionPool {
             });
         };
 
-        let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
+        // The edge enforces `timeout_secs` while executing.  Keep the server
+        // waiter alive briefly longer for the durable result callback, so a
+        // tool that ends at its deadline cannot lose its receiver in the same
+        // instant it reports the timeout/completion result.
+        let timeout_dur = edge_result_wait_timeout(timeout_secs);
         let result = if let Some(token) = cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -746,7 +953,7 @@ impl EdgeConnectionPool {
                     target: "astra_runtime::edge_dispatch_diag",
                     key = %key,
                     request_id = %request_id,
-                    timeout_secs = EDGE_TOOL_TIMEOUT_SECS,
+                    timeout_secs,
                     "edge_dispatch: execute_tool_with_cancel timed out waiting for edge tool result"
                 );
                 cancel_edge();
@@ -1015,6 +1222,9 @@ impl Default for EdgeConnectionPool {
 /// Public info about a connected edge (no sender exposed).
 #[derive(Debug, Clone)]
 pub struct EdgeConnectionInfo {
+    /// In-process connection incarnation. It is a liveness fence for a
+    /// read-only attestation and is never used as a durable Session generation.
+    pub generation: u64,
     pub edge_agent_id: String,
     pub hostname: Option<String>,
     pub workspace_dir: Option<String>,
@@ -1023,6 +1233,10 @@ pub struct EdgeConnectionInfo {
     /// Owning workspace, captured from the edge registration token at connect
     /// time. Used to enforce workspace isolation on the same-user hot path.
     pub workspace_id: Option<String>,
+    /// Stable database registration identity for this materialization.
+    pub registry_id: Option<String>,
+    /// Stable identity persisted beside the local checkout.
+    pub materialization_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1045,6 +1259,56 @@ mod tests {
         assert!(pool.has_connected_edge("user-1"));
         assert!(!pool.has_connected_edge("user-2"));
         assert_eq!(pool.connection_count(), 1);
+    }
+
+    #[test]
+    fn stable_materialization_identity_survives_pool_projection_and_reconnect() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let generation = pool.register_with_capabilities_registry_and_materialization_id(
+            "user-1",
+            "edge-a",
+            Some("laptop".into()),
+            Some("/workspace/a".into()),
+            Some(json!({"protocol_capabilities": {"shell": {}}})),
+            None,
+            Some("registry-a".into()),
+            Some("materialization-a".into()),
+            tx,
+        );
+        let info = pool
+            .find_user_edge_by_agent_and_workspace("user-1", "edge-a", None)
+            .expect("registered edge should be discoverable");
+        assert_eq!(info.registry_id.as_deref(), Some("registry-a"));
+        assert_eq!(
+            info.materialization_id.as_deref(),
+            Some("materialization-a")
+        );
+        assert_eq!(info.generation, generation);
+
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let reservation = pool.begin_reconnect("user-1", "edge-a");
+        let replacement_generation = pool.commit_reconnect_with_registry_and_materialization_id(
+            reservation,
+            "user-1",
+            "edge-a",
+            Some("laptop".into()),
+            Some("/workspace/a".into()),
+            None,
+            None,
+            Some("registry-a".into()),
+            Some("materialization-a".into()),
+            replacement_tx,
+        );
+        assert!(replacement_generation > generation);
+        let info = pool
+            .find_user_edge_by_agent_and_workspace("user-1", "edge-a", None)
+            .expect("replacement edge should be discoverable");
+        assert_eq!(info.registry_id.as_deref(), Some("registry-a"));
+        assert_eq!(
+            info.materialization_id.as_deref(),
+            Some("materialization-a")
+        );
     }
 
     #[test]
@@ -1142,6 +1406,61 @@ mod tests {
             } => (caller, request_id, delivery_generation),
             other => panic!("expected tool request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_execution_timeout_reaches_edge_and_is_bounded() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        pool.register("user-1", "edge-a", None, None, tx);
+        let identity = admitted_identity("policy-deadline");
+        let caller_pool = pool.clone();
+        let caller = tokio::spawn(async move {
+            caller_pool
+                .execute_durably_admitted_invocation_on_connection_with_cancel(
+                    DurablyAdmittedEdgeInvocation {
+                        connection_user_id: "user-1",
+                        identity: &identity,
+                        edge_agent_id: "edge-a",
+                        tool: "bash",
+                        args: &json!({ "command": "effect" }),
+                        runtime_process_authorization: None,
+                        timeout_secs: MAX_EDGE_TOOL_TIMEOUT_SECS + 1,
+                        cancel_token: None,
+                    },
+                )
+                .await
+        });
+
+        let request = rx.recv().await.expect("socket request");
+        let (request_id, delivery_generation, timeout_secs) = match request {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                timeout_secs,
+                ..
+            } => (request_id, delivery_generation, timeout_secs),
+            other => panic!("expected tool request, got {other:?}"),
+        };
+        assert_eq!(timeout_secs, MAX_EDGE_TOOL_TIMEOUT_SECS);
+        assert_eq!(
+            edge_result_wait_timeout(timeout_secs),
+            Duration::from_secs(MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS),
+            "server callback custody must outlive the edge execution deadline"
+        );
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output: "completed".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            }
+        ));
+        assert_eq!(caller.await.unwrap().unwrap().output, "completed");
     }
 
     #[tokio::test]
@@ -1898,6 +2217,47 @@ mod tests {
         assert!(
             result.is_none(),
             "unscoped request must not resolve a workspace-bound edge"
+        );
+    }
+
+    #[test]
+    fn find_user_edge_by_agent_and_workspace_scopes_owner_and_workspace() {
+        let pool = EdgeConnectionPool::new();
+        let (tx_owner, _rx_owner) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-a",
+            "edge-x",
+            None,
+            Some("/repo/a".into()),
+            None,
+            None,
+            tx_owner,
+        );
+        let (tx_other, _rx_other) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-b",
+            "edge-x",
+            None,
+            Some("/repo/b".into()),
+            None,
+            None,
+            tx_other,
+        );
+
+        assert_eq!(
+            pool.find_user_edge_by_agent_and_workspace("user-a", "edge-x", None)
+                .and_then(|edge| edge.workspace_dir),
+            Some("/repo/a".to_string())
+        );
+        assert!(
+            pool.find_user_edge_by_agent_and_workspace("user-c", "edge-x", None)
+                .is_none(),
+            "another user must not authorize this executor"
+        );
+        assert!(
+            pool.find_user_edge_by_agent_and_workspace("user-a", "edge-x", Some("ws-a"))
+                .is_none(),
+            "an unscoped request must not resolve a workspace-scoped edge"
         );
     }
 

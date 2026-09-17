@@ -3,11 +3,36 @@
 //! Shared between the CLI SSE loop and any future server-side handler that consumes the same shape.
 
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use thiserror::Error;
 
-use crate::tool::args::shape::{parse_tool_call_arguments, tool_call_name};
+use crate::tool::args::shape::canonicalize_tool_call_for_execution;
 use crate::tool::categories::is_file_mutation_tool;
-use crate::tool::result::semantics::tool_dedup_signature;
+
+/// A tool result already resolved by an upstream runtime interceptor.
+/// Execution status is carried with the result instead of reconstructed from
+/// its model-facing content later in the request pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessPreResolvedToolResult {
+    pub call_id: String,
+    pub content: String,
+    pub status: crate::tool_result_semantics::ToolResultStatus,
+}
+
+impl HeadlessPreResolvedToolResult {
+    #[must_use]
+    pub fn new(
+        call_id: impl Into<String>,
+        content: impl Into<String>,
+        status: crate::tool_result_semantics::ToolResultStatus,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            content: content.into(),
+            status,
+        }
+    }
+}
 
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,53 +98,80 @@ pub fn headless_round_tool_indices(
     }
 }
 
-/// Ensure every tool_call in the slice has a non-empty `"id"` field.
-/// Returns a `Cow::Borrowed` when all ids are present, avoiding allocation.
-/// When any id is empty/missing, clones those entries and patches them
-/// with a synthetic UUID v7.
-pub fn ensure_tool_call_ids(tool_calls: &[Value]) -> std::borrow::Cow<'_, [Value]> {
-    let needs_patch = tool_calls.iter().any(|tc| {
-        tc.get("id")
-            .and_then(|v| v.as_str())
-            .map_or(true, |s| s.is_empty())
-    });
-    if !needs_patch {
-        return std::borrow::Cow::Borrowed(tool_calls);
-    }
-    std::borrow::Cow::Owned(
-        tool_calls
-            .iter()
-            .map(|tc| {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if id.is_empty() {
-                    let mut patched = tc.clone();
-                    patched["id"] = Value::String(uuid::Uuid::now_v7().to_string());
-                    patched
-                } else {
-                    tc.clone()
-                }
-            })
-            .collect(),
-    )
+fn tool_call_ids_are_unique(tool_calls: &[Value]) -> bool {
+    let mut ids = HashSet::with_capacity(tool_calls.len());
+    tool_calls.iter().all(|tool_call| {
+        tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| ids.insert(id))
+    })
 }
 
-/// Parse flat `/chat/turn` tool-call JSON: top-level `id`, `name`, `arguments` (object or JSON string).
-/// Also handles OpenAI format (`function.name` / `function.arguments`) produced by
-/// `normalize_tool_call_for_accum` — see test `parse_flat_tool_call_openai_format`.
-pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
-    let id = tc
-        .get("id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProviderToolBatchError {
+    #[error("provider tool call at index {index} is invalid: {detail}")]
+    InvalidCall { index: usize, detail: &'static str },
+    #[error("provider tool call at index {index} has a malformed identity")]
+    InvalidIdentity { index: usize },
+    #[error("provider tool-call identity `{id}` is duplicated")]
+    DuplicateIdentity { id: String },
+}
 
-    let name = tool_call_name(tc).unwrap_or("").to_string();
-    // Admission canonicalizes executable calls to a flat object. Legacy
-    // display paths may still pass an OpenAI-shaped call, so consume the same
-    // strict shared parser here. Invalid or conflicting representations never
-    // become an executable empty argument object.
-    let args = parse_tool_call_arguments(tc).unwrap_or(Value::Null);
+/// Canonicalize one complete provider-owned tool batch without inventing
+/// identities. Any malformed entry or repeated identity invalidates the whole
+/// batch: partially retaining it would silently lose model intent and could
+/// execute two effects under one durable key.
+pub fn canonicalize_provider_tool_batch(
+    tool_calls: &[Value],
+) -> Result<std::borrow::Cow<'_, [Value]>, ProviderToolBatchError> {
+    let all_exact = tool_calls.iter().all(|tool_call| {
+        canonicalize_tool_call_for_execution(tool_call)
+            .is_ok_and(|canonical| canonical == *tool_call)
+    });
+    let canonical = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, tool_call)| {
+            canonicalize_tool_call_for_execution(tool_call)
+                .map_err(|detail| ProviderToolBatchError::InvalidCall { index, detail })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut identities = HashSet::with_capacity(canonical.len());
+    for (index, tool_call) in canonical.iter().enumerate() {
+        let id = tool_call["id"]
+            .as_str()
+            .filter(|id| id.len() <= 512 && !id.chars().any(char::is_control))
+            .ok_or(ProviderToolBatchError::InvalidIdentity { index })?;
+        if !identities.insert(id) {
+            return Err(ProviderToolBatchError::DuplicateIdentity { id: id.to_string() });
+        }
+    }
+    if all_exact && tool_call_ids_are_unique(tool_calls) {
+        Ok(std::borrow::Cow::Borrowed(tool_calls))
+    } else {
+        Ok(std::borrow::Cow::Owned(canonical))
+    }
+}
+
+/// Parse one exact canonical tool call. Invalid or id-less input returns an
+/// empty sentinel and must not be routed to execution.
+pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
+    let Ok(canonical) = canonicalize_tool_call_for_execution(tc) else {
+        return (String::new(), String::new(), Value::Null);
+    };
+    if canonical != *tc {
+        return (String::new(), String::new(), Value::Null);
+    }
+    let id = canonical["id"].as_str().unwrap_or_default().to_string();
+    let name = canonical["function"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let args = canonical["function"]["arguments"]
+        .as_str()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null);
     (id, name, args)
 }
 
@@ -242,7 +294,12 @@ pub fn headless_openai_duplicate_within_turn_pair(
     tool_call_id: &str,
     tool_name: &str,
 ) -> (Value, Value) {
-    openai_tool_roundtrip_values(tool_call_id, tool_name, HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
+    openai_tool_roundtrip_values(
+        tool_call_id,
+        tool_name,
+        HEADLESS_DUPLICATE_WITHIN_TURN_BODY,
+        crate::tool_result_semantics::ToolResultStatus::Skipped,
+    )
 }
 
 #[must_use]
@@ -250,9 +307,10 @@ pub fn headless_idempotency_hit_openai_pair(
     tool_call_id: &str,
     tool_name: &str,
     cached_output: &str,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
     let body = idempotency_cache_hit_message(cached_output);
-    openai_tool_roundtrip_values(tool_call_id, tool_name, body.as_str())
+    openai_tool_roundtrip_values(tool_call_id, tool_name, body.as_str(), status)
 }
 
 #[must_use]
@@ -262,7 +320,12 @@ pub fn headless_unknown_local_tool_openai_pair(
     valid_tool_names: &HashSet<String>,
 ) -> (Value, Value) {
     let err = unknown_local_tool_error_message(tool_name, valid_tool_names);
-    openai_tool_roundtrip_values(tool_call_id, tool_name, err.as_str())
+    openai_tool_roundtrip_values(
+        tool_call_id,
+        tool_name,
+        err.as_str(),
+        crate::tool_result_semantics::ToolResultStatus::Failed,
+    )
 }
 
 /// Read-only tools for headless (edge) execution — safe to execute
@@ -276,9 +339,24 @@ pub static READ_ONLY_TOOLS: std::sync::LazyLock<Vec<&'static str>> =
 
 /// One edge-executed tool row in the current LLM round (ordering preserved vs `tool_calls`).
 pub trait EdgeToolRoundRow {
+    fn execution_completion(
+        &self,
+    ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
+        None
+    }
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
+    /// Machine-owned terminal status supplied by the edge executor.
+    ///
+    /// This is deliberately distinct from a tool's human/JSON output.  The
+    /// execution pipeline uses it to preserve a typed transport failure even
+    /// when the diagnostic body is prose.  Legacy rows that did not carry a
+    /// terminal status remain `None` and use their established compatibility
+    /// path.
+    fn tool_execution_status(&self) -> Option<&str> {
+        None
+    }
     fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
         None
     }
@@ -300,76 +378,138 @@ pub trait EdgeToolRoundRow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMatchConflict {
+    /// More than one callback claimed the same provider call identity.
+    DuplicateIdentity,
+    /// The callback identity was found, but that row was already consumed by
+    /// another provider slot in this batch.
+    AlreadyConsumed,
+    /// The callback identity exists, but it claims a different tool name.
+    ToolNameMismatch,
+}
+
+/// Typed result of resolving one provider call against edge callback rows.
+///
+/// `Absent` means there is no callback for this provider identity, so a
+/// server/runtime route may still be considered. `Conflict` means callback
+/// evidence exists but is contradictory; it must fail closed and must never
+/// fall through to another executor. Keeping this distinction typed prevents
+/// transport corruption from being mistaken for a missing callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMatchOutcome {
+    Exact,
+    Absent,
+    Conflict(EdgeMatchConflict),
+}
+
+impl EdgeMatchOutcome {
+    #[must_use]
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+
+    #[must_use]
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    #[must_use]
+    pub const fn conflict(self) -> Option<EdgeMatchConflict> {
+        match self {
+            Self::Conflict(conflict) => Some(conflict),
+            Self::Exact | Self::Absent => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
+    pub execution_status: Option<String>,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
+    /// Typed identity result. A conflict is not equivalent to an absent row:
+    /// the former must fail closed instead of being redispatched.
+    pub match_outcome: EdgeMatchOutcome,
 }
 
-fn matched_edge_tool_output<T: EdgeToolRoundRow>(row: &T) -> MatchedEdgeToolOutput {
+fn matched_edge_tool_output<T: EdgeToolRoundRow>(
+    row: &T,
+    match_outcome: EdgeMatchOutcome,
+) -> MatchedEdgeToolOutput {
     MatchedEdgeToolOutput {
         output: row.tool_output().to_string(),
         duration_ms: row.tool_duration_ms(),
+        execution_status: row.tool_execution_status().map(ToString::to_string),
         tool_result_fields: row.tool_result_fields().cloned(),
+        match_outcome,
     }
 }
 
-pub fn take_edge_output_for_tool_call_id_or_signature_with_duration<T: EdgeToolRoundRow>(
+pub fn take_edge_output_for_tool_call_id_with_duration<T: EdgeToolRoundRow>(
     tool_call_id: &str,
     name: &str,
-    args: &Value,
     round: &[T],
     consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
 ) -> MatchedEdgeToolOutput {
-    if !tool_call_id.is_empty() {
-        for (i, e) in round.iter().enumerate() {
-            if consumed.get(i).copied().unwrap_or(true) {
-                continue;
-            }
-            if e.has_explicit_assistant_tool_call_id()
-                && e.assistant_tool_call_id(i) == tool_call_id
-                && e.tool_name() == name
-            {
-                consumed[i] = true;
-                return matched_edge_tool_output(e);
+    if tool_call_id.is_empty() {
+        // An id-less provider call has no stable execution identity.  Never
+        // infer custody from a name+arguments signature: another physical
+        // invocation could have the same shape.
+        return unmatched_edge_tool_output(name, EdgeMatchOutcome::Absent);
+    }
+
+    let mut explicit_index = None;
+    for (i, e) in round.iter().enumerate() {
+        if e.has_explicit_assistant_tool_call_id() && e.assistant_tool_call_id(i) == tool_call_id {
+            if explicit_index.replace(i).is_some() {
+                // One provider call id may own at most one edge result.
+                // Duplicate ids are an ambiguous transport state: do not
+                // choose an arbitrary row or grant either row terminal
+                // authority.
+                return unmatched_edge_tool_output(
+                    name,
+                    EdgeMatchOutcome::Conflict(EdgeMatchConflict::DuplicateIdentity),
+                );
             }
         }
     }
-
-    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig)
+    if let Some(i) = explicit_index {
+        let e = &round[i];
+        if consumed.get(i).copied().unwrap_or(true) {
+            return unmatched_edge_tool_output(
+                name,
+                EdgeMatchOutcome::Conflict(EdgeMatchConflict::AlreadyConsumed),
+            );
+        }
+        if e.tool_name() == name {
+            consumed[i] = true;
+            return matched_edge_tool_output(e, EdgeMatchOutcome::Exact);
+        }
+        // An explicit id with a different tool name is still an identity
+        // collision. Never fall through to a name+args match.
+        return unmatched_edge_tool_output(
+            name,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::ToolNameMismatch),
+        );
+    }
+    unmatched_edge_tool_output(name, EdgeMatchOutcome::Absent)
 }
 
-pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
+fn unmatched_edge_tool_output(
     name: &str,
-    args: &Value,
-    round: &[T],
-    consumed: &mut [bool],
-    by_sig: &HashMap<String, String>,
+    match_outcome: EdgeMatchOutcome,
 ) -> MatchedEdgeToolOutput {
-    let sig = tool_dedup_signature(name, args);
-    for (i, e) in round.iter().enumerate() {
-        if consumed.get(i).copied().unwrap_or(true) {
-            continue;
-        }
-        if tool_dedup_signature(e.tool_name(), e.tool_args()) == sig {
-            consumed[i] = true;
-            return matched_edge_tool_output(e);
-        }
-    }
     MatchedEdgeToolOutput {
-        output: by_sig.get(&sig).cloned().unwrap_or_else(|| {
-            // IMPORTANT: the prefix "Error: headless edge protocol" is
-            // load-bearing — `execute.rs::execute_tool_pure` keys on it
-            // to trigger server-side re-execution. If this tool has a
-            // ServerToolExecutor available, the error below is replaced
-            // with the real result. Only tools that truly have NO
-            // server-side executor will surface this message to the LLM.
-            no_matching_edge_execution_message(name)
-        }),
+        // The structured resolver provenance is the execution authority;
+        // this body is only the model-facing diagnostic for an unmatched
+        // callback.
+        output: no_matching_edge_execution_message(name),
         duration_ms: 0,
+        execution_status: None,
         tool_result_fields: None,
+        match_outcome,
     }
 }
 
@@ -445,9 +585,12 @@ pub fn tool_calls_for_stall_guard<T: EdgeToolRoundRow>(
 fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
     tool_calls
         .iter()
-        .map(|tc| {
+        .filter_map(|tc| {
             let (id, name, args) = parse_flat_tool_call_event(tc);
-            json!({
+            if id.is_empty() || name.is_empty() || !args.is_object() {
+                return None;
+            }
+            Some(json!({
                 "id": id,
                 "type": "function",
                 "function": {
@@ -455,7 +598,7 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
                     "arguments": serde_json::to_string(&args)
                         .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
                 }
-            })
+            }))
         })
         .collect()
 }
@@ -542,8 +685,9 @@ pub fn openai_tool_roundtrip_values(
     tool_call_id: &str,
     tool_name: &str,
     content: &str,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
-    openai_tool_roundtrip_values_with_result_fields(tool_call_id, tool_name, content, None)
+    openai_tool_roundtrip_values_with_result_fields(tool_call_id, tool_name, content, None, status)
 }
 
 #[must_use]
@@ -552,12 +696,17 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     tool_name: &str,
     content: &str,
     tool_result_fields: Option<&serde_json::Map<String, Value>>,
+    status: crate::tool_result_semantics::ToolResultStatus,
 ) -> (Value, Value) {
-    let msg = json!({
+    let mut msg = json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
         "content": content,
     });
+    crate::tool::result::advisory::set_advisories(
+        msg.as_object_mut().expect("tool message object"),
+        &crate::tool::result::advisory::advisories(tool_result_fields),
+    );
     let mut tr = serde_json::Map::from_iter([
         (
             "tool_call_id".to_string(),
@@ -569,6 +718,12 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
     if let Some(extra_fields) = tool_result_fields {
         tr.extend(extra_fields.clone());
     }
+    // The executor/interceptor status is authoritative over any optional
+    // metadata value with the same key.
+    tr.insert(
+        "status".to_string(),
+        Value::String(status.as_str().to_string()),
+    );
     let tr = Value::Object(tr);
     (msg, tr)
 }
@@ -614,7 +769,7 @@ pub fn begin_headless_tool_round_opening_ext<Edge: EdgeToolRoundRow>(
         force_reasoning_field,
     );
     let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());
-    let tool_count = indices.len().max(1);
+    let tool_count = indices.len();
     HeadlessRoundOpening {
         assistant_message,
         indices,
@@ -654,6 +809,7 @@ mod tests {
         tool: String,
         args: Value,
         output: String,
+        request_id: String,
         tool_result_fields: serde_json::Map<String, Value>,
     }
 
@@ -670,68 +826,52 @@ mod tests {
         fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
             Some(&self.tool_result_fields)
         }
+        fn assistant_tool_call_id(&self, _index: usize) -> String {
+            self.request_id.clone()
+        }
+        fn has_explicit_assistant_tool_call_id(&self) -> bool {
+            !self.request_id.is_empty()
+        }
     }
 
     #[test]
-    fn take_edge_output_matches_first_unconsumed_row() {
+    fn take_edge_output_matches_exact_id_and_skips_consumed_rows() {
         let rows = vec![
-            Row {
+            RowWithRequestId {
                 tool: "read_file".into(),
                 args: json!({"path": "x.rs"}),
                 output: "one".into(),
-                duration_ms: 7,
+                request_id: "call-x".into(),
             },
-            Row {
+            RowWithRequestId {
                 tool: "read_file".into(),
                 args: json!({"path": "y.rs"}),
                 output: "two".into(),
-                duration_ms: 13,
+                request_id: "call-y".into(),
             },
         ];
-        let mut consumed = vec![false; 2];
-        let by_sig: HashMap<String, String> = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let mut consumed = vec![true, false];
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "call-y",
             "read_file",
-            &json!({"path": "y.rs"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
         assert_eq!(out.output, "two");
-        assert_eq!(out.duration_ms, 13);
-        assert!(!consumed[0]);
-        assert!(consumed[1]);
-    }
-
-    #[test]
-    fn take_edge_output_falls_back_to_callback_map() {
-        let rows: Vec<Row> = vec![];
-        let mut consumed = vec![];
-        let mut by_sig = HashMap::new();
-        let sig = tool_dedup_signature("grep", &json!({"pattern": "foo"}));
-        by_sig.insert(sig, "from-map".into());
-        let out = take_edge_output_for_tool_call_with_duration(
-            "grep",
-            &json!({"pattern": "foo"}),
-            &rows,
-            &mut consumed,
-            &by_sig,
-        );
-        assert_eq!(out.output, "from-map");
         assert_eq!(out.duration_ms, 0);
+        assert!(consumed[0]);
+        assert!(consumed[1]);
     }
 
     #[test]
     fn no_edge_execution_for_file_mutation_does_not_suggest_shell_fallback() {
         let rows: Vec<Row> = vec![];
         let mut consumed = vec![];
-        let by_sig = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "write-call",
             "write_file",
-            &json!({"path": "index.html", "content": "<main></main>"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
 
         let lower = out.output.to_ascii_lowercase();
@@ -759,19 +899,18 @@ mod tests {
             tool: "mo_query".into(),
             args: json!({"sql": "UPDATE t SET v = 1"}),
             output: "OK (no results)".into(),
+            request_id: "mo-query-call".into(),
             tool_result_fields: serde_json::Map::from_iter([(
                 "pre_state_snapshot_id".to_string(),
                 Value::String("moq_snap_1".into()),
             )]),
         }];
         let mut consumed = vec![false];
-        let by_sig: HashMap<String, String> = HashMap::new();
-        let out = take_edge_output_for_tool_call_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "mo-query-call",
             "mo_query",
-            &json!({"sql": "UPDATE t SET v = 1"}),
             &rows,
             &mut consumed,
-            &by_sig,
         );
 
         assert_eq!(out.output, "OK (no results)");
@@ -811,7 +950,9 @@ mod tests {
 
     #[test]
     fn resolve_headless_slot_server_and_synthetic() {
-        let server = vec![json!({"id":"a","name":"read_file","arguments":{}})];
+        let server = vec![
+            json!({"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+        ];
         let s0 =
             resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
                 panic!("edge lookup not used")
@@ -836,11 +977,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_flat_tool_call_string_arguments() {
+    fn parse_canonical_tool_call_string_arguments() {
         let tc = json!({
             "id": "c1",
-            "name": "bash",
-            "arguments": "{\"command\":\"ls\"}"
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
         assert_eq!(id, "c1");
@@ -849,37 +990,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_flat_tool_call_object_arguments() {
+    fn parse_canonical_tool_call_rejects_non_exact_object_arguments() {
         let tc = json!({
             "id": "c2",
-            "name": "grep",
-            "arguments": {"pattern": "x"}
+            "type": "function",
+            "function": {"name": "grep", "arguments": {"pattern": "x"}}
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
-        assert_eq!(id, "c2");
-        assert_eq!(name, "grep");
-        assert_eq!(args, json!({"pattern":"x"}));
+        assert!(id.is_empty());
+        assert!(name.is_empty());
+        assert!(args.is_null());
     }
 
     #[test]
-    fn parse_flat_tool_call_canonicalizes_name() {
-        let flat = json!({
-            "id": "c1",
-            "name": " bash ",
-            "arguments": "{}"
-        });
-        let (_, name, _) = parse_flat_tool_call_event(&flat);
-        assert_eq!(name, "bash");
-
-        let openai = json!({
+    fn parse_canonical_tool_call_requires_exact_name() {
+        let tool_call = json!({
             "id": "c2",
             "type": "function",
             "function": {
-                "name": " grep ",
+                "name": "grep",
                 "arguments": "{}"
             }
         });
-        let (_, name, _) = parse_flat_tool_call_event(&openai);
+        let (_, name, _) = parse_flat_tool_call_event(&tool_call);
         assert_eq!(name, "grep");
     }
 
@@ -1015,6 +1148,7 @@ mod tests {
             tr["result"].as_str(),
             Some(HEADLESS_DUPLICATE_WITHIN_TURN_BODY)
         );
+        assert_eq!(tr["status"], "skipped");
     }
 
     #[test]
@@ -1024,6 +1158,16 @@ mod tests {
         let o = begin_headless_tool_round_opening(&server, &edge, "");
         assert_eq!(o.indices.len(), 1);
         assert_eq!(o.tool_count, 1);
+    }
+
+    #[test]
+    fn begin_headless_opening_does_not_invent_an_action_for_an_empty_round() {
+        let edge: Vec<Row> = vec![];
+        let opening = begin_headless_tool_round_opening(&[], &edge, "");
+
+        assert!(opening.indices.is_empty());
+        assert_eq!(opening.tool_count, 0);
+        assert!(opening.assistant_message.get("tool_calls").is_none());
     }
 
     #[test]
@@ -1097,8 +1241,8 @@ mod tests {
     fn openai_assistant_message_from_server_tool_calls() {
         let server = vec![json!({
             "id": "call_1",
-            "name": "read_file",
-            "arguments": {"path": "a.rs"}
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
         assert_eq!(msg["role"], "assistant");
@@ -1203,11 +1347,6 @@ mod tests {
             "slots": [{"id": "review", "prompt": "review"}],
             "title": "Review"
         });
-        let server_args = json!({
-            "action": "start",
-            "target_count": 3,
-            "slots": [{"id": "review", "prompt": "review"}]
-        });
         let rows = vec![RowWithRequestId {
             tool: "agent_fanout".into(),
             args: edge_args,
@@ -1216,13 +1355,11 @@ mod tests {
         }];
         let mut consumed = vec![false];
 
-        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
             "call-fanout-1",
             "agent_fanout",
-            &server_args,
             &rows,
             &mut consumed,
-            &HashMap::new(),
         );
 
         assert_eq!(out.output, r#"{"completed":3}"#);
@@ -1230,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn take_edge_output_falls_back_to_signature_when_request_id_differs() {
+    fn take_edge_output_rejects_explicit_id_mismatch_even_when_signature_matches() {
         let args = json!({"pattern": "needle"});
         let rows = vec![RowWithRequestId {
             tool: "grep".into(),
@@ -1240,17 +1377,73 @@ mod tests {
         }];
         let mut consumed = vec![false];
 
-        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+        let out = take_edge_output_for_tool_call_id_with_duration(
             "call-grep-1",
             "grep",
-            &args,
             &rows,
             &mut consumed,
-            &HashMap::new(),
         );
 
-        assert_eq!(out.output, "matched by args");
-        assert!(consumed[0]);
+        assert!(out.output.starts_with("Error: headless edge protocol"));
+        assert!(!consumed[0]);
+    }
+
+    #[test]
+    fn take_edge_output_rejects_duplicate_explicit_id_even_when_name_matches() {
+        let args = json!({"pattern": "needle"});
+        let rows = vec![
+            RowWithRequestId {
+                tool: "grep".into(),
+                args: args.clone(),
+                output: "first result".into(),
+                request_id: "duplicate-call".into(),
+            },
+            RowWithRequestId {
+                tool: "grep".into(),
+                args: args.clone(),
+                output: "second result".into(),
+                request_id: "duplicate-call".into(),
+            },
+        ];
+        let mut consumed = vec![false, false];
+
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "duplicate-call",
+            "grep",
+            &rows,
+            &mut consumed,
+        );
+
+        assert!(out.output.starts_with("Error: headless edge protocol"));
+        assert_eq!(
+            out.match_outcome,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::DuplicateIdentity)
+        );
+        assert_eq!(consumed, vec![false, false]);
+    }
+
+    #[test]
+    fn take_edge_output_rejects_same_id_with_different_tool_name() {
+        let rows = vec![RowWithRequestId {
+            tool: "read_file".into(),
+            args: json!({"path": "notes.txt"}),
+            output: "contents".into(),
+            request_id: "shared-call".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_with_duration(
+            "shared-call",
+            "bash",
+            &rows,
+            &mut consumed,
+        );
+
+        assert_eq!(
+            out.match_outcome,
+            EdgeMatchOutcome::Conflict(EdgeMatchConflict::ToolNameMismatch)
+        );
+        assert!(!consumed[0]);
     }
 
     #[test]
@@ -1276,13 +1469,44 @@ mod tests {
 
     #[test]
     fn openai_tool_roundtrip_values_matches_headless_shape() {
-        let (m, tr) = openai_tool_roundtrip_values("call-1", "read_file", "ok");
+        let (m, tr) = openai_tool_roundtrip_values(
+            "call-1",
+            "read_file",
+            "ok",
+            crate::tool_result_semantics::ToolResultStatus::Completed,
+        );
         assert_eq!(m["role"], "tool");
         assert_eq!(m["tool_call_id"], "call-1");
         assert_eq!(m["content"], "ok");
         assert_eq!(tr["tool_call_id"], "call-1");
         assert_eq!(tr["name"], "read_file");
         assert_eq!(tr["result"], "ok");
+        assert_eq!(tr["status"], "completed");
+    }
+
+    #[test]
+    fn tool_roundtrip_retains_guidance_without_changing_result_document() {
+        use crate::tool::result::advisory::{TOOL_RESULT_ADVISORIES_FIELD, set_advisories};
+        let body = r#"{ "executed": false, "error_kind": "probe_rejected" }"#;
+        let mut fields = serde_json::Map::new();
+        set_advisories(&mut fields, &["inspect the existing operation".into()]);
+        let (message, row) = openai_tool_roundtrip_values_with_result_fields(
+            "call-probe",
+            "probe",
+            body,
+            Some(&fields),
+            crate::tool_result_semantics::ToolResultStatus::Failed,
+        );
+        assert_eq!(message["content"], body);
+        assert_eq!(row["result"], body);
+        assert_eq!(
+            message[TOOL_RESULT_ADVISORIES_FIELD],
+            row[TOOL_RESULT_ADVISORIES_FIELD]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(row["result"].as_str().unwrap()).unwrap()["executed"],
+            false
+        );
     }
 
     #[test]
@@ -1296,93 +1520,117 @@ mod tests {
             "mo_query",
             "OK (no results)",
             Some(&extra_fields),
+            crate::tool_result_semantics::ToolResultStatus::Completed,
         );
         assert_eq!(tr["tool_call_id"], "call-2");
         assert_eq!(tr["name"], "mo_query");
         assert_eq!(tr["result"], "OK (no results)");
         assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
+        assert_eq!(tr["status"], "completed");
     }
 
     #[test]
-    fn parse_flat_tool_call_generates_id_when_missing() {
-        let tc = json!({"name": "bash", "arguments": "{}"});
+    fn parse_canonical_tool_call_rejects_missing_or_empty_id() {
+        let tc = json!({"type":"function","function":{"name":"bash","arguments":"{}"}});
         let (id, name, _) = parse_flat_tool_call_event(&tc);
-        assert!(!id.is_empty(), "empty id should be replaced with UUID");
-        assert_eq!(name, "bash");
+        assert!(id.is_empty());
+        assert!(name.is_empty());
 
-        // Empty string id should also be replaced
-        let tc2 = json!({"id": "", "name": "bash", "arguments": "{}"});
+        let tc2 = json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}});
         let (id2, _, _) = parse_flat_tool_call_event(&tc2);
-        assert!(!id2.is_empty());
-        assert_ne!(id, id2, "each call should get a unique id");
+        assert!(id2.is_empty());
     }
 
-    // ── ensure_tool_call_ids regression tests ───────────────────────────
+    // ── canonicalize_provider_tool_batch regression tests ───────────────
 
     #[test]
-    fn ensure_ids_borrows_when_all_present() {
+    fn canonical_batch_borrows_when_all_calls_are_exact() {
         let tcs = vec![
-            json!({"id": "a", "name": "bash"}),
-            json!({"id": "b", "name": "grep"}),
+            json!({"id":"a","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            json!({"id":"b","type":"function","function":{"name":"grep","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
+        let result = canonicalize_provider_tool_batch(&tcs).unwrap();
         assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
-    fn ensure_ids_patches_empty_id() {
+    fn canonical_batch_rejects_entire_batch_when_one_identity_is_empty() {
         let tcs = vec![
-            json!({"id": "", "name": "bash"}),
-            json!({"id": "ok", "name": "grep"}),
+            json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            json!({"id":"ok","type":"function","function":{"name":"grep","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
-        assert!(matches!(result, std::borrow::Cow::Owned(_)));
-        let id0 = result[0]["id"].as_str().unwrap();
-        assert!(!id0.is_empty(), "empty id must be patched");
-        assert_eq!(
-            result[1]["id"].as_str().unwrap(),
-            "ok",
-            "valid id untouched"
-        );
+        let error = canonicalize_provider_tool_batch(&tcs).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderToolBatchError::InvalidCall { index: 0, .. }
+        ));
     }
 
     #[test]
-    fn ensure_ids_patches_missing_id() {
-        let tcs = vec![json!({"name": "bash"})];
-        let result = ensure_tool_call_ids(&tcs);
-        let id = result[0]["id"].as_str().unwrap();
-        assert!(!id.is_empty());
+    fn canonical_batch_rejects_missing_id() {
+        let tcs = vec![json!({"type":"function","function":{"name":"bash","arguments":"{}"}})];
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::InvalidCall { index: 0, .. })
+        ));
     }
 
     #[test]
-    fn ensure_ids_unique_per_call() {
+    fn canonical_batch_never_mints_identity() {
         let tcs = vec![
-            json!({"id": "", "name": "a"}),
-            json!({"id": "", "name": "b"}),
+            json!({"id":"","type":"function","function":{"name":"a","arguments":"{}"}}),
+            json!({"type":"function","function":{"name":"b","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
-        let id0 = result[0]["id"].as_str().unwrap();
-        let id1 = result[1]["id"].as_str().unwrap();
-        assert_ne!(id0, id1, "each empty id must get a distinct UUID");
+        assert!(canonicalize_provider_tool_batch(&tcs).is_err());
     }
 
-    /// The critical invariant: after ensure_tool_call_ids, building an
-    /// assistant message and parsing tool result ids must produce matching ids.
     #[test]
-    fn ensure_ids_makes_assistant_and_result_ids_match() {
-        let tcs = vec![json!({"id": "", "name": "bash", "arguments": "{}"})];
-        let patched = ensure_tool_call_ids(&tcs);
+    fn canonical_batch_rejects_idless_call_before_assistant_pairing() {
+        let tcs =
+            vec![json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        assert!(canonicalize_provider_tool_batch(&tcs).is_err());
+    }
 
-        // Assistant message path
-        let assistant_msg = openai_assistant_with_tool_calls_message::<Row>(&patched, &[], "");
-        let assistant_id = assistant_msg["tool_calls"][0]["id"].as_str().unwrap();
+    #[test]
+    fn canonical_batch_rejects_entire_batch_for_duplicate_exact_identity() {
+        let tcs = vec![
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+        ];
 
-        // Tool result path
-        let (result_id, _, _) = parse_flat_tool_call_event(&patched[0]);
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::DuplicateIdentity { .. })
+        ));
+    }
 
+    #[test]
+    fn canonical_batch_rejects_duplicate_identity_with_conflicting_payloads() {
+        let tcs = vec![
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b\"}"}}),
+        ];
+
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::DuplicateIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_batch_normalizes_semantically_equivalent_argument_json() {
+        let tcs = vec![json!({
+            "id":"call-a",
+            "function":{"name":"read_file","arguments":"{\n  \"path\": \"a\", \"line_start\": 1\n}"}
+        })];
+
+        let canonical = canonicalize_provider_tool_batch(&tcs).unwrap();
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0]["type"], "function");
         assert_eq!(
-            assistant_id, result_id,
-            "assistant tool_call id and tool result id must match after ensure_tool_call_ids"
+            canonical[0]["function"]["arguments"],
+            serde_json::to_string(&json!({"path":"a", "line_start":1})).unwrap()
         );
     }
 
@@ -1470,11 +1718,11 @@ mod tests {
         );
     }
 
-    /// Regression: mixed flat + OpenAI format tool_calls in the same round.
+    /// Multiple canonical tool calls preserve order and payload.
     #[test]
-    fn openai_assistant_message_mixed_format_tool_calls() {
+    fn openai_assistant_message_multiple_canonical_tool_calls() {
         let server = vec![
-            json!({"id": "c1", "name": "git", "arguments": {"action": "status"}}),
+            json!({"id": "c1", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"status\"}"}}),
             json!({"id": "c2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\",\"ref\":\"HEAD\"}"}}),
         ];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");

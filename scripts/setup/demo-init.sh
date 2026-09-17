@@ -1,5 +1,5 @@
 #!/bin/bash
-# Smart interactive demo setup for astra-engine.
+# Smart interactive demo setup for Astra.
 #
 # Design principles:
 #   1. Detect current state — skip what's already done
@@ -153,7 +153,7 @@ do_login() {
 # ── Step 0: Pre-flight checks ──────────────────────────────────
 
 preflight() {
-    header "🚀 astra-engine — Interactive Setup"
+    header "🚀 Astra — Interactive Setup"
 
     info "Checking prerequisites..."
 

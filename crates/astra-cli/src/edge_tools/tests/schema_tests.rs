@@ -47,7 +47,7 @@ fn tool_schemas_include_core_tools() {
                 .map(String::from)
         })
         .collect();
-    // Consolidated action tools: git, github, memory, session, agent.
+    // Canonical public tools.
     for expected in &[
         "bash",
         "read_file",
@@ -56,8 +56,6 @@ fn tool_schemas_include_core_tools() {
         "list_dir",
         "grep",
         "glob",
-        "git",
-        "github",
         "memory",
         "session",
         "mo_query",
@@ -161,8 +159,8 @@ fn schemas_include_consolidated_tools() {
         })
         .collect();
     // Consolidated tools cover the old individual tools
-    assert!(names.contains(&"git"), "missing git schema");
-    assert!(names.contains(&"github"), "missing github schema");
+    assert!(!names.contains(&"git"));
+    assert!(!names.contains(&"github"));
     assert!(names.contains(&"lsp"), "missing lsp schema");
     assert!(names.contains(&"agent"), "missing agent schema");
 }
@@ -170,26 +168,6 @@ fn schemas_include_consolidated_tools() {
 // Transaction fields (transaction_id, rollback_on_failure) have been removed
 // from tool schemas as part of the tool consolidation. Transaction support is
 // now handled at the execution layer, not advertised per-schema.
-
-#[test]
-fn git_schema_exposes_stash_operation() {
-    let schemas = all_tool_schemas();
-    let git_schema = schemas
-        .iter()
-        .find(|schema| schema["function"]["name"].as_str() == Some("git"))
-        .expect("missing consolidated git schema");
-    let actions = git_schema["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("missing git action enum");
-    assert!(
-        actions.iter().any(|v| v.as_str() == Some("stash")),
-        "git schema should have stash action"
-    );
-    assert!(
-        actions.iter().any(|v| v.as_str() == Some("revert_commit")),
-        "git schema should have revert_commit action"
-    );
-}
 
 // ── Conditional required (allOf/if-then) regression guards ──────────────
 //
@@ -308,62 +286,6 @@ fn agent_other_actions_have_conditional_required() {
 }
 
 #[test]
-fn git_commit_and_revert_actions_declare_required_fields() {
-    let schemas = all_tool_schemas();
-    let git = tool_schema(&schemas, "git");
-    assert_eq!(
-        conditional_required_for(git, "commit"),
-        vec!["message".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "revert_commit"),
-        vec!["commit_sha".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "file_history"),
-        vec!["file".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "log_search"),
-        vec!["query".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "checkout_file"),
-        vec!["path".to_string(), "ref".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "stash"),
-        vec!["sub_action".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(git, "worktree"),
-        vec!["sub_action".to_string()]
-    );
-}
-
-#[test]
-fn github_schema_requires_pr_issue_numbers_and_title() {
-    let schemas = all_tool_schemas();
-    let gh = tool_schema(&schemas, "github");
-    assert_eq!(
-        conditional_required_for(gh, "get_pr"),
-        vec!["pr_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "ci_status"),
-        vec!["pr_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "get_issue"),
-        vec!["issue_number".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(gh, "create_issue"),
-        vec!["title".to_string()]
-    );
-}
-
-#[test]
 fn memory_schema_requires_content_query_new_content_signal() {
     let schemas = all_tool_schemas();
     let mem = tool_schema(&schemas, "memory");
@@ -465,90 +387,6 @@ fn mo_query_schema_requires_sql() {
     assert_eq!(required_fields(mo_query), vec!["sql".to_string()]);
 }
 
-#[test]
-fn task_board_schema_requires_title_and_task_id() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    assert_eq!(
-        conditional_required_for(task, "create"),
-        vec!["title".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "update"),
-        vec!["task_id".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "get"),
-        vec!["task_id".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "stop"),
-        vec!["task_id".to_string()]
-    );
-}
-
-#[test]
-fn task_board_schema_publishes_action_owned_fields() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    let create = conditional_allowed_for(task, "create");
-    let update = conditional_allowed_for(task, "update");
-
-    assert_eq!(
-        create,
-        astra_tools::task_tool_contract::task_action_allowed_fields("create")
-            .unwrap()
-            .iter()
-            .map(|field| (*field).to_string())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !create.iter().any(|field| field == "new_status"),
-        "task_board.create must not advertise update-only status fields"
-    );
-    assert!(
-        update.iter().any(|field| field == "new_status"),
-        "task_board.update must advertise status changes"
-    );
-    assert_eq!(
-        update,
-        astra_tools::task_tool_contract::task_action_allowed_fields("update")
-            .unwrap()
-            .iter()
-            .map(|field| (*field).to_string())
-            .collect::<Vec<_>>()
-    );
-}
-
-/// `task_board` is the durable checklist surface. Background execution control lives
-/// on typed `task_output` / `task_stop` / `task_list` tools, not the checklist
-/// action enum and not a generic job action union.
-#[test]
-fn task_board_schema_does_not_advertise_background_actions() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    let actions: Vec<&str> = task["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("task_board.action must be an enum")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    for banned in &["background_shell", "background_agent", "output", "kill"] {
-        assert!(
-            !actions.contains(banned),
-            "task_board.action enum still advertises `{banned}` — it must move to \
-             typed background task control tools. Got: {actions:?}"
-        );
-    }
-    // Sanity: the checklist verbs are still there.
-    for kept in &["create", "update", "list", "get", "stop"] {
-        assert!(
-            actions.contains(kept),
-            "task.action must still include `{kept}` — got: {actions:?}"
-        );
-    }
-}
-
 /// Typed task-control tools are the model-facing background task surface.
 /// The generic `job` action union must not be advertised to the model.
 #[test]
@@ -596,9 +434,10 @@ fn typed_background_task_schema_required_fields() {
 
 // ── Plan mode surfaces ────────────────────────────────────────────────────
 //
-// Local CLI keeps `/plan` as the human entrypoint, but the model-facing local
-// tool catalog now includes client-backed enter/exit wrappers so the active
-// cloud plan lifecycle stays consistent across turns.
+// Local CLI keeps `/plan` as the human entrypoint, and the model-facing local
+// tool catalog includes enter/exit wrappers. Cloud persistence through the
+// legacy `/plans` routes is a separate compatibility path and is not a
+// current-runtime capability.
 
 #[test]
 fn local_cli_catalog_includes_plan_mode_wrappers() {
@@ -608,11 +447,11 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
         .collect();
     assert!(
         names.iter().any(|n| n == "enter_plan_mode"),
-        "local CLI catalog should expose enter_plan_mode via the client-backed wrapper"
+        "local CLI catalog should expose enter_plan_mode via the local wrapper"
     );
     assert!(
         names.iter().any(|n| n == "exit_plan_mode"),
-        "local CLI catalog should expose exit_plan_mode via the client-backed wrapper"
+        "local CLI catalog should expose exit_plan_mode via the local wrapper"
     );
 }
 
@@ -699,7 +538,7 @@ fn local_cli_catalog_includes_normalized_reflect_schema() {
 }
 
 #[test]
-fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
+fn local_cli_catalog_exposes_the_root_work_lifecycle() {
     let names: Vec<String> = crate::edge_tools::local_tool_schemas()
         .iter()
         .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -711,13 +550,29 @@ fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
         "web_search",
         "bash",
         "read_file",
-        "git",
+        "worktree",
     ] {
         assert!(
             names.iter().any(|visible| visible == name),
             "local CLI runtime catalog should expose `{name}`: {names:?}"
         );
     }
+    for duplicate in ["git", "github"] {
+        assert!(
+            !names.iter().any(|name| name == duplicate),
+            "local Bash replaces duplicate {duplicate}"
+        );
+    }
+    for name in ["start_work", "run_next_work_item", "inspect_work_plan"] {
+        assert!(
+            names.iter().any(|visible| visible == name),
+            "the CLI root must expose the canonical Work lifecycle: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|visible| visible == "settle_work_item"),
+        "settlement belongs only to an assigned WorkItem attempt, not the root coordinator"
+    );
 }
 
 #[test]

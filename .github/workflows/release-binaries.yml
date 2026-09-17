@@ -1,65 +1,29 @@
-name: Release Astra CLI Binaries
+name: Build Astra Client Release Candidates
+
+permissions:
+  contents: read
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  workflow_dispatch:
+  workflow_call:
     inputs:
       version:
-        description: "Release version to publish, e.g. 0.1.0 or v0.1.0"
+        description: Release version without the leading v
+        required: true
+        type: string
+      source_sha:
+        description: Immutable source commit selected by the release controller
         required: true
         type: string
 
 env:
-  BINARY: astra
-  RELEASE_REPOSITORY: matrixorigin/astra-suite
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
 
 jobs:
-  version:
-    name: Resolve Version
-    runs-on: ubuntu-latest
-    outputs:
-      value: ${{ steps.resolve.outputs.value }}
-      tag: ${{ steps.resolve.outputs.tag }}
-      source_tag: ${{ steps.resolve.outputs.source_tag }}
-      prerelease: ${{ steps.resolve.outputs.prerelease }}
-    steps:
-      - name: Resolve release version
-        id: resolve
-        shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            version="${INPUT_VERSION}"
-          else
-            version="${GITHUB_REF_NAME}"
-          fi
-
-          if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release version: ${version}" >&2
-            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
-            exit 1
-          fi
-
-          value="${version#v}"
-          prerelease=false
-          if [[ "${value}" == *-* ]]; then
-            prerelease=true
-          fi
-
-          echo "value=${value}" >> "${GITHUB_OUTPUT}"
-          echo "tag=astra-cli-v${value}" >> "${GITHUB_OUTPUT}"
-          echo "source_tag=v${value}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-
   build:
     name: Build ${{ matrix.target }}
-    needs: version
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -67,67 +31,110 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             suffix: linux-amd64
-            use-cross: false
-            features: --features release-vendored-openssl
-          - os: ubuntu-latest
+            features: astra-cli/release-vendored-openssl
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             suffix: linux-arm64
-            use-cross: true
-            features: --features release-vendored-openssl
+            features: astra-cli/release-vendored-openssl
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
-            use-cross: false
             features: ""
           - os: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
-            use-cross: false
             features: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.version.outputs.source_tag }}
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SOURCE_SHA }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/registry/index
             ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: release-cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-${{ matrix.target }}-
+            release-cargo-${{ runner.os }}-${{ matrix.target }}-
 
-      - name: Install pinned Rust toolchain and target
+      - name: Install pinned Rust target
         shell: bash
         run: |
+          set -euo pipefail
           rustc --version
           rustup target add "${{ matrix.target }}"
 
-      - name: Install musl build deps
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      - name: Install musl build dependencies
+        if: ${{ contains(matrix.target, 'unknown-linux-musl') }}
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
+          set -euo pipefail
+          # Like mold in rust-setup, musl-tools comes from Ubuntu. Unrelated
+          # runner repositories (e.g. Chrome) must not block release builds.
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          if [[ ! -s "${ubuntu_sources}" ]]; then
+            ubuntu_sources=/etc/apt/sources.list
+          fi
+          test -s "${ubuntu_sources}"
+          apt_options=(
+            -o "Dir::Etc::sourcelist=${ubuntu_sources}"
+            -o "Dir::Etc::sourceparts=-"
+            -o "APT::Get::List-Cleanup=0"
+            -o "APT::Update::Error-Mode=any"
+          )
+          sudo apt-get "${apt_options[@]}" update
+          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends musl-tools
 
-      - name: Install cross
-        if: ${{ matrix.use-cross }}
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Build with cross
-        if: ${{ matrix.use-cross }}
+      - name: Build client candidates
+        shell: bash
+        env:
+          RELEASE_FEATURES: ${{ matrix.features }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cross build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          set -euo pipefail
+          set --
+          if [ -n "${RELEASE_FEATURES}" ]; then
+            set -- --features "${RELEASE_FEATURES}"
+          fi
+          cargo build --release --locked --no-default-features "$@" \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --bin astra \
+            -p astra-edge --bin astra-edge
 
-      - name: Build native
-        if: ${{ !matrix.use-cross }}
+      - name: Execute client candidates
+        shell: bash
         run: |
-          cargo build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          set -euo pipefail
+          for binary in astra astra-edge; do
+            candidate="target/${{ matrix.target }}/release/${binary}"
+            reported_version="$("${candidate}" --version)"
+            expected_version="${binary} ${RELEASE_VERSION}"
+            if [ "${reported_version}" != "${expected_version}" ]; then
+              echo "${binary} reports '${reported_version}', expected '${expected_version}'" >&2
+              exit 1
+            fi
+            "${candidate}" --help >/dev/null
+          done
 
-      - name: Package archive
+      - name: Verify Darwin session execution lease contract
+        if: ${{ contains(matrix.target, 'apple-darwin') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-services --lib macos_session_execution_lease
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --lib session_execution_lease::tests
+
+      - name: Package client archive
         shell: bash
         run: |
           set -euo pipefail
@@ -141,64 +148,67 @@ jobs:
           }
 
           mkdir -p dist
-          archive="${BINARY}-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
-          tar -czf "dist/${archive}" \
-            -C "target/${{ matrix.target }}/release" \
-            "${BINARY}"
-          (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
+          package_dir="${RUNNER_TEMP}/astra-package"
+          mkdir -p "${package_dir}"
+          for binary in astra astra-edge; do
+            install -m 0755 \
+              "target/${{ matrix.target }}/release/${binary}" \
+              "${package_dir}/${binary}"
+          done
+          install -m 0644 LICENSE "${package_dir}/LICENSE"
+          archive="astra-v${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz"
+          source_date_epoch="$(git show -s --format=%ct "${RELEASE_SOURCE_SHA}")"
+          python3 scripts/create_reproducible_release_archive.py \
+            "${package_dir}" "dist/${archive}" "${source_date_epoch}"
+          (cd dist && checksum_file "${archive}" > "${archive}.sha256")
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload client candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bins-${{ matrix.suffix }}
+          name: client-${{ matrix.suffix }}
           path: dist/
+          if-no-files-found: error
+          retention-days: 3
 
-  release:
-    name: Create Release
-    needs:
-      - version
-      - build
+  verify:
+    name: Verify Complete Client Set
+    needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          pattern: bins-*
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SOURCE_SHA }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: client-*
           path: dist
           merge-multiple: true
 
-      - name: Create checksums
+      - name: Verify archives and create aggregate checksums
+        shell: bash
+        run: scripts/verify-release-artifacts.sh "${RELEASE_VERSION}" dist
+
+      - name: Write client candidate summary
         shell: bash
         run: |
-          cd dist
-          cat astra-v*.tar.gz.sha256 > checksums.txt
-          sha256sum checksums.txt | tee checksums.txt.sha256
+          {
+            echo "## Verified Astra client candidates"
+            echo
+            echo "Source: \`${RELEASE_SOURCE_SHA}\`"
+            echo
+            echo '```text'
+            cat dist/checksums.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Upload verified client release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          repository: ${{ env.RELEASE_REPOSITORY }}
-          token: ${{ secrets.ASTRA_SUITE_PAT }}
-          name: Astra CLI v${{ needs.version.outputs.value }}
-          tag_name: ${{ needs.version.outputs.tag }}
-          target_commitish: main
-          draft: false
-          prerelease: ${{ needs.version.outputs.prerelease }}
-          generate_release_notes: false
-          body: |
-            Astra CLI v${{ needs.version.outputs.value }}.
-
-            This release contains the `astra` CLI binaries consumed by astra-suite `scripts/install-astra.sh`.
-            Source release tag: ${{ needs.version.outputs.source_tag }}.
-
-            Assets:
-            - astra-v${{ needs.version.outputs.value }}-linux-amd64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-linux-arm64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-darwin-amd64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-darwin-arm64.tar.gz
-            - checksums.txt
-          make_latest: false
-          files: dist/*
-          fail_on_unmatched_files: true
+          name: release-client-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

@@ -78,10 +78,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::upload_session_segments_handler),
         )
         .route(
-            "/sessions/{session_id}/publish",
-            post(session::session_handlers::publish_session_handler),
-        )
-        .route(
             "/sessions/{session_id}/execution-grants",
             post(session::session_handlers::issue_session_execution_grant_handler),
         )
@@ -121,18 +117,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
         .route(
             "/sessions/{session_id}/forks/{fork_id}/abort",
             post(session::session_handlers::abort_session_fork_handler),
-        )
-        .route(
-            "/sessions/{session_id}/todos:execute",
-            post(session::session_todo_handlers::execute_todo_handler),
-        )
-        .route(
-            "/sessions/{session_id}/todos",
-            get(session::session_todo_handlers::load_todos_handler),
-        )
-        .route(
-            "/users/me/todos",
-            get(session::session_todo_handlers::list_user_todos_handler),
         )
         .route(
             "/sessions/{session_id}/cancel",

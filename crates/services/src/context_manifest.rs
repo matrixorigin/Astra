@@ -623,6 +623,13 @@ impl DatabaseContextManifestStore {
                     entity: event.entity.to_string(),
                     source,
                 })?;
+        crate::storage::admit_session_event_write(&mut tx, event.session_id, event.user_id, true)
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source,
+            })?;
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, created_at)

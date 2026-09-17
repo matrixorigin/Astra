@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use astra_core::{agent_warn, canonical_names::normalize_optional_name};
 use serde_json::Value;
 
-use crate::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use crate::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
 use crate::interaction_types::tool_counts_as_external_observation;
 use crate::response_guard::{RESPONSE_GUARD_REDACTED_FINISH_REASON, apply_response_guards};
 use crate::tool::args::shape::tool_call_name;
@@ -24,6 +24,9 @@ pub struct AgenticTurnStreamSnapshot<'a> {
     pub run_id: &'a Option<String>,
     pub full_text: &'a str,
     pub tool_calls: &'a [Value],
+    /// Authoritative observation-only summary for a Server-owned loop.
+    /// These calls already ran remotely and must never become local work.
+    pub server_execution_summary: Option<&'a ServerLoopExecutionSummary>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -56,6 +59,7 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
         run_id: &accum.run_id,
         full_text: accum.full_text.as_str(),
         tool_calls: accum.tool_calls.as_slice(),
+        server_execution_summary: accum.server_execution_summary.as_ref(),
         prompt_tokens: accum.prompt_tokens,
         completion_tokens: accum.completion_tokens,
         cache_read_tokens: accum.cache_read_tokens,
@@ -136,12 +140,14 @@ pub fn ingest_agentic_turn_stream(
         *st.first_ttft_ms = snap.ttft_ms;
     }
 
-    if let Some(sid) = snap.session_id.as_ref() {
-        *st.current_session_id = Some(sid.clone());
-        st.step_recorder.attach_persistence_if_configured(sid);
-    }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
+    }
+    if let (Some(sid), Some(run_id)) = (snap.session_id.as_deref(), snap.run_id.as_deref()) {
+        *st.current_session_id = Some(sid.to_string());
+        st.step_recorder.bind_authoritative_run(sid, run_id);
+    } else if let Some(sid) = snap.session_id.as_ref() {
+        *st.current_session_id = Some(sid.clone());
     }
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
     let preserve_prior_final_after_runtime_scaffolding_retry = !snap.full_text.is_empty()
@@ -197,38 +203,58 @@ pub fn ingest_agentic_turn_stream(
     *st.total_completion += snap.completion_tokens;
     *st.total_cache_read += snap.cache_read_tokens;
     *st.total_cache_creation += snap.cache_creation_tokens;
-    *st.total_tool_calls += if !snap.tool_calls.is_empty() {
-        snap.tool_calls.len()
+    let tool_calls_this_round = snap.server_execution_summary.map_or_else(
+        || {
+            u32::try_from(if !snap.tool_calls.is_empty() {
+                snap.tool_calls.len()
+            } else {
+                edge_round_len
+            })
+            .unwrap_or(u32::MAX)
+        },
+        |summary| summary.tool_calls_count,
+    );
+    *st.total_tool_calls = st.total_tool_calls.saturating_add(tool_calls_this_round);
+    let observation_tool_calls_this_round = if let Some(summary) = snap.server_execution_summary {
+        summary.observation_tool_calls_count
+    } else if !snap.tool_calls.is_empty() {
+        u32::try_from(
+            snap.tool_calls
+                .iter()
+                .filter_map(tool_call_name)
+                .filter(|name| tool_counts_as_external_observation(name))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     } else {
-        edge_round_len
-    } as u32;
-    let observation_tool_calls_this_round = if !snap.tool_calls.is_empty() {
-        snap.tool_calls
-            .iter()
-            .filter_map(tool_call_name)
-            .filter(|name| tool_counts_as_external_observation(name))
-            .count()
-    } else {
-        let mut count = 0usize;
+        let mut count = 0u32;
         for i in 0..edge_round_len {
             if tool_counts_as_external_observation(&edge_tool_name(i)) {
-                count += 1;
+                count = count.saturating_add(1);
             }
         }
         count
     };
-    *st.total_observation_tool_calls += observation_tool_calls_this_round as u32;
+    *st.total_observation_tool_calls = st
+        .total_observation_tool_calls
+        .saturating_add(observation_tool_calls_this_round);
 
     st.step_recorder
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
 
-    for tc in snap.tool_calls {
-        if let Some(name) = tool_call_name(tc) {
-            insert_tool_used(st.all_tools_used, name.to_string());
+    if let Some(summary) = snap.server_execution_summary {
+        for name in &summary.tools_used {
+            insert_tool_used(st.all_tools_used, name.clone());
         }
-    }
-    for i in 0..edge_round_len {
-        insert_tool_used(st.all_tools_used, edge_tool_name(i));
+    } else {
+        for tc in snap.tool_calls {
+            if let Some(name) = tool_call_name(tc) {
+                insert_tool_used(st.all_tools_used, name.to_string());
+            }
+        }
+        for i in 0..edge_round_len {
+            insert_tool_used(st.all_tools_used, edge_tool_name(i));
+        }
     }
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
 
@@ -289,7 +315,10 @@ fn record_prompt_calibration_success(
         snap.cache_creation_tokens,
     )
     .total_input_tokens();
-    if snap.has_usage && billable_input > 0 {
+    // Server-owned terminal totals are execution accounting, not one request's
+    // context occupancy.  The host records the explicit physical request
+    // before ingestion; do not overwrite it with aggregate child usage.
+    if snap.has_usage && billable_input > 0 && snap.server_execution_summary.is_none() {
         *st.last_measured_prompt_tokens = Some(billable_input);
     }
 }
@@ -375,7 +404,12 @@ mod tests {
                 total_cache_creation: 0,
                 total_tool_calls: 0,
                 total_observation_tool_calls: 0,
-                step_recorder: StepRecorder::with_persistence(TEST_USER_ID, "s", "t"),
+                step_recorder: StepRecorder::with_persistence_for_run(
+                    TEST_USER_ID,
+                    "s",
+                    "t",
+                    "test-run",
+                ),
                 all_tools_used: HashSet::new(),
                 has_any_usage: false,
                 messages: Vec::new(),
@@ -408,12 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn ingest_attaches_step_persistence_using_recorder_owner() {
+    fn ingest_binds_step_persistence_only_after_authoritative_run_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let mut p = Pack::new();
-        p.step_recorder =
-            StepRecorder::with_deferred_persistence(TEST_USER_ID, "ephemeral", "task-1");
+        p.step_recorder = StepRecorder::with_deferred_persistence_for_run(
+            TEST_USER_ID,
+            "ephemeral",
+            "task-1",
+            "test-run",
+        );
+        p.step_recorder.begin_turn(1);
 
         let session_id = Some("authoritative-session".to_string());
         let run_id = None;
@@ -425,6 +464,7 @@ mod tests {
             run_id: &run_id,
             full_text: "",
             tool_calls: &tool_calls,
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -451,7 +491,173 @@ mod tests {
         );
         let summary = p.step_recorder.summary();
         assert_eq!(summary.user_id, TEST_USER_ID);
+        assert_eq!(
+            summary.session_id, "ephemeral",
+            "a session-only frame may update in-memory identity, but it cannot persist recorder events"
+        );
+
+        // A later frame carrying both identities establishes the durable run
+        // owner and flushes the buffered observations under that pair.
+        let run_id = Some("authoritative-run".to_string());
+        let full_text = "done";
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text,
+            tool_calls: &tool_calls,
+            server_execution_summary: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &error_message,
+            error_kind: None,
+        };
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "continue this session",
+            &[],
+            true,
+            p.ingest_mut(),
+        );
+        assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+        let summary = p.step_recorder.summary();
         assert_eq!(summary.session_id, "authoritative-session");
+        assert!(!p.step_recorder.events().is_empty());
+        assert!(
+            p.step_recorder
+                .events()
+                .iter()
+                .all(|event| event.run_id == "authoritative-run")
+        );
+    }
+
+    #[test]
+    fn server_execution_summary_is_observed_without_replaying_remote_work() {
+        let accum = ChatTurnSseAccum {
+            full_text: "completed remotely".to_string(),
+            server_loop_terminal: true,
+            server_execution_summary: Some(ServerLoopExecutionSummary {
+                tool_calls_count: 3,
+                observation_tool_calls_count: 2,
+                tools_used: vec!["agent".to_string(), "tool_search".to_string()],
+                llm_rounds: 4,
+                tool_ledger_receipt: crate::tool_ledger_receipt::ToolLedgerReceipt::new(
+                    "remote-run",
+                    1,
+                    3,
+                    3,
+                    0,
+                    crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                        succeeded: 3,
+                        ..Default::default()
+                    },
+                    3,
+                    crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+                    true,
+                ),
+                token_usage_coverage: None,
+                runtime_feedback: None,
+            }),
+            ..Default::default()
+        };
+        let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, Some(7));
+        let mut p = Pack::new();
+
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| panic!("Server-owned execution must not request an Edge tool"),
+            "delegate the work",
+            &[],
+            true,
+            p.ingest_mut(),
+        );
+
+        assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+        assert_eq!(p.total_tool_calls, 3);
+        assert_eq!(p.total_observation_tool_calls, 2);
+        assert_eq!(
+            p.all_tools_used,
+            HashSet::from(["agent".into(), "tool_search".into()])
+        );
+        assert_eq!(p.final_text, "completed remotely");
+        assert_eq!(p.messages.last().unwrap()["content"], "completed remotely");
+    }
+
+    #[test]
+    fn server_run_total_does_not_replace_host_recorded_physical_context() {
+        let summary = ServerLoopExecutionSummary {
+            tool_calls_count: 2,
+            observation_tool_calls_count: 0,
+            tools_used: vec!["agent".into()],
+            llm_rounds: 6,
+            tool_ledger_receipt: crate::tool_ledger_receipt::ToolLedgerReceipt::new(
+                "root-run",
+                1,
+                2,
+                2,
+                0,
+                crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                    succeeded: 2,
+                    ..Default::default()
+                },
+                2,
+                crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+                true,
+            ),
+            token_usage_coverage: None,
+            runtime_feedback: None,
+        };
+        let session_id = Some("s1".to_string());
+        let run_id = Some("root-run".to_string());
+        let error_message = None;
+        let tool_calls = Vec::new();
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text: "done",
+            tool_calls: &tool_calls,
+            server_execution_summary: Some(&summary),
+            prompt_tokens: 73_000,
+            completion_tokens: 2_000,
+            cache_read_tokens: 149_000,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &error_message,
+            error_kind: None,
+        };
+        let mut p = Pack::new();
+        // The admission host derived this from the terminal event's explicit
+        // last_request_usage: 1,700 fresh + 37,000 cached.
+        p.last_measured_prompt_tokens = Some(38_700);
+
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| panic!("server-owned execution must not request edge tools"),
+            "finish the delegated work",
+            &[],
+            true,
+            p.ingest_mut(),
+        );
+
+        assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+        assert_eq!(
+            p.total_prompt, 73_000,
+            "accounting still retains run totals"
+        );
+        assert_eq!(p.total_cache_read, 149_000);
+        assert_eq!(
+            p.last_measured_prompt_tokens,
+            Some(38_700),
+            "context calibration must retain the final root request, not root-plus-child usage"
+        );
     }
 
     #[test]
@@ -547,6 +753,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -578,6 +785,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 5,
             completion_tokens: 1,
             cache_read_tokens: 0,
@@ -613,6 +821,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -663,6 +872,7 @@ mod tests {
                 run_id: &None,
                 full_text: "",
                 tool_calls: &[],
+                server_execution_summary: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 cache_read_tokens: 0,
@@ -700,6 +910,7 @@ mod tests {
             run_id: &None,
             full_text: "ok",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 1,
             completion_tokens: 2,
             cache_read_tokens: 0,
@@ -738,6 +949,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -763,13 +975,18 @@ mod tests {
 
     #[test]
     fn has_tool_calls_from_server_tool_calls() {
-        let tcs = vec![json!({"name": "read_file", "arguments": {}})];
+        let tcs = vec![json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"}
+        })];
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
             session_id: &None,
             run_id: &None,
             full_text: "",
             tool_calls: &tcs,
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -793,11 +1010,10 @@ mod tests {
     }
 
     #[test]
-    fn has_tool_calls_canonicalizes_tool_names_before_recording() {
+    fn has_tool_calls_records_exact_canonical_tool_names() {
         let tcs = vec![
-            json!({"name": " read_file ", "arguments": {}}),
-            json!({"name": "read_file", "arguments": {}}),
-            json!({"name": " ", "arguments": {}}),
+            json!({"id": "call-1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "call-2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}),
         ];
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
@@ -805,6 +1021,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &tcs,
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -825,7 +1042,7 @@ mod tests {
         );
 
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
-        assert_eq!(pack.total_tool_calls, 3);
+        assert_eq!(pack.total_tool_calls, 2);
         assert_eq!(
             pack.all_tools_used,
             HashSet::from(["read_file".to_string()])
@@ -840,6 +1057,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -881,6 +1099,7 @@ mod tests {
             run_id: &None,
             full_text: "",
             tool_calls: &tcs,
+            server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -912,6 +1131,7 @@ mod tests {
             run_id: &None,
             full_text: "intermediate analysis before tool calls",
             tool_calls: &tcs,
+            server_execution_summary: None,
             prompt_tokens: 1,
             completion_tokens: 2,
             cache_read_tokens: 0,
@@ -947,6 +1167,7 @@ mod tests {
             run_id: &None,
             full_text: "Runtime follow-up without any new tool evidence.",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 10,
             completion_tokens: 5,
             cache_read_tokens: 0,
@@ -999,6 +1220,7 @@ mod tests {
             run_id: &None,
             full_text: "Updated answer for the user's follow-up.",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 10,
             completion_tokens: 5,
             cache_read_tokens: 0,
@@ -1041,6 +1263,7 @@ mod tests {
             run_id: &None,
             full_text: "Here are your recent PRs: ...",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 100,
             completion_tokens: 200,
             cache_read_tokens: 0,
@@ -1076,6 +1299,7 @@ mod tests {
             run_id: &None,
             full_text: "<ask_astra_data><query>previous task?</query></ask_astra_data>",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 10,
             completion_tokens: 20,
             cache_read_tokens: 0,
@@ -1133,6 +1357,7 @@ mod tests {
             run_id: &None,
             full_text: "turn1",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 100,
             completion_tokens: 50,
             cache_read_tokens: 80,
@@ -1190,6 +1415,7 @@ mod tests {
             run_id: &None,
             full_text: "test",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 500,
             completion_tokens: 200,
             cache_read_tokens: 0,
@@ -1222,6 +1448,7 @@ mod tests {
             run_id: &None,
             full_text: "response",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 500,
             completion_tokens: 200,
             cache_read_tokens: 400,
@@ -1255,6 +1482,7 @@ mod tests {
             run_id: &None,
             full_text: "t1",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 100,
             completion_tokens: 50,
             cache_read_tokens: 90,
@@ -1310,6 +1538,7 @@ mod tests {
             run_id: &run_id,
             full_text: "",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 100,
             completion_tokens: 0,
             cache_read_tokens: 0,
@@ -1341,6 +1570,7 @@ mod tests {
             run_id: &run_id,
             full_text: "done",
             tool_calls: &[],
+            server_execution_summary: None,
             prompt_tokens: 50,
             completion_tokens: 10,
             cache_read_tokens: 0,

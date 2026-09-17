@@ -206,9 +206,9 @@ impl std::fmt::Display for PermissionMode {
 impl std::str::FromStr for PermissionMode {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        match s {
             "auto" => Ok(Self::Auto),
-            "bypass" | "skip" => Ok(Self::Bypass),
+            "bypass" => Ok(Self::Bypass),
             "plan" => Ok(Self::Plan),
             "accept_edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
@@ -849,23 +849,31 @@ impl InheritedPermissions {
     /// Check if a tool is in the allowed_tools set (if set).
     pub fn is_tool_allowed_by_allowlist(&self, tool_name: &str) -> bool {
         match &self.allowed_tools {
-            Some(set) => set.contains(&tool_name.to_lowercase()),
+            Some(set) => set.contains("*") || set.contains(&tool_name.to_ascii_lowercase()),
             None => true, // No allowlist = all tools allowed
         }
     }
 
-    /// Set the tool allowlist. When set, only these tools may execute.
-    /// Used by the spawner to carry an agent type's `allowed_tools`
-    /// into the permission engine so the `ToolAllowlist` evaluation
-    /// step enforces it. This is the single source of truth for
-    /// execution-time tool restriction.
-    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
-        let set: HashSet<String> = tools
-            .into_iter()
-            .map(|t| t.trim().to_ascii_lowercase())
-            .filter(|t| !t.is_empty() && t != "*")
-            .collect();
-        self.allowed_tools = if set.is_empty() { None } else { Some(set) };
+    /// Narrow the inherited tool allowlist for a child execution.
+    ///
+    /// `*` means that the child adds no restriction; it never clears a parent
+    /// restriction. An explicit empty set permits no allowlist-governed tools.
+    /// This intersection is the permission boundary that prevents a child
+    /// profile or per-spawn override from widening its parent's authority.
+    pub fn constrain_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        let requested = crate::tool_allowlist::normalize_tool_names(tools);
+        let parent = self.allowed_tools.take().and_then(|tools| {
+            let tools = crate::tool_allowlist::normalize_tool_names(tools);
+            (!tools.contains("*")).then_some(tools)
+        });
+        if requested.contains("*") {
+            self.allowed_tools = parent;
+            return self;
+        }
+        self.allowed_tools = Some(match parent {
+            Some(parent) => parent.intersection(&requested).cloned().collect(),
+            None => requested,
+        });
         self
     }
 
@@ -1324,10 +1332,7 @@ mod tests {
         assert_eq!(parsed, PermissionMode::Bypass);
         assert_eq!(parsed.to_string(), "bypass");
         assert_eq!(parsed.chip_text(), "Bypass");
-        assert_eq!(
-            "skip".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Bypass
-        );
+        assert!("skip".parse::<PermissionMode>().is_err());
     }
 
     #[test]
@@ -1741,5 +1746,51 @@ mod tests {
         assert!(inherited.is_tool_allowed_by_allowlist("grep"));
         assert!(!inherited.is_tool_allowed_by_allowlist("bash"));
         assert!(!inherited.is_tool_allowed_by_allowlist("str_replace"));
+    }
+
+    #[test]
+    fn child_tool_constraint_intersects_parent_and_never_expands_wildcard() {
+        let parent = InheritedPermissions {
+            allowed_tools: Some(
+                [" READ_FILE ", "WEB_FETCH"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        let narrowed = parent
+            .clone()
+            .constrain_allowed_tools(["web_fetch".to_string(), "bash".to_string()]);
+        assert_eq!(
+            narrowed.allowed_tools,
+            Some(["web_fetch".to_string()].into_iter().collect())
+        );
+
+        let wildcard = parent.constrain_allowed_tools(["*".to_string()]);
+        assert_eq!(
+            wildcard.allowed_tools,
+            Some(
+                ["read_file", "web_fetch"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
+
+        let none =
+            InheritedPermissions::default().constrain_allowed_tools(std::iter::empty::<String>());
+        assert_eq!(none.allowed_tools, Some(HashSet::new()));
+
+        let legacy_wildcard = InheritedPermissions {
+            allowed_tools: Some(["*".to_string()].into_iter().collect()),
+            ..Default::default()
+        }
+        .constrain_allowed_tools(["bash".to_string()]);
+        assert_eq!(
+            legacy_wildcard.allowed_tools,
+            Some(["bash".to_string()].into_iter().collect())
+        );
     }
 }

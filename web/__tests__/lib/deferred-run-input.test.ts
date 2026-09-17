@@ -975,7 +975,7 @@ describe('queueDeferredRunInput', () => {
       total: 1,
       limit: 200,
     });
-    const resumeRun = vi.fn().mockResolvedValue(undefined);
+    const resumeRun = vi.fn().mockResolvedValue({ status: "running", disposition: "applied" });
 
     mockGetRuntimeClient.mockResolvedValue({
       sdk: { listRuntimeSessions, listRuns },

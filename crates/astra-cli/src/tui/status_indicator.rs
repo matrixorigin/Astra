@@ -321,7 +321,6 @@ fn label_for_tool(name: &str) -> String {
         "str_replace" => "Editing".into(),
         "grep" | "glob" => "Searching".into(),
         "list_dir" => "Listing".into(),
-        "task_board" => "Tracking".into(),
         "memory" => "Recalling".into(),
         "tool_search" => "Loading tool".into(),
         _ => format!("Running {name}"),
@@ -770,7 +769,6 @@ mod tests {
             ("grep", "Searching"),
             ("glob", "Searching"),
             ("list_dir", "Listing"),
-            ("task_board", "Tracking"),
             ("memory", "Recalling"),
             ("tool_search", "Loading tool"),
             // Unknown plugin tool — fall back to Running.

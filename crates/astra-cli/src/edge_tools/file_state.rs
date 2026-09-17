@@ -5,8 +5,11 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+
+use sha2::{Digest, Sha256};
 
 use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
 
@@ -22,6 +25,22 @@ const MAX_CACHED_FILE_BYTES: usize = 256 * 1024;
 /// When exceeded, cached content is evicted from the oldest entries first,
 /// keeping metadata intact for staleness tracking.
 const MAX_TOTAL_CACHED_BYTES: usize = 8 * 1024 * 1024;
+/// Bound per-file pagination history. If a file has more disjoint pages than
+/// this, coverage tracking stops adding new intervals rather than growing
+/// memory with model-controlled requests.
+const MAX_DELIVERED_LINE_RANGES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DeliveredLineRange {
+    pub(super) start: u64,
+    pub(super) end: u64,
+}
+
+impl DeliveredLineRange {
+    fn overlaps(self, other: Self) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
 
 /// Tracks the last-read state of a file for staleness detection and caching.
 pub(crate) struct FileState {
@@ -32,17 +51,69 @@ pub(crate) struct FileState {
     pub(super) from_read: bool,
     /// True if the last read was a partial view (outline, line range).
     pub(super) is_partial: bool,
+    /// Whether the current content identity is known in full.  This is
+    /// monotonic across partial reads of the same bytes: a range read must not
+    /// erase authority established by a complete read or content-bearing
+    /// write.  A changed digest clears it, so a partial view of a new file
+    /// cannot be used to authorize an overwrite.
+    pub(super) full_content_known: bool,
     /// How many times this file has been fully read.
     /// Used for escalating warnings when the model loops on the same file.
     pub(super) read_count: u32,
-    /// How many times this file has been read with different ranges.
-    /// Used to nudge the model toward grep for large files.
-    pub(super) ranged_read_count: u32,
+    /// Bounded union of source line intervals actually returned for the
+    /// current content digest. Partial/truncated lines are never included.
+    pub(super) delivered_line_ranges: Vec<DeliveredLineRange>,
     /// Cached full file content. Stored on reads/writes when the full content
     /// is available and fits within `MAX_CACHED_FILE_BYTES`. Serves subsequent
     /// reads without disk I/O when mtime is unchanged. Cached bytes are still
     /// returned to the caller; cache state never implies prompt visibility.
     pub(super) cached_content: Option<String>,
+    /// Digest of the bytes on disk when this state was recorded. Metadata is
+    /// only a fast hint: filesystems and external tools can preserve or
+    /// coarsen mtimes, so content identity is the correctness boundary.
+    pub(super) content_sha256: Option<[u8; 32]>,
+}
+
+fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
+}
+
+fn content_sha256(content: &[u8]) -> [u8; 32] {
+    Sha256::digest(content).into()
+}
+
+fn insert_delivered_line_range(
+    ranges: &mut Vec<DeliveredLineRange>,
+    mut inserted: DeliveredLineRange,
+) {
+    let mut index = 0;
+    while index < ranges.len() {
+        let existing = ranges[index];
+        let disjoint = existing.end.saturating_add(1) < inserted.start
+            || inserted.end.saturating_add(1) < existing.start;
+        if disjoint {
+            index += 1;
+            continue;
+        }
+        inserted.start = inserted.start.min(existing.start);
+        inserted.end = inserted.end.max(existing.end);
+        ranges.remove(index);
+    }
+    if ranges.len() == MAX_DELIVERED_LINE_RANGES {
+        return;
+    }
+    ranges.push(inserted);
+    ranges.sort_unstable_by_key(|range| range.start);
 }
 
 impl ToolExecutor {
@@ -130,33 +201,94 @@ impl ToolExecutor {
 
     /// Record file state after a read.
     pub(super) fn record_read(&self, path: &Path, is_partial: bool) {
-        self.record_read_impl(path, is_partial, None);
+        self.record_read_impl(path, is_partial, None, None);
     }
 
     /// Record file state after a read, caching the full file content for
     /// subsequent reads without disk I/O. Content is only cached if it fits
     /// within the per-file size limit (`MAX_CACHED_FILE_BYTES`).
     pub(super) fn record_read_cached(&self, path: &Path, is_partial: bool, content: String) {
-        self.record_read_impl(path, is_partial, Some(content));
+        self.record_read_impl(path, is_partial, Some(content), None);
     }
 
-    fn record_read_impl(&self, path: &Path, is_partial: bool, content: Option<String>) {
+    /// Record a ranged read and return whether any successfully delivered
+    /// source line overlapped an earlier delivered interval for the same file
+    /// content. Disjoint pages therefore do not trigger a redundant-read
+    /// warning.
+    pub(super) fn record_read_with_delivery_range_cached(
+        &self,
+        path: &Path,
+        is_partial: bool,
+        content: String,
+        delivered_range: Option<DeliveredLineRange>,
+    ) -> bool {
+        self.record_read_impl(path, is_partial, Some(content), delivered_range)
+    }
+
+    fn record_read_impl(
+        &self,
+        path: &Path,
+        is_partial: bool,
+        content: Option<String>,
+        delivered_range: Option<DeliveredLineRange>,
+    ) -> bool {
         let ts = Self::file_mtime_ms(path);
+        // A supplied content value is the executor's captured full-file
+        // snapshot.  It is the only bytes the model was actually shown and
+        // must therefore define the read authority.  Re-reading the path here
+        // would bind the authority to a later concurrent write instead.
+        // Callers that do not own a captured snapshot use the on-disk digest.
+        let content_sha256 = content
+            .as_ref()
+            .map(|content| content_sha256(content.as_bytes()))
+            .or_else(|| file_content_sha256(path));
+        let content_line_count = content.as_deref().map(|value| value.lines().count() as u64);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
+        let mut overlapped = false;
         if let Ok(mut state) = self.file_state.lock() {
             let prev = state.get(&key);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
-            let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
+            let same_content = content_sha256.is_some()
+                && prev.is_some_and(|previous| previous.content_sha256 == content_sha256);
+            let mut delivered_line_ranges = if same_content {
+                prev.map(|previous| previous.delivered_line_ranges.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let delivered_range = delivered_range.or_else(|| {
+                if is_partial {
+                    return None;
+                }
+                let line_count = content_line_count?;
+                (line_count > 0).then_some(DeliveredLineRange {
+                    start: 1,
+                    end: line_count,
+                })
+            });
+            if let Some(delivered_range) =
+                delivered_range.filter(|range| range.start > 0 && range.end >= range.start)
+            {
+                overlapped = same_content
+                    && delivered_line_ranges
+                        .iter()
+                        .any(|previous| previous.overlaps(delivered_range));
+                insert_delivered_line_range(&mut delivered_line_ranges, delivered_range);
+            }
             let new_count = if is_partial {
                 prev_count
             } else {
                 prev_count + 1
             };
-            let new_ranged = if is_partial {
-                prev_ranged + 1
+            let full_content_known = if is_partial {
+                prev.is_some_and(|previous| {
+                    previous.full_content_known
+                        && previous.content_sha256.is_some()
+                        && previous.content_sha256 == content_sha256
+                })
             } else {
-                prev_ranged
+                content_sha256.is_some()
             };
             state.insert(
                 key,
@@ -164,13 +296,16 @@ impl ToolExecutor {
                     timestamp_ms: ts,
                     from_read: true,
                     is_partial,
+                    full_content_known,
                     read_count: new_count,
-                    ranged_read_count: new_ranged,
+                    delivered_line_ranges,
                     cached_content,
+                    content_sha256,
                 },
             );
             enforce_limits(&mut state);
         }
+        overlapped
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
@@ -188,6 +323,9 @@ impl ToolExecutor {
             None => self.passive_lsp.sync_after_write(&self.project_root, path),
         }
         let ts = Self::file_mtime_ms(path);
+        let content_sha256 = content
+            .map(|content| content_sha256(content.as_bytes()))
+            .or_else(|| file_content_sha256(path));
         let cached_content = content
             .filter(|c| c.len() <= MAX_CACHED_FILE_BYTES)
             .map(String::from);
@@ -199,9 +337,11 @@ impl ToolExecutor {
                     timestamp_ms: ts,
                     from_read: false,
                     is_partial: false,
+                    full_content_known: content_sha256.is_some(),
                     read_count: 0,
-                    ranged_read_count: 0,
+                    delivered_line_ranges: Vec::new(),
                     cached_content,
+                    content_sha256,
                 },
             );
             enforce_limits(&mut state);
@@ -229,11 +369,15 @@ impl ToolExecutor {
         if current_ts == 0 {
             return Ok(()); // file doesn't exist yet — ok for write_file
         }
+        let current_sha256 = file_content_sha256(path);
         let key = self.file_state_key(path);
         let rel = self.project_relative_display(path);
         if let Ok(state) = self.file_state.lock() {
             if let Some(fs) = state.get(&key) {
-                if current_ts > fs.timestamp_ms {
+                if current_ts != fs.timestamp_ms
+                    || fs.content_sha256.is_none()
+                    || current_sha256 != fs.content_sha256
+                {
                     return Err(format!(
                         "File has been modified since last read (by user or linter). \
                          Read it again before editing.\n\
@@ -270,7 +414,7 @@ impl ToolExecutor {
         self.file_state
             .lock()
             .ok()
-            .and_then(|s| s.get(&key).map(|fs| !fs.is_partial))
+            .and_then(|s| s.get(&key).map(|fs| fs.full_content_known))
             .unwrap_or(false)
     }
 
@@ -284,15 +428,6 @@ impl ToolExecutor {
             .unwrap_or(0)
     }
 
-    /// How many times this file has been read with different ranges.
-    pub(super) fn file_ranged_read_count(&self, path: &Path) -> u32 {
-        let key = self.file_state_key(path);
-        self.file_state
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&key).map(|fs| fs.ranged_read_count))
-            .unwrap_or(0)
-    }
     /// Try to retrieve cached file content. Returns `Some(content)` if:
     /// - The file was previously read or written with content caching
     /// - The content was small enough to be cached
@@ -305,10 +440,11 @@ impl ToolExecutor {
         if current_ts == 0 {
             return None;
         }
+        let current_sha256 = file_content_sha256(path)?;
         let key = self.file_state_key(path);
         self.file_state.lock().ok().and_then(|s| {
             s.get(&key).and_then(|fs| {
-                if fs.timestamp_ms == current_ts {
+                if fs.timestamp_ms == current_ts && Some(current_sha256) == fs.content_sha256 {
                     fs.cached_content.clone()
                 } else {
                     None
@@ -396,6 +532,7 @@ fn enforce_limits(state: &mut HashMap<PathBuf, FileState>) {
 
 #[cfg(test)]
 mod tests {
+    use super::DeliveredLineRange;
     use crate::lock_recovery::LockRecovery;
 
     // ── Shared file-state across subtask turns ───────────────────────────
@@ -501,6 +638,100 @@ mod tests {
     }
 
     #[test]
+    fn delivered_line_coverage_is_bounded_and_resets_when_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("paged.txt");
+        let original = (1..=200)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &original).unwrap();
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+
+        for (start, end) in [(1, 76), (77, 145), (146, 186)] {
+            assert!(!exe.record_read_with_delivery_range_cached(
+                &file,
+                true,
+                original.clone(),
+                Some(DeliveredLineRange { start, end }),
+            ));
+        }
+        assert!(exe.record_read_with_delivery_range_cached(
+            &file,
+            true,
+            original.clone(),
+            Some(DeliveredLineRange {
+                start: 180,
+                end: 190
+            }),
+        ));
+
+        let key = exe.file_state_key(&file);
+        assert_eq!(
+            exe.file_state
+                .lock_recover()
+                .get(&key)
+                .unwrap()
+                .delivered_line_ranges,
+            vec![DeliveredLineRange { start: 1, end: 190 }],
+            "overlapping intervals should coalesce instead of accumulating"
+        );
+
+        let changed = "new version\nsecond line\n".to_string();
+        std::fs::write(&file, &changed).unwrap();
+        assert!(!exe.record_read_with_delivery_range_cached(
+            &file,
+            true,
+            changed,
+            Some(DeliveredLineRange { start: 1, end: 2 }),
+        ));
+        assert_eq!(
+            exe.file_state
+                .lock_recover()
+                .get(&key)
+                .unwrap()
+                .delivered_line_ranges,
+            vec![DeliveredLineRange { start: 1, end: 2 }],
+            "old line coverage must not carry across a new content digest"
+        );
+    }
+
+    #[test]
+    fn cached_file_bytes_are_rejected_when_content_changes_without_mtime_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cached.rs");
+        std::fs::write(&file, "old bytes\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe.record_read_cached(&file, false, "old bytes\n".to_string());
+        let original_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        std::fs::write(&file, "new bytes\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|file| file.set_modified(original_mtime))
+            .unwrap();
+
+        assert_eq!(
+            crate::edge_tools::ToolExecutor::file_mtime_ms(&file),
+            exe.file_state
+                .lock_recover()
+                .get(&exe.file_state_key(&file))
+                .unwrap()
+                .timestamp_ms,
+            "test setup must keep the metadata identity unchanged"
+        );
+        assert!(
+            exe.get_cached_content(&file).is_none(),
+            "content identity, not mtime alone, must guard replay"
+        );
+        assert!(
+            exe.check_staleness(&file).is_err(),
+            "read-before-write evidence must also reject same-mtime external edits"
+        );
+    }
+
+    #[test]
     fn record_write_replaces_prior_read_state() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("write.rs");
@@ -516,5 +747,66 @@ mod tests {
         let fs = state.get(&key).unwrap();
         assert!(!fs.from_read);
         assert_eq!(fs.read_count, 0);
+    }
+
+    #[test]
+    fn partial_read_does_not_erase_complete_content_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "complete bytes\nsecond line\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe.record_write_with_content(&file, "complete bytes\nsecond line\n");
+        exe.record_read_cached(&file, true, "complete bytes\nsecond line\n".to_string());
+
+        assert!(exe.was_fully_read(&file));
+        assert!(exe.check_staleness(&file).is_ok());
+    }
+
+    #[test]
+    fn initial_partial_read_never_authorizes_full_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "complete bytes\nsecond line\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe.record_read_cached(&file, true, "complete bytes\nsecond line\n".to_string());
+
+        assert!(!exe.was_fully_read(&file));
+        assert!(exe.check_staleness(&file).is_ok());
+    }
+
+    #[test]
+    fn changed_content_clears_complete_authority_even_after_partial_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        std::fs::write(&file, "v1\nrest\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        exe.record_read(&file, false);
+        std::fs::write(&file, "v2\nrest\n").unwrap();
+        exe.record_read_cached(&file, true, "v2\nrest\n".to_string());
+
+        assert!(!exe.was_fully_read(&file));
+        assert!(exe.check_staleness(&file).is_ok());
+    }
+
+    #[test]
+    fn captured_read_snapshot_wins_over_later_disk_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("race.txt");
+        std::fs::write(&file, "version one\n").unwrap();
+
+        let exe = crate::edge_tools::ToolExecutor::new(dir.path());
+        // The owner captured v1, then another writer changed the path before
+        // the read record was committed.  The stale v1 authority must not
+        // silently follow the new bytes on disk.
+        std::fs::write(&file, "version two\n").unwrap();
+        exe.record_read_cached(&file, false, "version one\n".to_string());
+
+        assert!(
+            exe.check_staleness(&file).is_err(),
+            "a read snapshot must be invalidated by a later disk write"
+        );
     }
 }

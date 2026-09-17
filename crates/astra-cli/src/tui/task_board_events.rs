@@ -15,7 +15,7 @@
 //! rather than position, so a board reshuffled by priority doesn't
 //! spuriously fire Created/Removed pairs.
 
-use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind};
+use super::work_board_projection::{SessionTask, SessionTaskStatusKind};
 
 /// One thing the observer detected between two snapshots. Ordered
 /// oldest first so the ring buffer trims from the front.
@@ -87,12 +87,11 @@ pub(crate) fn diff(prev: &[SessionTask], new: &[SessionTask]) -> Vec<TaskBoardEv
 
 #[cfg(test)]
 mod tests {
+    use super::super::work_board_projection::SessionTask;
     use super::{TaskBoardEvent, diff};
-    use astra_tools::task_mgmt::SessionTask;
 
     fn task(id: &str, title: &str, status: &str) -> SessionTask {
         SessionTask {
-            archived_at: None,
             id: id.into(),
             title: title.into(),
             description: None,
@@ -136,11 +135,11 @@ mod tests {
                 assert_eq!(task_id, "task-1");
                 assert_eq!(
                     from,
-                    &astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+                    &super::super::work_board_projection::SessionTaskStatusKind::Pending
                 );
                 assert_eq!(
                     to,
-                    &astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+                    &super::super::work_board_projection::SessionTaskStatusKind::InProgress
                 );
             }
             other => panic!("expected StatusChanged, got {other:?}"),

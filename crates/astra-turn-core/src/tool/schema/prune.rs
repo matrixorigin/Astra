@@ -24,7 +24,11 @@ fn index_schemas_by_name(all_schemas: &[Value]) -> HashMap<&str, &Value> {
 /// Prune tool schemas under token pressure to reduce context size.
 /// - `TrimSchemas` tier: truncate descriptions to first sentence
 /// - `CompactHistory` tier: truncate descriptions + strip property descriptions
-/// - `AggressivePrune` tier: truncate + remove optional parameters
+/// - `AggressivePrune` tier: remove function and property descriptions
+///
+/// Schema shape is an invocation contract, not expendable prose. Pressure may
+/// reduce descriptions, but must not remove parameters, enums, bounds, or
+/// action branches from a tool that remains visible.
 pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
     match tier {
         CompactionTier::Normal => tools.to_vec(),
@@ -67,7 +71,6 @@ pub fn prune_tool_schemas(tools: &[Value], tier: CompactionTier) -> Vec<Value> {
                     if let Some(obj) = func.as_object_mut() {
                         obj.remove("description");
                     }
-                    strip_optional_params(func);
                     strip_property_descriptions(func);
                 }
                 t
@@ -140,87 +143,6 @@ fn truncate_to_first_sentence(desc: &str) -> &str {
     }
 }
 
-fn strip_optional_params(func: &mut Value) {
-    if let Some(params) = func.get_mut("parameters").and_then(Value::as_object_mut) {
-        let required = collect_required_union(params);
-
-        if let Some(props) = params.get_mut("properties").and_then(Value::as_object_mut) {
-            let keys_to_remove: Vec<String> = props
-                .keys()
-                .filter(|k| !required.contains(k.as_str()))
-                .cloned()
-                .collect();
-            for key in keys_to_remove {
-                props.remove(&key);
-            }
-        }
-    }
-}
-
-/// Collect every field name that's required by *any* action of the
-/// schema — top-level `required`, every field in the per-action required map,
-/// and every field in the per-action alternative groups.
-///
-/// Background: we originally encoded per-action required fields via
-/// JSON-Schema `allOf + if/then/required`, but Anthropic/Bedrock
-/// reject those keywords at the top level of `input_schema` (HTTP
-/// 400: "input_schema does not support oneOf, allOf, or anyOf at
-/// the top level"). The vendor-prefixed extension (`x-...`) is
-/// ignored by providers but honoured here so `AggressivePrune`
-/// doesn't strip per-action required properties when the LLM is
-/// under context pressure.
-///
-/// Note: the extension key is deliberately a single constant
-/// (`PER_ACTION_REQUIRED_KEY`) so schema producers and pruners stay in
-/// lockstep.
-pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
-
-/// Per-action alternatives where at least one field group must be present.
-///
-/// Shape: `{ "action": [["field_a"], ["field_b", "field_c"]] }`.
-/// Each inner array is one valid alternative; every field in the selected
-/// alternative is required. This complements [`PER_ACTION_REQUIRED_KEY`]
-/// without relying on provider-specific support for JSON-Schema composition.
-pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
-
-pub fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
-    let mut union: HashSet<String> = HashSet::new();
-    if let Some(arr) = params.get("required").and_then(Value::as_array) {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                union.insert(s.to_string());
-            }
-        }
-    }
-    if let Some(map) = params
-        .get(PER_ACTION_REQUIRED_KEY)
-        .and_then(Value::as_object)
-    {
-        for (_action, fields) in map {
-            if let Some(arr) = fields.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        union.insert(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if let Some(map) = params
-        .get(PER_ACTION_ANY_OF_REQUIRED_KEY)
-        .and_then(Value::as_object)
-    {
-        for alternatives in map.values().filter_map(Value::as_array) {
-            for fields in alternatives.iter().filter_map(Value::as_array) {
-                for field in fields.iter().filter_map(Value::as_str) {
-                    union.insert(field.to_string());
-                }
-            }
-        }
-    }
-    union
-}
-
 fn strip_property_descriptions(func: &mut Value) {
     if let Some(props) = func
         .get_mut("parameters")
@@ -235,19 +157,31 @@ fn strip_property_descriptions(func: &mut Value) {
     }
 }
 
-/// Ensure tool schemas for previously-invoked tools remain available in follow-up turns.
+/// Ensure schemas for previously-invoked *direct* tools remain available in a
+/// follow-up request.
 ///
 /// When the tool surface includes a fresh set of tools for the next LLM round it may drop
 /// tools the LLM already called (because the query shifted). This function retains
-/// those schemas so the LLM can continue using them. Mutates `surface` and `report`
-/// in-place, returning the count of schemas that were added.
+/// those schemas so the LLM can continue using them. A deferred target invoked
+/// through the stable `invoke_tool` carrier is deliberately not retained: its
+/// logical name appears in a tool result, but it was not a provider-visible
+/// schema in the preceding request. Re-inserting it would turn a typed carrier
+/// activation into schema churn and would make the next request's cacheable
+/// tool prefix depend on the prior call.
+///
+/// `previous_visible_schemas` is the exact provider surface from the preceding
+/// request.  It is structural evidence, not a name-pattern heuristic.  The
+/// snapshot matters: rehydrating from `all_schemas` can replace a compact or
+/// provider-specific schema with a much larger canonical one.
+/// Mutates `surface` and `report` in-place, returning the count of schemas that
+/// were added.
 pub fn retain_invoked_tool_schemas(
     surface: &mut Vec<Value>,
     report: &mut ToolSelectionReport,
     tool_results: &[Value],
-    all_schemas: &[Value],
+    previous_visible_schemas: &[Value],
 ) -> u32 {
-    let schema_index = index_schemas_by_name(all_schemas);
+    let schema_index = index_schemas_by_name(previous_visible_schemas);
     let mut visible_names: HashSet<String> = surface
         .iter()
         .filter_map(|s| tool_schema_name(s).map(String::from))
@@ -471,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_aggressive_strips_optional_params() {
+    fn prune_aggressive_removes_prose_but_preserves_schema_shape() {
         let tools = vec![make_tool_schema(
             "bash",
             "Execute shell commands. Supports all standard Unix tools.",
@@ -486,8 +420,8 @@ mod tests {
         assert!(
             result[0]["function"]["parameters"]["properties"]
                 .get("timeout")
-                .is_none(),
-            "AggressivePrune should strip optional params"
+                .is_some(),
+            "pressure must not remove an optional invocation capability"
         );
         assert!(
             result[0]["function"]["parameters"]["properties"]
@@ -497,14 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_aggressive_keeps_per_action_required_fields() {
-        // Regression: consolidated tools express per-action required
-        // via the `x-astra-per-action-required` vendor extension
-        // (moved from `allOf` because Bedrock HTTP 400s on top-level
-        // allOf/oneOf/anyOf). If AggressivePrune only looked at
-        // top-level `required`, the LLM would lose the ability to
-        // call `agent spawn` (description/prompt stripped), `git
-        // commit` (message stripped), etc. under context pressure.
+    fn prune_aggressive_preserves_all_action_fields() {
         let tool = json!({
             "type": "function",
             "function": {
@@ -534,8 +461,8 @@ mod tests {
         });
         let result = prune_tool_schemas(&[tool], CompactionTier::AggressivePrune);
         let props = &result[0]["function"]["parameters"]["properties"];
-        // Union of every per-action required list must survive
-        // pruning even though they aren't in top-level `required`.
+        // Required, conditionally required, and optional fields are all part
+        // of the already-admitted tool contract and must survive pressure.
         assert!(
             props.get("description").is_some(),
             "description must survive"
@@ -551,11 +478,40 @@ mod tests {
             props.get("action").is_some(),
             "action (top-level required) must survive"
         );
-        // Pure optional stays stripped.
         assert!(
-            props.get("name").is_none(),
-            "purely-optional props still get pruned"
+            props.get("name").is_some(),
+            "purely optional fields are still invocation capabilities"
         );
+    }
+
+    #[test]
+    fn prune_aggressive_preserves_optional_only_schema() {
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "observe",
+                "description": "Read one of several bounded observations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "artifact": {"type": "string", "description": "Opaque handle."},
+                        "offset": {"type": "integer", "minimum": 0},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        });
+
+        let result = prune_tool_schemas(&[tool], CompactionTier::AggressivePrune);
+        let function = &result[0]["function"];
+        let properties = &function["parameters"]["properties"];
+        assert!(function.get("description").is_none());
+        assert!(properties["artifact"].get("description").is_none());
+        assert_eq!(properties["offset"]["minimum"], 0);
+        assert_eq!(properties["max_bytes"]["minimum"], 1);
+        assert_eq!(properties["max_bytes"]["maximum"], 65_536);
+        assert_eq!(function["parameters"]["additionalProperties"], false);
     }
 
     #[test]
@@ -631,6 +587,28 @@ mod tests {
     }
 
     #[test]
+    fn retain_reuses_exact_previous_schema_projection() {
+        let compact = make_tool_schema("git", "compact provider projection", false);
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = ToolSelectionReport {
+            visible_tools: vec!["bash".into()],
+            visible_count: 1,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
+        };
+
+        let retained = retain_invoked_tool_schemas(
+            &mut selected,
+            &mut report,
+            &[json!({"name": "git"})],
+            std::slice::from_ref(&compact),
+        );
+
+        assert_eq!(retained, 1);
+        assert_eq!(selected.last(), Some(&compact));
+    }
+
+    #[test]
     fn retain_does_not_duplicate_already_selected() {
         let all = vec![make_tool_schema("bash", "run", false)];
         let mut selected = vec![make_tool_schema("bash", "run", false)];
@@ -689,7 +667,7 @@ mod tests {
     /// updated, causing N duplicate schemas → LLM 400 "function name duplicated".
     #[test]
     fn retain_deduplicates_same_tool_in_multiple_results() {
-        let all = vec![
+        let all = [
             make_tool_schema("bash", "run", false),
             make_tool_schema("git", "version control", false),
         ];
@@ -712,6 +690,34 @@ mod tests {
             1,
             "git should appear once in report"
         );
+    }
+
+    #[test]
+    fn retain_does_not_materialize_deferred_carrier_target() {
+        let all = [
+            make_tool_schema("bash", "run", false),
+            make_tool_schema("git", "version control", false),
+        ];
+        let mut selected = vec![make_tool_schema("bash", "run", false)];
+        let mut report = ToolSelectionReport {
+            visible_tools: vec!["bash".into(), "invoke_tool".into()],
+            visible_count: 2,
+            schema_budget_used: 0,
+            schema_budget_total: 100,
+        };
+        let results = vec![json!({"name": "git"})];
+        let previous_visible_schemas = vec![all[0].clone()];
+        let retained = retain_invoked_tool_schemas(
+            &mut selected,
+            &mut report,
+            &results,
+            &previous_visible_schemas,
+        );
+
+        assert_eq!(retained, 0);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.visible_count, 2);
+        assert!(!report.visible_tools.iter().any(|name| name == "git"));
     }
 
     // ── inject_skill_allowed_tools ────────────────────────────

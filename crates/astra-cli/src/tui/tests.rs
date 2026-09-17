@@ -346,28 +346,32 @@ mod stream_bridge_tests {
             .unwrap();
         drop(stream_tx);
 
-        // Receive: should get Token, Token, TurnStreamClosed in order. Durable
-        // turn completion is owned by the turn-settlement path, not this bridge.
-        let mut events = Vec::new();
+        // Adjacent token deltas may be coalesced before they reach the
+        // foreground reducer. Durable turn completion is owned by the
+        // turn-settlement path, not this bridge.
+        let mut token_text = String::new();
+        let mut token_batches = 0usize;
+        let mut stream_closed = false;
         while let Some(evt) = tui_rx.recv().await {
-            let is_closed = matches!(evt, TuiAppEvent::TurnStreamClosed);
-            events.push(evt);
-            if is_closed {
-                break;
+            match evt {
+                TuiAppEvent::Token(text) => {
+                    token_batches += 1;
+                    token_text.push_str(&text);
+                }
+                TuiAppEvent::TurnStreamClosed => {
+                    stream_closed = true;
+                    break;
+                }
+                _ => {}
             }
         }
 
+        assert_eq!(token_text, "hello world");
         assert!(
-            events.len() >= 3,
-            "expected at least 3 events, got {}",
-            events.len()
+            (1..=2).contains(&token_batches),
+            "the bridge may observe one or two producer sends, got {token_batches}"
         );
-        assert!(matches!(&events[0], TuiAppEvent::Token(t) if t == "hello "));
-        assert!(matches!(&events[1], TuiAppEvent::Token(t) if t == "world"));
-        assert!(matches!(
-            &events[events.len() - 1],
-            TuiAppEvent::TurnStreamClosed
-        ));
+        assert!(stream_closed, "bridge must emit its terminal marker");
     }
 }
 

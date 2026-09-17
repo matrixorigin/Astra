@@ -151,5 +151,5 @@ pub async fn run_team_http_negative_paths() {
         "adversarial member count: {adv_j}"
     );
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

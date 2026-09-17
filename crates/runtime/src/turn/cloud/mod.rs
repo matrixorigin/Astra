@@ -4,7 +4,7 @@
 //!
 //! | Position | Layer                     | Trigger (pressure) | Behaviour |
 //! |----------|---------------------------|---------------------|-----------|
-//! | 1        | DuplicateReadElimination  | Tier × 0.625       | Merge consecutive read_file results with same path |
+//! | 1        | DuplicateToolOutputElimination  | Tier × 0.625       | Reference byte-identical output by call ID |
 //! | 2        | ToolResultTruncation      | Tier × 0.75        | Truncate old tool results to max length |
 //! | 3        | TieredCompaction          | Tier × 0.9375      | Drop middle turns; insert boundary marker |
 //! | 4        | ReactiveCompact           | 0.95                | Emergency: keep only last 4 messages |
@@ -34,5 +34,5 @@ pub mod session_end_governance;
 pub use compaction_engine::CompactionEngine;
 /// Re-export layers for tests and direct consumers.
 pub use layers::{
-    DuplicateReadElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
+    DuplicateToolOutputElimination, ReactiveCompact, TieredCompaction, ToolResultTruncation,
 };

@@ -204,6 +204,34 @@ pub struct ToolExecutionService {
 }
 
 impl ToolExecutionService {
+    /// Read existing durable Edge authority; this never creates or completes a
+    /// second invocation. Callers must check authenticated ownership first.
+    pub(crate) async fn edge_completion_result(
+        &self,
+        reference: &astra_turn_types::task_resolution::EdgeDispatchCompletionRef,
+    ) -> Result<astra_thin_client::ToolResultRequest, String> {
+        let service = self
+            .edge_dispatch_service
+            .as_ref()
+            .ok_or("edge evidence authority unavailable")?;
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            &reference.identity.user_id,
+            &reference.identity.session_id,
+            &reference.identity.run_id,
+            &reference.identity.turn_chain_id,
+            &reference.identity.invocation_id,
+        );
+        let json = service
+            .wait_result(&identity, std::time::Duration::ZERO)
+            .await?
+            .ok_or("durable edge evidence missing")?;
+        let result = canonical_edge_completion(&identity, &reference.edge_agent_id, &json)?;
+        if result.result_hash != reference.result_hash {
+            return Err("edge evidence does not match retained completion hash".into());
+        }
+        Ok(result)
+    }
+
     pub fn builder() -> ToolExecutionServiceBuilder {
         ToolExecutionServiceBuilder::default()
     }
@@ -218,6 +246,73 @@ impl ToolExecutionService {
     pub fn new() -> Self {
         Self::builder().build()
     }
+}
+
+/// Validate the existing canonical Edge result format at every durable reader.
+pub(crate) fn edge_completion_reference(
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    result: &astra_thin_client::ToolResultRequest,
+) -> Result<astra_turn_types::task_resolution::ToolExecutionEvidenceRef, String> {
+    // Called only after durable acceptance or canonical durable read. Never
+    // attach this reference to a merely process-local callback.
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        &identity.user_id,
+        &identity.session_id,
+        &identity.run_id,
+        &identity.turn_chain_id,
+        &identity.request_id,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(
+        astra_turn_types::task_resolution::ToolExecutionEvidenceRef::EdgeDispatch(
+            astra_turn_types::task_resolution::EdgeDispatchCompletionRef {
+                identity,
+                edge_agent_id: result.edge_agent_id.clone(),
+                result_hash: result.result_hash.clone(),
+            },
+        ),
+    )
+}
+
+/// Validate the existing canonical Edge result format at every durable reader.
+pub(crate) fn canonical_edge_completion(
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    expected_edge_agent_id: &str,
+    result_json: &str,
+) -> Result<astra_thin_client::ToolResultRequest, String> {
+    let result = serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json)
+        .map_err(|error| format!("invalid ToolResultRequest JSON: {error}"))?;
+    if !identity.is_complete()
+        || expected_edge_agent_id.trim().is_empty()
+        || result.session_id != identity.session_id
+        || result.run_id != identity.run_id
+        || result.turn_chain_id != identity.turn_chain_id
+        || result.request_id != identity.request_id
+    {
+        return Err("durable tool result identity does not match its dispatch".into());
+    }
+    if result.edge_agent_id != expected_edge_agent_id {
+        return Err("durable tool result executor custody does not match its dispatch".into());
+    }
+    astra_thin_client::tool_result_status_is_error(&result.status)
+        .ok_or("durable tool result status is not canonical")?;
+    let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+        astra_thin_client::ToolResultHashParts {
+            session_id: &result.session_id,
+            run_id: &result.run_id,
+            turn_chain_id: &result.turn_chain_id,
+            request_id: &result.request_id,
+            edge_agent_id: &result.edge_agent_id,
+            status: &result.status,
+            output: &result.output,
+            duration_ms: result.duration_ms,
+            tool_result_fields: result.tool_result_fields.as_ref(),
+        },
+    );
+    if result.result_hash != expected_hash {
+        return Err("durable tool result hash does not match its payload".into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -296,16 +391,16 @@ impl ToolExecutionService {
     }
 
     pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
+        let disabled_tool_offers = self.disabled_tool_offers.try_read().ok();
+        let provider_allowed_tools = self.provider_allowed_tools.try_read().ok();
         ToolAdmissionContext {
             provider_capabilities: self.provider_capabilities.as_ref().clone(),
-            disabled_tool_offers: self
-                .disabled_tool_offers
-                .try_read()
+            policy_snapshot_available: disabled_tool_offers.is_some()
+                && provider_allowed_tools.is_some(),
+            disabled_tool_offers: disabled_tool_offers
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
-            provider_allowed_tools: self
-                .provider_allowed_tools
-                .try_read()
+            provider_allowed_tools: provider_allowed_tools
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
             ..ToolAdmissionContext::default()
@@ -1177,7 +1272,8 @@ mod tests {
     fn default_service_uses_the_canonical_builtin_registry() {
         let service = ToolExecutionService::new_for_test();
 
-        assert!(service.tool_registry().get("task_board").is_some());
+        assert!(service.tool_registry().get("task_board").is_none());
+        assert!(service.tool_registry().get("inspect_work_plan").is_some());
         assert!(service.tool_registry().get("read_file").is_some());
     }
 
@@ -1206,8 +1302,8 @@ mod tests {
         );
         assert!(available["web_fetch"].is_empty());
         assert!(
-            available["github"].is_empty(),
-            "network egress alone must not claim credential-backed tools"
+            !available.contains_key("github"),
+            "provider capabilities must not resurrect removed tools"
         );
 
         let credential_service = ToolExecutionService::builder()
@@ -1222,7 +1318,7 @@ mod tests {
         let credential_tools = credential_service
             .optional_tool_providers_for_user("user-1")
             .await;
-        assert_eq!(credential_tools["github"].len(), 1);
+        assert!(!credential_tools.contains_key("github"));
     }
 
     #[tokio::test]
@@ -1336,6 +1432,8 @@ mod tests {
                     offer_id: "read_file@provider-a".to_string(),
                     provider_id: "provider-a".to_string(),
                     route: ToolExecutionRouteKind::ServerLocal,
+                    schema_digest: None,
+                    native_tool_id: None,
                 },
             ),
             policy: Default::default(),

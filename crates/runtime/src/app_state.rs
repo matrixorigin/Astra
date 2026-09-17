@@ -1,13 +1,14 @@
 use super::server::tool_transport::ToolExecutionService;
 use super::*;
 use crate::turn::services::{
-    NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter, NoopTurnHookDbWriter,
+    InMemoryTurnReflectionStateStore, NoopTurnAuxiliaryEventWriter, NoopTurnCoreEventWriter,
+    NoopTurnHookDbWriter, NoopTurnObserverWorker, NoopTurnReflectionLessonWriter,
     NoopTurnSessionActivityWriter, NoopTurnToolEventWriter,
 };
 use astra_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
-const DEFAULT_VERSION: &str = "0.1.0";
+const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_DOCS: &str = "";
 
 #[async_trait]
@@ -153,20 +154,16 @@ impl Default for AdminState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionServicesState {
-    pub(crate) task_service: Arc<dyn TaskService>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
     pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
-    pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
 }
 
 impl Default for ExecutionServicesState {
     fn default() -> Self {
         Self {
-            task_service: Arc::new(UnconfiguredTaskService),
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
             edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
-            task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
         }
     }
@@ -207,16 +204,26 @@ pub struct AppState {
     pub(crate) turn_persistence: TurnPersistenceState,
     pub(crate) execution: ExecutionServicesState,
     pub(crate) admin: AdminState,
-    pub(crate) chat_turn_bridge:
-        Option<Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>>,
-    pub(crate) chat_turn_bridge_secret: String,
-    pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    pub(crate) artifact_signing_secret: String,
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
+    /// True only when the application composition explicitly injects a
+    /// forwarder (normally an in-process test double). Production BYOK calls
+    /// resolve a per-user credential instead of falling back to the
+    /// server-wide forwarder merely because one is configured.
+    pub(crate) memoria_forwarder_is_override: bool,
+    /// Trusted self-hosted deployments may explicitly allow the configured
+    /// master only when a user's scoped credential lookup reports no binding.
+    /// Persisted consent and lookup errors never select this fallback.
+    pub(crate) memoria_self_hosted_fallback_enabled: bool,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
+    /// Auxiliary database pools owned by the application lifecycle, such as
+    /// the bounded control-plane reservation used by auth and health checks.
+    /// They must be closed with `shared_pool` during graceful shutdown.
+    pub(crate) auxiliary_pools: Vec<SharedPool>,
     /// Owner-neutral Matrix pool, journal ingestion, sync persistence, and shutdown tracking.
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
@@ -239,7 +246,6 @@ pub struct AppState {
     pub(crate) session_handoff_service: Option<Arc<astra_services::DatabaseSessionHandoffService>>,
     pub(crate) session_fork_coordinator:
         Option<Arc<astra_services::DatabaseSessionForkCoordinator>>,
-    pub(crate) session_publish_service: Option<Arc<astra_services::DatabaseSessionPublishService>>,
     pub(crate) execution_grant_signer: Option<Arc<astra_services::ExecutionGrantSigner>>,
     pub(crate) session_actor_id: String,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
@@ -267,8 +273,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Shared §5.5 ledger (`POST /tools/result`, `POST /approval/respond`); same `Arc` as
-    /// [`InProcessChatTurnBridge`](crate::turn::bridge::inprocess::InProcessChatTurnBridge) when wired.
+    /// Shared §5.5 ledger (`POST /tools/result`, `POST /approval/respond`).
     pub fn edge_callback_ledger(
         &self,
     ) -> Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> {
@@ -276,8 +281,6 @@ impl AppState {
     }
 
     pub fn new(service_info: ServiceInfo, health_checker: Arc<dyn HealthChecker>) -> Self {
-        let chat_turn_bridge_cache =
-            Arc::new(tokio::sync::Mutex::new(SessionCache::new(1000, 86400.0)));
         let default_memoria = astra_core::MemoriaSettings::from_env();
         let edge_connection_pool =
             astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
@@ -329,17 +332,18 @@ impl AppState {
             turn_persistence: TurnPersistenceState::default(),
             execution: ExecutionServicesState::default(),
             admin: AdminState::default(),
-            chat_turn_bridge: None,
-            chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
-            chat_turn_bridge_cache,
+            artifact_signing_secret: "dev-artifact-signing-secret-change-me".to_string(),
             memoria_base_url: default_memoria.base_url,
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
+            memoria_forwarder_is_override: false,
+            memoria_self_hosted_fallback_enabled: false,
             memoria_health_cache: Arc::new(std::sync::RwLock::new(CachedMemoriaHealth::new(
                 MemoriaHealth::Disabled,
             ))),
             memoria_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
             shared_pool: None,
+            auxiliary_pools: Vec::new(),
             matrix_cloud_runtime: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -353,7 +357,6 @@ impl AppState {
             session_context_coordinator: None,
             session_handoff_service: None,
             session_fork_coordinator: None,
-            session_publish_service: None,
             execution_grant_signer: None,
             session_actor_id: std::env::var("ASTRA_POD_ID")
                 .ok()
@@ -407,14 +410,6 @@ impl AppState {
         self
     }
 
-    pub fn with_session_publish_service(
-        mut self,
-        service: Arc<astra_services::DatabaseSessionPublishService>,
-    ) -> Self {
-        self.session_publish_service = Some(service);
-        self
-    }
-
     /// Inject the plan repository — production wires
     /// [`astra_plan::CloudPlanRepository`]; tests typically keep the default
     /// [`astra_plan::InMemoryPlanRepository`].
@@ -435,6 +430,8 @@ impl AppState {
         } else {
             Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
+        self.memoria_forwarder_is_override = false;
+        self.memoria_self_hosted_fallback_enabled = false;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(
                 if master_key.as_deref().is_some_and(|key| !key.is_empty()) {
@@ -448,9 +445,19 @@ impl AppState {
         self
     }
 
+    pub fn with_self_hosted_memoria_fallback(mut self, enabled: bool) -> Self {
+        self.memoria_self_hosted_fallback_enabled = enabled
+            && self
+                .memoria_master_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty());
+        self
+    }
+
     /// Inject a custom MemoriaForwarder (for testing).
     pub fn with_memoria_forwarder(mut self, forwarder: Arc<dyn MemoriaForwarder>) -> Self {
         self.memoria_forwarder = forwarder;
+        self.memoria_forwarder_is_override = true;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(MemoriaHealth::Unavailable("probe pending".to_string()));
         self
@@ -734,11 +741,6 @@ impl AppState {
         self
     }
 
-    pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
-        self.execution.task_service = task_service;
-        self
-    }
-
     pub fn with_edge_registry_service(
         mut self,
         edge_registry_service: Arc<dyn EdgeRegistryService>,
@@ -760,14 +762,6 @@ impl AppState {
         tool_execution_service: ToolExecutionService,
     ) -> Self {
         self.tool_execution_service = tool_execution_service;
-        self
-    }
-
-    pub fn with_task_lease_service(
-        mut self,
-        task_lease_service: Arc<dyn TaskLeaseService>,
-    ) -> Self {
-        self.execution.task_lease_service = task_lease_service;
         self
     }
 
@@ -816,25 +810,73 @@ impl AppState {
         self
     }
 
-    pub fn with_chat_turn_bridge(
+    pub fn with_artifact_signing_secret(
         mut self,
-        chat_turn_bridge: Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>,
+        artifact_signing_secret: impl Into<String>,
     ) -> Self {
-        self.chat_turn_bridge = Some(chat_turn_bridge);
-        self
-    }
-
-    pub fn with_chat_turn_bridge_secret(
-        mut self,
-        chat_turn_bridge_secret: impl Into<String>,
-    ) -> Self {
-        self.chat_turn_bridge_secret = chat_turn_bridge_secret.into();
+        self.artifact_signing_secret = artifact_signing_secret.into();
         self
     }
 
     pub fn with_shared_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
         self
+    }
+
+    pub(crate) fn with_auxiliary_pools(mut self, pools: Vec<SharedPool>) -> Self {
+        self.auxiliary_pools = pools;
+        self
+    }
+
+    /// Stop application-owned database workers and close every pool whose
+    /// lifetime belongs to this application.
+    ///
+    /// Services retain cloneable pool handles, so callers should invoke this
+    /// only after stopping request processing. Matrix ingestion and audit
+    /// workers are drained before their shared pool is closed.
+    pub async fn close_database_pools(&self) {
+        // Provider settlement ownership is process-scoped so a detached
+        // reconciliation job can outlive the request that admitted it. Drain
+        // those jobs while the database pool is still usable; otherwise a
+        // lifecycle that closes its pool can strand reservations in the
+        // global coordinator and make later provider admissions fail closed
+        // at capacity.
+        if !crate::turn::llm::durable::wait_for_provider_settlement_coordinator(
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            tracing::warn!(
+                "provider settlement coordinator did not drain before database pool shutdown"
+            );
+        }
+        if let Some(runtime) = self.matrix_cloud_runtime.as_ref() {
+            runtime.shutdown_ingestion_and_wait().await;
+        }
+        if let Some(pool) = self.shared_pool.as_ref() {
+            pool.close().await;
+        }
+        for pool in &self.auxiliary_pools {
+            pool.close().await;
+        }
+    }
+
+    /// Passively drain server-owned run tasks before removing their durable
+    /// resources or closing database pools.
+    pub async fn drain_background_runs(&self, timeout: std::time::Duration) -> bool {
+        self.execution
+            .run_lifecycle_service
+            .drain_background_tasks(timeout)
+            .await
+    }
+
+    /// Abort server-owned run tasks after a preceding passive drain could not
+    /// settle them before shutdown.
+    pub async fn stop_background_runs(&self, timeout: std::time::Duration) -> bool {
+        self.execution
+            .run_lifecycle_service
+            .stop_background_tasks_for_shutdown(timeout)
+            .await
     }
 
     pub fn with_matrix_cloud_runtime(
@@ -969,28 +1011,38 @@ impl ReqwestMemoriaForwarder {
         method: reqwest::Method,
         endpoint: &str,
         body: &serde_json::Value,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, String> {
         let url = format!("{}{}", self.base_url, endpoint);
         let mut payload = body.clone();
-        let authenticated_user_id = payload
+        let object = payload
             .as_object_mut()
-            .and_then(|object| object.remove("user_id"))
+            .ok_or_else(|| "Memoria master-key request requires a JSON object body".to_string())?;
+        let authenticated_user_id = object
+            .remove("user_id")
             .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
-            .filter(|user_id| !user_id.is_empty());
-        let request = self
-            .client
-            .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.master_key))
-            .json(&payload);
+            .filter(|user_id| !user_id.is_empty())
+            .ok_or_else(|| {
+                "Memoria master-key request requires an authenticated owner".to_string()
+            })?;
+        let request = self.client.request(method.clone(), url).header(
+            "Authorization",
+            format!("Memoria-Owner {}", self.master_key),
+        );
+        // Memoria's owner-scoped list endpoint is a GET with query
+        // parameters.  Keep the existing JSON body for write/POST/PUT
+        // routes, but never send a JSON body on GET: some HTTP servers ignore
+        // it and silently return an unscoped/default page.
+        let request = if method == reqwest::Method::GET {
+            request.query(&payload)
+        } else {
+            request.json(&payload)
+        };
         // Astra authenticates the caller before reaching this boundary and
         // overwrites body.user_id. Memoria's master-key mode derives its
         // storage scope from X-User-Id, not from arbitrary request fields.
         // Project the authenticated principal into the transport header, and
         // keep that transport-only identity out of endpoint domain payloads.
-        match authenticated_user_id {
-            Some(user_id) => request.header("X-User-Id", user_id),
-            _ => request,
-        }
+        Ok(request.header("X-User-Id", authenticated_user_id))
     }
 
     async fn bounded_error_body(mut response: reqwest::Response, limit: usize) -> String {
@@ -1004,6 +1056,15 @@ impl ReqwestMemoriaForwarder {
         }
         String::from_utf8_lossy(&body).into_owned()
     }
+
+    fn owner_scoped_error(status: reqwest::StatusCode, body: &str) -> String {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return format!(
+                "Memoria error {status}: owner-scoped authentication failed; verify MEMORIA_MASTER_KEY and upgrade Memoria to a version that supports the Memoria-Owner authorization scheme. Backend response: {body}"
+            );
+        }
+        format!("Memoria error {status}: {body}")
+    }
 }
 
 #[async_trait]
@@ -1015,14 +1076,14 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let resp = self
-            .request_builder(method, endpoint, &body)
+            .request_builder(method, endpoint, &body)?
             .send()
             .await
             .map_err(|e| format!("Memoria request failed: {e}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = Self::bounded_error_body(resp, 4096).await;
-            return Err(format!("Memoria error {status}: {text}"));
+            return Err(Self::owner_scoped_error(status, &text));
         }
         let text = resp
             .text()
@@ -1078,6 +1139,9 @@ impl MemoriaForwarder for NoopMemoriaForwarder {
 pub struct MatrixOneHealthChecker {
     settings: MatrixOneSettings,
     shared_pool: Option<SharedPool>,
+    /// Optional control-plane pool. Health must not compete with long-running
+    /// agent/session work for the last connection in the general pool.
+    control_pool: Option<SharedPool>,
 }
 
 impl MatrixOneHealthChecker {
@@ -1085,11 +1149,17 @@ impl MatrixOneHealthChecker {
         Self {
             settings,
             shared_pool: None,
+            control_pool: None,
         }
     }
 
     pub fn with_pool(mut self, shared_pool: SharedPool) -> Self {
         self.shared_pool = Some(shared_pool);
+        self
+    }
+
+    pub fn with_control_pool(mut self, control_pool: SharedPool) -> Self {
+        self.control_pool = Some(control_pool);
         self
     }
 }
@@ -1102,7 +1172,7 @@ impl HealthChecker for MatrixOneHealthChecker {
 
     async fn database_health(&self) -> DatabaseHealth {
         let query_timeout = Duration::from_secs(2);
-        if let Some(shared_pool) = &self.shared_pool {
+        if let Some(shared_pool) = self.control_pool.as_ref().or(self.shared_pool.as_ref()) {
             return match tokio::time::timeout(
                 query_timeout,
                 query("SELECT 1").execute(shared_pool.get()),
@@ -1233,8 +1303,13 @@ mod tests {
             .request_builder(
                 reqwest::Method::PUT,
                 "/v1/memories/test-id/correct",
-                &serde_json::json!({"new_content": "x", "reason": "y"}),
+                &serde_json::json!({
+                    "new_content": "x",
+                    "reason": "y",
+                    "user_id": "user-3"
+                }),
             )
+            .expect("authenticated owner")
             .build()
             .expect("request builder");
 
@@ -1248,8 +1323,101 @@ mod tests {
                 .headers()
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok()),
-            Some("Bearer test-key")
+            Some("Memoria-Owner test-key")
         );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-User-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("user-3")
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("JSON request body"),
+        )
+        .unwrap();
+        assert!(payload.get("user_id").is_none());
+    }
+
+    #[test]
+    fn owner_scoped_forwarder_unauthorized_error_explains_compatibility() {
+        let error = ReqwestMemoriaForwarder::owner_scoped_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "Missing Bearer token",
+        );
+        assert!(error.contains("verify MEMORIA_MASTER_KEY"));
+        assert!(error.contains("supports the Memoria-Owner authorization scheme"));
+        assert!(error.contains("Missing Bearer token"));
+    }
+
+    #[test]
+    fn memoria_forwarder_get_uses_query_without_a_json_body() {
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            "http://memoria.test".to_string(),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        let request = forwarder
+            .request_builder(
+                reqwest::Method::GET,
+                "/v1/memories",
+                &serde_json::json!({
+                    "session_id": "session-7",
+                    "memory_type": "working",
+                    "limit": 7,
+                    "user_id": "user-3"
+                }),
+            )
+            .expect("authenticated owner")
+            .build()
+            .expect("request builder");
+
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert!(
+            request.body().is_none(),
+            "GET list must not carry JSON body"
+        );
+        let query = request.url().query().expect("query parameters");
+        assert!(query.contains("session_id=session-7"));
+        assert!(query.contains("memory_type=working"));
+        assert!(query.contains("limit=7"));
+        assert!(!query.contains("user_id="));
+        assert_eq!(
+            request
+                .headers()
+                .get("X-User-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("user-3")
+        );
+    }
+
+    #[test]
+    fn memoria_forwarder_rejects_missing_or_non_object_owner_scope() {
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            "http://memoria.test".to_string(),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        let missing = forwarder.request_builder(
+            reqwest::Method::POST,
+            "/v1/memories",
+            &serde_json::json!({"content": "unscoped"}),
+        );
+        assert!(missing.unwrap_err().contains("authenticated owner"));
+
+        let non_object = forwarder.request_builder(
+            reqwest::Method::POST,
+            "/v1/memories",
+            &serde_json::json!([]),
+        );
+        assert!(non_object.unwrap_err().contains("JSON object"));
     }
 
     #[tokio::test]
@@ -1263,6 +1431,19 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains("authorization: memoria-owner test-key\r\n"),
+                    "self-hosted user requests must attenuate master authority: {req}"
+                );
+                assert!(
+                    req.to_ascii_lowercase().contains("x-user-id: user-3\r\n"),
+                    "authenticated owner must be projected to Memoria scope: {req}"
+                );
+                assert!(
+                    !req.contains("\"user_id\""),
+                    "transport identity must not leak into the Memoria domain body: {req}"
+                );
                 let method = req
                     .lines()
                     .next()
@@ -1288,7 +1469,11 @@ mod tests {
             .forward(
                 reqwest::Method::PUT,
                 "/v1/memories/test-id/correct",
-                serde_json::json!({"new_content": "x", "reason": "y"}),
+                serde_json::json!({
+                    "new_content": "x",
+                    "reason": "y",
+                    "user_id": "user-3"
+                }),
             )
             .await
             .expect("forward success");

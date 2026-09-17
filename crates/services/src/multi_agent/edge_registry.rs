@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::metrics::SharedMultiAgentMetrics;
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
+const CURRENT_READ_MAX_ATTEMPTS: u32 = 6;
+const CURRENT_READ_BASE_BACKOFF_MS: u64 = 25;
+
 // MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
 // decodes this optional payload as text before serde_json validation. Wrapping
 // the parsed value in a one-element JSON array lets JSON_UNQUOTE produce
@@ -18,13 +21,65 @@ use crate::db_row::RowExt as EdgeRegistryDbRow;
 // both the canonical TEXT schema and legacy JSON-typed columns to the same JSON
 // value. Keep every EdgeAgentRecord read on this projection so no query asks
 // sqlx to decode JSON directly or uses VARCHAR(65535)-bounded CAST(... AS CHAR).
-const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, materialization_id, \
      CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
        SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$'))), 2, \
          CHAR_LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
      END AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
+
+// One generation-scoped cleanup statement covers both possible ownership
+// positions during a reconnect:
+// - `edge_id = target`: the target is the current/predecessor generation. Its
+//   private metadata is scrubbed and it becomes inactive. A successor claim is
+//   preserved while state is 0/1 so setup can still complete.
+// - `registration_previous_edge_id = target`: the successor is finalized but
+//   unpublished. Clearing only the predecessor marker records that rollback
+//   must not resurrect the disconnected target.
+// Assignment order is intentional because MySQL-compatible engines evaluate
+// single-table UPDATE assignments from left to right.
+const DEACTIVATE_EDGE_GENERATION_SQL: &str = "UPDATE edge_agent_registry \
+    SET registration_claim_id = CASE \
+            WHEN (registration_state IN (0, 1) AND edge_id = ?) \
+              OR (registration_state = 2 AND registration_previous_edge_id = ?) \
+            THEN registration_claim_id ELSE NULL END, \
+        registration_claim_expires_at = CASE \
+            WHEN (registration_state IN (0, 1) AND edge_id = ?) \
+              OR (registration_state = 2 AND registration_previous_edge_id = ?) \
+            THEN registration_claim_expires_at ELSE NULL END, \
+        hostname = CASE WHEN edge_id = ? THEN NULL ELSE hostname END, \
+        worktree_path = CASE WHEN edge_id = ? THEN NULL ELSE worktree_path END, \
+        capabilities_json = CASE WHEN edge_id = ? THEN NULL ELSE capabilities_json END, \
+        workspace_id = CASE WHEN edge_id = ? THEN NULL ELSE workspace_id END, \
+        registration_state = CASE \
+            WHEN registration_state = 2 AND registration_previous_edge_id = ? \
+            THEN registration_state ELSE 0 END, \
+        registration_previous_edge_id = NULL \
+    WHERE user_id = ? AND edge_agent_id = ? \
+      AND (edge_id = ? \
+           OR (registration_state = 2 AND registration_previous_edge_id = ?))";
+
+fn deactivate_edge_generation_query<'q>(
+    user_id: &'q str,
+    edge_agent_id: &'q str,
+    edge_id: &'q str,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    sqlx::query(DEACTIVATE_EDGE_GENERATION_SQL)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(edge_id)
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .bind(edge_id)
+        .bind(edge_id)
+}
 
 fn serialize_edge_capabilities(
     capabilities: Option<&serde_json::Value>,
@@ -47,8 +102,23 @@ pub struct EdgeAgentRecord {
     /// Owning workspace (provider_scope_id from edge-registration token binding).
     /// None only for explicitly unscoped first-party registrations.
     pub workspace_id: Option<String>,
+    /// Stable identity persisted beside the local checkout. It is distinct
+    /// from the connection-scoped registry row and edge-agent label.
+    pub materialization_id: Option<String>,
     pub registered_at: String,
     pub last_heartbeat_at: String,
+}
+
+fn is_native_execution_target(record: &EdgeAgentRecord) -> bool {
+    record.workspace_id.is_none()
+        && record
+            .materialization_id
+            .as_deref()
+            .is_some_and(|identity| !identity.trim().is_empty())
+        && record
+            .worktree_path
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty())
 }
 
 /// Result of claiming an edge registry generation.
@@ -87,6 +157,15 @@ struct RegistrationState {
     edge_id: String,
     claim_id: Option<String>,
     state: i8,
+    previous_edge_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegistrationGenerationState {
+    edge_id: String,
+    claim_id: Option<String>,
+    previous_edge_id: Option<String>,
+    state: i8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +173,85 @@ enum RegistrationTransitionDecision {
     AlreadyApplied,
     Apply,
     Superseded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistrationAttemptDecision {
+    Retry,
+    Transition(RegistrationTransitionDecision),
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationMutation {
+    Heartbeat,
+    Unregister,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationMutationOutcome {
+    Applied,
+    AlreadyApplied,
+    Superseded,
+}
+
+fn heartbeat_generation_is_owned(
+    row: &RegistrationGenerationState,
+    edge_id: &str,
+    claim_id: Option<&str>,
+) -> bool {
+    (row.state == 1 && row.edge_id == edge_id)
+        || (row.state == 2
+            && (row.previous_edge_id.as_deref() == Some(edge_id)
+                || (row.edge_id == edge_id
+                    && claim_id.is_some()
+                    && row.claim_id.as_deref() == claim_id)))
+}
+
+fn unregister_generation_is_owned(row: &RegistrationGenerationState, edge_id: &str) -> bool {
+    row.edge_id == edge_id || (row.state == 2 && row.previous_edge_id.as_deref() == Some(edge_id))
+}
+
+fn unregister_generation_is_already_applied(
+    row: &RegistrationGenerationState,
+    edge_id: &str,
+) -> bool {
+    row.edge_id == edge_id && row.state == 0
+}
+
+fn heartbeat_generation_query<'q>(
+    user_id: &'q str,
+    edge_agent_id: &'q str,
+    edge_id: &'q str,
+    claim_id: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    sqlx::query(
+        "UPDATE edge_agent_registry \
+         SET last_heartbeat_at = NOW(6), \
+             registration_claim_expires_at = CASE \
+                 WHEN registration_state = 2 AND edge_id = ? \
+                      AND registration_claim_id = ? \
+                 THEN DATE_ADD(NOW(6), INTERVAL 120 SECOND) \
+                 ELSE registration_claim_expires_at END \
+         WHERE user_id = ? AND edge_agent_id = ? \
+           AND ((registration_state = 1 AND edge_id = ?) \
+                OR (registration_state = 2 AND registration_previous_edge_id = ?) \
+                OR (registration_state = 2 AND edge_id = ? \
+                    AND registration_claim_id = ?))",
+    )
+    .bind(edge_id)
+    .bind(claim_id)
+    .bind(user_id)
+    .bind(edge_agent_id)
+    .bind(edge_id)
+    .bind(edge_id)
+    .bind(edge_id)
+    .bind(claim_id)
+}
+
+fn registration_predecessor_is_live(row: &RegistrationState, predecessor_edge_id: &str) -> bool {
+    (row.state == 1 && row.edge_id == predecessor_edge_id)
+        || (row.state == 2 && row.previous_edge_id.as_deref() == Some(predecessor_edge_id))
 }
 
 fn registration_transition_decision(
@@ -136,7 +294,13 @@ fn registration_transition_decision(
             None | Some(_) => RegistrationTransitionDecision::Superseded,
         },
         RegistrationTransition::Rollback => match (&lease.previous, row) {
-            (None, None) => RegistrationTransitionDecision::AlreadyApplied,
+            (_, Some(row))
+                if row.edge_id == lease.current.edge_id
+                    && row.claim_id.is_none()
+                    && row.state == 0 =>
+            {
+                RegistrationTransitionDecision::AlreadyApplied
+            }
             (Some(previous), Some(row))
                 if row.edge_id == previous.edge_id && row.claim_id.is_none() && row.state == 1 =>
             {
@@ -145,9 +309,28 @@ fn registration_transition_decision(
             (_, Some(row)) if row.claim_id.as_deref() == Some(claim_id) => {
                 RegistrationTransitionDecision::Apply
             }
-            (_, Some(_)) | (Some(_), None) => RegistrationTransitionDecision::Superseded,
+            (_, Some(_)) | (_, None) => RegistrationTransitionDecision::Superseded,
         },
     }
+}
+
+fn registration_before_mutation_decision(
+    transition: RegistrationTransition,
+    lease: &EdgeRegistrationLease,
+    claim_id: &str,
+    row: Option<&RegistrationState>,
+    attempt: u32,
+    max_attempts: u32,
+) -> RegistrationAttemptDecision {
+    if row.is_none() {
+        if attempt + 1 < max_attempts {
+            return RegistrationAttemptDecision::Retry;
+        }
+        return RegistrationAttemptDecision::OutcomeUnknown;
+    }
+    RegistrationAttemptDecision::Transition(registration_transition_decision(
+        transition, lease, claim_id, row,
+    ))
 }
 
 async fn transition_error_with_rollback(
@@ -236,9 +419,43 @@ pub trait EdgeRegistryService: Send + Sync {
         })
     }
 
+    /// Register a connection while carrying the stable identity of the local
+    /// checkout it materializes. Backends that persist registrations override
+    /// this method; the default enriches the lease returned by the historical
+    /// registration path so in-memory/test backends retain the same contract.
+    #[allow(clippy::too_many_arguments)]
+    async fn register_or_update_with_lease_and_materialization(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let mut lease = self
+            .register_or_update_with_lease(
+                user_id,
+                edge_agent_id,
+                edge_id_header,
+                hostname,
+                worktree_path,
+                capabilities,
+                workspace_id,
+            )
+            .await?;
+        let materialization_id = materialization_id.map(ToOwned::to_owned);
+        lease.current.materialization_id = materialization_id;
+        Ok(lease)
+    }
+
     /// Undo a claimed generation only if it still owns the registry row.
-    /// Returns true when the rollback is applied or was already applied, and
-    /// false only after verifying that another generation owns the row.
+    /// Durable claiming backends return true when rollback is applied or was
+    /// already applied, false only after verifying another generation, and an
+    /// error when ownership cannot be established. Non-claiming backends use
+    /// their ordinary generation-scoped cleanup result.
     async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
         match &lease.previous {
             Some(previous) => {
@@ -262,27 +479,33 @@ pub trait EdgeRegistryService: Send + Sync {
     }
 
     /// Release the cross-pod setup claim after the connection is published.
-    /// Durable backends return true when release is applied or was already
-    /// applied, and false only after verifying that another generation owns
-    /// the row. Backends without durable claim support have nothing to release.
+    /// Durable claiming backends return true when release is applied or was
+    /// already applied, false only after verifying another generation, and an
+    /// error when ownership cannot be established. Backends without durable
+    /// claim support have nothing to release.
     async fn release_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
         Ok(false)
     }
 
     /// Finalize the durable generation while retaining the cross-pod claim.
-    /// Durable backends return true when finalization is applied or was already
-    /// applied, and false only after verifying that another generation owns
-    /// the row. The default registration path is already final, so non-claiming
-    /// backends have nothing else to do.
+    /// Durable claiming backends return true when finalization is applied or
+    /// was already applied, false only after verifying another generation, and
+    /// an error when ownership cannot be established. The default registration
+    /// path is already final, so non-claiming backends have nothing else to do.
     async fn finalize_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
         Ok(true)
     }
 
+    /// Refresh this exact connection generation. While a finalized durable
+    /// claim is awaiting release, `registration_claim_id` also fences and
+    /// renews that claim; ordinary published/non-durable registrations pass
+    /// `None`.
     async fn heartbeat(
         &self,
         user_id: &str,
         edge_agent_id: &str,
         edge_id_header: &str,
+        registration_claim_id: Option<&str>,
     ) -> Result<(), HeartbeatError>;
 
     /// Find the most-recently-active registry record for a given edge_agent_id,
@@ -302,11 +525,59 @@ pub trait EdgeRegistryService: Send + Sync {
         workspace_id: Option<&str>,
     ) -> Result<Option<EdgeAgentRecord>, String>;
 
+    /// Find one active Edge owned by this exact user, agent identity, and
+    /// workspace scope. The owner predicate is part of the lookup contract so
+    /// callers never need to load a user's full registry to authorize one
+    /// execution binding.
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        Ok(self
+            .list_by_user(user_id)
+            .await?
+            .into_iter()
+            .find(|record| {
+                record.edge_agent_id == edge_agent_id
+                    && match (workspace_id, record.workspace_id.as_deref()) {
+                        (Some(expected), Some(actual)) => expected == actual,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }))
+    }
+
+    /// List the bounded set of authenticated, first-party Edge targets that a
+    /// Work owner may hand off to. Provider-scoped registrations are excluded:
+    /// their provider scope is request authority and is not part of the native
+    /// Work handoff contract. Eligibility is applied before the database
+    /// limit, so stale rows cannot hide a usable target.
+    async fn list_native_execution_targets(
+        &self,
+        user_id: &str,
+        limit: u16,
+    ) -> Result<Vec<EdgeAgentRecord>, String> {
+        let limit = usize::from(limit.clamp(1, 100));
+        Ok(self
+            .list_by_user(user_id)
+            .await?
+            .into_iter()
+            .filter(is_native_execution_target)
+            .take(limit)
+            .collect())
+    }
+
     /// List all registered edge agents for a user (for cross-pod dispatch routing).
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String>;
 
     /// Remove only the exact connection incarnation registered by this socket.
-    /// Returns false when a newer connection already replaced it.
+    /// Durable backends retain an inactive, non-routable owner row so a later
+    /// retry has authoritative idempotence evidence; they return false only
+    /// after verifying that a newer connection replaced it. Non-durable
+    /// backends may return false because there is no persistent generation to
+    /// deactivate.
     async fn unregister_generation(
         &self,
         user_id: &str,
@@ -377,19 +648,213 @@ impl DatabaseEdgeRegistryService {
         user_id: &str,
         registry_id: &str,
     ) -> Result<Option<RegistrationState>, sqlx::Error> {
-        let row: Option<(String, Option<String>, i8)> = sqlx::query_as(
-            "SELECT edge_id, registration_claim_id, registration_state \
+        let row: Option<(String, Option<String>, i8, Option<String>)> = sqlx::query_as(
+            "SELECT edge_id, registration_claim_id, registration_state, \
+                    registration_previous_edge_id \
              FROM edge_agent_registry WHERE user_id = ? AND registry_id = ? FOR UPDATE",
         )
         .bind(user_id)
         .bind(registry_id)
         .fetch_optional(&mut **transaction)
         .await?;
-        Ok(row.map(|(edge_id, claim_id, state)| RegistrationState {
-            edge_id,
-            claim_id,
-            state,
-        }))
+        Ok(row.map(
+            |(edge_id, claim_id, state, previous_edge_id)| RegistrationState {
+                edge_id,
+                claim_id,
+                state,
+                previous_edge_id,
+            },
+        ))
+    }
+
+    /// Establish a write-write conflict boundary before trusting a registry
+    /// observation. MatrixOne optimistic transactions do not acquire a current
+    /// row lock for `SELECT ... FOR UPDATE`, while a no-op UPDATE participates
+    /// in commit-time conflict detection.
+    async fn establish_registry_current_read(
+        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        registry_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at \
+             WHERE user_id = ? AND registry_id = ?",
+        )
+        .bind(user_id)
+        .bind(registry_id)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn establish_generation_current_read(
+        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at \
+             WHERE user_id = ? AND edge_agent_id = ?",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_generation_state(
+        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Option<RegistrationGenerationState>, sqlx::Error> {
+        let row: Option<(String, Option<String>, Option<String>, i8)> = sqlx::query_as(
+            "SELECT edge_id, registration_claim_id, registration_previous_edge_id, registration_state \
+             FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        Ok(row.map(
+            |(edge_id, claim_id, previous_edge_id, state)| RegistrationGenerationState {
+                edge_id,
+                claim_id,
+                previous_edge_id,
+                state,
+            },
+        ))
+    }
+
+    async fn settle_generation_mutation_after_miss(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id: &str,
+        registration_claim_id: Option<&str>,
+        mutation: GenerationMutation,
+    ) -> Result<GenerationMutationOutcome, String> {
+        let operation = match mutation {
+            GenerationMutation::Heartbeat => "heartbeat",
+            GenerationMutation::Unregister => "unregister",
+        };
+        for attempt in 0..CURRENT_READ_MAX_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.registry_retry_total.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    CURRENT_READ_BASE_BACKOFF_MS * (1 << (attempt - 1)),
+                ))
+                .await;
+            }
+
+            let mut transaction = self.pool.begin().await.map_err(|error| {
+                format!("edge_registry {operation} verification begin (attempt {attempt}): {error}")
+            })?;
+            if let Err(error) =
+                Self::establish_generation_current_read(&mut transaction, user_id, edge_agent_id)
+                    .await
+            {
+                return Err(transition_error_with_rollback(
+                    transaction,
+                    operation,
+                    edge_agent_id,
+                    format!("current-read barrier failed on attempt {attempt}: {error}"),
+                )
+                .await);
+            }
+            let row =
+                match Self::load_generation_state(&mut transaction, user_id, edge_agent_id).await {
+                    Ok(row) => row,
+                    Err(error) => {
+                        return Err(transition_error_with_rollback(
+                            transaction,
+                            operation,
+                            edge_agent_id,
+                            format!("ownership lookup failed on attempt {attempt}: {error}"),
+                        )
+                        .await);
+                    }
+                };
+
+            let Some(row) = row else {
+                if attempt + 1 < CURRENT_READ_MAX_ATTEMPTS {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} retry rollback (attempt {attempt}): {error}"
+                        )
+                    })?;
+                    continue;
+                }
+                transaction.rollback().await.map_err(|error| {
+                    format!(
+                        "edge_registry {operation} absent-state rollback (attempt {attempt}): {error}"
+                    )
+                })?;
+                return Err(format!(
+                    "edge_registry generation {operation} remained absent after {CURRENT_READ_MAX_ATTEMPTS} current-read attempts"
+                ));
+            };
+            if mutation == GenerationMutation::Unregister
+                && unregister_generation_is_already_applied(&row, edge_id)
+            {
+                transaction.commit().await.map_err(|error| {
+                    format!("edge_registry {operation} idempotent verification commit: {error}")
+                })?;
+                return Ok(GenerationMutationOutcome::AlreadyApplied);
+            }
+            let owned = match mutation {
+                GenerationMutation::Heartbeat => {
+                    heartbeat_generation_is_owned(&row, edge_id, registration_claim_id)
+                }
+                GenerationMutation::Unregister => unregister_generation_is_owned(&row, edge_id),
+            };
+            if !owned {
+                transaction.commit().await.map_err(|error| {
+                    format!("edge_registry {operation} supersession verification commit: {error}")
+                })?;
+                return Ok(GenerationMutationOutcome::Superseded);
+            }
+
+            let affected = match mutation {
+                GenerationMutation::Heartbeat => {
+                    heartbeat_generation_query(
+                        user_id,
+                        edge_agent_id,
+                        edge_id,
+                        registration_claim_id,
+                    )
+                    .execute(&mut *transaction)
+                    .await
+                }
+                GenerationMutation::Unregister => {
+                    deactivate_edge_generation_query(user_id, edge_agent_id, edge_id)
+                        .execute(&mut *transaction)
+                        .await
+                }
+            }
+            .map_err(|error| {
+                format!("edge_registry {operation} retry mutation (attempt {attempt}): {error}")
+            })?
+            .rows_affected();
+            if affected == 0 {
+                transaction.rollback().await.map_err(|error| {
+                    format!("edge_registry {operation} retry rollback (attempt {attempt}): {error}")
+                })?;
+                continue;
+            }
+            transaction.commit().await.map_err(|error| {
+                format!(
+                    "edge_registry {operation} verification commit (attempt {attempt}): {error}"
+                )
+            })?;
+            return Ok(GenerationMutationOutcome::Applied);
+        }
+
+        Err(format!(
+            "edge_registry generation {operation} remained ambiguous after {CURRENT_READ_MAX_ATTEMPTS} current-read attempts"
+        ))
     }
 
     async fn settle_registration_transition(
@@ -397,9 +862,6 @@ impl DatabaseEdgeRegistryService {
         lease: &EdgeRegistrationLease,
         transition: RegistrationTransition,
     ) -> Result<bool, String> {
-        const MAX_ATTEMPTS: u32 = 6;
-        const BASE_BACKOFF_MS: u64 = 25;
-
         let operation = transition.operation();
         let registry_id = lease.current.registry_id.as_str();
         let claim_id = lease.claim_id.as_deref().ok_or_else(|| {
@@ -412,13 +874,13 @@ impl DatabaseEdgeRegistryService {
             None => None,
         };
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..CURRENT_READ_MAX_ATTEMPTS {
             if attempt > 0 {
                 if let Some(ref metrics) = self.metrics {
                     metrics.registry_retry_total.fetch_add(1, Ordering::Relaxed);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(
-                    BASE_BACKOFF_MS * (1 << (attempt - 1)),
+                    CURRENT_READ_BASE_BACKOFF_MS * (1 << (attempt - 1)),
                 ))
                 .await;
             }
@@ -428,6 +890,21 @@ impl DatabaseEdgeRegistryService {
                     "edge_registry {operation} registration {registry_id} begin (attempt {attempt}): {error}"
                 )
             })?;
+            if let Err(error) = Self::establish_registry_current_read(
+                &mut transaction,
+                &lease.current.user_id,
+                registry_id,
+            )
+            .await
+            {
+                return Err(transition_error_with_rollback(
+                    transaction,
+                    operation,
+                    registry_id,
+                    format!("current-read barrier failed on attempt {attempt}: {error}"),
+                )
+                .await);
+            }
             let before = match Self::load_registration_state_for_update(
                 &mut transaction,
                 &lease.current.user_id,
@@ -447,22 +924,36 @@ impl DatabaseEdgeRegistryService {
                 }
             };
 
-            if before.is_none()
-                && !(transition == RegistrationTransition::Rollback && lease.previous.is_none())
-                && attempt + 1 < MAX_ATTEMPTS
-            {
-                transaction.rollback().await.map_err(|error| {
-                    format!(
-                        "edge_registry {operation} registration {registry_id} retry rollback (attempt {attempt}): {error}"
-                    )
-                })?;
-                continue;
-            }
-
-            let before_decision =
-                registration_transition_decision(transition, lease, claim_id, before.as_ref());
+            let before_decision = registration_before_mutation_decision(
+                transition,
+                lease,
+                claim_id,
+                before.as_ref(),
+                attempt,
+                CURRENT_READ_MAX_ATTEMPTS,
+            );
             match before_decision {
-                RegistrationTransitionDecision::AlreadyApplied => {
+                RegistrationAttemptDecision::Retry => {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} retry rollback (attempt {attempt}): {error}"
+                        )
+                    })?;
+                    continue;
+                }
+                RegistrationAttemptDecision::OutcomeUnknown => {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} absent-state rollback: {error}"
+                        )
+                    })?;
+                    return Err(format!(
+                        "edge_registry {operation} registration {registry_id} remained absent after {CURRENT_READ_MAX_ATTEMPTS} current-read attempts"
+                    ));
+                }
+                RegistrationAttemptDecision::Transition(
+                    RegistrationTransitionDecision::AlreadyApplied,
+                ) => {
                     transaction.commit().await.map_err(|error| {
                         format!(
                             "edge_registry {operation} registration {registry_id} verification commit: {error}"
@@ -470,23 +961,36 @@ impl DatabaseEdgeRegistryService {
                     })?;
                     return Ok(true);
                 }
-                RegistrationTransitionDecision::Superseded => {
-                    transaction.rollback().await.map_err(|error| {
+                RegistrationAttemptDecision::Transition(
+                    RegistrationTransitionDecision::Superseded,
+                ) => {
+                    // Commit the no-op write barrier before reporting a newer
+                    // owner. On an optimistic snapshot, a stale predecessor
+                    // observation conflicts here instead of becoming a false
+                    // supersession result.
+                    transaction.commit().await.map_err(|error| {
                         format!(
-                            "edge_registry {operation} registration {registry_id} superseded rollback: {error}"
+                            "edge_registry {operation} registration {registry_id} superseded verification commit: {error}"
                         )
                     })?;
                     return Ok(false);
                 }
-                RegistrationTransitionDecision::Apply => {}
+                RegistrationAttemptDecision::Transition(RegistrationTransitionDecision::Apply) => {}
             }
+
+            let owned_before = before
+                .as_ref()
+                .expect("an applicable registration transition requires an observed owner row");
+            let live_previous = lease.previous.as_ref().filter(|previous| {
+                registration_predecessor_is_live(owned_before, &previous.edge_id)
+            });
 
             let execution = match transition {
                 RegistrationTransition::Finalize => {
                     sqlx::query(
                         "UPDATE edge_agent_registry \
                          SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                             workspace_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
+                             workspace_id = ?, materialization_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
                              registration_previous_edge_id = ? \
                          WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
                     )
@@ -495,12 +999,8 @@ impl DatabaseEdgeRegistryService {
                     .bind(&lease.current.worktree_path)
                     .bind(&current_capabilities)
                     .bind(&lease.current.workspace_id)
-                    .bind(
-                        lease
-                            .previous
-                            .as_ref()
-                            .map(|previous| previous.edge_id.as_str()),
-                    )
+                    .bind(&lease.current.materialization_id)
+                    .bind(live_previous.map(|previous| previous.edge_id.as_str()))
                     .bind(&lease.current.user_id)
                     .bind(registry_id)
                     .bind(claim_id)
@@ -522,12 +1022,12 @@ impl DatabaseEdgeRegistryService {
                     .execute(&mut *transaction)
                     .await
                 }
-                RegistrationTransition::Rollback => match &lease.previous {
+                RegistrationTransition::Rollback => match live_previous {
                     Some(previous) => {
                         sqlx::query(
                             "UPDATE edge_agent_registry \
                              SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                                 workspace_id = ?, last_heartbeat_at = NOW(6), \
+                                 workspace_id = ?, materialization_id = ?, last_heartbeat_at = NOW(6), \
                                  registration_claim_id = NULL, registration_claim_expires_at = NULL, \
                                  registration_state = 1, registration_previous_edge_id = NULL \
                              WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
@@ -537,6 +1037,7 @@ impl DatabaseEdgeRegistryService {
                         .bind(&previous.worktree_path)
                         .bind(&previous_capabilities)
                         .bind(&previous.workspace_id)
+                        .bind(&previous.materialization_id)
                         .bind(&lease.current.user_id)
                         .bind(registry_id)
                         .bind(claim_id)
@@ -544,10 +1045,20 @@ impl DatabaseEdgeRegistryService {
                         .await
                     }
                     None => {
+                        // A first registration, or a replacement whose
+                        // predecessor disconnected during setup, rolls back to
+                        // a skeletal inactive owner. It is excluded from
+                        // routing but remains durable settlement evidence.
                         sqlx::query(
-                            "DELETE FROM edge_agent_registry \
+                            "UPDATE edge_agent_registry \
+                             SET edge_id = ?, hostname = NULL, worktree_path = NULL, \
+                                 capabilities_json = NULL, workspace_id = NULL, \
+                                 last_heartbeat_at = NOW(6), \
+                                 registration_claim_id = NULL, registration_claim_expires_at = NULL, \
+                                 registration_state = 0, registration_previous_edge_id = NULL \
                              WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
                         )
+                        .bind(&lease.current.edge_id)
                         .bind(&lease.current.user_id)
                         .bind(registry_id)
                         .bind(claim_id)
@@ -584,6 +1095,15 @@ impl DatabaseEdgeRegistryService {
                     .await);
                 }
             };
+            if after.is_none() {
+                return Err(transition_error_with_rollback(
+                    transaction,
+                    operation,
+                    registry_id,
+                    format!("mutation produced an unexpected absent state on attempt {attempt}"),
+                )
+                .await);
+            }
             let after_decision =
                 registration_transition_decision(transition, lease, claim_id, after.as_ref());
             match after_decision {
@@ -596,9 +1116,9 @@ impl DatabaseEdgeRegistryService {
                     return Ok(true);
                 }
                 RegistrationTransitionDecision::Superseded => {
-                    transaction.rollback().await.map_err(|error| {
+                    transaction.commit().await.map_err(|error| {
                         format!(
-                            "edge_registry {operation} registration {registry_id} verification rollback (attempt {attempt}): {error}"
+                            "edge_registry {operation} registration {registry_id} superseded verification commit (attempt {attempt}): {error}"
                         )
                     })?;
                     return Ok(false);
@@ -614,7 +1134,7 @@ impl DatabaseEdgeRegistryService {
         }
 
         Err(format!(
-            "edge_registry {operation} registration {registry_id} remained owned but did not reach its target state after {MAX_ATTEMPTS} attempts"
+            "edge_registry {operation} registration {registry_id} remained owned but did not reach its target state after {CURRENT_READ_MAX_ATTEMPTS} attempts"
         ))
     }
 
@@ -628,8 +1148,9 @@ impl DatabaseEdgeRegistryService {
         worktree_path: Option<&str>,
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
     ) -> Result<EdgeRegistrationLease, String> {
-        let cap_json = serialize_edge_capabilities(capabilities.as_ref())?;
+        serialize_edge_capabilities(capabilities.as_ref())?;
         const MAX_RETRIES: u32 = 5;
         let claim_id = uuid::Uuid::new_v4().to_string();
 
@@ -668,14 +1189,41 @@ impl DatabaseEdgeRegistryService {
                 .unwrap_or(1);
 
             if let Some(previous) = previous {
+                if let (Some(previous_id), Some(next_id)) =
+                    (previous.materialization_id.as_deref(), materialization_id)
+                    && previous_id != next_id
+                {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry lease rollback after materialization identity change: {error}"
+                        )
+                    })?;
+                    return Err(
+                        "edge materialization identity changed for this edge id; use a new edge id or restore the original checkout"
+                            .to_string(),
+                    );
+                }
                 // Acquire only the setup claim. Keep every active routing field
                 // unchanged until finalize_registration(), so the published
                 // predecessor remains heartbeatable and routable while setup is
                 // pending.
+                // Taking an expired finalized claim abandons its unpublished
+                // owner and predecessor atomically. Keep the old edge_id for
+                // fenced cleanup, but use state 0 so that cleanup preserves the
+                // new setup claim instead of clearing it as the owner's claim.
                 let updated = sqlx::query(
                     "UPDATE edge_agent_registry \
                      SET registration_claim_id = ?, \
-                         registration_claim_expires_at = DATE_ADD(NOW(6), INTERVAL 120 SECOND) \
+                         registration_claim_expires_at = DATE_ADD(NOW(6), INTERVAL 120 SECOND), \
+                         hostname = CASE WHEN registration_state = 1 THEN hostname ELSE NULL END, \
+                         worktree_path = CASE WHEN registration_state = 1 THEN worktree_path ELSE NULL END, \
+                         capabilities_json = CASE WHEN registration_state = 1 THEN capabilities_json ELSE NULL END, \
+                         workspace_id = CASE WHEN registration_state = 1 THEN workspace_id ELSE NULL END, \
+                         materialization_id = CASE WHEN registration_state = 1 THEN materialization_id ELSE NULL END, \
+                         registration_previous_edge_id = CASE WHEN registration_state = 2 \
+                             THEN NULL ELSE registration_previous_edge_id END, \
+                         registration_state = CASE WHEN registration_state = 2 \
+                             THEN 0 ELSE registration_state END \
                      WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
                        AND (registration_claim_id IS NULL \
                             OR registration_claim_expires_at < NOW(6))",
@@ -698,9 +1246,10 @@ impl DatabaseEdgeRegistryService {
                 let now = chrono::Utc::now()
                     .format("%Y-%m-%d %H:%M:%S%.6f")
                     .to_string();
-                // State 1 is the only published state. State 0 is a never-
-                // published insert and state 2 is a finalized generation whose
-                // owner crashed before releasing its claim; neither is safe to
+                // State 1 is the only published state. State 0 is an inactive
+                // owner (either never published or disconnected while its
+                // successor holds the claim), and state 2 is a finalized
+                // generation whose claim is not released; neither is safe to
                 // resurrect as a rollback target.
                 let published_previous = (registration_state == 1).then_some(previous.clone());
                 let current = EdgeAgentRecord {
@@ -716,6 +1265,7 @@ impl DatabaseEdgeRegistryService {
                             .as_ref()
                             .and_then(|record| record.workspace_id.clone())
                     }),
+                    materialization_id: materialization_id.map(ToString::to_string),
                     registered_at: previous.registered_at.clone(),
                     last_heartbeat_at: now,
                 };
@@ -734,20 +1284,16 @@ impl DatabaseEdgeRegistryService {
             let registry_id = uuid::Uuid::new_v4().to_string();
             let inserted = sqlx::query(
                 "INSERT INTO edge_agent_registry \
-                 (registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-                  capabilities_json, workspace_id, registered_at, last_heartbeat_at, \
+                 (registry_id, user_id, edge_agent_id, edge_id, materialization_id, registered_at, last_heartbeat_at, \
                   registration_claim_id, registration_claim_expires_at, registration_state) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), ?, \
+                 VALUES (?, ?, ?, ?, ?, NOW(6), NOW(6), ?, \
                          DATE_ADD(NOW(6), INTERVAL 120 SECOND), 0)",
             )
             .bind(&registry_id)
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(edge_id_header)
-            .bind(hostname)
-            .bind(worktree_path)
-            .bind(&cap_json)
-            .bind(workspace_id)
+            .bind(materialization_id)
             .bind(&claim_id)
             .execute(&mut *transaction)
             .await;
@@ -766,6 +1312,7 @@ impl DatabaseEdgeRegistryService {
                             worktree_path: worktree_path.map(ToString::to_string),
                             capabilities: capabilities.clone(),
                             workspace_id: workspace_id.map(ToString::to_string),
+                            materialization_id: materialization_id.map(ToString::to_string),
                             registered_at: now.clone(),
                             last_heartbeat_at: now,
                         },
@@ -836,6 +1383,9 @@ fn decode_edge_agent_record(row: &impl EdgeRegistryDbRow) -> Result<EdgeAgentRec
         worktree_path: row
             .optional_string_column("worktree_path")
             .map_err(|e| edge_registry_decode_error("list_by_user row", "worktree_path", e))?,
+        materialization_id: row
+            .optional_string_column("materialization_id")
+            .map_err(|e| edge_registry_decode_error("list_by_user row", "materialization_id", e))?,
         capabilities,
         workspace_id: row
             .optional_string_column("workspace_id")
@@ -946,6 +1496,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                     worktree_path: worktree_path.map(|s| s.to_string()),
                     capabilities: capabilities_for_record.clone(),
                     workspace_id: workspace_id.map(|s| s.to_string()),
+                    materialization_id: None,
                     registered_at,
                     last_heartbeat_at: now,
                 };
@@ -961,8 +1512,8 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             match sqlx::query(
                 "INSERT INTO edge_agent_registry \
                  (registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-                  capabilities_json, workspace_id, registered_at, last_heartbeat_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                  capabilities_json, workspace_id, materialization_id, registered_at, last_heartbeat_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&registry_id)
             .bind(user_id)
@@ -972,6 +1523,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .bind(worktree_path)
             .bind(&cap_json)
             .bind(workspace_id)
+            .bind(None::<&str>)
             .execute(&mut *transaction)
             .await
             {
@@ -1021,6 +1573,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                         worktree_path: worktree_path.map(|s| s.to_string()),
                         capabilities: capabilities_for_record.clone(),
                         workspace_id: workspace_id.map(|s| s.to_string()),
+                        materialization_id: None,
                         registered_at,
                         last_heartbeat_at,
                     };
@@ -1066,6 +1619,41 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             worktree_path,
             capabilities,
             workspace_id,
+            None,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, capabilities), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn register_or_update_with_lease_and_materialization(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        edge_id_header: &str,
+        hostname: Option<&str>,
+        worktree_path: Option<&str>,
+        capabilities: Option<serde_json::Value>,
+        workspace_id: Option<&str>,
+        materialization_id: Option<&str>,
+    ) -> Result<EdgeRegistrationLease, String> {
+        let materialization_id = materialization_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "edge materialization identity is required".to_string())?;
+        if materialization_id.len() > 128
+            || !astra_runtime_env::is_valid_provider_id(materialization_id)
+        {
+            return Err("edge materialization identity is invalid".to_string());
+        }
+        self.claim_registration(
+            user_id,
+            edge_agent_id,
+            edge_id_header,
+            hostname,
+            worktree_path,
+            capabilities,
+            workspace_id,
+            Some(materialization_id),
         )
         .await
     }
@@ -1076,35 +1664,46 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         user_id: &str,
         edge_agent_id: &str,
         edge_id_header: &str,
+        registration_claim_id: Option<&str>,
     ) -> Result<(), HeartbeatError> {
         // Guard on edge_id so a stale connection cannot refresh (or resurrect)
         // the row after a newer connection has replaced it. register_or_update
         // already set edge_id to the current connection's value, so we only
         // touch last_heartbeat_at and never rewrite edge_id here. If a newer
-        // connection has taken over (edge_id differs), this matches 0 rows and
-        // the stale connection's heartbeat correctly returns Superseded.
-        let n = sqlx::query(
-            "UPDATE edge_agent_registry SET last_heartbeat_at = NOW(6) \
-             WHERE user_id = ? AND edge_agent_id = ? \
-               AND ((registration_state = 1 AND edge_id = ?) \
-                    OR (registration_state = 2 AND registration_previous_edge_id = ?))",
+        // connection has taken over (edge_id differs), this matches 0 rows. A
+        // finalized current generation also remains healthy if releasing its
+        // durable claim had an outcome-unknown storage failure.
+        let n = heartbeat_generation_query(
+            user_id,
+            edge_agent_id,
+            edge_id_header,
+            registration_claim_id,
         )
-        .bind(user_id)
-        .bind(edge_agent_id)
-        .bind(edge_id_header)
-        .bind(edge_id_header)
         .execute(&self.pool)
         .await
         .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat: {e}")))?
         .rows_affected();
         if n == 0 {
-            // The row is gone or belongs to a newer connection — this connection
-            // has been superseded and must not keep the DB entry alive.
             tracing::warn!(
                 edge_id = %edge_id_header,
-                "edge_registry: heartbeat matched no row (unregistered or superseded by newer connection)"
+                "edge_registry: heartbeat matched no row; verifying durable generation ownership"
             );
-            return Err(HeartbeatError::Superseded);
+            return match self
+                .settle_generation_mutation_after_miss(
+                    user_id,
+                    edge_agent_id,
+                    edge_id_header,
+                    registration_claim_id,
+                    GenerationMutation::Heartbeat,
+                )
+                .await
+                .map_err(HeartbeatError::StorageFailure)?
+            {
+                GenerationMutationOutcome::Applied | GenerationMutationOutcome::AlreadyApplied => {
+                    Ok(())
+                }
+                GenerationMutationOutcome::Superseded => Err(HeartbeatError::Superseded),
+            };
         }
         Ok(())
     }
@@ -1115,17 +1714,28 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         edge_agent_id: &str,
         edge_id_header: &str,
     ) -> Result<bool, String> {
-        let deleted = sqlx::query(
-            "DELETE FROM edge_agent_registry \
-             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
-        )
-        .bind(user_id)
-        .bind(edge_agent_id)
-        .bind(edge_id_header)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry unregister: {e}"))?;
-        Ok(deleted.rows_affected() > 0)
+        let deactivated = deactivate_edge_generation_query(user_id, edge_agent_id, edge_id_header)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry unregister: {e}"))?;
+        if deactivated.rows_affected() > 0 {
+            return Ok(true);
+        }
+        match self
+            .settle_generation_mutation_after_miss(
+                user_id,
+                edge_agent_id,
+                edge_id_header,
+                None,
+                GenerationMutation::Unregister,
+            )
+            .await?
+        {
+            GenerationMutationOutcome::Applied | GenerationMutationOutcome::AlreadyApplied => {
+                Ok(true)
+            }
+            GenerationMutationOutcome::Superseded => Ok(false),
+        }
     }
 
     async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
@@ -1232,6 +1842,32 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         row.as_ref().map(decode_edge_agent_record).transpose()
     }
 
+    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
+    async fn find_by_user_agent_and_workspace(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<EdgeAgentRecord>, String> {
+        let lookup_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ? \
+               AND registration_state = 1 \
+               AND ((? IS NOT NULL AND workspace_id = ?) OR (? IS NULL AND workspace_id IS NULL)) \
+             LIMIT 1"
+        );
+        let row = sqlx::query(&lookup_sql)
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .bind(workspace_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry find_by_user_agent_and_workspace: {e}"))?;
+        row.as_ref().map(decode_edge_agent_record).transpose()
+    }
+
     #[tracing::instrument(skip(self), fields(user_id = %user_id))]
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<EdgeAgentRecord>, String> {
         let list_sql = format!(
@@ -1245,6 +1881,31 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .await
             .map_err(|e| format!("edge_registry list_by_user: {e}"))?;
 
+        rows.iter().map(decode_edge_agent_record).collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(user_id = %user_id))]
+    async fn list_native_execution_targets(
+        &self,
+        user_id: &str,
+        limit: u16,
+    ) -> Result<Vec<EdgeAgentRecord>, String> {
+        let list_sql = format!(
+            "SELECT {EDGE_AGENT_RECORD_COLUMNS} FROM edge_agent_registry \
+             WHERE user_id = ? AND registration_state = 1 \
+               AND workspace_id IS NULL \
+               AND materialization_id IS NOT NULL \
+               AND CHAR_LENGTH(TRIM(materialization_id)) > 0 \
+               AND worktree_path IS NOT NULL \
+               AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
+             ORDER BY edge_agent_id ASC LIMIT ?"
+        );
+        let rows = sqlx::query(&list_sql)
+            .bind(user_id)
+            .bind(i64::from(limit.clamp(1, 100)))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("edge_registry list_native_execution_targets: {e}"))?;
         rows.iter().map(decode_edge_agent_record).collect()
     }
 }
@@ -1280,6 +1941,7 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
             worktree_path: worktree_path.map(|s| s.to_string()),
             capabilities,
             workspace_id: workspace_id.map(|s| s.to_string()),
+            materialization_id: None,
             registered_at: now.clone(),
             last_heartbeat_at: now,
         })
@@ -1299,6 +1961,7 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), HeartbeatError> {
         Ok(())
     }
@@ -1332,6 +1995,7 @@ mod tests {
             worktree_path: None,
             capabilities: None,
             workspace_id: Some("workspace-1".to_string()),
+            materialization_id: None,
             registered_at: "2026-09-02 00:00:00.000000".to_string(),
             last_heartbeat_at: "2026-09-02 00:00:00.000000".to_string(),
         };
@@ -1347,6 +2011,19 @@ mod tests {
             edge_id: edge_id.to_string(),
             claim_id: claim_id.map(ToString::to_string),
             state,
+            previous_edge_id: None,
+        }
+    }
+
+    fn registration_state_with_previous(
+        edge_id: &str,
+        claim_id: Option<&str>,
+        state: i8,
+        previous_edge_id: Option<&str>,
+    ) -> RegistrationState {
+        RegistrationState {
+            previous_edge_id: previous_edge_id.map(ToString::to_string),
+            ..registration_state(edge_id, claim_id, state)
         }
     }
 
@@ -1405,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_accepts_both_restored_and_deleted_idempotent_states() {
+    fn rollback_accepts_both_restored_and_inactive_idempotent_states() {
         let replacement = registration_lease(Some("edge-old"));
         let restored = registration_state("edge-old", None, 1);
         assert_eq!(
@@ -1419,15 +2096,153 @@ mod tests {
         );
 
         let first_registration = registration_lease(None);
+        let inactive = registration_state("edge-new", None, 0);
         assert_eq!(
             registration_transition_decision(
                 RegistrationTransition::Rollback,
                 &first_registration,
                 "claim-1",
-                None,
+                Some(&inactive),
             ),
             RegistrationTransitionDecision::AlreadyApplied
         );
+
+        let replacement_without_predecessor = registration_state("edge-new", None, 0);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Rollback,
+                &replacement,
+                "claim-1",
+                Some(&replacement_without_predecessor),
+            ),
+            RegistrationTransitionDecision::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn predecessor_liveness_tracks_disconnects_before_and_after_finalize() {
+        let pending_live = registration_state("edge-old", Some("claim-1"), 1);
+        assert!(registration_predecessor_is_live(&pending_live, "edge-old"));
+
+        let pending_disconnected = registration_state("edge-old", Some("claim-1"), 0);
+        assert!(!registration_predecessor_is_live(
+            &pending_disconnected,
+            "edge-old"
+        ));
+
+        let finalized_live =
+            registration_state_with_previous("edge-new", Some("claim-1"), 2, Some("edge-old"));
+        assert!(registration_predecessor_is_live(
+            &finalized_live,
+            "edge-old"
+        ));
+
+        let finalized_disconnected =
+            registration_state_with_previous("edge-new", Some("claim-1"), 2, None);
+        assert!(!registration_predecessor_is_live(
+            &finalized_disconnected,
+            "edge-old"
+        ));
+    }
+
+    #[test]
+    fn first_registration_rollback_retries_a_stale_empty_read_before_deactivating_owned_claim() {
+        let lease = registration_lease(None);
+        let owned = registration_state("edge-new", Some("claim-1"), 0);
+
+        assert_eq!(
+            registration_before_mutation_decision(
+                RegistrationTransition::Rollback,
+                &lease,
+                "claim-1",
+                None,
+                0,
+                CURRENT_READ_MAX_ATTEMPTS,
+            ),
+            RegistrationAttemptDecision::Retry
+        );
+        assert_eq!(
+            registration_before_mutation_decision(
+                RegistrationTransition::Rollback,
+                &lease,
+                "claim-1",
+                Some(&owned),
+                1,
+                CURRENT_READ_MAX_ATTEMPTS,
+            ),
+            RegistrationAttemptDecision::Transition(RegistrationTransitionDecision::Apply),
+            "the retried current read must recover the committed pending claim"
+        );
+        assert_eq!(
+            registration_before_mutation_decision(
+                RegistrationTransition::Rollback,
+                &lease,
+                "claim-1",
+                None,
+                CURRENT_READ_MAX_ATTEMPTS - 1,
+                CURRENT_READ_MAX_ATTEMPTS,
+            ),
+            RegistrationAttemptDecision::OutcomeUnknown,
+            "absence cannot prove that a committed owner row was removed"
+        );
+        let inactive = registration_state("edge-new", None, 0);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Rollback,
+                &lease,
+                "claim-1",
+                Some(&inactive),
+            ),
+            RegistrationTransitionDecision::AlreadyApplied,
+            "the retained inactive owner row is authoritative rollback evidence"
+        );
+    }
+
+    #[test]
+    fn generation_ownership_covers_release_unknown_and_rejects_a_successor() {
+        let release_unknown = RegistrationGenerationState {
+            edge_id: "edge-new".to_string(),
+            claim_id: Some("claim-1".to_string()),
+            previous_edge_id: Some("edge-old".to_string()),
+            state: 2,
+        };
+        assert!(heartbeat_generation_is_owned(
+            &release_unknown,
+            "edge-new",
+            Some("claim-1")
+        ));
+        assert!(!heartbeat_generation_is_owned(
+            &release_unknown,
+            "edge-new",
+            Some("claim-2")
+        ));
+        assert!(heartbeat_generation_is_owned(
+            &release_unknown,
+            "edge-old",
+            None
+        ));
+        assert!(unregister_generation_is_owned(&release_unknown, "edge-new"));
+        assert!(unregister_generation_is_owned(&release_unknown, "edge-old"));
+
+        let inactive = RegistrationGenerationState {
+            edge_id: "edge-new".to_string(),
+            claim_id: None,
+            previous_edge_id: None,
+            state: 0,
+        };
+        assert!(unregister_generation_is_already_applied(
+            &inactive, "edge-new"
+        ));
+        assert!(!heartbeat_generation_is_owned(&inactive, "edge-new", None));
+
+        let successor = RegistrationGenerationState {
+            edge_id: "edge-successor".to_string(),
+            claim_id: None,
+            previous_edge_id: None,
+            state: 1,
+        };
+        assert!(!heartbeat_generation_is_owned(&successor, "edge-new", None));
+        assert!(!unregister_generation_is_owned(&successor, "edge-new"));
     }
 
     #[test]
@@ -1447,6 +2262,7 @@ mod tests {
         capabilities_json: Option<&'static str>,
         hostname: Option<&'static str>,
         worktree_path: Option<&'static str>,
+        materialization_id: Option<&'static str>,
     }
 
     impl FakeEdgeRegistryRow {
@@ -1456,6 +2272,7 @@ mod tests {
                 capabilities_json: Some(r#"{"tools":["agent_fanout"]}"#),
                 hostname: Some("edge-host"),
                 worktree_path: Some("/worktree"),
+                materialization_id: Some("materialization-1"),
             }
         }
 
@@ -1472,6 +2289,7 @@ mod tests {
                 capabilities_json: None,
                 hostname: None,
                 worktree_path: None,
+                materialization_id: None,
             }
         }
 
@@ -1509,6 +2327,7 @@ mod tests {
             Ok(match column {
                 "hostname" => self.hostname,
                 "worktree_path" => self.worktree_path,
+                "materialization_id" => self.materialization_id,
                 "capabilities_json" => self.capabilities_json,
                 "workspace_id" => None,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -1528,6 +2347,10 @@ mod tests {
         assert_eq!(record.hostname.as_deref(), Some("edge-host"));
         assert_eq!(record.worktree_path.as_deref(), Some("/worktree"));
         assert_eq!(
+            record.materialization_id.as_deref(),
+            Some("materialization-1")
+        );
+        assert_eq!(
             record.capabilities.as_ref().and_then(|v| v.get("tools")),
             Some(&serde_json::json!(["agent_fanout"]))
         );
@@ -1542,6 +2365,7 @@ mod tests {
 
         assert_eq!(record.hostname, None);
         assert_eq!(record.worktree_path, None);
+        assert_eq!(record.materialization_id, None);
         assert_eq!(record.capabilities, None);
     }
 
@@ -1554,6 +2378,7 @@ mod tests {
             "edge_id",
             "hostname",
             "worktree_path",
+            "materialization_id",
             "capabilities_json",
             "registered_at",
             "last_heartbeat_at",

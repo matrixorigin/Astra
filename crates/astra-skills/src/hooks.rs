@@ -8,6 +8,8 @@
 //!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart).
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 const TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT: u32 = 3;
 const TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES: u32 = 3;
@@ -404,19 +406,136 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
-    /// Track which `once` hooks have already fired (by index in `hooks`).
-    fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
-    tripped_circuits: std::sync::Mutex<std::collections::HashMap<usize, u32>>,
-    consecutive_failures: std::sync::Mutex<std::collections::HashMap<usize, u32>>,
+    execution: Arc<Mutex<ToolHookExecution>>,
+}
+
+#[derive(Debug, Default)]
+struct ToolHookExecution {
+    fired_once: BTreeSet<usize>,
+    tripped_circuits: BTreeMap<usize, u32>,
+    consecutive_failures: BTreeMap<usize, u32>,
+    active_async: usize,
+    unconfirmed_async: bool,
+}
+
+/// Execution facts only; definitions must be loaded under current authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolHookContinuation {
+    definitions: [u8; 32],
+    fired_once: BTreeSet<usize>,
+    tripped_circuits: BTreeMap<usize, u32>,
+    consecutive_failures: BTreeMap<usize, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum HookContinuationError {
+    #[error("hook definitions differ from the current authorized registry")]
+    DefinitionsChanged,
+    #[error("hook continuation contains invalid execution facts")]
+    InvalidState,
+    #[error("asynchronous hooks are still executing")]
+    AsyncPending,
+    #[error("an asynchronous hook ended without a confirmed terminal outcome")]
+    AsyncUnconfirmed,
+    #[error("hook-derived environment requires authorized reconstruction")]
+    EnvironmentReconstructionRequired,
+}
+
+fn hook_definitions_digest(hooks: &impl Serialize) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let value = serde_json::to_value(hooks).expect("hook definitions are JSON serializable");
+    let canonical = astra_core::canonical_json_string(&value);
+    let mut hash = Sha256::new();
+    hash.update(b"astra/hook-definitions/v1\0");
+    hash.update(canonical.as_bytes());
+    hash.finalize().into()
+}
+
+/// Registered before spawn so cancellation before the first poll is not lost.
+struct AsyncHookExecution {
+    execution: Arc<Mutex<ToolHookExecution>>,
+    completed: bool,
+}
+
+impl AsyncHookExecution {
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for AsyncHookExecution {
+    fn drop(&mut self) {
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        execution.active_async -= 1;
+        execution.unconfirmed_async |= !self.completed;
+    }
 }
 
 impl ToolEventHookRegistry {
     pub fn new(hooks: Vec<ToolEventHook>) -> Self {
         Self {
             hooks,
-            fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
-            tripped_circuits: std::sync::Mutex::new(std::collections::HashMap::new()),
-            consecutive_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            execution: Arc::default(),
+        }
+    }
+
+    pub fn capture_continuation(&self) -> Result<ToolHookContinuation, HookContinuationError> {
+        let execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        Self::require_quiescence(&execution)?;
+        Ok(ToolHookContinuation {
+            definitions: hook_definitions_digest(&self.hooks),
+            fired_once: execution.fired_once.clone(),
+            tripped_circuits: execution.tripped_circuits.clone(),
+            consecutive_failures: execution.consecutive_failures.clone(),
+        })
+    }
+
+    pub fn restore_continuation(
+        &mut self,
+        snapshot: ToolHookContinuation,
+    ) -> Result<(), HookContinuationError> {
+        if snapshot.definitions != hook_definitions_digest(&self.hooks) {
+            return Err(HookContinuationError::DefinitionsChanged);
+        }
+        if snapshot
+            .fired_once
+            .iter()
+            .any(|&i| self.hooks.get(i).is_none_or(|h| !h.once))
+            || snapshot.tripped_circuits.iter().any(|(&i, &remaining)| {
+                i >= self.hooks.len() || remaining > TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES
+            })
+            || snapshot.consecutive_failures.iter().any(|(&i, &count)| {
+                i >= self.hooks.len() || count == 0 || count >= TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT
+            })
+        {
+            return Err(HookContinuationError::InvalidState);
+        }
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        Self::require_quiescence(&execution)?;
+        execution.fired_once = snapshot.fired_once;
+        execution.tripped_circuits = snapshot.tripped_circuits;
+        execution.consecutive_failures = snapshot.consecutive_failures;
+        Ok(())
+    }
+
+    fn require_quiescence(execution: &ToolHookExecution) -> Result<(), HookContinuationError> {
+        if execution.unconfirmed_async {
+            Err(HookContinuationError::AsyncUnconfirmed)
+        } else if execution.active_async != 0 {
+            Err(HookContinuationError::AsyncPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_async(&self) -> AsyncHookExecution {
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        execution.active_async += 1;
+        AsyncHookExecution {
+            execution: self.execution.clone(),
+            completed: false,
         }
     }
 
@@ -434,30 +553,26 @@ impl ToolEventHookRegistry {
         event: ToolEventKind,
         tool_name: &str,
     ) -> Vec<(usize, &ToolEventHook)> {
-        let fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
-        let mut tripped = self
-            .tripped_circuits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &ToolEventHook)> = self
             .hooks
             .iter()
             .enumerate()
             .filter(|(i, h)| {
-                let circuit_open = match tripped.get_mut(i) {
+                let circuit_open = match execution.tripped_circuits.get_mut(i) {
                     Some(remaining) if *remaining > 0 => {
                         *remaining -= 1;
                         true
                     }
                     Some(_) => {
-                        tripped.remove(i);
+                        execution.tripped_circuits.remove(i);
                         false
                     }
                     None => false,
                 };
                 h.event == event
                     && h.matches_tool(tool_name)
-                    && !(h.once && fired.contains(i))
+                    && !(h.once && execution.fired_once.contains(i))
                     && !circuit_open
             })
             .collect();
@@ -470,10 +585,10 @@ impl ToolEventHookRegistry {
         if !hook.once {
             return;
         }
-        let mut fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         for (i, h) in self.hooks.iter().enumerate() {
             if std::ptr::eq(h, hook) {
-                fired.insert(i);
+                execution.fired_once.insert(i);
                 return;
             }
         }
@@ -488,36 +603,22 @@ impl ToolEventHookRegistry {
     }
 
     fn note_hook_success(&self, index: usize) {
-        let mut failures = self
-            .consecutive_failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        failures.remove(&index);
-        drop(failures);
-        let mut tripped = self
-            .tripped_circuits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tripped.remove(&index);
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        execution.consecutive_failures.remove(&index);
+        execution.tripped_circuits.remove(&index);
     }
 
     fn note_hook_failure(&self, index: usize) -> bool {
-        let mut failures = self
-            .consecutive_failures
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let failure_count = failures.entry(index).or_insert(0);
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        let failure_count = execution.consecutive_failures.entry(index).or_insert(0);
         *failure_count = failure_count.saturating_add(1);
         if *failure_count < TOOL_HOOK_CONSECUTIVE_FAILURE_LIMIT {
             return false;
         }
-        failures.remove(&index);
-        drop(failures);
-        let mut tripped = self
+        execution.consecutive_failures.remove(&index);
+        execution
             .tripped_circuits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tripped.insert(index, TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES);
+            .insert(index, TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES);
         true
     }
 }
@@ -746,8 +847,10 @@ pub async fn evaluate_pre_tool_hooks(
             let action = hook.action.clone();
             let tn = tool_name.to_string();
             let ta = tool_args.clone();
+            let execution = registry.begin_async();
             tokio::spawn(async move {
                 run_hook_action_fire_and_forget(&action, &tn, &ta).await;
+                execution.complete();
             });
             continue;
         }
@@ -901,10 +1004,10 @@ pub async fn evaluate_post_tool_hooks(
             let action = hook.action.clone();
             let tn = tool_name.to_string();
             let ta = tool_args.clone();
-            let out = current_output.clone();
+            let execution = registry.begin_async();
             tokio::spawn(async move {
                 run_hook_action_fire_and_forget(&action, &tn, &ta).await;
-                let _ = out; // capture for potential future use
+                execution.complete();
             });
             continue;
         }
@@ -1486,26 +1589,127 @@ pub struct SessionHookOutput {
 #[derive(Debug, Default)]
 pub struct SessionEventHookRegistry {
     hooks: Vec<SessionEventHook>,
-    /// Track which `once` hooks have already fired (by index).
-    fired_once: std::sync::Mutex<std::collections::HashSet<usize>>,
+    execution: Mutex<SessionHookExecution>,
+}
+
+#[derive(Debug, Default)]
+struct SessionHookExecution {
+    fired_once: BTreeSet<usize>,
+    environment_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHookContinuation {
+    definitions: [u8; 32],
+    fired_once: BTreeSet<usize>,
+}
+
+/// A non-reconstructable hook obligation preserves checkpoint custody, but
+/// must not be treated as permission to resume with an empty hook registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HookContinuation {
+    Bound {
+        tools: ToolHookContinuation,
+        sessions: SessionHookContinuation,
+    },
+    Unavailable {
+        reason: HookContinuationError,
+    },
+}
+
+impl HookContinuation {
+    pub fn capture(tools: &ToolEventHookRegistry, sessions: &SessionEventHookRegistry) -> Self {
+        match tools.capture_continuation().and_then(|tools| {
+            sessions
+                .capture_continuation()
+                .map(|sessions| (tools, sessions))
+        }) {
+            Ok((tools, sessions)) => Self::Bound { tools, sessions },
+            Err(reason) => Self::Unavailable { reason },
+        }
+    }
+
+    /// Consume currently authorized registries so a failed restore cannot
+    /// expose a partially restored pair to an executor.
+    pub fn restore(
+        self,
+        mut tools: ToolEventHookRegistry,
+        mut sessions: SessionEventHookRegistry,
+    ) -> Result<(ToolEventHookRegistry, SessionEventHookRegistry), HookContinuationError> {
+        let Self::Bound {
+            tools: tool_state,
+            sessions: session_state,
+        } = self
+        else {
+            let Self::Unavailable { reason } = self else {
+                unreachable!()
+            };
+            return Err(reason);
+        };
+        tools.restore_continuation(tool_state)?;
+        sessions.restore_continuation(session_state)?;
+        Ok((tools, sessions))
+    }
 }
 
 impl SessionEventHookRegistry {
     pub fn new(hooks: Vec<SessionEventHook>) -> Self {
         Self {
             hooks,
-            fired_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+            execution: Mutex::default(),
         }
+    }
+
+    /// Call only after the environment output has actually been applied.
+    /// Values remain outside the checkpoint; the process-global overlay is
+    /// not evidence of authority in a new user/session executor.
+    pub fn note_environment_applied(&self) {
+        astra_core::sync_poison::recover_mutex_lock(&self.execution).environment_applied = true;
+    }
+
+    pub fn capture_continuation(&self) -> Result<SessionHookContinuation, HookContinuationError> {
+        let execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        if execution.environment_applied {
+            return Err(HookContinuationError::EnvironmentReconstructionRequired);
+        }
+        Ok(SessionHookContinuation {
+            definitions: hook_definitions_digest(&self.hooks),
+            fired_once: execution.fired_once.clone(),
+        })
+    }
+
+    pub fn restore_continuation(
+        &mut self,
+        snapshot: SessionHookContinuation,
+    ) -> Result<(), HookContinuationError> {
+        if snapshot.definitions != hook_definitions_digest(&self.hooks) {
+            return Err(HookContinuationError::DefinitionsChanged);
+        }
+        if snapshot
+            .fired_once
+            .iter()
+            .any(|&i| self.hooks.get(i).is_none_or(|h| !h.once))
+        {
+            return Err(HookContinuationError::InvalidState);
+        }
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
+        if execution.environment_applied {
+            return Err(HookContinuationError::EnvironmentReconstructionRequired);
+        }
+        execution.fired_once = snapshot.fired_once;
+        Ok(())
     }
 
     /// Return all hooks matching the given event, sorted by priority and filtered by `once`.
     pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
-        let fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
+        let execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &SessionEventHook)> = self
             .hooks
             .iter()
             .enumerate()
-            .filter(|(i, h)| h.event == event && !(h.once && fired.contains(i)))
+            .filter(|(i, h)| h.event == event && !(h.once && execution.fired_once.contains(i)))
             .collect();
         result.sort_by_key(|(_, h)| h.priority);
         result.into_iter().map(|(_, h)| h).collect()
@@ -1516,10 +1720,10 @@ impl SessionEventHookRegistry {
         if !hook.once {
             return;
         }
-        let mut fired = astra_core::sync_poison::recover_mutex_lock(&self.fired_once);
+        let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         for (i, h) in self.hooks.iter().enumerate() {
             if std::ptr::eq(h, hook) {
-                fired.insert(i);
+                execution.fired_once.insert(i);
                 return;
             }
         }
@@ -1757,6 +1961,304 @@ fn parse_session_hook_output(stdout: &[u8]) -> SessionHookOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn continuation_tool(once: bool, priority: i32) -> ToolEventHook {
+        ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "*".into(),
+            action: HookAction::Custom {
+                id: "continuation-test".into(),
+                config: None,
+            },
+            timeout_secs: 10,
+            is_async: false,
+            priority,
+            once,
+            condition: None,
+        }
+    }
+
+    #[test]
+    fn hook_continuation_preserves_original_indices_once_and_zero_cooldown() {
+        let definitions = vec![continuation_tool(true, 20), continuation_tool(false, -1)];
+        let continuous = ToolEventHookRegistry::new(definitions.clone());
+        let first = continuous.matching(ToolEventKind::PreToolUse, "bash");
+        assert_eq!(first[0].priority, -1);
+        continuous.mark_once_fired(first[1]);
+        assert!(!continuous.note_hook_failure(1));
+        let mut restored = ToolEventHookRegistry::new(definitions.clone());
+        let wire = serde_json::to_string(&continuous.capture_continuation().unwrap()).unwrap();
+        restored
+            .restore_continuation(serde_json::from_str(&wire).unwrap())
+            .unwrap();
+        for registry in [&continuous, &restored] {
+            assert!(!registry.note_hook_failure(1));
+            assert!(registry.note_hook_failure(1));
+            for _ in 0..TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES {
+                assert!(
+                    registry
+                        .matching(ToolEventKind::PreToolUse, "bash")
+                        .is_empty()
+                );
+            }
+        }
+        let zero = continuous.capture_continuation().unwrap();
+        assert_eq!(zero.tripped_circuits.get(&1), Some(&0));
+        restored.restore_continuation(zero).unwrap();
+        assert_eq!(
+            continuous.matching(ToolEventKind::PreToolUse, "bash"),
+            restored.matching(ToolEventKind::PreToolUse, "bash")
+        );
+        assert_eq!(
+            continuous.matching(ToolEventKind::PreToolUse, "bash").len(),
+            1
+        );
+        let mut invalid = continuous.capture_continuation().unwrap();
+        invalid.fired_once.insert(1); // Exists, but is not a once hook.
+        let before = restored.capture_continuation().unwrap();
+        assert_eq!(
+            restored.restore_continuation(invalid),
+            Err(HookContinuationError::InvalidState)
+        );
+        assert_eq!(restored.capture_continuation().unwrap(), before);
+    }
+
+    #[test]
+    fn hook_continuation_preserves_late_inflight_failure_after_circuit_opens() {
+        let definitions = vec![continuation_tool(false, 0)];
+        let continuous = ToolEventHookRegistry::new(definitions.clone());
+        assert!(!continuous.note_hook_failure(0));
+        assert!(!continuous.note_hook_failure(0));
+        // Both calls were admitted before either completed. Opening a circuit
+        // cannot retroactively remove the already executing second call.
+        let first = continuous.matching_indexed(ToolEventKind::PreToolUse, "bash");
+        let second = continuous.matching_indexed(ToolEventKind::PreToolUse, "bash");
+        assert!(continuous.note_hook_failure(first[0].0));
+        assert!(!continuous.note_hook_failure(second[0].0));
+        let snapshot = continuous.capture_continuation().unwrap();
+        assert_eq!(snapshot.consecutive_failures.get(&0), Some(&1));
+        assert_eq!(
+            snapshot.tripped_circuits.get(&0),
+            Some(&TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES)
+        );
+        let mut restored = ToolEventHookRegistry::new(definitions);
+        restored.restore_continuation(snapshot).unwrap();
+        for _ in 0..=TOOL_HOOK_CIRCUIT_BREAKER_SKIP_MATCHES {
+            assert_eq!(
+                continuous.matching(ToolEventKind::PreToolUse, "bash"),
+                restored.matching(ToolEventKind::PreToolUse, "bash")
+            );
+        }
+        assert_eq!(
+            continuous.capture_continuation().unwrap(),
+            restored.capture_continuation().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_continuation_tracks_real_async_pre_and_post_evaluators() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for event in [ToolEventKind::PreToolUse, ToolEventKind::PostToolUse] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut hook = continuation_tool(false, 0);
+                hook.event = event;
+                hook.is_async = true;
+                hook.action = HookAction::Http {
+                    url: format!("http://{}/hook", listener.local_addr().unwrap()),
+                    headers: Default::default(),
+                    timeout_secs: 5,
+                };
+                let registry = ToolEventHookRegistry::new(vec![hook]);
+                match event {
+                    ToolEventKind::PreToolUse => assert_eq!(
+                        evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await,
+                        PreToolDecision::Allow
+                    ),
+                    ToolEventKind::PostToolUse => assert_eq!(
+                        evaluate_post_tool_hooks(
+                            &registry,
+                            "bash",
+                            &serde_json::json!({}),
+                            "output"
+                        )
+                        .await,
+                        None
+                    ),
+                }
+                // The evaluator has returned but the remote effect is pending.
+                assert_eq!(
+                    registry.capture_continuation(),
+                    Err(HookContinuationError::AsyncPending)
+                );
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                assert_eq!(
+                    registry.capture_continuation(),
+                    Err(HookContinuationError::AsyncPending)
+                );
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+                loop {
+                    match registry.capture_continuation() {
+                        Ok(_) => break,
+                        Err(HookContinuationError::AsyncPending) => tokio::task::yield_now().await,
+                        other => panic!("unexpected completion: {other:?}"),
+                    }
+                }
+            }
+        })
+        .await
+        .expect("async hook completion must not hang");
+    }
+
+    #[test]
+    fn hook_continuation_binds_ordered_definitions_without_persisting_secrets() {
+        let mut first = continuation_tool(false, 0);
+        first.action = HookAction::Http {
+            url: "https://invalid.example/hook".into(),
+            headers: [
+                ("authorization".into(), "private-hook-sentinel".into()),
+                ("x-value".into(), "other".into()),
+            ]
+            .into(),
+            timeout_secs: 5,
+        };
+        let mut equivalent = first.clone();
+        if let HookAction::Http { headers, .. } = &mut equivalent.action {
+            let mut entries: Vec<_> = headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            entries.reverse();
+            *headers = entries.into_iter().collect();
+        }
+        let second = continuation_tool(true, 1);
+        let original = ToolEventHookRegistry::new(vec![first.clone(), second.clone()]);
+        let snapshot = original.capture_continuation().unwrap();
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("private-hook-sentinel"));
+        assert!(!wire.contains("invalid.example"));
+        ToolEventHookRegistry::new(vec![equivalent, second.clone()])
+            .restore_continuation(snapshot.clone())
+            .unwrap();
+        assert_eq!(
+            ToolEventHookRegistry::new(vec![second.clone(), first.clone()])
+                .restore_continuation(snapshot.clone()),
+            Err(HookContinuationError::DefinitionsChanged)
+        );
+        first.timeout_secs += 1;
+        assert_eq!(
+            ToolEventHookRegistry::new(vec![first, second]).restore_continuation(snapshot),
+            Err(HookContinuationError::DefinitionsChanged)
+        );
+        let empty = HookContinuation::capture(
+            &ToolEventHookRegistry::default(),
+            &SessionEventHookRegistry::default(),
+        );
+        empty
+            .restore(
+                ToolEventHookRegistry::default(),
+                SessionEventHookRegistry::default(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hook_continuation_async_completion_cancel_and_panic() {
+        let registry = ToolEventHookRegistry::default();
+        let execution = registry.begin_async();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            wait.await.unwrap();
+            execution.complete();
+        });
+        assert_eq!(
+            registry.capture_continuation(),
+            Err(HookContinuationError::AsyncPending)
+        );
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert!(registry.capture_continuation().is_ok());
+
+        for panic in [false, true] {
+            let registry = ToolEventHookRegistry::default();
+            let execution = registry.begin_async();
+            let task = tokio::spawn(async move {
+                let _execution = execution;
+                if panic {
+                    panic!("injected hook task panic");
+                }
+                std::future::pending::<()>().await;
+            });
+            if !panic {
+                task.abort();
+            }
+            assert!(task.await.is_err());
+            assert_eq!(
+                registry.capture_continuation(),
+                Err(HookContinuationError::AsyncUnconfirmed)
+            );
+            assert_eq!(
+                astra_core::sync_poison::recover_mutex_lock(&registry.execution).active_async,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_continuation_session_once_and_applied_environment() {
+        let hook = SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::SetEnv {
+                key: "TEST_CONTINUATION".into(),
+                value: "secret-env-sentinel".into(),
+            },
+            timeout_secs: 10,
+            is_async: false,
+            priority: 0,
+            once: true,
+            condition: None,
+        };
+        let registry = SessionEventHookRegistry::new(vec![hook.clone()]);
+        let output =
+            evaluate_session_hooks(&registry, SessionEvent::SessionStart, "test", None).await;
+        assert_eq!(output.env_vars[0].1, "secret-env-sentinel");
+        // Merely producing output does not mean it was applied.
+        assert!(registry.capture_continuation().is_ok());
+        registry.mark_once_fired(registry.matching(SessionEvent::SessionStart)[0]);
+        let wire = serde_json::to_string(&registry.capture_continuation().unwrap()).unwrap();
+        assert!(!wire.contains("secret-env-sentinel"));
+        let mut restored = SessionEventHookRegistry::new(vec![hook]);
+        restored
+            .restore_continuation(serde_json::from_str(&wire).unwrap())
+            .unwrap();
+        assert!(
+            evaluate_session_hooks(&restored, SessionEvent::SessionStart, "test", None)
+                .await
+                .env_vars
+                .is_empty()
+        );
+        registry.note_environment_applied();
+        let unavailable = HookContinuation::capture(&ToolEventHookRegistry::default(), &registry);
+        assert_eq!(
+            unavailable,
+            HookContinuation::Unavailable {
+                reason: HookContinuationError::EnvironmentReconstructionRequired
+            }
+        );
+        assert!(
+            !serde_json::to_string(&unavailable)
+                .unwrap()
+                .contains("secret-env-sentinel")
+        );
+    }
 
     // ── Skill lifecycle hook tests ──────────────────────────────────────
 

@@ -25,15 +25,122 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// Collected digest blob. The `json` field is whatever
-/// `astra journal digest --format json --focus summary` printed,
-/// stored as raw JSON for downstream consumption. Stored as `Value`
-/// so report formats can expose it without reshaping.
+/// The dashboard and report renderer consume the v2 summary wire, not an
+/// arbitrary JSON object. Keep this literal aligned with the producer's
+/// `astra-cli::journal_digest::SCHEMA_VERSION`.
+pub const JOURNAL_DIGEST_SCHEMA_VERSION: &str = "astra-journal-digest-v2";
+
+/// Collected, validated digest blob. The `json` field retains the producer's
+/// exact v2 summary wire for downstream JSON reports without reshaping it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DigestArtifact {
     pub session_id: String,
     pub json: serde_json::Value,
+}
+
+/// Validate the stable summary contract emitted by `journal digest --focus
+/// summary`. This is intentionally structural: the artifact is retained as
+/// raw JSON for reporting, but no missing field may silently become a fake
+/// zero and the payload must belong to the requested session.
+pub(crate) fn validate_digest_json(
+    json: &serde_json::Value,
+    expected_session_id: &str,
+) -> Result<(), String> {
+    let object = json
+        .as_object()
+        .ok_or_else(|| "digest stdout must be a JSON object".to_string())?;
+    let schema = object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "digest is missing string schema_version".to_string())?;
+    if schema != JOURNAL_DIGEST_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported digest schema_version {schema:?}, expected {JOURNAL_DIGEST_SCHEMA_VERSION:?}"
+        ));
+    }
+    let session_id = object
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "digest is missing string session_id".to_string())?;
+    if session_id != expected_session_id {
+        return Err(format!(
+            "digest session_id {session_id:?} does not match requested {expected_session_id:?}"
+        ));
+    }
+    object
+        .get("journal_file")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "digest is missing non-empty journal_file".to_string())?;
+    for key in ["journal_lines_non_empty", "journal_lines_malformed"] {
+        if object
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            return Err(format!("digest is missing non-negative integer {key}"));
+        }
+    }
+    let aggregates = object
+        .get("aggregates")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "digest is missing aggregates object".to_string())?;
+    const COUNTS: &[&str] = &[
+        "attempt_count",
+        "turn_count",
+        "turn_error_count",
+        "compact_count",
+        "stall_count",
+        "error_event_count",
+        "session_start_count",
+        "session_end_count",
+        "total_tokens_in",
+        "total_tokens_out",
+        "total_duration_ms",
+        "total_tool_calls",
+        "subrun_count",
+        "subrun_total_tokens_in",
+        "subrun_total_tokens_out",
+        "subrun_total_duration_ms",
+        "subrun_total_tool_calls",
+        "inclusive_total_tokens_in",
+        "inclusive_total_tokens_out",
+        "inclusive_total_tool_calls",
+        "total_fresh_tool_calls",
+        "total_noop_or_cached_tool_calls",
+        "tool_calls_failed",
+        "safety_guard_blocks",
+    ];
+    for key in COUNTS {
+        if aggregates
+            .get(*key)
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        {
+            return Err(format!(
+                "digest aggregates is missing non-negative integer {key}"
+            ));
+        }
+    }
+    for key in [
+        "avg_tokens_in",
+        "avg_tokens_out",
+        "avg_duration_ms",
+        "avg_llm_rounds",
+        "avg_tool_calls_per_round",
+    ] {
+        let value = aggregates
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("digest aggregates is missing numeric {key}"))?;
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "digest aggregates {key} is not a finite non-negative number"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Trait for collecting a journal digest for a failed case.
@@ -107,6 +214,14 @@ impl DigestCollector for AstraCliDigestCollector {
             .await
             .map_err(|_| format!("digest timeout after {}s", timeout.as_secs()))?
             .map_err(|e| format!("digest wait: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "digest exited {}: {}",
+                output.status,
+                stderr.chars().take(500).collect::<String>()
+            ));
+        }
         let stdout_body = String::from_utf8_lossy(&output.stdout).into_owned();
 
         let trimmed = stdout_body.trim();
@@ -122,6 +237,7 @@ impl DigestCollector for AstraCliDigestCollector {
                 trimmed.chars().take(200).collect::<String>()
             )
         })?;
+        validate_digest_json(&json, session_id)?;
         Ok(DigestArtifact {
             session_id: session_id.to_string(),
             json,
@@ -192,6 +308,31 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    fn valid_digest_json(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": JOURNAL_DIGEST_SCHEMA_VERSION,
+            "session_id": session_id,
+            "journal_file": format!("/tmp/{session_id}.jsonl"),
+            "journal_lines_non_empty": 1,
+            "journal_lines_malformed": 0,
+            "aggregates": {
+                "attempt_count": 1, "turn_count": 1, "turn_error_count": 0,
+                "compact_count": 0, "stall_count": 0, "error_event_count": 0,
+                "session_start_count": 1, "session_end_count": 1,
+                "total_tokens_in": 10, "total_tokens_out": 5, "total_duration_ms": 20,
+                "total_tool_calls": 1, "subrun_count": 0,
+                "subrun_total_tokens_in": 0, "subrun_total_tokens_out": 0,
+                "subrun_total_duration_ms": 0, "subrun_total_tool_calls": 0,
+                "inclusive_total_tokens_in": 10, "inclusive_total_tokens_out": 5,
+                "inclusive_total_tool_calls": 1, "total_fresh_tool_calls": 1,
+                "total_noop_or_cached_tool_calls": 0, "tool_calls_failed": 0,
+                "safety_guard_blocks": 0, "avg_tokens_in": 10.0,
+                "avg_tokens_out": 5.0, "avg_duration_ms": 20.0,
+                "avg_llm_rounds": 1.0, "avg_tool_calls_per_round": 1.0
+            }
+        })
+    }
+
     #[tokio::test]
     async fn astra_cli_digest_collector_fails_loudly_when_bin_missing() {
         // Missing binary → spawn error, not silent empty digest.
@@ -217,8 +358,9 @@ mod tests {
         write_executable_shim(
             &shim,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"turns\":1}}'\n",
-                args_path.display()
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{}'\n",
+                args_path.display(),
+                valid_digest_json("session-a")
             ),
         )
         .expect("write shim");
@@ -235,6 +377,35 @@ mod tests {
             "{args}"
         );
         assert!(args.ends_with("session-a\n"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn digest_rejects_foreign_or_partial_success_payloads() {
+        use crate::test_support::write_executable_shim;
+        for (payload, expected) in [
+            (valid_digest_json("other"), "does not match requested"),
+            (
+                serde_json::json!({
+                    "schema_version": JOURNAL_DIGEST_SCHEMA_VERSION,
+                    "session_id": "session-a",
+                    "journal_file": "/tmp/session-a.jsonl",
+                    "journal_lines_non_empty": 1,
+                    "journal_lines_malformed": 0,
+                    "aggregates": {}
+                }),
+                "missing non-negative integer attempt_count",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let shim = tmp.path().join("fake-astra");
+            write_executable_shim(&shim, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload))
+                .expect("write shim");
+            let error = AstraCliDigestCollector::new(shim)
+                .collect("session-a")
+                .await
+                .expect_err("invalid digest must fail closed");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -285,5 +456,40 @@ mod tests {
         c.seed_err("sess-broken", "flushed too late");
         let err = c.collect("sess-broken").await.unwrap_err();
         assert!(err.contains("flushed too late"));
+    }
+
+    #[tokio::test]
+    async fn digest_rejects_json_emitted_by_failed_subprocess() {
+        use crate::test_support::write_executable_shim;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(
+            &shim,
+            "#!/bin/sh\necho '{\"turns\":999}'\necho 'digest backend failed' 1>&2\nexit 23\n",
+        )
+        .expect("write shim");
+
+        let error = AstraCliDigestCollector::new(shim)
+            .collect("session-a")
+            .await
+            .expect_err("non-zero digest must never become evidence");
+        assert!(error.contains("digest exited"), "{error}");
+        assert!(error.contains("digest backend failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn digest_rejects_non_object_success_payload() {
+        use crate::test_support::write_executable_shim;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("fake-astra");
+        write_executable_shim(&shim, "#!/bin/sh\nprintf '%s\\n' 'null'\n").expect("write shim");
+
+        let error = AstraCliDigestCollector::new(shim)
+            .collect("session-a")
+            .await
+            .expect_err("digest evidence must be an object");
+        assert!(error.contains("JSON object"), "{error}");
     }
 }

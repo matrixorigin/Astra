@@ -84,90 +84,29 @@ impl ProviderCacheStrategy {
         }
     }
 
-    /// Derive provider cache capabilities from a provider or model hint.
-    ///
-    /// This is intentionally capability-shaped rather than placeholder-shaped:
-    /// OpenAI-compatible providers keep stable local placeholders for prefix
-    /// caching, while Anthropic-compatible providers prefer protocol-level
-    /// cache metadata and minimal local mutation.
-    pub fn from_provider_hint(provider_or_model: &str) -> Self {
-        let lower = provider_or_model.to_ascii_lowercase();
-        if lower.contains("claude") || lower.contains("anthropic") {
-            Self {
-                prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
-                compact_strategy: CompactStrategy::Minimal,
-                supports_cache_control: true,
-            }
-        } else {
-            Self::default()
-        }
-    }
-
-    /// Derive provider cache capabilities with an explicit provider taking
-    /// precedence over model name. This avoids misclassifying OpenAI-compatible
-    /// proxies that serve Claude-named models.
-    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
-        if let Some(provider) = provider.filter(|value| !value.trim().is_empty()) {
-            let from_provider = Self::from_provider_hint(provider);
-            // If the provider is explicitly Anthropic, trust it.
-            if from_provider.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
-                return from_provider;
-            }
-            // If the provider is a known non-Anthropic API (OpenAI, Gemini, etc.),
-            // respect that even when the model name contains "claude" — the caller
-            // is explicitly routing through a non-Anthropic endpoint.
-            // Unknown providers (e.g. openrouter, litellm) fall through to model
-            // detection so that Claude models served via proxy get the right protocol.
-            let lower = provider.to_ascii_lowercase();
-            let is_known_non_anthropic = lower.contains("openai")
-                || lower.contains("gemini")
-                || lower.contains("google")
-                || lower.contains("mistral")
-                || lower.contains("cohere")
-                || lower.contains("groq")
-                || lower.contains("together")
-                || lower.contains("deepseek")
-                || lower.contains("qwen")
-                || lower.contains("ollama");
-            if is_known_non_anthropic {
-                return from_provider;
-            }
-        }
-        model.map(Self::from_provider_hint).unwrap_or_default()
-    }
-
+    /// Resolve compaction behavior from an explicit deployment capability or
+    /// the provider transport baseline. Model aliases are intentionally absent:
+    /// they do not prove the cache protocol used by a concrete endpoint.
     #[must_use]
-    pub fn from_explicit_or_provider_model(
+    pub fn from_explicit_or_provider(
         explicit: Option<crate::cache_placement::CacheCapability>,
         provider: Option<&str>,
-        model: Option<&str>,
     ) -> Self {
-        explicit
-            .map(Self::from_cache_capability)
-            .unwrap_or_else(|| Self::from_provider_and_model(provider, model))
+        let capability = crate::cache_placement::CacheCapability::from_explicit_or_provider(
+            explicit,
+            provider.unwrap_or_default(),
+        );
+        Self::from_cache_capability(capability)
     }
 }
 
 impl CompactStrategy {
-    /// Derive strategy from provider/model name.
-    /// Anthropic (claude) → Minimal; everything else → Normalized.
-    pub fn from_provider_hint(provider_or_model: &str) -> Self {
-        ProviderCacheStrategy::from_provider_hint(provider_or_model).compact_strategy
-    }
-
-    /// Derive strategy from explicit provider plus model fallback.
-    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
-        ProviderCacheStrategy::from_provider_and_model(provider, model).compact_strategy
-    }
-
     #[must_use]
-    pub fn from_explicit_or_provider_model(
+    pub fn from_explicit_or_provider(
         explicit: Option<crate::cache_placement::CacheCapability>,
         provider: Option<&str>,
-        model: Option<&str>,
     ) -> Self {
-        ProviderCacheStrategy::from_explicit_or_provider_model(explicit, provider, model)
-            .compact_strategy
+        ProviderCacheStrategy::from_explicit_or_provider(explicit, provider).compact_strategy
     }
 }
 
@@ -226,12 +165,14 @@ fn normalize_args(raw: &str) -> String {
 struct ToolCallMaps {
     id_to_name: std::collections::HashMap<String, String>,
     id_to_args: std::collections::HashMap<String, String>,
+    ambiguous_ids: std::collections::HashSet<String>,
 }
 
 /// Build owned tool_call_id → (name, args) maps from assistant messages.
 fn build_tool_call_maps(messages: &[Value]) -> ToolCallMaps {
     let mut id_to_name = std::collections::HashMap::new();
     let mut id_to_args = std::collections::HashMap::new();
+    let mut ambiguous_ids = std::collections::HashSet::new();
     for msg in messages.iter() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -243,12 +184,40 @@ fn build_tool_call_maps(messages: &[Value]) -> ToolCallMaps {
             if let (Some(id), Some(name)) =
                 (tc.get("id").and_then(Value::as_str), tool_call_name(tc))
             {
-                id_to_name.insert(id.to_string(), name.to_string());
-                if let Some(args) = tc
+                if ambiguous_ids.contains(id) {
+                    continue;
+                }
+                let args = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str)
-                {
+                    .and_then(Value::as_str);
+                if id_to_name.get(id).is_some_and(|existing| existing != name) {
+                    // Provider call ids are only unique within their run.
+                    // If an old history contains the same id with different
+                    // tool names, inference by id is ambiguous; preserve the
+                    // result instead of compacting it under the wrong owner.
+                    id_to_name.remove(id);
+                    id_to_args.remove(id);
+                    ambiguous_ids.insert(id.to_string());
+                    continue;
+                }
+                if id_to_name.contains_key(id) {
+                    let args_match = match (id_to_args.get(id).map(String::as_str), args) {
+                        (Some(existing), Some(current)) => existing == current,
+                        (None, None) => true,
+                        // A call id with an incomplete argument frame is not
+                        // safe to use for a normalized recovery hint.
+                        _ => false,
+                    };
+                    if !args_match {
+                        id_to_name.remove(id);
+                        id_to_args.remove(id);
+                        ambiguous_ids.insert(id.to_string());
+                        continue;
+                    }
+                }
+                id_to_name.insert(id.to_string(), name.to_string());
+                if let Some(args) = args {
                     id_to_args.insert(id.to_string(), args.to_string());
                 }
             }
@@ -257,6 +226,7 @@ fn build_tool_call_maps(messages: &[Value]) -> ToolCallMaps {
     ToolCallMaps {
         id_to_name,
         id_to_args,
+        ambiguous_ids,
     }
 }
 
@@ -287,15 +257,11 @@ impl ToolCallMaps {
     fn name_ref_map(&self) -> std::collections::HashMap<&str, &str> {
         self.id_to_name
             .iter()
+            .filter(|(id, _)| !self.ambiguous_ids.contains(*id))
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect()
     }
 }
-
-/// Marker for tool results persisted to session-owned `tool_result_storage`.
-/// These retain a logical artifact handle the LLM can re-read through
-/// `introspect`; compaction must not destroy that recovery instruction.
-const PERSISTED_TAG: &str = "<persisted-output>";
 
 fn is_compactable_tool_name(name: &str) -> bool {
     crate::tool::categories::registry().is_compactable(name)
@@ -305,9 +271,14 @@ fn tool_result_name<'a>(
     msg: &'a Value,
     id_to_name: &'a std::collections::HashMap<&str, &str>,
 ) -> Option<&'a str> {
-    msg.get("name")
+    msg.get("_tool_name")
         .and_then(Value::as_str)
         .and_then(astra_core::canonical_names::normalize_name)
+        .or_else(|| {
+            msg.get("name")
+                .and_then(Value::as_str)
+                .and_then(astra_core::canonical_names::normalize_name)
+        })
         .or_else(|| {
             msg.get("tool_call_id")
                 .and_then(Value::as_str)
@@ -320,15 +291,108 @@ fn persisted_tool_name<'a>(
     call_id: &str,
     id_to_name: &'a std::collections::HashMap<&str, &str>,
 ) -> &'a str {
-    id_to_name
-        .get(call_id)
-        .copied()
+    msg.get("_tool_name")
+        .and_then(Value::as_str)
+        .and_then(astra_core::canonical_names::normalize_name)
         .or_else(|| {
             msg.get("name")
                 .and_then(Value::as_str)
                 .and_then(astra_core::canonical_names::normalize_name)
         })
+        .or_else(|| id_to_name.get(call_id).copied())
         .unwrap_or("unknown")
+}
+
+/// Build and apply one compaction replacement.  The helper owns the
+/// persistence/identity gate shared by state-aware and ordinary compaction so
+/// their safety semantics cannot drift.
+fn compact_one_tool_result(
+    message: &mut Value,
+    maps: &ToolCallMaps,
+    id_to_name: &std::collections::HashMap<&str, &str>,
+    strategy: CompactStrategy,
+    session_dir: Option<&std::path::Path>,
+    original_tokens: usize,
+) -> Option<usize> {
+    let call_id = message
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let original_content = message.get("content").and_then(Value::as_str).unwrap_or("");
+    let original_len = original_content.len();
+
+    let (replacement, descriptor) = if let Some(dir) = session_dir {
+        // A session directory alone is not an artifact identity. History can
+        // contain results from several runs, so never substitute the current
+        // run or a call-id-only file for this message's owner.
+        let run_id = crate::tool::result::storage::tool_result_run_id(message)?;
+        let tool_name = persisted_tool_name(message, &call_id, id_to_name).to_string();
+        let prepared = match crate::tool::result::storage::prepare_tool_result_for_compaction(
+            run_id,
+            &call_id,
+            &tool_name,
+            original_content,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::debug!(
+                    run_id,
+                    tool_call_id = %call_id,
+                    error = %error,
+                    "microcompact could not prepare an artifact projection"
+                );
+                return None;
+            }
+        };
+        if prepared.replacement.len() >= original_len
+            || estimate_tokens(&prepared.replacement) >= original_tokens
+        {
+            return None;
+        }
+        match crate::tool::result::storage::persist_tool_result_for_compaction(
+            dir,
+            run_id,
+            &call_id,
+            &tool_name,
+            original_content,
+        ) {
+            Ok(persisted) => (persisted.replacement, Some(persisted.descriptor)),
+            Err(error) => {
+                tracing::debug!(
+                    run_id,
+                    tool_call_id = %call_id,
+                    error = %error,
+                    "microcompact retained tool result after artifact persistence failure"
+                );
+                return None;
+            }
+        }
+    } else {
+        (maps.cleared_placeholder(&call_id, strategy), None)
+    };
+
+    let replacement_tokens = estimate_tokens(&replacement);
+    if replacement.len() >= original_len || replacement_tokens >= original_tokens {
+        // A recovery projection that is not smaller is not compaction.  The
+        // descriptor write above is immutable and harmless if this candidate
+        // is rejected; no message or saving counter is changed.
+        return None;
+    }
+
+    if let Err(error) = crate::tool::result::storage::mark_tool_result_artifact_descriptor(
+        message,
+        descriptor.as_ref(),
+    ) {
+        tracing::error!(
+            tool_call_id = %call_id,
+            error = %error,
+            "microcompact could not attach its immutable artifact descriptor"
+        );
+        return None;
+    }
+    message["content"] = Value::String(replacement);
+    Some(original_tokens.saturating_sub(replacement_tokens))
 }
 
 /// How many recent compactable tool results to keep intact.
@@ -554,6 +618,14 @@ fn compact_tool_results_with_pin_list(
         if !is_compactable_tool_result(msg, &id_to_name) {
             continue;
         }
+        if session_dir.is_some() && crate::tool::result::storage::tool_result_run_id(msg).is_none()
+        {
+            // The persistence boundary cannot establish ownership for this
+            // historical message.  Leave it in the candidate set's protected
+            // history rather than letting it consume the keep budget needed by
+            // results that can be compacted safely.
+            continue;
+        }
         let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
         if content.len() < MIN_COMPACT_SIZE || is_cleared_content(content) {
             continue;
@@ -597,35 +669,17 @@ fn compact_tool_results_with_pin_list(
     let mut stats = CompactStats::default();
 
     for &(idx, tokens) in unpinned.iter().take(to_compact) {
-        let call_id = messages[idx]
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        // If a session_dir is configured, we MUST successfully persist to disk
-        // before clearing. A failed write followed by a clear would silently
-        // lose the tool output. If persistence fails, skip this entry so the
-        // content survives in-memory for the next compaction attempt.
-        if let Some(dir) = session_dir {
-            if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
-                let content = content.to_string();
-                let tool_name =
-                    persisted_tool_name(&messages[idx], call_id.as_str(), &id_to_name).to_string();
-                let persisted =
-                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
-                        dir, &call_id, &tool_name, &content,
-                    );
-                if !persisted {
-                    // Disk write failed — do not clear; keep the content in memory.
-                    continue;
-                }
-            }
+        if let Some(saved) = compact_one_tool_result(
+            &mut messages[idx],
+            &maps,
+            &id_to_name,
+            strategy,
+            session_dir,
+            tokens,
+        ) {
+            stats.tokens_saved += saved;
+            stats.results_compacted += 1;
         }
-
-        stats.tokens_saved += tokens;
-        stats.results_compacted += 1;
-        messages[idx]["content"] = Value::String(maps.cleared_placeholder(&call_id, strategy));
     }
 
     stats
@@ -638,7 +692,7 @@ fn extract_file_path_from_tool_result(
 ) -> Option<String> {
     // For read_file results, the content often starts with the file path
     let tool_name = tool_result_name(msg, id_to_name)?;
-    if !matches!(tool_name, "read_file" | "grep" | "glob" | "git") {
+    if !matches!(tool_name, "read_file" | "grep" | "glob") {
         return None;
     }
     // Try to extract path from content (read_file results typically start with path)
@@ -736,13 +790,17 @@ fn compact_tool_results_with_config(
     let mut stats = CompactStats::default();
 
     for &(idx, tokens) in compactable.iter().take(to_compact) {
-        stats.tokens_saved += tokens;
-        stats.results_compacted += 1;
-        let call_id = messages[idx]
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        messages[idx]["content"] = Value::String(maps.cleared_placeholder(call_id, strategy));
+        if let Some(saved) = compact_one_tool_result(
+            &mut messages[idx],
+            &maps,
+            &id_to_name,
+            strategy,
+            None,
+            tokens,
+        ) {
+            stats.tokens_saved += saved;
+            stats.results_compacted += 1;
+        }
     }
 
     stats
@@ -769,6 +827,14 @@ fn compact_tool_results_with_persistence(
                 return None;
             }
             if !is_compactable_tool_result(msg, &id_to_name) {
+                return None;
+            }
+            if session_dir.is_some()
+                && crate::tool::result::storage::tool_result_run_id(msg).is_none()
+            {
+                // The persistence boundary cannot establish ownership for
+                // this historical message. Leave it out of the candidate
+                // budget so safely-owned results can still be compacted.
                 return None;
             }
             let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
@@ -805,32 +871,17 @@ fn compact_tool_results_with_persistence(
     let mut stats = CompactStats::default();
 
     for &(idx, tokens) in compactable.iter().take(to_compact) {
-        let call_id = messages[idx]
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
-        // Persist full content to disk before clearing. If persistence fails,
-        // skip this entry — clearing without a successful write would lose data.
-        if let Some(dir) = session_dir {
-            if let Some(content) = messages[idx].get("content").and_then(Value::as_str) {
-                let content = content.to_string();
-                let tool_name =
-                    persisted_tool_name(&messages[idx], call_id.as_str(), &id_to_name).to_string();
-                let persisted =
-                    crate::tool::result::storage::maybe_persist_tool_result_unconditional(
-                        dir, &call_id, &tool_name, &content,
-                    );
-                if !persisted {
-                    continue;
-                }
-            }
+        if let Some(saved) = compact_one_tool_result(
+            &mut messages[idx],
+            &maps,
+            &id_to_name,
+            strategy,
+            session_dir,
+            tokens,
+        ) {
+            stats.tokens_saved += saved;
+            stats.results_compacted += 1;
         }
-
-        stats.tokens_saved += tokens;
-        stats.results_compacted += 1;
-        messages[idx]["content"] = Value::String(maps.cleared_placeholder(&call_id, strategy));
     }
 
     stats
@@ -845,12 +896,18 @@ fn is_compactable_tool_result(
     if role != "tool" {
         return false;
     }
-    // Skip persisted-to-disk results — they contain a file reference
-    // the LLM needs to re-read the output.
-    if let Some(content) = msg.get("content").and_then(Value::as_str) {
-        if content.contains(PERSISTED_TAG) {
-            return false;
-        }
+    // Skip results whose typed descriptor proves that the full body already
+    // lives in an immutable artifact.  The strict projection parser is only
+    // a recovery guard for an older in-memory envelope; arbitrary text that
+    // merely mentions the tag is not treated as an artifact.
+    if crate::tool::result::storage::tool_result_artifact_descriptor(msg).is_some()
+        || msg
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(crate::tool::result::storage::parse_tool_result_artifact_projection)
+            .is_some()
+    {
+        return false;
     }
     if let Some(name) = tool_result_name(msg, id_to_name) {
         return is_compactable_tool_name(name);
@@ -902,15 +959,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_capability_overrides_provider_model_strategy() {
-        let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    fn explicit_cache_capability_overrides_provider_transport_baseline() {
+        let strategy = ProviderCacheStrategy::from_explicit_or_provider(
             Some(crate::cache_placement::CacheCapability {
                 protocol: crate::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement: crate::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(crate::cache_placement::CacheReuseScope::ConversationTurns),
             }),
             Some("openai"),
-            Some("proxy-claude"),
         );
         assert_eq!(
             strategy.prompt_cache_protocol,
@@ -1155,6 +1212,49 @@ mod tests {
 
         let stats = compact_tool_results(&mut messages, Some(0), Default::default());
         assert_eq!(stats.results_compacted, 0);
+    }
+
+    #[test]
+    fn duplicate_call_ids_with_conflicting_names_are_not_inferred() {
+        let big = "x".repeat(1_000);
+        let messages = vec![
+            assistant_with_tools(&[("reused", "read_file")]),
+            assistant_with_tools(&[("reused", "bash")]),
+            tool_result("reused", &big),
+        ];
+        let maps = build_tool_call_maps(&messages);
+        let names = maps.name_ref_map();
+        assert!(
+            !is_compactable_tool_result(&messages[2], &names),
+            "an ambiguous provider id must not be classified by whichever invocation came last"
+        );
+    }
+
+    #[test]
+    fn duplicate_call_ids_with_conflicting_arguments_are_not_normalized() {
+        let big = "x".repeat(1_000);
+        let messages = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "reused",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "reused",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}
+                }]
+            }),
+            tool_result("reused", &big),
+        ];
+        let maps = build_tool_call_maps(&messages);
+        let names = maps.name_ref_map();
+        assert!(!is_compactable_tool_result(&messages[2], &names));
     }
 
     #[test]
@@ -1816,7 +1916,6 @@ mod tests {
             tool_result("c7", &big),
             tool_result("c8", &big),
         ];
-
         compact_tool_results(&mut messages, None, Default::default());
 
         // Stub must survive untouched
@@ -2395,36 +2494,25 @@ mod tests {
     // ── Provider-aware strategy tests ──
 
     #[test]
-    fn strategy_from_provider_hint() {
+    fn strategy_uses_provider_transport_not_model_alias() {
         assert_eq!(
-            CompactStrategy::from_provider_hint("claude-sonnet-4-20250514"),
-            CompactStrategy::Minimal
+            CompactStrategy::from_explicit_or_provider(None, Some("anthropic")),
+            CompactStrategy::Minimal,
         );
         assert_eq!(
-            CompactStrategy::from_provider_hint("anthropic"),
-            CompactStrategy::Minimal
+            CompactStrategy::from_explicit_or_provider(None, Some("openai")),
+            CompactStrategy::Normalized,
         );
         assert_eq!(
-            CompactStrategy::from_provider_hint("gpt-4o"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint("glm-4-plus"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint("deepseek-chat"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint(""),
-            CompactStrategy::Normalized
+            CompactStrategy::from_explicit_or_provider(None, Some("claude-shaped-alias")),
+            CompactStrategy::Normalized,
+            "an opaque provider alias must not be reinterpreted as a model family",
         );
     }
 
     #[test]
     fn provider_cache_strategy_exposes_provider_capabilities() {
-        let anthropic = ProviderCacheStrategy::from_provider_hint("anthropic/claude-sonnet-4");
+        let anthropic = ProviderCacheStrategy::from_explicit_or_provider(None, Some("anthropic"));
         assert_eq!(
             anthropic.prompt_cache_protocol,
             PromptCacheProtocol::AnthropicCacheControl
@@ -2432,33 +2520,19 @@ mod tests {
         assert_eq!(anthropic.compact_strategy, CompactStrategy::Minimal);
         assert!(anthropic.supports_cache_control);
 
-        let openai = ProviderCacheStrategy::from_provider_hint("openai/gpt-4o");
+        let openai = ProviderCacheStrategy::from_explicit_or_provider(None, Some("openai"));
         assert_eq!(openai.prompt_cache_protocol, PromptCacheProtocol::Prefix);
         assert_eq!(openai.compact_strategy, CompactStrategy::Normalized);
         assert!(!openai.supports_cache_control);
     }
 
     #[test]
-    fn explicit_provider_takes_precedence_over_claude_named_model() {
-        // Known non-Anthropic providers override model name
-        assert_eq!(
-            CompactStrategy::from_provider_and_model(Some("openai"), Some("claude-sonnet-4")),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            ProviderCacheStrategy::from_provider_and_model(Some("anthropic"), Some("gpt-4o"))
-                .prompt_cache_protocol,
-            PromptCacheProtocol::AnthropicCacheControl
-        );
-        // Unknown proxy providers (openrouter, litellm) fall through to model detection
-        assert_eq!(
-            ProviderCacheStrategy::from_provider_and_model(
-                Some("openrouter"),
-                Some("claude-sonnet-4-20250514")
-            )
-            .prompt_cache_protocol,
-            PromptCacheProtocol::AnthropicCacheControl
-        );
+    fn unknown_provider_does_not_gain_cache_semantics_from_its_name() {
+        let strategy =
+            ProviderCacheStrategy::from_explicit_or_provider(None, Some("openrouter-claude-route"));
+        assert_eq!(strategy.prompt_cache_protocol, PromptCacheProtocol::Prefix);
+        assert_eq!(strategy.compact_strategy, CompactStrategy::Normalized);
+        assert!(!strategy.supports_cache_control);
     }
 
     #[test]
@@ -2636,6 +2710,12 @@ mod tests {
             tool_result("c7", &big),
             tool_result("c8", &big),
         ];
+        for message in messages.iter_mut() {
+            if message.get("role").and_then(Value::as_str) == Some("tool") {
+                crate::tool::result::storage::mark_tool_result_run_id(message, Some("run-mc"))
+                    .expect("test tool results have a valid run identity");
+            }
+        }
 
         let stats = compact_tool_results_adaptive_with_persistence(
             &mut messages,
@@ -2649,29 +2729,75 @@ mod tests {
             "should compact at least some results"
         );
 
-        // Every compacted result should have its full content persisted to disk
+        // Every compacted result should have its full content persisted as a
+        // run-bound artifact and retain the descriptor needed for recovery.
         for msg in &messages {
             if msg.get("role").and_then(Value::as_str) != Some("tool") {
                 continue;
             }
             let content = msg["content"].as_str().unwrap_or("");
-            if !is_cleared_content(content) {
+            if !content.contains("<persisted-output>") {
                 continue;
             }
             let call_id = msg["tool_call_id"].as_str().unwrap();
-            let recovered = crate::tool::result::storage::read_persisted_result(&dir, call_id);
-            assert!(
-                recovered.is_some(),
-                "cleared result for {call_id} must have been persisted to disk"
-            );
-            assert_eq!(
-                recovered.unwrap(),
-                big,
-                "persisted content must match original"
-            );
+            let descriptor = crate::tool::result::storage::tool_result_artifact_descriptor(msg)
+                .expect("compacted result must carry its typed descriptor");
+            assert_eq!(descriptor.run_id, "run-mc");
+            assert_eq!(descriptor.call_id, call_id);
+            let recovered = crate::tool::result::storage::read_verified_persisted_result(
+                &dir,
+                &descriptor,
+                64 * 1024,
+            )
+            .expect("run-bound artifact must be readable");
+            assert_eq!(recovered, big, "persisted content must match original");
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_without_run_identity_keeps_evidence_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = "x".repeat(2_000);
+        let mut messages = vec![
+            assistant_with_tools(&[
+                ("c1", "read_file"),
+                ("c2", "read_file"),
+                ("c3", "read_file"),
+                ("c4", "read_file"),
+                ("c5", "read_file"),
+                ("c6", "read_file"),
+                ("c7", "read_file"),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+            tool_result("c3", &big),
+            tool_result("c4", &big),
+            tool_result("c5", &big),
+            tool_result("c6", &big),
+            tool_result("c7", &big),
+        ];
+
+        let stats = compact_tool_results_adaptive_with_persistence(
+            &mut messages,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(dir.path()),
+        );
+
+        assert_eq!(stats.results_compacted, 0);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .is_some_and(|value| value == big.as_str())
+        );
+        assert!(
+            std::fs::read_dir(dir.path().join("tool-results"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "without an owner identity, compaction must not create an orphan artifact"
+        );
     }
 
     #[test]

@@ -771,7 +771,7 @@ pub async fn memoria_store_lessons_fire_and_forget(
             "content": lesson.content,
             "memory_type": lesson.memory_type,
             "trust_tier": lesson.trust_tier,
-            "source": {"agent": "session_end"},
+            "source": "astra:session_end",
         });
         if let Some(ref sid) = session_id {
             body["session_id"] = json!(sid);
@@ -878,6 +878,15 @@ mod tests {
             3,
             "must continue storing after first failure"
         );
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body["source"].is_string());
+            let source: serde_json::Value =
+                serde_json::from_str(body["source"].as_str().unwrap()).unwrap();
+            assert_eq!(source["label"], "astra:session_end");
+            assert_eq!(source["astra_views"]["version"], 1);
+            assert_eq!(body["session_id"], "sess-1");
+        }
     }
 }
 

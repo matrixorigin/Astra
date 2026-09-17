@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::context_feedback::ContextFeedback;
+use crate::context_feedback::RuntimeFeedbackFrame;
 use crate::trace_alert::TraceAlert;
 
 /// Discriminator for pipeline journal events.
@@ -28,21 +28,8 @@ pub struct PipelineJournalEvent {
     pub kind: PipelineEventKind,
     pub turn: u32,
 
-    // Feedback fields
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_hit_ratio: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_read_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_creation_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completion_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_break_reason: Option<String>,
+    pub runtime_feedback: Option<RuntimeFeedbackFrame>,
 
     // Alert fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,20 +51,11 @@ pub struct PipelineJournalEvent {
 impl PipelineJournalEvent {
     /// Create a feedback event from API response metrics.
     #[must_use]
-    pub fn from_feedback(turn: u32, model_id: &str, feedback: &ContextFeedback) -> Self {
+    pub fn from_feedback(feedback: &RuntimeFeedbackFrame) -> Self {
         Self {
             kind: PipelineEventKind::Feedback,
-            turn,
-            cache_hit_ratio: Some(feedback.cache_hit_ratio),
-            prompt_tokens: Some(feedback.tokens.prompt),
-            cache_read_tokens: Some(feedback.tokens.cache_read),
-            cache_creation_tokens: Some(feedback.tokens.cache_creation),
-            completion_tokens: Some(feedback.tokens.completion),
-            model_id: Some(model_id.to_string()),
-            cache_break_reason: feedback
-                .cache_break_detected
-                .as_ref()
-                .map(ToString::to_string),
+            turn: feedback.progress.session_turn,
+            runtime_feedback: Some(feedback.clone()),
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -93,13 +71,7 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::Alert,
             turn: alert.turn,
-            cache_hit_ratio: None,
-            prompt_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            completion_tokens: None,
-            model_id: None,
-            cache_break_reason: None,
+            runtime_feedback: None,
             alert_rule: Some(alert.rule.clone()),
             alert_severity: Some(format!("{:?}", alert.severity)),
             alert_message: Some(alert.message.clone()),
@@ -120,13 +92,7 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::CompactionAudit,
             turn,
-            cache_hit_ratio: None,
-            prompt_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            completion_tokens: None,
-            model_id: None,
-            cache_break_reason: None,
+            runtime_feedback: None,
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -143,15 +109,30 @@ mod tests {
 
     #[test]
     fn feedback_event_fields() {
-        let fb = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        let evt = PipelineJournalEvent::from_feedback(3, "claude", &fb);
+        let mut fb = crate::introspect::test_runtime_feedback(3, 3, 7);
+        fb.policy_feedback = crate::context_feedback::RuntimePolicyFeedbackSet::Evaluated {
+            schema_version: 1,
+            revision: 2,
+            evaluated_at_round: 3,
+            subject: crate::context_feedback::RuntimePolicySubject::Run,
+            entries: vec![crate::context_feedback::RuntimePolicyFeedbackEntry {
+                signal: crate::context_feedback::RuntimePolicySignal::RedundantReads,
+                stage: crate::context_feedback::RuntimePolicyStage::Observe,
+                observed_at_round: 3,
+                evidence_count: 8,
+                recommendation:
+                    crate::context_feedback::RuntimePolicyRecommendation::ReuseKnownContent,
+            }],
+        };
+        let evt = PipelineJournalEvent::from_feedback(&fb);
         assert_eq!(evt.kind, PipelineEventKind::Feedback);
         assert_eq!(evt.turn, 3);
-        assert!((evt.cache_hit_ratio.unwrap() - 0.4).abs() < 1e-9);
-        assert_eq!(evt.cache_read_tokens, Some(800));
-        assert_eq!(evt.cache_creation_tokens, Some(200));
-        assert_eq!(evt.completion_tokens, Some(500));
-        assert_eq!(evt.model_id.as_deref(), Some("claude"));
+        let persisted = evt.runtime_feedback.as_ref().unwrap();
+        assert_eq!(persisted.identity.run_id, "run-1");
+        assert_eq!(persisted.progress.session_turn, 3);
+        assert_eq!(persisted.run_usage.unwrap().cache_read, 95_000);
+        assert_eq!(persisted.policy_feedback, fb.policy_feedback);
+        assert_eq!(persisted, &fb);
     }
 
     #[test]

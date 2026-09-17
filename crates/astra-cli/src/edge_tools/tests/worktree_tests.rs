@@ -1,4 +1,4 @@
-use super::{ToolExecutor, detect_git_remote_repos, extract_github_owner_repo, test_executor};
+use super::ToolExecutor;
 use serde_json::json;
 
 fn init_temp_git_repo() -> tempfile::TempDir {
@@ -34,85 +34,9 @@ fn init_temp_git_repo() -> tempfile::TempDir {
 
 // ── extract_github_owner_repo edge cases ──
 
-#[test]
-fn extract_github_owner_repo_parsing() {
-    // HTTPS without .git suffix
-    let line = "origin\thttps://github.com/MatrixOrigin/Memoria (fetch)";
-    assert_eq!(
-        extract_github_owner_repo(line),
-        Some("MatrixOrigin/Memoria".to_string())
-    );
-
-    // SSH without .git
-    let ssh = "upstream\tgit@github.com:org/repo (push)";
-    assert_eq!(extract_github_owner_repo(ssh), Some("org/repo".to_string()));
-
-    // Malformed / non-GitHub URLs
-    assert_eq!(extract_github_owner_repo("origin"), None);
-    assert_eq!(extract_github_owner_repo(""), None);
-    assert_eq!(
-        extract_github_owner_repo("origin\thttps://not-github.com/a/b.git (fetch)"),
-        None
-    );
-}
-
 // ── detect_git_remote_repos ──
 
-#[test]
-fn detect_git_remote_repos_basics() {
-    // From current repo — should find at least one remote
-    let repos = detect_git_remote_repos(std::path::Path::new("."));
-    for repo in &repos {
-        assert!(repo.contains('/'), "repo should be owner/name: {repo}");
-        assert_eq!(repo, &repo.to_lowercase(), "should be lowercased: {repo}");
-    }
-    // No duplicates (same remote appears for fetch and push)
-    let mut seen = std::collections::HashSet::new();
-    for repo in &repos {
-        assert!(
-            seen.insert(repo.as_str()),
-            "duplicate preferred repo: {repo}"
-        );
-    }
-
-    // Nonexistent dir → empty
-    assert!(detect_git_remote_repos(std::path::Path::new("/nonexistent/path")).is_empty());
-}
-
 // ── add_preferred_repo / get_preferred_repos ──
-
-#[test]
-fn add_preferred_repo_deduplicates_and_normalizes() {
-    let exec = test_executor();
-    exec.add_preferred_repo("MatrixOrigin/Memoria");
-    exec.add_preferred_repo("MatrixOrigin/Memoria");
-    exec.add_preferred_repo("matrixorigin/memoria"); // same after lowercasing
-    let repos = exec.get_preferred_repos();
-    let memoria_count = repos
-        .iter()
-        .filter(|r| r == &"matrixorigin/memoria")
-        .count();
-    assert_eq!(
-        memoria_count, 1,
-        "should deduplicate case-insensitively: {repos:?}"
-    );
-    // also: normalized to lowercase
-    assert!(
-        repos.contains(&"matrixorigin/memoria".to_string()),
-        "should lowercase: {repos:?}"
-    );
-}
-
-#[test]
-fn preferred_repos_initialized_from_git_remote() {
-    // test_executor uses "." as root; if in a git repo, should have remotes
-    let exec = test_executor();
-    let repos = exec.get_preferred_repos();
-    // Can't assert specific content, but structure should be valid
-    for repo in &repos {
-        assert!(repo.contains('/'), "malformed: {repo}");
-    }
-}
 
 // ── Worktree session tests ────────────────────────────────────────────────
 
@@ -197,4 +121,42 @@ async fn git_worktree_enter_records_rollback_handle() {
         "discard_changes": true,
     }));
     assert!(!cleanup.starts_with("Error:"), "cleanup failed: {cleanup}");
+}
+
+#[tokio::test]
+async fn session_worktree_tool_enters_and_exits_through_public_dispatch() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+    let entered = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"enter", "branch":"session-lifecycle"}),
+        )
+        .await;
+    assert!(!entered.is_error, "{entered:?}");
+    let session = exe.get_worktree_session().expect("session switched");
+    assert!(session.worktree_path.join("tracked.txt").exists());
+    // A dirty linked worktree must not be deleted through an incomplete or ignored status query.
+    std::fs::write(session.worktree_path.join("tracked.txt"), "changed\n").unwrap();
+    let denied = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"exit", "exit_action":"remove"}),
+        )
+        .await;
+    assert!(denied.is_error, "{denied:?}");
+    assert!(exe.in_worktree_session());
+    let exited = exe
+        .execute_with_metadata(
+            "worktree",
+            &json!({"action":"exit", "exit_action":"remove", "discard_changes":true}),
+        )
+        .await;
+    assert!(!exited.is_error, "{exited:?}");
+    assert!(!exe.in_worktree_session());
+    assert!(!session.worktree_path.exists());
+    let invalid = exe
+        .execute_with_metadata("worktree", &json!({"action":"push", "branch":"main"}))
+        .await;
+    assert!(invalid.is_error);
 }

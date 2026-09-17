@@ -19,8 +19,7 @@
 //! Only covers the **active** tool set shipped today (the names
 //! advertised in `astra-tools::schemas`). Retired separate names
 //! have been removed — the model now issues unified action-param
-//! calls (`git(action="show")`, `memory(action="retrieve")`,
-//! `task_board(action="create")`,
+//! calls (`memory(action="retrieve")`,
 //! `lsp(operation="hover")`) and we
 //! don't maintain preview code for dead paths.
 //!
@@ -36,7 +35,7 @@
 
 use serde_json::Value;
 
-use astra_text_utils::str_preview::{github_repo_display, shorten_path, truncate_line};
+use astra_text_utils::str_preview::{shorten_path, truncate_line};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewStyle {
@@ -163,20 +162,17 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "lsp" => lsp_preview(args, path_budget, verbose),
 
         // ── Unified action-param tools ──────────────────────────────
-        "git" => git_preview(args, path_budget, verbose),
-        "github" => github_preview(args, path_budget, verbose),
         "memory" => memory_preview(args, path_budget, verbose),
         "session" => session_preview(args, path_budget, verbose),
         "mo_query" => mo_query_preview(args, path_budget, verbose),
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
-        "task_board" => task_preview(args, path_budget, verbose),
         "task_output" => background_task_output_preview(args, path_budget, verbose),
         "task_stop" => background_task_stop_preview(args, path_budget, verbose),
         "task_list" => "List background tasks".to_string(),
         "tool_search" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!("Searching tools: \"{}\"", trunc(query, path_budget(17)))
+            format!("Activating tools: \"{}\"", trunc(query, path_budget(18)))
         }
 
         // ── Web ─────────────────────────────────────────────────────
@@ -205,6 +201,7 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
 
         // ── Misc ────────────────────────────────────────────────────
         "introspect" => "Introspecting…".to_string(),
+        "reflect" => "Reflecting…".to_string(),
         "notify" => {
             let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
             format!("Notify: \"{}\"", trunc(msg, path_budget(10)))
@@ -224,144 +221,6 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         other if other.starts_with("mcp_") => mcp_preview(other, path_budget, verbose),
 
         _ => tool.to_string(),
-    }
-}
-
-fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("status");
-    let trunc = |s: &str, b: usize| -> String {
-        if verbose {
-            s.to_string()
-        } else {
-            truncate_line(s, b)
-        }
-    };
-    let short = |p: &str, b: usize| -> String {
-        if verbose {
-            p.to_string()
-        } else {
-            shorten_path(p, b)
-        }
-    };
-    match action {
-        "status" => "Git status".to_string(),
-        "log" => {
-            let n = args.get("n").and_then(Value::as_u64);
-            let git_ref = args.get("ref").and_then(Value::as_str);
-            match (n, git_ref) {
-                (Some(n), Some(r)) => format!("Git log -{n} {r}"),
-                (Some(n), None) => format!("Git log -{n}"),
-                (None, Some(r)) => format!("Git log {r}"),
-                _ => "Git log".to_string(),
-            }
-        }
-        "show" => {
-            let rev = args
-                .get("revision")
-                .and_then(Value::as_str)
-                .unwrap_or("HEAD");
-            format!("Git show {}", trunc(rev, path_budget(9)))
-        }
-        "diff" => {
-            let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-            let path = args.get("path").and_then(Value::as_str);
-            match (staged, path) {
-                (true, Some(p)) => format!("Git diff --staged {}", short(p, path_budget(18))),
-                (true, None) => "Git diff --staged".to_string(),
-                (false, Some(p)) => format!("Git diff {}", short(p, path_budget(10))),
-                _ => "Git diff".to_string(),
-            }
-        }
-        "blame" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            format!("Git blame {}", short(path, path_budget(10)))
-        }
-        "file_history" => {
-            let file = args.get("file").and_then(Value::as_str).unwrap_or("");
-            format!("Git history {}", short(file, path_budget(12)))
-        }
-        "log_search" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!("Git log search \"{}\"", trunc(query, path_budget(17)))
-        }
-        "contributors" => match args.get("path").and_then(Value::as_str) {
-            Some(p) => format!("Git contributors {}", short(p, path_budget(17))),
-            None => "Git contributors".to_string(),
-        },
-        "commit" => {
-            let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-            format!("Git commit \"{}\"", trunc(msg, path_budget(13)))
-        }
-        "revert_commit" => {
-            let sha = args.get("commit_sha").and_then(Value::as_str).unwrap_or("");
-            format!("Git revert {}", trunc(sha, path_budget(11)))
-        }
-        "stash" => {
-            let sub = args.get("sub_action").and_then(Value::as_str).unwrap_or("");
-            if sub.is_empty() {
-                "Git stash".to_string()
-            } else {
-                format!("Git stash {sub}")
-            }
-        }
-        "checkout_file" => {
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let git_ref = args.get("ref").and_then(Value::as_str);
-            match git_ref {
-                Some(r) => format!(
-                    "Git checkout {} -- {}",
-                    trunc(r, 16),
-                    short(path, path_budget(20)),
-                ),
-                None => format!("Git checkout {}", short(path, path_budget(13))),
-            }
-        }
-        "worktree" => {
-            let sub = args.get("sub_action").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str);
-            match (sub, path) {
-                ("", _) => "Git worktree".to_string(),
-                (s, Some(p)) => format!("Git worktree {s} {}", short(p, path_budget(14 + s.len()))),
-                (s, None) => format!("Git worktree {s}"),
-            }
-        }
-        _ => format!("Git {action}"),
-    }
-}
-
-fn github_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-    let owner = args.get("owner").and_then(Value::as_str);
-    let repo = args.get("repo").and_then(Value::as_str);
-    let repo_display = github_repo_display(owner, repo).unwrap_or_default();
-    let trunc = |s: &str, b: usize| -> String {
-        if verbose {
-            s.to_string()
-        } else {
-            truncate_line(s, b)
-        }
-    };
-    match action {
-        "list_prs" => format!("GitHub: list PRs {repo_display}"),
-        "get_pr" => match args.get("pr_number").and_then(Value::as_u64) {
-            Some(n) => format!("GitHub: PR #{n} {repo_display}"),
-            None => format!("GitHub: get PR {repo_display}"),
-        },
-        "ci_status" => format!("GitHub: CI status {repo_display}"),
-        "list_issues" => format!("GitHub: list issues {repo_display}"),
-        "get_issue" => match args.get("issue_number").and_then(Value::as_u64) {
-            Some(n) => format!("GitHub: issue #{n} {repo_display}"),
-            None => format!("GitHub: get issue {repo_display}"),
-        },
-        "repo_stats" => format!("GitHub: stats {repo_display}"),
-        "create_issue" => {
-            let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-            format!("GitHub: create issue \"{}\"", trunc(title, path_budget(22)))
-        }
-        _ => format!("GitHub: {action}"),
     }
 }
 
@@ -543,76 +402,6 @@ fn skill_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bo
                 .unwrap_or("unknown");
             format!("Running skill: {}", trunc(skill_name, 16))
         }
-    }
-}
-
-fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-    task_preview_for_action(action, args, path_budget, verbose)
-}
-
-fn task_preview_for_action(
-    action: &str,
-    args: &Value,
-    path_budget: impl Fn(usize) -> usize,
-    verbose: bool,
-) -> String {
-    let trunc = |s: &str, b: usize| -> String {
-        if verbose {
-            s.to_string()
-        } else {
-            truncate_line(s, path_budget(b))
-        }
-    };
-    match action {
-        "create" => {
-            let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-            format!("Creating task: \"{}\"", trunc(title, 16))
-        }
-        "update" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            let status = args.get("new_status").and_then(Value::as_str);
-            let subtask = args.get("subtask_id").and_then(Value::as_str);
-            match (subtask, status) {
-                (Some(sub), Some(st)) => format!(
-                    "Updating subtask {}/{} -> {}",
-                    trunc(task_id, 10),
-                    trunc(sub, 10),
-                    trunc(st, 12),
-                ),
-                (None, Some(st)) => {
-                    format!("Updating task: {} -> {}", trunc(task_id, 14), trunc(st, 14),)
-                }
-                _ => format!("Updating task: {}", trunc(task_id, 14)),
-            }
-        }
-        "list" => {
-            let status = args.get("status_filter").and_then(Value::as_str);
-            match status {
-                Some(s) => format!("Listing tasks: {}", trunc(s, 15)),
-                None => "Listing tasks".to_string(),
-            }
-        }
-        "list_user" => {
-            let status = args
-                .get("user_status")
-                .and_then(Value::as_str)
-                .unwrap_or("active");
-            format!("Listing cross-session tasks: {}", trunc(status, 15))
-        }
-        "get" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            format!("Getting task: {}", trunc(task_id, 14))
-        }
-        "stop" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            let reason = args.get("reason").and_then(Value::as_str);
-            match reason {
-                Some(r) => format!("Stopping task {}: {}", trunc(task_id, 10), trunc(r, 14),),
-                None => format!("Stopping task: {}", trunc(task_id, 14)),
-            }
-        }
-        _ => format!("Task: {action}"),
     }
 }
 
@@ -979,35 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn git_unified_status() {
-        assert_eq!(p("git", json!({"action": "status"})), "Git status");
-    }
-
-    #[test]
-    fn git_unified_log_with_n() {
-        assert_eq!(p("git", json!({"action": "log", "n": 5})), "Git log -5");
-    }
-
-    #[test]
-    fn git_unified_show() {
-        assert_eq!(
-            p("git", json!({"action": "show", "revision": "abc123"})),
-            "Git show abc123"
-        );
-    }
-
-    #[test]
-    fn github_action_get_pr() {
-        assert_eq!(
-            p(
-                "github",
-                json!({"action": "get_pr", "owner": "o", "repo": "r", "pr_number": 42})
-            ),
-            "GitHub: PR #42 o/r"
-        );
-    }
-
-    #[test]
     fn memory_retrieve() {
         assert_eq!(
             p("memory", json!({"action": "retrieve", "query": "branches"})),
@@ -1040,8 +800,8 @@ mod tests {
     #[test]
     fn tool_search_with_query() {
         assert_eq!(
-            p("tool_search", json!({"query": "github"})),
-            r#"Searching tools: "github""#
+            p("tool_search", json!({"query": "select:github"})),
+            r#"Activating tools: "select:github""#
         );
     }
 
@@ -1137,39 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn task_action_create() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "create", "title": "Fix renderer drift"})
-            ),
-            r#"Creating task: "Fix renderer drift""#
-        );
-    }
-
-    #[test]
-    fn task_update_status() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"})
-            ),
-            "Updating task: render-pass -> in_progress"
-        );
-    }
-
-    #[test]
-    fn task_list_with_filter() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list", "status_filter": "active"})
-            ),
-            "Listing tasks: active"
-        );
-    }
-
-    #[test]
     fn mcp_unknown_tool_formats_as_server_toolname() {
         assert_eq!(
             p("mcp_github_search_issues", json!({})),
@@ -1185,6 +912,11 @@ mod tests {
     #[test]
     fn introspect_is_standalone() {
         assert_eq!(p("introspect", json!({})), "Introspecting…");
+    }
+
+    #[test]
+    fn reflect_is_standalone() {
+        assert_eq!(p("reflect", json!({})), "Reflecting…");
     }
 
     #[test]
@@ -1251,127 +983,6 @@ mod tests {
     }
 
     // ─── Schema-canonical field names ──────────────────────────────────
-
-    #[test]
-    fn git_action_show_uses_canonical_revision_field() {
-        assert_eq!(
-            p("git", json!({"action": "show", "revision": "abc123"})),
-            "Git show abc123"
-        );
-    }
-
-    #[test]
-    fn git_action_show_defaults_to_head_when_omitted() {
-        assert_eq!(p("git", json!({"action": "show"})), "Git show HEAD");
-    }
-
-    #[test]
-    fn git_log_uses_canonical_ref_field() {
-        assert_eq!(
-            p("git", json!({"action": "log", "ref": "main"})),
-            "Git log main"
-        );
-    }
-
-    #[test]
-    fn git_stash_uses_canonical_sub_action_field() {
-        assert_eq!(
-            p("git", json!({"action": "stash", "sub_action": "push"})),
-            "Git stash push"
-        );
-    }
-
-    #[test]
-    fn git_revert_commit_renders() {
-        assert_eq!(
-            p(
-                "git",
-                json!({"action": "revert_commit", "commit_sha": "deadbee"})
-            ),
-            "Git revert deadbee"
-        );
-    }
-
-    #[test]
-    fn git_action_checkout_file_with_ref() {
-        assert_eq!(
-            p(
-                "git",
-                json!({"action": "checkout_file", "path": "src/lib.rs", "ref": "HEAD~1"})
-            ),
-            "Git checkout HEAD~1 -- src/lib.rs"
-        );
-    }
-
-    #[test]
-    fn git_action_worktree_add() {
-        assert_eq!(
-            p(
-                "git",
-                json!({"action": "worktree", "sub_action": "add", "path": "../wt"})
-            ),
-            "Git worktree add ../wt"
-        );
-    }
-
-    #[test]
-    fn github_action_get_pr_uses_canonical_pr_number_field() {
-        assert_eq!(
-            p(
-                "github",
-                json!({"action": "get_pr", "owner": "o", "repo": "r", "pr_number": 7})
-            ),
-            "GitHub: PR #7 o/r"
-        );
-    }
-
-    #[test]
-    fn github_action_get_issue_uses_canonical_issue_number_field() {
-        assert_eq!(
-            p(
-                "github",
-                json!({"action": "get_issue", "owner": "o", "repo": "r", "issue_number": 99})
-            ),
-            "GitHub: issue #99 o/r"
-        );
-    }
-
-    #[test]
-    fn task_update_uses_canonical_new_status_field() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "update", "task_id": "t-1", "new_status": "completed"})
-            ),
-            "Updating task: t-1 -> completed"
-        );
-    }
-
-    #[test]
-    fn task_list_uses_canonical_status_filter_field() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list", "status_filter": "pending"})
-            ),
-            "Listing tasks: pending"
-        );
-    }
-
-    #[test]
-    fn task_list_user_uses_canonical_user_status_field() {
-        assert_eq!(
-            p("task_board", json!({"action": "list_user"})),
-            "Listing cross-session tasks: active"
-        );
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list_user", "user_status": "paused"})
-            ),
-            "Listing cross-session tasks: paused"
-        );
-    }
 
     #[test]
     fn session_history_actions_render() {

@@ -3,23 +3,22 @@
 //! Some models emit tool calls as text instead of using the OpenAI function-calling
 //! protocol (`delta.tool_calls`).  Two degradation patterns are handled:
 //!
-//! 1. **`<invoke>` XML** (e.g. kimi-k2.5 under context pressure): structured XML
-//!    blocks with `<parameter>` children.
-//! 2. **`<tool_call>` text** (e.g. delegation sub-agents): corrupted function-call
-//!    syntax like `<tool_call>bash)(echo hello)` or `<tool_call>grep}{pattern: "x"}`.
+//! 1. **`<invoke>` XML**: structured XML blocks with `<parameter>` children.
+//! 2. **`<tool_call>` text**: corrupted function-call syntax like
+//!    `<tool_call>bash)(echo hello)` or `<tool_call>grep}{pattern: "x"}`.
 //!
 //! When the structured `tool_calls` array is empty but the text contains either
 //! pattern, this module extracts them into the same `Vec<Value>` shape the rest
 //! of the pipeline expects.
 //!
-//! **False-positive guard** (applies to `<tool_call>` only): if the non-tag
-//! portion of the text exceeds 20% of the total length, the content is likely
-//! a normal response that *mentions* the format rather than a degraded tool
-//! call.  In that case `parse_tool_call_tags` returns `None`.  The `<invoke>`
-//! format is unambiguous and does not need this guard.
+//! **False-positive guard**: `<tool_call>` blocks are ambiguous, so a response
+//! dominated by non-tag text is not executed. Bare `<invoke>` blocks are
+//! accepted only as a terminal call suffix; the explicit DSML `tool_calls`
+//! wrapper is stronger evidence and may be surrounded by prose.
 
 use regex::Regex;
 use serde_json::{Value, json};
+use std::ops::Range;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
@@ -194,6 +193,110 @@ fn dsml_tool_calls_close_regex() -> &'static Regex {
         ))
         .expect("DSML tool_calls close regex should compile")
     })
+}
+
+/// Incrementally removes explicit DSML tool-call envelopes from text shown to
+/// users while leaving the original provider response available to the
+/// fallback parser.
+///
+/// Providers may split the opening or closing tag at any UTF-8 boundary. The
+/// filter therefore retains only a possible tag suffix between chunks and
+/// suppresses everything from a confirmed opening envelope through its
+/// closing envelope. An unfinished envelope is dropped by [`Self::finish`].
+#[derive(Debug, Default)]
+pub struct DsmlToolCallStreamFilter {
+    pending: String,
+    suppressing: bool,
+}
+
+impl DsmlToolCallStreamFilter {
+    /// Consume one provider text chunk and return only bytes safe to publish.
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let mut visible = String::new();
+
+        loop {
+            if self.suppressing {
+                if let Some(close) = dsml_tool_calls_close_regex().find(&self.pending) {
+                    self.pending.drain(..close.end());
+                    self.suppressing = false;
+                    continue;
+                }
+                if let Some(start) = possible_dsml_envelope_suffix_start(&self.pending, true) {
+                    self.pending.drain(..start);
+                } else {
+                    self.pending.clear();
+                }
+                break;
+            }
+
+            if let Some(open) = dsml_tool_calls_open_regex().find(&self.pending) {
+                visible.push_str(&self.pending[..open.start()]);
+                self.pending.drain(..open.end());
+                self.suppressing = true;
+                continue;
+            }
+
+            if let Some(start) = possible_dsml_envelope_suffix_start(&self.pending, false) {
+                visible.push_str(&self.pending[..start]);
+                self.pending.drain(..start);
+            } else {
+                visible.push_str(&self.pending);
+                self.pending.clear();
+            }
+            break;
+        }
+
+        visible
+    }
+
+    /// Finish the stream. Visible text held only because it resembled a tag
+    /// prefix is released; an incomplete confirmed DSML envelope is discarded.
+    pub fn finish(&mut self) -> String {
+        if self.suppressing {
+            self.pending.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn possible_dsml_envelope_suffix_start(text: &str, closing: bool) -> Option<usize> {
+    const OPEN_FULLWIDTH: &str = "<｜｜dsml｜｜tool_calls>";
+    const OPEN_ASCII: &str = "<||dsml||tool_calls>";
+    const CLOSE_FULLWIDTH: &str = "</｜｜dsml｜｜tool_calls>";
+    const CLOSE_ASCII: &str = "</||dsml||tool_calls>";
+    let candidates = if closing {
+        [CLOSE_FULLWIDTH, CLOSE_ASCII]
+    } else {
+        [OPEN_FULLWIDTH, OPEN_ASCII]
+    };
+
+    text.char_indices().rev().find_map(|(start, ch)| {
+        if ch != '<' {
+            return None;
+        }
+        let compact = text[start..]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        candidates
+            .iter()
+            .any(|candidate| candidate.starts_with(&compact))
+            .then_some(start)
+    })
+}
+
+/// Remove explicit DSML envelopes from a complete or partial provider payload
+/// before it is rendered or embedded in an interruption message.
+#[must_use]
+pub fn filter_dsml_tool_call_markup_for_display(text: &str) -> String {
+    let mut filter = DsmlToolCallStreamFilter::default();
+    let mut visible = filter.push(text);
+    visible.push_str(&filter.finish());
+    visible
 }
 
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
@@ -420,21 +523,343 @@ pub fn strip_parsed_tool_call_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// Unified fallback: try `<invoke>` first, then `<tool_call>`.
-/// Returns the first successful parse.
-pub fn parse_degraded_tool_calls(text: &str) -> Option<Vec<Value>> {
-    parse_xml_tool_calls(text).or_else(|| parse_tool_call_tags(text))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedCallFormat {
+    Invoke,
+    ToolCallTag,
 }
 
-/// Unified strip: remove whichever degraded format was parsed.
-/// Runs both strip passes — intentional: text may contain both formats,
-/// and leftover tags should always be cleaned regardless of which format
-/// `parse_degraded_tool_calls` matched first.
+#[derive(Debug, Clone)]
+struct ParsedDegradedCall {
+    /// Byte offset in the original provider response.  Keeping the offset
+    /// here makes mixed fallback formats deterministic instead of giving one
+    /// syntax family precedence over another.
+    span: Range<usize>,
+    format: DegradedCallFormat,
+    call: Value,
+    /// A DSML tool_calls wrapper is stronger evidence than a bare invoke tag.
+    wrapped: bool,
+}
+
+#[derive(Debug, Default)]
+struct ParsedDegradedResponse {
+    calls: Vec<Value>,
+    /// Exact source ranges accepted as tool-call syntax. The strip path uses
+    /// these same ranges, so it cannot remove a candidate rejected by the
+    /// parse/ambiguity policy.
+    strip_ranges: Vec<Range<usize>>,
+}
+
+fn next_invoke_start(text: &str, from: usize) -> Option<usize> {
+    let plain = text[from..].find("<invoke").map(|offset| from + offset);
+    let dsml = dsml_tag_regex("invoke", false)
+        .find(&text[from..])
+        .map(|matched| from + matched.start());
+    [plain, dsml].into_iter().flatten().min()
+}
+
+fn invoke_block_end(text: &str, start: usize) -> usize {
+    let tail = &text[start..];
+    let plain_close = tail
+        .find("</invoke>")
+        .map(|offset| start + offset + "</invoke>".len());
+    let dsml_close = dsml_tag_regex("invoke", true).find(tail).map(|matched| {
+        let end = start + matched.end();
+        end + text[end..].find('>').map(|offset| offset + 1).unwrap_or(0)
+    });
+    let self_close = tail.find("/>").map(|offset| start + offset + 2);
+    [plain_close, dsml_close, self_close]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len())
+}
+
+fn dsml_tool_calls_ranges(text: &str) -> Vec<Range<usize>> {
+    let open = dsml_tool_calls_open_regex();
+    let close = dsml_tool_calls_close_regex();
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+    while let Some(open_match) = open.find(&text[search_from..]) {
+        let start = search_from + open_match.start();
+        let body_start = search_from + open_match.end();
+        let Some(close_match) = close.find(&text[body_start..]) else {
+            break;
+        };
+        let end = body_start + close_match.end();
+        ranges.push(start..end);
+        search_from = end;
+    }
+    ranges
+}
+
+fn span_is_inside(span: &Range<usize>, outer: &Range<usize>) -> bool {
+    span.start >= outer.start && span.end <= outer.end
+}
+
+fn parse_invokes_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
+    let mut calls = Vec::new();
+    let wrappers = dsml_tool_calls_ranges(text);
+    let mut search_from = 0;
+    while let Some(start) = next_invoke_start(text, search_from) {
+        let end = invoke_block_end(text, start);
+        let block = normalize_dsml_tool_call_markup(&text[start..end]);
+        if let Some(call) = parse_xml_tool_calls(&block).and_then(|mut parsed| parsed.pop()) {
+            let span = start..end;
+            calls.push(ParsedDegradedCall {
+                wrapped: wrappers
+                    .iter()
+                    .any(|wrapper| span_is_inside(&span, wrapper)),
+                span,
+                format: DegradedCallFormat::Invoke,
+                call,
+            });
+        }
+        // Always move forward, including malformed blocks, so a bad block
+        // cannot make the fallback parser spin forever.
+        search_from = end.max(start.saturating_add(1));
+    }
+    calls
+}
+
+fn parse_tool_call_tags_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
+    if !text.contains("<tool_call>") {
+        return Vec::new();
+    }
+
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+    while let Some(start_offset) = text[search_from..].find("<tool_call>") {
+        let start = search_from + start_offset;
+        let content_start = start + "<tool_call>".len();
+        let end = text[content_start..]
+            .find("</tool_call>")
+            .map(|offset| content_start + offset + "</tool_call>".len())
+            .or_else(|| {
+                text[content_start..]
+                    .find("<tool_call>")
+                    .map(|offset| content_start + offset)
+            })
+            .unwrap_or(text.len());
+        let inner = text[content_start..end]
+            .trim_end_matches("</tool_call>")
+            .replace('\0', "");
+        if let Some(call) = parse_single_tool_call_tag(inner.trim()) {
+            calls.push(ParsedDegradedCall {
+                span: start..end,
+                format: DegradedCallFormat::ToolCallTag,
+                call,
+                wrapped: false,
+            });
+        }
+        search_from = end.max(start.saturating_add(1));
+    }
+
+    calls
+}
+
+fn degraded_call_identity(call: &Value) -> Option<(String, String)> {
+    let function = call.get("function")?.as_object()?;
+    let name = function.get("name")?.as_str()?.trim();
+    let arguments = function.get("arguments")?.as_str()?.trim();
+    if name.is_empty() || arguments.is_empty() {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        crate::stall::canonical_tool_args(arguments),
+    ))
+}
+
+fn select_non_overlapping(mut candidates: Vec<ParsedDegradedCall>) -> Vec<ParsedDegradedCall> {
+    // Prefer the outer block when two candidates start at the same byte. A
+    // valid outer call owns any markup appearing in its argument text; nested
+    // scans are never independent calls.
+    candidates.sort_by(|left, right| {
+        left.span
+            .start
+            .cmp(&right.span.start)
+            .then_with(|| right.span.end.cmp(&left.span.end))
+    });
+    let mut selected = Vec::with_capacity(candidates.len());
+    let mut last_end = 0;
+    for candidate in candidates {
+        if candidate.span.start < last_end {
+            continue;
+        }
+        last_end = candidate.span.end;
+        selected.push(candidate);
+    }
+    selected
+}
+
+fn bare_invokes_form_terminal_suffix(text: &str, candidates: &[ParsedDegradedCall]) -> bool {
+    let Some(first_bare_index) = candidates
+        .iter()
+        .position(|call| call.format == DegradedCallFormat::Invoke && !call.wrapped)
+    else {
+        return true;
+    };
+    // A normal prose prefix is allowed, but once a bare invoke begins only
+    // confirmed call block may separate it from another block and from the
+    // response terminus. This permits an adjacent fallback syntax while
+    // preventing explanatory trailing text from being executed.
+    let trailing = &candidates[first_bare_index..];
+    trailing
+        .windows(2)
+        .all(|pair| text[pair[0].span.end..pair[1].span.start].trim().is_empty())
+        && text[trailing.last().unwrap().span.end..].trim().is_empty()
+}
+
+fn remove_ranges(text: &str, ranges: &[Range<usize>]) -> String {
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| (range.start, range.end));
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for range in sorted {
+        if range.start < cursor || range.end > text.len() {
+            continue;
+        }
+        output.push_str(&text[cursor..range.start]);
+        cursor = range.end;
+    }
+    output.push_str(&text[cursor..]);
+    output.trim().to_string()
+}
+
+fn parse_degraded_response(text: &str) -> ParsedDegradedResponse {
+    let mut candidates = parse_invokes_with_positions(text);
+    candidates.extend(parse_tool_call_tags_with_positions(text));
+    let candidates = select_non_overlapping(candidates);
+    let bare_suffix = bare_invokes_form_terminal_suffix(text, &candidates);
+    let accepted_invokes: Vec<ParsedDegradedCall> = candidates
+        .iter()
+        .filter(|invoke| {
+            invoke.format == DegradedCallFormat::Invoke && (invoke.wrapped || bare_suffix)
+        })
+        .cloned()
+        .collect();
+
+    let accepted_invoke_ranges: Vec<Range<usize>> = accepted_invokes
+        .iter()
+        .map(|invoke| invoke.span.clone())
+        .collect();
+    let mut tool_tags = candidates
+        .into_iter()
+        .filter(|candidate| candidate.format == DegradedCallFormat::ToolCallTag)
+        .filter(|tag| {
+            !accepted_invoke_ranges
+                .iter()
+                .any(|invoke| tag.span.start < invoke.end && invoke.start < tag.span.end)
+        })
+        .collect::<Vec<_>>();
+
+    // Apply the ambiguity guard only to residual text outside accepted invoke
+    // blocks. A large structured block must not subsidize prose around an
+    // unrelated, ambiguous tag.
+    let residual_total = text.len().saturating_sub(
+        accepted_invoke_ranges
+            .iter()
+            .map(|range| range.end.saturating_sub(range.start))
+            .sum::<usize>(),
+    );
+    let tag_bytes = tool_tags
+        .iter()
+        .map(|tag| tag.span.end.saturating_sub(tag.span.start))
+        .sum::<usize>();
+    if residual_total > 0
+        && !tool_tags.is_empty()
+        && residual_total.saturating_sub(tag_bytes) as f64 / residual_total as f64
+            > MAX_NON_XML_RATIO
+    {
+        tool_tags.clear();
+    }
+
+    let mut parsed = accepted_invokes;
+    parsed.extend(tool_tags);
+    let parsed = select_non_overlapping(parsed);
+    if parsed.is_empty() {
+        return ParsedDegradedResponse::default();
+    }
+
+    let mut calls = Vec::with_capacity(parsed.len());
+    // One occurrence can cancel at most one occurrence from the other syntax
+    // family. Same-family duplicates remain intact.
+    let mut seen_identities = Vec::<(DegradedCallFormat, (String, String), usize)>::new();
+    for entry in &parsed {
+        let identity = degraded_call_identity(&entry.call);
+        let mut duplicate = false;
+        if let Some(identity) = identity.as_ref() {
+            let current_count = seen_identities
+                .iter()
+                .find(|(format, seen, _)| *format == entry.format && *seen == *identity)
+                .map(|(_, _, count)| *count)
+                .unwrap_or(0);
+            let other_available = seen_identities.iter().any(|(format, seen, count)| {
+                *format != entry.format && *seen == *identity && *count > 0
+            });
+            duplicate = current_count == 0 && other_available;
+            if let Some((_, _, count)) = seen_identities
+                .iter_mut()
+                .find(|(format, seen, _)| *format == entry.format && *seen == *identity)
+            {
+                *count += 1;
+            } else {
+                seen_identities.push((entry.format, identity.clone(), 1));
+            }
+        }
+        if !duplicate {
+            calls.push(entry.call.clone());
+        }
+    }
+
+    let mut strip_ranges = accepted_invoke_ranges;
+    let accepted_invoke_ranges_ref = strip_ranges.clone();
+    // Strip a DSML wrapper as one unit so its wrapper tags do not leak into
+    // the assistant transcript. Bare invokes retain their exact block range.
+    strip_ranges.extend(dsml_tool_calls_ranges(text).into_iter().filter(|wrapper| {
+        accepted_invoke_ranges_ref
+            .iter()
+            .any(|range| span_is_inside(range, wrapper))
+    }));
+    strip_ranges.extend(
+        parsed
+            .iter()
+            .filter(|entry| entry.format == DegradedCallFormat::ToolCallTag)
+            .map(|entry| entry.span.clone()),
+    );
+
+    ParsedDegradedResponse {
+        calls,
+        strip_ranges,
+    }
+}
+
+/// Unified fallback for provider responses that contain only degraded text.
+///
+/// Native structured calls are handled by the caller before this function.
+/// When fallback is needed, all independently confirmed syntax families are
+/// merged in source order.  A duplicate represented once as `<invoke>` and
+/// once as `<tool_call>` is executed once; two calls from the same syntax
+/// family are preserved because they may be intentional repeated operations.
+pub fn parse_degraded_tool_calls(text: &str) -> Option<Vec<Value>> {
+    let parsed = parse_degraded_response(text);
+    (!parsed.calls.is_empty()).then_some(parsed.calls)
+}
+
+/// Unified strip: remove exactly the ranges accepted by the unified parser.
+/// Keeping parse and strip on one canonical decision prevents a rejected
+/// explanatory block from being silently deleted just because another format
+/// was accepted in the same response.
 pub fn strip_degraded_tool_calls(text: &str) -> String {
-    let after_invoke = strip_parsed_invocations(text);
-    let after_tool_call = strip_parsed_tool_call_tags(&after_invoke);
-    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_tool_call);
-    strip_residual_xml_fragments(&after_truncated_tail)
+    let parsed = parse_degraded_response(text);
+    let after_accepted = remove_ranges(text, &parsed.strip_ranges);
+    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_accepted);
+    let after_residual_fragments = strip_residual_xml_fragments(&after_truncated_tail);
+    filter_dsml_tool_call_markup_for_display(&after_residual_fragments)
 }
 
 fn strip_truncated_degraded_tool_call_tail(text: &str) -> String {
@@ -575,6 +1000,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dsml_stream_filter_hides_envelope_across_chunk_boundaries() {
+        let mut filter = DsmlToolCallStreamFilter::default();
+        let chunks = [
+            "visible before <｜｜DS",
+            "ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">secret",
+            "</｜｜DSML｜｜invoke></｜｜DSML",
+            "｜｜tool_calls> visible after",
+        ];
+        let mut visible = chunks
+            .into_iter()
+            .map(|chunk| filter.push(chunk))
+            .collect::<String>();
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "visible before  visible after");
+        assert!(!visible.contains("DSML"));
+        assert!(!visible.contains("secret"));
+    }
+
+    #[test]
+    fn dsml_stream_filter_hides_ascii_and_unfinished_envelopes() {
+        let complete = "before< ||DSML||tool_calls >< ||DSML||invoke name=\"bash\">hidden</ ||DSML||invoke></ ||DSML||tool_calls >after";
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display(complete),
+            "beforeafter"
+        );
+
+        let incomplete =
+            "safe prefix<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">hidden";
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display(incomplete),
+            "safe prefix"
+        );
+    }
+
+    #[test]
+    fn dsml_stream_filter_preserves_non_protocol_angle_brackets() {
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display("explain <tool_calls> literally"),
+            "explain <tool_calls> literally"
+        );
+        assert_eq!(filter_dsml_tool_call_markup_for_display("2 <"), "2 <");
+    }
+
+    #[test]
     fn parse_single_invoke_with_params() {
         let xml = r#"<invoke name="read_file">
 <parameter name="path">src/main.rs</parameter>
@@ -609,6 +1079,25 @@ mod tests {
             serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["action"], "get_result");
         assert_eq!(args["agent_id"], "reviewer@run");
+    }
+
+    #[test]
+    fn parse_fullwidth_dsml_with_adjacent_tool_call_blocks() {
+        let dsml = concat!(
+            "Let me start:\n\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"bash\">\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"command\" string=\"true\">echo test</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>\n",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls><\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"bash\">\n",
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter name=\"command\" string=\"true\">mkdir -p /run/sshd</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}parameter>\n",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke>\n",
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>"
+        );
+        let calls = parse_degraded_tool_calls(dsml).expect("fullwidth DSML should parse");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call["function"]["name"] == "bash"));
     }
 
     #[test]
@@ -754,8 +1243,8 @@ Done."#;
     }
 
     #[test]
-    fn real_world_kimi_output() {
-        // Exact pattern from the session log
+    fn real_world_multi_invoke_output() {
+        // A provider-neutral multi-call response with prose-free invoke blocks.
         let xml = r#"<invoke name="read_file">
 <parameter name="path">crates/runtime/src/tasks/task_learning.rs</parameter>
 </invoke>
@@ -898,11 +1387,31 @@ Done."#;
     // ─── Unified Parser Tests ──────────────────────────────────────
 
     #[test]
-    fn unified_prefers_invoke_over_tool_call() {
-        let xml = r#"<invoke name="bash">
-<parameter name="command">echo hi</parameter>
+    fn unified_keeps_mixed_fallback_calls_in_source_order() {
+        let text = r#"<tool_call>bash)(echo first)</tool_call>
+<invoke name="bash">
+<parameter name="command">echo second</parameter>
 </invoke>"#;
-        let calls = parse_degraded_tool_calls(xml).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            r#"{"command":"echo first"}"#
+        );
+        assert_eq!(
+            calls[1]["function"]["arguments"],
+            r#"{"command":"echo second"}"#
+        );
+    }
+
+    #[test]
+    fn unified_deduplicates_the_same_call_across_fallback_formats() {
+        let text = r#"<invoke name="bash">
+<parameter name="command">echo same</parameter>
+</invoke>
+<tool_call>bash)(echo same)</tool_call>"#;
+        let calls = parse_degraded_tool_calls(text).unwrap();
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
         assert!(calls[0]["id"].as_str().unwrap().starts_with("xmlfb_"));
     }
@@ -932,7 +1441,7 @@ Done."#;
         // followed by a valid <invoke> block.
         let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
 <invoke name=\"list_dir\">\n\
-<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+<parameter name=\"path\">/workspace/astra</parameter>\n\
 </invoke>";
         let calls = parse_degraded_tool_calls(text);
         assert!(
@@ -947,7 +1456,7 @@ Done."#;
     fn prose_prefix_invoke_is_stripped_from_text() {
         let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
 <invoke name=\"list_dir\">\n\
-<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+<parameter name=\"path\">/workspace/astra</parameter>\n\
 </invoke>";
         let stripped = strip_degraded_tool_calls(text);
         assert!(
@@ -975,17 +1484,69 @@ Done."#;
     }
 
     #[test]
-    fn multi_step_prose_with_invoke_is_parsed() {
-        // LLM enumerates steps, one of which is an invoke block
+    fn bare_invoke_with_trailing_prose_is_not_executed() {
+        // A bare invoke followed by explanatory text is ambiguous: preserve
+        // the response instead of executing a block that may only be an
+        // example in the explanation.
         let text = "I'll help you with that. Let me check the directory first.\n\n\
 <invoke name=\"bash\">\n\
 <parameter name=\"command\">ls -la</parameter>\n\
 </invoke>\n\nThen I'll analyze the results.";
         let calls = parse_degraded_tool_calls(text);
-        assert!(
-            calls.is_some(),
-            "invoke with surrounding prose should be parsed"
+        assert!(calls.is_none());
+    }
+
+    #[test]
+    fn nested_markup_inside_invoke_parameter_is_not_a_second_call() {
+        let text = r#"<invoke name="bash">
+<parameter name="command">printf '<tool_call>bash)(echo nested)</tool_call>'</parameter>
+</invoke>"#;
+        let calls = parse_degraded_tool_calls(text).expect("outer invoke should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        assert_eq!(strip_degraded_tool_calls(text), "");
+    }
+
+    #[test]
+    fn adjacent_mixed_fallback_blocks_are_not_treated_as_nested() {
+        let text = r#"<invoke name="bash"><parameter name="command">echo one</parameter></invoke>
+<tool_call>bash)(echo two)</tool_call>"#;
+        let calls = parse_degraded_tool_calls(text).expect("both adjacent blocks should parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(strip_degraded_tool_calls(text), "");
+    }
+
+    #[test]
+    fn cross_format_dedup_consumes_only_one_occurrence() {
+        let text = r#"<invoke name="bash"><parameter name="command">echo same</parameter></invoke>
+<tool_call>bash)(echo same)</tool_call>
+<tool_call>bash)(echo same)</tool_call>"#;
+        let calls = parse_degraded_tool_calls(text).expect("fallback blocks should parse");
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn cross_format_dedup_canonicalizes_json_argument_key_order() {
+        let text = r#"<invoke name="mcp">
+<parameter name="z">1</parameter><parameter name="a">2</parameter>
+</invoke>
+<tool_call>mcp{"a":"2","z":"1"}</tool_call>"#;
+        let calls = parse_degraded_tool_calls(text).expect("fallback blocks should parse");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn rejected_tag_is_not_stripped_when_a_different_invoke_is_accepted() {
+        let text = concat!(
+            "< ||DSML||tool_calls >< ||DSML||invoke name=\"bash\">",
+            "< ||DSML||parameter name=\"command\">echo ok</ ||DSML||parameter>",
+            "</ ||DSML||invoke></ ||DSML||tool_calls>\n",
+            "This explanation is intentionally long enough to make the adjacent ",
+            "ambiguous tag untrusted: <tool_call>bash)(echo maybe)</tool_call>"
         );
+        assert_eq!(parse_degraded_tool_calls(text).unwrap().len(), 1);
+        let stripped = strip_degraded_tool_calls(text);
+        assert!(stripped.contains("<tool_call>"));
     }
 
     #[test]

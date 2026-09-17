@@ -16,12 +16,18 @@ pub mod error;
 pub mod paths;
 pub mod protocol;
 pub mod sse;
+pub mod work;
 
 pub use astra_server_types::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
     SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
-    SessionRunTreeSnapshot,
+    SessionRunTreeSnapshot, WorkBranchActivityResponseV1, WorkBranchActivityV1,
+    WorkBranchAttachRequestV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
+    WorkCreateCriterionV1, WorkCreateRequestV1, WorkExecutionPlacementV1, WorkExecutionStateV1,
+    WorkExecutionSwitchOperationV1, WorkExecutionSwitchRequestV1,
+    WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
+    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1, WorkTurnRequestV1,
 };
 pub use client::ThinClient;
 pub use device_proof::{
@@ -37,12 +43,17 @@ pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
     EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    LegacyEdgePendingRequest, ModelSelection, ProviderInteractionRespondRequest,
-    RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem,
-    SessionTranscriptPage, SessionTranscriptPageRef, SessionTranscriptReadScope,
-    SessionTranscriptToolCall, SessionTranscriptToolResult, SessionUpdateRequest, StreamEvent,
-    TaskLeaseMutationRequest, ToolResultRequest, ToolResultRequestParts, UserPromptRespondRequest,
-    classify_stream_event,
+    ModelSelection, ProviderInteractionRespondRequest, RunUserIntentRequest, RunUserIntentResponse,
+    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
+    SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
+    SessionUpdateRequest, StreamEvent, ToolResultHashParts, ToolResultRequest,
+    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    tool_result_status_is_error,
 };
-/// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
+/// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;
+pub use work::{
+    WorkItemDeliveryBlockerKindV2, WorkItemDeliveryStatusV2, WorkItemExecutionStatusV2,
+    WorkItemVerificationStatusV2, WorkTaskGraphBasisV2, WorkTaskGraphCursorV2,
+    WorkTaskGraphDependencyV2, WorkTaskGraphItemV2, WorkTaskGraphPageV2,
+};
