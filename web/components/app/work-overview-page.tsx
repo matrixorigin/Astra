@@ -20,10 +20,12 @@ import type {
   WorkPatchMaterializationPageV2,
   WorkPatchCommitPageV1,
   WorkExecutionViewV1,
+  WorkRecoveryPointPageV1,
 } from "@astra/sdk";
 import {
   Archive,
   ArchiveRestore,
+  ArrowRight,
   Check,
   ChevronDown,
   ChevronRight,
@@ -50,6 +52,7 @@ import {
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
   refreshWorkBranchActivityAction,
+  refreshWorkEventsAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -103,6 +106,8 @@ const ARCHIVE_DATE_FORMATTER = new Intl.DateTimeFormat("en", {
   timeZone: "UTC",
 });
 const ACTIVE_BRANCH_ACTIVITY_REFRESH_MS = 1_200;
+const ACTIVE_WORK_EVENTS_REFRESH_MS = 2_000;
+const IDLE_WORK_EVENTS_REFRESH_MS = 10_000;
 
 function deletionProgressLabel(
   phase: WorkBranchDeletionOperationV1["phase"],
@@ -141,6 +146,7 @@ function branchActivityLabel(activity: WorkBranchActivityResponseV1["activity"])
 export function WorkOverviewPage({
   initial,
   attachment,
+  attachmentNotice,
   initialActivity,
   initialExecution,
   transcript,
@@ -150,9 +156,11 @@ export function WorkOverviewPage({
   patchArtifacts,
   patchMaterializations,
   patchCommits,
+  recoveryPoints,
 }: {
   initial: WorkOverviewSnapshot;
   attachment?: WorkBranchAttachmentV1 | null;
+  attachmentNotice?: string;
   initialActivity?: WorkBranchActivityResponseV1 | null;
   initialExecution?: WorkExecutionViewV1 | null;
   transcript?: WorkTranscriptPageV1 | null;
@@ -162,12 +170,16 @@ export function WorkOverviewPage({
   patchArtifacts?: WorkPatchArtifactPageV1 | null;
   patchMaterializations?: WorkPatchMaterializationPageV2 | null;
   patchCommits?: WorkPatchCommitPageV1 | null;
+  recoveryPoints?: WorkRecoveryPointPageV1 | null;
 }) {
   const [snapshot, setSnapshot] = useState(initial);
   const [turnActive, setTurnActive] = useState(false);
   const [branchActivity, setBranchActivity] = useState(initialActivity ?? null);
   const [branchActivityHealth, setBranchActivityHealth] = useState<"live" | "delayed">(
     initialActivity ? "live" : "delayed",
+  );
+  const [workEventsHealth, setWorkEventsHealth] = useState<"live" | "delayed" | "refreshing">(
+    "live",
   );
   const [expandedProposalId, setExpandedProposalId] = useState<string | null>(
     null,
@@ -204,6 +216,10 @@ export function WorkOverviewPage({
     useState<WorkBranchDeletionOperationV1 | null>(null);
   const deletionPollAttempt = useRef(0);
   const comparisonGeneration = useRef(0);
+  const eventHeadRef = useRef(initial.report.overview.event_head);
+  const initialEventHeadRef = useRef(initial.report.overview.event_head);
+  const pendingProjectionHead = useRef<number | null>(null);
+  const eventRefreshGeneration = useRef(0);
   const router = useRouter();
   const toast = useToast();
 
@@ -214,6 +230,44 @@ export function WorkOverviewPage({
     setBranchActivity(initialActivity ?? null);
     setBranchActivityHealth(initialActivity ? "live" : "delayed");
   }, [initialActivity, workId, selectedBranchId]);
+
+  useEffect(() => {
+    const incomingHead = initial.report.overview.event_head;
+    if (incomingHead >= eventHeadRef.current) {
+      eventHeadRef.current = incomingHead;
+    }
+    const pendingHead = pendingProjectionHead.current;
+    if (pendingHead !== null) {
+      if (incomingHead >= pendingHead) {
+        pendingProjectionHead.current = null;
+        setWorkEventsHealth("live");
+      } else {
+        setWorkEventsHealth("refreshing");
+      }
+    } else {
+      setWorkEventsHealth("live");
+    }
+  }, [initial.report.overview.event_head]);
+
+  useEffect(() => {
+    initialEventHeadRef.current = initial.report.overview.event_head;
+  }, [initial.report.overview.event_head]);
+
+  useEffect(() => {
+    // A route change can reuse this client component. Never carry the prior
+    // Work's cursor into the new identity; the next bounded read establishes
+    // the new Work's current head.
+    // The API accepts a cursor only after the first committed event. Start
+    // from the server snapshot for this Work/branch so the first poll is a
+    // valid bounded read and can discover the next event across surfaces.
+    eventHeadRef.current = initialEventHeadRef.current;
+    pendingProjectionHead.current = null;
+    setWorkEventsHealth("live");
+    eventRefreshGeneration.current += 1;
+    return () => {
+      eventRefreshGeneration.current += 1;
+    };
+  }, [selectedBranchId, workId]);
 
   const refreshBranchActivity = useCallback(async () => {
     try {
@@ -270,6 +324,52 @@ export function WorkOverviewPage({
       : null;
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
+
+  const refreshWorkEvents = useCallback(async () => {
+    const generation = eventRefreshGeneration.current;
+    const afterEventSeq = eventHeadRef.current;
+    try {
+      const result = await refreshWorkEventsAction({ workId, afterEventSeq });
+      if (generation !== eventRefreshGeneration.current) return true;
+      if (!result.ok || result.page.work_id !== workId) {
+        setWorkEventsHealth("delayed");
+        return false;
+      }
+      if (result.page.event_head > eventHeadRef.current) {
+        eventHeadRef.current = result.page.event_head;
+        pendingProjectionHead.current = result.page.event_head;
+        setWorkEventsHealth("refreshing");
+        // The server-rendered bounded snapshot is the single projection
+        // authority. Refresh it once the shared Work clock advances instead
+        // of trying to merge partial JSON in the browser.
+        router.refresh();
+      } else if (pendingProjectionHead.current !== null) {
+        // `router.refresh()` has no completion signal. Keep retrying the
+        // bounded server projection while its applied event head is behind
+        // the observed Work clock, otherwise one transient RSC failure could
+        // leave the page stale forever.
+        setWorkEventsHealth("refreshing");
+        router.refresh();
+      } else if (pendingProjectionHead.current === null) {
+        setWorkEventsHealth("live");
+      }
+      return true;
+    } catch {
+      if (generation === eventRefreshGeneration.current) {
+        setWorkEventsHealth("delayed");
+      }
+      return false;
+    }
+  }, [router, workId]);
+
+  useVisiblePoll({
+    enabled: true,
+    intervalMs: activityNeedsGraphRefresh
+      ? ACTIVE_WORK_EVENTS_REFRESH_MS
+      : IDLE_WORK_EVENTS_REFRESH_MS,
+    maximumIntervalMs: 30_000,
+    refresh: refreshWorkEvents,
+  });
   const branchLabel = workBranchLabel(branchCatalog, selectedBranch);
   const isDeliveryBranch = selectedBranch.is_delivery;
   const deliveryBranch = branchCatalog.branches.find((branch) => branch.is_delivery)!;
@@ -898,9 +998,17 @@ export function WorkOverviewPage({
             >
               {currentActivity
                 ? branchActivityHealth === "live"
-                  ? `${branchActivityLabel(currentActivity)} · Live`
+                  ? `${branchActivityLabel(currentActivity)} · ${
+                      workEventsHealth === "refreshing"
+                        ? "new update received"
+                        : workEventsHealth === "live"
+                          ? "Live"
+                          : "updates delayed"
+                    }`
                   : `Connection delayed · last confirmed ${branchActivityLabel(currentActivity)}`
-                : "Activity status unavailable · reconnecting"}
+                : workEventsHealth === "delayed"
+                  ? "Activity unavailable · reconnecting"
+                  : "Waiting for the first live update"}
             </p>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-2">
@@ -910,7 +1018,7 @@ export function WorkOverviewPage({
             </div>
             {branchCatalog.branches.length > 1 ? (
               <label className="flex items-center gap-2 text-xs text-text-muted">
-                Approach
+                View approach
                 <select
                   aria-label="Work approach"
                   className="rounded-control border border-border bg-surface px-2 py-1 text-sm font-medium text-text outline-none focus:border-accent"
@@ -932,25 +1040,49 @@ export function WorkOverviewPage({
           </div>
         </header>
 
+        {attachmentNotice ? (
+          <div
+            role="alert"
+            className="mt-5 rounded-control border border-warning/40 bg-warning/10 px-4 py-3 text-sm leading-6 text-text-secondary"
+          >
+            {attachmentNotice}
+          </div>
+        ) : null}
+
+        <WorkJourneyGuide
+          activity={currentActivity}
+          factCode={snapshot.report.finding.fact_code}
+          pendingCount={pending.length}
+          acceptedCriteriaCount={snapshot.criteria.criteria.total}
+          isDeliveryBranch={isDeliveryBranch}
+        />
+
         <div className="mt-8 grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0 space-y-6">
-            <WorkExecutionCard
-              key={branchId}
-              workId={overview.work_id}
-              branchId={branchId}
-              initialExecution={initialExecution}
-              attachment={attachment}
-              branchRevision={attachment?.branch_revision}
-              controlBasis={attachment?.control_basis}
+            <WorkTaskGraph
+              id="work-plan"
+              initial={snapshot.taskGraph}
+              live={turnActive || activityNeedsGraphRefresh}
             />
-            <Card className="space-y-4">
+
+            <WorkActivityCard
+              id="work-activity"
+              workId={overview.work_id}
+              activity={snapshot.activity}
+            />
+
+            <WorkRecoveryPointsCard points={recoveryPoints} />
+
+            <Card id="work-approach" className="space-y-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <p className="text-sm font-semibold text-text">{branchLabel}</p>
+                  <p className="text-sm font-semibold text-text">
+                    {isDeliveryBranch ? "Main result" : `Alternative · ${branchLabel}`}
+                  </p>
                   <p className="mt-1 text-xs leading-5 text-text-muted">
                     {attachment?.head
-                      ? "Starts a separate approach after the latest saved turn. Work still running stays here; tools and workspace access are checked again."
-                      : "A separate approach becomes available after the first turn is saved."}
+                      ? "Start a separate approach from this saved turn. The current turn keeps running here; the new approach gets its own checks."
+                      : "Save the first turn before starting a separate approach."}
                   </p>
                   {selectedBranch.materialization ? (
                     <ForkMaterializationSummary
@@ -978,7 +1110,7 @@ export function WorkOverviewPage({
                         )
                       }
                     >
-                      {retentionPending === branchId ? "Archiving…" : "Archive"}
+                      {retentionPending === branchId ? "Archiving…" : "Archive this approach"}
                     </Button>
                   ) : null}
                   {!isDeliveryBranch ? (
@@ -1009,7 +1141,7 @@ export function WorkOverviewPage({
                       disabled={!attachment?.head || forkStarting}
                       onClick={() => void createAlternative()}
                     >
-                      {forkStarting ? "Creating…" : "Try another approach"}
+                      {forkStarting ? "Creating…" : "Start a separate approach"}
                     </Button>
                   )}
                 </div>
@@ -1154,12 +1286,14 @@ export function WorkOverviewPage({
             </Card>
 
             <WorkTranscriptCard
+              id="work-conversation"
               workId={overview.work_id}
               branchId={branchId}
               initial={transcript}
             />
 
             <WorkTurnComposer
+              key={`${overview.work_id}:${branchId}`}
               workId={overview.work_id}
               branchId={branchId}
               attachmentId={attachment?.attachment_id}
@@ -1200,13 +1334,8 @@ export function WorkOverviewPage({
               />
             ) : null}
 
-            <WorkActivityCard
-              workId={overview.work_id}
-              activity={snapshot.activity}
-            />
-
             {pending.length > 0 ? (
-              <Card className="overflow-hidden p-0">
+              <Card id="work-done-when" className="overflow-hidden p-0">
                 <div className="flex items-start gap-3 px-5 py-4">
                   <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">
                     <ClipboardCheck className="size-4" />
@@ -1287,12 +1416,7 @@ export function WorkOverviewPage({
               </Card>
             ) : null}
 
-            <WorkTaskGraph
-              initial={snapshot.taskGraph}
-              live={turnActive || activityNeedsGraphRefresh}
-            />
-
-            <Card>
+              <Card id={pending.length === 0 ? "work-done-when" : undefined}>
               <div className="flex items-center justify-between gap-3">
                 <h2 className="text-sm font-semibold text-text">Accepted Done when</h2>
                 <span className="text-xs tabular-nums text-text-muted">
@@ -1320,6 +1444,16 @@ export function WorkOverviewPage({
           </div>
 
           <aside className="space-y-5">
+            <WorkExecutionCard
+              key={branchId}
+              workId={overview.work_id}
+              branchId={branchId}
+              initialExecution={initialExecution}
+              attachment={attachment}
+              branchRevision={attachment?.branch_revision}
+              controlBasis={attachment?.control_basis}
+            />
+
             <Card>
               <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
                 Main result status
@@ -1351,6 +1485,160 @@ export function WorkOverviewPage({
       </main>
     </div>
   );
+}
+
+function WorkJourneyGuide({
+  activity,
+  factCode,
+  pendingCount,
+  acceptedCriteriaCount,
+  isDeliveryBranch,
+}: {
+  activity: WorkBranchActivityResponseV1["activity"] | null;
+  factCode: WorkObservationFactCodeV1;
+  pendingCount: number;
+  acceptedCriteriaCount: number;
+  isDeliveryBranch: boolean;
+}) {
+  const next = nextWorkAction(
+    activity,
+    factCode,
+    pendingCount,
+    acceptedCriteriaCount,
+    isDeliveryBranch,
+  );
+  return (
+    <Card
+      role="region"
+      aria-label="Next step"
+      className="mt-6 border-accent/20 bg-accent/[0.025] p-0"
+    >
+      <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:px-5">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-accent/10 text-accent">
+          {next.icon}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
+            Next step
+          </p>
+          <p className="mt-1 text-sm font-semibold text-text">{next.title}</p>
+          <p className="mt-1 text-sm leading-6 text-text-secondary">{next.detail}</p>
+        </div>
+        <a
+          href={next.href}
+          className="inline-flex shrink-0 items-center gap-1.5 text-sm font-semibold text-accent hover:underline"
+        >
+          {next.action}
+          <ArrowRight className="size-4" aria-hidden="true" />
+        </a>
+      </div>
+    </Card>
+  );
+}
+
+function nextWorkAction(
+  activity: WorkBranchActivityResponseV1["activity"] | null,
+  factCode: WorkObservationFactCodeV1,
+  pendingCount: number,
+  acceptedCriteriaCount: number,
+  isDeliveryBranch: boolean,
+) {
+  if (activity === "working") {
+    return {
+      title: "Astra is working",
+      detail:
+        pendingCount > 0
+          ? "Follow the current tasks in the plan. A completion suggestion is also ready for review."
+          : "Follow the current tasks and their latest changes in the plan.",
+      action: "View live plan",
+      href: "#work-plan",
+      icon: <ListChecks className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (activity === "waiting") {
+    return {
+      title: "Astra is waiting",
+      detail:
+        pendingCount > 0
+          ? "Check the plan for what it needs. A completion suggestion is ready for review too."
+          : "Check the plan and conversation for the input or capability it needs.",
+      action: "See what is waiting",
+      href: "#work-plan",
+      icon: <CircleDot className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (pendingCount > 0) {
+    return {
+      title: `Review ${pendingCount} Done-when suggestion${pendingCount === 1 ? "" : "s"}`,
+      detail: "Astra suggested a completion check. The Work can keep moving while you review it.",
+      action: "Review suggestions",
+      href: "#work-done-when",
+      icon: <CircleDot className="size-4" aria-hidden="true" />,
+    };
+  }
+  if (!isDeliveryBranch) {
+    return {
+      title: "Compare this approach",
+      detail:
+        "This alternative has its own conversation and plan. Compare it with Main before choosing which result to deliver.",
+      action: "Compare with Main result",
+      href: "#work-approach",
+      icon: <GitBranch className="size-4" aria-hidden="true" />,
+    };
+  }
+  switch (factCode) {
+    case "ready_for_review":
+      return {
+        title: "Review the result",
+        detail: "The accepted Done-when checks have current supporting evidence.",
+        action: "Read the result",
+        href: "#work-conversation",
+        icon: <Check className="size-4" aria-hidden="true" />,
+      };
+    case "verification_required":
+      return {
+        title: "Check the evidence",
+        detail: "The Work has a result, but one or more Done-when checks still need proof.",
+        action: "View Done when",
+        href: "#work-done-when",
+        icon: <ListChecks className="size-4" aria-hidden="true" />,
+      };
+    case "branch_basis_out_of_date":
+      return {
+        title: "Review this approach",
+        detail: "This approach is based on an older goal or completion contract.",
+        action: "View approach",
+        href: "#work-approach",
+        icon: <CircleDot className="size-4" aria-hidden="true" />,
+      };
+    case "subject_unavailable":
+      return {
+        title: "Continue the Work",
+        detail: "There is no result revision to check yet. Guide Astra from the conversation below.",
+        action: "Continue below",
+        href: "#work-conversation",
+        icon: <ArrowRight className="size-4" aria-hidden="true" />,
+      };
+    case "criteria_not_accepted":
+      if (acceptedCriteriaCount === 0) {
+        return {
+          title: "Ask Astra to define Done when",
+          detail:
+            "This Work has no completion checks yet. Ask Astra in the conversation to propose the checks that will make the outcome reviewable.",
+          action: "Continue in conversation",
+          href: "#work-conversation",
+          icon: <Check className="size-4" aria-hidden="true" />,
+        };
+      }
+    default:
+      return {
+        title: "Define Done when",
+        detail: "Accept a completion check so Astra can tell you when this Work is finished.",
+        action: "View Done when",
+        href: "#work-done-when",
+        icon: <Check className="size-4" aria-hidden="true" />,
+      };
+  }
 }
 
 function BranchComparisonSummary({
@@ -1517,6 +1805,185 @@ function ForkMaterializationSummary({
       ))}
     </dl>
   );
+}
+
+function WorkRecoveryPointsCard({
+  points,
+}: {
+  points?: WorkRecoveryPointPageV1 | null;
+}) {
+  return (
+    <Card id="work-progress" className="space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-text">Saved progress</h2>
+          <p className="mt-1 text-xs leading-5 text-text-muted">
+            Conversation and Work state recorded at a stable point. Code files are not included yet.
+          </p>
+        </div>
+        {points?.points.length ? (
+          <span className="rounded-full bg-surface-muted px-2 py-0.5 text-xs tabular-nums text-text-muted">
+            {points.points.length}
+          </span>
+        ) : null}
+      </div>
+      {points === undefined || points === null ? (
+        <p className="text-sm leading-6 text-text-secondary">
+          Progress records are temporarily unavailable. The Work itself remains readable.
+        </p>
+      ) : points.points.length === 0 ? (
+        <p className="text-sm leading-6 text-text-secondary">
+          No progress saved yet. In TUI, use <code className="rounded bg-surface-muted px-1">/work save</code> after a stable turn.
+        </p>
+      ) : (
+        <ul className="divide-y divide-border/70 border-t border-border/70">
+          {points.points.map((point) => (
+            <li key={point.recovery_point_id} className="py-2.5 text-sm">
+              <details className="group">
+                <summary className="flex cursor-pointer list-none items-center gap-3 rounded-control px-1 py-1 outline-none transition-colors hover:bg-surface-muted/60 focus-visible:ring-2 focus-visible:ring-accent [&::-webkit-details-marker]:hidden">
+                  <ChevronRight className="size-4 shrink-0 text-text-muted transition-transform group-open:rotate-90" />
+                  <span
+                    className={cn(
+                      "size-2 shrink-0 rounded-full",
+                      point.status === "captured" || point.status === "ready"
+                        ? "bg-success"
+                        : point.status === "failed" || point.status === "aborted"
+                          ? "bg-danger"
+                          : "bg-warning",
+                    )}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-medium text-text">
+                      {recoveryPointStatusLabel(point.status)}
+                    </span>
+                    <span className="block text-xs text-text-muted">
+                      record {recoveryPointShortId(point)} · {recoveryPointTurnLabel(point)}
+                      {formatRecoveryPointDate(point.created_at)}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-xs text-text-muted">
+                    {recoveryPointPlacementLabel(point)}
+                  </span>
+                </summary>
+                <div className="ml-7 mt-2 grid gap-2 rounded-control bg-surface-muted/45 px-3 py-2.5 text-xs leading-5 text-text-muted sm:grid-cols-2">
+                  <div>
+                    <p className="font-medium text-text-secondary">Recorded</p>
+                    <p>{recoveryPointCoverageLabel(point)}</p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Boundary</p>
+                    <p>
+                      Work r{point.work_revision} · branch r{point.branch_revision} · graph r
+                      {point.graph_revision}
+                    </p>
+                    <p>
+                      Session turn {point.session_cursor.completed_turn} · binding generation {point.execution.binding_generation}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Available next</p>
+                    <p>{recoveryPointCapabilityLabel(point)}</p>
+                  </div>
+                  <div>
+                    <p className="font-medium text-text-secondary">Not included</p>
+                    <p>{recoveryPointMissingCoverageLabel(point)}</p>
+                  </div>
+                </div>
+              </details>
+            </li>
+          ))}
+        </ul>
+      )}
+      {points?.next_cursor ? (
+        <p className="text-xs leading-5 text-text-muted">
+          Showing the latest {points.points.length} saved points. Older points are available through the Work API.
+        </p>
+      ) : null}
+      <p className="text-xs leading-5 text-text-muted">
+        Restore and workspace migration are not available from these records yet.
+      </p>
+    </Card>
+  );
+}
+
+function recoveryPointStatusLabel(status: WorkRecoveryPointPageV1["points"][number]["status"]): string {
+  switch (status) {
+    case "captured":
+    case "ready":
+      return "Progress saved";
+    case "preparing":
+      return "Saving progress";
+    case "failed":
+      return "Save failed";
+    case "aborted":
+      return "Save stopped";
+  }
+  return "Progress state unavailable";
+}
+
+function recoveryPointTurnLabel(point: WorkRecoveryPointPageV1["points"][number]): string {
+  return point.session_cursor.completed_turn === 0
+    ? "Before the first committed turn"
+    : `${point.session_cursor.completed_turn} committed ${point.session_cursor.completed_turn === 1 ? "turn" : "turns"}`;
+}
+
+function recoveryPointShortId(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  return point.recovery_point_id.length > 16
+    ? `${point.recovery_point_id.slice(0, 15)}…`
+    : point.recovery_point_id;
+}
+
+function recoveryPointPlacementLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  return point.execution.placement === "edge" ? "Edge" : "Server";
+}
+
+function recoveryPointCoverageLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  const recorded = [
+    point.coverage.session_state && "conversation",
+    point.coverage.work_state && "Work state",
+    point.coverage.workspace && "workspace",
+    point.coverage.run_frontier && "run frontier",
+    point.coverage.artifacts && "artifacts",
+  ].filter(Boolean);
+  return recorded.length > 0 ? recorded.join(" · ") : "Nothing recorded";
+}
+
+function recoveryPointMissingCoverageLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  const missing = [
+    !point.coverage.workspace && "code/workspace files",
+    !point.coverage.run_frontier && "active run frontier",
+    !point.coverage.artifacts && "artifacts",
+  ].filter(Boolean);
+  return missing.length > 0 ? missing.join(" · ") : "None";
+}
+
+function recoveryPointCapabilityLabel(
+  point: WorkRecoveryPointPageV1["points"][number],
+): string {
+  if (point.capabilities.can_restore_conversation) {
+    return point.capabilities.can_continue_in_original_environment
+      ? "Conversation and original environment can continue"
+      : "Conversation can be restored after an environment check";
+  }
+  if (point.capabilities.requires_effect_review) {
+    return "Review unresolved external effects before continuing";
+  }
+  return "Use this as a progress reference; restore is not available yet";
+}
+
+function formatRecoveryPointDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf())
+    ? ""
+    : ` · ${ARCHIVE_DATE_FORMATTER.format(date)}`;
 }
 
 function ProposalDetail({

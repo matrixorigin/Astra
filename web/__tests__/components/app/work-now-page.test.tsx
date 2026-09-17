@@ -79,13 +79,13 @@ beforeEach(() => {
 test("groups Work by server-owned attention without exposing runtime identity", () => {
   render(<WorkNowPage page={page} isLatest />);
 
-  const needsYou = screen.getByRole("region", { name: "Needs you" });
-  expect(within(needsYou).getByText("Review the proposed completion contract")).toBeVisible();
-  expect(within(needsYou).getByText(/1 to review/)).toBeVisible();
-  expect(screen.getByRole("region", { name: "Updated" })).toHaveTextContent("2 new");
-  expect(screen.getByRole("region", { name: "Updated" })).toHaveTextContent("Working");
-  expect(needsYou).toHaveTextContent("Waiting");
-  expect(screen.getByRole("region", { name: "Current" })).toHaveTextContent("up to date");
+  const needsDecision = screen.getByRole("region", { name: "Needs your review" });
+  expect(within(needsDecision).getByText("Review the proposed completion contract")).toBeVisible();
+  expect(within(needsDecision).getByText(/1 to review/)).toBeVisible();
+  expect(screen.getByRole("region", { name: "New activity" })).toHaveTextContent("2 new");
+  expect(screen.getByRole("region", { name: "New activity" })).toHaveTextContent("Working");
+  expect(needsDecision).toHaveTextContent("Waiting");
+  expect(screen.getByRole("region", { name: "No action needed" })).toHaveTextContent("up to date");
   expect(screen.queryByText(/session-/i)).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: /older work/i })).toHaveAttribute(
     "href",
@@ -102,7 +102,7 @@ test("renders a useful bounded empty state on the latest page", () => {
   );
 
   expect(screen.getByText("No Work yet")).toBeVisible();
-  expect(screen.getByRole("link", { name: "Start Work" })).toHaveAttribute(
+  expect(screen.getByRole("link", { name: "Start a new Work" })).toHaveAttribute(
     "href",
     "/works",
   );

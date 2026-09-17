@@ -2,7 +2,7 @@
 
 > Status: target design contract; current support and verification limits are
 > described in the final section.
-> Last updated: 2026-09-15.
+> Last updated: 2026-09-16.
 
 This document owns the user-visible journey for finding, observing, continuing,
 and changing the execution provider for one durable Work across TUI, Web, and
@@ -57,9 +57,10 @@ Server Run-owner recovery require separate contracts and release gates.
 ### 1. Start or promote once
 
 Web and TUI create Work through the same Server Work service. Web may create a
-new Work. TUI may promote its current idle durable Session, preserving that
-Session instead of creating a hidden second conversation. If TUI has no durable
-Session yet, it explains the one prerequisite and offers the next action.
+new Work. TUI promotes its current idle durable Session when one exists. If a
+fresh TUI has no Session yet, `/work start <goal>` creates and binds the
+Session as part of the same explicit action; the user never needs to send a
+throwaway message or issue `/resume`.
 
 On success, both surfaces show the same `work_id` and selected `branch_id`.
 TUI should expose a direct Web link when the profile has a configured Web origin;
@@ -88,6 +89,17 @@ such as refreshing or explicitly taking control. Concurrent readers remain
 usable. Duplicate admission requests reuse an idempotency identity; unresolved
 external effects are reconciled through the invocation ledger before any retry
 that could repeat them.
+
+On TUI, `/work` first opens the owner-scoped catalog and then presents two
+explicit actions for the selected item: **Observe Work** keeps the current
+Session read-only, while **Continue this Work** prepares an editable
+`/work continue <work-id> <message>` command. The continuation uses a TUI-scoped
+attachment and the canonical Work turn endpoint; it never resumes the hidden
+Work Session in the current chat tab. The TUI receives lifecycle progress for
+accepted runs, tools, approvals, prompts, and waiting states. A stream that
+ends before a terminal fact keeps the partial response and request identity and
+offers `/work retry <request-id>` after the user checks the Work status. A
+terminal response remains visible even if controller cleanup needs attention.
 
 ### 4. Continue on another Edge
 
@@ -183,8 +195,10 @@ per projection and recover retention gaps with a bounded snapshot. They must
 not scan all events or rebuild the entire Work view for every task update. The
 owner-scoped Server activity read discovers Runs started by other surfaces; a
 local Web composer flag is not evidence that a Run is active. Each visible Work
-detail page polls one exact branch about every 1.2 seconds so a quiet page can
-discover a Run started elsewhere. The latest `/now` page refreshes its first
+detail page polls one exact branch about every 1.2 seconds and its Work event
+head about every 2 seconds while active (10 seconds while idle), so a quiet page
+can discover a Run started elsewhere and a Work started from TUI or another
+Edge can trigger a bounded server snapshot refresh. The latest `/now` page refreshes its first
 20-entry keyset page about every 10 seconds; older pages do not poll. Task graph
 refresh remains bounded to its first page while a Run can change it. Hidden tabs
 pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
@@ -273,9 +287,14 @@ workspace safe.
 ## Current implementation audit
 
 - TUI `/work start` promotes its current durable Session through the Server Work
-  binding API. It rejects a missing Session, reuses the Session on exact retry,
-  and prints the Work id, `Ctrl+T` task-board hint, and the Web `/now` entry
-  point. There is no configured Web deep link yet.
+  binding API, creating and binding a Session when the TUI is pristine. It
+  reuses the Session on exact retry, and prints the Work id, the next action,
+  and the Web `/now` entry point. There is no configured Web deep link yet. TUI `/work` opens an
+  owner-scoped catalog with explicit Observe/Continue actions; Continue routes
+  a Work-scoped turn through a TUI attachment, shows accepted-run lifecycle
+  progress without feeding Work Session events into the current chat, and
+  preserves partial/unknown results with an exact retry request id. There is
+  no automatic Session resume.
 - TUI `/work execution` reads the current Work binding, authoritative provider
   generation, and a bounded target directory without blocking the render loop.
   It is a read-only diagnostic surface; provider switching and retry are
@@ -291,7 +310,13 @@ workspace safe.
   active task graphs refresh their first bounded page every 2 seconds even for
   TUI-originated Runs. Both
   loops pause in hidden tabs, add jitter, back off after errors, and avoid
-  overlapping requests. Load targets remain unmeasured.
+  overlapping requests. The Web page uses one stable read-attachment identity
+  per browser instance and Work/branch, and renews it on projection refresh, so
+  live updates do not consume a new attachment slot or inherit another
+  browser's controller. An expired attachment is replaced by a fresh
+  read-only generation without waiting for the janitor. Switching Work or
+  branch remounts the composer and closes only that browser stream; the durable
+  Server Run keeps its own lifecycle. Load targets remain unmeasured.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
@@ -319,6 +344,37 @@ workspace safe.
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.
+- Recovery-point foundations now have one shared typed manifest for Work,
+  branch, Session cursor/context head, Run frontier, execution binding,
+  Workspace snapshot, Artifact references, and environment requirements. The
+  Workspace manifest validates the capture declaration shape, matching
+  fingerprints, canonical paths, content aggregates, file/blob digests,
+  symlink boundaries, and MatrixOne Git4Data source references. The Work
+  repository records owner-scoped, idempotent
+  `preparing` captures and removes them with branch cleanup. A canonical
+  same-transaction verifier can now publish `captured` after it confirms the
+  current Work/branch revisions, immutable graph basis, Session context head,
+  quiescent invocation state, and execution binding. `captured` is a logical
+  boundary for observation only: it does not claim that a Workspace, Artifact,
+  or unfinished Run can be restored. No caller-supplied manifest is published
+  as `ready`; that state remains reserved for a future verifier that resolves
+  those durable payloads and effect receipts. The first user-facing capture
+  path is `POST /v1/works/{work}/branches/{branch}/recovery-points`; TUI exposes
+  it as `/work save` (with `/work checkpoint` as an alias), and Web lists the
+  resulting boundaries under **Saved progress**. The action is intentionally
+  explicit and non-restoring: it records the current conversation/Work point,
+  reports the missing workspace and effect coverage, and never silently
+  changes Session or execution authority. This is still not cross-Edge
+  migration or Server Run-owner recovery.
+- The shared Artifact catalog now has an owner-scoped, content-addressed byte
+  backend with resumable chunk puts, one artifact-level upload lease, temporary
+  reachability edges, and an atomic seal verifier. It is ready for the next capture slice (one typed
+  workspace package plus its file blobs), but no Work recovery point references
+  those bytes yet. Session hard-delete refuses while a preparing/captured/ready
+  Work recovery point still depends on the Session provenance; the canonical
+  Work branch-deletion operation releases those points before deleting the
+  Session, so neither ordinary Session deletion nor cleanup can silently
+  discard a saved boundary.
 - Work branch-control operations and Session handoff already implement
   authorized client-controller transfer with fencing and effect sealing. The
   Web force-takeover copy currently says `Moving this Work here`, which can be

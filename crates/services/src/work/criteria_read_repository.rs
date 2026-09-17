@@ -5,7 +5,7 @@ use super::{
     WorkCriterionView, WorkRevision,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{MySql, QueryBuilder, Row, Transaction, query};
 use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
@@ -86,6 +86,143 @@ fn decode_definition(
     let hash = WorkContentHash::parse(persisted_hash.to_string())
         .map_err(|message| corrupt_definition(std::io::Error::other(message)))?;
     Ok((definition, hash))
+}
+
+/// Validate the complete criterion-set payload while the caller's transaction
+/// already holds the Work/branch capture locks.  The basis row's revision,
+/// count, and hash are only an envelope; a recovery boundary must also prove
+/// that the canonical member manifest and every referenced definition still
+/// exist and decode to the stored hashes.
+pub(super) async fn validate_criteria_set_in_transaction(
+    transaction: &mut Transaction<'_, MySql>,
+    owner_id: &super::WorkOwnerId,
+    work_id: &super::WorkId,
+    expected_revision: CriterionSetRevision,
+    expected_count: u16,
+    expected_hash: &WorkContentHash,
+) -> Result<(), WorkRepositoryError> {
+    let row = query(
+        "SELECT member_manifest_json, member_manifest_hash, member_count
+         FROM work_criterion_sets
+         WHERE owner_id = ? AND work_id = ? AND revision = ?
+         LIMIT 1",
+    )
+    .bind(owner_id.as_str())
+    .bind(work_id.as_str())
+    .bind(expected_revision.get())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|source| WorkRepositoryError::persistence("load Work recovery criteria", source))?
+    .ok_or_else(|| {
+        WorkRepositoryError::corrupt(
+            "Work recovery criteria",
+            std::io::Error::other("current criterion-set revision is missing"),
+        )
+    })?;
+    let manifest_json = row
+        .try_get::<String, _>("member_manifest_json")
+        .map_err(|source| WorkRepositoryError::corrupt("Work recovery criteria", source))?;
+    let manifest_hash = row
+        .try_get::<String, _>("member_manifest_hash")
+        .map_err(|source| WorkRepositoryError::corrupt("Work recovery criteria", source))?;
+    let member_count = row
+        .try_get::<i64, _>("member_count")
+        .map_err(|source| WorkRepositoryError::corrupt("Work recovery criteria", source))?;
+    if member_count != i64::from(expected_count)
+        || manifest_hash != expected_hash.as_str()
+        || super::repository::content_hash(&manifest_json) != manifest_hash
+    {
+        return Err(WorkRepositoryError::corrupt(
+            "Work recovery criteria",
+            std::io::Error::other("criterion-set basis does not match canonical content"),
+        ));
+    }
+    let members = super::repository::decode_criterion_set_manifest(&manifest_json, member_count)?;
+    if members.len() != usize::from(expected_count) {
+        return Err(WorkRepositoryError::corrupt(
+            "Work recovery criteria",
+            std::io::Error::other("criterion-set manifest count is inconsistent"),
+        ));
+    }
+    if members.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<MySql>::new(
+        "SELECT criterion_id, revision, criterion_kind, definition_json, definition_hash
+         FROM work_criterion_revisions
+         WHERE owner_id = ",
+    );
+    builder
+        .push_bind(owner_id.as_str())
+        .push(" AND work_id = ")
+        .push_bind(work_id.as_str())
+        .push(" AND (");
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
+            builder.push(" OR ");
+        }
+        builder
+            .push("(criterion_id = ")
+            .push_bind(member.criterion_id.as_str())
+            .push(" AND revision = ")
+            .push_bind(member.revision.get())
+            .push(")");
+    }
+    builder.push(")");
+
+    let mut found = BTreeMap::new();
+    for row in builder
+        .build()
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::persistence("load Work recovery criterion definitions", source)
+        })?
+    {
+        let criterion_id = CriterionId::parse(
+            row.try_get::<String, _>("criterion_id")
+                .map_err(corrupt_definition)?,
+        )
+        .map_err(corrupt_definition)?;
+        let revision = CriterionRevision::new(
+            row.try_get::<i64, _>("revision")
+                .map_err(corrupt_definition)?,
+        )
+        .map_err(corrupt_definition)?;
+        let definition_json = row
+            .try_get::<String, _>("definition_json")
+            .map_err(corrupt_definition)?;
+        let definition_hash = row
+            .try_get::<String, _>("definition_hash")
+            .map_err(corrupt_definition)?;
+        let _ = decode_definition(
+            &definition_json,
+            &row.try_get::<String, _>("criterion_kind")
+                .map_err(corrupt_definition)?,
+            &definition_hash,
+        )?;
+        if found
+            .insert(
+                super::CriterionRevisionRef {
+                    criterion_id,
+                    revision,
+                },
+                (),
+            )
+            .is_some()
+        {
+            return Err(corrupt_definition(std::io::Error::other(
+                "duplicate criterion revision returned by primary-key query",
+            )));
+        }
+    }
+    if found.len() != members.len() || members.iter().any(|member| !found.contains_key(member)) {
+        return Err(corrupt_definition(std::io::Error::other(
+            "criterion-set member revision is missing",
+        )));
+    }
+    Ok(())
 }
 
 pub(super) async fn load_criteria_page(

@@ -213,6 +213,7 @@ async fn load_compaction_candidates_after(
                WHERE ledger.user_id = ar.user_id
                  AND ledger.session_id = ar.session_id
                  AND ledger.run_id = ar.run_id
+                 AND ledger.state <> 'outcome_unknown'
            )
            AND (
                ar.updated_at > ?

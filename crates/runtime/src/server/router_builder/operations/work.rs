@@ -33,6 +33,15 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::work_handlers::get_work_branch_execution_handler),
         )
         .route(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points",
+            get(crate::server::work_handlers::get_work_branch_recovery_points_handler)
+                .post(crate::server::work_handlers::post_work_branch_recovery_point_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}",
+            get(crate::server::work_handlers::get_work_branch_recovery_point_handler),
+        )
+        .route(
             "/v1/works/{work_id}/branches/{branch_id}/execution/targets",
             get(crate::server::work_handlers::get_work_branch_execution_targets_handler),
         )

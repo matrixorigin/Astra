@@ -16,6 +16,147 @@ const MAX_CRITERIA: u16 = 128;
 const MAX_CAPABILITIES: usize = 16;
 const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
 
+/// Owner-scoped Work catalog entry shared by the TUI and non-interactive
+/// clients.  The catalog is a discovery projection: it carries enough
+/// durable facts to choose a Work without exposing the private Session id.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCatalogEntryV1 {
+    pub work_id: String,
+    pub goal: String,
+    pub work_revision: u64,
+    pub delivery_branch_id: String,
+    pub delivery_branch_revision: u64,
+    pub graph_revision: u64,
+    pub graph_item_count: u16,
+    pub pending_decision_count: u16,
+    pub event_head: u64,
+    pub seen_through_event_seq: Option<u64>,
+    pub unseen_event_count: u64,
+    pub attention: WorkCatalogAttentionV1,
+    pub delivery_branch_activity: astra_server_types::WorkBranchActivityV1,
+    pub created_at: String,
+    pub last_activity_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkCatalogAttentionV1 {
+    NeedsReview,
+    Updated,
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCatalogCursorV1 {
+    pub created_at: String,
+    pub work_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkCatalogPageV1 {
+    pub schema_version: u16,
+    pub entries: Vec<WorkCatalogEntryV1>,
+    pub next_cursor: Option<WorkCatalogCursorV1>,
+}
+
+impl WorkCatalogPageV1 {
+    pub const MAX_ENTRIES: usize = 50;
+
+    /// Validate facts which are required before a catalog row is used as
+    /// navigation input.  The Work detail endpoint remains the authority for
+    /// the full graph; this prevents a torn catalog response from selecting a
+    /// different resource than the user saw.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("unsupported Work catalog schema".into());
+        }
+        if self.entries.len() > Self::MAX_ENTRIES {
+            return Err("Work catalog page is too large".into());
+        }
+        let mut previous: Option<(&str, &str)> = None;
+        for entry in &self.entries {
+            if entry.work_id.is_empty()
+                || entry.delivery_branch_id.is_empty()
+                || entry
+                    .work_id
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+                || entry
+                    .delivery_branch_id
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            {
+                return Err("Work catalog contains an invalid identity".into());
+            }
+            if entry.work_revision == 0
+                || entry.delivery_branch_revision == 0
+                || entry.graph_revision == 0
+                || entry.event_head == 0
+            {
+                return Err("Work catalog contains a non-positive revision".into());
+            }
+            if entry
+                .seen_through_event_seq
+                .is_some_and(|seen| seen > entry.event_head)
+                || entry.unseen_event_count
+                    != entry
+                        .event_head
+                        .saturating_sub(entry.seen_through_event_seq.unwrap_or(0))
+            {
+                return Err("Work catalog event cursors disagree".into());
+            }
+            let expected_attention = if entry.pending_decision_count > 0 {
+                WorkCatalogAttentionV1::NeedsReview
+            } else if entry.unseen_event_count > 0 {
+                WorkCatalogAttentionV1::Updated
+            } else {
+                WorkCatalogAttentionV1::None
+            };
+            if entry.attention != expected_attention {
+                return Err("Work catalog attention disagrees with event facts".into());
+            }
+            let created = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+                .map_err(|_| "Work catalog has an invalid creation timestamp".to_string())?;
+            let last_activity = chrono::DateTime::parse_from_rfc3339(&entry.last_activity_at)
+                .map_err(|_| "Work catalog has an invalid activity timestamp".to_string())?;
+            if last_activity < created {
+                return Err("Work catalog activity precedes creation".into());
+            }
+            if let Some((previous_created, previous_id)) = previous {
+                let previous_time = chrono::DateTime::parse_from_rfc3339(previous_created)
+                    .map_err(|_| "Work catalog has an invalid ordering timestamp".to_string())?;
+                if created > previous_time
+                    || (created == previous_time && entry.work_id.as_str() >= previous_id)
+                {
+                    return Err("Work catalog is not in canonical creation order".into());
+                }
+            }
+            previous = Some((&entry.created_at, &entry.work_id));
+        }
+        if let Some(cursor) = &self.next_cursor {
+            if cursor.work_id.is_empty()
+                || cursor
+                    .work_id
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+            {
+                return Err("Work catalog continuation has an invalid identity".into());
+            }
+            let tail = self
+                .entries
+                .last()
+                .ok_or_else(|| "Work catalog continuation has no page tail".to_string())?;
+            if tail.created_at != cursor.created_at || tail.work_id != cursor.work_id {
+                return Err("Work catalog continuation is not pinned to the page tail".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTaskGraphPageV2 {

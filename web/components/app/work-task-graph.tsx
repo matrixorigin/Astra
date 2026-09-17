@@ -40,6 +40,7 @@ import {
 type TaskFilter = "active" | "attention" | "all";
 
 type WorkTaskGraphProps = {
+  id?: string;
   initial: WorkTaskGraphPageV2;
   live?: boolean;
 };
@@ -47,7 +48,7 @@ type WorkTaskGraphProps = {
 const LIVE_REFRESH_INTERVAL_MS = 2_000;
 const QUIET_REFRESH_INTERVAL_MS = 30_000;
 
-export function WorkTaskGraph({ initial, live = false }: WorkTaskGraphProps) {
+export function WorkTaskGraph({ id, initial, live = false }: WorkTaskGraphProps) {
   const [head, setHead] = useState(initial);
   const [items, setItems] = useState(initial.items.entries);
   const [dependencies, setDependencies] = useState(initial.dependencies.entries);
@@ -288,7 +289,7 @@ export function WorkTaskGraph({ initial, live = false }: WorkTaskGraphProps) {
   }
 
   return (
-    <Card className="p-0" aria-label="Work plan">
+    <Card id={id} className="scroll-mt-6 p-0" aria-label="Work plan">
       <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h2 className="text-sm font-semibold text-text">Plan</h2>

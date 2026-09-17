@@ -79,6 +79,7 @@ struct ObserverInner {
 
 struct ObserverState {
     session_id: String,
+    selected_work: Option<SelectedWork>,
     binding_generation: u64,
     projection: PlanTaskProjection,
     request_in_flight: bool,
@@ -90,6 +91,15 @@ struct ObserverState {
     /// transport failure. Automatic polling stays dormant until an explicit
     /// refresh or session rebind invalidates the observation.
     binding_absent: bool,
+}
+
+/// A Work selected from the owner catalog. This is a read-only projection
+/// target; it deliberately carries no Session identity and never resumes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedWork {
+    pub work_id: String,
+    pub branch_id: String,
+    pub graph_revision: i64,
 }
 
 impl PlanTaskObserver {
@@ -106,6 +116,7 @@ impl PlanTaskObserver {
                 profile: profile.map(str::to_owned),
                 state: Mutex::new(ObserverState {
                     session_id,
+                    selected_work: None,
                     binding_generation: 0,
                     projection: PlanTaskProjection {
                         truth_state,
@@ -128,10 +139,11 @@ impl PlanTaskObserver {
         let session_id = normalized_session_id(session_id);
         {
             let mut state = lock_state(&self.inner, "rebind_session");
-            if state.session_id == session_id {
+            if state.session_id == session_id && state.selected_work.is_none() {
                 return;
             }
             state.session_id = session_id;
+            state.selected_work = None;
             state.binding_generation = state.binding_generation.wrapping_add(1);
             state.request_in_flight = false;
             state.consecutive_failures = 0;
@@ -152,6 +164,55 @@ impl PlanTaskObserver {
         self.abort_fetch();
     }
 
+    /// Observe a Work chosen in the owner catalog without resuming or
+    /// attaching its Session. The current conversation remains the composer
+    /// context until the user explicitly starts a turn there.
+    pub(crate) fn select_work(&self, work_id: &str, branch_id: &str, graph_revision: u64) -> bool {
+        let work_id = work_id.trim();
+        let branch_id = branch_id.trim();
+        let Ok(graph_revision) = i64::try_from(graph_revision) else {
+            return false;
+        };
+        if work_id.is_empty()
+            || branch_id.is_empty()
+            || work_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            || branch_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            || graph_revision <= 0
+        {
+            return false;
+        }
+        {
+            let mut state = lock_state(&self.inner, "select_work");
+            let selected = SelectedWork {
+                work_id: work_id.to_owned(),
+                branch_id: branch_id.to_owned(),
+                graph_revision,
+            };
+            if state.selected_work.as_ref() == Some(&selected) {
+                return true;
+            }
+            state.selected_work = Some(selected);
+            state.binding_generation = state.binding_generation.wrapping_add(1);
+            state.request_in_flight = false;
+            state.consecutive_failures = 0;
+            state.access_token = None;
+            state.binding_absent = false;
+            state.last_fetch = Instant::now()
+                .checked_sub(QUIET_POLL_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            state.projection.sequence = state.projection.sequence.wrapping_add(1);
+            state.projection.truth_state = PlanTaskTruthState::Loading;
+            state.projection.tasks.clear();
+            state.projection.work = None;
+        }
+        self.abort_fetch();
+        true
+    }
+
     pub(crate) fn projection(&self) -> PlanTaskProjection {
         lock_state(&self.inner, "projection").projection.clone()
     }
@@ -170,7 +231,8 @@ impl PlanTaskObserver {
     /// existing fetch, so a refresh key cannot create competing reads.
     pub(crate) fn request_refresh(&self) -> bool {
         let mut state = lock_state(&self.inner, "request_refresh");
-        if state.session_id.is_empty() || state.request_in_flight {
+        if (state.session_id.is_empty() && state.selected_work.is_none()) || state.request_in_flight
+        {
             return false;
         }
         state.binding_absent = false;
@@ -195,9 +257,9 @@ impl PlanTaskObserver {
     /// network/auth work; a panic is turned into truthful unavailable/stale
     /// state rather than leaving `request_in_flight` latched forever.
     pub(crate) fn maybe_refresh(&self) {
-        let (session_id, binding_generation, access_token) = {
+        let (session_id, selected_work, observation_id, binding_generation, access_token) = {
             let mut state = lock_state(&self.inner, "maybe_refresh");
-            if state.session_id.is_empty()
+            if (state.session_id.is_empty() && state.selected_work.is_none())
                 || state.binding_absent
                 || state.request_in_flight
                 || state.last_fetch.elapsed() < refresh_interval(&state)
@@ -205,27 +267,38 @@ impl PlanTaskObserver {
                 return;
             }
             state.request_in_flight = true;
+            let selected_work = state.selected_work.clone();
+            let observation_id = selected_work
+                .as_ref()
+                .map(|work| format!("work:{}:{}", work.work_id, work.branch_id))
+                .unwrap_or_else(|| state.session_id.clone());
             (
                 state.session_id.clone(),
+                selected_work,
+                observation_id,
                 state.binding_generation,
                 state.access_token.clone(),
             )
         };
 
         let inner = Arc::clone(&self.inner);
-        let request_session_id = session_id.clone();
-        self.spawn_fetch(binding_generation, session_id, async move {
+        self.spawn_fetch(binding_generation, observation_id, async move {
             fetch_single_plan_projection(
                 &inner.api,
                 inner.profile.as_deref(),
-                &request_session_id,
+                if session_id.is_empty() {
+                    None
+                } else {
+                    Some(session_id.as_str())
+                },
+                selected_work.as_ref(),
                 access_token,
             )
             .await
         });
     }
 
-    fn spawn_fetch<F>(&self, binding_generation: u64, session_id: String, fetch: F)
+    fn spawn_fetch<F>(&self, binding_generation: u64, observation_id: String, fetch: F)
     where
         F: Future<Output = Result<PlanTaskFetchSuccess, PlanTaskFetchError>> + Send + 'static,
     {
@@ -235,7 +308,7 @@ impl PlanTaskObserver {
                 apply_fetch_result(
                     &self.inner,
                     binding_generation,
-                    &session_id,
+                    &observation_id,
                     Err(PlanTaskFetchError::ObserverRuntimeUnavailable),
                 );
                 return;
@@ -247,7 +320,7 @@ impl PlanTaskObserver {
                 Ok(result) => result,
                 Err(_) => Err(PlanTaskFetchError::ObserverTaskPanicked),
             };
-            apply_fetch_result(&inner, binding_generation, &session_id, result);
+            apply_fetch_result(&inner, binding_generation, &observation_id, result);
         });
         let mut current = match self.fetch_task.lock() {
             Ok(current) => current,
@@ -295,7 +368,10 @@ fn refresh_interval(state: &ObserverState) -> Duration {
             .saturating_mul(1_u32 << exponent)
             .min(MAX_FAILURE_BACKOFF);
     }
-    if state.projection.tasks.iter().any(task_needs_attention) {
+    // Selecting a Work from the catalog is an explicit request to observe it
+    // from this TUI. Keep that projection live even when its current tasks
+    // are all idle; another surface may still replan or complete a turn.
+    if state.selected_work.is_some() || state.projection.tasks.iter().any(task_needs_attention) {
         ACTIVE_POLL_INTERVAL
     } else {
         QUIET_POLL_INTERVAL
@@ -598,7 +674,8 @@ fn project_live_task(
 async fn fetch_single_plan_projection(
     api: &ThinClient,
     profile: Option<&str>,
-    session_id: &str,
+    session_id: Option<&str>,
+    selected_work: Option<&SelectedWork>,
     access_token: Option<String>,
 ) -> Result<PlanTaskFetchSuccess, PlanTaskFetchError> {
     let token = match access_token {
@@ -608,33 +685,45 @@ async fn fetch_single_plan_projection(
             .ok_or(PlanTaskFetchError::AuthenticationUnavailable)?,
     };
     let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let binding = match api.get_work_session_binding(&token, session_id).await {
-            Ok(binding) => binding,
-            Err(ThinClientError::Api { status, .. })
-                if status == reqwest::StatusCode::NOT_FOUND =>
-            {
-                return Ok(PlanTaskFetchProjection::NotBound);
-            }
-            Err(error) => return Err(PlanTaskFetchError::Transport(error)),
+        let (work_id, branch_id, expected_graph_revision) = if let Some(selected) = selected_work {
+            // A catalog row is a discovery hint, not a revision pin. Read the
+            // current branch head first, then pin only the continuation pages
+            // to the revision returned by that first response.
+            (selected.work_id.clone(), selected.branch_id.clone(), None)
+        } else {
+            let session_id = session_id.ok_or(PlanTaskFetchError::AuthenticationUnavailable)?;
+            let binding = match api.get_work_session_binding(&token, session_id).await {
+                Ok(binding) => binding,
+                Err(ThinClientError::Api { status, .. })
+                    if status == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    return Ok(PlanTaskFetchProjection::NotBound);
+                }
+                Err(error) => return Err(PlanTaskFetchError::Transport(error)),
+            };
+            (
+                binding.work_id,
+                binding.branch_id,
+                Some(binding.graph_revision),
+            )
         };
         let mut page = fetch_work_graph_page(
             api,
             &token,
-            &binding.work_id,
-            &binding.branch_id,
-            binding.graph_revision,
+            &work_id,
+            &branch_id,
+            expected_graph_revision,
             0,
             0,
         )
         .await?;
-        validate_graph_page(
-            &page,
-            &binding.work_id,
-            &binding.branch_id,
-            binding.graph_revision,
-            0,
-            0,
-        )?;
+        let graph_revision = page.basis.graph_revision;
+        if selected_work.is_some_and(|selected| graph_revision < selected.graph_revision) {
+            return Err(PlanTaskFetchError::InvalidResponse(
+                "Task Graph moved behind the selected catalog revision".to_string(),
+            ));
+        }
+        validate_graph_page(&page, &work_id, &branch_id, graph_revision, 0, 0)?;
         let item_total = page.items.total;
         let dependency_total = page.dependencies.total;
         let basis = page.basis;
@@ -652,18 +741,18 @@ async fn fetch_single_plan_projection(
             let continuation = fetch_work_graph_page(
                 api,
                 &token,
-                &binding.work_id,
-                &binding.branch_id,
-                binding.graph_revision,
+                &work_id,
+                &branch_id,
+                Some(graph_revision),
                 cursor.item_offset,
                 cursor.dependency_offset,
             )
             .await?;
             validate_graph_page(
                 &continuation,
-                &binding.work_id,
-                &binding.branch_id,
-                binding.graph_revision,
+                &work_id,
+                &branch_id,
+                graph_revision,
                 cursor.item_offset,
                 cursor.dependency_offset,
             )?;
@@ -706,7 +795,7 @@ async fn fetch_work_graph_page(
     token: &str,
     work_id: &str,
     branch_id: &str,
-    graph_revision: i64,
+    graph_revision: Option<i64>,
     item_offset: u16,
     dependency_offset: u16,
 ) -> Result<WorkTaskGraphPageV2, PlanTaskFetchError> {
@@ -714,7 +803,7 @@ async fn fetch_work_graph_page(
         token,
         work_id,
         branch_id,
-        Some(graph_revision),
+        graph_revision,
         item_offset,
         dependency_offset,
     )
@@ -998,7 +1087,9 @@ fn apply_fetch_result(
     result: Result<PlanTaskFetchSuccess, PlanTaskFetchError>,
 ) {
     let mut state = lock_state(inner, "apply_fetch_result");
-    if state.binding_generation != binding_generation || state.session_id != session_id {
+    if state.binding_generation != binding_generation
+        || current_observation_id(&state) != session_id
+    {
         return;
     }
     state.request_in_flight = false;
@@ -1049,9 +1140,17 @@ fn apply_fetch_result(
                 state.projection.sequence = state.projection.sequence.wrapping_add(1);
             }
             state.projection.truth_state = next_truth;
-            tracing::warn!(error = ?error, %session_id, "Work Task Graph projection refresh failed");
+            tracing::warn!(error = ?error, observation = %session_id, "Work Task Graph projection refresh failed");
         }
     }
+}
+
+fn current_observation_id(state: &ObserverState) -> String {
+    state
+        .selected_work
+        .as_ref()
+        .map(|work| format!("work:{}:{}", work.work_id, work.branch_id))
+        .unwrap_or_else(|| state.session_id.clone())
 }
 
 fn same_plan_rows(left: &[SessionTask], right: &[SessionTask]) -> bool {
@@ -1148,6 +1247,30 @@ mod tests {
         let state = lock_state(&plan_observer.inner, "test");
         assert!(!state.binding_absent);
         assert_eq!(state.projection.truth_state, PlanTaskTruthState::Loading);
+    }
+
+    #[test]
+    fn selecting_catalog_work_is_read_only_and_refreshable_without_a_session_binding() {
+        let plan_observer = observer(None);
+        assert!(plan_observer.select_work("work-1", "branch-main", 7));
+        {
+            let state = lock_state(&plan_observer.inner, "test");
+            assert_eq!(
+                state.selected_work,
+                Some(SelectedWork {
+                    work_id: "work-1".into(),
+                    branch_id: "branch-main".into(),
+                    graph_revision: 7,
+                })
+            );
+            assert_eq!(state.projection.truth_state, PlanTaskTruthState::Loading);
+            assert!(state.session_id.is_empty());
+        }
+        assert!(plan_observer.request_refresh());
+        plan_observer.rebind_session(None);
+        let state = lock_state(&plan_observer.inner, "test");
+        assert!(state.selected_work.is_none());
+        assert_eq!(state.projection.truth_state, PlanTaskTruthState::Unbound);
     }
 
     #[test]

@@ -142,6 +142,27 @@ export function workBranchExecutionTargetsPath(workId: string, branchId: string)
   return `${workBranchExecutionPath(workId, branchId)}/targets`;
 }
 
+export function workBranchRecoveryPointsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/recovery-points`;
+}
+
+export function workBranchRecoveryPointPath(
+  workId: string,
+  branchId: string,
+  recoveryPointId: string,
+): string {
+  if (
+    recoveryPointId === "." ||
+    recoveryPointId === ".." ||
+    recoveryPointId.length === 0 ||
+    Array.from(recoveryPointId).length > 128 ||
+    !/^[A-Za-z0-9._-]+$/u.test(recoveryPointId)
+  ) {
+    throw new TypeError("recoveryPointId is not a canonical recovery point identity");
+  }
+  return `${workBranchRecoveryPointsPath(workId, branchId)}/${encodeURIComponent(recoveryPointId)}`;
+}
+
 export function workBranchExecutionSwitchesPath(workId: string, branchId: string): string {
   return `${workBranchExecutionPath(workId, branchId)}/switches`;
 }

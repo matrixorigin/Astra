@@ -15,7 +15,8 @@
         "database": "connected",
         "memoria": "disabled",
         "interaction_api_major": "3",
-        "build_git_sha": "<dynamic-build-git-sha>"
+        "build_git_sha": "<dynamic-build-git-sha>",
+        "build_git_dirty": "<dynamic-build-git-dirty>"
       }
     },
     "unhealthy": {
@@ -25,7 +26,8 @@
         "database": "unavailable",
         "memoria": "disabled",
         "interaction_api_major": "3",
-        "build_git_sha": "<dynamic-build-git-sha>"
+        "build_git_sha": "<dynamic-build-git-sha>",
+        "build_git_dirty": "<dynamic-build-git-dirty>"
       }
     }
   },

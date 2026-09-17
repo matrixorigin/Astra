@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde::Serialize;
-use sqlx::{MySql, Pool, Row, query, query_as};
+use sqlx::{MySql, Pool, Row, query, query_as, query_scalar};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SessionDeleteStatement {
@@ -343,14 +343,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM work_patch_artifacts WHERE session_id = ? AND owner_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_artifact_references",
-        sql: "DELETE FROM session_artifact_references WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_artifacts",
-        sql: "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "session_device_lease_events",
         sql: "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
     },
@@ -437,6 +429,34 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "semantic_read_observation_budgets",
         sql: "DELETE FROM semantic_read_observation_budgets WHERE session_id = ? AND user_id = ?",
+    },
+];
+
+// Artifact projections (state items and context manifests) update their
+// catalog counters after locking their own rows. Keep this group after every
+// state/context delete so Session cleanup cannot lock the catalog before those
+// writers have finished. The helper immediately before this loop then follows
+// the sweeper's lease -> catalog -> edge lock order.
+const SESSION_DELETE_ARTIFACT_TABLES: &[SessionDeleteStatement] = &[
+    SessionDeleteStatement {
+        label: "session_artifact_references",
+        sql: "DELETE FROM session_artifact_references WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_artifact_content_refs",
+        sql: "DELETE FROM session_artifact_content_refs WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_artifact_content_upload_leases",
+        sql: "DELETE FROM session_artifact_content_upload_leases WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_artifact_content_reservations",
+        sql: "DELETE FROM session_artifact_content_reservations WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_artifacts",
+        sql: "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
     },
 ];
 
@@ -578,6 +598,9 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("session_attachments", "owner_user_id"),
     ("session_handoff_slots", "owner_user_id"),
     ("session_attachment_quarantines", "owner_user_id"),
+    ("session_artifact_content_refs", "user_id"),
+    ("session_artifact_content_upload_leases", "user_id"),
+    ("session_artifact_content_reservations", "user_id"),
     ("work_branch_control_operations", "owner_id"),
     ("session_weighted_admission_reservations", "owner_user_id"),
     ("agent_events", "user_id"),
@@ -941,6 +964,8 @@ pub(crate) async fn hard_delete_session_rows(
             "delete_session.lock_lifecycle_fence: pending delete fence not found".to_string()
         })?;
 
+    ensure_no_live_work_recovery_points(tx, session_id, user_id).await?;
+
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or
     // provider attempts so session deletion follows the same global order.
@@ -1069,6 +1094,24 @@ pub(crate) async fn hard_delete_session_rows(
     }
 
     for statement in SESSION_DELETE_TERMINAL_TABLES {
+        let rows_deleted = delete_session_rows_session_user(
+            tx,
+            statement.label,
+            statement.sql,
+            session_id,
+            user_id,
+        )
+        .await?;
+        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
+    }
+
+    // State items and context manifests were deleted above. Their projection
+    // writers lock those rows before updating session_artifacts, so acquire
+    // the artifact lease/catalog locks only now. This keeps delete ordering
+    // compatible with both projection writers (state/context -> catalog) and
+    // retention GC (lease -> catalog -> edges).
+    lock_session_artifact_content_rows(tx, session_id, user_id).await?;
+    for statement in SESSION_DELETE_ARTIFACT_TABLES {
         let rows_deleted = delete_session_rows_session_user(
             tx,
             statement.label,
@@ -1243,6 +1286,8 @@ async fn mark_session_deleting(
     .await
     .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
 
+    ensure_no_live_work_recovery_points(&mut tx, session_id, user_id).await?;
+
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)
         .bind(user_id)
@@ -1287,6 +1332,100 @@ async fn mark_session_deleting(
         .await
         .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
 
+    Ok(())
+}
+
+/// Saved progress is owned by Work even though the originating Session is the
+/// provenance key used by the artifact catalog.  Refuse a Session hard-delete
+/// while a live recovery point still depends on that provenance; otherwise the
+/// existing cleanup would remove the catalog/reference rows and leave users
+/// with a saved point that cannot be inspected or restored.
+async fn ensure_no_live_work_recovery_points(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let retained = query(
+        "SELECT recovery_point_id, work_recovery_points.work_id,
+                work_recovery_points.branch_id, works.delivery_branch_id
+         FROM work_recovery_points
+         JOIN work_branches
+           ON work_branches.owner_id = work_recovery_points.owner_id
+          AND work_branches.work_id = work_recovery_points.work_id
+          AND work_branches.branch_id = work_recovery_points.branch_id
+         JOIN works
+           ON works.owner_id = work_recovery_points.owner_id
+          AND works.work_id = work_recovery_points.work_id
+         WHERE work_recovery_points.owner_id = ?
+           AND work_recovery_points.status IN ('preparing', 'captured', 'ready')
+           AND work_branches.session_id = ?
+         ORDER BY work_recovery_points.created_at ASC, recovery_point_id ASC
+         LIMIT 1
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.check_recovery_points: {source}"))?;
+    let Some(row) = retained else {
+        return Ok(());
+    };
+    let recovery_point_id: String = row
+        .try_get("recovery_point_id")
+        .map_err(|source| format!("delete_session.check_recovery_points.id: {source}"))?;
+    let work_id: String = row
+        .try_get("work_id")
+        .map_err(|source| format!("delete_session.check_recovery_points.work: {source}"))?;
+    let branch_id: String = row
+        .try_get("branch_id")
+        .map_err(|source| format!("delete_session.check_recovery_points.branch: {source}"))?;
+    let delivery_branch_id: String = row.try_get("delivery_branch_id").map_err(|source| {
+        format!("delete_session.check_recovery_points.delivery_branch: {source}")
+    })?;
+    if branch_id == delivery_branch_id {
+        Err(format!(
+            "delete_session.recovery_point_retained: Work {work_id} has saved progress {recovery_point_id} on its delivery branch {branch_id}; open Work {work_id} and choose another delivery branch before deleting this Session (the delivery branch cannot be deleted)"
+        ))
+    } else {
+        Err(format!(
+            "delete_session.recovery_point_retained: Work {work_id} has saved progress {recovery_point_id} on alternative branch {branch_id}; open Work {work_id} and delete that branch to release the saved progress, then retry deleting this Session"
+        ))
+    }
+}
+
+async fn lock_session_artifact_content_rows(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    // Upload leases are optional because sealed artifacts have already
+    // released theirs. Lock all present leases before any catalog row.
+    query_scalar::<_, String>(
+        "SELECT artifact_id
+         FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ?
+         ORDER BY artifact_id ASC
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.lock_artifact_upload_leases: {source}"))?;
+
+    query_scalar::<_, String>(
+        "SELECT artifact_id
+         FROM session_artifacts
+         WHERE user_id = ? AND session_id = ?
+         ORDER BY artifact_id ASC
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.lock_artifact_catalog: {source}"))?;
     Ok(())
 }
 
@@ -1787,6 +1926,7 @@ mod tests {
             SESSION_DELETE_DERIVED_PARENT_TABLES,
             SESSION_DELETE_DIRECT_TABLES,
             SESSION_DELETE_TERMINAL_TABLES,
+            SESSION_DELETE_ARTIFACT_TABLES,
         ] {
             for statement in group {
                 let normalized = statement

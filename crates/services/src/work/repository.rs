@@ -43,6 +43,49 @@ pub enum WorkConflictResource {
     WorkEventIdentity,
     WorkAttentionReceipt,
     WorkProposalIdentity,
+    RecoveryPointIdentity,
+    RecoveryPointRequest,
+}
+
+/// Typed lifecycle blockers for a recovery-point capture. HTTP adapters use
+/// these variants to choose an actionable status without parsing explanatory
+/// prose, while the Display text remains useful in local logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum WorkRecoveryPointBlocker {
+    #[error("the Work Session is unavailable for a stable capture")]
+    SessionUnavailable,
+    #[error("the Work branch Session changed during capture admission")]
+    SessionChanged,
+    #[error("the Work or branch revision changed; refresh before saving progress")]
+    BasisChanged,
+    #[error(
+        "the branch plan basis is behind the current Work plan; refresh before saving progress"
+    )]
+    BranchBasisChanged,
+    #[error("the Work Session execution slot has no canonical Run")]
+    DanglingRunSlot,
+    #[error("the Work Session Run is missing its status")]
+    RunStatusMissing,
+    #[error("the Work Run is still active; finish or pause it before saving progress")]
+    ActiveRun,
+    #[error("the Work Session still has an active turn reservation")]
+    ActiveReservation,
+    #[error("the Work Session has an unresolved tool invocation")]
+    UnresolvedInvocation,
+    #[error("the Work execution environment is changing or needs attention")]
+    ExecutionChanging,
+    #[error("Run frontier verification is not available yet")]
+    RunFrontierUnavailable,
+    #[error("the Session context head changed since capture began")]
+    ContextChanged,
+    #[error("the Session execution binding changed since capture began")]
+    ExecutionChanged,
+    #[error("the current Edge executor has no canonical identity")]
+    EdgeIdentityMissing,
+    #[error("the current executor kind is not recoverable")]
+    UnsupportedExecutor,
+    #[error("the canonical Session context is missing or requires repair")]
+    ContextUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +176,8 @@ pub enum WorkRepositoryError {
     BranchActive,
     #[error("the Work branch has a durable deletion in progress")]
     BranchDeleting,
+    #[error("Work recovery point cannot be captured: {reason}")]
+    RecoveryPointNotCapturable { reason: WorkRecoveryPointBlocker },
     #[error("branch retention has a stale or incoherent {resource:?} basis")]
     StaleBranchRetention {
         resource: super::WorkBranchRetentionBasisResource,

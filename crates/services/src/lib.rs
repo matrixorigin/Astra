@@ -322,11 +322,16 @@ pub use self_surface::{
 pub use service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,
-    MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX, OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord,
+    MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX, OwnerScope, OwnerScopeKind,
+    SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1, SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+    SESSION_ARTIFACT_CONTENT_UPLOAD_LEASE_DAYS, SessionArtifactContentChunkReceiptV1,
+    SessionArtifactContentChunkV1, SessionArtifactContentChunkV1WithBytes,
+    SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
     SessionArtifactJsonStore, SessionArtifactListCursor, SessionArtifactListPage,
     SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
-    SessionArtifactStoreError, StoredSessionArtifact, configure_local_owner_scope,
-    local_owner_scope, local_owner_user_id, local_session_artifact_store,
+    SessionArtifactStoreError, StoredSessionArtifact, StoredSessionArtifactContentV1,
+    configure_local_owner_scope, local_owner_scope, local_owner_user_id,
+    local_session_artifact_store,
 };
 pub use session_context_coordinator::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,

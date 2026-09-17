@@ -294,7 +294,9 @@ the replica should be removed from service routing.
 ### GET /health
 
 Aggregate diagnostic state, including optional Memoria degradation and build
-identity. This endpoint is for observation; use `/live` and `/ready` for
+identity. `build_git_dirty` is `true` when the binary was built from tracked
+source changes; local launchers must not reuse such a process after a checkout
+change. This endpoint is for observation; use `/live` and `/ready` for
 orchestrator probes.
 
 ```json
@@ -303,7 +305,8 @@ orchestrator probes.
   "database": "connected",
   "memoria": "available",
   "interaction_api_major": "3",
-  "build_git_sha": "0123456789abcdef0123456789abcdef01234567"
+  "build_git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "build_git_dirty": false
 }
 ```
 

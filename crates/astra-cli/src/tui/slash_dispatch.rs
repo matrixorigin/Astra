@@ -34,7 +34,14 @@ pub(crate) enum SlashResult {
 pub(crate) struct WorkStartRequest {
     pub api: astra_thin_client::ThinClient,
     pub profile: Option<String>,
-    pub session_id: String,
+    /// A new TUI has no durable Session until its first turn. Starting Work
+    /// is itself a durable action, so the worker creates and binds one rather
+    /// than asking the user to send a meaningless message first.
+    pub session_id: Option<String>,
+    /// Attachment generation at the moment the user asked to start Work.
+    /// A completion from an earlier conversation must never adopt a Session
+    /// after the user has explicitly switched elsewhere.
+    pub attachment_epoch: u64,
     pub goal: String,
 }
 
@@ -62,10 +69,10 @@ impl SlashResult {
     }
 }
 
-/// A read-only workbench action whose I/O is owned by the event loop rather
-/// than the slash dispatcher. These actions have no mutable session effect,
-/// so they can complete after the user keeps composing without borrowing UI
-/// state across a filesystem or process wait.
+/// A workbench action whose I/O is owned by the event loop rather than the
+/// slash dispatcher. Reads and the small, idempotent progress-save request
+/// can complete after the user keeps composing without borrowing UI state
+/// across a network wait.
 pub(crate) enum SlashBackgroundRead {
     Clipboard {
         text: String,
@@ -79,6 +86,27 @@ pub(crate) enum SlashBackgroundRead {
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         session_id: String,
+    },
+    WorkRecoveryPointCapture {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        session_id: String,
+        request_id: String,
+    },
+    WorkCatalog {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
+    },
+    WorkContinue {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        work_id: String,
+        branch_id: Option<String>,
+        message: String,
+        client_id: String,
+        request_id: String,
+        attachment_request_id: String,
     },
     ResumePicker,
     SessionHub {
@@ -106,22 +134,57 @@ pub(crate) enum SlashBackgroundRead {
     },
 }
 
+/// A Work turn whose transport ended before the Server proved a terminal
+/// outcome. Keeping the exact request identity lets `/work retry <id>` ask
+/// the canonical lifecycle to replay or reconcile the same turn instead of
+/// creating a second run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingWorkContinue {
+    pub work_id: String,
+    pub branch_id: Option<String>,
+    pub message: String,
+    pub request_id: String,
+    pub attachment_request_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkCommandRoute {
+    Catalog,
     Tasks,
     Execution,
+    SaveProgress,
     Start(String),
+    Continue { work_id: String, message: String },
+    Retry(String),
     MissingGoal,
+    MissingContinueInput,
+    MissingRetryInput,
     Unsupported,
 }
 
 pub(crate) fn work_command_route(args: &str) -> WorkCommandRoute {
     let (subcommand, remainder) = split_sub(args.trim());
     match subcommand {
-        "" | "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
+        "" | "list" if remainder.trim().is_empty() => WorkCommandRoute::Catalog,
+        "status" if remainder.trim().is_empty() => WorkCommandRoute::Tasks,
         "execution" if remainder.trim().is_empty() => WorkCommandRoute::Execution,
+        "save" | "checkpoint" if remainder.trim().is_empty() => WorkCommandRoute::SaveProgress,
         "start" if remainder.trim().is_empty() => WorkCommandRoute::MissingGoal,
         "start" => WorkCommandRoute::Start(remainder.trim().to_owned()),
+        "continue" if remainder.trim().is_empty() => WorkCommandRoute::MissingContinueInput,
+        "continue" => {
+            let (work_id, message) = split_sub(remainder);
+            if work_id.is_empty() || message.trim().is_empty() {
+                WorkCommandRoute::MissingContinueInput
+            } else {
+                WorkCommandRoute::Continue {
+                    work_id: work_id.to_owned(),
+                    message: message.trim().to_owned(),
+                }
+            }
+        }
+        "retry" if remainder.trim().is_empty() => WorkCommandRoute::MissingRetryInput,
+        "retry" => WorkCommandRoute::Retry(remainder.trim().to_owned()),
         _ => WorkCommandRoute::Unsupported,
     }
 }
@@ -170,6 +233,14 @@ pub(crate) struct DispatchContext<'a> {
     pub bottom_pane: &'a mut BottomPane,
     pub chat_widget: &'a mut crate::tui::chat_widget::ChatWidget,
     pub width: u16,
+    /// Stable identity for this TUI process. Work attachments use it to keep
+    /// two local TUIs independent while allowing retries from one process to
+    /// renew the same bounded attachment.
+    pub client_id: &'a str,
+    /// Work continuation identities that ended without a proven terminal
+    /// event. They are keyed by the full request id so a retry can be
+    /// explicit and exact without coupling Work state to the current Session.
+    pub pending_work_retries: &'a mut std::collections::BTreeMap<String, PendingWorkContinue>,
 }
 
 impl<'a> DispatchContext<'a> {
@@ -340,8 +411,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/mcp" => handle_mcp_dispatch(args, ctx),
 
         "/work" => match work_command_route(args) {
+            WorkCommandRoute::Catalog => {
+                ctx.show_response(
+                    "Loading Work… choose a task to view or continue, or use `/work start <goal>` to begin one."
+                        .to_string(),
+                );
+                SlashResult::background_read(SlashBackgroundRead::WorkCatalog {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    cursor: None,
+                })
+            }
             WorkCommandRoute::Tasks => {
-                ctx.show_response("Opened Work tasks".to_string());
+                ctx.show_response("Opened tasks for this conversation".to_string());
                 SlashResult::OpenWorkTasks
             }
             WorkCommandRoute::Execution => {
@@ -353,7 +435,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then inspect Work execution."
+                        "This conversation has no Work yet. Use `/work start <goal>` to track it, or `/work` to choose an existing task; execution becomes available after a Work is selected."
                             .to_string(),
                     );
                     return SlashResult::Handled;
@@ -365,11 +447,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     session_id,
                 })
             }
-            WorkCommandRoute::MissingGoal => {
-                ctx.show_error("Usage: /work start <goal>".to_string());
-                SlashResult::Handled
-            }
-            WorkCommandRoute::Start(goal) => {
+            WorkCommandRoute::SaveProgress => {
                 let Some(session_id) = ctx
                     .state
                     .session_id
@@ -378,21 +456,98 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     .map(str::to_owned)
                 else {
                     ctx.show_error(
-                        "This conversation has no durable session yet. Send one message, then start Work."
+                        "There is no Work checkpoint to save yet. Use `/work start <goal>` first, or `/work` to choose an existing task."
                             .to_string(),
                     );
                     return SlashResult::Handled;
                 };
-                ctx.show_response("Starting Work…".to_string());
-                SlashResult::StartWork(Box::new(WorkStartRequest {
+                ctx.show_response("Saving Work progress…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkRecoveryPointCapture {
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     session_id,
+                    request_id: format!("tui-recovery-{}", uuid::Uuid::new_v4().simple()),
+                })
+            }
+            WorkCommandRoute::MissingGoal => {
+                ctx.show_info(
+                    "Start a tracked task in this TUI. Example: `/work start Fix the flaky API test`"
+                        .to_string(),
+                );
+                SlashResult::Handled
+            }
+            WorkCommandRoute::Start(goal) => {
+                ctx.show_response("Starting tracked Work…".to_string());
+                SlashResult::StartWork(Box::new(WorkStartRequest {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    session_id: ctx
+                        .state
+                        .session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())
+                        .map(str::to_owned),
+                    attachment_epoch: ctx.state.session_attachment_epoch,
                     goal,
                 }))
             }
+            WorkCommandRoute::Continue { work_id, message } => {
+                let operation_id = uuid::Uuid::now_v7().simple().to_string();
+                let request_id = format!("tui-work-turn-{operation_id}");
+                let attachment_request_id = format!("tui-work-attach-{operation_id}");
+                ctx.pending_work_retries.insert(
+                    request_id.clone(),
+                    PendingWorkContinue {
+                        work_id: work_id.clone(),
+                        branch_id: None,
+                        message: message.clone(),
+                        request_id: request_id.clone(),
+                        attachment_request_id: attachment_request_id.clone(),
+                    },
+                );
+                ctx.show_response("Continuing Work…".to_string());
+                SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    work_id,
+                    branch_id: None,
+                    message,
+                    client_id: ctx.client_id.to_owned(),
+                    request_id,
+                    attachment_request_id,
+                })
+            }
+            WorkCommandRoute::Retry(request_id) => {
+                let Some(pending) = ctx.pending_work_retries.get(&request_id).cloned() else {
+                    ctx.show_error(format!(
+                        "No pending Work request `{request_id}`. Open `/work` to inspect the current state."
+                    ));
+                    return SlashResult::Handled;
+                };
+                ctx.show_response(format!("Retrying Work request {request_id}…"));
+                SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    api: ctx.api.clone(),
+                    profile: ctx.profile.map(str::to_owned),
+                    work_id: pending.work_id,
+                    branch_id: pending.branch_id,
+                    message: pending.message,
+                    client_id: ctx.client_id.to_owned(),
+                    request_id: pending.request_id,
+                    attachment_request_id: pending.attachment_request_id,
+                })
+            }
+            WorkCommandRoute::MissingContinueInput => {
+                ctx.show_error("Usage: /work continue <work-id> <message>".to_string());
+                SlashResult::Handled
+            }
+            WorkCommandRoute::MissingRetryInput => {
+                ctx.show_error("Usage: /work retry <request-id>".to_string());
+                SlashResult::Handled
+            }
             WorkCommandRoute::Unsupported => {
-                ctx.show_error("Usage: /work [status | execution | start <goal>]".to_string());
+                ctx.show_error(
+                    "Usage: /work [start <goal> | list | status | continue <work-id> <message> | execution | save | retry <request-id>]".to_string(),
+                );
                 SlashResult::Handled
             }
         },
@@ -1480,7 +1635,10 @@ pub(crate) fn handle_view_result(
         | ViewResult::Model { .. }
         | ViewResult::ModelThinking { .. }
         | ViewResult::Session { .. }
-        | ViewResult::WorkspaceTrust(_) => {}
+        | ViewResult::WorkspaceTrust(_)
+        | ViewResult::WorkCatalogNextPage { .. }
+        | ViewResult::WorkSelection { .. }
+        | ViewResult::WorkAction { .. } => {}
     }
 }
 
@@ -3526,12 +3684,18 @@ mod routing_tests {
     }
 
     #[test]
-    fn work_route_has_one_explicit_read_only_execution_surface() {
-        assert_eq!(work_command_route(""), WorkCommandRoute::Tasks);
+    fn work_route_separates_catalog_from_current_session_tasks() {
+        assert_eq!(work_command_route(""), WorkCommandRoute::Catalog);
+        assert_eq!(work_command_route("list"), WorkCommandRoute::Catalog);
         assert_eq!(work_command_route("status"), WorkCommandRoute::Tasks);
         assert_eq!(
             work_command_route(" execution "),
             WorkCommandRoute::Execution
+        );
+        assert_eq!(work_command_route("save"), WorkCommandRoute::SaveProgress);
+        assert_eq!(
+            work_command_route(" checkpoint "),
+            WorkCommandRoute::SaveProgress
         );
         assert_eq!(
             work_command_route("start ship the durable flow"),
@@ -3539,13 +3703,31 @@ mod routing_tests {
         );
         assert_eq!(work_command_route("start"), WorkCommandRoute::MissingGoal);
         assert_eq!(
-            work_command_route("execution extra"),
-            WorkCommandRoute::Unsupported
+            work_command_route("continue work-1 ship the next step"),
+            WorkCommandRoute::Continue {
+                work_id: "work-1".into(),
+                message: "ship the next step".into(),
+            }
         );
         assert_eq!(
-            work_command_route("list"),
-            WorkCommandRoute::Unsupported,
-            "the old list alias adds no distinct TUI behavior"
+            work_command_route("continue work-1"),
+            WorkCommandRoute::MissingContinueInput
+        );
+        assert_eq!(
+            work_command_route("continue"),
+            WorkCommandRoute::MissingContinueInput
+        );
+        assert_eq!(
+            work_command_route("retry"),
+            WorkCommandRoute::MissingRetryInput
+        );
+        assert_eq!(
+            work_command_route("retry tui-work-turn-1"),
+            WorkCommandRoute::Retry("tui-work-turn-1".into())
+        );
+        assert_eq!(
+            work_command_route("execution extra"),
+            WorkCommandRoute::Unsupported
         );
     }
 

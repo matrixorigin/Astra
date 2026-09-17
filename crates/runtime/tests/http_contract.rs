@@ -130,6 +130,15 @@ fn assert_health_contract_json(
         Some("<dynamic-build-git-sha>"),
         "{label}: health contract must use the dynamic build SHA sentinel"
     );
+    let expected_dirty = expected
+        .as_object()
+        .and_then(|object| object.get("build_git_dirty"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        expected_dirty,
+        Some("<dynamic-build-git-dirty>"),
+        "{label}: health contract must use the dynamic build dirty sentinel"
+    );
 
     let mut resolved_expected = expected.clone();
     resolved_expected
@@ -138,6 +147,13 @@ fn assert_health_contract_json(
         .insert(
             "build_git_sha".to_string(),
             serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
+        );
+    resolved_expected
+        .as_object_mut()
+        .expect("health contract should be a JSON object")
+        .insert(
+            "build_git_dirty".to_string(),
+            serde_json::Value::Bool(astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"),
         );
     assert_contract_json(actual, &resolved_expected, label);
 }

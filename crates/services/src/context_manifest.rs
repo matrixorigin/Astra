@@ -475,8 +475,29 @@ pub enum ContextManifestError {
     },
     #[error("cross-session retrieval missing user_id filter")]
     CrossSessionAuthMissing,
+    #[error("session is not active: owner={user_id}, session={session_id}")]
+    SessionNotActive { user_id: String, session_id: String },
     #[error("unsupported raw_ref scheme: {scheme}")]
     UnsupportedRawRefScheme { scheme: String },
+}
+
+fn context_manifest_session_admission_error(
+    source: sqlx::Error,
+    user_id: &str,
+    session_id: &str,
+    entity: &str,
+) -> ContextManifestError {
+    match source {
+        sqlx::Error::RowNotFound => ContextManifestError::SessionNotActive {
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+        },
+        source => ContextManifestError::Database {
+            operation: "admit_context_manifest_session",
+            entity: entity.to_string(),
+            source,
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -752,6 +773,21 @@ impl DatabaseContextManifestStore {
                     entity: manifest.manifest_id.clone(),
                     source,
                 })?;
+        crate::storage::admit_session_event_write(
+            &mut tx,
+            &manifest.session_id,
+            &manifest.user_id,
+            false,
+        )
+        .await
+        .map_err(|source| {
+            context_manifest_session_admission_error(
+                source,
+                &manifest.user_id,
+                &manifest.session_id,
+                &manifest.manifest_id,
+            )
+        })?;
         sqlx::query(
             "INSERT INTO context_manifests
              (manifest_id, user_id, session_id, run_id, turn_id, model_provider, model_name,
@@ -1070,6 +1106,34 @@ pub fn cross_session_retrieval_requires_user_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_manifest_session_admission_only_reclassifies_row_not_found() {
+        let inactive = context_manifest_session_admission_error(
+            sqlx::Error::RowNotFound,
+            "user-1",
+            "session-1",
+            "manifest-1",
+        );
+        assert!(matches!(
+            inactive,
+            ContextManifestError::SessionNotActive { .. }
+        ));
+
+        let database = context_manifest_session_admission_error(
+            sqlx::Error::Protocol("database connection lost".to_string()),
+            "user-1",
+            "session-1",
+            "manifest-1",
+        );
+        assert!(matches!(
+            database,
+            ContextManifestError::Database {
+                operation: "admit_context_manifest_session",
+                ..
+            }
+        ));
+    }
 
     #[derive(Clone)]
     struct FakeContextManifestRow {

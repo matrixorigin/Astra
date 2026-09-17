@@ -9,11 +9,12 @@ use std::{sync::Arc, time::Duration};
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    ActorContextV1, ConversationWriterLeaseV1, HandoffOperationWatermarksV1, HandoffRiskEvidenceV1,
-    ManifestDeltaV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SESSION_COORDINATION_SCHEMA_VERSION,
-    SESSION_HANDOFF_SCHEMA_VERSION, SessionAttachmentModeV1, SessionAttachmentV1,
-    SessionContextHeadV1, SessionCursorV1, SessionHandoffModeV1, SessionHandoffRecordV1,
-    SessionHandoffStateV1, SessionKeyV1, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
+    ActorContextV1, ActorKindV1, ConversationWriterLeaseV1, HandoffOperationWatermarksV1,
+    HandoffRiskEvidenceV1, ManifestDeltaV1, SESSION_ATTACHMENT_SCHEMA_VERSION,
+    SESSION_COORDINATION_SCHEMA_VERSION, SESSION_HANDOFF_SCHEMA_VERSION, SessionAttachmentModeV1,
+    SessionAttachmentV1, SessionContextHeadV1, SessionCursorV1, SessionHandoffModeV1,
+    SessionHandoffRecordV1, SessionHandoffStateV1, SessionKeyV1, SessionPlacementV1,
+    SessionSurfaceV1, WorkspaceHandoffEvidenceV1,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -108,6 +109,27 @@ pub struct AttachSessionRequestV1 {
 pub struct AttachSessionOutcomeV1 {
     pub attachment: SessionAttachmentV1,
     pub delta: ManifestDeltaV1,
+}
+
+/// The identity of a logical read attachment is stable across observations.
+///
+/// `after_manifest_root` and actor authority epochs describe the caller's
+/// current observation and are deliberately excluded. A Web page refresh must
+/// renew the same bounded attachment after a new turn instead of consuming a
+/// new attachment slot. The actor identity remains part of the fingerprint:
+/// two browser/device instances must never silently share a controller
+/// attachment, even when they observe the same Work branch. The authenticated
+/// SessionKey, surface, and placement also remain part of the identity.
+#[derive(Debug, Serialize)]
+struct AttachRequestIdentity<'a> {
+    key: &'a SessionKeyV1,
+    actor_user_id: &'a str,
+    actor_id: &'a str,
+    actor_kind: ActorKindV1,
+    surface: SessionSurfaceV1,
+    device_id: Option<&'a str>,
+    placement: SessionPlacementV1,
+    workspace: Option<&'a WorkspaceHandoffEvidenceV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,7 +298,7 @@ impl DatabaseSessionHandoffService {
     ) -> Result<AttachSessionOutcomeV1, SessionHandoffError> {
         validate_attach_request(request)?;
         validate_duration(ttl, MAX_ATTACHMENT_TTL, "attachment TTL")?;
-        let request_hash = stable_hash(b"astra.attach-session.v1\0", request)?;
+        let request_hash = attach_request_hash(request)?;
         let idempotency_hash = identity_hash("attach", &request.idempotency_key);
         let delta = match self
             .coordinator
@@ -308,10 +330,21 @@ impl DatabaseSessionHandoffService {
             Err(error) => return Err(error.into()),
         };
         let mut tx = self.begin("begin_attach").await?;
+
+        // All attachment mutations use the branch slot before touching an
+        // attachment row. This keeps attach/reopen ordered with controller,
+        // detach, and handoff operations (slot -> attachment) and prevents a
+        // refresh racing a control mutation from forming an inverse lock
+        // cycle.
+        ensure_slot(&mut tx, &request.key).await?;
+        lock_attachment_slot(&mut tx, &request.key).await?;
+        // Read the authority clock after waiting for the slot. A refresh that
+        // was blocked behind a controller mutation must not renew a lease that
+        // expired while it waited for the lock.
         let now = database_now_ms(&mut tx).await?;
 
         if let Some(row) = sqlx::query(
-            "SELECT request_hash, attachment_json
+            "SELECT request_hash, attachment_json, expires_at_ms
              FROM session_attachments
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ? AND idempotency_hash = ?
@@ -330,33 +363,64 @@ impl DatabaseSessionHandoffService {
             let mut attachment: SessionAttachmentV1 =
                 decode_json_row(&row, "attachment_json", "attachment")?;
             validate_stored_attachment(&attachment, &request.key)?;
-            if attachment.expires_at_unix_ms <= now {
-                return Err(SessionHandoffError::AttachmentExpired);
-            }
-            install_observation(&mut attachment, &delta);
-            sqlx::query(
-                "UPDATE session_attachments
-                 SET observed_manifest_root = ?, attachment_json = ?, updated_at = NOW(6)
-                 WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND attachment_id = ?",
-            )
-            .bind(attachment.observed_manifest_root.as_deref())
-            .bind(to_json("attachment", &attachment)?)
-            .bind(&request.key.isolation_domain)
-            .bind(&request.key.owner_user_id)
-            .bind(&request.key.session_id)
-            .bind(&request.key.branch_id)
-            .bind(&attachment.attachment_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| database_error("refresh_attach_observation", source))?;
-            tx.commit()
+            let row_expires_at_ms: i64 = row
+                .try_get("expires_at_ms")
+                .map_err(|source| database_error("decode_attach_expiry", source))?;
+            if attachment.expires_at_unix_ms <= now || row_expires_at_ms <= now {
+                if lock_active_handoff(&mut tx, &request.key).await?.is_some() {
+                    // Handoff participants are durable inputs to an in-flight
+                    // transfer. Keep the expired row until that operation has
+                    // settled instead of deleting a participant underneath
+                    // it; the next attach then allocates a new generation.
+                    return Err(SessionHandoffError::AttachmentInUse);
+                }
+                // An idempotency key is a logical observation slot, not a
+                // lease that can resurrect old authority. Remove the stale
+                // generation while holding its row lock, then let the normal
+                // admission path allocate a fresh read-only attachment. This
+                // makes a reopened Work self-healing even when the janitor has
+                // not run yet, and an expired controller can never be revived.
+                sqlx::query(
+                    "DELETE FROM session_attachments
+                     WHERE isolation_domain = ? AND owner_user_id = ?
+                       AND session_id = ? AND branch_id = ? AND attachment_id = ?",
+                )
+                .bind(&request.key.isolation_domain)
+                .bind(&request.key.owner_user_id)
+                .bind(&request.key.session_id)
+                .bind(&request.key.branch_id)
+                .bind(&attachment.attachment_id)
+                .execute(&mut *tx)
                 .await
-                .map_err(|source| database_error("commit_attach_retry", source))?;
-            return Ok(AttachSessionOutcomeV1 { attachment, delta });
+                .map_err(|source| database_error("delete_expired_attachment", source))?;
+            } else {
+                install_observation(&mut attachment, &delta);
+                attachment.expires_at_unix_ms = checked_expiry(now, ttl)?;
+                sqlx::query(
+                    "UPDATE session_attachments
+                     SET observed_manifest_root = ?, attachment_json = ?,
+                         expires_at_ms = ?, updated_at = NOW(6)
+                     WHERE isolation_domain = ? AND owner_user_id = ?
+                       AND session_id = ? AND branch_id = ? AND attachment_id = ?",
+                )
+                .bind(attachment.observed_manifest_root.as_deref())
+                .bind(to_json("attachment", &attachment)?)
+                .bind(attachment.expires_at_unix_ms)
+                .bind(&request.key.isolation_domain)
+                .bind(&request.key.owner_user_id)
+                .bind(&request.key.session_id)
+                .bind(&request.key.branch_id)
+                .bind(&attachment.attachment_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|source| database_error("refresh_attach_observation", source))?;
+                tx.commit()
+                    .await
+                    .map_err(|source| database_error("commit_attach_retry", source))?;
+                return Ok(AttachSessionOutcomeV1 { attachment, delta });
+            }
         }
 
-        ensure_slot(&mut tx, &request.key).await?;
         // The slot row serializes capacity admission and epoch allocation for
         // this exact owner/session/branch. Concurrent opens therefore cannot
         // both observe the final available slot.
@@ -1775,6 +1839,26 @@ async fn ensure_slot(
     Ok(())
 }
 
+async fn lock_attachment_slot(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionHandoffError> {
+    sqlx::query(
+        "SELECT next_attachment_epoch FROM session_handoff_slots
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?
+         FOR UPDATE",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|source| database_error("lock_attachment_slot", source))?;
+    Ok(())
+}
+
 async fn lock_active_handoff(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
@@ -2287,6 +2371,22 @@ fn stable_hash<T: Serialize>(domain: &[u8], value: &T) -> Result<String, Session
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn attach_request_hash(request: &AttachSessionRequestV1) -> Result<String, SessionHandoffError> {
+    stable_hash(
+        b"astra.attach-session.v2\0",
+        &AttachRequestIdentity {
+            key: &request.key,
+            actor_user_id: &request.actor.actor_user_id,
+            actor_id: &request.actor.actor_id,
+            actor_kind: request.actor.actor_kind,
+            surface: request.actor.surface,
+            device_id: request.actor.device_id.as_deref(),
+            placement: request.placement,
+            workspace: request.workspace.as_ref(),
+        },
+    )
+}
+
 fn identity_hash(operation: &str, value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"astra.session-handoff-idempotency.v1\0");
@@ -2432,6 +2532,72 @@ mod tests {
             | ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
             other => panic!("unexpected reservation outcome {other:?}"),
         }
+    }
+
+    #[test]
+    fn attachment_retry_identity_ignores_observation_progress() {
+        let key = SessionKeyV1::owner_session("server", "owner", "session", "main");
+        let mut first_actor = actor(&key.owner_user_id, "web");
+        first_actor.actor_kind = ActorKindV1::Server;
+        first_actor.surface = SessionSurfaceV1::Web;
+        first_actor.device_id = None;
+        let first = AttachSessionRequestV1 {
+            idempotency_key: "web-open:session:main".into(),
+            key: key.clone(),
+            actor: first_actor.clone(),
+            placement: SessionPlacementV1::Server,
+            after_manifest_root: None,
+            workspace: None,
+        };
+        let mut later_actor = first_actor;
+        later_actor.authority_epochs.authorization_epoch = 7;
+        later_actor.authority_epochs.device_trust_epoch = 3;
+        let later = AttachSessionRequestV1 {
+            after_manifest_root: Some("a".repeat(64)),
+            actor: later_actor,
+            ..first.clone()
+        };
+
+        assert_eq!(
+            attach_request_hash(&first).expect("hash first attach"),
+            attach_request_hash(&later).expect("hash retry attach"),
+            "a new observation must renew the same logical attachment"
+        );
+
+        let different_actor = AttachSessionRequestV1 {
+            actor: ActorContextV1::owner_user(
+                &key.owner_user_id,
+                "web-client:other-browser",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Web,
+                Some("other-browser".into()),
+                AuthorityEpochsV1::default(),
+            ),
+            ..later.clone()
+        };
+        assert_ne!(
+            attach_request_hash(&later).expect("hash retry attach"),
+            attach_request_hash(&different_actor).expect("hash different actor"),
+            "distinct Web client actors must not share an attachment fingerprint"
+        );
+
+        let different_surface = AttachSessionRequestV1 {
+            actor: ActorContextV1::owner_user(
+                &key.owner_user_id,
+                "edge",
+                ActorKindV1::Edge,
+                SessionSurfaceV1::Edge,
+                Some("edge-1".into()),
+                AuthorityEpochsV1::default(),
+            ),
+            placement: SessionPlacementV1::Edge,
+            ..first
+        };
+        assert_ne!(
+            attach_request_hash(&later).expect("hash retry attach"),
+            attach_request_hash(&different_surface).expect("hash different attach"),
+            "a different placement/surface must retain a distinct attachment"
+        );
     }
 
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {

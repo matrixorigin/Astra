@@ -7,9 +7,20 @@ type CardProps = {
   className?: string;
   href?: string;
   interactive?: boolean;
+  id?: string;
+  role?: string;
+  'aria-label'?: string;
 };
 
-export function Card({ children, className, href, interactive }: CardProps) {
+export function Card({
+  children,
+  className,
+  href,
+  interactive,
+  id,
+  role,
+  'aria-label': ariaLabel,
+}: CardProps) {
   const classes = cn(
     'relative rounded-card border border-border/80 bg-surface p-4 shadow-[0_1px_2px_rgba(15,23,42,0.025)]',
     interactive &&
@@ -19,11 +30,15 @@ export function Card({ children, className, href, interactive }: CardProps) {
 
   if (href) {
     return (
-      <Link href={href} className={classes}>
+      <Link href={href} className={classes} id={id} role={role} aria-label={ariaLabel}>
         {children}
       </Link>
     );
   }
 
-  return <div className={classes}>{children}</div>;
+  return (
+    <div className={classes} id={id} role={role} aria-label={ariaLabel}>
+      {children}
+    </div>
+  );
 }

@@ -210,6 +210,25 @@ pub enum StateProjectionError {
     PersonalSkillVersionNotActivatable { version_id: String, status: String },
 }
 
+fn state_projection_session_admission_error(
+    source: sqlx::Error,
+    user_id: &str,
+    session_id: &str,
+    entity: &str,
+) -> StateProjectionError {
+    match source {
+        sqlx::Error::RowNotFound => StateProjectionError::SessionNotActive {
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+        },
+        source => StateProjectionError::Database {
+            operation: "admit_state_item_session",
+            entity: entity.to_string(),
+            source,
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DelegationProjectionUpsert {
     pub delegation_id: String,
@@ -687,6 +706,16 @@ impl DatabaseStateProjectionStore {
                     entity: item_id.clone(),
                     source,
                 })?;
+        crate::storage::admit_session_event_write(&mut tx, &item.session_id, &item.user_id, false)
+            .await
+            .map_err(|source| {
+                state_projection_session_admission_error(
+                    source,
+                    &item.user_id,
+                    &item.session_id,
+                    &item_id,
+                )
+            })?;
         sqlx::query(
             "INSERT INTO session_state_items
              (item_id, user_id, session_id, scope, category, item_key, status, priority, source,
@@ -1736,6 +1765,34 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_session_admission_only_reclassifies_row_not_found() {
+        let inactive = state_projection_session_admission_error(
+            sqlx::Error::RowNotFound,
+            "user-1",
+            "session-1",
+            "state-1",
+        );
+        assert!(matches!(
+            inactive,
+            StateProjectionError::SessionNotActive { .. }
+        ));
+
+        let database = state_projection_session_admission_error(
+            sqlx::Error::Protocol("database connection lost".to_string()),
+            "user-1",
+            "session-1",
+            "state-1",
+        );
+        assert!(matches!(
+            database,
+            StateProjectionError::Database {
+                operation: "admit_state_item_session",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn state_item_id_preserves_readable_identity_when_it_fits() {

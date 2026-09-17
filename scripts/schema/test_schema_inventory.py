@@ -126,12 +126,13 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_events",
             "work_runtime_event_outbox",
             "work_runtime_event_outbox_slots",
+            "work_recovery_points",
         }
         actual = {
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(32, len(actual))
+        self.assertEqual(33, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
@@ -151,6 +152,7 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
         self.assertIn("canonical history", self.tables["work_events"]["state_class"])
         self.assertIn("runtime event projection", self.tables["work_runtime_event_outbox"]["merge_guidance"])
+        self.assertIn("canonical verification", self.tables["work_recovery_points"]["merge_guidance"])
         self.assertIn("terminal", self.tables["work_terminal_cuts"]["state_class"])
 
     def test_work_retention_and_runtime_coverage_metadata_is_explicit(self) -> None:
@@ -696,6 +698,10 @@ fn char_literal() { let slash = '/'; }
             "agent_event_edges",
             "session_artifacts",
             "session_artifacts_grants",
+            "session_artifact_content_chunks",
+            "session_artifact_content_refs",
+            "session_artifact_content_reservations",
+            "session_artifact_content_upload_leases",
             "session_checkpoints",
             "user_preferences",
             "edge_agent_registry",

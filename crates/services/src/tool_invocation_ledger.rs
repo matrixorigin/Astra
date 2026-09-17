@@ -632,6 +632,12 @@ impl DatabaseToolInvocationLedger {
             });
         }
 
+        // An `outcome_unknown` row is a live safety fact: the provider boundary
+        // may have been crossed, but no terminal outcome is authoritative yet.
+        // Keep it in the hot ledger so Session admission can continue to see
+        // the unresolved effect after compaction. Archiving it would make a
+        // later recovery capture look quiescent even though replay still needs
+        // human/provider reconciliation.
         let rows = sqlx::query(
             "SELECT turn_chain_id, invocation_id, identity_key,
                     JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
@@ -643,6 +649,7 @@ impl DatabaseToolInvocationLedger {
                         AS dispatch_lease_expires_at_epoch_ms
              FROM tool_invocation_ledger
              WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND state <> 'outcome_unknown'
              ORDER BY identity_key
              LIMIT ? FOR UPDATE",
         )
@@ -653,10 +660,21 @@ impl DatabaseToolInvocationLedger {
         .fetch_all(&mut *tx)
         .await?;
         if rows.is_empty() {
+            let remaining_records: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(ToolInvocationCompactionOutcome {
                 archived_records: 0,
-                remaining_records: 0,
+                remaining_records: u64::try_from(remaining_records).map_err(|_| {
+                    ToolInvocationLedgerStoreError::InvalidCompactionCount(remaining_records)
+                })?,
                 artifact_id: None,
             });
         }

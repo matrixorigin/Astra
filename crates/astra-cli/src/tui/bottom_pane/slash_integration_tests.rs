@@ -89,6 +89,26 @@ fn typing_slash_opens_menu() {
 }
 
 #[test]
+fn slash_reopens_command_palette_after_a_completed_work_view() {
+    let mut bp = fresh();
+    bp.push_view(Box::new(
+        crate::tui::bottom_pane::info_view::InfoView::from_plain(
+            "Work hub",
+            vec!["Read-only Work catalog".into()],
+        ),
+    ));
+
+    let _ = bp.handle_key(key('/'));
+    assert!(
+        !bp.has_active_view(),
+        "slash should return focus to the composer"
+    );
+    assert!(bp.slash_menu_is_open());
+    type_string(&mut bp, "m");
+    assert_eq!(bp.slash_menu_selected_name(), Some("/model"));
+}
+
+#[test]
 fn slash_menu_opens_after_due_paste_burst_flush() {
     let mut bp = fresh();
     let now = std::time::Instant::now();

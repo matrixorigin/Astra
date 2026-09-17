@@ -812,6 +812,21 @@ async fn attach_work_branch(
     branch_id: &str,
     request_id: &str,
 ) -> (StatusCode, Value) {
+    attach_work_branch_with_client(app, user_id, work_id, branch_id, request_id, None).await
+}
+
+async fn attach_work_branch_with_client(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    request_id: &str,
+    client_id: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut payload = serde_json::json!({"request_id": request_id, "surface": "web"});
+    if let Some(client_id) = client_id {
+        payload["client_id"] = Value::from(client_id);
+    }
     let request = Request::builder()
         .method("POST")
         .uri(format!(
@@ -820,9 +835,7 @@ async fn attach_work_branch(
         .header("authorization", format!("Bearer {user_id}"))
         .header(WORK_API_MAJOR_HEADER, "1")
         .header("content-type", "application/json")
-        .body(body::Body::from(
-            serde_json::json!({"request_id": request_id}).to_string(),
-        ))
+        .body(body::Body::from(payload.to_string()))
         .expect("request");
     let response = app.oneshot(request).await.expect("response");
     let status = response.status();
@@ -1287,6 +1300,82 @@ async fn get_work_execution(
         .await
         .expect("bounded execution response");
     let value = serde_json::from_slice(&bytes).expect("JSON execution response");
+    (status, value)
+}
+
+async fn post_work_recovery_point(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    payload: Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points"
+        ))
+        .header("authorization", format!("Bearer {user_id}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .header("content-type", "application/json")
+        .body(body::Body::from(
+            serde_json::to_vec(&payload).expect("recovery point request JSON"),
+        ))
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("recovery point response is bounded");
+    let value = serde_json::from_slice(&bytes).expect("JSON recovery point response");
+    (status, value)
+}
+
+async fn get_work_recovery_points(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    query: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points{query}"
+        ))
+        .header("authorization", format!("Bearer {user_id}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .body(body::Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .expect("recovery point page is bounded");
+    let value = serde_json::from_slice(&bytes).expect("JSON recovery point page");
+    (status, value)
+}
+
+async fn get_work_recovery_point(
+    app: Router,
+    user_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    recovery_point_id: &str,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!(
+            "/v1/works/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}"
+        ))
+        .header("authorization", format!("Bearer {user_id}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .body(body::Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("recovery point detail is bounded");
+    let value = serde_json::from_slice(&bytes).expect("JSON recovery point detail");
     (status, value)
 }
 
@@ -2334,6 +2423,39 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
     assert_eq!(retry["attachment_id"], first["attachment_id"]);
     assert_eq!(retry["attachment_epoch"], first["attachment_epoch"]);
 
+    // Work detail refreshes are frequent while another surface is running.
+    // Re-observing the same logical Web attachment must remain one active
+    // slot even after more than the branch capacity of refreshes.
+    for _ in 0..65 {
+        let (status, observed) = attach_work_branch(
+            app.clone(),
+            &owner_id,
+            work_id,
+            branch_id,
+            "attachment-open-1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "repeated attach: {observed}");
+        assert_eq!(observed["attachment_id"], first["attachment_id"]);
+    }
+    let active_after_refreshes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_attachments
+         WHERE owner_user_id = ? AND session_id = (
+           SELECT session_id FROM work_branches
+           WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+         ) AND branch_id = ?
+         AND expires_at_ms > CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)",
+    )
+    .bind(&owner_id)
+    .bind(&owner_id)
+    .bind(work_id)
+    .bind(branch_id)
+    .bind("main")
+    .fetch_one(pool.get())
+    .await
+    .expect("count active attachments after refreshes");
+    assert_eq!(active_after_refreshes, 1);
+
     let (second_status, second) = attach_work_branch(
         app.clone(),
         &owner_id,
@@ -2348,6 +2470,52 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
         second["attachment_epoch"].as_u64().expect("second epoch")
             > first["attachment_epoch"].as_u64().expect("first epoch"),
         "attachment epochs must be monotonic"
+    );
+
+    // A browser may reopen a Work after its read lease expired while the
+    // expired row is still present. The fixed logical key must create a fresh
+    // read generation instead of depending on the maintenance janitor.
+    let second_attachment_id = second["attachment_id"].as_str().expect("second attachment");
+    let second_json: String = sqlx::query_scalar(
+        "SELECT attachment_json FROM session_attachments
+         WHERE owner_user_id = ? AND attachment_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(second_attachment_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load second attachment JSON");
+    let mut expired_json: Value = serde_json::from_str(&second_json).expect("attachment JSON");
+    expired_json["attached_at_unix_ms"] = Value::from(0);
+    expired_json["expires_at_unix_ms"] = Value::from(1);
+    sqlx::query(
+        "UPDATE session_attachments
+         SET expires_at_ms = 1, attachment_json = ?
+         WHERE owner_user_id = ? AND attachment_id = ?",
+    )
+    .bind(expired_json.to_string())
+    .bind(&owner_id)
+    .bind(second_attachment_id)
+    .execute(pool.get())
+    .await
+    .expect("expire second attachment without janitor");
+    let (reopen_status, reopened) = attach_work_branch(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "attachment-open-2",
+    )
+    .await;
+    assert_eq!(
+        reopen_status,
+        StatusCode::OK,
+        "reopen expired attachment: {reopened}"
+    );
+    assert_eq!(reopened["mode"], "read_only");
+    assert_ne!(
+        reopened["attachment_id"], second["attachment_id"],
+        "reopening an expired logical attachment allocates a new generation"
     );
 
     let (foreign_status, foreign) = attach_work_branch(
@@ -2426,6 +2594,154 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
 
     cleanup_owner(&pool, &owner_id).await;
     cleanup_owner(&pool, &other_owner_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_branch_web_clients_keep_independent_observers_and_control() {
+    let Some((app, pool)) =
+        setup_with_run_lifecycle(Arc::new(WorkTurnRecordingLifecycle::default())).await
+    else {
+        return;
+    };
+    let owner_id = id("web-client-owner");
+    cleanup_owner(&pool, &owner_id).await;
+    let (create_status, created) = post_work(
+        app.clone(),
+        &owner_id,
+        serde_json::json!({
+            "request_id": "web-client-work",
+            "goal": "Keep browser observers independent while control remains explicit.",
+            "criteria": []
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "create Work: {created}");
+    let work_id = created["overview"]["work_id"].as_str().expect("Work id");
+    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("branch id");
+
+    let (_, browser_a) = attach_work_branch_with_client(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "web-browser-a-open",
+        Some("browser-a"),
+    )
+    .await;
+    let (_, browser_b) = attach_work_branch_with_client(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "web-browser-b-open",
+        Some("browser-b"),
+    )
+    .await;
+    let browser_a_id = browser_a["attachment_id"]
+        .as_str()
+        .expect("browser A attachment");
+    let browser_b_id = browser_b["attachment_id"]
+        .as_str()
+        .expect("browser B attachment");
+    assert_ne!(browser_a_id, browser_b_id);
+    assert_eq!(browser_a["mode"], "read_only");
+    assert_eq!(browser_b["mode"], "read_only");
+
+    let control = serde_json::json!({
+        "request_id": "web-browser-a-control",
+        "expected_branch_revision": 1,
+        "expected_writer_epoch": 0,
+        "expected_canonical_root_hash": null,
+        "command": {"kind": "acquire_branch_control", "attachment_id": browser_a_id}
+    });
+    let (control_status, control_result) =
+        post_work_control(app.clone(), &owner_id, work_id, branch_id, control).await;
+    assert_eq!(
+        control_status,
+        StatusCode::CREATED,
+        "A control: {control_result}"
+    );
+    assert_eq!(control_result["outcome"], "acquired");
+
+    // B's refresh renews only B's read attachment. It must not inherit A's
+    // controller mode through a shared idempotency key or actor identity.
+    let (refresh_status, refreshed_b) = attach_work_branch_with_client(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "web-browser-b-open",
+        Some("browser-b"),
+    )
+    .await;
+    assert_eq!(refresh_status, StatusCode::OK, "B refresh: {refreshed_b}");
+    assert_eq!(refreshed_b["attachment_id"], browser_b["attachment_id"]);
+    assert_eq!(refreshed_b["mode"], "read_only");
+
+    let (turn_status, _events, raw) = post_work_turn(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        serde_json::json!({
+            "request_id": "web-browser-b-turn",
+            "attachment_id": browser_b_id,
+            "message": "B must not write until it explicitly acquires control."
+        }),
+    )
+    .await;
+    assert_eq!(
+        turn_status,
+        StatusCode::CONFLICT,
+        "B write must be fenced: {raw}"
+    );
+    let error: Value = serde_json::from_str(&raw).expect("typed Work conflict");
+    assert_eq!(error["code"], "writer_conflict");
+
+    // Expiring a controller must fence that generation. Reopening with the
+    // same browser identity creates a read-only generation; it never revives
+    // the old controller authority.
+    let browser_a_json: String = sqlx::query_scalar(
+        "SELECT attachment_json FROM session_attachments
+         WHERE owner_user_id = ? AND attachment_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(browser_a_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load browser A attachment JSON");
+    let mut expired_browser_a: Value =
+        serde_json::from_str(&browser_a_json).expect("browser A attachment JSON");
+    expired_browser_a["attached_at_unix_ms"] = Value::from(0);
+    expired_browser_a["expires_at_unix_ms"] = Value::from(1);
+    sqlx::query(
+        "UPDATE session_attachments
+         SET expires_at_ms = 1, attachment_json = ?
+         WHERE owner_user_id = ? AND attachment_id = ?",
+    )
+    .bind(expired_browser_a.to_string())
+    .bind(&owner_id)
+    .bind(browser_a_id)
+    .execute(pool.get())
+    .await
+    .expect("expire browser A controller");
+    let (reopen_a_status, reopened_a) = attach_work_branch_with_client(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "web-browser-a-open",
+        Some("browser-a"),
+    )
+    .await;
+    assert_eq!(reopen_a_status, StatusCode::OK, "reopen A: {reopened_a}");
+    assert_ne!(reopened_a["attachment_id"], browser_a["attachment_id"]);
+    assert_eq!(reopened_a["mode"], "read_only");
+
+    cleanup_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
@@ -4803,6 +5119,131 @@ async fn work_turn_route_uses_durable_edge_selection_without_server_override() {
     }
 
     cleanup_owner(&pool, &owner_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn recovery_point_route_is_canonical_owner_scoped_and_explicit_about_capabilities() {
+    let Some((app, pool)) = setup().await else {
+        return;
+    };
+    let owner_id = id("recovery-owner");
+    let other_owner_id = id("recovery-other-owner");
+    cleanup_owner(&pool, &owner_id).await;
+    cleanup_owner(&pool, &other_owner_id).await;
+
+    let (create_status, created) = post_work(
+        app.clone(),
+        &owner_id,
+        serde_json::json!({
+            "request_id": "start-for-recovery-point",
+            "goal": "Record one stable logical progress boundary.",
+            "criteria": []
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED, "create Work: {created}");
+    let work_id = created["overview"]["work_id"].as_str().expect("Work id");
+    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("branch id");
+    let session_id: String = sqlx::query_scalar(
+        "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(work_id)
+    .bind(branch_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("Work branch Session id");
+    let cursor = commit_test_conversation_turn(&pool, &owner_id, &session_id, None, 1).await;
+    assert_eq!(cursor.completed_turn, 1);
+
+    let capture = serde_json::json!({
+        "request_id": "save-progress-1",
+        "expected_work_revision": 1,
+        "expected_branch_revision": 1,
+        "reason": "user_requested"
+    });
+    let (capture_status, captured) =
+        post_work_recovery_point(app.clone(), &owner_id, work_id, branch_id, capture.clone()).await;
+    assert_eq!(capture_status, StatusCode::OK, "capture: {captured}");
+    assert_eq!(captured["status"], "captured");
+    assert_eq!(captured["coverage"]["session_state"], true);
+    assert_eq!(captured["coverage"]["work_state"], true);
+    assert_eq!(captured["coverage"]["workspace"], false);
+    assert_eq!(captured["coverage"]["run_frontier"], false);
+    assert_eq!(captured["coverage"]["artifacts"], false);
+    assert_eq!(captured["capabilities"]["can_restore_conversation"], false);
+    assert_eq!(captured["capabilities"]["has_portable_workspace"], false);
+    assert_field_absent(&captured, "session_id");
+    assert_field_absent(&captured, "owner_id");
+    let recovery_point_id = captured["recovery_point_id"]
+        .as_str()
+        .expect("recovery point id");
+
+    // Lost HTTP responses are safe to retry. The original immutable point is
+    // returned even if a later Work mutation would make the old expected
+    // revisions stale.
+    let (replay_status, replay) =
+        post_work_recovery_point(app.clone(), &owner_id, work_id, branch_id, capture).await;
+    assert_eq!(replay_status, StatusCode::OK, "replay: {replay}");
+    assert_eq!(replay, captured);
+
+    let (list_status, listed) =
+        get_work_recovery_points(app.clone(), &owner_id, work_id, branch_id, "?limit=1").await;
+    assert_eq!(list_status, StatusCode::OK, "list: {listed}");
+    assert_eq!(listed["points"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["points"][0]["recovery_point_id"], recovery_point_id);
+
+    let (detail_status, detail) = get_work_recovery_point(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        recovery_point_id,
+    )
+    .await;
+    assert_eq!(detail_status, StatusCode::OK, "detail: {detail}");
+    assert_eq!(detail, captured);
+
+    let (other_status, other) =
+        get_work_recovery_points(app.clone(), &other_owner_id, work_id, branch_id, "").await;
+    assert_eq!(
+        other_status,
+        StatusCode::NOT_FOUND,
+        "owner isolation: {other}"
+    );
+
+    let (stale_status, stale) = post_work_recovery_point(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        serde_json::json!({
+            "request_id": "save-progress-stale",
+            "expected_work_revision": 2,
+            "expected_branch_revision": 1,
+            "reason": "user_requested"
+        }),
+    )
+    .await;
+    assert_eq!(stale_status, StatusCode::CONFLICT, "stale basis: {stale}");
+    assert_eq!(stale["code"], "recovery_point_basis_changed");
+
+    let (invalid_cursor_status, invalid_cursor) = get_work_recovery_points(
+        app.clone(),
+        &owner_id,
+        work_id,
+        branch_id,
+        "?before_created_at=2026-09-16T00:00:00Z",
+    )
+    .await;
+    assert_eq!(invalid_cursor_status, StatusCode::BAD_REQUEST);
+    assert_eq!(invalid_cursor["code"], "invalid_recovery_point_cursor");
+
+    cleanup_owner(&pool, &owner_id).await;
+    cleanup_owner(&pool, &other_owner_id).await;
 }
 
 #[tokio::test]

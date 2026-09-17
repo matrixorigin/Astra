@@ -408,17 +408,26 @@ const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
 // The bare command opens the agent workbench; `list` is only an alias.
 const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[];
-// The bare command opens the Work board; `status` is only an alias.
+// `/work` opens the owner's Work hub. Keep the inline descriptions phrased as
+// user outcomes: this menu is the first place most people learn what Work is.
+// `status` stays focused on the current conversation's task board; discovery
+// and execution are separate actions.
 const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("start", "Track this conversation as durable Work"),
+    ("start", "Begin here: track a goal across TUI and Web"),
+    ("list", "Open saved tasks; choose View or Continue"),
+    ("status", "See this task's plan and progress"),
+    ("continue", "Give a chosen task its next instruction"),
     (
         "execution",
-        "Show live execution placement and handoff targets",
+        "See where a task runs; move it to another Edge",
     ),
+    ("retry", "Retry only when a request result is unknown"),
+    ("save", "Save a recovery point before a risky change"),
 ];
 // The bare command opens the editor; `edit` is only an alias.
 const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
 const WORK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "Browse your durable Work"),
     ("start", "Track this conversation as durable Work"),
     ("status", "Open the canonical Work task board"),
 ];
@@ -575,12 +584,13 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/work",
-        "Open the Work board or start durable work",
+        "Keep a task available across TUI, Web, and Edge",
         CommandGroup::Work,
     )
     .with_subcommands(WORK_SUBCOMMANDS)
     .with_tui_subcommands(TUI_WORK_SUBCOMMANDS)
-    .with_arg_hint("[start <goal>]")
+    .with_arg_hint("[start <goal> | list | status | continue <work-id> <message>]")
+    .with_usage_examples(&["work start Fix the flaky API test", "work list"])
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     // ── Inspect and settings ───────────────────────────────────────────────
@@ -1127,11 +1137,16 @@ mod tests {
         assert_eq!(
             work.visible_tui_subcommands(),
             [
-                ("start", "Track this conversation as durable Work"),
+                ("start", "Begin here: track a goal across TUI and Web"),
+                ("list", "Open saved tasks; choose View or Continue"),
+                ("status", "See this task's plan and progress"),
+                ("continue", "Give a chosen task its next instruction"),
                 (
                     "execution",
-                    "Show live execution placement and handoff targets"
-                )
+                    "See where a task runs; move it to another Edge"
+                ),
+                ("retry", "Retry only when a request result is unknown"),
+                ("save", "Save a recovery point before a risky change")
             ]
         );
 

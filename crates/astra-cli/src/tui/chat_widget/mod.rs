@@ -2721,6 +2721,15 @@ impl ChatWidget {
         self.commit_cell(Box::new(cell));
     }
 
+    /// Commit a complete response produced by the explicit Work continuation
+    /// surface. Work turns have their own canonical transcript and lifecycle;
+    /// this method only projects the final Markdown into the current TUI and
+    /// never changes the local Session identity or runs local tools.
+    pub(crate) fn commit_work_response(&mut self, markdown: impl Into<String>) {
+        self.commit_transcript_boundary();
+        self.commit_cell(Box::new(AssistantCell::from_markdown(markdown)));
+    }
+
     /// Append a runtime-owned lifecycle projection without claiming that the
     /// currently executing tool has ended. Use this only for concurrent work
     /// receipts/handoffs; ordinary conversational system messages retain the

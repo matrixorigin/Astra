@@ -55,6 +55,7 @@ mod proposal_acceptance_repository;
 mod proposal_identity;
 mod proposal_queue;
 mod proposal_repository;
+mod recovery_point;
 mod repository;
 mod runtime_event_outbox;
 mod subject;
@@ -211,10 +212,15 @@ pub use proposal::{
     WorkProposalSourceKind, WorkProposalStatus,
 };
 pub use proposal_identity::WorkProposalInvocationIdentity;
+pub use recovery_point::{
+    DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
+    WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointPage,
+    WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
+};
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
     WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
-    WorkRepository, WorkRepositoryError,
+    WorkRecoveryPointBlocker, WorkRepository, WorkRepositoryError,
 };
 pub use runtime_event_outbox::{
     WorkRuntimeEventProjectionResult, project_pending_runtime_events,
@@ -1269,6 +1275,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',
         'check_recorded', 'gaps_accepted',
         'run_completed', 'run_delegated', 'run_failed', 'run_cancelled',
+        'recovery_point_captured',
         'runtime_events_expired'
     )),
     CONSTRAINT chk_work_event_work_revision CHECK (
@@ -1328,6 +1335,44 @@ pub(crate) const WORK_RUNTIME_EVENT_OUTBOX_SLOTS_CREATE_SQL: &str =
         (has_pending = 0 AND last_projected_event_seq = last_enqueued_event_seq)
         OR
         (has_pending = 1 AND last_projected_event_seq < last_enqueued_event_seq)
+    )
+)";
+
+pub(crate) const WORK_RECOVERY_POINTS_CREATE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS work_recovery_points (
+    owner_id VARCHAR(128) NOT NULL,
+    work_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    recovery_point_id VARCHAR(128) NOT NULL,
+    request_id VARCHAR(256) NOT NULL,
+    request_hash CHAR(71) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    manifest_json LONGTEXT NULL,
+    manifest_hash CHAR(71) NULL,
+    failure_reason VARCHAR(1024) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    ready_at DATETIME(6) NULL,
+    PRIMARY KEY (owner_id, work_id, recovery_point_id),
+    UNIQUE KEY uq_work_recovery_point_request (owner_id, work_id, request_id),
+    INDEX idx_work_recovery_points_branch_status (
+        owner_id, work_id, branch_id, status, created_at, recovery_point_id
+    ),
+    INDEX idx_work_recovery_points_owner_created (
+        owner_id, created_at, work_id, recovery_point_id
+    ),
+    CONSTRAINT chk_work_recovery_point_status CHECK (
+        status IN ('preparing', 'captured', 'ready', 'failed', 'aborted')
+    ),
+    CONSTRAINT chk_work_recovery_point_ready_shape CHECK (
+        (status = 'ready'
+         AND manifest_json IS NOT NULL AND manifest_hash IS NOT NULL AND ready_at IS NOT NULL
+         AND failure_reason IS NULL)
+        OR (status <> 'ready' AND ready_at IS NULL)
+    ),
+    CONSTRAINT chk_work_recovery_point_failure_shape CHECK (
+        (status = 'failed' AND failure_reason IS NOT NULL)
+        OR (status <> 'failed' AND failure_reason IS NULL)
     )
 )";
 
@@ -1412,6 +1457,7 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         "work_runtime_event_outbox",
         WORK_RUNTIME_EVENT_OUTBOX_CREATE_SQL,
     ),
+    ("work_recovery_points", WORK_RECOVERY_POINTS_CREATE_SQL),
 ];
 
 pub(crate) use runtime_event_outbox::enqueue_root_run_terminal_event;

@@ -320,7 +320,7 @@ test("confirms forced takeover and resumes the same durable turn", async () => {
     },
     password: "correct horse battery staple",
   });
-  expect(await screen.findByText("Preparing a safe handoff")).toBeVisible();
+  expect(await screen.findByText("Preparing to take control here")).toBeVisible();
   await waitFor(() => expect(streamHarness.instances).toHaveLength(2));
   expect(observeControl).toHaveBeenCalledWith({
     workId: "work-1",
@@ -379,7 +379,7 @@ test("stops a durable takeover only while the server marks it abortable", async 
   fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "password" } });
   fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
-  fireEvent.click(await screen.findByRole("button", { name: "Stop moving" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Stop taking control" }));
   await waitFor(() =>
     expect(abortControl).toHaveBeenCalledWith({
       workId: "work-1",
@@ -387,8 +387,64 @@ test("stops a durable takeover only while the server marks it abortable", async 
       operationId: "operation-abort",
     }),
   );
-  expect(await screen.findByRole("alert")).toHaveTextContent(/move was stopped/i);
+  expect(await screen.findByRole("alert")).toHaveTextContent(/taking control was stopped/i);
   expect(streamHarness.instances).toHaveLength(1);
+});
+
+test("does not invent execution location when stopping a takeover is unconfirmed", async () => {
+  forceTakeover.mockResolvedValue({
+    ok: true,
+    operation: {
+      schema_version: 2,
+      operation_id: "operation-unknown-stop",
+      work_id: "work-1",
+      branch_id: "branch-1",
+      attachment_id: "attachment-1",
+      kind: "force_takeover",
+      state: "pending",
+      outcome: "pending",
+      branch_revision: 3,
+      control_basis: { writer_epoch: 4, canonical_root_hash: "a".repeat(64) },
+      progress: { phase: "preparing", abortable: true },
+      created_at: "2026-08-01T00:00:00Z",
+      completed_at: null,
+    },
+  });
+  abortControl.mockRejectedValue(new Error("connection lost after commit"));
+  render(
+    <WorkTurnComposer
+      workId="work-1"
+      branchId="branch-1"
+      attachmentId="attachment-1"
+      branchRevision={3}
+      controlBasis={{ writer_epoch: 4, canonical_root_hash: "a".repeat(64) }}
+    />,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), {
+    target: { value: "Continue safely here" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  act(() =>
+    streamHarness.instances[0]!.options.onEvent({
+      type: "error",
+      code: "writer_conflict",
+      message: "This Work is active elsewhere. You can keep viewing it here.",
+      retryable: false,
+      http_status: 409,
+      action_hints: ["refresh_work"],
+    }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Continue here" }));
+  fireEvent.change(await screen.findByLabelText("Password"), {
+    target: { value: "password" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Stop taking control" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /could not confirm whether taking control stopped.*refresh to see the recorded status/i,
+  );
+  expect(screen.queryByRole("alert")).not.toHaveTextContent(/active on the other device/i);
 });
 
 test("keeps viewing without losing guidance or leaving optimistic messages behind", () => {

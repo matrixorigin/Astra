@@ -28,18 +28,18 @@ const GROUPS: Array<{
 }> = [
   {
     attention: "needs_review",
-    title: "Needs you",
-    description: "Astra has a concrete decision ready for review.",
+    title: "Needs your review",
+    description: "Astra suggested a completion check; the Work can keep moving while you review it.",
   },
   {
     attention: "updated",
-    title: "Updated",
-    description: "New durable activity since you last opened this Work.",
+    title: "New activity",
+    description: "This Work changed since you last opened it.",
   },
   {
     attention: "none",
-    title: "Current",
-    description: "No unread activity or pending decision.",
+    title: "No action needed",
+    description: "These Works are saved and ready to continue when you are.",
   },
 ];
 
@@ -118,10 +118,11 @@ export function WorkNowPage({
               Now
             </p>
             <h1 className="mt-2 text-3xl font-semibold tracking-[-0.035em] text-text">
-              Work that can move forward
+              What needs your attention
             </h1>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-text-secondary">
-              Decisions first, then unread updates and the rest of your current Work.
+              Now is your Work inbox. Open a Work to see its plan, live progress,
+              result, and the next action in one place.
             </p>
             {isLatest ? (
               <p
@@ -140,7 +141,7 @@ export function WorkNowPage({
             className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-control bg-text px-4 text-sm font-semibold text-white transition hover:bg-text/90"
           >
             <Plus className="size-4" />
-            Start Work
+            Start a new Work
           </Link>
         </header>
 
@@ -154,7 +155,7 @@ export function WorkNowPage({
             </h2>
             <p className="mt-2 max-w-md text-sm leading-6 text-text-secondary">
               {isLatest
-                ? "Start with an outcome. Astra will keep its tasks, decisions, and evidence together."
+                ? "Start with an outcome. Astra keeps the plan, progress, decisions, and evidence together across TUI and Web."
                 : "You have reached the end of this bounded Work history."}
             </p>
           </Card>
@@ -264,6 +265,9 @@ function WorkRow({
             : entry.unseen_event_count > 0
               ? ` · ${entry.unseen_event_count} new`
               : " · up to date"}
+        </p>
+        <p className="mt-1 text-xs font-medium text-accent opacity-0 transition group-hover:opacity-100 group-focus-visible:opacity-100">
+          Open Work
         </p>
       </div>
       <ArrowRight className="size-4 shrink-0 text-text-muted transition group-hover:translate-x-0.5 group-hover:text-text" />

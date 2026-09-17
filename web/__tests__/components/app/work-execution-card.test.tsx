@@ -17,7 +17,6 @@ import {
   acquireWorkBranchControlAction,
   loadWorkExecutionAction,
   loadWorkExecutionTargetsAction,
-  observeWorkBranchControlAction,
   observeWorkExecutionSwitchAction,
   retryWorkExecutionSwitchAction,
   switchWorkExecutionAction,
@@ -28,7 +27,6 @@ const refreshMock = vi.fn();
 const acquireControl = vi.mocked(acquireWorkBranchControlAction);
 const loadExecution = vi.mocked(loadWorkExecutionAction);
 const loadTargets = vi.mocked(loadWorkExecutionTargetsAction);
-const observeControl = vi.mocked(observeWorkBranchControlAction);
 const observeExecution = vi.mocked(observeWorkExecutionSwitchAction);
 const switchExecution = vi.mocked(switchWorkExecutionAction);
 const retryExecution = vi.mocked(retryWorkExecutionSwitchAction);
@@ -115,20 +113,10 @@ const controlSucceeded = {
   completed_at: "2026-08-01T00:00:01Z",
 };
 
-const controlPending = {
-  ...controlSucceeded,
-  operation_id: "control-pending",
-  state: "pending" as const,
-  outcome: "pending" as const,
-  control_basis: null,
-  completed_at: null,
-};
-
 beforeEach(() => {
   vi.clearAllMocks();
   loadExecution.mockReset();
   loadExecution.mockResolvedValue({ ok: true, execution });
-  observeControl.mockReset();
   observeExecution.mockReset();
   loadTargets.mockResolvedValue({ ok: true, page: targets });
   acquireControl.mockResolvedValue({
@@ -139,7 +127,7 @@ beforeEach(() => {
   retryExecution.mockResolvedValue({ ok: true, operation: succeeded });
 });
 
-test("hydrates a persisted failed move after a page reload", async () => {
+test("hydrates a persisted failed device change after a page reload", async () => {
   const failed = {
     ...succeeded,
     state: "failed" as const,
@@ -157,7 +145,7 @@ test("hydrates a persisted failed move after a page reload", async () => {
     />,
   );
 
-  expect(await screen.findByRole("button", { name: "Retry move" })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "Try device change again" })).toBeInTheDocument();
   expect(observeExecution).toHaveBeenCalledWith({
     workId: "work-1",
     branchId: "branch-1",
@@ -165,7 +153,7 @@ test("hydrates a persisted failed move after a page reload", async () => {
   });
 });
 
-test("keeps an interrupted switching move recoverable after reload", async () => {
+test("keeps an interrupted device change recoverable after reload", async () => {
   const switching = { ...succeeded, state: "switching" as const };
   observeExecution
     .mockResolvedValueOnce({ ok: true, operation: switching })
@@ -181,12 +169,12 @@ test("keeps an interrupted switching move recoverable after reload", async () =>
     />,
   );
 
-  expect(await screen.findByRole("button", { name: "Resume move" })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "Check device change" })).toBeInTheDocument();
   await waitFor(() => expect(observeExecution).toHaveBeenCalledTimes(2));
-  expect(screen.queryByRole("button", { name: "Resume move" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Check device change" })).not.toBeInTheDocument();
 });
 
-test("acquires controller before retrying a persisted failed move from read-only attachment", async () => {
+test("acquires controller before retrying a persisted failed device change from read-only attachment", async () => {
   const failed = {
     ...succeeded,
     state: "failed" as const,
@@ -204,7 +192,7 @@ test("acquires controller before retrying a persisted failed move from read-only
     />,
   );
 
-  fireEvent.click(await screen.findByRole("button", { name: "Retry move" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Try device change again" }));
   await waitFor(() => expect(acquireControl).toHaveBeenCalledTimes(1));
   await waitFor(() =>
     expect(retryExecution).toHaveBeenCalledWith({
@@ -216,11 +204,11 @@ test("acquires controller before retrying a persisted failed move from read-only
   );
 });
 
-test("waits for controller acquisition before resuming a switching move", async () => {
+test("checks a switching device change without taking control or retrying it", async () => {
   const switching = { ...succeeded, state: "switching" as const };
-  observeExecution.mockResolvedValue({ ok: true, operation: switching });
-  acquireControl.mockResolvedValueOnce({ ok: true, operation: controlPending });
-  observeControl.mockResolvedValueOnce({ ok: true, operation: controlSucceeded });
+  observeExecution
+    .mockResolvedValueOnce({ ok: true, operation: switching })
+    .mockRejectedValue(new Error("check unavailable"));
   render(
     <WorkExecutionCard
       workId="work-1"
@@ -232,16 +220,13 @@ test("waits for controller acquisition before resuming a switching move", async 
     />,
   );
 
-  fireEvent.click(await screen.findByRole("button", { name: "Resume move" }));
-  await waitFor(() => expect(observeControl).toHaveBeenCalledWith({
-    workId: "work-1",
-    branchId: "branch-1",
-    operationId: "control-pending",
-  }));
-  await waitFor(() => expect(retryExecution).toHaveBeenCalledTimes(1));
+  fireEvent.click(await screen.findByRole("button", { name: "Check device change" }));
+  await waitFor(() => expect(observeExecution).toHaveBeenCalledTimes(2));
+  expect(acquireControl).not.toHaveBeenCalled();
+  expect(retryExecution).not.toHaveBeenCalled();
 });
 
-test("does not retry a recovered move when controller acquisition is denied", async () => {
+test("does not retry a recovered device change when controller acquisition is denied", async () => {
   const failed = {
     ...succeeded,
     state: "failed" as const,
@@ -265,12 +250,12 @@ test("does not retry a recovered move when controller acquisition is denied", as
     />,
   );
 
-  fireEvent.click(await screen.findByRole("button", { name: "Retry move" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Try device change again" }));
   await waitFor(() => expect(acquireControl).toHaveBeenCalledTimes(1));
   expect(retryExecution).not.toHaveBeenCalled();
 });
 
-test("refreshes placement and generation after a switching move settles", async () => {
+test("refreshes placement and generation after a device change settles", async () => {
   const moved = {
     ...execution,
     generation: 5,
@@ -295,8 +280,8 @@ test("refreshes placement and generation after a switching move settles", async 
     />,
   );
 
-  await waitFor(() => expect(screen.getByText("Running on Edge · Desktop")).toBeInTheDocument());
-  expect(screen.getByText("Durable generation 5")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText("The next turn runs on this device · Desktop")).toBeInTheDocument());
+  expect(screen.getByText("The next turn runs on this device · Desktop")).toBeInTheDocument();
 });
 
 test("ignores a delayed refresh from a previous branch", async () => {
@@ -336,11 +321,11 @@ test("ignores a delayed refresh from a previous branch", async () => {
     />,
   );
   resolveOld?.({ ok: true, execution: { ...execution, executor_id: "stale-old" } });
-  await waitFor(() => expect(screen.getByText("Running on Edge · Next")).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText("The next turn runs on this device · Next")).toBeInTheDocument());
   expect(screen.queryByText(/stale-old/)).not.toBeInTheDocument();
 });
 
-test("loads owner targets only when the user opens the move picker", async () => {
+test("loads owner targets only when the user opens the device picker", async () => {
   render(
     <WorkExecutionCard
       workId="work-1"
@@ -352,14 +337,43 @@ test("loads owner targets only when the user opens the move picker", async () =>
     />,
   );
 
-  expect(screen.getByText("Running on Edge · Laptop")).toBeInTheDocument();
+  expect(screen.getByText("The next turn runs on this device · Laptop")).toBeInTheDocument();
   expect(loadTargets).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
-  expect(await screen.findByText("Desktop")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
+  expect(await screen.findByRole("button", { name: /Use Desktop next/ })).toBeInTheDocument();
   expect(loadTargets).toHaveBeenCalledWith({ workId: "work-1", branchId: "branch-1" });
 });
 
-test("takes control explicitly before moving and uses the displayed generation", async () => {
+test("keeps the Server default truthful and does not offer an unsupported Edge switch", () => {
+  render(
+    <WorkExecutionCard
+      workId="work-1"
+      branchId="branch-1"
+      initialExecution={{
+        ...execution,
+        initialized: false,
+        placement: "server",
+        executor_id: "server",
+        executor_name: "Astra Server",
+      }}
+      attachment={attachment}
+      branchRevision={4}
+      controlBasis={attachment.control_basis}
+    />,
+  );
+
+  expect(
+    screen.getByText("Astra Server is the default for the next turn · Astra Server"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Changing between Edges is available after a turn/),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Choose device for next turn" })).not.toBeInTheDocument();
+  expect(loadTargets).not.toHaveBeenCalled();
+  expect(acquireControl).not.toHaveBeenCalled();
+});
+
+test("takes control explicitly before changing and uses the displayed generation", async () => {
   render(
     <WorkExecutionCard
       workId="work-1"
@@ -370,7 +384,7 @@ test("takes control explicitly before moving and uses the displayed generation",
       controlBasis={attachment.control_basis}
     />,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
   fireEvent.click(await screen.findByRole("button", { name: /Desktop/i }));
 
   await waitFor(() =>
@@ -387,11 +401,11 @@ test("takes control explicitly before moving and uses the displayed generation",
   expect(acquireControl).toHaveBeenCalledTimes(1);
   expect(refreshMock).toHaveBeenCalled();
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "Choose device for next turn" })).not.toBeDisabled(),
   );
 });
 
-test("keeps a failed durable move retryable without submitting a new target", async () => {
+test("keeps a failed durable device change retryable without submitting a new target", async () => {
   switchExecution.mockResolvedValueOnce({
     ok: true,
     operation: { ...succeeded, state: "failed", completed_generation: 6, failure_code: "edge_attestation_command_failed" },
@@ -406,16 +420,16 @@ test("keeps a failed durable move retryable without submitting a new target", as
       controlBasis={attachment.control_basis}
     />,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
   fireEvent.click(await screen.findByRole("button", { name: /Desktop/i }));
-  expect(await screen.findByRole("button", { name: "Retry move" })).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Retry move" }));
+  expect(await screen.findByRole("button", { name: "Try device change again" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Try device change again" }));
   await waitFor(() => expect(retryExecution).toHaveBeenCalledWith(expect.objectContaining({
     operationId: "switch-1",
     attachmentId: "attachment-1",
   })));
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "Choose device for next turn" })).not.toBeDisabled(),
   );
 });
 
@@ -438,17 +452,17 @@ test("does not leave target loading stuck after a refresh supersedes its request
     />,
   );
 
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
   await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Move to another Edge" })).not.toBeDisabled(),
+    expect(screen.getByRole("button", { name: "Choose device for next turn" })).not.toBeDisabled(),
   );
 
   resolveTargets?.({ ok: true, page: targets });
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
   await waitFor(() => expect(loadTargets).toHaveBeenCalledTimes(2));
-  expect(await screen.findByText("Desktop")).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: /Use Desktop next/ })).toBeInTheDocument();
 });
 
 test("refreshes an empty target directory before reopening the picker", async () => {
@@ -466,11 +480,11 @@ test("refreshes an empty target directory before reopening the picker", async ()
     />,
   );
 
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
-  expect(await screen.findByText(/No other connected Edge is available/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
+  expect(await screen.findByText(/No other connected device is available/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   await waitFor(() => expect(loadExecution).toHaveBeenCalledTimes(1));
-  fireEvent.click(screen.getByRole("button", { name: "Move to another Edge" }));
-  expect(await screen.findByText("Desktop")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Choose device for next turn" }));
+  expect(await screen.findByRole("button", { name: /Use Desktop next/ })).toBeInTheDocument();
   expect(loadTargets).toHaveBeenCalledTimes(2);
 });

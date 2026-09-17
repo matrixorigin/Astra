@@ -22,6 +22,8 @@ import type {
   WorkExecutionTargetV1,
   WorkExecutionTargetPageV1,
   WorkExecutionSwitchOperationV1,
+  WorkRecoveryPointV1,
+  WorkRecoveryPointPageV1,
   WorkBranchControlBasisV1,
   WorkBranchControlOperationV2,
   WorkBranchCreationOperationV1,
@@ -293,6 +295,223 @@ export function decodeWorkExecutionSwitchOperationV1(
   return operation;
 }
 
+function decodeWorkRecoveryPoint(value: unknown, path: string): WorkRecoveryPointV1 {
+  const object = exactObject(
+    value,
+    [
+      "schema_version",
+      "work_id",
+      "branch_id",
+      "recovery_point_id",
+      "request_id",
+      "status",
+      "reason",
+      "created_at",
+      "updated_at",
+      "manifest_hash",
+      "work_revision",
+      "branch_revision",
+      "graph_revision",
+      "goal_revision",
+      "criteria_set_revision",
+      "session_cursor",
+      "execution",
+      "coverage",
+      "capabilities",
+    ],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  const sessionCursor = exactObject(
+    object.session_cursor,
+    [
+      "completed_turn",
+      "journal_event_seq",
+      "conversation_seq",
+      "canonical_root_hash",
+      "compaction_generation",
+    ],
+    `${path}.session_cursor`,
+  );
+  const execution = exactObject(
+    object.execution,
+    ["placement", "executor_id", "binding_generation"],
+    `${path}.execution`,
+  );
+  const coverage = exactObject(
+    object.coverage,
+    ["session_state", "work_state", "workspace", "run_frontier", "artifacts"],
+    `${path}.coverage`,
+  );
+  const capabilities = exactObject(
+    object.capabilities,
+    [
+      "can_restore_conversation",
+      "can_continue_in_original_environment",
+      "has_portable_workspace",
+      "requires_target_environment_check",
+      "requires_effect_review",
+    ],
+    `${path}.capabilities`,
+  );
+  return {
+    schema_version: 1,
+    work_id: resourceIdentity(object.work_id, `${path}.work_id`),
+    branch_id: resourceIdentity(object.branch_id, `${path}.branch_id`),
+    recovery_point_id: opaqueIdentity(object.recovery_point_id, `${path}.recovery_point_id`),
+    request_id: opaqueIdentity(object.request_id, `${path}.request_id`),
+    status: oneOf(
+      object.status,
+      ["preparing", "captured", "ready", "failed", "aborted"] as const,
+      `${path}.status`,
+    ),
+    reason: oneOf(
+      object.reason,
+      ["user_requested", "before_environment_change", "run_settled", "safe_boundary"] as const,
+      `${path}.reason`,
+    ),
+    created_at: timestamp(object.created_at, `${path}.created_at`),
+    updated_at: timestamp(object.updated_at, `${path}.updated_at`),
+    manifest_hash: contentHash(object.manifest_hash, `${path}.manifest_hash`),
+    work_revision: positiveRevision(object.work_revision, `${path}.work_revision`),
+    branch_revision: positiveRevision(object.branch_revision, `${path}.branch_revision`),
+    graph_revision: positiveRevision(object.graph_revision, `${path}.graph_revision`),
+    goal_revision: positiveRevision(object.goal_revision, `${path}.goal_revision`),
+    criteria_set_revision: positiveRevision(
+      object.criteria_set_revision,
+      `${path}.criteria_set_revision`,
+    ),
+    session_cursor: {
+      completed_turn: boundedCount(
+        sessionCursor.completed_turn,
+        Number.MAX_SAFE_INTEGER,
+        `${path}.session_cursor.completed_turn`,
+      ),
+      journal_event_seq: safeIntegerAtLeast(
+        sessionCursor.journal_event_seq,
+        0,
+        `${path}.session_cursor.journal_event_seq`,
+      ),
+      conversation_seq: safeIntegerAtLeast(
+        sessionCursor.conversation_seq,
+        0,
+        `${path}.session_cursor.conversation_seq`,
+      ),
+      canonical_root_hash: conversationRootHash(
+        sessionCursor.canonical_root_hash,
+        `${path}.session_cursor.canonical_root_hash`,
+      ),
+      compaction_generation: safeIntegerAtLeast(
+        sessionCursor.compaction_generation,
+        0,
+        `${path}.session_cursor.compaction_generation`,
+      ),
+    },
+    execution: {
+      placement: oneOf(
+        execution.placement,
+        ["server", "edge"] as const,
+        `${path}.execution.placement`,
+      ),
+      executor_id: opaqueIdentity(execution.executor_id, `${path}.execution.executor_id`),
+      binding_generation: positiveRevision(
+        execution.binding_generation,
+        `${path}.execution.binding_generation`,
+      ),
+    },
+    coverage: {
+      session_state: booleanValue(coverage.session_state, `${path}.coverage.session_state`),
+      work_state: booleanValue(coverage.work_state, `${path}.coverage.work_state`),
+      workspace: booleanValue(coverage.workspace, `${path}.coverage.workspace`),
+      run_frontier: booleanValue(coverage.run_frontier, `${path}.coverage.run_frontier`),
+      artifacts: booleanValue(coverage.artifacts, `${path}.coverage.artifacts`),
+    },
+    capabilities: {
+      can_restore_conversation: booleanValue(
+        capabilities.can_restore_conversation,
+        `${path}.capabilities.can_restore_conversation`,
+      ),
+      can_continue_in_original_environment: booleanValue(
+        capabilities.can_continue_in_original_environment,
+        `${path}.capabilities.can_continue_in_original_environment`,
+      ),
+      has_portable_workspace: booleanValue(
+        capabilities.has_portable_workspace,
+        `${path}.capabilities.has_portable_workspace`,
+      ),
+      requires_target_environment_check: booleanValue(
+        capabilities.requires_target_environment_check,
+        `${path}.capabilities.requires_target_environment_check`,
+      ),
+      requires_effect_review: booleanValue(
+        capabilities.requires_effect_review,
+        `${path}.capabilities.requires_effect_review`,
+      ),
+    },
+  };
+}
+
+export function decodeWorkRecoveryPointV1(value: unknown): WorkRecoveryPointV1 {
+  return decodeWorkRecoveryPoint(value, "work_recovery_point");
+}
+
+export function decodeWorkRecoveryPointPageV1(value: unknown): WorkRecoveryPointPageV1 {
+  const path = "work_recovery_point_page";
+  const object = exactObject(
+    value,
+    ["schema_version", "work_id", "branch_id", "points", "next_cursor"],
+    path,
+  );
+  if (object.schema_version !== 1) {
+    throw new TypeError(`${path}.schema_version must be 1`);
+  }
+  if (!Array.isArray(object.points) || object.points.length > 256) {
+    throw new TypeError(`${path}.points must contain at most 256 entries`);
+  }
+  const points = object.points.map((point, index) =>
+    decodeWorkRecoveryPoint(point, `${path}.points[${index}]`),
+  );
+  const pointIds = new Set<string>();
+  for (const point of points) {
+    if (point.work_id !== resourceIdentity(object.work_id, `${path}.work_id`)) {
+      throw new TypeError(`${path}.points contain a different Work identity`);
+    }
+    if (point.branch_id !== resourceIdentity(object.branch_id, `${path}.branch_id`)) {
+      throw new TypeError(`${path}.points contain a different branch identity`);
+    }
+    if (pointIds.has(point.recovery_point_id)) {
+      throw new TypeError(`${path}.points contain a duplicate recovery point`);
+    }
+    pointIds.add(point.recovery_point_id);
+  }
+  const workId = resourceIdentity(object.work_id, `${path}.work_id`);
+  const branchId = resourceIdentity(object.branch_id, `${path}.branch_id`);
+  let nextCursor: WorkRecoveryPointPageV1["next_cursor"] = null;
+  if (object.next_cursor !== null) {
+    const cursor = exactObject(
+      object.next_cursor,
+      ["created_at", "recovery_point_id"],
+      `${path}.next_cursor`,
+    );
+    nextCursor = {
+      created_at: timestamp(cursor.created_at, `${path}.next_cursor.created_at`),
+      recovery_point_id: opaqueIdentity(
+        cursor.recovery_point_id,
+        `${path}.next_cursor.recovery_point_id`,
+      ),
+    };
+  }
+  return {
+    schema_version: 1,
+    work_id: workId,
+    branch_id: branchId,
+    points,
+    next_cursor: nextCursor,
+  };
+}
+
 type WireObject = Record<string, unknown>;
 
 function exactObject(
@@ -390,6 +609,14 @@ function contentHash(value: unknown, path: string): WorkContentHash {
     throw new TypeError(`${path} must be a canonical SHA-256 content hash`);
   }
   return parsed as WorkContentHash;
+}
+
+function conversationRootHash(value: unknown, path: string): string {
+  const parsed = nonEmptyString(value, path);
+  if (!/^[0-9a-f]{64}$/u.test(parsed)) {
+    throw new TypeError(`${path} must be a canonical conversation root hash`);
+  }
+  return parsed;
 }
 
 function timestamp(value: unknown, path: string): string {
@@ -1131,6 +1358,7 @@ const EVENT_KINDS = [
   "run_delegated",
   "run_failed",
   "run_cancelled",
+  "recovery_point_captured",
   "runtime_events_expired",
 ] as const satisfies readonly WorkEventKind[];
 

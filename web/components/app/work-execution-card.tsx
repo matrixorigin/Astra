@@ -26,32 +26,34 @@ import { cn } from "@/lib/utils/cn";
 const OPERATION_POLL_DELAYS_MS = [350, 700, 1_200, 2_000, 3_000, 3_000] as const;
 
 function executionStateLabel(execution: WorkExecutionViewV1): string {
-  if (execution.state === "switching") return "Moving between devices";
-  if (execution.state === "needs_attention") return "Needs attention";
-  if (!execution.initialized) return "Ready to choose a provider";
-  return execution.placement === "edge" ? "Running on Edge" : "Running on Server";
+  if (execution.state === "switching") return "Preparing a device change";
+  if (execution.state === "needs_attention") return "Device change needs your attention";
+  if (!execution.initialized) return "Astra Server is the default for the next turn";
+  return execution.placement === "edge"
+    ? "The next turn runs on this device"
+    : "The next turn runs on Astra Server";
 }
 
 function operationStateLabel(operation: WorkExecutionSwitchOperationV1): string {
-  if (operation.state === "switching") return "Checking both workspaces…";
-  if (operation.state === "succeeded") return "Move confirmed";
-  return "Move needs another try";
+  if (operation.state === "switching") return "Checking the current and new device…";
+  if (operation.state === "succeeded") return "The next turn will use the new device";
+  return "The device change needs another try";
 }
 
 function actionErrorMessage(code: string): string {
   switch (code) {
     case "controller_attachment_required":
-      return "Take control of this Work here before moving its execution.";
+      return "Take control of this Work here before choosing another device.";
     case "execution_switch_conflict":
     case "execution_binding_fenced":
-      return "This Work advanced elsewhere. Refresh its current execution before trying again.";
+      return "This Work changed elsewhere. Refresh to see the device that owns the next turn.";
     case "source_workspace_dirty":
     case "workspace_revision_mismatch":
-      return "Both devices must show the same clean Git revision before the move can start.";
+      return "The two devices do not have the same clean workspace. Sync them, then try again.";
     case "target_edge_unavailable":
-      return "That Edge is no longer available. Refresh the target list and choose another.";
+      return "That device is no longer available. Refresh the list and choose another.";
     default:
-      return "The durable move was not confirmed. Its current state is still safe to check.";
+      return "The device change was not confirmed. Nothing was lost; refresh to see its current state.";
   }
 }
 
@@ -156,14 +158,14 @@ export function WorkExecutionCard({
         );
         if (!mounted.current || operationGeneration.current !== generation) return;
         if (settled === null) {
-          setError("The move is still recorded. Check again to see its durable result.");
+          setError("The device change is still recorded. Check again to see which device owns the next turn.");
         } else if (settled.state === "failed") {
           setError(actionErrorMessage(settled.failure_code ?? "execution_switch_failed"));
         }
         if (settled) await loadExecutionState(generation, false);
       } catch {
         if (mounted.current && operationGeneration.current === generation) {
-          setError("The durable move could not be checked yet. Refresh to try again.");
+          setError("The device change could not be checked yet. Refresh to try again.");
         }
       }
     },
@@ -221,6 +223,12 @@ export function WorkExecutionCard({
       setTargetsOpen(false);
       return;
     }
+    if (!execution?.initialized || execution.placement !== "edge") {
+      setError(
+        "This Work is scheduled on Astra Server. Continue here, or start it on an Edge before choosing another Edge.",
+      );
+      return;
+    }
     setTargetsOpen(true);
     if (targets || targetsLoading) return;
     const generation = operationGeneration.current;
@@ -236,7 +244,7 @@ export function WorkExecutionCard({
       setTargets(result.page);
     } catch {
       if (mounted.current && operationGeneration.current === generation) {
-        setError("Edge targets could not be loaded. Try again when the device is online.");
+        setError("Connected devices could not be loaded. Try again when a device is online.");
       }
     } finally {
       if (mounted.current && operationGeneration.current === generation) setTargetsLoading(false);
@@ -248,7 +256,7 @@ export function WorkExecutionCard({
     if (controllerReady) return true;
     if (!isCurrent()) return false;
     if (!attachment?.attachment_id || branchRevision === undefined || !controlBasis) {
-      setError("Take control of this Work here before moving its execution.");
+      setError("Take control of this Work here before changing its next-turn device.");
       return false;
     }
     const currentRequestId =
@@ -318,6 +326,8 @@ export function WorkExecutionCard({
       busy ||
       !execution ||
       execution.state !== "ready" ||
+      !execution.initialized ||
+      execution.placement !== "edge" ||
       execution.executor_id === executorId ||
       !attachment?.attachment_id
     ) {
@@ -358,7 +368,7 @@ export function WorkExecutionCard({
         );
         if (!mounted.current || operationGeneration.current !== generation) return;
         if (settled === null) {
-          setError("The move is still recorded. Check again to see its durable result.");
+          setError("The device change is still recorded. Check again to see which device owns the next turn.");
           return;
         }
         if (settled.state === "failed") {
@@ -376,7 +386,7 @@ export function WorkExecutionCard({
       if (mounted.current) router.refresh();
     } catch {
       if (mounted.current && operationGeneration.current === generation) {
-        setError("The move could not be confirmed. Its durable state is safe to check again.");
+        setError("The device change could not be confirmed. Its state is safe to check again.");
       }
     } finally {
       if (mounted.current && operationGeneration.current === generation) setBusy(false);
@@ -387,7 +397,7 @@ export function WorkExecutionCard({
     if (
       busy ||
       !operation ||
-      (operation.state !== "failed" && operation.state !== "switching") ||
+      operation.state !== "failed" ||
       !attachment?.attachment_id
     )
       return;
@@ -420,7 +430,7 @@ export function WorkExecutionCard({
         );
         if (!mounted.current || operationGeneration.current !== generation) return;
         if (!settled || settled.state !== "succeeded") {
-          setError("The retry is still recorded. Check again to see its durable result.");
+          setError("The retry is still recorded. Check again to see its result.");
           return;
         }
       } else if (result.operation.state !== "succeeded") {
@@ -434,7 +444,48 @@ export function WorkExecutionCard({
       if (mounted.current) router.refresh();
     } catch {
       if (mounted.current && operationGeneration.current === generation) {
-        setError("The retry could not be confirmed. The previous durable result remains available.");
+        setError("The retry could not be confirmed. The previous result remains available.");
+      }
+    } finally {
+      if (mounted.current && operationGeneration.current === generation) setBusy(false);
+    }
+  }
+
+  // Observing a pending operation is read-only. In particular, this path
+  // must not acquire controller authority or call the retry mutation; users
+  // should be able to check a device change safely from any browser.
+  async function checkSwitch() {
+    if (busy || !operation || operation.state !== "switching") return;
+    const generation = operationGeneration.current + 1;
+    operationGeneration.current = generation;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await observeWorkExecutionSwitchAction({
+        workId,
+        branchId,
+        operationId: operation.operation_id,
+      });
+      if (!mounted.current || operationGeneration.current !== generation) return;
+      if (!result.ok) {
+        setError(actionErrorMessage(result.code ?? "execution_switch_unavailable"));
+        return;
+      }
+      setOperation(result.operation);
+      if (result.operation.state === "failed") {
+        setError(
+          actionErrorMessage(result.operation.failure_code ?? "execution_switch_failed"),
+        );
+      } else if (result.operation.state === "succeeded") {
+        setOperation(null);
+        await refreshExecution(generation);
+        if (mounted.current) router.refresh();
+      } else {
+        setError("The device change is still in progress. Check again shortly.");
+      }
+    } catch {
+      if (mounted.current && operationGeneration.current === generation) {
+        setError("The device change is still recorded. Check again when the target is online.");
       }
     } finally {
       if (mounted.current && operationGeneration.current === generation) setBusy(false);
@@ -452,17 +503,15 @@ export function WorkExecutionCard({
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <Monitor className="size-4 text-accent" aria-hidden="true" />
-            <p className="text-sm font-semibold text-text">Where this Work runs</p>
+            <p className="text-sm font-semibold text-text">Next turn device</p>
           </div>
           <p className="mt-1 text-xs leading-5 text-text-muted">
-            {execution ? `${executionStateLabel(execution)} · ${currentExecutor}` : "Loading the current execution…"}
+            {execution ? `${executionStateLabel(execution)} · ${currentExecutor}` : "Checking the current device…"}
           </p>
           {execution ? (
-            <p className="mt-1 text-[11px] tabular-nums text-text-muted">
-              Durable generation {execution.generation}
-              {execution.state === "needs_attention" && execution.failure_code
-                ? ` · ${execution.failure_code}`
-                : ""}
+            <p className="mt-1 max-w-xl text-[11px] leading-5 text-text-muted">
+              Choosing another device affects the next Work turn. A turn already
+              running keeps its current device and workspace.
             </p>
           ) : null}
         </div>
@@ -471,9 +520,9 @@ export function WorkExecutionCard({
             <RefreshCw className={cn("size-3.5", refreshing && "animate-spin")} aria-hidden="true" />
             Refresh
           </Button>
-          {execution?.state === "ready" ? (
+          {execution?.state === "ready" && execution.initialized && execution.placement === "edge" ? (
             <Button size="sm" variant="secondary" onClick={() => void openTargets()} disabled={busy || targetsLoading}>
-              {targetsLoading ? "Loading…" : targetsOpen ? "Hide Edges" : "Move to another Edge"}
+              {targetsLoading ? "Checking devices…" : targetsOpen ? "Close device list" : "Choose device for next turn"}
             </Button>
           ) : null}
         </div>
@@ -489,49 +538,75 @@ export function WorkExecutionCard({
             <div className="mt-3 flex flex-wrap items-center gap-2">
               {operation.state === "failed" ? (
                 <span className="text-danger">
-                  {operation.failure_code ?? "workspace checks did not match"}
+                  {actionErrorMessage(operation.failure_code ?? "execution_switch_failed")}
                 </span>
               ) : (
                 <span className="text-text-muted">
-                  If the other device disconnected, resume the recorded move here.
+                  You can leave this page. The recorded device change can be checked again later.
                 </span>
               )}
-              <Button size="sm" onClick={() => void retryMove()} disabled={busy}>
-                {busy ? "Retrying…" : operation.state === "switching" ? "Resume move" : "Retry move"}
+              <Button
+                size="sm"
+                onClick={() =>
+                  void (operation.state === "switching" ? checkSwitch() : retryMove())
+                }
+                disabled={busy}
+              >
+                {busy
+                  ? operation.state === "switching"
+                    ? "Checking…"
+                    : "Trying again…"
+                  : operation.state === "switching"
+                    ? "Check device change"
+                    : "Try device change again"}
               </Button>
             </div>
           ) : null}
         </div>
       ) : null}
 
+      {execution?.state === "ready" &&
+      (!execution.initialized || execution.placement === "server") ? (
+        <p className="rounded-control bg-surface-muted px-3 py-2 text-xs leading-5 text-text-secondary">
+          This Work will continue on Astra Server. Changing between Edges is
+          available after a turn has been run on a verified Edge workspace.
+        </p>
+      ) : null}
+
       {targetsOpen ? (
         <div className="border-t border-border/70 pt-3">
           {availableTargets.length > 0 ? (
-            <ul className="grid gap-2 sm:grid-cols-2" aria-label="Connected Edge targets">
-              {availableTargets.map((target) => (
-                <li key={target.executor_id}>
-                  <button
-                    type="button"
-                    className="flex w-full items-center justify-between gap-3 rounded-control border border-border bg-surface px-3 py-2 text-left transition hover:border-accent disabled:cursor-not-allowed disabled:opacity-60"
-                    onClick={() => void moveTo(target.executor_id)}
-                    disabled={busy}
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium text-text">
-                        {target.display_name || target.executor_id}
+            <>
+              <div className="mb-3 rounded-control bg-surface-muted px-3 py-2 text-xs leading-5 text-text-secondary">
+                Current device: <span className="font-medium text-text">{currentExecutor}</span>.
+                Select a connected device below for the next turn.
+              </div>
+              <ul className="grid gap-2 sm:grid-cols-2" aria-label="Connected devices">
+                {availableTargets.map((target) => (
+                  <li key={target.executor_id}>
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between gap-3 rounded-control border border-border bg-surface px-3 py-2 text-left transition hover:border-accent disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => void moveTo(target.executor_id)}
+                      disabled={busy}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium text-text">
+                          Use {target.display_name || target.executor_id} next
+                        </span>
+                        <span className="block truncate text-xs text-text-muted">
+                          {target.hostname || target.executor_id} · workspace verified before switch
+                        </span>
                       </span>
-                      <span className="block truncate text-xs text-text-muted">
-                        {target.hostname || target.executor_id}
-                      </span>
-                    </span>
-                    <ArrowRight className="size-4 shrink-0 text-accent" aria-hidden="true" />
-                  </button>
-                </li>
-              ))}
-            </ul>
+                      <ArrowRight className="size-4 shrink-0 text-accent" aria-hidden="true" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
           ) : (
             <p className="text-xs leading-5 text-text-muted">
-              No other connected Edge is available for this owner right now. Keep this page open and refresh when the other device comes online.
+              No other connected device is available right now. Keep this page open and refresh when the other device comes online.
             </p>
           )}
         </div>
@@ -546,7 +621,7 @@ export function WorkExecutionCard({
 
       {execution?.state === "needs_attention" && !error ? (
         <p className="text-xs leading-5 text-warning">
-          The last move did not settle cleanly. Review its durable operation before trying another move.
+          The last device change did not settle cleanly. Check its recorded result before trying again.
         </p>
       ) : null}
     </Card>

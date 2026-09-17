@@ -649,9 +649,9 @@ impl BottomPane {
         locally_owned
     }
 
-    /// Accept a message for the next turn once the current answer is visible.
-    /// The event loop transfers this FIFO lane to its ordinary submit path as
-    /// soon as the current canonical turn boundary is committed.
+    /// Accept a message for the next safe conversational turn. The event loop
+    /// transfers this FIFO lane to its ordinary submit path once the current
+    /// run or Session lifecycle action has reached a safe boundary.
     pub fn queue_next_turn_submission(&mut self, text: String) -> bool {
         if text.trim().is_empty() {
             return false;
@@ -1596,6 +1596,22 @@ impl BottomPane {
         if let Some(a) = self.handle_ctrl_keys(key) {
             return a;
         }
+        // A slash is an explicit command-palette gesture. Let it reclaim
+        // focus from a completed picker (for example `/work`'s catalog) so a
+        // user can immediately type `/model` or any other command without
+        // first guessing which close key the overlay expects. The picker is
+        // already a read-only action; closing it does not mutate Work.
+        if matches!(key.code, KeyCode::Char('/'))
+            && key.modifiers.is_empty()
+            && self
+                .active_view()
+                .is_some_and(|view| view.slash_reclaims_focus())
+        {
+            self.pop_active_view();
+            self.composer.set_text("/");
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
+        }
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }
@@ -2241,7 +2257,7 @@ impl BottomPane {
         Widget::render(
             Line::from(Span::styled(
                 truncate_display(
-                    "Next message queued · starts after this reply is committed",
+                    "Message queued · starts when the current action is ready",
                     area.width as usize,
                 ),
                 title_style,

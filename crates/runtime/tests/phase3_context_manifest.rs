@@ -31,6 +31,18 @@ async fn setup_pool() -> astra_core::SharedPool {
         .expect("SharedPool::new")
 }
 
+async fn ensure_test_session(pool: &astra_core::SharedPool, user_id: &str, session_id: &str) {
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+         VALUES (?, ?, 'phase3 context manifest test', 'active', 0)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(pool.get())
+    .await
+    .expect("create active test session");
+}
+
 fn manifest(user_id: &str, session_id: &str, run_id: &str, reason: &str) -> ContextManifestWrite {
     ContextManifestWrite {
         manifest_id: format!("manifest-{}", Uuid::new_v4()),
@@ -80,6 +92,7 @@ async fn l2_19_manifest_items_persist_included_and_dropped_entries() {
     let user_id = format!("user-{suffix}");
     let manifest = manifest(&user_id, &session_id, &run_id, "normal_turn");
     let manifest_id = manifest.manifest_id.clone();
+    ensure_test_session(&pool, &user_id, &session_id).await;
     store
         .save_manifest(
             manifest,
@@ -482,6 +495,7 @@ async fn l3_8_s14_small_window_ambiguity_stays_under_budget_and_asks_user() {
     let user_id = format!("user-{suffix}");
     let budget = BudgetV1_8k::standard();
     assert!(budget.input_context_cap() <= 7300);
+    ensure_test_session(&pool, &user_id, &session_id).await;
 
     let mut m = manifest(&user_id, &session_id, &run_id, "ambiguity_clarification");
     m.total_estimated_tokens = 7_200;
@@ -664,6 +678,7 @@ async fn l3_10_s01_second_compaction_records_post_compaction_drop_count() {
     let session_id = format!("session-{suffix}");
     let run_id = format!("run-{suffix}");
     let user_id = format!("user-{suffix}");
+    ensure_test_session(&pool, &user_id, &session_id).await;
     let mut messages = vec![
         json!({"role": "system", "content": "You are Astra."}),
         json!({"role": "tool", "content": "old verbose search output ".repeat(6000)}),

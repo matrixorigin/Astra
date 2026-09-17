@@ -711,6 +711,15 @@ impl DatabaseWorkBranchDeletionService {
         if renewed.rows_affected() != 1 {
             return Err(WorkBranchDeletionError::ExecutorConflict);
         }
+        self.release_branch_recovery_points_for_session_cleanup(
+            owner_id,
+            work_id,
+            branch_id,
+            operation_id,
+            executor_token,
+            admission.session_id.as_str(),
+        )
+        .await?;
         let session_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM agent_sessions WHERE user_id = ? AND session_id = ?
@@ -797,6 +806,119 @@ impl DatabaseWorkBranchDeletionService {
             .await
             .map_err(|source| database_error("commit branch session cleanup", source))?;
         Ok(operation)
+    }
+
+    /// A branch deletion is the one authorized Work-management operation that
+    /// may release saved progress before removing its provenance Session. The
+    /// release is durable and idempotent: if the executor crashes after this
+    /// commit, the session delete can retry without leaving the guard stuck.
+    /// Ordinary Session deletion never calls this path and remains protected
+    /// while a recovery point is retained.
+    async fn release_branch_recovery_points_for_session_cleanup(
+        &self,
+        owner_id: &WorkOwnerId,
+        work_id: &WorkId,
+        branch_id: &WorkBranchId,
+        operation_id: &str,
+        executor_token: &str,
+        session_id: &str,
+    ) -> Result<(), WorkBranchDeletionError> {
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin branch recovery-point release", source))?;
+        // Keep deletion-operation ownership as the first lock, matching every
+        // other recovery phase. The branch row is locked only after the
+        // operation proves this executor still owns the phase lease.
+        let operation = sqlx::query(
+            "SELECT * FROM work_branch_deletion_operations
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND operation_id = ?
+             FOR UPDATE",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock branch recovery-point release", source))?
+        .ok_or(WorkBranchDeletionError::OperationNotFound)?;
+        let admission = decode_admission(&operation)?;
+        if admission.operation.state != WorkBranchDeletionState::Pending
+            || admission.operation.phase != WorkBranchDeletionPhase::SessionCleanup
+        {
+            tx.commit().await.map_err(|source| {
+                database_error("commit replayed recovery-point release", source)
+            })?;
+            return Ok(());
+        }
+        verify_executor(&operation, executor_token)?;
+
+        let branch_session = sqlx::query_scalar::<_, String>(
+            "SELECT session_id FROM work_branches
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+             FOR UPDATE",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock branch recovery-point owner", source))?
+        .ok_or_else(|| {
+            WorkBranchDeletionError::NeedsRepair(
+                "branch disappeared before saved progress could be released".into(),
+            )
+        })?;
+        if branch_session != session_id {
+            return Err(WorkBranchDeletionError::NeedsRepair(
+                "branch recovery-point Session identity changed during deletion".into(),
+            ));
+        }
+
+        let recovery_point_ids = sqlx::query_scalar::<_, String>(
+            "SELECT recovery_point_id FROM work_recovery_points
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+             ORDER BY created_at ASC, recovery_point_id ASC
+             FOR UPDATE",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock branch recovery points", source))?;
+        for recovery_point_id in recovery_point_ids {
+            sqlx::query(
+                "DELETE FROM session_artifact_references
+                 WHERE user_id = ? AND session_id = ?
+                   AND reference_kind = 'recovery_point' AND reference_id = ?",
+            )
+            .bind(owner_id.as_str())
+            .bind(session_id)
+            .bind(&recovery_point_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| {
+                database_error("release recovery-point artifact reference", source)
+            })?;
+        }
+        sqlx::query(
+            "DELETE FROM work_recovery_points
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+        )
+        .bind(owner_id.as_str())
+        .bind(work_id.as_str())
+        .bind(branch_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("release branch recovery points", source))?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit branch recovery-point release", source))?;
+        Ok(())
     }
 
     /// Proves that every retained lineage object is still owned by a valid
@@ -1106,6 +1228,11 @@ impl DatabaseWorkBranchDeletionService {
             (
                 "delete branch control operations",
                 "DELETE FROM work_branch_control_operations
+                 WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+            ),
+            (
+                "delete branch recovery points",
+                "DELETE FROM work_recovery_points
                  WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
             ),
         ] {

@@ -4558,6 +4558,44 @@ async fn lock_database_state_at_now(
     Ok((state, now))
 }
 
+/// Facts needed by a Work recovery capture while the canonical Session row is
+/// locked.  Recovery publication must use this seam instead of calling the
+/// ordinary read-only `load_head`: the latter opens its own pool connection
+/// and would leave a race between verification and the recovery-row update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryContextFactsV1 {
+    pub(crate) head: SessionContextHeadV1,
+    pub(crate) execution_binding: Option<SessionExecutionBindingV1>,
+    pub(crate) has_active_reservation: bool,
+    pub(crate) has_unresolved_invocations: bool,
+}
+
+pub(crate) async fn lock_recovery_context_in_transaction(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<RecoveryContextFactsV1, SessionContextCoordinatorError> {
+    key.validate()
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+    let (state, now) = lock_database_state_at_now(tx, key).await?;
+    let head = state.head.ok_or_else(|| {
+        SessionContextCoordinatorError::NeedsRepair(
+            "context head is missing for recovery capture".into(),
+        )
+    })?;
+    let has_active_reservation = state
+        .active_reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.expires_at_unix_ms > now);
+    let has_unresolved_invocations = unresolved_session_invocation_exists(tx, key).await?;
+    let execution_binding = load_execution_binding_in_tx(tx, key, true).await?;
+    Ok(RecoveryContextFactsV1 {
+        head,
+        execution_binding,
+        has_active_reservation,
+        has_unresolved_invocations,
+    })
+}
+
 async fn load_execution_binding_in_tx(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,

@@ -15,6 +15,7 @@ pub struct ArtifactRetentionSweepOutcome {
     pub referenced_retained: usize,
     pub extended: usize,
     pub expired: usize,
+    pub content_chunks_deleted: u64,
     pub backlog_overflow_warning: bool,
 }
 
@@ -162,7 +163,89 @@ pub async fn run_artifact_retention_gc_once(
     if let Some(error) = first_apply_error {
         return Err(error);
     }
+    outcome.content_chunks_deleted =
+        reap_unreferenced_content_chunks(&pool, effective_limit).await?;
     Ok(outcome)
+}
+
+async fn reap_unreferenced_content_chunks(
+    pool: &SharedPool,
+    limit: u32,
+) -> Result<u64, sqlx::Error> {
+    // Uploads have one authoritative lease per artifact. Lock leases, then
+    // their catalog rows and temporary chunk edges in that order before
+    // collecting bytes. Put and seal use the same order, so an expired-GC
+    // pass cannot form a row-lock cycle with an upload that is renewing.
+    let mut tx = pool.get().begin().await?;
+    let expired_leases = sqlx::query(
+        "SELECT user_id, session_id, artifact_id
+         FROM session_artifact_content_upload_leases
+         WHERE expires_at <= NOW(6)
+         ORDER BY user_id ASC, session_id ASC, artifact_id ASC
+         LIMIT ?
+         FOR UPDATE",
+    )
+    .bind(i64::from(limit.max(1)))
+    .fetch_all(&mut *tx)
+    .await?;
+    for lease in expired_leases {
+        let user_id: String = lease.try_get("user_id")?;
+        let session_id: String = lease.try_get("session_id")?;
+        let artifact_id: String = lease.try_get("artifact_id")?;
+        // Serialize with byte puts/seals after the lease lock. The artifact
+        // may already have been deleted by Session cleanup; the lease and
+        // edges are still safe to remove in that case.
+        let _ = sqlx::query(
+            "SELECT 1 FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+             FOR UPDATE",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_reservations
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_upload_leases
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&artifact_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM session_artifact_content_chunks
+         WHERE created_at <= DATE_SUB(NOW(6), INTERVAL 1 DAY)
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_content_refs refs
+               WHERE refs.user_id = session_artifact_content_chunks.user_id
+                 AND refs.content_digest = session_artifact_content_chunks.content_digest
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_content_reservations reservations
+               WHERE reservations.user_id = session_artifact_content_chunks.user_id
+                 AND reservations.content_digest = session_artifact_content_chunks.content_digest
+           )
+         ORDER BY user_id ASC, updated_at ASC, content_digest ASC
+         LIMIT ?",
+    )
+    .bind(i64::from(limit.max(1)))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 async fn record_artifact_retention_backlog_warning(
@@ -289,6 +372,21 @@ async fn apply_artifact_retention_policy(
         return Ok(ArtifactRetentionAction::ReferencedRetained);
     }
 
+    let mut expiration_tx = pool.get().begin().await?;
+    // Byte upload paths acquire the optional artifact lease before the
+    // catalog row. Retention expiry must take the same order so a server
+    // running the sweeper cannot deadlock with a concurrent put or seal.
+    let _upload_lease = sqlx::query(
+        "SELECT expires_at
+         FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         FOR UPDATE",
+    )
+    .bind(&artifact.user_id)
+    .bind(&artifact.session_id)
+    .bind(&artifact.artifact_id)
+    .fetch_optional(&mut *expiration_tx)
+    .await?;
     let expired_rows = sqlx::query(
         "UPDATE session_artifacts
          SET status = 'expired',
@@ -313,12 +411,41 @@ async fn apply_artifact_retention_policy(
     .bind(&artifact.user_id)
     .bind(&artifact.session_id)
     .bind(&artifact.artifact_id)
-    .execute(pool.get())
+    .execute(&mut *expiration_tx)
     .await?
     .rows_affected();
     if expired_rows > 0 {
+        sqlx::query(
+            "DELETE FROM session_artifact_content_refs
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_reservations
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_artifact_content_upload_leases
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&artifact.user_id)
+        .bind(&artifact.session_id)
+        .bind(&artifact.artifact_id)
+        .execute(&mut *expiration_tx)
+        .await?;
+        expiration_tx.commit().await?;
         return Ok(ArtifactRetentionAction::Expired);
     }
+    expiration_tx.commit().await?;
 
     let marked_rows = sqlx::query(
         "UPDATE session_artifacts

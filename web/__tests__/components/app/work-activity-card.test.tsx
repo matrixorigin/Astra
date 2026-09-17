@@ -105,3 +105,25 @@ test("does not write a read cursor when there is no unseen activity", () => {
   expect(container).toBeEmptyDOMElement();
   expect(markSeen).not.toHaveBeenCalled();
 });
+
+test("keeps a newly observed update visible after the read cursor is acknowledged", async () => {
+  const { rerender } = render(
+    <WorkActivityCard workId="work-1" activity={activity} />,
+  );
+
+  await waitFor(() =>
+    expect(markSeen).toHaveBeenCalledWith({
+      workId: "work-1",
+      throughEventSeq: 4,
+    }),
+  );
+  rerender(
+    <WorkActivityCard
+      workId="work-1"
+      activity={{ ...activity, unseenCount: 0, events: [] }}
+    />,
+  );
+
+  expect(screen.getByText("Recent activity")).toBeInTheDocument();
+  expect(screen.getByText("The latest run stopped with an error")).toBeInTheDocument();
+});

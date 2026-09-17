@@ -52,6 +52,7 @@ pub enum WorkEventKind {
     RunDelegated,
     RunFailed,
     RunCancelled,
+    RecoveryPointCaptured,
     RuntimeEventsExpired,
 }
 
@@ -77,6 +78,7 @@ impl WorkEventKind {
             Self::RunDelegated => "run_delegated",
             Self::RunFailed => "run_failed",
             Self::RunCancelled => "run_cancelled",
+            Self::RecoveryPointCaptured => "recovery_point_captured",
             Self::RuntimeEventsExpired => "runtime_events_expired",
         }
     }
@@ -102,6 +104,7 @@ impl WorkEventKind {
             "run_delegated" => Some(Self::RunDelegated),
             "run_failed" => Some(Self::RunFailed),
             "run_cancelled" => Some(Self::RunCancelled),
+            "recovery_point_captured" => Some(Self::RecoveryPointCaptured),
             "runtime_events_expired" => Some(Self::RuntimeEventsExpired),
             _ => None,
         }

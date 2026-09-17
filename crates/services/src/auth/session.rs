@@ -600,6 +600,13 @@ impl DatabaseSessionService {
                 }
                 return Err(internal_error(error));
             }
+            Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    error.trim_start_matches("delete_session.recovery_point_retained: "),
+                    "session_has_saved_work",
+                ));
+            }
             Err(error) => return Err(internal_error(error)),
         };
 

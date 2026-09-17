@@ -18,8 +18,9 @@ use astra_services::work::{
     WorkEventSeq, WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemId, WorkItemRevision,
     WorkMaterializationProviderRef, WorkObservationQuery, WorkOwnerId, WorkPatchArtifactId,
     WorkPatchCommitId, WorkPatchCommitPageLimit, WorkPatchCommitProviderRef,
-    WorkPatchMaterializationId, WorkProposalId, WorkRepository, WorkRepositoryError, WorkRevision,
-    WorkSubjectRef, WorkTaskGraphQuery,
+    WorkPatchMaterializationId, WorkProposalId, WorkRecoveryPointCaptureRequest,
+    WorkRecoveryPointCursor, WorkRecoveryPointQuery, WorkRepository, WorkRepositoryError,
+    WorkRevision, WorkSubjectRef, WorkTaskGraphQuery,
 };
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use serde::Serialize;
@@ -50,12 +51,17 @@ use astra_server_types::{
     WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
     WorkObservationResponseV1, WorkPatchArtifactExportRequestV1, WorkPatchArtifactsQueryV1,
     WorkPatchCommitRequestV1, WorkPatchCommitsQueryV1, WorkPatchMaterializationRequestV1,
-    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkSessionBindingResponseV1,
-    WorkTaskGraphQueryV1, WorkTaskGraphResponseV1, WorkTranscriptItemV1,
-    WorkTranscriptPageResponseV1, WorkTranscriptQueryV1, WorkTurnRequestV1,
+    WorkReadCursorRequestV1, WorkReadCursorResponseV1, WorkRecoveryPointCapabilitiesV1,
+    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCoverageV1, WorkRecoveryPointCursorV1,
+    WorkRecoveryPointExecutionV1, WorkRecoveryPointPageV1, WorkRecoveryPointQueryV1,
+    WorkRecoveryPointReasonV1, WorkRecoveryPointSessionCursorV1, WorkRecoveryPointStatusV1,
+    WorkRecoveryPointViewV1, WorkSessionBindingResponseV1, WorkTaskGraphQueryV1,
+    WorkTaskGraphResponseV1, WorkTranscriptItemV1, WorkTranscriptPageResponseV1,
+    WorkTranscriptQueryV1, WorkTurnRequestV1,
 };
 
 const WORK_REQUEST_ID_MAX_BYTES: usize = 256;
+const WORK_CLIENT_ID_MAX_BYTES: usize = 128;
 const WORK_TURN_MESSAGE_MAX_BYTES: usize = 256 * 1024;
 const WORK_TASK_GRAPH_DEFAULT_ITEM_LIMIT: u16 = 8;
 const WORK_TASK_GRAPH_DEFAULT_DEPENDENCY_LIMIT: u16 = 128;
@@ -90,6 +96,7 @@ enum WorkApiActionHint {
     RetryRead,
     RetryWrite,
     RetryAttach,
+    ReviewEffects,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +178,27 @@ fn map_repository_error(
             false,
             vec![WorkApiActionHint::RefreshWork],
         ),
+        WorkRepositoryError::Conflict {
+            resource: WorkConflictResource::RecoveryPointRequest,
+        } => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_request_conflict",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        WorkRepositoryError::Conflict {
+            resource: WorkConflictResource::RecoveryPointIdentity,
+        } => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_identity_conflict",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        WorkRepositoryError::RecoveryPointNotCapturable { reason } => {
+            map_recovery_point_blocker(work_id, reason)
+        }
         error @ WorkRepositoryError::Persistence { .. } => {
             tracing::warn!(work_id, error = %error, "Work read persistence failed");
             work_error(
@@ -192,6 +220,237 @@ fn map_repository_error(
             )
         }
     }
+}
+
+fn map_recovery_point_blocker(
+    work_id: &str,
+    reason: astra_services::work::WorkRecoveryPointBlocker,
+) -> (StatusCode, Json<WorkApiErrorV1>) {
+    use astra_services::work::WorkRecoveryPointBlocker as Blocker;
+
+    match reason {
+        Blocker::SessionUnavailable => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_session_unavailable",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        Blocker::DanglingRunSlot | Blocker::RunStatusMissing => {
+            tracing::error!(work_id, blocker = ?reason, "Work recovery point found corrupt Run slot");
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_point_repair_required",
+                WorkApiErrorCategory::Degraded,
+                false,
+                vec![WorkApiActionHint::RetryRead],
+            )
+        }
+        Blocker::ActiveRun => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_run_active",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ),
+        Blocker::ActiveReservation => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_turn_active",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ),
+        Blocker::UnresolvedInvocation => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_effect_unresolved",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![
+                WorkApiActionHint::ReviewEffects,
+                WorkApiActionHint::RefreshWork,
+            ],
+        ),
+        Blocker::ExecutionChanging => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_execution_changing",
+            WorkApiErrorCategory::Conflict,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        ),
+        Blocker::BasisChanged
+        | Blocker::BranchBasisChanged
+        | Blocker::SessionChanged
+        | Blocker::ContextChanged
+        | Blocker::ExecutionChanged => work_error(
+            StatusCode::CONFLICT,
+            "recovery_point_basis_changed",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        Blocker::RunFrontierUnavailable
+        | Blocker::EdgeIdentityMissing
+        | Blocker::UnsupportedExecutor
+        | Blocker::ContextUnavailable => {
+            tracing::warn!(work_id, blocker = ?reason, "recovery point verification unavailable");
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "recovery_point_verification_unavailable",
+                WorkApiErrorCategory::Degraded,
+                true,
+                vec![WorkApiActionHint::RetryWrite],
+            )
+        }
+    }
+}
+
+fn public_recovery_point(
+    record: astra_services::work::WorkRecoveryPointRecord,
+) -> Result<WorkRecoveryPointViewV1, &'static str> {
+    let manifest = record
+        .manifest
+        .as_ref()
+        .ok_or("recovery point has no manifest")?;
+    let manifest_hash = record
+        .manifest_hash
+        .as_ref()
+        .ok_or("recovery point has no manifest hash")?;
+    let status = match record.status {
+        astra_services::work::WorkRecoveryPointStatus::Preparing => {
+            WorkRecoveryPointStatusV1::Preparing
+        }
+        astra_services::work::WorkRecoveryPointStatus::Captured => {
+            WorkRecoveryPointStatusV1::Captured
+        }
+        astra_services::work::WorkRecoveryPointStatus::Ready => WorkRecoveryPointStatusV1::Ready,
+        astra_services::work::WorkRecoveryPointStatus::Failed => WorkRecoveryPointStatusV1::Failed,
+        astra_services::work::WorkRecoveryPointStatus::Aborted => {
+            WorkRecoveryPointStatusV1::Aborted
+        }
+    };
+    let reason = match manifest.reason {
+        astra_turn_types::RecoveryPointReasonV1::UserRequested => {
+            WorkRecoveryPointReasonV1::UserRequested
+        }
+        astra_turn_types::RecoveryPointReasonV1::BeforeEnvironmentChange => {
+            WorkRecoveryPointReasonV1::BeforeEnvironmentChange
+        }
+        astra_turn_types::RecoveryPointReasonV1::RunSettled => {
+            WorkRecoveryPointReasonV1::RunSettled
+        }
+        astra_turn_types::RecoveryPointReasonV1::SafeBoundary => {
+            WorkRecoveryPointReasonV1::SafeBoundary
+        }
+    };
+    let placement = match manifest.execution.executor_kind {
+        astra_turn_types::RecoveryPointExecutorKindV1::Server => WorkExecutionPlacementV1::Server,
+        astra_turn_types::RecoveryPointExecutorKindV1::Edge => WorkExecutionPlacementV1::Edge,
+    };
+    let verified_boundary = matches!(
+        record.status,
+        astra_services::work::WorkRecoveryPointStatus::Captured
+            | astra_services::work::WorkRecoveryPointStatus::Ready
+    );
+    Ok(WorkRecoveryPointViewV1 {
+        schema_version: 1,
+        work_id: record.work_id.as_str().to_owned(),
+        branch_id: record.branch_id.as_str().to_owned(),
+        recovery_point_id: record.recovery_point_id,
+        request_id: record.request_id.as_str().to_owned(),
+        status,
+        reason,
+        created_at: record
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        updated_at: record
+            .updated_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        manifest_hash: manifest_hash.as_str().to_owned(),
+        work_revision: manifest.work_revision,
+        branch_revision: manifest.branch_revision,
+        graph_revision: manifest.graph_revision,
+        goal_revision: manifest.goal_revision,
+        criteria_set_revision: manifest.criteria_set_revision,
+        session_cursor: WorkRecoveryPointSessionCursorV1 {
+            completed_turn: manifest.session_cursor.completed_turn,
+            journal_event_seq: manifest.session_cursor.journal_event_seq,
+            conversation_seq: manifest.session_cursor.conversation_seq,
+            canonical_root_hash: manifest.session_cursor.canonical_root_hash.clone(),
+            compaction_generation: manifest.session_cursor.compaction_generation,
+        },
+        execution: WorkRecoveryPointExecutionV1 {
+            placement,
+            executor_id: manifest.execution.executor_id.clone(),
+            binding_generation: manifest.execution.binding_generation,
+        },
+        coverage: WorkRecoveryPointCoverageV1 {
+            session_state: verified_boundary,
+            work_state: verified_boundary,
+            workspace: verified_boundary && manifest.workspace.is_some(),
+            run_frontier: verified_boundary && manifest.run.is_some(),
+            artifacts: verified_boundary && !manifest.artifacts.is_empty(),
+        },
+        // A captured logical boundary is not a restorable payload. Keep every
+        // positive capability false until a future content/effect verifier
+        // can prove it, rather than letting the shape of the manifest imply
+        // a restore guarantee.
+        capabilities: WorkRecoveryPointCapabilitiesV1 {
+            can_restore_conversation: false,
+            can_continue_in_original_environment: false,
+            has_portable_workspace: false,
+            requires_target_environment_check: manifest.environment.platform.is_some()
+                || manifest.environment.runtime_fingerprint.is_some()
+                || !manifest.environment.required_capabilities.is_empty()
+                || !manifest.environment.required_external_services.is_empty(),
+            requires_effect_review: manifest
+                .run
+                .as_ref()
+                .is_some_and(|run| run.has_unresolved_effects),
+        },
+    })
+}
+
+fn map_recovery_point_projection_error(
+    work_id: &str,
+    reason: &'static str,
+) -> (StatusCode, Json<WorkApiErrorV1>) {
+    tracing::error!(
+        work_id,
+        reason,
+        "Work recovery point projection is degraded"
+    );
+    work_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "causal_projection_degraded",
+        WorkApiErrorCategory::Degraded,
+        true,
+        vec![WorkApiActionHint::RetryRead],
+    )
+}
+
+fn parse_work_recovery_point_ids(
+    work_id: String,
+    branch_id: String,
+) -> Result<(WorkId, WorkBranchId), (StatusCode, Json<WorkApiErrorV1>)> {
+    let work_id = WorkId::parse(work_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let branch_id = WorkBranchId::parse(branch_id).map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_branch_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    Ok((work_id, branch_id))
 }
 
 fn map_cursor_repository_error(
@@ -434,6 +693,14 @@ fn valid_work_request_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= WORK_REQUEST_ID_MAX_BYTES
         && !value.chars().any(char::is_control)
+}
+
+fn valid_work_client_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= WORK_CLIENT_ID_MAX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn criteria_proposal_summary(
@@ -1410,6 +1677,19 @@ pub(super) async fn post_work_branch_attachment_handler(
             Vec::new(),
         ));
     }
+    if payload
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| !valid_work_client_id(client_id))
+    {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_work_attachment_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
     let owner_id = authenticated_work_owner(&state, &headers).await?;
     let work_id = WorkId::parse(work_id).map_err(|_| {
         work_error(
@@ -1467,12 +1747,21 @@ pub(super) async fn post_work_branch_attachment_handler(
         .await
         .map_err(map_work_attachment_coordinator_error)?
         .unwrap_or_default();
+    // A client instance is a distinct observer. Keep its actor identity stable
+    // across Server replicas so a refresh renews that surface's attachment
+    // while another client cannot inherit its controller claim. The surface
+    // itself is a separate coordinate in the canonical attachment identity.
+    let (actor_id, device_id) = payload
+        .client_id
+        .as_deref()
+        .map(|client_id| (format!("client:{client_id}"), Some(client_id.to_owned())))
+        .unwrap_or_else(|| (state.session_actor_id.clone(), None));
     let actor = astra_turn_types::ActorContextV1::owner_user(
         owner_id.as_str(),
-        state.session_actor_id.clone(),
+        actor_id,
         astra_turn_types::ActorKindV1::Server,
-        astra_turn_types::SessionSurfaceV1::Server,
-        None,
+        payload.surface,
+        device_id,
         authority_epochs,
     );
     let service = astra_services::DatabaseSessionHandoffService::new(pool, coordinator);
@@ -3194,6 +3483,19 @@ fn valid_work_attachment_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
+fn valid_work_recovery_point_id(value: &str) -> bool {
+    !matches!(value, "." | "..")
+        && !value.is_empty()
+        && value.chars().count() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_work_recovery_request_id(value: &str) -> bool {
+    valid_work_request_id(value) && !value.chars().any(char::is_whitespace)
+}
+
 fn valid_work_operation_id(value: &str) -> bool {
     !matches!(value, "." | "..")
         && !value.is_empty()
@@ -4514,9 +4816,265 @@ async fn attest_execution_pair(
     Ok((source_result?.0, target_result?.0))
 }
 
-/// Read the canonical execution location. A missing row is projected as the
-/// explicit Server Work default; no database row is written and no historical
-/// Run metadata is consulted.
+/// Record one owner-scoped, quiescent Work/Session progress boundary. The
+/// server derives the manifest inside one transaction; callers cannot claim
+/// workspace, artifact, or unfinished-Run restore capability.
+pub(super) async fn post_work_branch_recovery_point_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+    payload: Result<Json<WorkRecoveryPointCaptureRequestV1>, JsonRejection>,
+) -> WorkApiResult<WorkRecoveryPointViewV1> {
+    require_work_api_major(&headers)?;
+    let Json(payload) = payload.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_recovery_point_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    if !valid_work_recovery_request_id(&payload.request_id)
+        || payload.expected_work_revision == 0
+        || payload.expected_branch_revision == 0
+    {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_recovery_point_request",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_point_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    let record = DatabaseWorkRepository::new(pool)
+        .recovery_points()
+        .capture_canonical(WorkRecoveryPointCaptureRequest {
+            owner_id,
+            work_id: work_id.clone(),
+            branch_id: branch_id.clone(),
+            request_id: WorkChangeRef::parse(payload.request_id).map_err(|_| {
+                work_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_recovery_point_request",
+                    WorkApiErrorCategory::InvalidRequest,
+                    false,
+                    Vec::new(),
+                )
+            })?,
+            expected_work_revision: payload.expected_work_revision,
+            expected_branch_revision: payload.expected_branch_revision,
+            reason: match payload.reason {
+                WorkRecoveryPointReasonV1::UserRequested => {
+                    astra_turn_types::RecoveryPointReasonV1::UserRequested
+                }
+                WorkRecoveryPointReasonV1::BeforeEnvironmentChange => {
+                    astra_turn_types::RecoveryPointReasonV1::BeforeEnvironmentChange
+                }
+                WorkRecoveryPointReasonV1::RunSettled => {
+                    astra_turn_types::RecoveryPointReasonV1::RunSettled
+                }
+                WorkRecoveryPointReasonV1::SafeBoundary => {
+                    astra_turn_types::RecoveryPointReasonV1::SafeBoundary
+                }
+            },
+        })
+        .await
+        .map_err(|error| map_repository_error(work_id.as_str(), error))?;
+    let view = public_recovery_point(record)
+        .map_err(|error| map_recovery_point_projection_error(work_id.as_str(), error))?;
+    Ok(Json(view))
+}
+
+pub(super) async fn get_work_branch_recovery_points_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id)): Path<(String, String)>,
+    query: Result<Query<WorkRecoveryPointQueryV1>, QueryRejection>,
+) -> WorkApiResult<WorkRecoveryPointPageV1> {
+    require_work_api_major(&headers)?;
+    let Query(query) = query.map_err(|_| {
+        work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_recovery_point_query",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        )
+    })?;
+    let limit = query.limit.unwrap_or(32);
+    if limit == 0 || limit > 256 {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_recovery_point_query",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let before = match (query.before_created_at, query.before_recovery_point_id) {
+        (None, None) => None,
+        (Some(created_at), Some(recovery_point_id))
+            if valid_work_recovery_point_id(&recovery_point_id) =>
+        {
+            Some(WorkRecoveryPointCursor {
+                created_at,
+                recovery_point_id,
+            })
+        }
+        _ => {
+            return Err(work_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_recovery_point_cursor",
+                WorkApiErrorCategory::InvalidRequest,
+                false,
+                Vec::new(),
+            ));
+        }
+    };
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_point_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let catalog = astra_services::work::DatabaseWorkBranchCatalogService::new(pool.clone())
+        .load_active(&owner_id, &work_id)
+        .await
+        .map_err(|error| match error {
+            astra_services::work::WorkBranchCatalogError::NotFound => work_error(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            ),
+            error => {
+                tracing::warn!(error = %error, "recovery point branch catalog degraded");
+                work_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "recovery_point_unavailable",
+                    WorkApiErrorCategory::Degraded,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            }
+        })?;
+    if !catalog
+        .branches
+        .iter()
+        .any(|branch| branch.branch_id == branch_id)
+    {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "work_branch_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    let mut recovery_query = WorkRecoveryPointQuery::new(owner_id, work_id.clone())
+        .branch(branch_id.clone())
+        .limit(limit);
+    if let Some(before) = before {
+        recovery_query = recovery_query.before(before);
+    }
+    let page = DatabaseWorkRepository::new(pool)
+        .recovery_points()
+        .list_page(recovery_query)
+        .await
+        .map_err(|error| map_repository_error(work_id.as_str(), error))?;
+    let points = page
+        .records
+        .into_iter()
+        .map(public_recovery_point)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| map_recovery_point_projection_error(work_id.as_str(), error))?;
+    let next_cursor = page.next_cursor.map(|cursor| WorkRecoveryPointCursorV1 {
+        created_at: cursor
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        recovery_point_id: cursor.recovery_point_id,
+    });
+    Ok(Json(WorkRecoveryPointPageV1 {
+        schema_version: 1,
+        work_id: work_id.as_str().to_owned(),
+        branch_id: branch_id.as_str().to_owned(),
+        points,
+        next_cursor,
+    }))
+}
+
+pub(super) async fn get_work_branch_recovery_point_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((work_id, branch_id, recovery_point_id)): Path<(String, String, String)>,
+) -> WorkApiResult<WorkRecoveryPointViewV1> {
+    require_work_api_major(&headers)?;
+    if !valid_work_recovery_point_id(&recovery_point_id) {
+        return Err(work_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_recovery_point_id",
+            WorkApiErrorCategory::InvalidRequest,
+            false,
+            Vec::new(),
+        ));
+    }
+    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (work_id, branch_id) = parse_work_recovery_point_ids(work_id, branch_id)?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        work_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_point_unavailable",
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryRead],
+        )
+    })?;
+    let record = DatabaseWorkRepository::new(pool)
+        .recovery_points()
+        .load(&owner_id, &work_id, &recovery_point_id)
+        .await
+        .map_err(|error| map_repository_error(work_id.as_str(), error))?
+        .ok_or_else(|| {
+            work_error(
+                StatusCode::NOT_FOUND,
+                "recovery_point_not_found",
+                WorkApiErrorCategory::NotFound,
+                false,
+                Vec::new(),
+            )
+        })?;
+    if record.branch_id != branch_id {
+        return Err(work_error(
+            StatusCode::NOT_FOUND,
+            "recovery_point_not_found",
+            WorkApiErrorCategory::NotFound,
+            false,
+            Vec::new(),
+        ));
+    }
+    let view = public_recovery_point(record)
+        .map_err(|error| map_recovery_point_projection_error(work_id.as_str(), error))?;
+    Ok(Json(view))
+}
+
 pub(super) async fn get_work_branch_execution_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7498,6 +8056,51 @@ mod tests {
         assert_eq!(error.code, "work_not_found");
         assert!(!error.retryable);
         assert!(error.action_hints.is_empty());
+    }
+
+    #[test]
+    fn recovery_point_blockers_keep_distinct_user_actions() {
+        use astra_services::work::WorkRecoveryPointBlocker as Blocker;
+
+        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::ActiveRun);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "recovery_point_run_active");
+        assert!(error.retryable);
+        assert!(matches!(
+            error.action_hints.as_slice(),
+            [WorkApiActionHint::RetryWrite]
+        ));
+
+        let (status, Json(error)) =
+            map_recovery_point_blocker("work-1", Blocker::UnresolvedInvocation);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "recovery_point_effect_unresolved");
+        assert!(!error.retryable);
+        assert!(matches!(
+            error.action_hints.as_slice(),
+            [
+                WorkApiActionHint::ReviewEffects,
+                WorkApiActionHint::RefreshWork
+            ]
+        ));
+
+        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::RunStatusMissing);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "recovery_point_repair_required");
+        assert!(!error.retryable);
+        assert!(matches!(
+            error.action_hints.as_slice(),
+            [WorkApiActionHint::RetryRead]
+        ));
+
+        let (status, Json(error)) = map_recovery_point_blocker("work-1", Blocker::BasisChanged);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "recovery_point_basis_changed");
+        assert!(!error.retryable);
+        assert!(matches!(
+            error.action_hints.as_slice(),
+            [WorkApiActionHint::RefreshWork]
+        ));
     }
 
     fn criteria_proposal_decision_request(

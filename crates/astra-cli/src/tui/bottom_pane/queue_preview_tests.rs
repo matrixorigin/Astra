@@ -209,7 +209,7 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 10));
     assert!(
-        rendered.contains("Next message queued"),
+        rendered.contains("Message queued"),
         "a locally accepted next turn must be visible immediately; got {rendered:?}"
     );
     assert!(rendered.contains("summarize the findings"), "{rendered:?}");

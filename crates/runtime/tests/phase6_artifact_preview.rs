@@ -2,10 +2,15 @@ mod test_support;
 
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
-    DatabaseRunStateStore, budget_for_turn_intent, build_presigned_artifact_download,
-    content_hash_with_normalize_version, expired_artifact_placeholder, runs::ToolOutputBatchItem,
+    DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
+    DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
+    SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
+    SessionArtifactStoreError, SessionService, StateItemUpsert, budget_for_turn_intent,
+    build_presigned_artifact_download, content_hash_with_normalize_version,
+    expired_artifact_placeholder, runs::ToolOutputBatchItem,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, QueryBuilder, Row};
 use uuid::Uuid;
 
@@ -139,6 +144,659 @@ async fn artifact_retention_until(
     .fetch_one(pool.get())
     .await
     .unwrap()
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+shared_db_test! {
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_49_byte_artifact_round_trip_reservation_seal_load_and_gc() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("workspace-package-{}", Uuid::new_v4());
+    let first = b"tracked file\n".to_vec();
+    let second = b"same workspace, new edge\n".to_vec();
+    let first_digest = content_digest(&first);
+    let second_digest = content_digest(&second);
+    let mut aggregate = Sha256::new();
+    aggregate.update(&first);
+    aggregate.update(&second);
+    let descriptor = SessionArtifactContentDescriptorV1 {
+        schema_version: astra_services::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+        backend: astra_services::SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1.to_string(),
+        digest: format!("sha256:{:x}", aggregate.finalize()),
+        byte_size: (first.len() + second.len()) as u64,
+        chunk_count: 2,
+        sealed: false,
+    };
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let record = SessionArtifactJsonRecord {
+        artifact_id: artifact_id.clone(),
+        session_id: session_id.clone(),
+        user_id: user_id.clone(),
+        artifact_kind: "workspace_snapshot_package".to_string(),
+        source: Some("phase6".to_string()),
+        turn: None,
+        round: None,
+        content: json!({"manifest_version": 1}),
+        metadata: Some(json!({
+            "workspace": {
+                "files": ["src/lib.rs", "Cargo.toml"],
+                "clean": false,
+            },
+            "capture": {"reason": "edge handoff"},
+        })),
+        references: Vec::new(),
+    };
+    store
+        .begin_byte_artifact(record.clone(), descriptor.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(&user_id, &session_id, &artifact_id, &first_digest, first.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(
+            &user_id,
+            &session_id,
+            &artifact_id,
+            &second_digest,
+            second.clone(),
+        )
+        .await
+        .unwrap();
+
+    // A stale, unsealed chunk remains reachable through the upload lease.
+    sqlx::query(
+        "UPDATE session_artifact_content_chunks
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY),
+             updated_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND content_digest IN (?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&first_digest)
+    .bind(&second_digest)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_artifact_content_reservations
+         SET expires_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+           AND content_digest = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .bind(&first_digest)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    // Uploading a later chunk renews the artifact-level lease, including the
+    // first chunk that was not sent again by the client.
+    store
+        .put_content_chunk(
+            &user_id,
+            &session_id,
+            &artifact_id,
+            &second_digest,
+            second.clone(),
+        )
+        .await
+        .unwrap();
+    let protected = run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(protected.content_chunks_deleted, 0);
+
+    // Begin is the explicit restart boundary. Both the upload lease and the
+    // catalog deadline may be stale after a disconnected client; a successful
+    // restart renews them atomically before the next sweeper pass.
+    sqlx::query(
+        "UPDATE session_artifacts
+         SET retention_until = DATE_SUB(NOW(6), INTERVAL 2 DAY), status = 'active'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_artifact_content_upload_leases
+         SET expires_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    store
+        .begin_byte_artifact(record.clone(), descriptor.clone())
+        .await
+        .unwrap();
+    assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await.0, "active");
+    let retention_live: i64 = sqlx::query_scalar(
+        "SELECT CAST(retention_until > NOW(6) AS SIGNED) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(retention_live, 1);
+    let restarted_gc = run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(restarted_gc.expired, 0);
+
+    // Once the artifact lease itself expires, an upload racing the sweeper
+    // must either lose the lease and fail cleanly or be observed before the
+    // sweeper. In either case the shared row lock makes the interleaving
+    // bounded; this branch exercises the expired-GC winner and restart path.
+    sqlx::query(
+        "UPDATE session_artifact_content_upload_leases
+         SET expires_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let (raced_put, raced_gc) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            tokio::join!(
+                store.put_content_chunk(
+                    &user_id,
+                    &session_id,
+                    &artifact_id,
+                    &second_digest,
+                    second.clone(),
+                ),
+                run_artifact_retention_gc_once(pool.clone(), 100),
+            )
+        },
+    )
+    .await
+    .expect("expired upload and GC must not deadlock");
+    assert!(matches!(
+        raced_put,
+        Err(SessionArtifactStoreError::ContentUploadReservationExpired { .. })
+    ));
+    assert_eq!(raced_gc.unwrap().content_chunks_deleted, 2);
+
+    // GC won the expired lease, so begin is the explicit restart boundary.
+    store
+        .begin_byte_artifact(record.clone(), descriptor.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(&user_id, &session_id, &artifact_id, &first_digest, first.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(
+            &user_id,
+            &session_id,
+            &artifact_id,
+            &second_digest,
+            second.clone(),
+        )
+        .await
+        .unwrap();
+
+    let sealed = store
+        .seal_byte_artifact(
+            &user_id,
+            &session_id,
+            &artifact_id,
+            vec![
+                SessionArtifactContentChunkV1 {
+                    chunk_index: 0,
+                    digest: first_digest.clone(),
+                    byte_size: first.len() as u64,
+                },
+                SessionArtifactContentChunkV1 {
+                    chunk_index: 1,
+                    digest: second_digest.clone(),
+                    byte_size: second.len() as u64,
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sealed.status.as_deref(), Some("active"));
+    let upload_lease_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(upload_lease_count, 0, "sealed artifact must not retain upload lease");
+    // Replaying the original begin after a lost seal response is idempotent;
+    // the server-owned sealed bit is intentionally excluded from the plan.
+    store
+        .begin_byte_artifact(record, descriptor.clone())
+        .await
+        .unwrap();
+    let loaded = store
+        .load_byte_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected_descriptor = descriptor.clone();
+    expected_descriptor.sealed = true;
+    assert_eq!(loaded.descriptor, expected_descriptor);
+    assert_eq!(loaded.chunks[0].bytes, first);
+    assert_eq!(loaded.chunks[1].bytes, second);
+
+    sqlx::query(
+        "UPDATE session_artifact_content_chunks
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY),
+             updated_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND content_digest IN (?, ?)",
+    )
+    .bind(&user_id)
+    .bind(&first_digest)
+    .bind(&second_digest)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_artifacts
+         SET retention_until = DATE_SUB(NOW(6), INTERVAL 1 DAY), status = 'active'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let expired = run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(expired.expired, 1);
+    assert_eq!(expired.content_chunks_deleted, 2);
+    assert_eq!(artifact_status(&pool, &user_id, &session_id, &artifact_id).await.0, "expired");
+    assert!(store
+        .load_byte_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .is_err());
+}
+}
+
+shared_db_test! {
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_49b_shared_chunk_seals_use_global_lock_order() {
+    let pool = setup_pool().await;
+    let (user_id, session_a, _) = ids();
+    let session_b = format!("phase6-session-b-{}", Uuid::new_v4());
+    insert_session(&pool, &user_id, &session_a).await;
+    insert_session(&pool, &user_id, &session_b).await;
+
+    let first = b"shared header\n".to_vec();
+    let second = b"shared body\n".to_vec();
+    let first_digest = content_digest(&first);
+    let second_digest = content_digest(&second);
+    let descriptor = |ordered: &[&[u8]]| {
+        let mut aggregate = Sha256::new();
+        let mut byte_size = 0_u64;
+        for bytes in ordered {
+            aggregate.update(bytes);
+            byte_size += bytes.len() as u64;
+        }
+        SessionArtifactContentDescriptorV1 {
+            schema_version: astra_services::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+            backend: astra_services::SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1
+                .to_string(),
+            digest: format!("sha256:{:x}", aggregate.finalize()),
+            byte_size,
+            chunk_count: ordered.len() as u64,
+            sealed: false,
+        }
+    };
+    let artifact_a = format!("workspace-a-{}", Uuid::new_v4());
+    let artifact_b = format!("workspace-b-{}", Uuid::new_v4());
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+
+    let record_a = SessionArtifactJsonRecord {
+        artifact_id: artifact_a.clone(),
+        session_id: session_a.clone(),
+        user_id: user_id.clone(),
+        artifact_kind: "workspace_snapshot_package".to_string(),
+        source: Some("phase6-lock-order-a".to_string()),
+        turn: None,
+        round: None,
+        content: json!({"order": "first-second"}),
+        metadata: None,
+        references: Vec::new(),
+    };
+    let record_b = SessionArtifactJsonRecord {
+        artifact_id: artifact_b.clone(),
+        session_id: session_b.clone(),
+        user_id: user_id.clone(),
+        artifact_kind: "workspace_snapshot_package".to_string(),
+        source: Some("phase6-lock-order-b".to_string()),
+        turn: None,
+        round: None,
+        content: json!({"order": "second-first"}),
+        metadata: None,
+        references: Vec::new(),
+    };
+    store
+        .begin_byte_artifact(record_a, descriptor(&[&first, &second]))
+        .await
+        .unwrap();
+    store
+        .begin_byte_artifact(record_b, descriptor(&[&second, &first]))
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(&user_id, &session_a, &artifact_a, &first_digest, first.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(
+            &user_id,
+            &session_a,
+            &artifact_a,
+            &second_digest,
+            second.clone(),
+        )
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(&user_id, &session_b, &artifact_b, &second_digest, second.clone())
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(
+            &user_id,
+            &session_b,
+            &artifact_b,
+            &first_digest,
+            first.clone(),
+        )
+        .await
+        .unwrap();
+
+    let (sealed_a, sealed_b) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            tokio::join!(
+                store.seal_byte_artifact(
+                    &user_id,
+                    &session_a,
+                    &artifact_a,
+                    vec![
+                        SessionArtifactContentChunkV1 {
+                            chunk_index: 0,
+                            digest: first_digest.clone(),
+                            byte_size: first.len() as u64,
+                        },
+                        SessionArtifactContentChunkV1 {
+                            chunk_index: 1,
+                            digest: second_digest.clone(),
+                            byte_size: second.len() as u64,
+                        },
+                    ],
+                    Vec::new(),
+                ),
+                store.seal_byte_artifact(
+                    &user_id,
+                    &session_b,
+                    &artifact_b,
+                    vec![
+                        SessionArtifactContentChunkV1 {
+                            chunk_index: 0,
+                            digest: second_digest.clone(),
+                            byte_size: second.len() as u64,
+                        },
+                        SessionArtifactContentChunkV1 {
+                            chunk_index: 1,
+                            digest: first_digest.clone(),
+                            byte_size: first.len() as u64,
+                        },
+                    ],
+                    Vec::new(),
+                ),
+            )
+        },
+    )
+    .await
+    .expect("shared chunk seals must not deadlock");
+    assert!(sealed_a.is_ok(), "first seal failed: {sealed_a:?}");
+    assert!(sealed_b.is_ok(), "second seal failed: {sealed_b:?}");
+}
+}
+
+shared_db_test! {
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("sealed-race-{}", Uuid::new_v4());
+    let bytes = b"sealed race payload\n".to_vec();
+    let digest = content_digest(&bytes);
+    let mut aggregate = Sha256::new();
+    aggregate.update(&bytes);
+    let descriptor = SessionArtifactContentDescriptorV1 {
+        schema_version: astra_services::SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+        backend: astra_services::SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1.to_string(),
+        digest: format!("sha256:{:x}", aggregate.finalize()),
+        byte_size: bytes.len() as u64,
+        chunk_count: 1,
+        sealed: false,
+    };
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    store
+        .begin_byte_artifact(
+            SessionArtifactJsonRecord {
+                artifact_id: artifact_id.clone(),
+                session_id: session_id.clone(),
+                user_id: user_id.clone(),
+                artifact_kind: "workspace_snapshot_package".to_string(),
+                source: Some("phase6-expiry-race".to_string()),
+                turn: None,
+                round: None,
+                content: json!({"manifest_version": 1}),
+                metadata: None,
+                references: Vec::new(),
+            },
+            descriptor,
+        )
+        .await
+        .unwrap();
+    store
+        .put_content_chunk(&user_id, &session_id, &artifact_id, &digest, bytes.clone())
+        .await
+        .unwrap();
+    store
+        .seal_byte_artifact(
+            &user_id,
+            &session_id,
+            &artifact_id,
+            vec![SessionArtifactContentChunkV1 {
+                chunk_index: 0,
+                digest: digest.clone(),
+                byte_size: bytes.len() as u64,
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE session_artifacts
+         SET retention_until = DATE_SUB(NOW(6), INTERVAL 2 DAY), status = 'active'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_artifact_content_chunks
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 2 DAY),
+             updated_at = DATE_SUB(NOW(6), INTERVAL 2 DAY)
+         WHERE user_id = ? AND content_digest = ?",
+    )
+    .bind(&user_id)
+    .bind(&digest)
+    .execute(pool.get())
+    .await
+    .unwrap();
+
+    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let (deleted, swept) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            tokio::join!(
+                service.delete_session(session_id.clone(), user_id.clone()),
+                run_artifact_retention_gc_once(pool.clone(), 100),
+            )
+        },
+    )
+    .await
+    .expect("sealed expiry and Session delete must not deadlock");
+    deleted.expect("Session delete should succeed without saved Work");
+    swept.expect("retention sweep should succeed");
+
+    let session_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let artifact_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&artifact_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(session_count, 0);
+    assert_eq!(artifact_count, 0);
+}
+
+}
+
+shared_db_test! {
+
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn l2_49d_state_projection_and_session_delete_are_fenced() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("state-race-artifact-{}", Uuid::new_v4());
+    insert_artifact(
+        &pool,
+        ArtifactSeed {
+            user_id: &user_id,
+            session_id: &session_id,
+            artifact_id: &artifact_id,
+            kind: "state_projection_fixture",
+            policy: "default",
+            status: "active",
+            retention_days: 1,
+            manifest_refs: 0,
+        },
+    )
+    .await;
+
+    let projection = DatabaseStateProjectionStore::new(pool.clone());
+    let item = StateItemUpsert {
+        item_id: Some(format!("state-race-{}", Uuid::new_v4())),
+        user_id: user_id.clone(),
+        session_id: session_id.clone(),
+        scope: "session".to_string(),
+        category: "finding".to_string(),
+        item_key: "artifact-race".to_string(),
+        status: "active".to_string(),
+        priority: 10,
+        source: "phase6-race".to_string(),
+        provenance_event_id: None,
+        run_id: None,
+        title: Some("state projection race".to_string()),
+        summary_text: Some("the writer and delete must settle cleanly".to_string()),
+        payload_json: json!({"artifact_id": artifact_id}),
+        token_estimate: 32,
+        mutation: "insert".to_string(),
+    };
+    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let (write, deleted) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            tokio::join!(
+                projection.upsert_state_item(item),
+                service.delete_session(session_id.clone(), user_id.clone()),
+            )
+        },
+    )
+    .await
+    .expect("state projection and Session delete must not deadlock");
+
+    deleted.expect("Session delete should succeed without saved Work");
+    if let Err(error) = write {
+        assert!(
+            matches!(error, astra_services::StateProjectionError::SessionNotActive { .. }),
+            "a losing state writer should fail with an actionable lifecycle error: {error}"
+        );
+    }
+
+    let row = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
+            (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
+            (SELECT COUNT(*) FROM session_state_item_events WHERE user_id = ? AND session_id = ?) AS state_events,
+            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<i64, _>("sessions").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
+}
 }
 
 shared_db_test! {

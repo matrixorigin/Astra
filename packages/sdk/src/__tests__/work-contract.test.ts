@@ -4,6 +4,7 @@ import {
   ASTRA_WORK_API_MAJOR_HEADER,
   AstraApiError,
   AstraClient,
+  type WorkApiErrorV1,
   type WorkEventPageV1,
   decodeWorkCatalogPageV1,
   decodeWorkArchivedBranchPageV1,
@@ -36,6 +37,8 @@ import {
   decodeWorkExecutionViewV1,
   decodeWorkExecutionTargetPageV1,
   decodeWorkExecutionSwitchOperationV1,
+  decodeWorkRecoveryPointV1,
+  decodeWorkRecoveryPointPageV1,
 } from "../index";
 
 const fixture = JSON.parse(
@@ -409,15 +412,41 @@ test("attachWorkBranch establishes bounded read continuity without session ident
   const client = new AstraClient({ baseUrl: "https://astra.example" });
 
   await expect(
-    client.attachWorkBranch("work-1", "branch-1", { requestId: "open-1" }),
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "open-1",
+      surface: "web",
+    }),
   ).resolves.toEqual(workAttachment);
   const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
   expect(url).toBe(
     "https://astra.example/v1/works/work-1/branches/branch-1/attachments",
   );
   expect(init.method).toBe("POST");
-  expect(JSON.parse(String(init.body))).toEqual({ request_id: "open-1" });
+  expect(JSON.parse(String(init.body))).toEqual({
+    request_id: "open-1",
+    surface: "web",
+  });
   expect(JSON.stringify(workAttachment)).not.toContain("session_id");
+});
+
+test("attachWorkBranch carries a stable Web client identity when provided", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(response(200, workAttachment));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "open-1",
+      clientId: "browser-a",
+      surface: "web",
+    }),
+  ).resolves.toEqual(workAttachment);
+  const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(JSON.parse(String(init.body))).toEqual({
+    request_id: "open-1",
+    client_id: "browser-a",
+    surface: "web",
+  });
 });
 
 test("detachWorkBranch releases only the exact attachment resource", async () => {
@@ -1731,8 +1760,18 @@ test("Work attachment rejects malformed continuity and request identities", asyn
   globalThis.fetch = fetchMock;
   const client = new AstraClient({ baseUrl: "https://astra.example" });
   await expect(
-    client.attachWorkBranch("work-1", "branch-1", { requestId: "bad\nrequest" }),
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "bad\nrequest",
+      surface: "web",
+    }),
   ).rejects.toThrow("control-free");
+  await expect(
+    client.attachWorkBranch("work-1", "branch-1", {
+      requestId: "open-1",
+      clientId: "other browser",
+      surface: "web",
+    }),
+  ).rejects.toThrow("canonical");
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
@@ -2730,6 +2769,50 @@ const executionOperation = {
   failure_code: null,
 } as const;
 
+const recoveryPoint = {
+  schema_version: 1,
+  work_id: "work-1",
+  branch_id: "branch-1",
+  recovery_point_id: "rp-1",
+  request_id: "save-1",
+  status: "captured",
+  reason: "user_requested",
+  created_at: "2026-09-16T00:00:00Z",
+  updated_at: "2026-09-16T00:00:00Z",
+  manifest_hash: `sha256:${"a".repeat(64)}`,
+  work_revision: 1,
+  branch_revision: 1,
+  graph_revision: 1,
+  goal_revision: 1,
+  criteria_set_revision: 1,
+  session_cursor: {
+    completed_turn: 1,
+    journal_event_seq: 2,
+    conversation_seq: 1,
+    canonical_root_hash: "b".repeat(64),
+    compaction_generation: 0,
+  },
+  execution: {
+    placement: "server",
+    executor_id: "server",
+    binding_generation: 1,
+  },
+  coverage: {
+    session_state: true,
+    work_state: true,
+    workspace: false,
+    run_frontier: false,
+    artifacts: false,
+  },
+  capabilities: {
+    can_restore_conversation: false,
+    can_continue_in_original_environment: false,
+    has_portable_workspace: false,
+    requires_target_environment_check: false,
+    requires_effect_review: false,
+  },
+} as const;
+
 test("execution decoders enforce identity, bounded targets, and terminal generations", () => {
   expect(decodeWorkExecutionViewV1(executionView).generation).toBe(3);
   expect(decodeWorkExecutionViewV1({ ...executionView, initialized: false }).initialized).toBe(false);
@@ -2747,6 +2830,29 @@ test("execution decoders enforce identity, bounded targets, and terminal generat
   const inconsistent = { ...executionOperation, completed_generation: null };
   expect(() => decodeWorkExecutionSwitchOperationV1(inconsistent)).toThrow(
     "terminal state and completed_generation disagree",
+  );
+});
+
+test("recovery point decoders preserve logical coverage and reject bad roots", () => {
+  expect(decodeWorkRecoveryPointV1(recoveryPoint).session_cursor.canonical_root_hash).toBe(
+    "b".repeat(64),
+  );
+  const page = decodeWorkRecoveryPointPageV1({
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    points: [recoveryPoint],
+    next_cursor: null,
+  });
+  expect(page.points[0].capabilities.can_restore_conversation).toBe(false);
+  expect(() =>
+    decodeWorkRecoveryPointV1({
+      ...recoveryPoint,
+      session_cursor: { ...recoveryPoint.session_cursor, canonical_root_hash: `sha256:${"b".repeat(64)}` },
+    }),
+  ).toThrow("conversation root hash");
+  expect(() => decodeWorkRecoveryPointV1({ ...recoveryPoint, future: true })).toThrow(
+    "unsupported field set",
   );
 });
 
@@ -2795,5 +2901,73 @@ test("execution client methods use no-store reads and sealed mutation bodies", a
   });
   expect(JSON.parse(String(calls[4]?.[1].body))).toEqual({
     attachment_id: "attachment-1",
+  });
+});
+
+test("recovery point client methods use explicit capture, keyset reads, and no restore claim", async () => {
+  const page = {
+    schema_version: 1,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    points: [recoveryPoint],
+    next_cursor: null,
+  } as const;
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce(response(200, recoveryPoint))
+    .mockResolvedValueOnce(response(200, page))
+    .mockResolvedValueOnce(response(200, recoveryPoint));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.captureWorkBranchRecoveryPoint("work-1", "branch-1", {
+      requestId: "save-1",
+      expectedWorkRevision: 1,
+      expectedBranchRevision: 1,
+    }),
+  ).resolves.toEqual(recoveryPoint);
+  await expect(client.listWorkBranchRecoveryPoints("work-1", "branch-1", { limit: 1 })).resolves.toEqual(
+    page,
+  );
+  await expect(
+    client.getWorkBranchRecoveryPoint("work-1", "branch-1", "rp-1"),
+  ).resolves.toEqual(recoveryPoint);
+
+  const calls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+  expect(calls[0]?.[0]).toContain("/v1/works/work-1/branches/branch-1/recovery-points");
+  expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({
+    request_id: "save-1",
+    expected_work_revision: 1,
+    expected_branch_revision: 1,
+    reason: "user_requested",
+  });
+  expect(calls[1]?.[0]).toContain("limit=1");
+  expect(calls[1]?.[1].cache).toBe("no-store");
+  expect(calls[2]?.[0]).toContain("/recovery-points/rp-1");
+});
+
+test("recovery point capture preserves typed unresolved-effect errors", async () => {
+  const body: WorkApiErrorV1 = {
+    code: "recovery_point_effect_unresolved",
+    category: "conflict",
+    retryable: false,
+    action_hints: ["review_effects", "refresh_work"],
+  };
+  globalThis.fetch = vi.fn().mockResolvedValue(response(409, body));
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+
+  await expect(
+    client.captureWorkBranchRecoveryPoint("work-1", "branch-1", {
+      requestId: "save-1",
+      expectedWorkRevision: 1,
+      expectedBranchRevision: 1,
+    }),
+  ).rejects.toMatchObject({
+    status: 409,
+    code: "recovery_point_effect_unresolved",
+    category: "conflict",
+    retryable: false,
+    actionHints: ["review_effects", "refresh_work"],
   });
 });

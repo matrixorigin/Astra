@@ -58,8 +58,13 @@ TUI.
 | `/agent` | Open the agent monitor for active and recent runs. |
 
 `/work` opens the canonical task board. Use `/work start <goal>` to track the
-current conversation as durable Work; the conversation must have a saved
-session first. `/work status` remains accepted as an alias for the board.
+current conversation as durable Work. If this TUI has not sent a message yet,
+the command creates and binds its durable Session automatically; no throwaway
+message or `/resume` is required. `/work status` remains accepted as an alias
+for the board. If you press Enter with a normal message while that first Work
+action is still starting, the message is shown in the queue and sent after the
+same Session is attached. A deliberate Session switch leaves the message in
+the composer for review instead of sending it to the wrong conversation.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains

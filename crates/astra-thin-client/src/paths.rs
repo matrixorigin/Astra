@@ -132,6 +132,35 @@ pub fn work_branch_execution_targets(work_id: &str, branch_id: &str) -> Option<S
     work_branch_execution(work_id, branch_id).map(|path| format!("{path}/targets"))
 }
 
+/// Read the immutable progress boundaries recorded for one Work branch.
+#[inline]
+pub fn work_branch_recovery_points(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/recovery-points"
+    ))
+}
+
+/// Read one immutable progress boundary for a Work branch.
+#[inline]
+pub fn work_branch_recovery_point(
+    work_id: &str,
+    branch_id: &str,
+    recovery_point_id: &str,
+) -> Option<String> {
+    if !is_safe_path_segment(work_id)
+        || !is_safe_path_segment(branch_id)
+        || !is_safe_path_segment(recovery_point_id)
+    {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/recovery-points/{recovery_point_id}"
+    ))
+}
+
 /// `GET` — optional tool capacity from server and connected edge providers.
 pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
 
@@ -773,6 +802,14 @@ mod tests {
             Some("/v1/works/work-1/branches/branch.main/execution/targets")
         );
         assert_eq!(
+            work_branch_recovery_points("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/recovery-points")
+        );
+        assert_eq!(
+            work_branch_recovery_point("work-1", "branch.main", "rp-1").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/recovery-points/rp-1")
+        );
+        assert_eq!(
             work_branch_attachment("work-1", "branch.main", "attachment-1").as_deref(),
             Some("/v1/works/work-1/branches/branch.main/attachments/attachment-1")
         );
@@ -789,8 +826,11 @@ mod tests {
             assert!(work_branch_activity("work-1", unsafe_id).is_none());
             assert!(work_branch_execution("work-1", unsafe_id).is_none());
             assert!(work_branch_execution_targets("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_points("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_point("work-1", unsafe_id, "rp-1").is_none());
             assert!(work_branch_attachment("work-1", "branch-1", unsafe_id).is_none());
             assert!(work_branch_control_operations("work-1", unsafe_id).is_none());
+            assert!(work_branch_recovery_point("work-1", "branch-1", unsafe_id).is_none());
         }
     }
 }

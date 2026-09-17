@@ -402,6 +402,38 @@ async fn load_basis_and_graph(
     Ok((basis, graph))
 }
 
+/// Load and validate the immutable Work/branch basis while the caller holds
+/// the Work and branch row locks. Recovery publication uses this narrow seam
+/// so a revision number is never accepted without checking the canonical Goal,
+/// criterion-set, graph manifest/hash, and every referenced WorkItem revision.
+pub(super) async fn load_recovery_basis_in_transaction(
+    transaction: &mut Transaction<'_, MySql>,
+    owner_id: &WorkOwnerId,
+    work_id: &WorkId,
+    branch_id: &WorkBranchId,
+) -> Result<WorkPlanBasis, WorkRepositoryError> {
+    let (basis, graph) = load_basis_and_graph(
+        transaction,
+        owner_id,
+        WorkPlanLookup::Branch { work_id, branch_id },
+    )
+    .await?;
+    // The graph manifest/hash check above proves the immutable graph envelope;
+    // this second bounded read proves each referenced item revision still
+    // exists and decodes under the canonical item contract.
+    let _ = load_graph_items(transaction, owner_id, work_id, &graph.item_refs).await?;
+    super::criteria_read_repository::validate_criteria_set_in_transaction(
+        transaction,
+        owner_id,
+        work_id,
+        basis.criteria_set_revision,
+        basis.criteria_member_count,
+        &basis.criteria_manifest_hash,
+    )
+    .await?;
+    Ok(basis)
+}
+
 async fn load_graph_items(
     transaction: &mut Transaction<'_, MySql>,
     owner_id: &WorkOwnerId,

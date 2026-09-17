@@ -1,7 +1,9 @@
 # Artifacts and debug bundles
 
-> Status: target design contract.
-> Last updated: 2026-07-16.
+> Status: target design contract; the shared byte-content backend is now
+> implemented for immutable artifacts, while Work capture/upload and restore
+> clients remain a later vertical slice.
+> Last updated: 2026-09-17.
 
 Artifacts and debug bundles define how Astra stores large outputs, raw captures, manifests, and support diagnostics without polluting normal trace or learning data.
 
@@ -34,6 +36,21 @@ source_event_refs
 created_at
 expires_at
 ```
+
+Immutable binary artifacts use the same catalog, owner, reference, retention,
+and audit boundary as JSON artifacts. Their content is stored as
+owner-scoped, content-addressed chunks and sealed only after the server has
+verified every digest, size, order, and aggregate hash. A chunk digest is an
+address within the authenticated owner scope; it is never a download grant.
+An unfinished upload has one durable artifact-level lease, refreshed by each
+successful chunk put, plus a temporary reservation edge for every chunk. The
+lease is the only upload lifetime authority; the edges describe which chunks
+must remain reachable. Retention GC fences the lease before removing its edges,
+so a reused chunk cannot be collected between puts and seal, and uploads do not
+perform an O(n²) renewal of every earlier chunk. Sealing atomically replaces
+the temporary edges with ordered artifact-to-content references. The first
+workspace package uses one typed artifact containing the snapshot manifest plus
+deduplicated file bytes, rather than one catalog row per file.
 
 ## Debug bundle rules
 

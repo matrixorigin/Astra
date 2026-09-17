@@ -5,6 +5,10 @@
 //! - [`SessionArtifactJsonStore`] persists remote-visible JSON artifacts (for example
 //!   LLM captures and request dumps) without assuming the caller can access server-local
 //!   files.
+//! - [`SessionArtifactContentStore`] persists the immutable byte content behind a
+//!   typed artifact.  The catalog and byte content share the same owner and
+//!   retention boundary; the byte rows are content-addressed so a workspace
+//!   snapshot does not create one catalog row per file.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -17,7 +21,8 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{QueryBuilder, query, query_scalar};
+use sha2::{Digest, Sha256};
+use sqlx::{QueryBuilder, Row, query, query_scalar};
 use uuid::Uuid;
 
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
@@ -139,11 +144,57 @@ pub enum SessionArtifactStoreError {
 
     #[error("artifact store does not support monotonic workspace projections")]
     MonotonicWorkspaceProjectionUnsupported,
+
+    #[error("content digest must be sha256:<64 lowercase hex>: {0:?}")]
+    InvalidContentDigest(String),
+
+    #[error("byte artifact metadata is invalid: {0}")]
+    InvalidByteArtifactMetadata(String),
+
+    #[error("byte artifact {artifact_id:?} conflicts with an existing artifact")]
+    ByteArtifactConflict { artifact_id: String },
+
+    #[error("content chunk {digest} does not match its digest")]
+    ContentChunkDigestMismatch { digest: String },
+
+    #[error("content chunk {digest} has an unexpected byte size")]
+    ContentChunkSizeMismatch { digest: String },
+
+    #[error("content chunk {digest} was not found for user {user_id}")]
+    ContentChunkNotFound { digest: String, user_id: String },
+
+    #[error("content chunk {digest} is not reserved by byte artifact {artifact_id}")]
+    ContentChunkNotReserved { digest: String, artifact_id: String },
+
+    #[error("byte artifact {artifact_id} upload reservation has expired")]
+    ContentUploadReservationExpired { artifact_id: String },
+
+    #[error("byte artifact {artifact_id} upload is already sealed")]
+    ByteArtifactUploadClosed { artifact_id: String },
+
+    #[error("content chunk index must be contiguous starting at zero")]
+    InvalidContentChunkOrder,
+
+    #[error("byte artifact {artifact_id} is not sealed")]
+    ByteArtifactNotSealed { artifact_id: String },
+
+    #[error("byte artifact {artifact_id} content is already sealed with different bytes")]
+    SealedByteArtifactConflict { artifact_id: String },
+
+    #[error("byte artifact {artifact_id} content is unavailable")]
+    ByteArtifactContentUnavailable { artifact_id: String },
 }
 
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
 pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
 pub const MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX: &str = "projection:";
+pub const SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION: u16 = 1;
+pub const SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1: &str =
+    "matrixone-content-chunks-v1";
+/// An upload reservation is refreshed by every successful chunk put. It is a
+/// lease for unfinished uploads, not a product-size limit; abandoned uploads
+/// become collectible after this interval.
+pub const SESSION_ARTIFACT_CONTENT_UPLOAD_LEASE_DAYS: u64 = 1;
 const MAX_ARTIFACT_ID_BYTES: usize = 64;
 
 fn is_mutable_artifact_projection_id(artifact_id: &str) -> bool {
@@ -327,6 +378,7 @@ pub enum SessionArtifactReferenceKind {
     Manifest,
     StateItem,
     Citation,
+    RecoveryPoint,
 }
 
 impl SessionArtifactReferenceKind {
@@ -336,6 +388,7 @@ impl SessionArtifactReferenceKind {
             Self::Manifest => "manifest",
             Self::StateItem => "state_item",
             Self::Citation => "citation",
+            Self::RecoveryPoint => "recovery_point",
         }
     }
 
@@ -345,6 +398,7 @@ impl SessionArtifactReferenceKind {
             "manifest" => Ok(Self::Manifest),
             "state_item" => Ok(Self::StateItem),
             "citation" => Ok(Self::Citation),
+            "recovery_point" => Ok(Self::RecoveryPoint),
             other => Err(SessionArtifactStoreError::InvalidStoredReferenceKind(
                 other.to_string(),
             )),
@@ -377,6 +431,85 @@ pub struct StoredSessionArtifact {
     pub referenced_by_citation_count: u32,
     pub referenced_by_durable_count: u32,
     pub created_at: Option<String>,
+}
+
+/// The byte content descriptor stored in the catalog metadata of an immutable
+/// byte artifact.  The descriptor is deliberately separate from the artifact
+/// manifest: the manifest describes the payload's meaning, while this value
+/// describes how the payload is sealed and retrieved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionArtifactContentDescriptorV1 {
+    pub schema_version: u16,
+    pub backend: String,
+    pub digest: String,
+    pub byte_size: u64,
+    pub chunk_count: u64,
+    pub sealed: bool,
+}
+
+impl SessionArtifactContentDescriptorV1 {
+    pub fn new(backend: impl Into<String>, digest: impl Into<String>, byte_size: u64) -> Self {
+        Self {
+            schema_version: SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+            backend: backend.into(),
+            digest: digest.into(),
+            byte_size,
+            chunk_count: 0,
+            sealed: false,
+        }
+    }
+
+    fn validate(&self) -> Result<(), SessionArtifactStoreError> {
+        if self.schema_version != SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                format!("unsupported content schema version {}", self.schema_version),
+            ));
+        }
+        if self.backend != SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1 {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                format!("unsupported content backend {:?}", self.backend),
+            ));
+        }
+        validate_content_digest(&self.digest)?;
+        Ok(())
+    }
+}
+
+/// One content-addressed byte chunk.  Chunks are owned by the authenticated
+/// user, while an artifact/session reference determines who may reach them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactContentChunkV1 {
+    pub chunk_index: u64,
+    pub digest: String,
+    pub byte_size: u64,
+}
+
+/// Result of putting one content chunk.  A replay with the same digest and
+/// bytes is successful and reports `inserted = false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactContentChunkReceiptV1 {
+    pub digest: String,
+    pub byte_size: u64,
+    pub inserted: bool,
+}
+
+/// A sealed artifact with its manifest and the verified chunks needed by a
+/// materializer.  The artifact catalog remains available through
+/// [`StoredSessionArtifact`]; this type is the byte-specific read result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSessionArtifactContentV1 {
+    pub artifact: StoredSessionArtifact,
+    pub manifest: Value,
+    pub descriptor: SessionArtifactContentDescriptorV1,
+    pub chunks: Vec<SessionArtifactContentChunkV1WithBytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionArtifactContentChunkV1WithBytes {
+    pub chunk_index: u64,
+    pub digest: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +633,50 @@ pub trait SessionArtifactJsonStore: Send + Sync {
     ) -> Result<Vec<String>, SessionArtifactStoreError> {
         Err(SessionArtifactStoreError::ReferenceQueryUnsupported)
     }
+}
+
+/// Shared byte-content boundary for immutable artifacts.
+///
+/// The catalog row is created once with [`Self::begin_byte_artifact`].  Each
+/// content-addressed chunk can then be uploaded and retried independently;
+/// the unsealed artifact owns one refreshed upload lease and temporary
+/// chunk-edges so retention GC cannot collect an old, reused chunk during a
+/// long upload. [`Self::seal_byte_artifact`] is the only operation that makes
+/// the byte artifact immutable and attaches durable references.
+/// Implementations must scope every operation by the authenticated owner and
+/// must not treat a digest or artifact id as an access grant.
+#[async_trait]
+pub trait SessionArtifactContentStore: Send + Sync {
+    async fn begin_byte_artifact(
+        &self,
+        record: SessionArtifactJsonRecord,
+        descriptor: SessionArtifactContentDescriptorV1,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
+
+    async fn put_content_chunk(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        digest: &str,
+        bytes: Vec<u8>,
+    ) -> Result<SessionArtifactContentChunkReceiptV1, SessionArtifactStoreError>;
+
+    async fn seal_byte_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        chunks: Vec<SessionArtifactContentChunkV1>,
+        references: Vec<SessionArtifactReference>,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
+
+    async fn load_byte_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<StoredSessionArtifactContentV1>, SessionArtifactStoreError>;
 }
 
 #[derive(Clone, Debug)]
@@ -710,9 +887,149 @@ impl DatabaseSessionArtifactStore {
     }
 }
 
+async fn admit_byte_artifact_session(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), SessionArtifactStoreError> {
+    crate::storage::admit_session_event_write(tx, session_id, user_id, false)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::RowNotFound => SessionArtifactStoreError::SessionNotOwned {
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+            },
+            other => SessionArtifactStoreError::Database(other),
+        })
+}
+
 fn validate_session_id(session_id: &str) -> Result<(), SessionArtifactStoreError> {
     crate::session_journal::validate_session_id(session_id)
         .map_err(SessionArtifactStoreError::InvalidSessionId)
+}
+
+fn validate_content_digest(value: &str) -> Result<(), SessionArtifactStoreError> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(SessionArtifactStoreError::InvalidContentDigest(
+            value.to_string(),
+        ));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SessionArtifactStoreError::InvalidContentDigest(
+            value.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn aggregate_content_digest(
+    chunks: &[SessionArtifactContentChunkV1WithBytes],
+) -> Result<(String, u64), SessionArtifactStoreError> {
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    for chunk in chunks {
+        digest.update(&chunk.bytes);
+        byte_size = byte_size.checked_add(chunk.bytes.len() as u64).ok_or(
+            SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "content byte size overflow".to_string(),
+            ),
+        )?;
+    }
+    Ok((format!("sha256:{:x}", digest.finalize()), byte_size))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ByteArtifactEnvelopeV1 {
+    schema_version: u16,
+    manifest: Value,
+    content: SessionArtifactContentDescriptorV1,
+}
+
+fn byte_artifact_envelope(
+    manifest: Value,
+    descriptor: SessionArtifactContentDescriptorV1,
+) -> Result<Value, SessionArtifactStoreError> {
+    descriptor.validate()?;
+    serde_json::to_value(ByteArtifactEnvelopeV1 {
+        schema_version: SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+        manifest,
+        content: descriptor,
+    })
+    .map_err(Into::into)
+}
+
+fn parse_byte_artifact_envelope(
+    artifact_id: &str,
+    content: Value,
+) -> Result<ByteArtifactEnvelopeV1, SessionArtifactStoreError> {
+    let envelope: ByteArtifactEnvelopeV1 = serde_json::from_value(content).map_err(|source| {
+        SessionArtifactStoreError::InvalidByteArtifactMetadata(format!(
+            "artifact {artifact_id:?} envelope: {source}"
+        ))
+    })?;
+    if envelope.schema_version != SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION {
+        return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+            format!(
+                "artifact {artifact_id:?} has unsupported envelope schema {}",
+                envelope.schema_version
+            ),
+        ));
+    }
+    envelope.content.validate()?;
+    Ok(envelope)
+}
+
+/// A begin request is an upload plan. The `sealed` bit is a server-owned
+/// lifecycle fact and therefore must not participate in idempotency. This
+/// lets a client safely replay begin after losing the response to seal while
+/// still rejecting any change to the immutable manifest or byte plan.
+fn same_byte_artifact_upload_plan(
+    existing: &ByteArtifactEnvelopeV1,
+    requested: &ByteArtifactEnvelopeV1,
+) -> bool {
+    existing.schema_version == requested.schema_version
+        && existing.manifest == requested.manifest
+        && existing.content.schema_version == requested.content.schema_version
+        && existing.content.backend == requested.content.backend
+        && existing.content.digest == requested.content.digest
+        && existing.content.byte_size == requested.content.byte_size
+        && existing.content.chunk_count == requested.content.chunk_count
+}
+
+/// MatrixOne may canonicalize the textual representation of a JSON column
+/// (for example, inserting spaces after `:` and `,`).  Idempotency compares
+/// the JSON value, not that storage-specific formatting.
+fn same_optional_json(
+    existing: Option<String>,
+    requested: Option<&Value>,
+    artifact_id: &str,
+    column: &'static str,
+) -> Result<bool, SessionArtifactStoreError> {
+    let existing = existing
+        .map(|raw| artifact_row_json(&raw, artifact_id, column))
+        .transpose()?;
+    Ok(existing == requested.cloned())
+}
+
+fn validate_content_chunk_refs(
+    chunks: &[SessionArtifactContentChunkV1],
+) -> Result<(), SessionArtifactStoreError> {
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        if chunk.chunk_index != expected_index as u64 {
+            return Err(SessionArtifactStoreError::InvalidContentChunkOrder);
+        }
+        validate_content_digest(&chunk.digest)?;
+    }
+    Ok(())
 }
 
 fn validate_artifact_list_limit(limit: usize) -> usize {
@@ -1563,6 +1880,831 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     }
 }
 
+#[async_trait]
+impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
+    async fn begin_byte_artifact(
+        &self,
+        mut record: SessionArtifactJsonRecord,
+        descriptor: SessionArtifactContentDescriptorV1,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
+        if record.artifact_id.trim().is_empty() {
+            record.artifact_id = Uuid::now_v7().to_string();
+        } else if is_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::ReservedMutableProjectionId(
+                record.artifact_id,
+            ));
+        }
+        if record.artifact_id.len() > MAX_ARTIFACT_ID_BYTES {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                record.artifact_id,
+            ));
+        }
+        if record.artifact_kind.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "artifact_kind must not be empty".to_string(),
+            ));
+        }
+        if !record.references.is_empty() {
+            return Err(SessionArtifactStoreError::ByteArtifactConflict {
+                artifact_id: record.artifact_id,
+            });
+        }
+        if descriptor.sealed {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "a new byte artifact must start unsealed".to_string(),
+            ));
+        }
+        let envelope = byte_artifact_envelope(record.content.clone(), descriptor)?;
+        let content_json = serde_json::to_string(&envelope)?;
+        let metadata_json = record.metadata.as_ref().map(Value::to_string);
+        let pool = self.get_pool().await?;
+        let mut tx = pool.begin().await?;
+        admit_byte_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
+        // Create the single artifact-level upload lease before locking the
+        // catalog row. Every later byte operation acquires this lease first,
+        // which gives begin/put/seal/GC one global lock order.
+        query(
+            "INSERT INTO session_artifact_content_upload_leases
+             (user_id, session_id, artifact_id, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, DATE_ADD(NOW(6), INTERVAL 1 DAY), NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE updated_at = updated_at",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        query(
+            "INSERT INTO session_artifacts
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round,
+              content_json, metadata, retention_until, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 1 DAY), NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE updated_at = updated_at",
+        )
+        .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
+        .bind(&record.artifact_kind)
+        .bind(record.source.as_deref())
+        .bind(encode_counter(
+            record.turn,
+            SessionArtifactStoreError::TurnOverflow,
+        )?)
+        .bind(encode_counter(
+            record.round,
+            SessionArtifactStoreError::RoundOverflow,
+        )?)
+        .bind(&content_json)
+        .bind(&metadata_json)
+        .execute(&mut *tx)
+        .await?;
+
+        let existing = query(
+            "SELECT artifact_kind, source, turn, round,
+                    CAST(metadata AS CHAR) AS metadata_json,
+                    content_json, status
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_kind = existing.string_column("artifact_kind")?;
+        let existing_source = existing.optional_string_column("source")?;
+        let existing_turn = existing.try_get::<Option<i32>, _>("turn")?;
+        let existing_round = existing.try_get::<Option<i32>, _>("round")?;
+        let existing_metadata = existing.optional_string_column("metadata_json")?;
+        let existing_content = existing.string_column("content_json")?;
+        let existing_status = existing.string_column("status")?;
+        let existing_envelope = parse_byte_artifact_envelope(
+            &record.artifact_id,
+            serde_json::from_str(&existing_content).map_err(|source| {
+                SessionArtifactStoreError::JsonDecode {
+                    artifact_id: record.artifact_id.clone(),
+                    column: "content_json",
+                    source,
+                }
+            })?,
+        )?;
+        let requested_envelope = parse_byte_artifact_envelope(
+            &record.artifact_id,
+            serde_json::from_str(&content_json).map_err(|source| {
+                SessionArtifactStoreError::JsonDecode {
+                    artifact_id: record.artifact_id.clone(),
+                    column: "content_json",
+                    source,
+                }
+            })?,
+        )?;
+        if existing_kind != record.artifact_kind
+            || existing_status == "expired"
+            || existing_source != record.source
+            || existing_turn
+                != encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?
+            || existing_round
+                != encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?
+            || !same_optional_json(
+                existing_metadata,
+                record.metadata.as_ref(),
+                &record.artifact_id,
+                "metadata_json",
+            )?
+            || !same_byte_artifact_upload_plan(&existing_envelope, &requested_envelope)
+        {
+            return Err(SessionArtifactStoreError::ByteArtifactConflict {
+                artifact_id: record.artifact_id,
+            });
+        }
+        if existing_envelope.content.sealed {
+            query(
+                "DELETE FROM session_artifact_content_upload_leases
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            query(
+                "UPDATE session_artifact_content_upload_leases
+                 SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY), updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id)
+            .execute(&mut *tx)
+            .await?;
+            // A retried begin is also the explicit restart boundary for an
+            // unsealed upload. Renew the catalog retention in the same
+            // transaction as the upload lease; otherwise a sweeper that sees
+            // the old catalog deadline could expire the artifact immediately
+            // after a successful restart.
+            query(
+                "UPDATE session_artifacts
+                 SET retention_until = DATE_ADD(NOW(6), INTERVAL 1 DAY),
+                     status = 'active', updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+                   AND status <> 'expired'",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
+            .await?
+            .ok_or(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: record.artifact_id,
+                session_id: record.session_id,
+                user_id: record.user_id,
+            })
+    }
+
+    async fn put_content_chunk(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        digest: &str,
+        bytes: Vec<u8>,
+    ) -> Result<SessionArtifactContentChunkReceiptV1, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() || artifact_id.len() > MAX_ARTIFACT_ID_BYTES {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        validate_content_digest(digest)?;
+        let actual_digest = content_digest(&bytes);
+        if actual_digest != digest {
+            return Err(SessionArtifactStoreError::ContentChunkDigestMismatch {
+                digest: digest.to_string(),
+            });
+        }
+        let byte_size = bytes.len() as u64;
+        let pool = self.get_pool().await?;
+        let mut tx = pool.begin().await?;
+        admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
+        let lease_live =
+            lock_byte_artifact_upload_lease(&mut tx, user_id, session_id, artifact_id).await?;
+        let artifact_row = query(
+            "SELECT content_json, status
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(artifact_row) = artifact_row else {
+            return Err(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: artifact_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+            });
+        };
+        let status = artifact_row.string_column("status")?;
+        if status == "expired" {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let envelope = parse_byte_artifact_envelope(
+            artifact_id,
+            serde_json::from_str(&artifact_row.string_column("content_json")?).map_err(
+                |source| SessionArtifactStoreError::JsonDecode {
+                    artifact_id: artifact_id.to_string(),
+                    column: "content_json",
+                    source,
+                },
+            )?,
+        )?;
+        if envelope.content.sealed {
+            return Err(SessionArtifactStoreError::ByteArtifactUploadClosed {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        if lease_live != Some(true) {
+            return Err(SessionArtifactStoreError::ContentUploadReservationExpired {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        query(
+            "UPDATE session_artifact_content_upload_leases
+             SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY), updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        // Establish the upload reachability edge before touching shared chunk
+        // bytes. Seal and GC use the same lease -> artifact -> reservation ->
+        // chunk order, so a reused old chunk cannot deadlock with either path.
+        query(
+            "INSERT INTO session_artifact_content_reservations
+             (user_id, session_id, artifact_id, content_digest, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 1 DAY), NOW(6), NOW(6))
+             ON DUPLICATE KEY UPDATE
+                 expires_at = DATE_ADD(NOW(6), INTERVAL 1 DAY),
+                 updated_at = NOW(6)",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(digest)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = query(
+            "INSERT IGNORE INTO session_artifact_content_chunks
+             (user_id, content_digest, byte_size, content, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(user_id)
+        .bind(digest)
+        .bind(byte_size)
+        .bind(&bytes)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        let existing = query(
+            "SELECT byte_size, content
+             FROM session_artifact_content_chunks
+             WHERE user_id = ? AND content_digest = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(digest)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_size = existing.try_get::<u64, _>("byte_size")?;
+        let existing_bytes = existing.try_get::<Vec<u8>, _>("content")?;
+        if existing_size != byte_size || existing_bytes != bytes {
+            return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
+                digest: digest.to_string(),
+            });
+        }
+        query(
+            "UPDATE session_artifacts
+             SET retention_until = DATE_ADD(NOW(6), INTERVAL 1 DAY),
+                 status = 'active', updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+               AND status <> 'expired'",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SessionArtifactContentChunkReceiptV1 {
+            digest: digest.to_string(),
+            byte_size,
+            inserted,
+        })
+    }
+
+    async fn seal_byte_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+        chunks: Vec<SessionArtifactContentChunkV1>,
+        references: Vec<SessionArtifactReference>,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() || artifact_id.len() > MAX_ARTIFACT_ID_BYTES {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        validate_content_chunk_refs(&chunks)?;
+        validate_artifact_references(&references)?;
+        let pool = self.get_pool().await?;
+        let mut tx = pool.begin().await?;
+        admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
+        // An unfinished upload is fenced by the artifact-level lease. Sealed
+        // artifacts intentionally have no lease, but still pass through this
+        // optional lock before the catalog row so concurrent GC and uploads
+        // share one ordering.
+        let _upload_lease =
+            lock_byte_artifact_upload_lease(&mut tx, user_id, session_id, artifact_id).await?;
+        let artifact_row = query(
+            "SELECT content_json, status
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(artifact_row) = artifact_row else {
+            return Err(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: artifact_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: user_id.to_string(),
+            });
+        };
+        let status = artifact_row.string_column("status")?;
+        if status == "expired" {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let content_json = artifact_row.string_column("content_json")?;
+        let envelope = parse_byte_artifact_envelope(
+            artifact_id,
+            serde_json::from_str(&content_json).map_err(|source| {
+                SessionArtifactStoreError::JsonDecode {
+                    artifact_id: artifact_id.to_string(),
+                    column: "content_json",
+                    source,
+                }
+            })?,
+        )?;
+        let existing_refs =
+            load_content_chunk_refs(&mut tx, user_id, session_id, artifact_id).await?;
+        if envelope.content.sealed {
+            if !same_content_chunk_refs(&existing_refs, &chunks)
+                || envelope.content.chunk_count != chunks.len() as u64
+            {
+                return Err(SessionArtifactStoreError::SealedByteArtifactConflict {
+                    artifact_id: artifact_id.to_string(),
+                });
+            }
+            let stored_chunks = load_and_verify_content_chunks(&mut tx, user_id, &chunks).await?;
+            let (actual_digest, actual_size) = aggregate_content_digest(&stored_chunks)?;
+            if actual_digest != envelope.content.digest || actual_size != envelope.content.byte_size
+            {
+                return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                    artifact_id: artifact_id.to_string(),
+                });
+            }
+            retain_references_in_transaction(
+                &mut tx,
+                user_id,
+                session_id,
+                artifact_id,
+                &references,
+            )
+            .await?;
+            query(
+                "DELETE FROM session_artifact_content_upload_leases
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(artifact_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return self
+                .load_json_artifact(user_id, session_id, artifact_id)
+                .await?
+                .ok_or(SessionArtifactStoreError::ArtifactNotFound {
+                    artifact_id: artifact_id.to_string(),
+                    session_id: session_id.to_string(),
+                    user_id: user_id.to_string(),
+                });
+        }
+        if envelope.content.chunk_count != chunks.len() as u64 {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                format!(
+                    "expected {} chunks, received {}",
+                    envelope.content.chunk_count,
+                    chunks.len()
+                ),
+            ));
+        }
+
+        ensure_content_upload_reservations(&mut tx, user_id, session_id, artifact_id, &chunks)
+            .await?;
+        let stored_chunks = load_and_verify_content_chunks(&mut tx, user_id, &chunks).await?;
+        let (actual_digest, actual_size) = aggregate_content_digest(&stored_chunks)?;
+        if actual_digest != envelope.content.digest || actual_size != envelope.content.byte_size {
+            return Err(SessionArtifactStoreError::SealedByteArtifactConflict {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        if !existing_refs.is_empty() && !same_content_chunk_refs(&existing_refs, &chunks) {
+            return Err(SessionArtifactStoreError::SealedByteArtifactConflict {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        for chunk in &chunks {
+            query(
+                "INSERT IGNORE INTO session_artifact_content_refs
+                 (user_id, session_id, artifact_id, chunk_index, content_digest, byte_size, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, NOW(6))",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(artifact_id)
+            .bind(chunk.chunk_index)
+            .bind(&chunk.digest)
+            .bind(chunk.byte_size)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let mut descriptor = envelope.content;
+        descriptor.sealed = true;
+        descriptor.validate()?;
+        let content_json = serde_json::to_string(&ByteArtifactEnvelopeV1 {
+            schema_version: SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
+            manifest: envelope.manifest,
+            content: descriptor,
+        })?;
+        query(
+            "UPDATE session_artifacts
+             SET content_json = ?, retention_until = DATE_ADD(NOW(6), INTERVAL 30 DAY),
+                 status = 'active', updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(content_json)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        retain_references_in_transaction(&mut tx, user_id, session_id, artifact_id, &references)
+            .await?;
+        query(
+            "DELETE FROM session_artifact_content_reservations
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        query(
+            "DELETE FROM session_artifact_content_upload_leases
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        let artifact = query(
+            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round,
+                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy,
+                    CAST(retention_until AS CHAR) AS retention_until, status,
+                    referenced_by_manifest_count, referenced_by_state_items_count,
+                    referenced_by_citation_count,
+                    (SELECT COUNT(*) FROM session_artifact_references refs
+                     WHERE refs.user_id = session_artifacts.user_id
+                       AND refs.session_id = session_artifacts.session_id
+                       AND refs.artifact_id = session_artifacts.artifact_id)
+                       AS referenced_by_durable_count,
+                    CAST(created_at AS CHAR) AS created_at
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(SessionArtifactStoreError::Database)
+        .and_then(|row| stored_artifact_from_row(&row))?;
+        tx.commit().await?;
+        Ok(artifact)
+    }
+
+    async fn load_byte_artifact(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        artifact_id: &str,
+    ) -> Result<Option<StoredSessionArtifactContentV1>, SessionArtifactStoreError> {
+        validate_session_id(session_id)?;
+        if artifact_id.trim().is_empty() {
+            return Err(SessionArtifactStoreError::InvalidArtifactId(
+                artifact_id.to_string(),
+            ));
+        }
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, user_id, session_id)
+            .await?;
+        let Some(artifact) =
+            load_json_artifact_from_pool(&pool, user_id, session_id, artifact_id).await?
+        else {
+            return Ok(None);
+        };
+        if artifact.status.as_deref() == Some("expired") {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let envelope = parse_byte_artifact_envelope(artifact_id, artifact.content.clone())?;
+        if !envelope.content.sealed {
+            return Err(SessionArtifactStoreError::ByteArtifactNotSealed {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let mut tx = pool.begin().await?;
+        let chunks = load_content_chunk_refs(&mut tx, user_id, session_id, artifact_id).await?;
+        let stored_chunks = load_and_verify_content_chunks(&mut tx, user_id, &chunks).await?;
+        tx.commit().await?;
+        if envelope.content.chunk_count != stored_chunks.len() as u64 {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        let (actual_digest, actual_size) = aggregate_content_digest(&stored_chunks)?;
+        if actual_digest != envelope.content.digest || actual_size != envelope.content.byte_size {
+            return Err(SessionArtifactStoreError::ByteArtifactContentUnavailable {
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+        Ok(Some(StoredSessionArtifactContentV1 {
+            artifact,
+            manifest: envelope.manifest,
+            descriptor: envelope.content,
+            chunks: stored_chunks,
+        }))
+    }
+}
+
+async fn retain_references_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+    references: &[SessionArtifactReference],
+) -> Result<(), SessionArtifactStoreError> {
+    for reference in references {
+        query(
+            "INSERT IGNORE INTO session_artifact_references
+             (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+             VALUES (?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .bind(reference.kind.wire_name())
+        .bind(reference.reference_id.trim())
+        .execute(&mut **tx)
+        .await?;
+    }
+    if !references.is_empty() {
+        query(
+            "UPDATE session_artifacts
+             SET retention_until = CASE
+                 WHEN retention_until IS NULL OR retention_until < DATE_ADD(NOW(6), INTERVAL 30 DAY)
+                 THEN DATE_ADD(NOW(6), INTERVAL 30 DAY)
+                 ELSE retention_until END
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(artifact_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn load_content_chunk_refs(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<Vec<SessionArtifactContentChunkV1>, SessionArtifactStoreError> {
+    let rows = query(
+        "SELECT chunk_index, content_digest, byte_size
+         FROM session_artifact_content_refs
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         ORDER BY chunk_index ASC
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let chunk_index = row.try_get::<u64, _>("chunk_index")?;
+            let byte_size = row.try_get::<u64, _>("byte_size")?;
+            let digest = row.string_column("content_digest")?;
+            validate_content_digest(&digest)?;
+            Ok(SessionArtifactContentChunkV1 {
+                chunk_index,
+                digest,
+                byte_size,
+            })
+        })
+        .collect()
+}
+
+fn same_content_chunk_refs(
+    left: &[SessionArtifactContentChunkV1],
+    right: &[SessionArtifactContentChunkV1],
+) -> bool {
+    left == right
+}
+
+async fn lock_byte_artifact_upload_lease(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<Option<bool>, SessionArtifactStoreError> {
+    let row = query(
+        "SELECT CAST(expires_at > NOW(6) AS SIGNED) AS lease_live
+         FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| row.try_get::<i64, _>("lease_live").map(|value| value != 0))
+        .transpose()
+        .map_err(SessionArtifactStoreError::Database)
+}
+
+async fn ensure_content_upload_reservations(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+    chunks: &[SessionArtifactContentChunkV1],
+) -> Result<(), SessionArtifactStoreError> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let lease = query(
+        "SELECT CAST(expires_at > NOW(6) AS SIGNED) AS lease_live
+         FROM session_artifact_content_upload_leases
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let lease_live = lease
+        .map(|row| row.try_get::<i64, _>("lease_live"))
+        .transpose()?
+        .unwrap_or_default()
+        != 0;
+    if !lease_live {
+        return Err(SessionArtifactStoreError::ContentUploadReservationExpired {
+            artifact_id: artifact_id.to_string(),
+        });
+    }
+
+    // The lease is the authority for the upload lifetime. Reservation rows
+    // are only reachability edges, so they are locked in digest order and
+    // never bulk-renewed here. This keeps seal and GC's lock order bounded by
+    // the number of chunks and avoids an O(n²) update pattern for long uploads.
+    let rows = query(
+        "SELECT content_digest
+         FROM session_artifact_content_reservations
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?
+         ORDER BY content_digest ASC
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let reservations = rows
+        .into_iter()
+        .map(|row| {
+            row.string_column("content_digest")
+                .map_err(SessionArtifactStoreError::Database)
+        })
+        .collect::<Result<std::collections::HashSet<_>, SessionArtifactStoreError>>()?;
+    for chunk in chunks {
+        if !reservations.contains(&chunk.digest) {
+            return Err(SessionArtifactStoreError::ContentChunkNotReserved {
+                digest: chunk.digest.clone(),
+                artifact_id: artifact_id.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn load_and_verify_content_chunks(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    refs: &[SessionArtifactContentChunkV1],
+) -> Result<Vec<SessionArtifactContentChunkV1WithBytes>, SessionArtifactStoreError> {
+    // Chunks are shared across artifacts. Always acquire their row locks in a
+    // global owner+digest order, then restore logical chunk order for aggregate
+    // hashing and materialization. This prevents two seals that share blobs
+    // in opposite file order from forming a lock cycle.
+    let mut lock_order = refs.to_vec();
+    lock_order.sort_by(|left, right| {
+        left.digest
+            .cmp(&right.digest)
+            .then(left.chunk_index.cmp(&right.chunk_index))
+    });
+    let mut chunks = Vec::with_capacity(refs.len());
+    for reference in &lock_order {
+        let row = query(
+            "SELECT byte_size, content
+             FROM session_artifact_content_chunks
+             WHERE user_id = ? AND content_digest = ?
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(&reference.digest)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| SessionArtifactStoreError::ContentChunkNotFound {
+            digest: reference.digest.clone(),
+            user_id: user_id.to_string(),
+        })?;
+        let stored_size = row.try_get::<u64, _>("byte_size")?;
+        let bytes = row.try_get::<Vec<u8>, _>("content")?;
+        if stored_size != reference.byte_size
+            || bytes.len() as u64 != reference.byte_size
+            || content_digest(&bytes) != reference.digest
+        {
+            return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
+                digest: reference.digest.clone(),
+            });
+        }
+        chunks.push(SessionArtifactContentChunkV1WithBytes {
+            chunk_index: reference.chunk_index,
+            digest: reference.digest.clone(),
+            bytes,
+        });
+    }
+    chunks.sort_by_key(|chunk| chunk.chunk_index);
+    validate_content_chunk_refs(
+        &chunks
+            .iter()
+            .map(|chunk| SessionArtifactContentChunkV1 {
+                chunk_index: chunk.chunk_index,
+                digest: chunk.digest.clone(),
+                byte_size: chunk.bytes.len() as u64,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(chunks)
+}
+
 fn validate_relative_path(relative: &Path) -> Result<(), String> {
     if relative.as_os_str().is_empty() {
         return Ok(());
@@ -2230,5 +3372,112 @@ mod tests {
         assert_eq!(validate_artifact_list_limit(20), 20);
         assert_eq!(validate_artifact_list_limit(usize::MAX), 100);
         assert_eq!(artifact_list_query_limit(100), 101);
+    }
+
+    #[test]
+    fn byte_content_descriptor_is_strict_and_envelope_round_trips() {
+        let digest = content_digest(b"hello");
+        let descriptor = SessionArtifactContentDescriptorV1::new(
+            SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1,
+            digest.clone(),
+            5,
+        );
+        let envelope = byte_artifact_envelope(serde_json::json!({"snapshot": "rp-1"}), descriptor)
+            .expect("descriptor envelope should encode");
+        let decoded = parse_byte_artifact_envelope("artifact-1", envelope)
+            .expect("descriptor envelope should decode");
+        assert_eq!(decoded.manifest["snapshot"], "rp-1");
+        assert_eq!(decoded.content.digest, digest);
+        assert!(!decoded.content.sealed);
+
+        let bad_digest = SessionArtifactContentDescriptorV1::new(
+            SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1,
+            "sha256:ABC",
+            0,
+        );
+        assert!(matches!(
+            bad_digest.validate(),
+            Err(SessionArtifactStoreError::InvalidContentDigest(_))
+        ));
+        let bad_backend =
+            SessionArtifactContentDescriptorV1::new("local-path", content_digest(b""), 0);
+        assert!(matches!(
+            bad_backend.validate(),
+            Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn byte_content_digest_is_order_sensitive_and_chunk_order_is_contiguous() {
+        let first = SessionArtifactContentChunkV1WithBytes {
+            chunk_index: 0,
+            digest: content_digest(b"a"),
+            bytes: b"a".to_vec(),
+        };
+        let second = SessionArtifactContentChunkV1WithBytes {
+            chunk_index: 1,
+            digest: content_digest(b"b"),
+            bytes: b"b".to_vec(),
+        };
+        let (digest, size) = aggregate_content_digest(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(digest, content_digest(b"ab"));
+        assert_eq!(size, 2);
+        let (reverse_digest, _) = aggregate_content_digest(&[second, first]).unwrap();
+        assert_ne!(digest, reverse_digest);
+
+        let refs = vec![
+            SessionArtifactContentChunkV1 {
+                chunk_index: 0,
+                digest: content_digest(b"a"),
+                byte_size: 1,
+            },
+            SessionArtifactContentChunkV1 {
+                chunk_index: 2,
+                digest: content_digest(b"b"),
+                byte_size: 1,
+            },
+        ];
+        assert!(matches!(
+            validate_content_chunk_refs(&refs),
+            Err(SessionArtifactStoreError::InvalidContentChunkOrder)
+        ));
+    }
+
+    #[tokio::test]
+    async fn byte_store_rejects_invalid_inputs_before_database_access() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let invalid_digest = store
+            .put_content_chunk(
+                "user-1",
+                "session-1",
+                "artifact-1",
+                "sha256:bad",
+                b"bytes".to_vec(),
+            )
+            .await
+            .expect_err("invalid digest must be rejected locally");
+        assert!(matches!(
+            invalid_digest,
+            SessionArtifactStoreError::InvalidContentDigest(_)
+        ));
+
+        let invalid_order = store
+            .seal_byte_artifact(
+                "user-1",
+                "session-1",
+                "artifact-1",
+                vec![SessionArtifactContentChunkV1 {
+                    chunk_index: 1,
+                    digest: content_digest(b"bytes"),
+                    byte_size: 5,
+                }],
+                Vec::new(),
+            )
+            .await
+            .expect_err("non-contiguous chunks must be rejected locally");
+        assert!(matches!(
+            invalid_order,
+            SessionArtifactStoreError::InvalidContentChunkOrder
+        ));
     }
 }

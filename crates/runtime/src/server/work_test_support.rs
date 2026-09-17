@@ -13,6 +13,7 @@ pub(crate) async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
     for (table, owner_column) in [
         ("work_runtime_event_outbox_slots", "owner_id"),
         ("work_runtime_event_outbox", "owner_id"),
+        ("work_recovery_points", "owner_id"),
         ("work_item_attempts", "owner_id"),
         ("work_establishment_operations", "owner_id"),
         ("work_events", "owner_id"),

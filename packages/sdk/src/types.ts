@@ -2024,6 +2024,91 @@ export type WorkExecutionSwitchOperationV1 = {
   failure_code: string | null;
 };
 
+export type WorkRecoveryPointReasonV1 =
+  | "user_requested"
+  | "before_environment_change"
+  | "run_settled"
+  | "safe_boundary";
+
+export type WorkRecoveryPointStatusV1 =
+  | "preparing"
+  | "captured"
+  | "ready"
+  | "failed"
+  | "aborted";
+
+export type WorkRecoveryPointCoverageV1 = {
+  session_state: boolean;
+  work_state: boolean;
+  workspace: boolean;
+  run_frontier: boolean;
+  artifacts: boolean;
+};
+
+export type WorkRecoveryPointCapabilitiesV1 = {
+  can_restore_conversation: boolean;
+  can_continue_in_original_environment: boolean;
+  has_portable_workspace: boolean;
+  requires_target_environment_check: boolean;
+  requires_effect_review: boolean;
+};
+
+export type WorkRecoveryPointSessionCursorV1 = {
+  completed_turn: number;
+  journal_event_seq: number;
+  conversation_seq: number;
+  canonical_root_hash: string;
+  compaction_generation: number;
+};
+
+export type WorkRecoveryPointExecutionV1 = {
+  placement: WorkExecutionPlacementV1;
+  executor_id: string;
+  binding_generation: number;
+};
+
+export type WorkRecoveryPointV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  recovery_point_id: string;
+  request_id: string;
+  status: WorkRecoveryPointStatusV1;
+  reason: WorkRecoveryPointReasonV1;
+  created_at: string;
+  updated_at: string;
+  manifest_hash: WorkContentHash;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  goal_revision: number;
+  criteria_set_revision: number;
+  session_cursor: WorkRecoveryPointSessionCursorV1;
+  execution: WorkRecoveryPointExecutionV1;
+  coverage: WorkRecoveryPointCoverageV1;
+  capabilities: WorkRecoveryPointCapabilitiesV1;
+};
+
+export type WorkRecoveryPointCaptureInputV1 = {
+  requestId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+  reason?: WorkRecoveryPointReasonV1;
+};
+
+export type WorkRecoveryPointCursorV1 = {
+  created_at: string;
+  recovery_point_id: string;
+};
+
+export type WorkRecoveryPointPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  points: WorkRecoveryPointV1[];
+  next_cursor: WorkRecoveryPointCursorV1 | null;
+};
+
 export type WorkCatalogCursorV1 = {
   created_at: string;
   work_id: string;
@@ -2108,6 +2193,14 @@ export type WorkBranchAttachmentV1 = {
   attached_at: string;
   expires_at: string;
 };
+
+export type WorkAttachmentSurface =
+  | "cli"
+  | "tui"
+  | "web"
+  | "app"
+  | "server"
+  | "edge";
 
 export type WorkBranchControlBasisV1 = {
   writer_epoch: number;
@@ -2573,6 +2666,7 @@ export type WorkEventKind =
   | "run_delegated"
   | "run_failed"
   | "run_cancelled"
+  | "recovery_point_captured"
   | "runtime_events_expired";
 
 export type WorkEventRecordV1 = {
@@ -2921,6 +3015,22 @@ export type WorkApiErrorV1 = {
     | "work_attachment_capacity"
     | "attachment_fenced"
     | "attachment_in_use"
+    | "invalid_recovery_point_request"
+    | "invalid_recovery_point_query"
+    | "invalid_recovery_point_cursor"
+    | "invalid_recovery_point_id"
+    | "recovery_point_unavailable"
+    | "recovery_point_not_found"
+    | "recovery_point_request_conflict"
+    | "recovery_point_identity_conflict"
+    | "recovery_point_session_unavailable"
+    | "recovery_point_repair_required"
+    | "recovery_point_run_active"
+    | "recovery_point_turn_active"
+    | "recovery_point_effect_unresolved"
+    | "recovery_point_execution_changing"
+    | "recovery_point_basis_changed"
+    | "recovery_point_verification_unavailable"
     | "control_operation_terminal"
     | "control_operation_not_found"
     | "control_operation_unavailable"
@@ -2940,6 +3050,7 @@ export type WorkApiErrorV1 = {
     | "retry_read"
     | "retry_write"
     | "retry_attach"
+    | "review_effects"
   )[];
   request_id?: string;
 };

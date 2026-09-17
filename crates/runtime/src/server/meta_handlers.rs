@@ -393,6 +393,7 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
         memoria: memoria_health.label().to_string(),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: astra_core::history_work_baseline::BUILD_GIT_SHA.to_string(),
+        build_git_dirty: astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true",
     }
 }
 

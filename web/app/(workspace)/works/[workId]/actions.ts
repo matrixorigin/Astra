@@ -20,6 +20,7 @@ import {
   type WorkCriteriaProposalSummaryV1,
   type WorkReadCursorReceiptV1,
   type WorkTranscriptPageV1,
+  type WorkEventPageV1,
   type WorkPatchArtifactContent,
   type WorkPatchArtifactCursorV1,
   type WorkPatchArtifactPageV1,
@@ -138,6 +139,17 @@ export type RefreshWorkBranchActivityResult =
   | { ok: true; activity: WorkBranchActivityResponseV1 }
   | WorkActionError;
 
+/**
+ * The lightweight live cursor used by the Work detail page.  A Work event
+ * head is the shared cross-surface clock: polling it lets Web notice a turn
+ * started in TUI (or on another Edge) without loading the whole transcript on
+ * every tick.  The event page is read-only and never advances the user's
+ * seen cursor.
+ */
+export type RefreshWorkEventsResult =
+  | { ok: true; page: Pick<WorkEventPageV1, "work_id" | "event_head" | "events"> }
+  | WorkActionError;
+
 export type LoadWorkExecutionResult =
   | { ok: true; execution: WorkExecutionViewV1 }
   | WorkActionError;
@@ -191,6 +203,59 @@ export async function refreshWorkBranchActivityAction(
     return {
       ok: true,
       activity: await runtime.sdk.getWorkBranchActivity(input.workId, input.branchId),
+    };
+  } catch (error) {
+    const known = classifyWorkActionError(error);
+    if (known) return known;
+    throw error;
+  }
+}
+
+type RefreshWorkEventsInput = {
+  workId: string;
+  afterEventSeq: number;
+};
+
+function validWorkEventsInput(input: RefreshWorkEventsInput): boolean {
+  const value = input as unknown;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    Object.keys(object).sort().join("\0") === "afterEventSeq\0workId" &&
+    canonicalWorkIdentity(object.workId) &&
+    Number.isSafeInteger(object.afterEventSeq) &&
+    Number(object.afterEventSeq) >= 1
+  );
+}
+
+/** Read only the Work event head so every surface can converge on live state. */
+export async function refreshWorkEventsAction(
+  input: RefreshWorkEventsInput,
+): Promise<RefreshWorkEventsResult> {
+  if (!validWorkEventsInput(input)) {
+    return {
+      ok: false,
+      status: 400,
+      code: "invalid_work_events_query",
+      retryable: false,
+    };
+  }
+  try {
+    const runtime = await requireRuntimeClient({
+      auth: "required",
+      operation: "refresh Work events",
+    });
+    const page = await runtime.sdk.listWorkEvents(input.workId, {
+      afterEventSeq: input.afterEventSeq,
+      limit: 1,
+    });
+    return {
+      ok: true,
+      page: {
+        work_id: page.work_id,
+        event_head: page.event_head,
+        events: page.events,
+      },
     };
   } catch (error) {
     const known = classifyWorkActionError(error);

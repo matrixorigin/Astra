@@ -24,6 +24,7 @@ mod memory_ranking;
 mod memory_structure;
 mod provider_canonical_transition;
 mod provider_contract;
+mod recovery_point;
 mod result_quality;
 mod resume;
 mod runtime_scaffolding;
@@ -109,6 +110,14 @@ pub use provider_contract::{
     ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
     ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_METADATA_KEY,
     STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
+};
+pub use recovery_point::{
+    RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
+    RecoveryPointBindingStateV1, RecoveryPointCapabilityAssessmentV1,
+    RecoveryPointEnvironmentRequirementsV1, RecoveryPointExecutionBindingV1,
+    RecoveryPointExecutorKindV1, RecoveryPointManifestV1, RecoveryPointReasonV1,
+    RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,
+    RecoveryPointWorkspaceReferenceV1,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{

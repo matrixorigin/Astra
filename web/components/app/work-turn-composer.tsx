@@ -9,6 +9,11 @@ import {
   type WorkBranchControlOperationV2,
   type WorkTurnStreamEvent,
 } from "@astra/sdk";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { ArrowUp, RotateCcw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
@@ -24,6 +29,9 @@ type LocalMessage = { id: string; role: "user" | "assistant"; text: string };
 type PendingTurn = { requestId: string; message: string };
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 
+const markdownRemarkPlugins = [remarkGfm, remarkMath];
+const markdownRehypePlugins = [rehypeKatex, rehypeHighlight];
+
 function localTurnPath(workId: string, branchId: string) {
   return `/api/works/${encodeURIComponent(workId)}/branches/${encodeURIComponent(branchId)}/turns`;
 }
@@ -33,7 +41,7 @@ function takeoverPhaseLabel(operation: WorkBranchControlOperationV2) {
     case "awaiting_reauthentication":
       return "Confirming your identity";
     case "preparing":
-      return "Preparing a safe handoff";
+      return "Preparing to take control here";
     case "fencing":
       return "Stopping new work on the other device";
     case "sealing_effects":
@@ -41,7 +49,7 @@ function takeoverPhaseLabel(operation: WorkBranchControlOperationV2) {
     case "activating":
       return "Opening the Work here";
     default:
-      return "Moving this Work here";
+      return "Taking control here";
   }
 }
 
@@ -299,7 +307,7 @@ export function WorkTurnComposer({
     }
     if (operation.outcome === "aborted") {
       setConfirmingTakeover(false);
-      setError("The move was stopped. This Work is still active on the other device.");
+      setError("Taking control was stopped. Refresh to confirm the recorded Work status.");
       return;
     }
     if (operation.outcome === "head_conflict" && operation.control_basis) {
@@ -324,7 +332,7 @@ export function WorkTurnComposer({
       const result = await observeWorkBranchControlAction({ workId, branchId, operationId });
       if (!mounted.current || activeControlOperationId.current !== operationId) return;
       if (!result.ok) {
-        setError("The move is still recorded, but its progress could not be refreshed.");
+        setError("Could not refresh the recorded taking-control status. Refresh before trying again.");
         return;
       }
       setControlOperation(result.operation);
@@ -348,17 +356,17 @@ export function WorkTurnComposer({
         setControlOperation(null);
         setTakingControl(false);
         setConfirmingTakeover(false);
-        setError("The move was stopped. This Work is still active on the other device.");
+        setError("Taking control was stopped. Refresh to confirm the recorded Work status.");
       } else {
         setError(
           result.code === "control_operation_not_abortable"
-            ? "The safe handoff has already started and can no longer be stopped."
-            : "The move could not be stopped. Its durable status is unchanged.",
+            ? "Taking control has already started and cannot be stopped here. Refresh to see its status."
+            : "Could not confirm whether taking control stopped. Refresh to see the recorded status.",
         );
       }
     } catch {
       if (mounted.current && activeControlOperationId.current === operationId) {
-        setError("The stop request could not be confirmed. The durable move is unchanged.");
+        setError("Could not confirm whether taking control stopped. Refresh to see the recorded status.");
       }
     } finally {
       if (mounted.current) setAbortingControl(false);
@@ -374,7 +382,7 @@ export function WorkTurnComposer({
       await observeTakeover(operationId, turn);
     } catch {
       if (mounted.current) {
-        setError("The move is still recorded, but its progress could not be refreshed.");
+        setError("Could not refresh the recorded taking-control status. Refresh before trying again.");
       }
     } finally {
       if (mounted.current) setTakingControl(false);
@@ -422,11 +430,11 @@ export function WorkTurnComposer({
         }
         setError(
           result.status === 401
-            ? "Identity verification was not accepted or your sign-in expired. Nothing was moved."
+              ? "Identity verification was not accepted or your sign-in expired. The Work stayed on the other device."
             : result.code === "reauthentication_required" || result.status === 403
-              ? "Identity verification was not accepted. Nothing was moved."
+              ? "Identity verification was not accepted. The Work stayed on the other device."
             : result.retryable
-              ? "This Work could not move here yet. You can safely try again."
+              ? "This Work could not be continued here yet. You can safely try again."
               : "This Work could not continue on this device.",
         );
         return;
@@ -437,14 +445,14 @@ export function WorkTurnComposer({
       if (operation.state === "pending") {
         activeControlOperationId.current = operation.operation_id;
         setControlOperation(operation);
-        setError("Moving this Work here…");
+        setError("Taking control here…");
         await observeTakeover(operation.operation_id, turn);
         return;
       }
       finishTakeover(operation, turn);
     } catch {
       if (mounted.current) {
-        setError("The move could not be confirmed. You can safely try the same action again.");
+        setError("Taking control could not be confirmed. Refresh to see the recorded status before retrying.");
       }
     } finally {
       if (mounted.current) setTakingControl(false);
@@ -464,9 +472,18 @@ export function WorkTurnComposer({
               <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-text-muted">
                 {message.role === "user" ? "You" : "Astra"}
               </p>
-              <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-text">
-                {message.text || (busy ? "Working…" : "")}
-              </p>
+              {message.text ? (
+                <div className="astra-markdown mt-1 text-sm leading-6 text-text">
+                  <ReactMarkdown
+                    remarkPlugins={markdownRemarkPlugins}
+                    rehypePlugins={markdownRehypePlugins}
+                  >
+                    {message.text}
+                  </ReactMarkdown>
+                </div>
+              ) : busy ? (
+                <p className="mt-1 text-sm leading-6 text-text-muted">Working…</p>
+              ) : null}
             </div>
           ))}
         </div>
@@ -502,7 +519,7 @@ export function WorkTurnComposer({
                         onClick={() => void abortTakeover()}
                         disabled={abortingControl}
                       >
-                        {abortingControl ? "Stopping…" : "Stop moving"}
+                        {abortingControl ? "Stopping…" : "Stop taking control"}
                       </Button>
                     ) : null}
                   </div>
@@ -538,7 +555,7 @@ export function WorkTurnComposer({
                         onClick={() => void continueHere()}
                         disabled={takingControl || takeoverPassword.length === 0}
                       >
-                        {takingControl ? "Moving…" : "Confirm"}
+                        {takingControl ? "Taking control…" : "Confirm"}
                       </Button>
                       <Button
                         size="sm"

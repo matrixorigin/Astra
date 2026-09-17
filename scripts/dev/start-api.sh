@@ -5,6 +5,9 @@ set -e
 
 PID_FILE="api_server.pid"
 LOG_FILE="api_server.log"
+REPO_ROOT="$(pwd -P)"
+# shellcheck source=../lib/api_identity.sh
+. "$REPO_ROOT/scripts/lib/api_identity.sh"
 
 BUILD_MODE="${BUILD_MODE:-release}"
 if [ "$BUILD_MODE" = "debug" ]; then
@@ -36,15 +39,6 @@ case "$CURRENT_NOFILE" in
         fi
         ;;
 esac
-
-# Check if already running
-if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
-    echo "⚠️  API server already running (PID: $(cat $PID_FILE))"
-    exit 0
-fi
-
-# Clean up old process record
-rm -f "$PID_FILE"
 
 # Load the selected env file early so DB host/port are available for the
 # readiness check. ASTRA_ENV_FILE lets cross-repository local harnesses use an
@@ -79,6 +73,97 @@ DB_PORT="${MATRIXONE_PORT:-6001}"
 HEALTH_URL="http://127.0.0.1:${API_PORT}/health"
 READY_URL="http://127.0.0.1:${API_PORT}/ready"
 
+# A ready process is reusable only when its process identity, source revision,
+# and checkout state are provable. Reusing a healthy process from another
+# worktree makes the Web UI send a newer Work contract to an older Server,
+# which then reports a misleading invalid JSON request. The health response
+# carries the build identity; the process cwd closes the same-commit,
+# different-worktree gap. A dirty checkout is never silently reused because
+# the health contract does not expose the uncommitted source identity.
+api_build_git_sha() {
+    NO_PROXY=localhost,127.0.0.1 curl -s \
+        --connect-timeout 1 --max-time 2 "$HEALTH_URL" 2>/dev/null |
+        api_health_build_git_sha
+}
+
+api_build_git_dirty() {
+    NO_PROXY=localhost,127.0.0.1 curl -s \
+        --connect-timeout 1 --max-time 2 "$HEALTH_URL" 2>/dev/null |
+        api_health_build_git_dirty
+}
+
+current_git_sha() {
+    git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || true
+}
+
+checkout_is_clean() {
+    [ -z "$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=no 2>/dev/null)" ]
+}
+
+checkout_git_dirty() {
+    if checkout_is_clean; then
+        printf 'false\n'
+    else
+        printf 'true\n'
+    fi
+}
+
+process_cwd() {
+    local pid=$1
+    local cwd
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+    if [ -z "$cwd" ] && command -v lsof >/dev/null 2>&1; then
+        cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)
+    fi
+    printf '%s\n' "$cwd"
+}
+
+process_is_this_checkout() {
+    local pid=$1
+    local cwd
+    [ -n "$pid" ] || return 1
+    cwd=$(process_cwd "$pid")
+    [ -n "$cwd" ] && [ "$cwd" = "$REPO_ROOT" ]
+}
+
+api_build_matches_head() {
+    local expected actual
+    expected=$(current_git_sha)
+    actual=$(api_build_git_sha)
+    [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" = "$actual" ]
+}
+
+api_reusable() {
+    local pid=$1
+    process_is_this_checkout "$pid" &&
+        api_build_matches_head &&
+        [ "$(api_build_git_dirty)" = "false" ] &&
+        checkout_is_clean
+}
+
+api_started_from_this_checkout() {
+    local pid=$1
+    kill -0 "$pid" 2>/dev/null &&
+        api_build_matches_head &&
+        [ "$(api_build_git_dirty)" = "$(checkout_git_dirty)" ]
+}
+
+api_identity_mismatch() {
+    api_health_identity_mismatch_from_url \
+        "$(current_git_sha)" "$(checkout_git_dirty)" "$HEALTH_URL"
+}
+
+prepare_build_identity() {
+    export ASTRA_BUILD_SOURCE_GIT_SHA="$(current_git_sha)"
+    export ASTRA_BUILD_SOURCE_GIT_DIRTY="$(checkout_git_dirty)"
+}
+
+existing_api_pid() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1
+    fi
+}
+
 # Startup readiness is owned by the core API dependency: the primary
 # database.  Optional capabilities (currently Memoria) are reported by
 # /health as degraded and must not prevent a usable API from starting.
@@ -90,13 +175,37 @@ api_ready() {
     [ "$status" = "200" ]
 }
 
+# A PID file is only an optimization. Never let it turn a process from an
+# earlier checkout or commit into the API for this one.
+if [ -f "$PID_FILE" ]; then
+    PID_FROM_FILE=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+    if [ -n "$PID_FROM_FILE" ] && kill -0 "$PID_FROM_FILE" 2>/dev/null; then
+        if api_ready && api_reusable "$PID_FROM_FILE"; then
+            echo "⚠️  API server already ready for this checkout (PID: $PID_FROM_FILE)"
+            exit 0
+        fi
+        if process_is_this_checkout "$PID_FROM_FILE"; then
+            echo "❌ API server PID $PID_FROM_FILE belongs to this checkout but cannot be safely reused."
+            echo "   Stop it with 'make dev-api-stop', then start the API again."
+            exit 1
+        fi
+        echo "⚠️  Ignoring stale API PID file: $PID_FILE"
+    fi
+    rm -f "$PID_FILE"
+fi
+
 # Recover from an earlier launcher losing its PID after the server became
 # ready (notably the macOS screen branch). Starting a second server would
 # only produce a misleading bind failure while the first instance is usable.
 if api_ready; then
-    EXISTING_PID=""
-    if command -v lsof >/dev/null 2>&1; then
-        EXISTING_PID=$(lsof -nP -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)
+    EXISTING_PID="$(existing_api_pid)"
+    if [ -z "$EXISTING_PID" ] || ! api_reusable "$EXISTING_PID"; then
+        echo "❌ API port $API_PORT is served by a Server that cannot be proven to belong to this checkout."
+        echo "   Current checkout: $(current_git_sha)"
+        echo "   Running build:    $(api_build_git_sha || echo unknown)"
+        echo "   Running source:   $(api_build_git_dirty || echo unknown)"
+        echo "   Stop that Server, then restart it from this checkout before opening Web."
+        exit 1
     fi
     if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
         echo "$EXISTING_PID" > "$PID_FILE"
@@ -124,7 +233,13 @@ for i in {1..15}; do
 done
 
 # Skip build entirely with SKIP_BUILD=1 for fast iteration.
+prepare_build_identity
 if [ "${SKIP_BUILD:-}" = "1" ] && [ -f "$BIN_PATH" ]; then
+    if ! checkout_is_clean; then
+        echo "❌ SKIP_BUILD=1 cannot safely start a binary from a dirty checkout."
+        echo "   Rebuild without SKIP_BUILD so the Server records the current source state."
+        exit 1
+    fi
     echo "⏩ Skipping build (SKIP_BUILD=1)"
 elif [ "$BUILD_MODE" = "debug" ]; then
     echo "Building debug API binary..."
@@ -217,19 +332,33 @@ fi
 # capability is unavailable.
 echo "Waiting for API readiness (timeout: ${API_START_TIMEOUT_SECONDS}s)..."
 START_SECONDS=$SECONDS
+STARTUP_IDENTITY_MISMATCH=0
 while [ $((SECONDS - START_SECONDS)) -lt "$API_START_TIMEOUT_SECONDS" ]; do
     if ! kill -0 "$PID" 2>/dev/null; then
         break
     fi
     if api_ready; then
-        echo "✅ API server started (PID: $PID, port: $API_PORT)"
-        exit 0
+        if api_started_from_this_checkout "$PID"; then
+            echo "✅ API server started (PID: $PID, port: $API_PORT)"
+            exit 0
+        fi
+        if api_identity_mismatch; then
+            STARTUP_IDENTITY_MISMATCH=1
+            break
+        fi
     fi
     sleep "$API_HEALTH_INTERVAL_SECONDS"
 done
 
 if kill -0 "$PID" 2>/dev/null; then
-    echo "❌ API server did not become ready in time"
+    if [ "$STARTUP_IDENTITY_MISMATCH" -eq 1 ]; then
+        echo "❌ API server started, but its build identity does not match this checkout"
+        echo "   Current checkout: $(current_git_sha)"
+        echo "   Running build:    $(api_build_git_sha || echo unknown)"
+        echo "   Running source:   $(api_build_git_dirty || echo unknown)"
+    else
+        echo "❌ API server did not become ready in time"
+    fi
     echo "Last /ready response:"
     NO_PROXY=localhost,127.0.0.1 curl -sS --connect-timeout 1 --max-time 2 \
         "$READY_URL" 2>/dev/null || true
@@ -238,7 +367,7 @@ if kill -0 "$PID" 2>/dev/null; then
         "$HEALTH_URL" 2>/dev/null || true
     echo "Recent API log:"
     tail -20 "$LOG_FILE" 2>/dev/null || true
-    echo "Stopping unready API server (PID: $PID)..."
+    echo "Stopping API server (PID: $PID)..."
     kill "$PID" 2>/dev/null || true
     for _ in {1..20}; do
         if ! kill -0 "$PID" 2>/dev/null; then

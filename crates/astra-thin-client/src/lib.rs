@@ -27,7 +27,10 @@ pub use astra_server_types::{
     WorkCreateCriterionV1, WorkCreateRequestV1, WorkExecutionPlacementV1, WorkExecutionStateV1,
     WorkExecutionSwitchOperationV1, WorkExecutionSwitchRequestV1,
     WorkExecutionSwitchRetryRequestV1, WorkExecutionSwitchStateV1, WorkExecutionTargetPageV1,
-    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1, WorkTurnRequestV1,
+    WorkExecutionTargetRequestV1, WorkExecutionTargetV1, WorkExecutionViewV1,
+    WorkRecoveryPointCaptureRequestV1, WorkRecoveryPointCursorV1, WorkRecoveryPointPageV1,
+    WorkRecoveryPointReasonV1, WorkRecoveryPointStatusV1, WorkRecoveryPointViewV1,
+    WorkTurnRequestV1,
 };
 pub use client::ThinClient;
 pub use device_proof::{
@@ -53,6 +56,7 @@ pub use protocol::{
 /// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;
 pub use work::{
+    WorkCatalogAttentionV1, WorkCatalogCursorV1, WorkCatalogEntryV1, WorkCatalogPageV1,
     WorkItemDeliveryBlockerKindV2, WorkItemDeliveryStatusV2, WorkItemExecutionStatusV2,
     WorkItemVerificationStatusV2, WorkTaskGraphBasisV2, WorkTaskGraphCursorV2,
     WorkTaskGraphDependencyV2, WorkTaskGraphItemV2, WorkTaskGraphPageV2,

@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v78";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-17-v81";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -8459,7 +8459,7 @@ async fn ensure_core_schema_while_leased(
             reference_id VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_artifact_reference_kind CHECK (
-                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation')
+                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation', 'recovery_point')
             ),
             PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
             INDEX idx_artifact_references_owner_reference
@@ -8497,6 +8497,171 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE session_artifact_references ADD INDEX idx_artifact_references_owner_reference (user_id, session_id, reference_kind, reference_id, artifact_id)",
     )
     .await?;
+
+    // Byte payloads are content-addressed and owner-scoped.  The catalog and
+    // its durable references remain the authority for access and retention;
+    // these rows only hold deduplicated bytes and the artifact-to-content
+    // edges needed by the verifier and garbage collector.
+    core_schema_create!(
+        pool,
+        "session_artifact_content_chunks",
+        "CREATE TABLE IF NOT EXISTS session_artifact_content_chunks (
+            user_id VARCHAR(128) NOT NULL,
+            content_digest CHAR(71) NOT NULL,
+            byte_size BIGINT UNSIGNED NOT NULL,
+            content LONGBLOB NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, content_digest),
+            INDEX idx_artifact_content_chunks_updated (user_id, updated_at, content_digest)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_chunks",
+        &["user_id", "content_digest"],
+        "ALTER TABLE session_artifact_content_chunks ADD PRIMARY KEY (user_id, content_digest)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_chunks",
+        "idx_artifact_content_chunks_updated",
+        &["user_id", "updated_at", "content_digest"],
+        "ALTER TABLE session_artifact_content_chunks ADD INDEX idx_artifact_content_chunks_updated (user_id, updated_at, content_digest)",
+    )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_artifact_content_refs",
+        "CREATE TABLE IF NOT EXISTS session_artifact_content_refs (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            chunk_index BIGINT UNSIGNED NOT NULL,
+            content_digest CHAR(71) NOT NULL,
+            byte_size BIGINT UNSIGNED NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, artifact_id, chunk_index),
+            INDEX idx_artifact_content_refs_digest (user_id, content_digest)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_refs",
+        &["user_id", "session_id", "artifact_id", "chunk_index"],
+        "ALTER TABLE session_artifact_content_refs ADD PRIMARY KEY (user_id, session_id, artifact_id, chunk_index)",
+    )
+    .await?;
+    for (index, expected_columns, ddl) in [(
+        "idx_artifact_content_refs_digest",
+        &["user_id", "content_digest"][..],
+        "ALTER TABLE session_artifact_content_refs ADD INDEX idx_artifact_content_refs_digest (user_id, content_digest)",
+    )] {
+        ensure_index_shape(
+            &pool,
+            &settings.database,
+            "session_artifact_content_refs",
+            index,
+            expected_columns,
+            ddl,
+        )
+        .await?;
+    }
+
+    core_schema_create!(
+        pool,
+        "session_artifact_content_upload_leases",
+        "CREATE TABLE IF NOT EXISTS session_artifact_content_upload_leases (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, artifact_id),
+            INDEX idx_artifact_content_upload_leases_expiry
+                (user_id, expires_at, session_id, artifact_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_upload_leases",
+        &["user_id", "session_id", "artifact_id"],
+        "ALTER TABLE session_artifact_content_upload_leases ADD PRIMARY KEY (user_id, session_id, artifact_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_upload_leases",
+        "idx_artifact_content_upload_leases_expiry",
+        &["user_id", "expires_at", "session_id", "artifact_id"],
+        "ALTER TABLE session_artifact_content_upload_leases ADD INDEX idx_artifact_content_upload_leases_expiry (user_id, expires_at, session_id, artifact_id)",
+    )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_artifact_content_reservations",
+        "CREATE TABLE IF NOT EXISTS session_artifact_content_reservations (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            content_digest CHAR(71) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, artifact_id, content_digest),
+            INDEX idx_artifact_content_reservations_expiry
+                (user_id, expires_at, content_digest),
+            INDEX idx_artifact_content_reservations_digest
+                (user_id, content_digest, expires_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_content_reservations",
+        &["user_id", "session_id", "artifact_id", "content_digest"],
+        "ALTER TABLE session_artifact_content_reservations ADD PRIMARY KEY (user_id, session_id, artifact_id, content_digest)",
+    )
+    .await?;
+    for (index, expected_columns, ddl) in [
+        (
+            "idx_artifact_content_reservations_expiry",
+            &["user_id", "expires_at", "content_digest"][..],
+            "ALTER TABLE session_artifact_content_reservations ADD INDEX idx_artifact_content_reservations_expiry (user_id, expires_at, content_digest)",
+        ),
+        (
+            "idx_artifact_content_reservations_digest",
+            &["user_id", "content_digest", "expires_at"][..],
+            "ALTER TABLE session_artifact_content_reservations ADD INDEX idx_artifact_content_reservations_digest (user_id, content_digest, expires_at)",
+        ),
+    ] {
+        ensure_index_shape(
+            &pool,
+            &settings.database,
+            "session_artifact_content_reservations",
+            index,
+            expected_columns,
+            ddl,
+        )
+        .await?;
+    }
 
     for (table, column, ddl) in [
         (

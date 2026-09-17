@@ -27,20 +27,43 @@ const EVENT_LABELS: Record<WorkEventKind, string> = {
   run_delegated: "Astra delegated the next workstream",
   run_failed: "The latest run stopped with an error",
   run_cancelled: "The latest run was cancelled",
-  runtime_events_expired: "Some older runtime updates expired before projection",
+  recovery_point_captured: "Progress saved",
+  runtime_events_expired:
+    "Some older runtime updates expired before projection",
 };
 
 export function WorkActivityCard({
+  id,
   workId,
   activity,
 }: {
+  id?: string;
   workId: string;
   activity: WorkActivitySnapshot;
 }) {
   const attemptedHead = useRef(0);
+  const attemptedWorkId = useRef(workId);
+  const visibleWorkId = useRef(workId);
   const [syncDeferred, setSyncDeferred] = useState(false);
+  const [visibleActivity, setVisibleActivity] = useState(activity);
 
   useEffect(() => {
+    if (visibleWorkId.current !== workId) {
+      visibleWorkId.current = workId;
+      setVisibleActivity(activity);
+    } else if (activity.events.length > 0) {
+      // Keep the bounded updates on screen even after the read cursor is
+      // acknowledged.  A background page refresh must not make the update
+      // disappear before the user can read it.
+      setVisibleActivity(activity);
+    }
+  }, [activity, workId]);
+
+  useEffect(() => {
+    if (attemptedWorkId.current !== workId) {
+      attemptedWorkId.current = workId;
+      attemptedHead.current = 0;
+    }
     if (
       activity.unseenCount === 0 ||
       attemptedHead.current >= activity.eventHead
@@ -57,22 +80,25 @@ export function WorkActivityCard({
       .catch(() => setSyncDeferred(true));
   }, [activity.eventHead, activity.unseenCount, workId]);
 
-  if (activity.unseenCount === 0) return null;
+  if (visibleActivity.events.length === 0) return null;
+  const hasUnseen = activity.unseenCount > 0;
 
   return (
-    <Card className="overflow-hidden p-0">
+    <Card id={id} className="scroll-mt-6 overflow-hidden p-0">
       <div className="flex items-start gap-3 border-b border-border/70 px-5 py-4">
         <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">
           <History className="size-4" />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold text-text">Since your last visit</h2>
+            <h2 className="text-sm font-semibold text-text">
+              {hasUnseen ? "Since your last visit" : "Recent activity"}
+            </h2>
             <span className="text-xs tabular-nums text-text-muted">
-              {activity.unseenCount} new
+              {hasUnseen ? `${activity.unseenCount} new` : "Recorded here"}
             </span>
           </div>
-          {activity.truncated ? (
+          {visibleActivity.truncated ? (
             <p className="mt-1 text-xs leading-5 text-text-muted">
               Showing the latest {activity.events.length} updates.
             </p>
@@ -85,8 +111,11 @@ export function WorkActivityCard({
         </div>
       </div>
       <ol className="divide-y divide-border/60">
-        {[...activity.events].reverse().map((event) => (
-          <li key={event.event_seq} className="flex items-center gap-3 px-5 py-3 text-sm">
+        {[...visibleActivity.events].reverse().map((event) => (
+          <li
+            key={event.event_seq}
+            className="flex items-center gap-3 px-5 py-3 text-sm"
+          >
             <span className="size-1.5 shrink-0 rounded-full bg-accent" />
             <span className="min-w-0 flex-1 text-text-secondary">
               {EVENT_LABELS[event.kind]}

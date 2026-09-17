@@ -230,6 +230,10 @@ impl BottomPaneView for ListSelectionView {
         None
     }
 
+    fn slash_reclaims_focus(&self) -> bool {
+        true
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         self.completed = true;
         CancellationEvent::Consumed

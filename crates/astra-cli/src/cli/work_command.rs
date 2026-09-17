@@ -129,6 +129,8 @@ async fn run_work_turn(
             branch_id,
             &WorkBranchAttachRequestV1 {
                 request_id: request_id("attach"),
+                client_id: None,
+                surface: astra_turn_types::SessionSurfaceV1::Cli,
             },
         )
         .await
@@ -178,12 +180,33 @@ async fn run_work_turn(
     Ok(())
 }
 
-async fn release_work_controller(
+pub(crate) async fn release_work_controller(
     api: &ThinClient,
     token: &str,
     work_id: &str,
     branch_id: &str,
     controller_attachment_id: &str,
+) -> Result<(), String> {
+    release_work_controller_with_client(
+        api,
+        token,
+        work_id,
+        branch_id,
+        controller_attachment_id,
+        None,
+        astra_turn_types::SessionSurfaceV1::Cli,
+    )
+    .await
+}
+
+pub(crate) async fn release_work_controller_with_client(
+    api: &ThinClient,
+    token: &str,
+    work_id: &str,
+    branch_id: &str,
+    controller_attachment_id: &str,
+    client_id: Option<&str>,
+    surface: astra_turn_types::SessionSurfaceV1,
 ) -> Result<(), String> {
     let observer = api
         .post_work_branch_attachment(
@@ -192,6 +215,8 @@ async fn release_work_controller(
             branch_id,
             &WorkBranchAttachRequestV1 {
                 request_id: request_id("release-basis"),
+                client_id: client_id.map(str::to_owned),
+                surface,
             },
         )
         .await

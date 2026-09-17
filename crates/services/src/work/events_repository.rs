@@ -173,6 +173,7 @@ async fn prune_expired_event_fact(
         | WorkEventKind::RunDelegated
         | WorkEventKind::RunFailed
         | WorkEventKind::RunCancelled
+        | WorkEventKind::RecoveryPointCaptured
         | WorkEventKind::RuntimeEventsExpired => None,
     };
     if let Some((statement, entity)) = deletion {

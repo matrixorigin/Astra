@@ -65,6 +65,7 @@ import type {
   WorkCatalogCursorV1,
   WorkCatalogPageV1,
   WorkBranchAttachmentV1,
+  WorkAttachmentSurface,
   WorkArchivedBranchListParamsV1,
   WorkArchivedBranchPageV1,
   WorkBranchControlBasisV1,
@@ -112,6 +113,10 @@ import type {
   WorkExecutionViewV1,
   WorkExecutionTargetPageV1,
   WorkExecutionSwitchOperationV1,
+  WorkRecoveryPointCaptureInputV1,
+  WorkRecoveryPointCursorV1,
+  WorkRecoveryPointPageV1,
+  WorkRecoveryPointV1,
   WorkTurnInput,
   WorkTurnStreamEvent,
 } from "./types";
@@ -206,6 +211,8 @@ import {
   workBranchExecutionSwitchesPath,
   workBranchExecutionSwitchPath,
   workBranchExecutionSwitchRetryPath,
+  workBranchRecoveryPointsPath,
+  workBranchRecoveryPointPath,
   workSessionBindingPath,
   workBranchCriteriaProposalsPath,
   workBranchCriteriaProposalPath,
@@ -255,6 +262,8 @@ import {
   decodeWorkExecutionViewV1,
   decodeWorkExecutionTargetPageV1,
   decodeWorkExecutionSwitchOperationV1,
+  decodeWorkRecoveryPointV1,
+  decodeWorkRecoveryPointPageV1,
   decodeWorkTurnStreamEventV1,
 } from "./work-wire";
 
@@ -267,6 +276,24 @@ function assertWorkRequestId(value: string): void {
     throw new TypeError(
       "requestId must be non-empty, control-free, and at most 256 UTF-8 bytes",
     );
+  }
+}
+
+function assertWorkRecoveryRequestId(value: string): void {
+  assertWorkRequestId(value);
+  if (/\s/u.test(value)) {
+    throw new TypeError("requestId must not contain whitespace for a recovery point");
+  }
+}
+
+function assertWorkClientId(value: string): void {
+  const bytes = new TextEncoder().encode(value).length;
+  if (
+    bytes === 0 ||
+    bytes > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(value)
+  ) {
+    throw new TypeError("clientId must be non-empty, canonical, and at most 128 UTF-8 bytes");
   }
 }
 
@@ -969,6 +996,113 @@ export class AstraClient {
     return page;
   }
 
+  /** Record the current stable Work/Session boundary without claiming a restore. */
+  async captureWorkBranchRecoveryPoint(
+    workId: string,
+    branchId: string,
+    input: WorkRecoveryPointCaptureInputV1,
+  ): Promise<WorkRecoveryPointV1> {
+    assertWorkRecoveryRequestId(input.requestId);
+    if (
+      !Number.isSafeInteger(input.expectedWorkRevision) ||
+      input.expectedWorkRevision < 1 ||
+      !Number.isSafeInteger(input.expectedBranchRevision) ||
+      input.expectedBranchRevision < 1
+    ) {
+      throw new TypeError("expected Work and branch revisions must be positive safe integers");
+    }
+    if (
+      input.reason !== undefined &&
+      ![
+        "user_requested",
+        "before_environment_change",
+        "run_settled",
+        "safe_boundary",
+      ].includes(input.reason)
+    ) {
+      throw new TypeError("reason is not a supported recovery point reason");
+    }
+    const raw = await this.post<unknown>(
+      workBranchRecoveryPointsPath(workId, branchId),
+      {
+        request_id: input.requestId,
+        expected_work_revision: input.expectedWorkRevision,
+        expected_branch_revision: input.expectedBranchRevision,
+        reason: input.reason ?? "user_requested",
+      },
+      { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const point = decodeWorkRecoveryPointV1(raw);
+    if (point.work_id !== workId || point.branch_id !== branchId) {
+      throw new TypeError("recovery point identity disagrees with the requested branch");
+    }
+    return point;
+  }
+
+  /** List immutable progress records using the server's keyset cursor. */
+  async listWorkBranchRecoveryPoints(
+    workId: string,
+    branchId: string,
+    options: { cursor?: WorkRecoveryPointCursorV1; limit?: number } = {},
+  ): Promise<WorkRecoveryPointPageV1> {
+    if (
+      options.limit !== undefined &&
+      (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 256)
+    ) {
+      throw new TypeError("limit must be a safe integer between 1 and 256");
+    }
+    if (options.cursor !== undefined) {
+      if (!/^[A-Za-z0-9._-]+$/u.test(options.cursor.recovery_point_id)) {
+        throw new TypeError("cursor.recovery_point_id is not canonical");
+      }
+      if (
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(
+          options.cursor.created_at,
+        ) ||
+        !Number.isFinite(Date.parse(options.cursor.created_at))
+      ) {
+        throw new TypeError("cursor.created_at must be an RFC 3339 UTC timestamp");
+      }
+    }
+    const raw = await this.fetch<unknown>(
+      `${workBranchRecoveryPointsPath(workId, branchId)}${buildQueryString({
+        before_created_at: options.cursor?.created_at,
+        before_recovery_point_id: options.cursor?.recovery_point_id,
+        limit: options.limit,
+      })}`,
+      {
+        cache: "no-store",
+        headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
+      },
+    );
+    const page = decodeWorkRecoveryPointPageV1(raw);
+    if (page.work_id !== workId || page.branch_id !== branchId) {
+      throw new TypeError("recovery point page identity disagrees with the requested branch");
+    }
+    return page;
+  }
+
+  /** Read one immutable progress record without changing Work authority. */
+  async getWorkBranchRecoveryPoint(
+    workId: string,
+    branchId: string,
+    recoveryPointId: string,
+  ): Promise<WorkRecoveryPointV1> {
+    const raw = await this.fetch<unknown>(
+      workBranchRecoveryPointPath(workId, branchId, recoveryPointId),
+      { cache: "no-store", headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
+    );
+    const point = decodeWorkRecoveryPointV1(raw);
+    if (
+      point.work_id !== workId ||
+      point.branch_id !== branchId ||
+      point.recovery_point_id !== recoveryPointId
+    ) {
+      throw new TypeError("recovery point identity disagrees with the requested resource");
+    }
+    return point;
+  }
+
   /** Request an Edge→Edge handoff using one controller attachment and CAS generation. */
   async switchWorkBranchExecution(
     workId: string,
@@ -1504,12 +1638,30 @@ export class AstraClient {
   async attachWorkBranch(
     workId: string,
     branchId: string,
-    input: { requestId: string },
+    input: {
+      requestId: string;
+      clientId?: string;
+      surface: WorkAttachmentSurface;
+    },
   ): Promise<WorkBranchAttachmentV1> {
     assertWorkRequestId(input.requestId);
+    if (input.clientId !== undefined) {
+      assertWorkClientId(input.clientId);
+    }
+    const body: {
+      request_id: string;
+      client_id?: string;
+      surface: WorkAttachmentSurface;
+    } = {
+      request_id: input.requestId,
+      surface: input.surface,
+    };
+    if (input.clientId !== undefined) {
+      body.client_id = input.clientId;
+    }
     const raw = await this.post<unknown>(
       workBranchAttachmentsPath(workId, branchId),
-      { request_id: input.requestId },
+      body,
       { headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR } },
     );
     const attachment = decodeWorkBranchAttachmentV1(raw);

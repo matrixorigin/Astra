@@ -4,6 +4,9 @@ export const API_URL_COOKIE = 'astra_api_url';
 export const ACCESS_TOKEN_COOKIE = 'astra_access_token';
 export const REFRESH_TOKEN_COOKIE = 'astra_refresh_token';
 export const DEMO_MODE_COOKIE = 'astra_demo_mode';
+/** Stable browser instance identity used to isolate Work read attachments. */
+export const WEB_CLIENT_ID_COOKIE = 'astra_web_client_id';
+export const WEB_CLIENT_ID_HEADER = 'x-astra-web-client-id';
 
 export type WebDataMode = 'live' | 'demo' | 'unconfigured';
 
