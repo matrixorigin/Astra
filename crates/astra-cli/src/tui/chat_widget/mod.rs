@@ -3859,13 +3859,26 @@ impl ChatWidget {
                         AgentLiveTermination::Interrupted => "interrupted",
                         AgentLiveTermination::Cancelled => "cancelled",
                     };
-                    // A terminal reason is status detail, not a replacement
-                    // for findings already streamed by the run. Keep the
-                    // live output when it exists; the reason remains visible
-                    // through the error/detail field passed to `complete`.
-                    let summary = cell.output_summary.clone().or(reason.clone());
+                    // Success/delegation/cancellation reasons are terminal
+                    // status detail, not errors. Keep them visible in the
+                    // summary without replacing findings already streamed by
+                    // the run. Failure/interruption reasons stay in the
+                    // dedicated error field and never duplicate the output.
+                    let (summary, error) = match termination {
+                        AgentLiveTermination::Completed
+                        | AgentLiveTermination::Delegated
+                        | AgentLiveTermination::Cancelled => {
+                            if let Some(reason) = reason.as_deref() {
+                                append_terminal_reason_preserving_output(cell, reason);
+                            }
+                            (cell.output_summary.clone(), None)
+                        }
+                        AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => {
+                            (cell.output_summary.clone(), reason)
+                        }
+                    };
                     let elapsed = cell.started_at.elapsed().as_millis() as u64;
-                    cell.complete(status_str, elapsed.max(duration_ms), summary, reason);
+                    cell.complete(status_str, elapsed.max(duration_ms), summary, error);
                 }
             }
         }
@@ -9226,8 +9239,11 @@ mod tests {
             crate::tui::history_cell::task::TaskStatus::Cancelled,
             "list and detail must agree that user cancellation is not failure"
         );
-        assert_eq!(row.output_summary.as_deref(), Some("running"));
-        assert_eq!(row.error.as_deref(), Some("user cancellation"));
+        assert_eq!(
+            row.output_summary.as_deref(),
+            Some("running\nuser cancellation")
+        );
+        assert_eq!(row.error, None);
         let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows[0].state.status, AgentRunStatus::Cancelled);
     }
@@ -9267,6 +9283,7 @@ mod tests {
 
         for (index, termination) in [
             AgentLiveTermination::Completed,
+            AgentLiveTermination::Delegated,
             AgentLiveTermination::Failed,
             AgentLiveTermination::Interrupted,
             AgentLiveTermination::Cancelled,
@@ -9294,16 +9311,32 @@ mod tests {
             let detail = widget
                 .agent_run_cell(&agent_id)
                 .expect("terminal projection remains inspectable");
+            let expected_output = match termination {
+                AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => "live finding",
+                AgentLiveTermination::Completed
+                | AgentLiveTermination::Delegated
+                | AgentLiveTermination::Cancelled => "live finding\nterminal reason",
+            };
             assert_eq!(
                 detail.output_summary.as_deref(),
-                Some("live finding"),
+                Some(expected_output),
                 "{termination:?} must retain live output"
             );
-            assert_eq!(
-                detail.error.as_deref(),
-                Some("terminal reason"),
-                "{termination:?} must keep the terminal reason visible"
-            );
+            let expected_error = match termination {
+                AgentLiveTermination::Failed | AgentLiveTermination::Interrupted => {
+                    Some("terminal reason")
+                }
+                AgentLiveTermination::Completed
+                | AgentLiveTermination::Delegated
+                | AgentLiveTermination::Cancelled => None,
+            };
+            assert_eq!(detail.error.as_deref(), expected_error, "{termination:?}");
+            if matches!(
+                termination,
+                AgentLiveTermination::Completed | AgentLiveTermination::Delegated
+            ) {
+                assert_eq!(detail.status, TaskStatus::Completed);
+            }
         }
     }
 

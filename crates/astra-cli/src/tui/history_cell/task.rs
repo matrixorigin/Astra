@@ -151,8 +151,9 @@ impl TaskCell {
     }
 
     /// Terminal transition for the parent task. `status_str` follows
-    /// the shared canonical tool-result convention:
-    /// `"completed"` = green, anything else except `"skipped"` = failed.
+    /// the shared canonical tool-result convention. Agent delegation is
+    /// also a successful terminal outcome, so `"delegated"` renders like
+    /// `"completed"` instead of falling through to failure.
     pub fn complete(
         &mut self,
         status_str: &str,
@@ -163,6 +164,7 @@ impl TaskCell {
         self.status = match status_str {
             "interrupted" => TaskStatus::Interrupted,
             "cancelled" => TaskStatus::Cancelled,
+            "delegated" => TaskStatus::Completed,
             status if tool_result_status_is_success(status) => TaskStatus::Completed,
             _ => TaskStatus::Failed,
         };
@@ -612,6 +614,17 @@ mod tests {
         let mut t = TaskCell::new_running("tu_parent", "do work");
         t.complete("ok", 2500, Some("3 files changed".into()), None);
         assert_eq!(t.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn delegated_completion_uses_the_successful_task_surface() {
+        let mut t = TaskCell::new_running("tu_parent", "hand off work");
+        t.complete("delegated", 2500, Some("handed off".into()), None);
+        assert_eq!(t.status, TaskStatus::Completed);
+        let output = render(&t, 80, 3);
+        assert!(output.contains("done"), "{output}");
+        assert!(!output.contains("failed"), "{output}");
+        assert!(!output.contains("Error"), "{output}");
     }
 
     #[test]
