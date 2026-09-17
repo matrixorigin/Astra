@@ -1296,6 +1296,15 @@ impl BottomPane {
         self.staged_permission_mode = Some(mode);
     }
 
+    /// Peek at the policy selected for the next turn without consuming it.
+    /// Repeated runtime shortcuts use this value as their cycle cursor while
+    /// the currently executing turn keeps its original policy.
+    pub(crate) fn staged_permission_mode(
+        &self,
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
+        self.staged_permission_mode
+    }
+
     pub(crate) fn take_staged_permission_mode(
         &mut self,
     ) -> Option<crate::cli::permission_manager::PermissionMode> {
@@ -1628,7 +1637,7 @@ impl BottomPane {
             return a;
         }
         if key.code == KeyCode::BackTab {
-            return BottomPaneAction::OpenPermissionModePicker;
+            return BottomPaneAction::CyclePermissionMode;
         }
         self.route_to_composer(key)
     }
@@ -2418,10 +2427,10 @@ pub(crate) enum BottomPaneAction {
     /// editor here would stop polling that turn, so the dispatcher must show a
     /// non-blocking explanation instead.
     ExternalEditorUnavailable,
-    /// Request the explicit permission-mode picker. Permission modes encode
-    /// distinct capability/consent policies, so keyboard navigation must
-    /// never silently advance through them as if they were one dial.
-    OpenPermissionModePicker,
+    /// Cycle the everyday permission policies. The event loop applies the
+    /// action immediately while idle, or stages it for the next safe turn
+    /// boundary while a turn is running.
+    CyclePermissionMode,
     ViewCompleted {
         result: Option<view::ViewResult>,
         reopen: Option<String>,

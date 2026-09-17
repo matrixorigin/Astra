@@ -232,6 +232,7 @@ show an unavailable message if typed in the workbench.
 | `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
 | `Alt+E` | Composer | Open the external editor |
 | `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |
+| `Shift+Tab` | Composer or active turn | Cycle Ask → Edits → Read-only → Auto; active-turn changes apply after settlement |
 | `Ctrl+U` | Composer | Kill to start of line |
 | `Esc` | Overlay/Popup | Close and return |
 | `/` | Composer | Slash command popup |

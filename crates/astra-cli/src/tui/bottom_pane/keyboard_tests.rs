@@ -34,12 +34,12 @@ fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
 }
 
 #[test]
-fn backtab_opens_permission_picker_when_composer_is_active() {
+fn backtab_cycles_permission_mode_when_composer_is_active() {
     let mut pane = BottomPane::new();
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]
@@ -61,9 +61,7 @@ fn backtab_keeps_approval_navigation_when_approval_is_pending() {
 }
 
 #[test]
-fn backtab_opens_picker_when_idle_no_view_no_approval() {
-    // The shortcut is available while composing or idle, but it opens an
-    // explicit picker rather than changing a capability/consent policy.
+fn backtab_cycles_permission_mode_when_idle_no_view_no_approval() {
     let mut pane = BottomPane::new();
     // Composer is empty; no view; no approval.
     assert!(pane.composer.is_empty());
@@ -71,17 +69,32 @@ fn backtab_opens_picker_when_idle_no_view_no_approval() {
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
 }
 
 #[test]
-fn backtab_opens_picker_when_composer_has_text() {
+fn backtab_cycles_permission_mode_when_composer_has_text() {
     let mut pane = BottomPane::new();
     pane.composer.set_text("hello world");
 
     let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-    assert!(matches!(action, BottomPaneAction::OpenPermissionModePicker));
+    assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+}
+
+#[test]
+fn backtab_stays_with_an_active_permission_picker() {
+    let mut pane = BottomPane::new();
+    pane.push_view(Box::new(
+        crate::tui::slash_dispatch::build_permission_mode_picker(
+            crate::cli::permission_manager::PermissionMode::Prompt,
+        ),
+    ));
+
+    let action = pane.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(pane.has_active_view());
 }
 
 #[test]

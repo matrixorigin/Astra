@@ -125,7 +125,10 @@ read-only; server configuration changes are not available here.
 picker with no arguments. Its modes include `auto`, `bypass`, `read_only`,
 `accept_edits`, `prompt`, and `deny`; additional actions show rules, manage
 workspace trust, or inspect the permission trace. The TUI asks for confirmation
-before enabling `bypass`.
+before enabling `bypass`. In the TUI, `Shift+Tab` cycles the everyday modes
+`Ask → Edits → Read-only → Auto`; during a running turn the selected mode is
+shown immediately and takes effect at the next safe turn boundary. `Bypass`
+and `Deny` remain explicit `/allow` choices.
 
 `/instructions` opens the project-instructions actions. The accepted forms are
 `/instructions show`, `/instructions reload`, and `/instructions off`.

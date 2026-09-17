@@ -1387,6 +1387,12 @@ pub(crate) fn permission_mode_feedback(
     crate::cli::permission_command::permission_mode_feedback(mode)
 }
 
+pub(crate) fn next_permission_mode_for_cycle(
+    current: crate::cli::permission_manager::PermissionMode,
+) -> crate::cli::permission_manager::PermissionMode {
+    crate::cli::permission_command::next_permission_mode_for_cycle(current)
+}
+
 pub(crate) fn apply_permission_mode_selection(
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,

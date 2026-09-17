@@ -3449,6 +3449,23 @@ fn stage_permission_mode_for_next_turn(
     )));
 }
 
+/// Handle the typed Shift+Tab action while a turn owns `SessionState`.
+///
+/// The staged selection is the cycle cursor, so a key repeat advances through
+/// the policies instead of returning the same target. The running turn and its
+/// permission context remain unchanged until settlement transfers ownership
+/// back to the outer loop.
+fn stage_cycled_permission_mode_for_active_turn(
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    current_mode: crate::cli::permission_manager::PermissionMode,
+) -> crate::cli::permission_manager::PermissionMode {
+    let cycle_cursor = bottom_pane.staged_permission_mode().unwrap_or(current_mode);
+    let next_mode = slash_dispatch::next_permission_mode_for_cycle(cycle_cursor);
+    stage_permission_mode_for_next_turn(bottom_pane, chat_widget, next_mode);
+    next_mode
+}
+
 #[derive(Clone)]
 struct ViewActionBackends {
     agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -5809,12 +5826,19 @@ pub(crate) async fn run_tui_session(
                             bottom_pane.handle_key(key)
                         };
                         match bottom_pane_action {
-                            BottomPaneAction::OpenPermissionModePicker => {
-                                bottom_pane.push_view(Box::new(
-                                    slash_dispatch::build_permission_mode_picker(
-                                        state.perm_manager.mode(),
-                                    ),
-                                ));
+                            BottomPaneAction::CyclePermissionMode => {
+                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                let next_mode = slash_dispatch::next_permission_mode_for_cycle(
+                                    state.perm_manager.mode(),
+                                );
+                                slash_dispatch::apply_permission_mode_selection(
+                                    &mut state,
+                                    &mut bottom_pane,
+                                    &mut chat_widget,
+                                    next_mode,
+                                );
+                                refresh_footer_from_state(&mut bottom_pane, &state);
+                                flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
@@ -6563,19 +6587,6 @@ pub(crate) async fn run_tui_session(
                                                                 }
                                                                 None => {}
                                                             }
-                                                            // Shift+Tab opens the same explicit picker as
-                                                            // idle mode. Permission policies are not a
-                                                            // cycling dial, and a selected mode only applies
-                                                            // at the next safe turn boundary.
-                                                            if k.code == crossterm::event::KeyCode::BackTab {
-                                                                bottom_pane.push_view(Box::new(
-                                                                    slash_dispatch::build_permission_mode_picker(
-                                                                        perm_mode_mirror.current(),
-                                                                    ),
-                                                                ));
-                                                                frame_requester.schedule_frame();
-                                                                continue;
-                                                            }
                                                             if is_background_task_manage_key(&k) {
                                                                 let _ = force_open_background_task_view(
                                                                     &mut background_registry,
@@ -6743,6 +6754,14 @@ pub(crate) async fn run_tui_session(
                                                             // Ctrl+C interrupts.
                                                             bottom_pane.pre_draw_tick(std::time::Instant::now());
                                                             match bottom_pane.handle_key(k) {
+                                                                    BottomPaneAction::CyclePermissionMode => {
+                                                                        stage_cycled_permission_mode_for_active_turn(
+                                                                            &mut bottom_pane,
+                                                                            &mut chat_widget,
+                                                                            perm_mode_mirror.current(),
+                                                                        );
+                                                                        frame_requester.schedule_frame();
+                                                                    }
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         match slash_dispatch::immediate_control(&queued_text) {
                                                                             Some(slash_dispatch::ImmediateControl::Exit) => {
@@ -10464,6 +10483,68 @@ mod tests {
         assert_eq!(
             bottom_pane.take_staged_permission_mode(),
             Some(crate::cli::permission_manager::PermissionMode::Auto)
+        );
+    }
+
+    #[test]
+    fn active_shift_tab_cycles_from_staged_mode_without_mutating_current_policy() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let mode_mirror = state.perm_manager.mode_mirror_handle();
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.composer.set_text("draft remains intact");
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+
+        let action = bottom_pane.handle_key(key);
+        assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+        let first = stage_cycled_permission_mode_for_active_turn(
+            &mut bottom_pane,
+            &mut chat_widget,
+            mode_mirror.current(),
+        );
+        assert_eq!(
+            first,
+            crate::cli::permission_manager::PermissionMode::AcceptEdits
+        );
+
+        let action = bottom_pane.handle_key(key);
+        assert!(matches!(action, BottomPaneAction::CyclePermissionMode));
+        let second = stage_cycled_permission_mode_for_active_turn(
+            &mut bottom_pane,
+            &mut chat_widget,
+            mode_mirror.current(),
+        );
+        assert_eq!(second, crate::cli::permission_manager::PermissionMode::Plan);
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt,
+            "runtime cycling must not rewrite the policy of the active turn"
+        );
+        assert!(!bottom_pane.has_active_view());
+        assert_eq!(bottom_pane.composer.text(), "draft remains intact");
+        assert_eq!(
+            bottom_pane.staged_permission_mode(),
+            Some(crate::cli::permission_manager::PermissionMode::Plan)
+        );
+
+        let staged = bottom_pane
+            .take_staged_permission_mode()
+            .expect("the selected mode must remain pending until settlement");
+        slash_dispatch::apply_permission_mode_selection(
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+            staged,
+        );
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Plan
         );
     }
 
