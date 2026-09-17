@@ -136,6 +136,7 @@ impl<'a> CompactCtx<'a> {
             model: self.state.model.as_deref(),
             provider: None,
             explain: ExplainMode::Off,
+            explain_report_format: self.state.runtime_config.explain.effective_report_format(),
             render_md: false,
             history,
             perm_manager,
@@ -828,46 +829,70 @@ pub(crate) async fn handle_state_command(
         }
 
         "/explain" => {
-            let mode = match ExplainMode::parse_slash_arg(arg) {
-                Ok(mode) => mode,
+            let command = match ExplainMode::parse_slash_command(arg) {
+                Ok(command) => command,
                 Err(error) => {
                     eprintln!("  {}", error.yellow());
                     return Ok(());
                 }
             };
-            state.explain = mode;
+            if let Some(mode) = command.mode {
+                state.explain = mode;
+            }
+            if let Some(format) = command.report_format {
+                state.set_explain_report_format_override(format);
+            }
             let s = match state.explain {
                 ExplainMode::Off => "off".yellow().to_string(),
                 ExplainMode::On => "on".green().to_string(),
                 ExplainMode::Verbose => "verbose".green().to_string(),
             };
-            eprintln!("  Explain mode: {}", s);
-            match state.explain {
-                ExplainMode::On => eprintln!(
-                    "{}",
-                    "  (on: measured execution tree and concise runtime facts)".dim()
-                ),
-                ExplainMode::Verbose => eprintln!(
-                    "{}",
-                    "  (verbose: tree plus context, dependency, and coverage diagnostics on stderr)"
-                        .dim()
-                ),
-                ExplainMode::Off => {}
-            }
-            let explain_val = match state.explain {
-                ExplainMode::Off => "off",
-                ExplainMode::On => "on",
-                ExplainMode::Verbose => "verbose",
-            };
-            append_state_journal_event_or_warn(
-                state,
-                &session_journal::JournalEvent::config_change(
-                    state.session_id.as_deref(),
-                    "explain",
-                    explain_val,
-                ),
-                "slash_state:explain",
+            eprintln!(
+                "  Explain mode: {} · report: {}",
+                s,
+                state.runtime_config.explain.effective_report_format()
             );
+            if command.mode.is_some() {
+                match state.explain {
+                    ExplainMode::On => eprintln!(
+                        "{}",
+                        "  (on: measured execution tree and concise runtime facts)".dim()
+                    ),
+                    ExplainMode::Verbose => eprintln!(
+                        "{}",
+                        "  (verbose: tree plus context, dependency, and coverage diagnostics on stderr)"
+                            .dim()
+                    ),
+                    ExplainMode::Off => {}
+                }
+            }
+            if command.mode.is_some() {
+                let explain_val = match state.explain {
+                    ExplainMode::Off => "off",
+                    ExplainMode::On => "on",
+                    ExplainMode::Verbose => "verbose",
+                };
+                append_state_journal_event_or_warn(
+                    state,
+                    &session_journal::JournalEvent::config_change(
+                        state.session_id.as_deref(),
+                        "explain",
+                        explain_val,
+                    ),
+                    "slash_state:explain",
+                );
+            }
+            if let Some(format) = command.report_format {
+                append_state_journal_event_or_warn(
+                    state,
+                    &session_journal::JournalEvent::config_change(
+                        state.session_id.as_deref(),
+                        "explain.report_format",
+                        format.as_str(),
+                    ),
+                    "slash_state:explain.report_format",
+                );
+            }
         }
 
         "/verbose" => {

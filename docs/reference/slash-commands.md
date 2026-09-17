@@ -78,7 +78,7 @@ accepted as an alias for the monitor.
 
 | Command | What it does |
 | --- | --- |
-| `/explain [on\|verbose\|off]` | Show measured execution facts at the selected detail. A bare `/explain` is the idempotent `on` form. |
+| `/explain [on\|verbose\|off] [--format html\|markdown\|text]` | Show measured execution facts at the selected detail and choose the derived local report format. A bare `/explain` is the idempotent `on` form; format-only commands keep the current mode. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |
@@ -94,7 +94,9 @@ view with `/stats cost`, `/stats health`, `/stats history`, `/stats learn`, or
 facts. `on` keeps subsequent execution concise, `verbose` adds context,
 dependency, and coverage details, and `off` suppresses the projection for
 subsequent execution while retaining durable evidence and already recorded
-history. Invalid arguments leave the current mode unchanged.
+history. The local report defaults to HTML; Markdown and text remain explicit
+derived representations. Invalid arguments leave both mode and format
+unchanged.
 
 ## Tools
 

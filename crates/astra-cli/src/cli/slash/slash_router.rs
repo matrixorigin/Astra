@@ -356,7 +356,15 @@ pub(crate) async fn handle_slash_command(
 
         "/session" => handle_session_command(arg, api, profile, state, token).await,
 
-        "/config" => slash_config::handle_config_command(arg),
+        "/config" => {
+            if slash_config::handle_config_command(arg) {
+                // Config editing is synchronous in line mode. Refresh the
+                // session-owned snapshot only after a successful save so
+                // read-only/show/cancel commands cannot erase session
+                // overrides or create needless reload work.
+                state.reload_runtime_config();
+            }
+        }
 
         "/checkpoint" => match session_checkpointing::create_manual_checkpoint(state, arg) {
             Ok(summary) => {

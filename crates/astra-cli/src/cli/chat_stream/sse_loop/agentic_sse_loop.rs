@@ -19,11 +19,13 @@ use serde_json::Value;
 
 use crate::cli::stream::streaming_types::AppliedStreamUserIntent;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
+use astra_config::runtime_config::ExplainReportFormat;
 
 use crate::cli::chat_stream::verdict_reports::print_verdict_report;
 
 pub(crate) struct StreamLoopSidecarEprint<'a> {
     pub(crate) explain: ExplainMode,
+    pub(crate) explain_report_format: ExplainReportFormat,
     pub(crate) quiet: bool,
     pub(crate) verbose_mode: bool,
     pub(crate) start: Instant,
@@ -42,6 +44,7 @@ pub(crate) struct StreamLoopSidecarEprint<'a> {
 pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
     let StreamLoopSidecarEprint {
         explain,
+        explain_report_format,
         quiet,
         verbose_mode,
         start,
@@ -64,6 +67,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
                 session_id,
                 explain_analyze_events,
                 explain_analyze_degraded,
+                explain_report_format,
                 explain == ExplainMode::Verbose,
             ) {
                 Ok(publication) => publication,

@@ -307,7 +307,7 @@ surface may render them:
 
 | Topology | Live and replay facts | Human rendering | Next-turn artifact analysis |
 | --- | --- | --- | --- |
-| CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local Markdown companion and print its path | The local `introspect` reader can consume the opaque session handle |
+| CLI/local runtime | Local typed stream and session journal | CLI/TUI may write a local HTML companion by default (or explicit Markdown/text) and print its path | The local `introspect` reader can consume the opaque session handle |
 | Server + TUI/CLI | Server lifecycle is authoritative; the client consumes the same typed stream and durable replay | The client may render a local companion for the human, but must not treat its path as server authority | The model can recover only through a reader backed by the same server/session store; otherwise the required context reports the artifact as unavailable |
 | Server only | Server emits the versioned stream and durable run cursor | Web/SDK owns rendering or export; no server process writes a user's local path | The server-owned database handle is discovered on the next turn and read through server `introspect` |
 | Server + Edge | Server and Edge facts retain producer, clock, parent, and gap metadata; reconnect uses the durable server cursor | The attached client renders one graph from merged facts; Edge never creates a second Explain semantics | Edge-local paths stay local; recovery uses the authorized host artifact backend and reports missing cross-host readers explicitly |
@@ -361,12 +361,13 @@ payloads on the same reference model without widening Explain Analyze into a
 raw trace or file browser.
 
 The server advertises the latest handle through the typed required-context lane
-on the next turn. The CLI/TUI may also print the path of a derived Markdown
-report for the human operator. That path is a presentation affordance; the
-model receives the server-owned opaque handle and reads the canonical artifact
-through the bounded reader. The physical path is never treated as model
-authority. A client-local companion is explicitly unavailable to a remote model
-when no shared artifact backend exists.
+on the next turn. The CLI/TUI may also print the path of a derived HTML report
+by default, or an explicitly selected Markdown/text representation, for the
+human operator. That path is a presentation affordance; the model receives the
+server-owned opaque handle and reads the canonical artifact through the bounded
+reader. The physical path is never treated as model authority. A client-local
+companion is explicitly unavailable to a remote model when no shared artifact
+backend exists.
 The next turn receives only a short artifact handle through `introspect`. An
 agent that is explicitly asked to analyze the previous explain report reads
 that handle through the bounded artifact window API, then cites the recorded
@@ -383,7 +384,7 @@ trace payloads.
   server-session handle; a failure carries a bounded safe reason. The current
   stream receives this result before its terminal frames. If retaining the
   result also fails, `recorded=false` makes that limitation explicit. A local
-  Markdown path never substitutes for server publication success.
+  derived-report path never substitutes for server publication success.
 - Failed publication is a run observation, not an immutable empty snapshot.
   Missing reports can be recovered from the exact completed run's durable
   facts on discovery or buffered-completion resume. Paused or cancelled runs

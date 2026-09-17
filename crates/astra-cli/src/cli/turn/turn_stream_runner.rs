@@ -144,6 +144,7 @@ fn build_turn_stream_params<'a>(
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,
+        explain_report_format: state.runtime_config.explain.effective_report_format(),
         render_md: true,
         history: &state.history,
         perm_manager: &mut state.perm_manager,

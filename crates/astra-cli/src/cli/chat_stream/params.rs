@@ -518,6 +518,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Prefer this over model-name heuristics when the resolved provider is known.
     pub(crate) provider: Option<&'a str>,
     pub(crate) explain: ExplainMode,
+    /// Per-turn snapshot of the local derived Explain Analyze format. It is
+    /// frozen before streaming so a mid-turn config edit cannot rewrite the
+    /// artifact representation after the fact.
+    pub(crate) explain_report_format: astra_config::runtime_config::ExplainReportFormat,
     pub(crate) render_md: bool,
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
@@ -706,6 +710,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub explain: ExplainMode,
+    pub explain_report_format: astra_config::runtime_config::ExplainReportFormat,
     pub render_md: bool,
     pub verbose_mode: bool,
     pub render_policy: crate::cli::stream::stream_render::RenderPolicy,
@@ -775,6 +780,7 @@ impl<'a> ChatTurnParams<'a> {
             model: ctx.model,
             provider: ctx.provider,
             explain: ctx.explain,
+            explain_report_format: ctx.explain_report_format,
             render_md: ctx.render_md,
             history: &[],
             perm_manager,

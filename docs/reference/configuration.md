@@ -161,12 +161,16 @@ does not hide the conversation. Configure the row budget in
 ```toml
 [explain]
 live_rows = 5 # 1–5, default 5
+report_format = "html" # html, markdown, or text; default html
 ```
 
 The same setting is available in the `/config` editor as **Live Explain
 Analyze rows (1–5)** and takes effect for the next live capture immediately.
-The settled Explain cell and the local Markdown report are not truncated by
-this live-row setting.
+The settled Explain cell and the local report are not truncated by this
+live-row setting. HTML is the default because it keeps the report readable
+across terminals and browsers; `/explain --format markdown` and
+`/explain --format text` select a different derived companion for the next
+capture.
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
 

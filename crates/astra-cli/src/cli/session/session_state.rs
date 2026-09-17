@@ -7,13 +7,14 @@ use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::permission_manager::PermissionManager;
 use crate::cli::slash::slash_team;
 use crate::mcp_client;
+use astra_config::runtime_config::ExplainReportFormat;
 use astra_runtime::plan as runtime_plan;
 use astra_runtime::prompts;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 /// Verbosity level for explain mode.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ExplainMode {
     Off,
     On,
@@ -35,7 +36,8 @@ impl ExplainMode {
     /// toggle.  A bare command is the shortest spelling for the useful
     /// concise mode; repeating it is therefore idempotent and safe when an
     /// input is retried after a reconnect or session handoff.
-    pub(crate) const SLASH_USAGE: &'static str = "Usage: /explain [on|verbose|off]";
+    pub(crate) const SLASH_USAGE: &'static str =
+        "Usage: /explain [on|verbose|off] [--format html|markdown|text]";
 
     /// Parse the user-facing `/explain` argument contract shared by the TUI
     /// and line-mode command paths.  This deliberately does not accept the
@@ -67,6 +69,103 @@ impl ExplainMode {
             )),
         }
     }
+
+    /// Parse the full `/explain` command. Mode and artifact format are
+    /// independent controls: a format-only command leaves the current mode
+    /// unchanged, while a bare command remains the concise `on` shorthand.
+    pub(crate) fn parse_slash_command(arg: &str) -> Result<ExplainSlashCommand, String> {
+        let tokens = arg.split_whitespace().collect::<Vec<_>>();
+        if tokens.is_empty() {
+            return Ok(ExplainSlashCommand {
+                mode: Some(Self::On),
+                report_format: None,
+            });
+        }
+
+        let mut mode = None;
+        let mut report_format = None;
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index].to_ascii_lowercase();
+            if let Some(value) = token.strip_prefix("--format=") {
+                if value.is_empty() {
+                    return Err(format!("Missing report format. {}", Self::SLASH_USAGE));
+                }
+                if report_format.is_some() {
+                    return Err(format!(
+                        "Report format was provided more than once. {}",
+                        Self::SLASH_USAGE
+                    ));
+                }
+                report_format = Some(ExplainReportFormat::parse(value).map_err(|_| {
+                    format!("Invalid report format `{value}`. {}", Self::SLASH_USAGE)
+                })?);
+                index += 1;
+                continue;
+            }
+            if token == "--format" || token == "format" {
+                let Some(value) = tokens.get(index + 1) else {
+                    return Err(format!("Missing report format. {}", Self::SLASH_USAGE));
+                };
+                if report_format.is_some() {
+                    return Err(format!(
+                        "Report format was provided more than once. {}",
+                        Self::SLASH_USAGE
+                    ));
+                }
+                report_format = Some(ExplainReportFormat::parse(value).map_err(|_| {
+                    format!("Invalid report format `{value}`. {}", Self::SLASH_USAGE)
+                })?);
+                index += 2;
+                continue;
+            }
+            if matches!(
+                token.as_str(),
+                "html" | "markdown" | "md" | "text" | "txt" | "plain"
+            ) {
+                if report_format.is_some() {
+                    return Err(format!(
+                        "Report format was provided more than once. {}",
+                        Self::SLASH_USAGE
+                    ));
+                }
+                report_format = Some(ExplainReportFormat::parse(&token).map_err(|_| {
+                    format!("Invalid report format `{token}`. {}", Self::SLASH_USAGE)
+                })?);
+                index += 1;
+                continue;
+            }
+            let parsed_mode = match token.as_str() {
+                "on" => Self::On,
+                "verbose" => Self::Verbose,
+                "off" => Self::Off,
+                _ => {
+                    return Err(format!(
+                        "Invalid explain argument `{token}`. {}",
+                        Self::SLASH_USAGE
+                    ));
+                }
+            };
+            if mode.replace(parsed_mode).is_some() {
+                return Err(format!(
+                    "Explain mode was provided more than once. {}",
+                    Self::SLASH_USAGE
+                ));
+            }
+            index += 1;
+        }
+
+        Ok(ExplainSlashCommand {
+            mode,
+            report_format,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExplainSlashCommand {
+    pub(crate) mode: Option<ExplainMode>,
+    pub(crate) report_format: Option<ExplainReportFormat>,
 }
 
 /// Active `/skill dev` session — name and directory are always set together.
@@ -230,6 +329,13 @@ pub(crate) struct SessionState {
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
     pub runtime_config: astra_config::runtime_config::RuntimeConfig,
+    /// Explicit `/explain --format …` choice for this running CLI session.
+    ///
+    /// Keep this separate from `runtime_config`: a read-only `/config` action
+    /// may reload the file-backed snapshot, but must not erase a deliberate
+    /// session choice. The override is applied to the in-memory snapshot only
+    /// and is never written to a config file.
+    pub explain_report_format_override: Option<ExplainReportFormat>,
     /// Content-addressed id of `runtime_config`. Set by
     /// `RuntimeConfig::load_with_version` at startup and whenever
     /// `/config` saves an edit. Threaded into HeavyCheckpoint writes
@@ -538,6 +644,7 @@ impl Default for SessionState {
             // `session_runtime::resolve_startup_config_version`. Until
             // then, legacy code paths treat None as "unknown".
             config_version_id: None,
+            explain_report_format_override: None,
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
@@ -646,6 +753,24 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    /// Apply a format selected through `/explain` and remember its precedence
+    /// across config reloads during this CLI session.
+    pub(crate) fn set_explain_report_format_override(&mut self, format: ExplainReportFormat) {
+        self.explain_report_format_override = Some(format);
+        self.runtime_config.explain.report_format = Some(format);
+    }
+
+    /// Reload file-backed configuration while retaining an explicit session
+    /// format choice. This is used after a successful `/config` save; callers
+    /// that only inspect configuration should not reload at all.
+    pub(crate) fn reload_runtime_config(&mut self) {
+        let format_override = self.explain_report_format_override;
+        self.runtime_config = astra_config::runtime_config::RuntimeConfig::load();
+        if let Some(format) = format_override {
+            self.runtime_config.explain.report_format = Some(format);
+        }
+    }
+
     fn advance_session_attachment(&mut self) {
         self.session_attachment_epoch = self
             .session_attachment_epoch
@@ -822,6 +947,7 @@ pub(crate) fn apply_initial_explain_mode(
 mod default_tests {
     use super::{ContinuationAnchor, ExplainMode, SessionState, apply_initial_explain_mode};
     use crate::cli::permission_manager::PermissionManager;
+    use astra_config::runtime_config::ExplainReportFormat;
 
     #[test]
     fn explain_slash_parser_is_explicit_and_idempotent() {
@@ -834,6 +960,36 @@ mod default_tests {
         assert_eq!(ExplainMode::parse_slash_arg("off"), Ok(ExplainMode::Off));
         assert!(ExplainMode::parse_slash_arg("true").is_err());
         assert!(ExplainMode::parse_slash_arg("on extra").is_err());
+    }
+
+    #[test]
+    fn explain_slash_command_supports_independent_report_format() {
+        let command = ExplainMode::parse_slash_command("verbose --format html").unwrap();
+        assert_eq!(command.mode, Some(ExplainMode::Verbose));
+        assert_eq!(
+            command.report_format,
+            Some(astra_config::runtime_config::ExplainReportFormat::Html)
+        );
+
+        let command = ExplainMode::parse_slash_command("format markdown").unwrap();
+        assert_eq!(command.mode, None);
+        assert_eq!(
+            command.report_format,
+            Some(astra_config::runtime_config::ExplainReportFormat::Markdown)
+        );
+        let command = ExplainMode::parse_slash_command("txt").unwrap();
+        assert_eq!(
+            command.report_format,
+            Some(astra_config::runtime_config::ExplainReportFormat::Text)
+        );
+    }
+
+    #[test]
+    fn invalid_explain_slash_command_does_not_have_a_partial_result() {
+        assert!(ExplainMode::parse_slash_command("on --format pdf").is_err());
+        assert!(ExplainMode::parse_slash_command("--format").is_err());
+        assert!(ExplainMode::parse_slash_command("on on").is_err());
+        assert!(ExplainMode::parse_slash_command("format html markdown").is_err());
     }
 
     #[test]
@@ -869,6 +1025,23 @@ mod default_tests {
 
         apply_initial_explain_mode(&mut state, None);
         assert_eq!(state.explain, ExplainMode::On);
+    }
+
+    #[test]
+    fn explicit_report_format_override_survives_runtime_config_reload() {
+        let mut state = SessionState::default();
+        state.set_explain_report_format_override(ExplainReportFormat::Text);
+
+        state.reload_runtime_config();
+
+        assert_eq!(
+            state.explain_report_format_override,
+            Some(ExplainReportFormat::Text)
+        );
+        assert_eq!(
+            state.runtime_config.explain.effective_report_format(),
+            ExplainReportFormat::Text
+        );
     }
 
     #[test]

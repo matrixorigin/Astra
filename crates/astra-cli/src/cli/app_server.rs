@@ -556,6 +556,9 @@ async fn run_turn(
         model: model.as_deref(),
         provider: None,
         explain: explain_mode,
+        explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
+            .explain
+            .effective_report_format(),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,

@@ -741,7 +741,7 @@ pub fn apply_edit(
                 })?;
             config.explain.report_format = Some(
                 ExplainReportFormat::parse(value)
-                    .map_err(|error| OverlayError::InvalidInvariant(error))?,
+                    .map_err(OverlayError::InvalidInvariant)?,
             );
         }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),

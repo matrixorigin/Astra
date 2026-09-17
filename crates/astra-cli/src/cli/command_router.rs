@@ -1018,6 +1018,9 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
+                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
+                    .explain
+                    .effective_report_format(),
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
@@ -1633,6 +1636,9 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: explain_mode,
+                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
+                    .explain
+                    .effective_report_format(),
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
@@ -2866,6 +2872,9 @@ pub(crate) async fn run_print_mode(
         offering_id: effective_offering_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
+        explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
+            .explain
+            .effective_report_format(),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,

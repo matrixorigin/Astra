@@ -1257,6 +1257,7 @@ pub(crate) async fn stream_chat_sse(
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
+        explain_report_format: p.explain_report_format,
         quiet: p.render_policy.is_silent(),
         verbose_mode: p.verbose_mode,
         start,

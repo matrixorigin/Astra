@@ -6,8 +6,8 @@
 //! terminal UI to complete an action.
 
 use crate::cli::command_registry;
-use crate::cli::session::session_state::ExplainMode;
 use crate::cli::session::session_state::SessionState;
+use crate::cli::session::session_state::{ExplainMode, ExplainSlashCommand};
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
 use crate::tui::bottom_pane::view::{
@@ -146,6 +146,10 @@ fn background_tasks_command_route(args: &str) -> BackgroundTasksCommandRoute {
 
 fn explain_mode_for_command(args: &str) -> Result<ExplainMode, String> {
     ExplainMode::parse_slash_arg(args)
+}
+
+fn explain_command_for_command(args: &str) -> Result<ExplainSlashCommand, String> {
+    ExplainMode::parse_slash_command(args)
 }
 
 /// Immutable request captured when a read-only memory surface is submitted.
@@ -681,22 +685,31 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Explain ─────────────────────────────────────────────────
         "/explain" => {
-            let mode = match explain_mode_for_command(args) {
-                Ok(mode) => mode,
+            let command = match explain_command_for_command(args) {
+                Ok(command) => command,
                 Err(error) => {
                     ctx.show_error(error);
                     return SlashResult::Handled;
                 }
             };
-            ctx.state.explain = mode;
+            if let Some(mode) = command.mode {
+                ctx.state.explain = mode;
+                ctx.chat_widget
+                    .set_explain_verbose(matches!(mode, ExplainMode::Verbose));
+            }
+            if let Some(format) = command.report_format {
+                ctx.state.set_explain_report_format_override(format);
+                ctx.chat_widget.set_explain_report_format(format);
+            }
             let label = match ctx.state.explain {
                 ExplainMode::Off => "off",
                 ExplainMode::On => "on",
                 ExplainMode::Verbose => "verbose",
             };
-            ctx.chat_widget
-                .set_explain_verbose(matches!(ctx.state.explain, ExplainMode::Verbose));
-            ctx.show_response(format!("Explain mode: {label}"));
+            ctx.show_response(format!(
+                "Explain mode: {label} · report: {}",
+                ctx.state.runtime_config.explain.effective_report_format()
+            ));
             SlashResult::Handled
         }
 
@@ -3456,9 +3469,9 @@ mod routing_tests {
         HistoryCommandRoute, MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT,
         MemoryCommandRoute, SkillCommandRoute, WorkCommandRoute, background_tasks_command_route,
         config_command_route, context_breakdown_for_panel, context_dump_argument,
-        explain_mode_for_command, help_command_route, history_command_route,
-        is_model_picker_request, keyboard_shortcut_pairs, memory_command_route,
-        skill_command_route, work_command_route,
+        explain_command_for_command, explain_mode_for_command, help_command_route,
+        history_command_route, is_model_picker_request, keyboard_shortcut_pairs,
+        memory_command_route, skill_command_route, work_command_route,
     };
     use crate::cli::command_registry;
     use crate::cli::session::session_state::{ExplainMode, SessionState};
@@ -3615,6 +3628,12 @@ mod routing_tests {
         );
         assert_eq!(explain_mode_for_command("off"), Ok(ExplainMode::Off));
         assert!(explain_mode_for_command("typo").is_err());
+        let command = explain_command_for_command("--format html").unwrap();
+        assert_eq!(command.mode, None);
+        assert_eq!(
+            command.report_format,
+            Some(astra_config::runtime_config::ExplainReportFormat::Html)
+        );
     }
 
     #[test]

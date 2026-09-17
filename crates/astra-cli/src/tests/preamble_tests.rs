@@ -6,6 +6,7 @@ use crate::cli::slash::slash_router::handle_slash_command;
 use crate::cli::stream::stream_render::{
     RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block,
 };
+use astra_config::runtime_config::ExplainReportFormat;
 use astra_runtime::prompts;
 
 #[test]
@@ -218,6 +219,35 @@ async fn slash_explain_rejects_invalid_mode_without_mutating_state() {
         .expect("slash command should report usage without failing the REPL");
     assert!(!should_exit);
     assert_eq!(state.explain, ExplainMode::Verbose);
+}
+
+#[tokio::test]
+async fn read_only_config_command_keeps_explain_format_override() {
+    let api =
+        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
+    let mut state = SessionState::default();
+
+    handle_slash_command("/explain --format text", &api, None, &mut state, None)
+        .await
+        .expect("format-only explain command should succeed");
+    assert_eq!(
+        state.runtime_config.explain.effective_report_format(),
+        ExplainReportFormat::Text
+    );
+
+    handle_slash_command("/config show", &api, None, &mut state, None)
+        .await
+        .expect("read-only config command should succeed");
+
+    assert_eq!(
+        state.explain_report_format_override,
+        Some(ExplainReportFormat::Text)
+    );
+    assert_eq!(
+        state.runtime_config.explain.effective_report_format(),
+        ExplainReportFormat::Text,
+        "a read-only config view must not reset the next-turn report format"
+    );
 }
 
 #[test]

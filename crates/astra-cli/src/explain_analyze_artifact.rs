@@ -7,11 +7,12 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{IsTerminal, Read, Seek, SeekFrom},
+    io::{IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
+use astra_config::runtime_config::ExplainReportFormat;
 use astra_services::SessionArtifactStore;
 use astra_turn_types::{EXPLAIN_ANALYZE_SCHEMA_VERSION, ExplainAnalyzeEventV1};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -156,19 +157,21 @@ struct ExplainAnalyzeArtifactV1 {
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedArtifact {
     pub(crate) handle: String,
+    pub(crate) format: ExplainReportFormat,
     pub(crate) rendered_path: Option<PathBuf>,
     pub(crate) render_error: Option<String>,
 }
 
 impl PublishedArtifact {
     pub(crate) fn user_notice(&self) -> String {
+        let format = self.format.display_name();
         match (&self.rendered_path, self.render_error.as_deref()) {
-            (Some(_), None) => "Explain Analyze report ready".to_string(),
+            (Some(_), None) => format!("Explain Analyze {format} report ready"),
             (Some(_), Some(error)) => {
-                format!("Explain Analyze report ready · rendering warning: {error}")
+                format!("Explain Analyze {format} report ready · rendering warning: {error}")
             }
             (None, Some(error)) => {
-                format!("Explain Analyze data saved · Markdown unavailable: {error}")
+                format!("Explain Analyze data saved · {format} report unavailable: {error}")
             }
             (None, None) => "Explain Analyze data saved · no local report is available".to_string(),
         }
@@ -477,14 +480,15 @@ pub(crate) fn persist(
     }
 }
 
-/// Publish the canonical JSON snapshot and a bounded Markdown/plain-text
-/// rendering for the local user interface. The canonical handle remains
+/// Publish the canonical JSON snapshot and a bounded human-readable rendering
+/// in the selected format for the local user interface. The canonical handle remains
 /// readable even if the derived report cannot be written, so a rendering
 /// failure is returned as metadata instead of hiding the usable artifact.
 pub(crate) fn persist_rendered_report(
     session_id: &str,
     events: &[ExplainAnalyzeEventV1],
     delivery_degraded: bool,
+    format: ExplainReportFormat,
     verbose: bool,
 ) -> Result<Option<PublishedArtifact>, String> {
     let Some(handle) = persist(session_id, events, delivery_degraded)? else {
@@ -493,16 +497,26 @@ pub(crate) fn persist_rendered_report(
     let token = token_from_handle(&handle)
         .map(str::to_owned)
         .ok_or_else(|| "invalid Explain artifact handle after publication".to_string())?;
-    let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
     let directory = artifact_directory(session_id)?;
-    let path = directory.join(format!("{token}.md"));
-    // Keep tree prefixes and aligned timing columns intact in Markdown
-    // previews. The report itself is deliberately plain text; a fenced block
-    // prevents proportional-font rendering from destroying its graph shape.
-    let rendered = markdown_report(&report);
+    let (extension, rendered) = match format {
+        ExplainReportFormat::Html => (
+            "html",
+            crate::explain_analyze_html::render(events, verbose, delivery_degraded),
+        ),
+        ExplainReportFormat::Markdown => {
+            let report = crate::explain_analyze_report::render(events, verbose, delivery_degraded);
+            ("md", markdown_report(&report))
+        }
+        ExplainReportFormat::Text => (
+            "txt",
+            crate::explain_analyze_report::render(events, verbose, delivery_degraded),
+        ),
+    };
+    let path = directory.join(format!("{token}.{extension}"));
     if rendered.len() > RENDERED_REPORT_MAX_BYTES {
         return Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: None,
             render_error: Some(format!(
                 "rendered report exceeds the {} byte bound",
@@ -513,21 +527,30 @@ pub(crate) fn persist_rendered_report(
     let render_result = (|| {
         std::fs::create_dir_all(&directory)
             .map_err(|error| format!("create Explain Analyze report directory: {error}"))?;
-        let temporary = path.with_extension("md.tmp");
-        std::fs::write(&temporary, rendered.as_bytes())
+        // Keep the temporary file owned by `NamedTempFile` until the atomic
+        // publish succeeds. A failed write or rename therefore removes its
+        // partial bytes immediately instead of accumulating one bounded file
+        // per failed turn.
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)
+            .map_err(|error| format!("create Explain Analyze rendered report: {error}"))?;
+        temporary
+            .write_all(rendered.as_bytes())
             .map_err(|error| format!("write Explain Analyze rendered report: {error}"))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|error| format!("publish Explain Analyze rendered report: {error}"))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| format!("publish Explain Analyze rendered report: {}", error.error))?;
         Ok::<(), String>(())
     })();
     match render_result {
         Ok(()) => Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: Some(path),
             render_error: None,
         })),
         Err(error) => Ok(Some(PublishedArtifact {
             handle,
+            format,
             rendered_path: None,
             render_error: Some(error),
         })),
@@ -892,20 +915,21 @@ mod tests {
     fn published_artifact_notice_keeps_human_copy_compact_and_separates_the_link() {
         let local = PublishedArtifact {
             handle: artifact_handle("run-1", "turn-1"),
-            rendered_path: Some(PathBuf::from("/tmp/report with spaces.md")),
+            format: ExplainReportFormat::Html,
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.html")),
             render_error: None,
         };
         let notice = local.user_notice();
-        assert_eq!(notice, "Explain Analyze report ready");
+        assert_eq!(notice, "Explain Analyze HTML report ready");
         let link = local
             .user_link()
             .expect("local report should be actionable");
         assert_eq!(link.label, "Open report");
         assert!(
             link.uri
-                .starts_with("file:///tmp/report%20with%20spaces.md")
+                .starts_with("file:///tmp/report%20with%20spaces.html")
         );
-        assert_eq!(link.fallback, "/tmp/report with spaces.md");
+        assert_eq!(link.fallback, "/tmp/report with spaces.html");
         assert!(!notice.contains("artifact://"));
 
         let server = PublishedArtifact {
@@ -924,7 +948,7 @@ mod tests {
             ..server
         };
         let notice = failed_render.user_notice();
-        assert!(notice.contains("Markdown unavailable"));
+        assert!(notice.contains("HTML report unavailable"));
         assert!(notice.contains("rendered report exceeds the bound"));
         assert_eq!(
             notice.matches("rendered report exceeds the bound").count(),
@@ -932,11 +956,11 @@ mod tests {
         );
 
         let rendered_with_warning = PublishedArtifact {
-            rendered_path: Some(PathBuf::from("/tmp/report with spaces.md")),
+            rendered_path: Some(PathBuf::from("/tmp/report with spaces.html")),
             ..failed_render.clone()
         };
         let notice = rendered_with_warning.user_notice();
-        assert!(notice.starts_with("Explain Analyze report ready · rendering warning:"));
+        assert!(notice.starts_with("Explain Analyze HTML report ready · rendering warning:"));
         assert!(rendered_with_warning.user_link().is_some());
         assert_eq!(
             notice.matches("rendered report exceeds the bound").count(),
@@ -960,12 +984,13 @@ mod tests {
     fn redirected_artifact_notice_uses_plain_path_without_osc8() {
         let publication = PublishedArtifact {
             handle: artifact_handle("run-redirected", "turn-1"),
+            format: ExplainReportFormat::Html,
             rendered_path: Some(PathBuf::from("/tmp/report.md")),
             render_error: None,
         };
 
         let notice = publication.terminal_notice_with_links(false);
-        assert_eq!(notice, "Explain Analyze report ready · /tmp/report.md");
+        assert_eq!(notice, "Explain Analyze HTML report ready · /tmp/report.md");
         assert!(!notice.contains('\x1b'));
     }
 
@@ -975,9 +1000,15 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f304";
         let events = complete_events();
-        let publication = persist_rendered_report(session_id, &events, false, false)
-            .expect("publication should succeed")
-            .expect("non-empty capture should publish");
+        let publication = persist_rendered_report(
+            session_id,
+            &events,
+            false,
+            ExplainReportFormat::Markdown,
+            false,
+        )
+        .expect("publication should succeed")
+        .expect("non-empty capture should publish");
         let rendered_path = publication
             .rendered_path
             .as_ref()
@@ -998,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn persist_rendered_report_writes_selected_html_companion_by_default() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f305";
+        let publication = persist_rendered_report(
+            session_id,
+            &complete_events(),
+            false,
+            ExplainReportFormat::Html,
+            false,
+        )
+        .expect("publication should succeed")
+        .expect("non-empty capture should publish");
+        assert_eq!(publication.format, ExplainReportFormat::Html);
+        let path = publication
+            .rendered_path
+            .as_ref()
+            .expect("HTML companion should be written");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("html")
+        );
+        let html = std::fs::read_to_string(path).expect("HTML report");
+        assert!(html.starts_with("<!doctype html>"), "{html}");
+        assert!(html.contains("Execution workspace"), "{html}");
+    }
+
+    #[test]
     fn rendered_report_failure_does_not_hide_the_canonical_artifact() {
         let temp = tempfile::tempdir().expect("temporary sessions directory");
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -1008,16 +1067,13 @@ mod tests {
         let session_dir = astra_services::local_session_artifact_store()
             .session_dir(session_id)
             .expect("session directory");
-        std::fs::create_dir_all(
-            session_dir
-                .join(ARTIFACT_DIR)
-                .join(format!("{token}.md.tmp")),
-        )
-        .expect("block Markdown temporary path");
+        std::fs::create_dir_all(session_dir.join(ARTIFACT_DIR).join(format!("{token}.html")))
+            .expect("block HTML temporary path");
 
-        let publication = persist_rendered_report(session_id, &events, false, false)
-            .expect("canonical publication should succeed")
-            .expect("non-empty capture should publish");
+        let publication =
+            persist_rendered_report(session_id, &events, false, ExplainReportFormat::Html, false)
+                .expect("canonical publication should succeed")
+                .expect("non-empty capture should publish");
         assert!(publication.rendered_path.is_none());
         assert!(publication.render_error.is_some());
         let resolved = resolve_request(
@@ -1027,6 +1083,51 @@ mod tests {
         .expect("canonical handle should be recognized")
         .expect("canonical artifact must remain readable when rendering fails");
         assert!(resolved.contains("Artifact handle:"), "{resolved}");
+    }
+
+    #[test]
+    fn repeated_render_failures_clean_up_temporary_reports() {
+        let temp = tempfile::tempdir().expect("temporary sessions directory");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "a5c2f6e9-0f88-44db-a7a4-5e89c1d2f306";
+        let events = complete_events();
+        let handle = artifact_handle("run-1", "turn-2");
+        let token = token_from_handle(&handle).expect("encoded handle token");
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("session directory");
+        let artifact_dir = session_dir.join(ARTIFACT_DIR);
+        std::fs::create_dir_all(artifact_dir.join(format!("{token}.html")))
+            .expect("block HTML publication target");
+
+        for _ in 0..3 {
+            let publication = persist_rendered_report(
+                session_id,
+                &events,
+                false,
+                ExplainReportFormat::Html,
+                false,
+            )
+            .expect("canonical publication should succeed")
+            .expect("non-empty capture should publish");
+            assert!(publication.rendered_path.is_none());
+            assert!(publication.render_error.is_some());
+        }
+
+        let mut entries = std::fs::read_dir(&artifact_dir)
+            .expect("artifact directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from(format!("{token}.html")),
+                std::ffi::OsString::from(format!("{token}.json")),
+                std::ffi::OsString::from("latest.json"),
+            ],
+            "failed derived publications must not leave temporary files"
+        );
     }
 
     #[test]

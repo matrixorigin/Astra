@@ -144,6 +144,14 @@ impl ExplainReportFormat {
             Self::Text => "text",
         }
     }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Html => "HTML",
+            Self::Markdown => "Markdown",
+            Self::Text => "text",
+        }
+    }
 }
 
 impl Default for ExplainReportFormat {

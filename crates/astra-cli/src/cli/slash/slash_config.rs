@@ -53,25 +53,46 @@ fn active_model_for_display() -> Option<String> {
 /// Primary dispatch matches the reference CLI: bare `/config` opens the
 /// interactive panel. The explicit `show` sub-command is retained for
 /// scripts / introspection that want the static print.
-pub fn handle_config_command(arg: &str) {
+/// Handle `/config` and report whether it successfully wrote a config file.
+/// Read-only views and cancelled edits return `false`, allowing callers to
+/// avoid reloading their session snapshot and accidentally dropping session
+/// scoped presentation overrides.
+pub fn handle_config_command(arg: &str) -> bool {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     // Empty arg → open interactive panel. `edit` is an alias.
     let subcommand = parts.first().copied().unwrap_or("");
 
     match subcommand {
         "" | "edit" => run_config_edit(),
-        "show" => show_config(),
-        "paths" => show_paths(),
-        "sources" => show_sources(),
+        "show" => {
+            show_config();
+            false
+        }
+        "paths" => {
+            show_paths();
+            false
+        }
+        "sources" => {
+            show_sources();
+            false
+        }
         "export" => {
             let path = parts.get(1).map(|s| PathBuf::from(*s));
             export_config(path);
+            false
         }
-        "diff" => show_diff(),
-        "help" | "-h" | "--help" => print_help(),
+        "diff" => {
+            show_diff();
+            false
+        }
+        "help" | "-h" | "--help" => {
+            print_help();
+            false
+        }
         _ => {
             eprintln!("{}", format!("Unknown subcommand: {}", subcommand).red());
             print_help();
+            false
         }
     }
 }
@@ -688,7 +709,7 @@ fn print_help() {
 ///
 /// Returning from this function ends the /config edit session. Ctrl+C /
 /// Esc from inquire is surfaced as a graceful cancel.
-fn run_config_edit() {
+fn run_config_edit() -> bool {
     use astra_config::config_overlay::{
         SettingItem, apply_edit, build_settings_catalog, filter_settings,
     };
@@ -760,7 +781,7 @@ fn run_config_edit() {
 
     if !dirty {
         stdout_println!("{}", "No changes made.".dim());
-        return;
+        return false;
     }
 
     // Confirm-then-save. Writing to user-level is the safer default;
@@ -773,7 +794,7 @@ fn run_config_edit() {
         .unwrap_or(false);
     if !save {
         stdout_println!("{}", "Discarded — no files written.".dim());
-        return;
+        return false;
     }
     match write_user_runtime_toml(&working) {
         Ok(path) => {
@@ -801,9 +822,11 @@ fn run_config_edit() {
                     );
                 }
             }
+            true
         }
         Err(err) => {
             eprintln!("  {} Failed to save: {}", "✗".red(), err.to_string().red());
+            false
         }
     }
 }

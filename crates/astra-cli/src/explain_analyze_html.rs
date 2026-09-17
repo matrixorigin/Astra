@@ -330,9 +330,11 @@ fn render_stage_list(writer: &mut HtmlWriter, graph: &ExplainAnalyzeGraphV1, ver
     let remaining = writer.remaining_capacity();
     let include_timeline =
         timeline_markup.is_empty() || timeline_markup.len() <= remaining.saturating_sub(4_096);
-    let timeline_len = include_timeline
-        .then_some(timeline_markup.len())
-        .unwrap_or(0);
+    let timeline_len = if include_timeline {
+        timeline_markup.len()
+    } else {
+        0
+    };
     let rows_budget = remaining.saturating_sub(timeline_len).saturating_sub(2_048);
     let mut rows = String::with_capacity(rows_budget.min(16 * 1024));
     let mut capacity_reached = false;
@@ -745,9 +747,7 @@ fn render_node(
     let indent = depth.min(8) * 12;
     format!(
         "<details class=\"stage stage-row state-{state_class}{}\" style=\"--indent:{indent}px\" data-index=\"{index}\"><summary><span class=\"stage-leading\"><span class=\"stage-toggle\" aria-hidden=\"true\">›</span><span class=\"stage-marker\" aria-hidden=\"true\"></span></span><span class=\"stage-label\"><span class=\"stage-name\">{}</span><span class=\"stage-kind\">{}</span></span><span class=\"stage-duration\">{}</span><span class=\"stage-tokens\">{}</span><span class=\"stage-outcome\"><span class=\"outcome-dot\" aria-hidden=\"true\"></span>{}</span></summary><div class=\"stage-body\">{body}</div></details>",
-        if node.parent_index.is_none() && node.parent_node_id.is_some() {
-            " conflict"
-        } else if node.conflicted {
+        if node.conflicted || (node.parent_index.is_none() && node.parent_node_id.is_some()) {
             " conflict"
         } else {
             ""
@@ -959,7 +959,7 @@ fn escape_html(value: &str, max_chars: usize) -> String {
         }
     }
     if truncated {
-        escaped.push_str("…");
+        escaped.push('…');
     }
     escaped
 }

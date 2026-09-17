@@ -1757,6 +1757,9 @@ pub(crate) struct ChatWidget {
     /// This is configured through `/config` and remains bounded by the
     /// renderer's hard five-row ceiling.
     explain_analyze_live_rows: u8,
+    /// Derived local Explain Analyze artifact format for the next completed
+    /// turn. The canonical JSON snapshot is written regardless of this view.
+    explain_analyze_report_format: astra_config::runtime_config::ExplainReportFormat,
     /// Identity of the non-Task ToolCell in `active_cell`. Tool completion
     /// must match this id; a late completion for some other tool must never
     /// finalize the currently visible command by name or position alone.
@@ -1838,6 +1841,8 @@ impl ChatWidget {
             explain_analyze_snapshot_confirmed: false,
             explain_analyze_verbose: false,
             explain_analyze_live_rows: 5,
+            explain_analyze_report_format:
+                astra_config::runtime_config::ExplainReportFormat::default(),
             active_tool_use_id: None,
             parked_tools: std::collections::HashMap::new(),
             parked_tool_order: Vec::new(),
@@ -2537,6 +2542,13 @@ impl ChatWidget {
         self.explain_analyze_live_rows = rows.clamp(1, 5);
     }
 
+    pub(crate) fn set_explain_report_format(
+        &mut self,
+        format: astra_config::runtime_config::ExplainReportFormat,
+    ) {
+        self.explain_analyze_report_format = format;
+    }
+
     pub(crate) fn explain_analyze_live_lines(
         &self,
         width: u16,
@@ -2617,6 +2629,7 @@ impl ChatWidget {
             &self.session_id,
             &events,
             delivery_degraded,
+            self.explain_analyze_report_format,
             self.explain_analyze_verbose,
         ) {
             Ok(publication) => publication,
