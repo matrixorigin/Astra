@@ -762,9 +762,9 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     let pool = common::setup_pool().await;
     let suffix = Uuid::new_v4().to_string();
     let owner_id = format!("execution-claim-owner-{suffix}");
-    let work_session_id = format!("execution-claim-work-session-{suffix}");
-    let ordinary_session_id = format!("execution-claim-ordinary-session-{suffix}");
-    let other_device_session_id = format!("execution-claim-other-device-session-{suffix}");
+    let work_session_id = format!("claim-work-{suffix}");
+    let ordinary_session_id = format!("claim-chat-{suffix}");
+    let other_device_session_id = format!("claim-device-{suffix}");
     let work_key = SessionKeyV1::owner_session("server", &owner_id, &work_session_id, "main");
     let ordinary_key =
         SessionKeyV1::owner_session("server", &owner_id, &ordinary_session_id, "main");
@@ -782,6 +782,16 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         (&ordinary_key, &ordinary_initial),
         (&other_device_key, &other_device_initial),
     ] {
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, event_count, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', 0, NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&key.session_id)
+        .bind(&key.owner_user_id)
+        .execute(pool.get())
+        .await
+        .expect("create durable checkout owner");
         coordinator
             .load_or_initialize_execution_binding(key, initial)
             .await
@@ -844,6 +854,28 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .await
         .expect("the first Session claims the checkout");
 
+    let active_writer = match coordinator
+        .acquire_writer(
+            &work_key,
+            None,
+            &ActorContextV1::owner_user(
+                &owner_id,
+                "checkout-owner",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Server,
+                None,
+                AuthorityEpochsV1::default(),
+            ),
+            Duration::from_secs(60),
+            "active-checkout-writer",
+        )
+        .await
+        .expect("make checkout genuinely active")
+    {
+        AcquireWriterOutcome::Acquired(lease) => lease,
+        other => panic!("unexpected writer outcome: {other:?}"),
+    };
+
     let mut ordinary_edge = edge_binding(
         &ordinary_initial.logical_workspace_id,
         2,
@@ -854,14 +886,17 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     let error = coordinator
         .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_edge)
         .await
-        .expect_err("a second Session must not share one physical checkout");
-    assert!(matches!(
-        error,
-        SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            ref owner_session_id,
-            ref owner_branch_id,
-        } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
-    ));
+        .expect_err("a second Session must not execute in an actively owned checkout");
+    assert!(
+        matches!(
+            error,
+            SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
+                ref owner_session_id,
+                ref owner_branch_id,
+            } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
+        ),
+        "unexpected claim failure: {error:?}"
+    );
     let ordinary_after = coordinator
         .load_execution_binding(&ordinary_key)
         .await
@@ -872,6 +907,7 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         ordinary_after.workspace.kind,
         astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
     );
+    coordinator.release_writer(&active_writer).await.unwrap();
 
     let mut other_device_preparing = edge_binding(
         &other_device_initial.logical_workspace_id,
@@ -948,6 +984,8 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         for table in [
             "session_execution_workspace_claims",
             "session_execution_bindings",
+            "session_context_operation_receipts",
+            "session_context_authority_events",
             "session_context_heads",
         ] {
             sqlx::query(&format!(
@@ -959,6 +997,16 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
             .execute(pool.get())
             .await
             .expect("clean execution claim fixture");
+        }
+        for table in ["agent_session_lifecycle_fences", "agent_sessions"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+            ))
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .execute(pool.get())
+            .await
+            .expect("clean durable checkout owner");
         }
     }
 }

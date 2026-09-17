@@ -224,6 +224,25 @@ mutation boundary must still serialize conflicting mutations or require
 separate worktrees; independent Session leases alone do not make a shared
 workspace safe.
 
+A saved Session does not permanently own its checkout. Ordinary CLI startup
+creates a fresh conversation in the selected directory; continuing a saved
+conversation requires explicit resume. When another Session has an idle
+physical claim, admission may retire that claim without changing its binding,
+history, files, or Git state. This is workspace reuse, not conversation handoff.
+Dirty files alone are not a reason to resume an old conversation or reject a
+new one; verified Edge-to-Edge transfer remains a separate operation.
+
+Idle reuse must be proven under the previous owner's canonical execution
+fence. Live writer/reservation authority, an execution slot, active child or
+retry Runs, unresolved tool invocations, or an unfinished provider switch
+prevent release. Expired leases or disconnected clients alone do not prove
+that external effects have stopped. Release runs in its own transaction before
+claimant admission, so no transaction locks two Session heads. Root, child,
+and retry Run admission rechecks the physical claim, including when resuming,
+to fence delayed execution after reuse. The existing per-checkout uniqueness
+constraint arbitrates concurrent claimants; tool dispatch retains its
+non-locking verification path.
+
 ## Unhappy paths
 
 | Failure | Required behavior |
@@ -244,6 +263,7 @@ workspace safe.
 | Disconnect or cancel races with transfer | Before binding commit, an abandoned preflight leaves the current provider unchanged; after commit, keep the new binding and admit no execution until resumed |
 | Transfer races with a new Run | Serialize at canonical admission or binding compare-and-swap; exactly one transition wins |
 | Different Sessions share a checkout | Serialize conflicting workspace mutations or require isolated worktrees |
+| Old Session is idle in the selected checkout | Admit a fresh conversation after fenced idle-claim release; preserve old history and binding; do not require resume or a new worktree |
 | DB or event service degraded | Show last confirmed revision and staleness; retry with bounded backoff |
 | Duplicate or reordered updates | Reconcile by durable cursor/revision; never regress status or synthesize twice |
 

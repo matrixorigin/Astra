@@ -9674,6 +9674,8 @@ struct ToolOutputPreviewRow {
 
 #[derive(Debug, Error)]
 pub enum DatabaseRunStateStoreError {
+    #[error("execution binding admission failed: {0}")]
+    ExecutionBinding(#[from] crate::SessionContextCoordinatorError),
     #[error("database operation failed: operation={operation}, entity={entity}, source={source}")]
     Database {
         operation: &'static str,
@@ -11182,6 +11184,10 @@ impl DatabaseRunStateStore {
         if session_status.as_deref() != Some("active") {
             return Ok(false);
         }
+        crate::session_context_coordinator::ensure_run_execution_workspace_claim_in_tx(
+            tx, user_id, session_id,
+        )
+        .await?;
         let slot = sqlx::query(
             "SELECT run_id, updated_at FROM agent_session_execution_slots
              WHERE user_id = ? AND session_id = ? FOR UPDATE",
@@ -11335,6 +11341,14 @@ impl DatabaseRunStateStore {
         waiting_for: Option<&str>,
     ) -> DbStoreResult<bool> {
         if !run_requires_session_execution_slot(run) {
+            if durable_run_status_blocks_session(status, waiting_for) {
+                crate::session_context_coordinator::ensure_run_execution_workspace_claim_in_tx(
+                    tx,
+                    &run.user_id,
+                    &run.session_id,
+                )
+                .await?;
+            }
             return Ok(true);
         }
         if durable_run_status_blocks_session(status, waiting_for) {
@@ -12646,6 +12660,16 @@ impl DatabaseRunStateStore {
                 "run identity {} is already bound to session {existing_session}",
                 record.run_id
             ));
+        }
+
+        if !run_requires_session_execution_slot(&record) {
+            crate::session_context_coordinator::ensure_run_execution_workspace_claim_in_tx(
+                &mut tx,
+                &record.user_id,
+                &record.session_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
 
         let work_binding_present = record.work_binding.is_some();

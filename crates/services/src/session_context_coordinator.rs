@@ -908,6 +908,166 @@ impl DatabaseSessionContextCoordinator {
         Self { pool }
     }
 
+    /// Retire only an idle physical claim, in a transaction belonging to its
+    /// existing owner. Never lock a second Session head inside admission.
+    async fn release_idle_execution_workspace_claim(
+        &self,
+        claimant: &SessionKeyV1,
+        target: &SessionExecutionBindingV1,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let Some(identity) = execution_workspace_identity(target) else {
+            return Ok(());
+        };
+        let identity_hash = execution_workspace_identity_hash(&identity);
+        let owner = sqlx::query(
+            "SELECT workspace_identity, session_id, branch_id
+             FROM session_execution_workspace_claims
+             WHERE isolation_domain = ? AND owner_user_id = ? AND workspace_identity_hash = ?",
+        )
+        .bind(&claimant.isolation_domain)
+        .bind(&claimant.owner_user_id)
+        .bind(&identity_hash)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("discover_idle_workspace_claim", source))?;
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let existing_identity: String = owner
+            .try_get("workspace_identity")
+            .map_err(|source| database_error("decode_idle_workspace_identity", source))?;
+        let session_id: String = owner
+            .try_get("session_id")
+            .map_err(|source| database_error("decode_idle_workspace_session", source))?;
+        let branch_id: String = owner
+            .try_get("branch_id")
+            .map_err(|source| database_error("decode_idle_workspace_branch", source))?;
+        if existing_identity != identity
+            || (session_id == claimant.session_id && branch_id == claimant.branch_id)
+        {
+            return Ok(());
+        }
+        let key = SessionKeyV1::owner_session(
+            &claimant.isolation_domain,
+            &claimant.owner_user_id,
+            &session_id,
+            &branch_id,
+        );
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_idle_workspace_release", source))?;
+        // The canonical session/slot fence also serializes late Run creation
+        // and terminal transitions. A missing durable Session is not idle proof.
+        match crate::storage::admit_session_execution_write(
+            &mut tx,
+            &key.session_id,
+            &key.owner_user_id,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(sqlx::Error::RowNotFound) => return Ok(()),
+            Err(source) => return Err(database_error("fence_idle_workspace_session", source)),
+        }
+        let slot = sqlx::query(
+            "SELECT 1 FROM agent_session_execution_slots
+             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_idle_workspace_slot", source))?;
+        if slot.is_some() {
+            return Ok(());
+        }
+        // Child/retry Runs do not own a root execution slot. They are still
+        // execution authority; lock Run evidence before the conversation head.
+        let running = sqlx::query(
+            "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ?
+             AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
+             LIMIT 1 FOR UPDATE",
+        ).bind(&key.owner_user_id).bind(&key.session_id)
+            .fetch_optional(&mut *tx).await
+            .map_err(|source| database_error("lock_idle_workspace_runs", source))?;
+        if running.is_some() {
+            return Ok(());
+        }
+        let (state, now) = lock_database_state_at_now(&mut tx, &key).await?;
+        if state
+            .active_writer
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at_unix_ms > now)
+            || state
+                .active_reservation
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at_unix_ms > now)
+        {
+            return Ok(());
+        }
+        let Some(binding) = load_execution_binding_in_tx(&mut tx, &key, true).await? else {
+            return Ok(());
+        };
+        if binding.state != SessionExecutionBindingStateV1::Ready
+            || execution_workspace_identity(&binding).as_deref() != Some(identity.as_str())
+        {
+            return Ok(());
+        }
+        let unresolved = sqlx::query(
+            "SELECT 1 FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?
+             AND state IN ('prepared', 'dispatched', 'outcome_unknown') LIMIT 1 FOR UPDATE",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_idle_workspace_invocations", source))?;
+        if unresolved.is_some() {
+            return Ok(());
+        }
+        // This conditional delete is a current write, not the discovery
+        // snapshot. If another owner won meanwhile it cannot delete its claim.
+        sqlx::query(
+            "DELETE FROM session_execution_workspace_claims
+             WHERE isolation_domain = ? AND owner_user_id = ? AND workspace_identity_hash = ?
+             AND workspace_identity = ? AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&identity_hash)
+        .bind(&identity)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("release_idle_workspace_claim", source))?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_idle_workspace_release", source))?;
+        Ok(())
+    }
+
+    async fn release_idle_claim_for_current_binding(
+        &self,
+        key: &SessionKeyV1,
+        expected_generation: Option<u64>,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        let Some(expected) = expected_generation.filter(|generation| *generation != 0) else {
+            return Ok(());
+        };
+        if let Some(binding) = self.load_execution_binding(key).await?
+            && binding.generation == expected
+            && binding.state == SessionExecutionBindingStateV1::Ready
+        {
+            self.release_idle_execution_workspace_claim(key, &binding)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Load the provider selection for one Work Session, creating the supplied
     /// server-owned initial binding exactly once when upgrading an existing
     /// Work branch. Session-head locking serializes concurrent first reads
@@ -925,6 +1085,12 @@ impl DatabaseSessionContextCoordinator {
                 "initial Session execution binding must be ready at generation 1".into(),
             ));
         }
+        let target = self
+            .load_execution_binding(key)
+            .await?
+            .unwrap_or_else(|| initial.clone());
+        self.release_idle_execution_workspace_claim(key, &target)
+            .await?;
         let mut tx = self
             .pool
             .get()
@@ -1044,6 +1210,8 @@ impl DatabaseSessionContextCoordinator {
             ));
         }
 
+        self.release_idle_execution_workspace_claim(key, next)
+            .await?;
         let mut tx = self
             .pool
             .get()
@@ -1184,6 +1352,8 @@ impl DatabaseSessionContextCoordinator {
         }
 
         let request_hash = execution_switch_request_hash(key, request)?;
+        self.release_idle_execution_workspace_claim(key, &request.target)
+            .await?;
         let mut tx = self
             .pool
             .get()
@@ -2972,6 +3142,11 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
         validate_idempotency_key(idempotency_key)?;
         validate_optional_cursor(&lease.key, expected_cursor)?;
+        self.release_idle_claim_for_current_binding(
+            &lease.key,
+            expected_execution_binding_generation,
+        )
+        .await?;
         let mut tx = self
             .pool
             .get()
@@ -3194,6 +3369,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
         validate_optional_cursor(key, expected_cursor)?;
 
+        self.release_idle_claim_for_current_binding(key, expected_execution_binding_generation)
+            .await?;
         let mut tx = self
             .pool
             .get()
@@ -5002,7 +5179,8 @@ fn ordered_execution_claim_hashes(previous_hash: Option<&str>, next_hash: &str) 
     hashes
 }
 
-/// Reserve an Edge checkout for exactly one Session at a time. The claim is
+/// Reserve an Edge checkout for one executing Session at a time. Idle claims
+/// may be retired under their owner's canonical execution fence. The claim is
 /// keyed by a hash so long paths remain indexable; the full identity is
 /// retained and compared after the lock to make a hash collision fail closed.
 /// Claims move with the binding in the same transaction, so two Sessions
@@ -5135,6 +5313,31 @@ pub(crate) async fn ensure_execution_workspace_claim_in_tx(
             owner_session_id: existing_session,
             owner_branch_id: existing_branch,
         });
+    }
+    Ok(())
+}
+
+/// Run creation/resume holds the canonical Session execution fence. Recheck
+/// its selection using current reads so delayed admission cannot execute after
+/// an idle Session has relinquished the checkout. This is not a tool hot path.
+pub(crate) async fn ensure_run_execution_workspace_claim_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    let key = SessionKeyV1::owner_session(
+        "server",
+        user_id,
+        session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    if let Some(binding) = load_execution_binding_in_tx(tx, &key, true).await? {
+        if binding.state != SessionExecutionBindingStateV1::Ready {
+            return Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
+                binding.state,
+            ));
+        }
+        ensure_execution_workspace_claim_in_tx(tx, &key, &binding).await?;
     }
     Ok(())
 }

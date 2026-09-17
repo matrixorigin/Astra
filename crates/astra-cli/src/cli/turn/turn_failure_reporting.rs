@@ -84,7 +84,7 @@ pub(crate) fn report_admission_rejection(
         if owner.is_some() {
             message.push_str("  To continue existing work, run /resume and choose the session.\n");
         }
-        message.push_str("  To keep this new session, switch to another worktree and retry.\n");
+        message.push_str("  Retry after the current work settles, or use another worktree.\n");
         message.push_str("  No model or tool ran.");
         ui.show_error(&message);
         return;
