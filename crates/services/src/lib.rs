@@ -7,6 +7,7 @@ pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
 pub mod byok_endpoint;
+pub(crate) mod cancellation_safe_db;
 pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;

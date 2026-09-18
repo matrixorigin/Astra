@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, Row, pool::PoolConnection};
+use sqlx::{Acquire, Executor, MySql, Row};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -20,6 +20,7 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::db_row::RowExt as RunStateDbRow;
 use crate::models::AdmittedModelExecution;
 use crate::pagination::MAX_API_LIST_LIMIT;
@@ -3328,15 +3329,18 @@ fn decode_run_execution_authority_snapshot(
 /// intentionally separate from event-pair reconciliation: exact durable
 /// facts prove that the commit landed, but do not prove a delayed caller is
 /// still allowed to project the Edge request.
-async fn load_exact_live_run_execution_authority(
-    pool: &sqlx::MySqlPool,
+async fn load_exact_live_run_execution_authority<'e, E>(
+    executor: E,
     user_id: &str,
     expected_session_id: &str,
     run_id: &str,
     expected_owner_generation: u64,
     expected_owner_pod_id: &str,
     expected_statuses: &[&str],
-) -> Result<ExactLiveRunExecutionAuthority, String> {
+) -> Result<ExactLiveRunExecutionAuthority, String>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     let row = sqlx::query(
         "SELECT status, run_generation, owner_pod_id,
                 CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
@@ -3348,7 +3352,7 @@ async fn load_exact_live_run_execution_authority(
     .bind(user_id)
     .bind(expected_session_id)
     .bind(run_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(|source| db_error("reload_run_execution_authority", run_id, source).to_string())?;
     let Some(row) = row else {
@@ -9729,50 +9733,16 @@ type DbStoreResult<T> = Result<T, DatabaseRunStateStoreError>;
 const RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
 
-/// A checked-out shared-pool connection that is reusable only after its
-/// caller explicitly proves the MySQL protocol is synchronized.
-///
-/// Dropping a future while SQLx is awaiting a MySQL response can otherwise
-/// return a connection with an in-flight exchange to the pool. Normal paths
-/// call [`Self::release`] after completing every query; timeout/cancellation
-/// paths reach `Drop` and close only that physical connection.
-struct CancellationSafePoolConnection {
-    connection: Option<PoolConnection<MySql>>,
-}
-
-impl CancellationSafePoolConnection {
-    async fn acquire(
-        pool: &SharedPool,
-        deadline: tokio::time::Instant,
-        operation: &'static str,
-        entity: &str,
-    ) -> Result<Self, String> {
-        let connection = tokio::time::timeout_at(deadline, pool.get().acquire())
-            .await
-            .map_err(|_| bounded_run_control_timeout(operation, entity))?
-            .map_err(|source| db_error(operation, entity, source).to_string())?;
-        Ok(Self {
-            connection: Some(connection),
-        })
-    }
-
-    fn connection_mut(&mut self) -> &mut sqlx::MySqlConnection {
-        self.connection
-            .as_deref_mut()
-            .expect("cancellation-safe connection already released")
-    }
-
-    fn release(mut self) {
-        drop(self.connection.take());
-    }
-}
-
-impl Drop for CancellationSafePoolConnection {
-    fn drop(&mut self) {
-        if let Some(connection) = self.connection.as_mut() {
-            connection.close_on_drop();
-        }
-    }
+async fn acquire_cancellation_safe_connection(
+    pool: &SharedPool,
+    deadline: tokio::time::Instant,
+    operation: &'static str,
+    entity: &str,
+) -> Result<CancellationSafePoolConnection, String> {
+    tokio::time::timeout_at(deadline, CancellationSafePoolConnection::acquire(pool))
+        .await
+        .map_err(|_| bounded_run_control_timeout(operation, entity))?
+        .map_err(|source| db_error(operation, entity, source).to_string())
 }
 
 struct BoundedRunControlConnection {
@@ -9788,7 +9758,7 @@ impl BoundedRunControlConnection {
         entity: &str,
     ) -> Result<Self, String> {
         let mut connection =
-            CancellationSafePoolConnection::acquire(pool, deadline, operation, entity).await?;
+            acquire_cancellation_safe_connection(pool, deadline, operation, entity).await?;
         let original_lock_wait_timeout = match tokio::time::timeout_at(
             deadline,
             sqlx::query_scalar::<_, String>("SELECT @@session.lock_wait_timeout")
@@ -13425,7 +13395,7 @@ impl DatabaseRunStateStore {
         else {
             return Err("orphan cancellation terminal event has no idempotency key".to_string());
         };
-        let mut connection = CancellationSafePoolConnection::acquire(
+        let mut connection = acquire_cancellation_safe_connection(
             &self.pool,
             deadline,
             "reconcile_orphan_cancellation_commit_acquire",
@@ -13629,7 +13599,7 @@ impl DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<bool, String> {
-        let mut connection = CancellationSafePoolConnection::acquire(
+        let mut connection = acquire_cancellation_safe_connection(
             &self.pool,
             deadline,
             "request_run_cancellation_reconcile_acquire",
@@ -13931,7 +13901,7 @@ impl DatabaseRunStateStore {
         request: AtomicExecutionOwnerCancellationRequest<'_>,
         terminal_event: &serde_json::Value,
     ) -> Result<bool, String> {
-        let mut connection = CancellationSafePoolConnection::acquire(
+        let mut connection = acquire_cancellation_safe_connection(
             &self.pool,
             deadline,
             "execution_owner_cancellation_reconcile_acquire",
@@ -21083,12 +21053,29 @@ impl RunStateStore for DatabaseRunStateStore {
         separated.push_unseparated(")");
         query.push(" AND cancellation_requested_at IS NULL");
 
-        let result = query
-            .build()
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
-        Ok(result.rows_affected() > 0)
+        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let mut connection = acquire_cancellation_safe_connection(
+            &self.pool,
+            deadline,
+            "renew_owner_lease_prepare",
+            run_id,
+        )
+        .await?;
+        let result = match tokio::time::timeout_at(
+            deadline,
+            query.build().execute(connection.connection_mut()),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(source)) => {
+                return Err(db_error("renew_owner_lease", run_id, source).to_string());
+            }
+            Err(_) => return Err(bounded_run_control_timeout("renew_owner_lease", run_id)),
+        };
+        let renewed = result.rows_affected() > 0;
+        connection.release();
+        Ok(renewed)
     }
 
     async fn authorize_execution_boundary(
@@ -21102,23 +21089,34 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let update = sqlx::query(
-            "UPDATE agent_runs
+        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let mut connection = acquire_cancellation_safe_connection(
+            &self.pool,
+            deadline,
+            "authorize_execution_boundary_prepare",
+            request.run_id,
+        )
+        .await?;
+        let update = tokio::time::timeout_at(
+            deadline,
+            sqlx::query(
+                "UPDATE agent_runs
              SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND owner_pod_id = ?
                AND run_generation = ? AND status IN (?, ?)
                AND owner_lease_expires_at >= NOW(6)
                AND cancellation_requested_at IS NULL",
+            )
+            .bind(self.lease_ttl_micros())
+            .bind(request.user_id)
+            .bind(request.expected_session_id)
+            .bind(request.run_id)
+            .bind(&self.owner_pod_id)
+            .bind(expected_generation)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_WAITING)
+            .execute(connection.connection_mut()),
         )
-        .bind(self.lease_ttl_micros())
-        .bind(request.user_id)
-        .bind(request.expected_session_id)
-        .bind(request.run_id)
-        .bind(&self.owner_pod_id)
-        .bind(expected_generation)
-        .bind(STATUS_RUNNING)
-        .bind(STATUS_WAITING)
-        .execute(self.pool.get())
         .await;
         let acknowledgement_unknown = {
             #[cfg(test)]
@@ -21132,13 +21130,28 @@ impl RunStateStore for DatabaseRunStateStore {
             }
         };
         match update {
-            Ok(result) if result.rows_affected() == 1 && !acknowledgement_unknown => {
+            Err(_) => {
+                return Err(bounded_run_control_timeout(
+                    "authorize_execution_boundary",
+                    request.run_id,
+                ));
+            }
+            Ok(Ok(result)) if result.rows_affected() == 1 && !acknowledgement_unknown => {
+                connection.release();
                 return Ok(RunExecutionBoundaryAuthorization::Authorized);
             }
-            Ok(_) => {}
-            Err(update_error) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(update_error)) => {
+                drop(connection);
+                let mut reread = acquire_cancellation_safe_connection(
+                    &self.pool,
+                    deadline,
+                    "authorize_execution_boundary_reconcile_prepare",
+                    request.run_id,
+                )
+                .await?;
                 let authority = load_exact_live_run_execution_authority(
-                    self.pool.get(),
+                    &mut *reread.connection_mut(),
                     request.user_id,
                     request.expected_session_id,
                     request.run_id,
@@ -21153,13 +21166,14 @@ impl RunStateStore for DatabaseRunStateStore {
                         db_error("authorize_execution_boundary", request.run_id, update_error)
                     )
                 })?;
+                reread.release();
                 return Ok(execution_boundary_authorization_from_exact_authority(
                     authority,
                 ));
             }
         }
         let authority = load_exact_live_run_execution_authority(
-            self.pool.get(),
+            &mut *connection.connection_mut(),
             request.user_id,
             request.expected_session_id,
             request.run_id,
@@ -21168,6 +21182,7 @@ impl RunStateStore for DatabaseRunStateStore {
             &[STATUS_RUNNING, STATUS_WAITING],
         )
         .await?;
+        connection.release();
         Ok(execution_boundary_authorization_from_exact_authority(
             authority,
         ))
@@ -21180,7 +21195,15 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         expected_owner_generation: u64,
     ) -> Result<bool, String> {
-        let result = sqlx::query(
+        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
+        let mut connection = acquire_cancellation_safe_connection(
+            &self.pool,
+            deadline,
+            "release_owner_lease_prepare",
+            run_id,
+        )
+        .await?;
+        let result = tokio::time::timeout_at(deadline, sqlx::query(
             "UPDATE agent_runs
              SET owner_pod_id = NULL, owner_lease_expires_at = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND owner_pod_id = ? AND run_generation = ?",
@@ -21190,10 +21213,13 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(run_id)
         .bind(&self.owner_pod_id)
         .bind(expected_owner_generation as i64)
-        .execute(self.pool.get())
+        .execute(connection.connection_mut()))
         .await
+        .map_err(|_| bounded_run_control_timeout("release_owner_lease", run_id))?
         .map_err(|source| db_error("release_owner_lease", run_id, source).to_string())?;
-        Ok(result.rows_affected() > 0)
+        let released = result.rows_affected() > 0;
+        connection.release();
+        Ok(released)
     }
 
     async fn find_blocking_session_run(

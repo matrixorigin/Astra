@@ -2,7 +2,9 @@ use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
+
+use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
@@ -1480,10 +1482,13 @@ struct PersistedInvocationAdmissionFact {
     terminal_fingerprint: Option<String>,
 }
 
-async fn load_invocation_admission_fact(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn load_invocation_admission_fact<'e, E>(
+    executor: E,
     plan: &InferenceInvocationPlan,
-) -> ServiceResult<Option<PersistedInvocationAdmissionFact>> {
+) -> ServiceResult<Option<PersistedInvocationAdmissionFact>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     sqlx::query(
         "SELECT route_id, admission_token, owner_token, owner_generation,
                 status, terminal_fingerprint
@@ -1492,7 +1497,7 @@ async fn load_invocation_admission_fact(
     )
     .bind(&plan.input.user_id)
     .bind(&plan.invocation_id)
-    .fetch_optional(db)
+    .fetch_optional(executor)
     .await
     .map_err(|error| {
         ServiceError::with_source(
@@ -1582,11 +1587,22 @@ pub async fn admit_inference_invocation(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     let db = pool.get();
-    if let Some(persisted) = load_invocation_admission_fact(db, plan).await? {
+    let mut connection = CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference admission connection",
+                error,
+            )
+        })?;
+    if let Some(persisted) =
+        load_invocation_admission_fact(&mut *connection.connection_mut(), plan).await?
+    {
+        connection.release();
         return Err(existing_invocation_error(plan, &persisted));
     }
-
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission",
@@ -1604,6 +1620,7 @@ pub async fn admit_inference_invocation(
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation").await;
+        drop(connection);
         match load_invocation_admission_fact(db, plan).await {
             Ok(Some(persisted)) => return Err(existing_invocation_error(plan, &persisted)),
             Ok(None) => return Err(error),
@@ -1617,8 +1634,15 @@ pub async fn admit_inference_invocation(
             }
         }
     }
-    let Err(error) = tx.commit().await else {
-        return Ok(());
+    let error = match tx.commit().await {
+        Ok(()) => {
+            connection.release();
+            return Ok(());
+        }
+        Err(error) => {
+            drop(connection);
+            error
+        }
     };
     let commit_error = ServiceError::with_source(
         ServiceErrorKind::Persistence,
@@ -1803,7 +1827,16 @@ pub async fn settle_uncertain_inference_admission(
     let fingerprint = terminal_fingerprint(terminal)?;
     let durable_terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference admission recovery connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference admission recovery",
@@ -1814,6 +1847,7 @@ pub async fn settle_uncertain_inference_admission(
         Ok(authority) => authority,
         Err(error) => {
             rollback_inference_tx(tx, "settle_uncertain_inference_admission").await;
+            drop(connection);
             return Err(error);
         }
     };
@@ -1949,8 +1983,15 @@ pub async fn settle_uncertain_inference_admission(
     {
         resolution = InferenceInvocationAdmissionResolution::AuthorityLost;
     }
-    let Err(error) = tx.commit().await else {
-        return Ok(resolution);
+    let error = match tx.commit().await {
+        Ok(()) => {
+            connection.release();
+            return Ok(resolution);
+        }
+        Err(error) => {
+            drop(connection);
+            error
+        }
     };
     let commit_error = ServiceError::with_source(
         ServiceErrorKind::Persistence,
@@ -2835,7 +2876,16 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     validate_first_provider_attempt_binding(invocation, attempt)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire combined inference admission connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined inference admission",
@@ -2853,6 +2903,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     .await;
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await;
+        drop(connection);
         match load_invocation_admission_fact(db, invocation).await {
             Ok(Some(persisted)) => return Err(existing_invocation_error(invocation, &persisted)),
             Ok(None) => {}
@@ -2890,8 +2941,15 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
         }
         return Err(error);
     }
-    let Err(error) = tx.commit().await else {
-        return Ok(());
+    let error = match tx.commit().await {
+        Ok(()) => {
+            connection.release();
+            return Ok(());
+        }
+        Err(error) => {
+            drop(connection);
+            error
+        }
     };
     let commit_error = ServiceError::with_source(
         ServiceErrorKind::Persistence,

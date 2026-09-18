@@ -170,6 +170,26 @@ fn detached_reconciliation_timeout() -> std::time::Duration {
 }
 const MAX_FOREGROUND_ADMISSION_RECOVERIES: u32 = 1;
 #[cfg(not(test))]
+const PROVIDER_SETTLEMENT_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(not(test))]
+const PROVIDER_SETTLEMENT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const PROVIDER_SETTLEMENT_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(5);
+#[cfg(test)]
+const PROVIDER_SETTLEMENT_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn provider_settlement_retry_delay(attempt_number: u32) -> std::time::Duration {
+    // Settlement debt cannot be discarded: the provider may already have
+    // observed the request. Exponential backoff retains that exact debt while
+    // preventing one blocked durable row from continuously consuming DB
+    // connections and lock waiters.
+    let exponent = attempt_number.saturating_sub(1).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    PROVIDER_SETTLEMENT_RETRY_BASE
+        .saturating_mul(multiplier)
+        .min(PROVIDER_SETTLEMENT_RETRY_MAX)
+}
+#[cfg(not(test))]
 const DEFAULT_PROVIDER_SETTLEMENT_CAPACITY: usize = 256;
 #[cfg(test)]
 const DEFAULT_PROVIDER_SETTLEMENT_CAPACITY: usize = 16;
@@ -1828,11 +1848,7 @@ impl ProviderSettlementCoordinator {
             // but it must not monopolize one of the fixed workers. Requeue at
             // the tail after a bounded delay so all users' already-reserved
             // settlements continue to make progress.
-            #[cfg(not(test))]
-            let backoff =
-                std::time::Duration::from_millis(1_000 + u64::from(attempt_number % 8) * 250);
-            #[cfg(test)]
-            let backoff = std::time::Duration::from_millis(5);
+            let backoff = provider_settlement_retry_delay(attempt_number);
             // The delayed retry owns the exact reservation, while this worker
             // immediately returns to the fair queue. A bounded set of poison
             // jobs therefore cannot consume all worker loops merely by being
@@ -4620,6 +4636,25 @@ fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvo
 mod tests {
     use super::*;
     use axum::{Router, body::Body, response::Response, routing::post};
+
+    #[test]
+    fn provider_settlement_retry_backoff_is_exponential_and_capped() {
+        assert_eq!(
+            (1..=8)
+                .map(provider_settlement_retry_delay)
+                .collect::<Vec<_>>(),
+            vec![
+                std::time::Duration::from_millis(5),
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+            ]
+        );
+    }
 
     async fn spawn_test_server(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
