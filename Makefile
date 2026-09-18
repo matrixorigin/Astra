@@ -438,7 +438,6 @@ dev-sdk-deps:
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
-<<<<<<< HEAD
 # The Web app consumes the package's dist entrypoint. Rebuild when source or
 # package configuration changed so a restarted Web server cannot silently load
 # an older decoder.
