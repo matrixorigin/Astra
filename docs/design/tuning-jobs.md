@@ -117,3 +117,24 @@ Track:
 - provider fallback changes;
 - tool-call validity;
 - user correction rate after activation.
+
+## Skill lifecycle implementation boundary
+
+Skill creation and improvement use the existing Skillify harness for
+source-backed drafts and the personal-skill store for immutable versions. A
+candidate is not active behavior and is not publishable merely because its
+Markdown parses. The draft records its source packets, citations, redaction
+and evidence watermark, target scope, and uncertainty.
+
+The first evaluation job type is a private paired comparison for prompt-only
+skills. It is rejected at preflight when the package requires tools,
+external writes, undeclared resources, or a verifier that cannot be isolated.
+Each trial references exact baseline/candidate hashes and has an idempotent
+identity. Budgets cover candidate generation, all arms, retries, and judging;
+partial or unknown usage remains visible.
+
+Adoption uses a tenant-scoped compare-and-set against the active revision and
+records the expected baseline. Concurrent adoption therefore cannot silently
+replace another user's choice. Rollback is a normal adoption to the previous
+revision. Reports and derived datasets retain source lineage and are
+invalidated or rebuilt when consent is revoked or a source is deleted.
