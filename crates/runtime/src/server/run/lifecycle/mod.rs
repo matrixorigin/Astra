@@ -45,17 +45,25 @@ use astra_core::{
 };
 use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
+use astra_services::evaluation::{
+    DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
+    DatabaseMaterializationReceiptStore, EvaluationObservationRequest, EvaluationRunAdmission,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, MaterializationComponentKind,
+    MaterializationOutcome, MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
+    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
+    prompt_only_snapshot_envelope, prompt_policy_fingerprint, terminal_run_observation,
+};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunEventDelta,
     DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
-    DurableWorkItemRunBinding, DurableWorkRunBinding, ModelSelectionMode,
-    RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
-    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
-    RunProjectionCheckpointRecord, RunProjectionRecord, RunStartIdempotency,
-    RunStartIdempotencyKind, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
-    RuntimeAuthRequest, RuntimeProfileRequest, durable_run_status_blocks_session,
-    durable_run_status_is_terminal, durable_run_status_kind,
+    DurableWorkItemRunBinding, DurableWorkRunBinding, ExecutionDeadlineAuthority,
+    ModelSelectionMode, RequestedTurnInteractionMode, ResolvedModelSelection,
+    RunContinuationRecord, RunLifecycleService, RunListCursor, RunListRecord,
+    RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
+    RunStartIdempotency, RunStartIdempotencyKind, RunStatusRecord, RunUserIntentData,
+    RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
+    durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -7727,6 +7735,20 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        if let Some(admission) = request.evaluation_admission.as_ref() {
+            context
+                .execution_metadata
+                .get_or_insert_with(Map::new)
+                .insert(
+                    "evaluation_admission".to_string(),
+                    serde_json::to_value(admission).map_err(|error| {
+                        error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid evaluation admission metadata: {error}"),
+                        )
+                    })?,
+                );
+        }
         context.work_binding = work_binding.map(ValidatedWorkRuntimeBinding::durable_binding);
         use astra_services::runs::{
             DurableAdmissionSource, ModelAdmissionSource, RuntimeCapabilitySource,
@@ -7803,6 +7825,483 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    /// Admit the evaluation metadata at the canonical Run boundary.  The
+    /// ordinary lifecycle has already selected the model/provider and checked
+    /// request capabilities when this runs; no provider or tool work starts
+    /// before this method returns successfully.
+    async fn admit_evaluation_trial(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        execution_owner_generation: u64,
+        request: &ChatRequestData,
+        admission: &EvaluationRunAdmission,
+    ) -> Result<EvaluationRunAdmission, (StatusCode, Json<ErrorResponse>)> {
+        admission.validate_shape().map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_admission_invalid",
+                error,
+            )
+        })?;
+        let pool = self.shared_pool.clone().ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "evaluation admission requires the shared durable database",
+            )
+        })?;
+        let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+        // Read and validate the frozen trial before claiming it.  All request
+        // and policy checks below are pure admission checks; a rejected
+        // request must not strand the planned trial in a durable binding that
+        // can never be retried.
+        let binding = plan_store
+            .load_trial(user_id, &admission.trial_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_trial_binding_rejected",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != admission.experiment_id {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_identity_conflict",
+                "trial belongs to another experiment",
+            ));
+        }
+        if binding.binding_status == "bound"
+            && binding.run_generation != Some(execution_owner_generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_run_generation_conflict",
+                "trial binding was created for another canonical Run generation",
+            ));
+        }
+        let experiment = plan_store
+            .load_experiment(user_id, &admission.experiment_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_store_error",
+                    error,
+                )
+            })?;
+        let run_created_at = sqlx::query_scalar::<_, chrono::NaiveDateTime>(
+            "SELECT created_at FROM agent_runs
+             WHERE user_id = ? AND run_id = ? AND session_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .fetch_one(pool.get())
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_run_start_time_unavailable",
+                error,
+            )
+        })?;
+        let run_created_at =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(run_created_at, chrono::Utc);
+        let Some(execution_deadline) = request.admitted_execution_deadline else {
+            return Err(evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_deadline_missing",
+                "prompt-only evaluation requires an admitted execution deadline",
+            ));
+        };
+        let execution_deadline = chrono::DateTime::from_timestamp_millis(
+            i64::try_from(execution_deadline.deadline_unix_ms).map_err(|_| {
+                evaluation_preflight_error(
+                    StatusCode::BAD_REQUEST,
+                    "evaluation_deadline_invalid",
+                    "admitted execution deadline exceeds the supported timestamp range",
+                )
+            })?,
+        )
+        .ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_deadline_invalid",
+                "admitted execution deadline is outside the supported timestamp range",
+            )
+        })?;
+        let max_wall_time_secs =
+            i64::try_from(experiment.spec.budget.max_wall_time_secs).map_err(|_| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_budget_invalid",
+                    "frozen experiment wall-time budget exceeds the supported duration range",
+                )
+            })?;
+        let wall_time = chrono::Duration::try_seconds(max_wall_time_secs).ok_or_else(|| {
+            evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_budget_invalid",
+                "frozen experiment wall-time budget exceeds the supported duration range",
+            )
+        })?;
+        let frozen_deadline = run_created_at
+            .checked_add_signed(wall_time)
+            .ok_or_else(|| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_budget_invalid",
+                    "frozen experiment wall-time budget cannot be represented as a deadline",
+                )
+            })?;
+        if execution_deadline > frozen_deadline {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_deadline_exceeds_budget",
+                "admitted execution deadline exceeds the frozen experiment wall-time budget",
+            ));
+        }
+        let receipt_expiry = execution_deadline.min(frozen_deadline);
+        let run_created_at = run_created_at.to_rfc3339();
+        let trial = &binding.trial;
+        let expected_revision_hash = match trial.arm {
+            astra_services::evaluation::ComparisonArm::Baseline => {
+                &experiment.spec.target.baseline.content_hash
+            }
+            astra_services::evaluation::ComparisonArm::Candidate => {
+                &experiment.spec.target.candidate.content_hash
+            }
+        };
+        if &admission.revision_content_hash != expected_revision_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_revision_mismatch",
+                "trial revision content does not match the frozen baseline/candidate",
+            ));
+        }
+        let Some(revision_prompt) = request.stable_runtime_system_prompt.as_deref() else {
+            return Err(evaluation_preflight_error(
+                StatusCode::BAD_REQUEST,
+                "evaluation_revision_content_missing",
+                "prompt-only evaluation requires the frozen revision content",
+            ));
+        };
+        if content_fingerprint(revision_prompt) != admission.revision_content_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_revision_content_mismatch",
+                "revision content hash does not match the frozen revision identity",
+            ));
+        }
+        if trial.input_content_hash != admission.input_content_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_input_identity_conflict",
+                "trial input hash does not match the admission metadata",
+            ));
+        }
+        let context_hash = prompt_context_fingerprint(
+            &request.message,
+            &request.parts,
+            &request.attachments,
+            request.context.as_ref(),
+        );
+        // The prompt-only adapter defines Context as the canonical request
+        // payload (message, parts, attachments, and explicit context).  The
+        // frozen case input and the frozen Context snapshot must therefore
+        // both name this exact assembly; a caller cannot manufacture an
+        // Available Context receipt from a declaration alone.
+        if context_hash != admission.input_content_hash
+            || context_hash != experiment.spec.conditions.context_snapshot_hash
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_context_mismatch",
+                "actual prompt Context does not match the frozen trial and Context identities",
+            ));
+        }
+        let Some(resolved_model) = request.resolved_model_selection.as_ref() else {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_unresolved",
+                "evaluation requires a resolved model offering before execution",
+            ));
+        };
+        if resolved_model.offering_id != experiment.spec.conditions.model_binding {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_binding_mismatch",
+                "resolved model offering differs from the frozen model binding",
+            ));
+        }
+        let Some(admitted_model) = request.admitted_model_execution.as_ref() else {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_model_unresolved",
+                "evaluation requires admitted provider execution material",
+            ));
+        };
+        if admitted_model.offering_id != resolved_model.offering_id
+            || admitted_model.provider != experiment.spec.conditions.provider_binding
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_provider_binding_mismatch",
+                "admitted provider execution differs from the frozen provider binding",
+            ));
+        }
+        // The adapter can prove only the cache modes that the normal model
+        // admission already selected.  Keep the experiment label deliberately
+        // small and closed: provider-default means no explicit deployment
+        // capability, while explicit-recorded means the trusted offering
+        // supplied one.  Other labels would claim behavior this adapter does
+        // not verify and are rejected before any receipt is issued.
+        let expected_cache_policy = if admitted_model.cache_capability.is_some() {
+            "explicit_recorded"
+        } else {
+            "provider_default_recorded"
+        };
+        if experiment.spec.conditions.cache_policy != expected_cache_policy {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_cache_policy_unsupported",
+                format!(
+                    "prompt-only evaluation supports cache policy {expected_cache_policy}, not {}",
+                    experiment.spec.conditions.cache_policy
+                ),
+            ));
+        }
+        if !matches!(
+            experiment.spec.conditions.memory_isolation,
+            astra_services::evaluation::MemoryIsolation::Disabled
+        ) || !matches!(
+            experiment.spec.conditions.data_isolation,
+            astra_services::evaluation::DataIsolation::Disabled
+        ) {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_isolation_unsupported",
+                "this execution adapter supports only prompt-only trials; Memory/Data branches are not materialized",
+            ));
+        }
+        let edge_context = Self::extract_edge_context(request)?;
+        if request.workspace_binding.is_some()
+            || request.executor_binding.is_some()
+            || request.edge_executor_id.is_some()
+            || !request.runtime_mcp_bindings.is_empty()
+            || !request.agent_bindings.is_empty()
+            || request.agent_binding.is_some()
+            || request.runtime_skill_binding.is_some()
+            || request.provider_runtime_authorized
+            || request.runtime_system_prompt.is_some()
+            || request.capability_descriptors.is_some()
+            || request.skill_search.is_some()
+            || request.explain
+            || request
+                .allow_skills
+                .as_ref()
+                .is_some_and(|skills| !skills.is_empty())
+            || request
+                .allow_skill_sources
+                .as_ref()
+                .is_some_and(|sources| !sources.is_empty())
+            || request
+                .allow_tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+            || request
+                .enabled_tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+            || !edge_context.edge_tools.is_empty()
+            || !edge_context.edge_skills.is_empty()
+            || !edge_context.edge_profile.extra.is_empty()
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_execution_surface_unsupported",
+                "prompt-only evaluation does not admit workspace, edge, MCP, skill, or tool side effects",
+            ));
+        }
+        let policy_facts = serde_json::json!({
+            "model_binding": experiment.spec.conditions.model_binding,
+            "provider_binding": experiment.spec.conditions.provider_binding,
+            "cache_policy": experiment.spec.conditions.cache_policy,
+            "resolved_model_selection": request.resolved_model_selection,
+            "admitted_provider": admitted_model.provider,
+            "admitted_cache_capability": admitted_model.cache_capability,
+            "execution_policy": request.execution_policy,
+            "allow_skills": request.allow_skills,
+            "allow_skill_sources": request.allow_skill_sources,
+            "allow_tools": request.allow_tools,
+            "enabled_tools": request.enabled_tools,
+            "runtime_profile": request.runtime_profile,
+        });
+        let policy_hash = prompt_policy_fingerprint(&policy_facts);
+        if policy_hash != experiment.spec.conditions.tool_policy_hash {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_policy_mismatch",
+                "actual resolved policy does not match the frozen tool policy",
+            ));
+        }
+        let envelope = if let Some(envelope) = admission.snapshot_envelope.as_ref() {
+            envelope
+                .validate_for(
+                    user_id,
+                    &experiment.experiment_id,
+                    Some(&trial.trial_id),
+                    Some(session_id),
+                )
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_snapshot_mismatch",
+                        error,
+                    )
+                })?;
+            envelope.clone()
+        } else {
+            prompt_only_snapshot_envelope(
+                user_id,
+                &experiment.experiment_id,
+                &trial.trial_id,
+                session_id,
+                trial.repetition,
+                &run_created_at,
+                &context_hash,
+                &experiment.spec.conditions.tool_policy_hash,
+            )
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_snapshot_unavailable",
+                    error,
+                )
+            })?
+        };
+        if envelope.context_snapshot_hash != context_hash
+            || envelope.policy_snapshot_hash != policy_hash
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_snapshot_mismatch",
+                "snapshot envelope does not prove the admitted Context and policy",
+            ));
+        }
+        // Claim the trial only after every caller-controlled identity and
+        // policy value has matched the frozen experiment.  The CAS is the
+        // cross-process/multi-session fence; an exact retry for this run is
+        // idempotent, while a competing run receives a conflict.
+        let binding = plan_store
+            .bind_trial_run(user_id, &admission.trial_id, session_id, run_id)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_trial_binding_rejected",
+                    error,
+                )
+            })?;
+        if binding.experiment_id != admission.experiment_id
+            || binding.run_generation != Some(execution_owner_generation)
+        {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_trial_binding_rejected",
+                "trial binding changed before materialization",
+            ));
+        }
+        let materializer = DatabaseMaterializationReceiptStore::new(pool.clone());
+        let receipt_ids = if admission.receipt_ids.is_empty() {
+            // The receipt lifetime is the shorter of the frozen experiment
+            // budget and the canonical execution deadline. Retries reproduce
+            // this exact timestamp from the durable Run start rather than
+            // extending a queued evaluation with a fresh wall-clock window.
+            let expires_at = receipt_expiry;
+            let trusted = TrustedMaterializerContext {
+                owner_user_id: user_id.to_string(),
+                materializer_kind: "runtime.prompt_only.v1".to_string(),
+                provider_binding_id: Some(experiment.spec.conditions.provider_binding.clone()),
+                execution_run_id: Some(run_id.to_string()),
+                execution_run_generation: Some(execution_owner_generation),
+            };
+            let mut ids = Vec::with_capacity(2);
+            for (component_kind, fingerprint) in [
+                (MaterializationComponentKind::Context, context_hash.as_str()),
+                (MaterializationComponentKind::Policy, policy_hash.as_str()),
+            ] {
+                let record = materializer
+                    .record_receipt(
+                        &trusted,
+                        &MaterializationReceiptRequest {
+                            trial_id: trial.trial_id.clone(),
+                            session_id: session_id.to_string(),
+                            envelope: envelope.clone(),
+                            component_kind,
+                            component_snapshot_ref: Some(format!(
+                                "prompt-only://{}/{}/{fingerprint}",
+                                experiment.experiment_id, trial.trial_id
+                            )),
+                            component_base_snapshot_ref: None,
+                            component_content_fingerprint: Some(fingerprint.to_string()),
+                            outcome: MaterializationOutcome::Available,
+                            failure_code: None,
+                            expires_at: Some(expires_at),
+                            idempotency_key: evaluation_component_idempotency_key(
+                                &trial.trial_id,
+                                run_id,
+                                execution_owner_generation,
+                                component_kind.as_str(),
+                            ),
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "evaluation_materialization_failed",
+                            error,
+                        )
+                    })?;
+                ids.push(record.receipt_id);
+            }
+            ids
+        } else {
+            admission.receipt_ids.clone()
+        };
+        materializer
+            .validate_receipts_for_execution(
+                user_id,
+                &trial.trial_id,
+                session_id,
+                &experiment.spec,
+                &envelope,
+                &receipt_ids,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_materialization_rejected",
+                    error,
+                )
+            })?;
+        Ok(EvaluationRunAdmission {
+            experiment_id: admission.experiment_id.clone(),
+            trial_id: admission.trial_id.clone(),
+            input_content_hash: admission.input_content_hash.clone(),
+            revision_content_hash: admission.revision_content_hash.clone(),
+            receipt_ids,
+            snapshot_envelope: Some(envelope),
+        })
+    }
+
     async fn fail_started_run_before_spawn_with_handles(
         run_engine: &RunEngine,
         runs: &Arc<RwLock<HashMap<String, RunState>>>,
@@ -7813,7 +8312,12 @@ impl AgenticRunLifecycleService {
         message: &str,
         failure_code: PreSpawnFailureCode,
     ) -> bool {
-        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
+        let mut terminal_events = pre_spawn_failure_terminal_events(message, failure_code)
+            .into_iter()
+            .collect::<Vec<_>>();
+        terminal_events.extend(Self::zero_execution_settlement_events(
+            execution_owner_generation,
+        ));
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -7881,6 +8385,10 @@ impl AgenticRunLifecycleService {
             "run-pre-admission-user-cancelled:{run_id}:generation:{execution_owner_generation}"
         ));
         let terminal_events = vec![terminal_event];
+        let mut persisted_terminal_events = terminal_events.clone();
+        persisted_terminal_events.extend(Self::zero_execution_settlement_events(
+            execution_owner_generation,
+        ));
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -7891,7 +8399,7 @@ impl AgenticRunLifecycleService {
                 STATUS_CANCELLED,
                 None,
                 None,
-                &terminal_events,
+                &persisted_terminal_events,
             )
             .await
         {
@@ -7968,6 +8476,7 @@ impl AgenticRunLifecycleService {
             "cache_creation_tokens": loop_state.total_cache_creation,
             "completion_tokens": loop_state.total_completion,
             "tool_call_count": loop_state.total_tool_calls,
+            "usage_available": loop_state.has_any_usage,
             // This is the sum of every physical model request in the run,
             // not a context-window measurement.
             "usage_scope": "run_total",
@@ -8000,6 +8509,33 @@ impl AgenticRunLifecycleService {
             ),
             "data": Self::durable_run_accounting(loop_state),
         })
+    }
+
+    fn zero_execution_settlement_events(execution_owner_generation: u64) -> [Value; 2] {
+        [
+            json!({
+                "event_type": "run_accounting_finalized",
+                "idempotency_key": format!(
+                    "run-accounting-finalized:{execution_owner_generation}"
+                ),
+                "data": {
+                    "prompt_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "completion_tokens": 0,
+                    "tool_call_count": 0,
+                    "usage_available": false,
+                    "usage_scope": "run_total",
+                },
+            }),
+            json!({
+                "event_type": "run_settlement_finished",
+                "idempotency_key": format!(
+                    "run-settlement-finished:{execution_owner_generation}"
+                ),
+                "data": {"owner_generation": execution_owner_generation},
+            }),
+        ]
     }
 
     fn settlement_started_event(execution_owner_generation: u64) -> Value {
@@ -8267,6 +8803,54 @@ impl AgenticRunLifecycleService {
                 false
             }
         }
+    }
+
+    async fn persist_finalized_accounting_after_terminal(
+        run_engine: &RunEngine,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        status: RunStatus,
+        execution_owner_generation: u64,
+        loop_state: &AgenticLoopState,
+    ) -> bool {
+        let event = Self::finalized_accounting_event(loop_state, execution_owner_generation);
+        for attempt in 1..=3u64 {
+            match run_engine
+                .append_events_if_current_generation_and_status(
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    execution_owner_generation,
+                    &[
+                        STATUS_CANCELLED,
+                        STATUS_PAUSED,
+                        STATUS_COMPLETED,
+                        STATUS_FAILED,
+                        STATUS_DELEGATED,
+                    ],
+                    std::slice::from_ref(&event),
+                )
+                .await
+            {
+                Ok(committed) => return committed,
+                Err(error) if attempt == 3 => {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        run_id,
+                        status = status.as_str(),
+                        execution_owner_generation,
+                        error = %error,
+                        "failed to persist generation-fenced terminal accounting"
+                    );
+                }
+                Err(_) => {}
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(attempt * 10)).await;
+            }
+        }
+        false
     }
 
     fn finalize_run_events(
@@ -10155,7 +10739,10 @@ impl AgenticRunLifecycleService {
                 "agent_binding_runtime_profile_conflict",
             ));
         }
-        if !has_agent_bindings && request.stable_runtime_system_prompt.is_some() {
+        if !has_agent_bindings
+            && request.stable_runtime_system_prompt.is_some()
+            && request.evaluation_admission.is_none()
+        {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "stable_runtime_system_prompt requires agent_binding or agent_bindings",
@@ -12062,6 +12649,108 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    /// Prompt-only evaluation trials must start from a genuinely empty
+    /// session. Reusing a normal chat session would silently import canonical
+    /// history, checkpoints, state projections, or context snapshots that
+    /// are absent from the frozen Context receipt.
+    async fn ensure_evaluation_session_clean(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let Some(shared) = &self.shared_pool else {
+            return Err(evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_store_unavailable",
+                "evaluation admission requires the shared durable database",
+            ));
+        };
+        let pool = shared.get();
+        let checks = [
+            (
+                "agent_events",
+                "SELECT 1 FROM agent_events WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "agent_runs",
+                "SELECT 1 FROM agent_runs WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_context_heads",
+                "SELECT 1 FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_state_items",
+                "SELECT 1 FROM session_state_items WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "ctx_snapshots",
+                "SELECT 1 FROM ctx_snapshots WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "run_checkpoints",
+                "SELECT 1 FROM run_checkpoints WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "session_execution_bindings",
+                "SELECT 1 FROM session_execution_bindings WHERE owner_user_id = ? AND session_id = ? LIMIT 1",
+            ),
+            (
+                "conversation_log",
+                "SELECT 1 FROM conversation_log WHERE user_id = ? AND session_id = ? LIMIT 1",
+            ),
+        ];
+        for (table, sql) in checks {
+            let present = sqlx::query(sql)
+                .bind(user_id)
+                .bind(session_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| {
+                    evaluation_preflight_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "evaluation_session_check_failed",
+                        format!("failed to inspect {table}: {error}"),
+                    )
+                })?
+                .is_some();
+            if present {
+                return Err(evaluation_preflight_error(
+                    StatusCode::CONFLICT,
+                    "evaluation_session_not_clean",
+                    format!(
+                        "prompt-only evaluation requires a new session; {table} already has state"
+                    ),
+                ));
+            }
+        }
+        // The transcript helper is intentionally best-effort for ordinary
+        // resume hydration. Admission is different: an unavailable history
+        // query must fail closed, otherwise a partially visible old prompt
+        // could contaminate a supposedly prompt-only trial.
+        let transcript_present = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                evaluation_preflight_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evaluation_session_check_failed",
+                    format!("failed to inspect prompt history transcript: {error}"),
+                )
+            })?
+            .is_some();
+        if transcript_present {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "prompt-only evaluation requires a new session without conversation history",
+            ));
+        }
+        Ok(())
+    }
+
     fn session_resume_hydration_hint_from_sources(
         primary_messages: &[Value],
         transcript_messages: &[Value],
@@ -12230,20 +12919,24 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override.cloned().unwrap_or_else(|| {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
-        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
-            match svc.scoped_to_owner(user_id) {
-                Ok(scoped) => Some(scoped),
-                Err(error) => {
-                    tracing::error!(
-                        user_id,
-                        session_id,
-                        error = %error,
-                        "session-memory extraction disabled because the transport could not bind the authenticated owner"
-                    );
-                    None
+        let memory_extraction_service = if request.evaluation_admission.is_some() {
+            None
+        } else {
+            self.memory_extraction_service.as_ref().and_then(|svc| {
+                match svc.scoped_to_owner(user_id) {
+                    Ok(scoped) => Some(scoped),
+                    Err(error) => {
+                        tracing::error!(
+                            user_id,
+                            session_id,
+                            error = %error,
+                            "session-memory extraction disabled because the transport could not bind the authenticated owner"
+                        );
+                        None
+                    }
                 }
-            }
-        });
+            })
+        };
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -13460,6 +14153,66 @@ impl AgenticRunLifecycleService {
         Ok(run)
     }
 
+    /// Rebuild a missing Eval observation from bounded durable admission and
+    /// settlement markers, then hydrate the canonical Run only after the
+    /// exact generation has closed its settlement fence. This is intentionally
+    /// a projection retry, not a second executor: owner/session/generation/
+    /// terminal checks remain in `DatabaseEvaluationObservationStore`.
+    async fn reconcile_evaluation_observation_for_run(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+        run_generation: u64,
+        durable_status: &str,
+    ) {
+        let Some(pool) = self.shared_pool.clone() else {
+            return;
+        };
+        let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+        let Some(marker) = observation_store
+            .load_admission_marker_for_run(user_id, run_id, run_generation)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if observation_store
+            .load_by_trial(user_id, &marker.admission.trial_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        let Some(status) = RunStatus::from_durable_status(durable_status) else {
+            return;
+        };
+        if evaluation_trial_status(status).is_none() {
+            return;
+        }
+        // Terminal status is not enough: a status poll may race the executor
+        // between its terminal CAS and the accounting/settlement fence. Do
+        // not create an immutable `Missing` observation in that window.
+        if !marker.settlement_finished {
+            return;
+        }
+        persist_evaluation_observation_after_settlement(
+            &self.run_engine,
+            Some(&pool),
+            user_id,
+            session_id,
+            run_id,
+            marker.execution_run_generation,
+            Some(&marker.admission),
+            status,
+            true,
+        )
+        .await;
+    }
+
     async fn require_durable_run_for_user(
         &self,
         run_id: &str,
@@ -14116,6 +14869,317 @@ fn work_subject_invalidation_response(
         "work_subject_unavailable",
     )
 }
+
+fn evaluation_preflight_error(
+    status: StatusCode,
+    code: &'static str,
+    detail: impl std::fmt::Display,
+) -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(
+        status,
+        format!("evaluation trial admission rejected: {detail}"),
+        code,
+    )
+}
+
+fn evaluation_trial_status(status: RunStatus) -> Option<TrialStatus> {
+    match status {
+        RunStatus::Completed => Some(TrialStatus::Completed),
+        RunStatus::Failed => Some(TrialStatus::Failed),
+        RunStatus::Cancelled => Some(TrialStatus::Cancelled),
+        // Delegation is a terminal Run fact, but it is not evidence that the
+        // evaluated revision completed the case. Keep it explicitly
+        // unavailable so comparison code cannot mistake it for success.
+        RunStatus::Delegated => Some(TrialStatus::Unavailable),
+        RunStatus::Running | RunStatus::Paused | RunStatus::Waiting => None,
+    }
+}
+
+async fn revalidate_evaluation_before_provider(
+    run_engine: &RunEngine,
+    pool: Option<&SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: &EvaluationRunAdmission,
+    execution_deadline: Option<ExecutionDeadlineAuthority>,
+) -> Result<(), String> {
+    let Some(deadline) = execution_deadline else {
+        return Err("evaluation execution deadline is missing at provider admission".to_string());
+    };
+    let now_unix_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("evaluation admission clock is unavailable: {error}"))?
+        .as_millis();
+    let now_unix_ms = u64::try_from(now_unix_ms)
+        .map_err(|_| "evaluation admission clock exceeds supported range".to_string())?;
+    if now_unix_ms >= deadline.deadline_unix_ms || Instant::now() >= deadline.monotonic_deadline() {
+        return Err("evaluation execution deadline expired before provider admission".to_string());
+    }
+    if !run_engine
+        .confirm_execution_authority(
+            owner_user_id,
+            session_id,
+            run_id,
+            run_generation,
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| format!("evaluation execution authority could not be renewed: {error}"))?
+    {
+        return Err("evaluation execution authority changed before provider admission".to_string());
+    }
+    let pool = pool
+        .ok_or_else(|| "evaluation execution requires the shared durable database".to_string())?;
+    let envelope = admission
+        .snapshot_envelope
+        .as_ref()
+        .ok_or_else(|| "evaluation admission has no snapshot envelope".to_string())?;
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let binding = plan_store
+        .load_trial(owner_user_id, &admission.trial_id)
+        .await
+        .map_err(|error| format!("evaluation trial could not be reloaded: {error}"))?;
+    if binding.binding_status != "bound"
+        || binding.session_id.as_deref() != Some(session_id)
+        || binding.run_id.as_deref() != Some(run_id)
+        || binding.run_generation != Some(run_generation)
+    {
+        return Err("evaluation trial binding changed before provider admission".to_string());
+    }
+    let experiment = plan_store
+        .load_experiment(owner_user_id, &admission.experiment_id)
+        .await
+        .map_err(|error| format!("evaluation experiment could not be reloaded: {error}"))?;
+    DatabaseMaterializationReceiptStore::new(pool.clone())
+        .validate_receipts_for_execution(
+            owner_user_id,
+            &binding.trial_id,
+            session_id,
+            &experiment.spec,
+            envelope,
+            &admission.receipt_ids,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| {
+            format!("evaluation materialization expired before provider admission: {error}")
+        })?;
+    Ok(())
+}
+
+async fn persist_evaluation_observation_after_settlement(
+    run_engine: &RunEngine,
+    pool: Option<&SharedPool>,
+    owner_user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    run_generation: u64,
+    admission: Option<&EvaluationRunAdmission>,
+    persisted_status: RunStatus,
+    durable_fence_closed: bool,
+) {
+    let Some(admission) = admission else {
+        return;
+    };
+    let Some(status) = evaluation_trial_status(persisted_status) else {
+        return;
+    };
+    if !durable_fence_closed {
+        tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            owner_user_id,
+            session_id,
+            run_id,
+            run_generation,
+            "evaluation observation deferred because canonical settlement is not closed"
+        );
+        return;
+    }
+    let Some(pool) = pool else {
+        tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            owner_user_id,
+            session_id,
+            run_id,
+            "evaluation observation could not be persisted without the shared database"
+        );
+        return;
+    };
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let binding = match plan_store
+        .load_trial(owner_user_id, &admission.trial_id)
+        .await
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                trial_id = %admission.trial_id,
+                error = %error,
+                "evaluation observation could not load its frozen trial"
+            );
+            return;
+        }
+    };
+    let experiment = match plan_store
+        .load_experiment(owner_user_id, &admission.experiment_id)
+        .await
+    {
+        Ok(experiment) => experiment,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                experiment_id = %admission.experiment_id,
+                error = %error,
+                "evaluation observation could not load its frozen experiment"
+            );
+            return;
+        }
+    };
+    let canonical_events = match run_engine.load_run(owner_user_id, run_id).await {
+        Ok(Some(run)) if run.run_id == run_id && run.run_generation == run_generation => run.events,
+        Ok(Some(_)) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                run_generation,
+                "evaluation evidence run generation changed before observation; retrying projection later"
+            );
+            return;
+        }
+        Ok(None) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                run_generation,
+                "evaluation evidence run disappeared before observation; retrying projection later"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                run_generation,
+                error = %error,
+                "evaluation evidence read failed; retrying projection later"
+            );
+            return;
+        }
+    };
+    let accounting_key = format!("run-accounting-finalized:{run_generation}");
+    let accounting_index = canonical_events.iter().rposition(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
+            && event.get("idempotency_key").and_then(Value::as_str) == Some(accounting_key.as_str())
+    });
+    let (prompt_tokens, completion_tokens, tool_calls) = accounting_index
+        .and_then(|index| canonical_events.get(index))
+        .map(|event| {
+            let data = event.get("data").unwrap_or(&Value::Null);
+            let usage_available = data
+                .get("usage_available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (
+                usage_available
+                    .then(|| data.get("prompt_tokens").and_then(Value::as_u64))
+                    .flatten(),
+                usage_available
+                    .then(|| data.get("completion_tokens").and_then(Value::as_u64))
+                    .flatten(),
+                data.get("tool_call_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+            )
+        })
+        .unwrap_or((None, None, None));
+    let evidence_available = accounting_index.is_some();
+    let evidence_events = accounting_index
+        .map(|index| canonical_events[..=index].to_vec())
+        .unwrap_or_default();
+    let evidence_payload = json!({
+        "run_id": run_id,
+        "run_generation": run_generation,
+        "status": persisted_status.as_str(),
+        "event_watermark": accounting_index,
+        "events": evidence_events,
+    });
+    let evidence_json = serde_json::to_string(&evidence_payload).ok();
+    let evidence = vec![EvidenceRef {
+        evidence_id: format!("run:{run_id}:{run_generation}"),
+        kind: EvidenceKind::Trace,
+        availability: if evidence_available && evidence_json.is_some() {
+            EvidenceAvailability::Available
+        } else {
+            EvidenceAvailability::Missing
+        },
+        content_hash: evidence_json
+            .as_deref()
+            .filter(|_| evidence_available)
+            .map(content_fingerprint),
+        locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+    }];
+    let observation = terminal_run_observation(
+        experiment.spec_fingerprint.clone(),
+        binding.trial.trial_id.clone(),
+        binding.trial.case_id.clone(),
+        binding.trial.arm.clone(),
+        binding.trial.repetition,
+        status,
+        prompt_tokens,
+        completion_tokens,
+        tool_calls,
+        evidence,
+    );
+    let request = EvaluationObservationRequest {
+        session_id: session_id.to_string(),
+        execution_run_id: run_id.to_string(),
+        execution_run_generation: run_generation,
+        observation,
+        materialization_receipt_ids: admission.receipt_ids.clone(),
+        idempotency_key: format!("eval-observation:{run_id}:{run_generation}"),
+    };
+    match DatabaseEvaluationObservationStore::new(pool.clone())
+        .record_observation(owner_user_id, &request)
+        .await
+    {
+        Ok(record) => {
+            tracing::debug!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id,
+                session_id,
+                run_id,
+                trial_id = %record.trial_id,
+                observation_id = %record.observation_id,
+                "durable evaluation observation settled"
+            );
+        }
+        Err(error) => tracing::warn!(
+            target: "astra_runtime::run_lifecycle",
+            owner_user_id,
+            session_id,
+            run_id,
+            trial_id = %admission.trial_id,
+            error = %error,
+            "durable evaluation observation settlement failed"
+        ),
+    }
+}
+
 impl AgenticRunLifecycleService {
     async fn launch_owned_background_execution(&self, execution: OwnedBackgroundExecution) {
         let OwnedBackgroundExecution {
@@ -14163,6 +15227,7 @@ impl AgenticRunLifecycleService {
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let bg_shared_pool = self.shared_pool.clone();
         let bg_explain = request.explain;
+        let bg_eval_admission = request.evaluation_admission.clone();
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
@@ -14383,6 +15448,58 @@ impl AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
+
+                // Capacity admission can queue for longer than a receipt's
+                // frozen lifetime. Re-prove the exact owner generation and
+                // receipt set immediately before entering the agentic loop,
+                // so an expired or recovered evaluation never reaches the
+                // provider boundary.
+                if let Some(admission) = bg_eval_admission.as_ref()
+                    && let Err(error) = revalidate_evaluation_before_provider(
+                        &run_engine,
+                        bg_shared_pool.as_ref(),
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                        admission,
+                        request.admitted_execution_deadline,
+                    )
+                    .await
+                {
+                    drop(execution_permit);
+                    park_server_root_mailbox(&mut loop_state).await;
+                    let committed = Self::fail_started_run_before_spawn_with_handles(
+                        &run_engine,
+                        &runs,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        execution_owner_generation,
+                        &error,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                    bg_approval_channels.lock().await.remove(&bg_run_id);
+                    bg_user_prompt_channels.lock().await.remove(&bg_run_id);
+                    bg_progress_channels.lock().await.remove(&bg_run_id);
+                    if committed {
+                        Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                            Self::cleanup_cloud_workspace_with_debt(
+                                bg_workspace_record_store.clone(),
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                record,
+                                RuntimeCleanupReason::Failed,
+                                error,
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
@@ -14949,12 +16066,32 @@ impl AgenticRunLifecycleService {
                     } else {
                         None
                     };
+                let terminal_accounting_committed =
+                    if control_terminal_settlement_committed.is_some() {
+                        control_terminal_settlement_committed
+                    } else if durable_status_committed {
+                        Some(
+                            Self::persist_finalized_accounting_after_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                persisted_status,
+                                execution_owner_generation,
+                                &loop_state,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 let all_settlement_facts_committed = settlement_facts_committed(
                     control_terminal_settlement_committed,
                     durable_status_committed,
                     terminal_events.len(),
                     terminal_events_committed,
-                );
+                ) && terminal_accounting_committed
+                    .unwrap_or(true);
                 let settlement_closed = all_settlement_facts_committed
                     && Self::persist_settlement_finished(
                         &run_engine,
@@ -14977,6 +16114,23 @@ impl AgenticRunLifecycleService {
                 // slower observability, memory, and workspace cleanup so those
                 // side effects do not extend the executor's apparent lifetime.
                 drop(_owner_lease_heartbeat);
+
+                // Evaluation observations are derived from the same fenced
+                // terminal Run. A takeover may race this write; the
+                // observation store rechecks owner/session/generation and
+                // rejects stale writers instead of creating a second result.
+                persist_evaluation_observation_after_settlement(
+                    &run_engine,
+                    bg_shared_pool.as_ref(),
+                    &bg_user_id,
+                    &bg_session_id,
+                    &bg_run_id,
+                    execution_owner_generation,
+                    bg_eval_admission.as_ref(),
+                    persisted_status,
+                    durable_fence_closed,
+                )
+                .await;
 
                 if owner_terminal_committed && persist_terminal_events {
                     flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
@@ -15120,11 +16274,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .session_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let evaluation_prompt_only = request.evaluation_admission.is_some();
+        if evaluation_prompt_only {
+            self.ensure_evaluation_session_clean(&user_id, &session_id)
+                .await?;
+        }
         let active_personal_skills =
             load_active_personal_skills(self.shared_pool.as_ref(), &user_id, &session_id).await?;
-        let work_runtime_binding = self
-            .validate_work_runtime_binding(&user_id, &session_id, &request)
-            .await?;
+        if evaluation_prompt_only && !active_personal_skills.is_empty() {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "prompt-only evaluation cannot run in a session with active personal skills",
+            ));
+        }
+        let work_runtime_binding = if evaluation_prompt_only {
+            if request.work_binding.is_some() {
+                return Err(evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_execution_surface_unsupported",
+                    "prompt-only evaluation cannot inherit a Work session context",
+                ));
+            }
+            // Do not discover the session's implicit Work binding here. The
+            // evaluation path has already required a clean canonical session;
+            // looking up and installing Work context would add un-fingerprinted
+            // prompt state before the canonical turn fence.
+            None
+        } else {
+            self.validate_work_runtime_binding(&user_id, &session_id, &request)
+                .await?
+        };
         self.bind_execution_selection(
             &user_id,
             &session_id,
@@ -15136,11 +16316,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_service_tool_catalog_enabled =
+        let server_service_tool_catalog_enabled = if evaluation_prompt_only {
+            false
+        } else {
             Self::server_service_tool_catalog_enabled_for_request(
                 agent_binding_mode,
                 edge_context.has_tools(),
-            );
+            )
+        };
         let runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
@@ -15153,12 +16336,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
-        self.append_latest_explain_artifact_context_bounded(
-            &user_id,
-            &session_id,
-            &mut edge_profile,
-        )
-        .await;
+        if !evaluation_prompt_only {
+            self.append_latest_explain_artifact_context_bounded(
+                &user_id,
+                &session_id,
+                &mut edge_profile,
+            )
+            .await;
+        }
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
                 &mut edge_profile,
@@ -15371,12 +16556,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
         // resume context must not activate plan-mode blocking.
-        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
-            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-        } else {
-            astra_plan::PlanResumeSnapshot::default()
-        };
+        let plan_resume_snapshot =
+            if !evaluation_prompt_only && let Some(shared) = &self.shared_pool {
+                let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+                astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
+            } else {
+                astra_plan::PlanResumeSnapshot::default()
+            };
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
@@ -15388,7 +16574,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile.clone(),
             server_service_tool_catalog_enabled,
-            !agent_binding_mode,
+            !agent_binding_mode && !evaluation_prompt_only,
             execution_bindings.as_ref(),
             plan_resume_hint,
             plan_authoring_active,
@@ -15461,6 +16647,168 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
+        if evaluation_prompt_only
+            && canonical_turn.as_ref().is_some_and(|admission| {
+                admission.had_canonical_head || !admission.prior_messages.is_empty()
+            })
+        {
+            // The coordinator's writer/turn reservation is the atomic
+            // session boundary. A preflight SELECT cannot protect this
+            // decision from a concurrent Edge or server turn, so reject as
+            // soon as the canonical reservation proves the session is no
+            // longer empty and release the reservation before returning.
+            drop(canonical_turn);
+            self.fail_started_run_before_spawn(
+                &user_id,
+                &session_id,
+                &run_id,
+                execution_owner_generation,
+                "prompt-only evaluation requires an empty canonical session",
+                PreSpawnFailureCode::PreSpawnFailure,
+            )
+            .await;
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "prompt-only evaluation requires an empty canonical session".to_string(),
+                )
+                .await;
+            }
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "prompt-only evaluation requires an empty canonical session",
+            ));
+        }
+        // Admit the frozen trial only after the canonical coordinator has
+        // reserved the session boundary. The reservation is the atomic
+        // empty-session check; doing trial admission before it could leave a
+        // generation-bound trial behind when another session writer wins the
+        // race.
+        if let Some(admission) = request.evaluation_admission.clone() {
+            match self
+                .admit_evaluation_trial(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    execution_owner_generation,
+                    &request,
+                    &admission,
+                )
+                .await
+            {
+                Ok(admitted) => {
+                    let admitted_event = json!({
+                        "event_type": "evaluation_admitted",
+                        "run_generation": execution_owner_generation,
+                        "idempotency_key": format!(
+                            "evaluation-admitted:{run_id}:{execution_owner_generation}"
+                        ),
+                        "data": {
+                            "schema_version": astra_services::evaluation::EVALUATION_EXECUTION_SCHEMA_VERSION,
+                            "admission": admitted.clone(),
+                        },
+                    });
+                    match self
+                        .run_engine
+                        .append_events_if_current_generation_and_status(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            execution_owner_generation,
+                            &[STATUS_RUNNING],
+                            std::slice::from_ref(&admitted_event),
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            drop(canonical_turn);
+                            self.fail_started_run_before_spawn(
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                execution_owner_generation,
+                                "evaluation admission lost its canonical execution generation",
+                                PreSpawnFailureCode::PreSpawnFailure,
+                            )
+                            .await;
+                            if let Some(record) = cloud_workspace_record.as_ref() {
+                                self.cleanup_cloud_workspace_after_failed_start(
+                                    &user_id,
+                                    &session_id,
+                                    &run_id,
+                                    record,
+                                    "evaluation admission lost its canonical execution generation"
+                                        .to_string(),
+                                )
+                                .await;
+                            }
+                            return Err(evaluation_preflight_error(
+                                StatusCode::CONFLICT,
+                                "evaluation_admission_generation_lost",
+                                "the canonical execution owner changed before evaluation admission was recorded",
+                            ));
+                        }
+                        Err(persist_error) => {
+                            drop(canonical_turn);
+                            self.fail_started_run_before_spawn(
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                execution_owner_generation,
+                                "evaluation admission evidence could not be persisted",
+                                PreSpawnFailureCode::PreSpawnFailure,
+                            )
+                            .await;
+                            if let Some(record) = cloud_workspace_record.as_ref() {
+                                self.cleanup_cloud_workspace_after_failed_start(
+                                    &user_id,
+                                    &session_id,
+                                    &run_id,
+                                    record,
+                                    "evaluation admission evidence could not be persisted"
+                                        .to_string(),
+                                )
+                                .await;
+                            }
+                            return Err(evaluation_preflight_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "evaluation_admission_persistence_failed",
+                                persist_error,
+                            ));
+                        }
+                    }
+                    request.evaluation_admission = Some(admitted)
+                }
+                Err(error) => {
+                    drop(canonical_turn);
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "evaluation trial admission failed before execution",
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            "evaluation trial admission failed before execution".to_string(),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let restore_prior_prompt_history = should_restore_prior_prompt_history(
             request.session_id.is_some(),
             match canonical_turn.as_ref() {
@@ -15551,7 +16899,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if restore_prior_prompt_history {
+        if restore_prior_prompt_history && !evaluation_prompt_only {
             if let Ok(Some(restored)) =
                 astra_pipeline::step_restore::restore_session(&user_id, &session_id)
             {
@@ -15565,6 +16913,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── CSL: Load conversation history from the log ─────────────
         let csl_manager = if restore_prior_prompt_history
+            && !evaluation_prompt_only
             && canonical_turn
                 .as_ref()
                 .is_none_or(|admission| !admission.had_canonical_head)
@@ -15630,12 +16979,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             );
-            if let Some(memoria_port) = self
-                .memory_extraction_service
-                .as_ref()
-                .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
-            {
-                executor = executor.with_memoria_port(memoria_port);
+            if !evaluation_prompt_only {
+                if let Some(memoria_port) = self
+                    .memory_extraction_service
+                    .as_ref()
+                    .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
+                {
+                    executor = executor.with_memoria_port(memoria_port);
+                }
             }
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(loop_state.cancellation.token.clone());
@@ -15954,6 +17305,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             self.prepare_chat_request(&user_id, request).await?
         };
+        if request.evaluation_admission.is_some() {
+            return Err(evaluation_preflight_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "evaluation_streaming_unsupported",
+                "prompt-only evaluation currently requires the durable background Run entrypoint",
+            ));
+        }
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -18397,12 +19755,32 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     } else {
                         None
                     };
+                let terminal_accounting_committed =
+                    if control_terminal_settlement_committed.is_some() {
+                        control_terminal_settlement_committed
+                    } else if durable_status_committed {
+                        Some(
+                            Self::persist_finalized_accounting_after_terminal(
+                                &run_engine,
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                persisted_status,
+                                execution_owner_generation,
+                                &state,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
                 let all_settlement_facts_committed = settlement_facts_committed(
                     control_terminal_settlement_committed,
                     durable_status_committed,
                     streaming_events_for_durable.len(),
                     streaming_events_committed,
-                );
+                ) && terminal_accounting_committed
+                    .unwrap_or(true);
                 let settlement_closed = all_settlement_facts_committed
                     && Self::persist_settlement_finished(
                         &run_engine,
@@ -18634,9 +20012,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 Self::durable_persist_error("status snapshot", error)
             })?;
-        let mut status = snapshot
-            .map(Self::durable_status_snapshot_record)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+        let Some(snapshot) = snapshot else {
+            return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
+        };
+        let mut status = Self::durable_status_snapshot_record(snapshot.clone());
+        if durable_run_status_is_terminal(&snapshot.status) {
+            self.reconcile_evaluation_observation_for_run(
+                &user_id,
+                &run_id,
+                &snapshot.session_id,
+                snapshot.run_generation,
+                &snapshot.status,
+            )
+            .await;
+        }
         // This optional field can retain an unrecorded local observation. The
         // canonical cross-pod/history source remains the run's replay stream.
         status.artifact_publication = local_publication;
@@ -18650,6 +20039,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         recent_limit: u32,
     ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
         let run = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        if durable_run_status_is_terminal(&run.status) {
+            self.reconcile_evaluation_observation_for_run(
+                &user_id,
+                &run_id,
+                &run.session_id,
+                run.run_generation,
+                &run.status,
+            )
+            .await;
+        }
         let projection = self
             .run_engine
             .load_run_projection(&user_id, &run_id)

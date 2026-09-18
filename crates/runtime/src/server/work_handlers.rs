@@ -3545,6 +3545,7 @@ pub(super) async fn post_work_branch_turn_handler(
             }),
         }),
         run_start_idempotency: Some(turn.start_idempotency),
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: None,

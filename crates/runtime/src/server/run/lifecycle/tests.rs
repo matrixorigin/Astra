@@ -12,6 +12,29 @@ fn explain_artifact_publication_requires_a_durable_terminal_status() {
     assert!(!explain_artifact_publishable_status(RunStatus::Paused));
 }
 
+#[test]
+fn evaluation_trial_status_keeps_terminal_run_meanings_distinct() {
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Completed),
+        Some(astra_services::evaluation::TrialStatus::Completed)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Failed),
+        Some(astra_services::evaluation::TrialStatus::Failed)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Cancelled),
+        Some(astra_services::evaluation::TrialStatus::Cancelled)
+    );
+    assert_eq!(
+        evaluation_trial_status(RunStatus::Delegated),
+        Some(astra_services::evaluation::TrialStatus::Unavailable)
+    );
+    for status in [RunStatus::Running, RunStatus::Paused, RunStatus::Waiting] {
+        assert_eq!(evaluation_trial_status(status), None);
+    }
+}
+
 fn complete_tool_ledger_receipt(
     run_id: &str,
     attempted: u32,
@@ -9991,6 +10014,335 @@ fn db_backed_test_service(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_scoped() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("eval-runtime-owner-{}", Uuid::new_v4());
+    let session_id = format!("eval-runtime-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
+    let llm = spawn_terminal_test_llm().await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind("model-test-model")
+        .execute(pool.get())
+        .await
+        .expect("clear runtime evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind("model-test-model")
+        .bind("test-model")
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed runtime evaluation model fixture");
+    let service = db_backed_test_service(&pool, &format!("eval-runtime-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_run_concurrency_limit(1);
+
+    let mut request = test_request("evaluate this fixed input");
+    request.session_id = Some(session_id.clone());
+    request.stable_runtime_system_prompt = Some("Frozen revision text".to_string());
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    let input_hash = prompt_context_fingerprint(
+        &request.message,
+        &request.parts,
+        &request.attachments,
+        request.context.as_ref(),
+    );
+    let revision_hash = content_fingerprint("Frozen revision text");
+    let admitted_model = test_admitted_model_execution();
+    let policy_facts = json!({
+        "model_binding": "model-test-model",
+        "provider_binding": "openai",
+        "cache_policy": "provider_default_recorded",
+        "resolved_model_selection": {
+            "offering_id": "model-test-model",
+            "model_name": "test-model"
+        },
+        "admitted_provider": admitted_model.provider,
+        "admitted_cache_capability": admitted_model.cache_capability,
+        "execution_policy": request.execution_policy,
+        "allow_skills": request.allow_skills,
+        "allow_skill_sources": request.allow_skill_sources,
+        "allow_tools": request.allow_tools,
+        "enabled_tools": request.enabled_tools,
+        "runtime_profile": request.runtime_profile,
+    });
+    let policy_hash = prompt_policy_fingerprint(&policy_facts);
+    let experiment_id = format!("eval-runtime-exp-{}", Uuid::new_v4());
+    let spec = astra_services::evaluation::ExperimentSpec {
+        schema_version: 1,
+        experiment_id: experiment_id.clone(),
+        target: astra_services::evaluation::EvaluationTarget {
+            kind: astra_services::evaluation::EvaluationTargetKind::Skill,
+            baseline: astra_services::evaluation::RevisionRef {
+                revision_id: "revision-baseline".to_string(),
+                content_hash: revision_hash.clone(),
+            },
+            candidate: astra_services::evaluation::RevisionRef {
+                revision_id: "revision-candidate".to_string(),
+                content_hash: content_fingerprint("Candidate revision text"),
+            },
+        },
+        cases: vec![astra_services::evaluation::EvaluationCase {
+            case_id: "case-runtime".to_string(),
+            input_snapshot_ref: "input://runtime".to_string(),
+            input_content_hash: input_hash.clone(),
+            verifier_id: "verifier-runtime".to_string(),
+            verifier_version: "1".to_string(),
+            holdout: false,
+        }],
+        repetitions: 1,
+        order: astra_services::evaluation::TrialOrder::BaselineFirst,
+        conditions: astra_services::evaluation::FrozenConditions {
+            isolation_profile: "prompt_only_private".to_string(),
+            model_binding: "model-test-model".to_string(),
+            provider_binding: "openai".to_string(),
+            context_snapshot_hash: input_hash,
+            tool_policy_hash: policy_hash,
+            cache_policy: "provider_default_recorded".to_string(),
+            memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
+            data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+        },
+        budget: astra_services::evaluation::EvaluationBudget {
+            max_trials: 2,
+            max_concurrency: 1,
+            max_wall_time_secs: 60,
+        },
+    };
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec, "runtime-eval-submit")
+        .await
+        .expect("register runtime evaluation");
+    let trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("load runtime evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .expect("baseline runtime trial");
+    request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: trial.trial_id.clone(),
+        input_content_hash: trial.trial.input_content_hash.clone(),
+        revision_content_hash: revision_hash,
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let run = service
+        .create_run(owner.clone(), request)
+        .await
+        .expect("evaluation must use the ordinary durable Run entrypoint");
+    let durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &run.run_id)
+                .await
+                .expect("load runtime evaluation run")
+                .expect("runtime evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime evaluation should settle");
+    assert_eq!(durable.status, STATUS_COMPLETED, "{durable:?}");
+    let marker = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_admitted")
+        })
+        .expect("evaluation admission marker");
+    assert_eq!(
+        marker.get("run_generation").and_then(Value::as_u64),
+        Some(durable.run_generation)
+    );
+    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &trial.trial_id)
+                .await
+                .expect("load runtime evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime evaluation observation should settle");
+    assert_eq!(observation.observation.status, TrialStatus::Completed);
+    assert_eq!(observation.execution_run_id, run.run_id);
+    assert_eq!(observation.execution_run_generation, durable.run_generation);
+    assert_eq!(observation.materialization_receipt_ids.len(), 2);
+    assert!(
+        observation
+            .observation
+            .evidence
+            .iter()
+            .all(|evidence| evidence.availability == EvidenceAvailability::Available)
+    );
+
+    // A queued Eval cancelled before semaphore admission must still settle a
+    // terminal observation from the same canonical transaction, without ever
+    // reaching the provider.
+    let cancel_session_id = format!("eval-runtime-cancel-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &cancel_session_id).await;
+    let cancel_trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("reload runtime evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Candidate)
+        .expect("candidate runtime trial");
+    let held_permit = service
+        .test_run_semaphore()
+        .acquire_owned()
+        .await
+        .expect("hold the only runtime evaluation slot");
+    let mut cancel_request = test_request("evaluate this fixed input");
+    cancel_request.session_id = Some(cancel_session_id.clone());
+    cancel_request.stable_runtime_system_prompt = Some("Candidate revision text".to_string());
+    cancel_request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    cancel_request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: cancel_trial.trial_id.clone(),
+        input_content_hash: cancel_trial.trial.input_content_hash.clone(),
+        revision_content_hash: content_fingerprint("Candidate revision text"),
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let provider_calls_before_cancel = llm.requests.load(Ordering::SeqCst);
+    let cancel_run = service
+        .create_run(owner.clone(), cancel_request)
+        .await
+        .expect("queued evaluation must be accepted before cancellation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &cancel_run.run_id)
+                .await
+                .expect("load queued evaluation run")
+                .expect("queued evaluation run exists");
+            if durable.events.iter().any(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("evaluation_admitted")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("queued evaluation must persist admission before cancellation");
+    service
+        .cancel_run(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("cancel queued evaluation");
+    let cancelled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &cancel_run.run_id)
+                .await
+                .expect("load cancelled evaluation run")
+                .expect("cancelled evaluation run exists");
+            if durable.status == STATUS_CANCELLED {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("queued cancellation must settle without provider admission");
+    drop(held_permit);
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls_before_cancel,
+        "queued cancellation must not call the provider"
+    );
+    assert!(cancelled.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("run_accounting_finalized")
+            && event.get("idempotency_key").and_then(Value::as_str)
+                == Some(format!("run-accounting-finalized:{}", cancelled.run_generation).as_str())
+    }));
+    assert!(cancelled.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str) == Some("run_settlement_finished")
+            && event.get("idempotency_key").and_then(Value::as_str)
+                == Some(format!("run-settlement-finished:{}", cancelled.run_generation).as_str())
+    }));
+    service
+        .get_run_status(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("status recovery should project the cancelled evaluation");
+    let cancelled_observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &cancel_trial.trial_id)
+                .await
+                .expect("load cancelled evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled evaluation observation should settle");
+    assert_eq!(
+        cancelled_observation.observation.status,
+        TrialStatus::Cancelled
+    );
+    assert_eq!(cancelled_observation.execution_run_id, cancel_run.run_id);
+    let _ = service
+        .get_run_status(cancel_run.run_id.clone(), owner.clone())
+        .await
+        .expect("repeated status repair remains idempotent");
+
+    for (table, column) in [
+        ("evaluation_trial_observations", "owner_user_id"),
+        ("evaluation_materialization_receipts", "owner_user_id"),
+        ("evaluation_trial_bindings", "owner_user_id"),
+        ("evaluation_experiments", "owner_user_id"),
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE {column} = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .expect("clean runtime evaluation plan");
+    }
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, &cancel_run.run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &cancel_session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind("model-test-model")
+        .execute(pool.get())
+        .await
+        .expect("clean runtime evaluation model fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
     let pool = setup_lifecycle_run_db_it().await;
     let owner_a = format!("cap-owner-a-{}", Uuid::new_v4());
@@ -10767,6 +11119,7 @@ fn test_request(message: &str) -> ChatRequestData {
         session_id: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
@@ -21476,6 +21829,7 @@ fn extract_edge_tools_from_context() {
         session_id: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: None,
@@ -21564,6 +21918,7 @@ fn extract_edge_profile_from_context() {
         session_id: None,
         work_binding: None,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: None,
         model: None,

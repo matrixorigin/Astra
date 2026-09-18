@@ -237,15 +237,14 @@ impl SnapshotEnvelope {
             }
         }
         validate_identifier("experiment_id", &self.experiment_id)?;
-        if let Some(trial_id) = &self.trial_id {
-            if trial_id.is_empty()
+        if let Some(trial_id) = &self.trial_id
+            && (trial_id.is_empty()
                 || trial_id.len() > 128
                 || !trial_id.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-                })
-            {
-                return Err("trial_id contains an unsupported character".to_string());
-            }
+                }))
+        {
+            return Err("trial_id contains an unsupported character".to_string());
         }
         if self.composite.snapshot_id.trim().is_empty() {
             return Err("composite snapshot_id must not be empty".to_string());
@@ -394,17 +393,15 @@ impl ExperimentSpec {
         }
         if let MemoryIsolation::BranchPerTrial { base_snapshot_ref } =
             &self.conditions.memory_isolation
+            && base_snapshot_ref.trim().is_empty()
         {
-            if base_snapshot_ref.trim().is_empty() {
-                return Err("memory branch base_snapshot_ref must not be empty".to_string());
-            }
+            return Err("memory branch base_snapshot_ref must not be empty".to_string());
         }
         if let DataIsolation::MatrixOneBranchPerTrial { base_snapshot_ref } =
             &self.conditions.data_isolation
+            && base_snapshot_ref.trim().is_empty()
         {
-            if base_snapshot_ref.trim().is_empty() {
-                return Err("MatrixOne branch base_snapshot_ref must not be empty".to_string());
-            }
+            return Err("MatrixOne branch base_snapshot_ref must not be empty".to_string());
         }
         let expected = self
             .cases
@@ -431,6 +428,14 @@ impl ExperimentSpec {
         }
         if self.budget.max_wall_time_secs == 0 {
             return Err("budget max_wall_time_secs must be greater than zero".to_string());
+        }
+        let max_wall_time_secs = i64::try_from(self.budget.max_wall_time_secs).map_err(|_| {
+            "budget max_wall_time_secs exceeds the supported duration range".to_string()
+        })?;
+        if chrono::Duration::try_seconds(max_wall_time_secs).is_none() {
+            return Err(
+                "budget max_wall_time_secs exceeds the supported duration range".to_string(),
+            );
         }
         Ok(())
     }
@@ -468,6 +473,159 @@ impl ExperimentSpec {
         max_serialized_bytes: usize,
     ) -> Result<Vec<TrialUnit>, String> {
         self.plan_trials_internal(Some((max_trials, max_serialized_bytes)))
+    }
+
+    /// Validate one persisted trial against the frozen specification without
+    /// expanding and sorting every other trial. Runtime admission and
+    /// settlement call this hot path for each Run; the full plan expansion is
+    /// reserved for registration/list integrity checks.
+    pub fn validate_trial_identity(&self, trial: &TrialUnit) -> Result<(), String> {
+        self.validate()?;
+        let spec_fingerprint = self.spec_fingerprint()?;
+        let planned_trial_count = self.planned_trial_count()?;
+        if trial.sequence == 0 || trial.sequence as usize > planned_trial_count {
+            return Err(format!(
+                "trial {} has sequence {} outside the planned range",
+                trial.trial_id, trial.sequence
+            ));
+        }
+        if trial.experiment_id != self.experiment_id || trial.spec_fingerprint != spec_fingerprint {
+            return Err(format!(
+                "trial {} is not bound to this experiment identity",
+                trial.trial_id
+            ));
+        }
+        let case = self
+            .cases
+            .iter()
+            .find(|case| case.case_id == trial.case_id)
+            .ok_or_else(|| format!("trial {} references an unknown case", trial.trial_id))?;
+        if trial.repetition >= self.repetitions {
+            return Err(format!(
+                "trial {} repetition {} is outside the experiment",
+                trial.trial_id, trial.repetition
+            ));
+        }
+        let expected_trial_id = trial_id(
+            &spec_fingerprint,
+            &self.experiment_id,
+            &trial.case_id,
+            trial.repetition,
+            &trial.arm,
+        );
+        if trial.trial_id != expected_trial_id {
+            return Err(format!(
+                "trial {} does not match its case/repetition/arm identity",
+                trial.trial_id
+            ));
+        }
+        let expected_memory_base = match &self.conditions.memory_isolation {
+            MemoryIsolation::Disabled => None,
+            MemoryIsolation::BranchPerTrial { base_snapshot_ref } => {
+                Some(base_snapshot_ref.as_str())
+            }
+        };
+        let expected_data_base = match &self.conditions.data_isolation {
+            DataIsolation::Disabled => None,
+            DataIsolation::MatrixOneBranchPerTrial { base_snapshot_ref } => {
+                Some(base_snapshot_ref.as_str())
+            }
+        };
+        if trial.input_snapshot_ref != case.input_snapshot_ref
+            || trial.input_content_hash != case.input_content_hash
+            || trial.verifier_id != case.verifier_id
+            || trial.verifier_version != case.verifier_version
+            || trial.holdout != case.holdout
+            || trial.memory_base_snapshot_ref.as_deref() != expected_memory_base
+            || trial.data_base_snapshot_ref.as_deref() != expected_data_base
+        {
+            return Err(format!(
+                "trial {} does not match its frozen case or isolation conditions",
+                trial.trial_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return the deterministic sequence assigned by `plan_trials` without
+    /// allocating the complete `TrialUnit` vector. Balanced ordering still
+    /// scans the bounded case/repetition space, but retains only the target's
+    /// rank and therefore cannot duplicate the persisted plan payload.
+    pub fn canonical_trial_sequence(&self, trial: &TrialUnit) -> Result<u32, String> {
+        self.validate_trial_identity(trial)?;
+        let case_index = self
+            .cases
+            .iter()
+            .position(|case| case.case_id == trial.case_id)
+            .ok_or_else(|| format!("trial {} references an unknown case", trial.trial_id))?;
+        let arm_index = match &trial.arm {
+            ComparisonArm::Baseline => 0_usize,
+            ComparisonArm::Candidate => 1_usize,
+        };
+        let target_original_index =
+            (case_index * self.repetitions as usize + trial.repetition as usize) * 2 + arm_index;
+        let rank = match &self.order {
+            TrialOrder::BaselineFirst | TrialOrder::CandidateFirst => {
+                let case_rank = self
+                    .cases
+                    .iter()
+                    .filter(|case| case.case_id < trial.case_id)
+                    .count();
+                let arm_rank = match (&self.order, &trial.arm) {
+                    (TrialOrder::BaselineFirst, ComparisonArm::Baseline)
+                    | (TrialOrder::CandidateFirst, ComparisonArm::Candidate) => 0,
+                    _ => 1,
+                };
+                (case_rank * self.repetitions as usize + trial.repetition as usize) * 2 + arm_rank
+            }
+            TrialOrder::Balanced { seed } => {
+                let target_pair_key =
+                    stable_pair_key(*seed, &trial.case_id, trial.repetition, b"pair");
+                let target_arm_rank = {
+                    let candidate_first =
+                        stable_pair_key(*seed, &trial.case_id, trial.repetition, b"orientation")
+                            & 1
+                            == 1;
+                    match (&trial.arm, candidate_first) {
+                        (ComparisonArm::Baseline, false) | (ComparisonArm::Candidate, true) => 0,
+                        _ => 1,
+                    }
+                };
+                let mut preceding = 0_usize;
+                for (other_case_index, case) in self.cases.iter().enumerate() {
+                    for repetition in 0..self.repetitions {
+                        let pair_key = stable_pair_key(*seed, &case.case_id, repetition, b"pair");
+                        let candidate_first =
+                            stable_pair_key(*seed, &case.case_id, repetition, b"orientation") & 1
+                                == 1;
+                        for (other_arm_index, other_arm) in
+                            [ComparisonArm::Baseline, ComparisonArm::Candidate]
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let arm_rank = match (&other_arm, candidate_first) {
+                                (ComparisonArm::Baseline, false)
+                                | (ComparisonArm::Candidate, true) => 0,
+                                _ => 1,
+                            };
+                            let other_original_index = (other_case_index
+                                * self.repetitions as usize
+                                + repetition as usize)
+                                * 2
+                                + other_arm_index;
+                            if (pair_key, arm_rank) < (target_pair_key, target_arm_rank)
+                                || ((pair_key, arm_rank) == (target_pair_key, target_arm_rank)
+                                    && other_original_index < target_original_index)
+                            {
+                                preceding += 1;
+                            }
+                        }
+                    }
+                }
+                preceding
+            }
+        };
+        u32::try_from(rank + 1).map_err(|_| "trial sequence exceeds u32".to_string())
     }
 
     fn plan_trials_internal(
@@ -750,6 +908,11 @@ mod tests {
                 .iter()
                 .all(|trial| trial.spec_fingerprint == fingerprint)
         );
+        assert!(
+            first
+                .iter()
+                .all(|trial| { spec.canonical_trial_sequence(trial).unwrap() == trial.sequence })
+        );
     }
 
     #[test]
@@ -770,6 +933,18 @@ mod tests {
             assert_eq!(pair[0].repetition, pair[1].repetition);
             assert_ne!(pair[0].arm, pair[1].arm);
         }
+    }
+
+    #[test]
+    fn rejects_wall_time_values_that_cannot_be_represented_as_a_duration() {
+        let mut spec = spec(TrialOrder::BaselineFirst);
+        spec.budget.max_wall_time_secs = u64::MAX;
+        let error = spec.validate().expect_err("unrepresentable wall time");
+        assert!(error.contains("supported duration range"));
+
+        spec.budget.max_wall_time_secs = i64::MAX as u64;
+        let error = spec.validate().expect_err("overflowing wall time");
+        assert!(error.contains("supported duration range"));
     }
 
     #[test]

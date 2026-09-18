@@ -2043,6 +2043,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         work_binding: request.work_binding,
         run_start_idempotency: None,
+        evaluation_admission: None,
         full_llm_capture: false,
         agent_id: request.agent_id,
         model: None,

@@ -381,6 +381,60 @@ impl DatabaseEvaluationPlanStore {
         Ok(trials)
     }
 
+    /// Load one owner-scoped persisted trial without scanning every persisted
+    /// binding. The frozen plan is still validated before the result is used;
+    /// this keeps settlement's database read bounded even when many trials
+    /// share the experiment.
+    pub async fn load_trial(
+        &self,
+        owner_user_id: &str,
+        trial_id: &str,
+    ) -> Result<EvaluationTrialBindingRecord, EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        validate_bounded("trial_id", trial_id, MAX_TRIAL_ID_BYTES)?;
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            EvaluationPersistenceError::Database {
+                operation: "begin_load_evaluation_trial",
+                source,
+            }
+        })?;
+        let row = sqlx::query(
+            "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
+                    sequence_num, trial_json, binding_status, session_id, run_id,
+                    run_generation,
+                    CAST(created_at AS CHAR) AS created_at,
+                    CAST(updated_at AS CHAR) AS updated_at
+             FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND trial_id = ? LIMIT 1",
+        )
+        .bind(owner_user_id)
+        .bind(trial_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "load_evaluation_trial",
+            source,
+        })?
+        .ok_or_else(|| EvaluationPersistenceError::NotFound(trial_id.to_string()))?;
+        let binding = decode_trial_binding(row)?;
+        let experiment = load_experiment_read_tx(&mut tx, owner_user_id, &binding.experiment_id)
+            .await?
+            .ok_or_else(|| {
+                EvaluationPersistenceError::Conflict(format!(
+                    "trial {trial_id} references a missing experiment {}",
+                    binding.experiment_id
+                ))
+            })?;
+        validate_single_trial_against_spec(&experiment, &binding)?;
+        tx.commit()
+            .await
+            .map_err(|source| EvaluationPersistenceError::Database {
+                operation: "commit_load_evaluation_trial",
+                source,
+            })?;
+        Ok(binding)
+    }
+
     /// Bind an existing canonical Run to one planned trial with a CAS on the
     /// unbound row. The session and run are checked under the same transaction
     /// and must belong to the requesting owner.
@@ -483,8 +537,7 @@ impl DatabaseEvaluationPlanStore {
                     existing.experiment_id
                 ))
             })?;
-        let canonical = canonical_trial_index(&experiment)?;
-        validate_trial_against_experiment(&existing, &experiment, &canonical)?;
+        validate_single_trial_against_spec(&experiment, &existing)?;
         if let (Some(existing_session), Some(existing_run)) =
             (existing.session_id.as_deref(), existing.run_id.as_deref())
         {
@@ -695,8 +748,7 @@ impl DatabaseEvaluationPlanStore {
                     binding.experiment_id
                 ))
             })?;
-        let canonical = canonical_trial_index(&experiment)?;
-        validate_trial_against_experiment(&binding, &experiment, &canonical)?;
+        validate_single_trial_against_spec(&experiment, &binding)?;
         if binding.binding_status != "bound"
             || binding.session_id.as_deref() != Some(session_id)
             || binding.run_id.as_deref() != Some(trial_run_id.as_str())
@@ -969,6 +1021,27 @@ fn canonical_trial_index(
         .into_iter()
         .map(|trial| (trial.trial_id.clone(), trial))
         .collect())
+}
+
+fn validate_single_trial_against_spec(
+    experiment: &EvaluationExperimentRecord,
+    binding: &EvaluationTrialBindingRecord,
+) -> Result<(), EvaluationPersistenceError> {
+    experiment
+        .spec
+        .validate_trial_identity(&binding.trial)
+        .map_err(EvaluationPersistenceError::Conflict)?;
+    let expected_sequence = experiment
+        .spec
+        .canonical_trial_sequence(&binding.trial)
+        .map_err(EvaluationPersistenceError::Conflict)?;
+    if binding.trial.sequence != expected_sequence {
+        return Err(EvaluationPersistenceError::Conflict(format!(
+            "trial {} sequence {} does not match canonical sequence {expected_sequence}",
+            binding.trial.trial_id, binding.trial.sequence
+        )));
+    }
+    Ok(())
 }
 
 fn validate_trial_set(

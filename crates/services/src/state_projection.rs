@@ -1379,14 +1379,14 @@ impl DatabaseStateProjectionStore {
                 });
             }
         }
-        if current_active_version.as_deref() != expected_active_version_id {
+        if current_active_version != expected_active_version_id {
             return Err(StateProjectionError::PersonalSkillActivationConflict {
                 skill_name: skill_name.to_string(),
                 expected: expected_active_version_id.map(str::to_string),
                 actual: current_active_version.map(str::to_string),
             });
         }
-        if current_active_version.as_deref() == Some(version_id) {
+        if current_active_version == Some(version_id) {
             tx.commit()
                 .await
                 .map_err(|source| StateProjectionError::Database {

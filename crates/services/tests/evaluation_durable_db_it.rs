@@ -9,12 +9,14 @@ mod common;
 use astra_core::SharedPool;
 use astra_core::composite_snapshot::CompositeSnapshot;
 use astra_services::{
-    ComparisonArm, DataIsolation, DatabaseEvaluationPlanStore, DatabaseMaterializationReceiptStore,
-    EvaluationBudget, EvaluationCase, EvaluationPersistenceError, EvaluationTarget,
-    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MaterializationComponentKind,
+    ComparisonArm, DataIsolation, DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
+    DatabaseMaterializationReceiptStore, EvaluationBudget, EvaluationCase,
+    EvaluationExecutionError, EvaluationObservationRequest, EvaluationPersistenceError,
+    EvaluationRunAdmission, EvaluationTarget, EvaluationTargetKind, EvidenceAvailability,
+    EvidenceKind, EvidenceRef, ExperimentSpec, FrozenConditions, MaterializationComponentKind,
     MaterializationOutcome, MaterializationReceiptError, MaterializationReceiptRequest,
-    MaterializationValidationError, MemoryIsolation, RevisionRef, SnapshotEnvelope, TrialOrder,
-    TrustedMaterializerContext, validate_receipt_set,
+    MaterializationValidationError, MemoryIsolation, RevisionRef, SnapshotEnvelope,
+    TrialObservation, TrialOrder, TrialStatus, TrustedMaterializerContext, validate_receipt_set,
 };
 use uuid::Uuid;
 
@@ -94,8 +96,75 @@ async fn insert_run(pool: &SharedPool, owner: &str, session_id: &str) -> String 
     run_id
 }
 
+async fn insert_evaluation_admitted_event(
+    pool: &SharedPool,
+    owner: &str,
+    session_id: &str,
+    run_id: &str,
+    generation: u64,
+    admission: &EvaluationRunAdmission,
+) {
+    let payload = serde_json::json!({
+        "event_type": "evaluation_admitted",
+        "run_generation": generation,
+        "idempotency_key": format!("evaluation-admitted:{run_id}:{generation}"),
+        "data": {"admission": admission},
+    });
+    sqlx::query(
+        "INSERT INTO agent_run_events
+         (id, run_id, event_idx, user_id, session_id, event_type, event_id,
+          idempotency_key, event_hash, payload_json, created_at)
+         VALUES (?, ?, 0, ?, ?, 'evaluation_admitted', ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(format!("eval-event-{}", Uuid::new_v4()))
+    .bind(run_id)
+    .bind(owner)
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(format!("evaluation-admitted:{run_id}:{generation}"))
+    .bind("test-event-hash")
+    .bind(serde_json::to_string(&payload).expect("serialize evaluation admission event"))
+    .execute(pool.get())
+    .await
+    .expect("insert evaluation admission event");
+}
+
+async fn insert_run_settlement_finished_event(
+    pool: &SharedPool,
+    owner: &str,
+    session_id: &str,
+    run_id: &str,
+    generation: u64,
+    event_idx: i64,
+) {
+    let payload = serde_json::json!({
+        "event_type": "run_settlement_finished",
+        "idempotency_key": format!("run-settlement-finished:{generation}"),
+        "data": {"owner_generation": generation},
+    });
+    sqlx::query(
+        "INSERT INTO agent_run_events
+         (id, run_id, event_idx, user_id, session_id, event_type, event_id,
+          idempotency_key, event_hash, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, 'run_settlement_finished', ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(format!("settlement-event-{}", Uuid::new_v4()))
+    .bind(run_id)
+    .bind(event_idx)
+    .bind(owner)
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(format!("run-settlement-finished:{generation}"))
+    .bind("test-settlement-hash")
+    .bind(serde_json::to_string(&payload).expect("serialize settlement event"))
+    .execute(pool.get())
+    .await
+    .expect("insert settlement finished event");
+}
+
 async fn cleanup(pool: &SharedPool, owner: &str) {
     for (table, column) in [
+        ("evaluation_trial_observations", "owner_user_id"),
         ("evaluation_materialization_receipts", "owner_user_id"),
         ("evaluation_trial_bindings", "owner_user_id"),
         ("evaluation_experiments", "owner_user_id"),
@@ -365,6 +434,284 @@ async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() 
 
 #[tokio::test]
 #[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenced() {
+    let pool = common::setup_pool().await;
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let owner = format!("observation-owner-a-{}", Uuid::new_v4());
+    let other_owner = format!("observation-owner-b-{}", Uuid::new_v4());
+    let experiment_id = format!("observation-exp-{}", Uuid::new_v4().simple());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec(&experiment_id), "observation-submit")
+        .await
+        .expect("register observation plan");
+    let trials = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("list observation trials");
+    let session_a = insert_session(&pool, &owner).await;
+    let run_a = insert_run(&pool, &owner, &session_a).await;
+    let binding_a = plan_store
+        .bind_trial_run(&owner, &trials[0].trial_id, &session_a, &run_a)
+        .await
+        .expect("bind first observation trial");
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run_a)
+    .execute(pool.get())
+    .await
+    .expect("complete first observation run");
+    let receipt_store = DatabaseMaterializationReceiptStore::new(pool.clone());
+    let envelope = SnapshotEnvelope::new(
+        &owner,
+        &experiment.experiment_id,
+        Some(binding_a.trial_id.clone()),
+        CompositeSnapshot {
+            snapshot_id: format!("observation-envelope-{}", Uuid::new_v4()),
+            session_id: session_a.clone(),
+            turn: 0,
+            created_at: "2026-09-18T00:00:00Z".to_string(),
+            version: 1,
+            label: None,
+            refs: vec![],
+        },
+        "sha256:context",
+        "sha256:tools",
+    )
+    .expect("build observation envelope");
+    let trusted = TrustedMaterializerContext {
+        owner_user_id: owner.clone(),
+        materializer_kind: "test.observation".to_string(),
+        provider_binding_id: Some("provider-v1".to_string()),
+        execution_run_id: Some(run_a.clone()),
+        execution_run_generation: Some(0),
+    };
+    let context_receipt = receipt_store
+        .record_receipt(
+            &trusted,
+            &MaterializationReceiptRequest {
+                trial_id: binding_a.trial_id.clone(),
+                session_id: session_a.clone(),
+                envelope: envelope.clone(),
+                component_kind: MaterializationComponentKind::Context,
+                component_snapshot_ref: Some("context://observation".to_string()),
+                component_base_snapshot_ref: None,
+                component_content_fingerprint: Some("sha256:context".to_string()),
+                outcome: MaterializationOutcome::Available,
+                failure_code: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                idempotency_key: "observation-context".to_string(),
+            },
+        )
+        .await
+        .expect("record observation context receipt");
+    let policy_receipt = receipt_store
+        .record_receipt(
+            &trusted,
+            &MaterializationReceiptRequest {
+                trial_id: binding_a.trial_id.clone(),
+                session_id: session_a.clone(),
+                envelope: envelope.clone(),
+                component_kind: MaterializationComponentKind::Policy,
+                component_snapshot_ref: Some("policy://observation".to_string()),
+                component_base_snapshot_ref: None,
+                component_content_fingerprint: Some("sha256:tools".to_string()),
+                outcome: MaterializationOutcome::Available,
+                failure_code: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                idempotency_key: "observation-policy".to_string(),
+            },
+        )
+        .await
+        .expect("record observation policy receipt");
+    insert_evaluation_admitted_event(
+        &pool,
+        &owner,
+        &session_a,
+        &run_a,
+        0,
+        &EvaluationRunAdmission {
+            experiment_id: experiment.experiment_id.clone(),
+            trial_id: binding_a.trial_id.clone(),
+            input_content_hash: format!("sha256:{}", "a".repeat(64)),
+            revision_content_hash: format!("sha256:{}", "b".repeat(64)),
+            receipt_ids: vec![
+                context_receipt.receipt_id.clone(),
+                policy_receipt.receipt_id.clone(),
+            ],
+            snapshot_envelope: Some(envelope.clone()),
+        },
+    )
+    .await;
+    let marker = observation_store
+        .load_admission_marker_for_run(&owner, &run_a, 0)
+        .await
+        .expect("load bounded evaluation marker")
+        .expect("evaluation marker exists");
+    assert_eq!(marker.execution_run_generation, 0);
+    assert!(!marker.settlement_finished);
+    insert_run_settlement_finished_event(&pool, &owner, &session_a, &run_a, 0, 1).await;
+    assert!(
+        observation_store
+            .load_admission_marker_for_run(&owner, &run_a, 0)
+            .await
+            .expect("reload bounded evaluation marker")
+            .expect("evaluation marker remains")
+            .settlement_finished
+    );
+    let request_a = EvaluationObservationRequest {
+        session_id: session_a.clone(),
+        execution_run_id: run_a.clone(),
+        execution_run_generation: 0,
+        observation: TrialObservation {
+            experiment_fingerprint: experiment.spec_fingerprint.clone(),
+            trial_id: binding_a.trial.trial_id.clone(),
+            case_id: binding_a.trial.case_id.clone(),
+            arm: binding_a.trial.arm.clone(),
+            repetition: binding_a.trial.repetition,
+            status: TrialStatus::Completed,
+            measurements: Vec::new(),
+            evidence: vec![EvidenceRef {
+                evidence_id: format!("run:{run_a}:0"),
+                kind: EvidenceKind::Trace,
+                availability: EvidenceAvailability::Available,
+                content_hash: Some("sha256:trace".to_string()),
+                locator: Some(format!("run://{owner}/{session_a}/{run_a}")),
+            }],
+        },
+        materialization_receipt_ids: vec![context_receipt.receipt_id, policy_receipt.receipt_id],
+        idempotency_key: "observation-a".to_string(),
+    };
+    let first = observation_store
+        .record_observation(&owner, &request_a)
+        .await
+        .expect("record first observation");
+    let repeated = observation_store
+        .record_observation(&owner, &request_a)
+        .await
+        .expect("repeat observation is idempotent");
+    assert_eq!(first, repeated);
+    assert_eq!(first.owner_user_id, owner);
+    assert_eq!(first.execution_run_generation, 0);
+    assert_eq!(
+        observation_store
+            .load_by_idempotency(&owner, "observation-a")
+            .await
+            .expect("load observation by idempotency")
+            .expect("observation exists"),
+        first
+    );
+    assert!(
+        observation_store
+            .load_by_idempotency(&other_owner, "observation-a")
+            .await
+            .expect("foreign owner lookup is isolated")
+            .is_none()
+    );
+
+    let mut conflicting = request_a.clone();
+    conflicting.observation.status = TrialStatus::Failed;
+    assert!(matches!(
+        observation_store
+            .record_observation(&owner, &conflicting)
+            .await,
+        Err(EvaluationExecutionError::Conflict(_))
+    ));
+    assert!(matches!(
+        observation_store
+            .record_observation(&other_owner, &request_a)
+            .await,
+        Err(EvaluationExecutionError::Persistence(
+            EvaluationPersistenceError::NotFound(_)
+        ))
+    ));
+
+    // A second session/run can settle a different planned trial without
+    // sharing process-local state or an idempotency namespace with session A.
+    let session_b = insert_session(&pool, &owner).await;
+    let run_b = insert_run(&pool, &owner, &session_b).await;
+    let binding_b = plan_store
+        .bind_trial_run(&owner, &trials[1].trial_id, &session_b, &run_b)
+        .await
+        .expect("bind second observation trial");
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'failed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run_b)
+    .execute(pool.get())
+    .await
+    .expect("fail second observation run");
+    let request_b = EvaluationObservationRequest {
+        session_id: session_b.clone(),
+        execution_run_id: run_b.clone(),
+        execution_run_generation: 0,
+        observation: TrialObservation {
+            experiment_fingerprint: experiment.spec_fingerprint.clone(),
+            trial_id: binding_b.trial.trial_id.clone(),
+            case_id: binding_b.trial.case_id.clone(),
+            arm: binding_b.trial.arm.clone(),
+            repetition: binding_b.trial.repetition,
+            status: TrialStatus::Failed,
+            measurements: Vec::new(),
+            evidence: Vec::new(),
+        },
+        materialization_receipt_ids: Vec::new(),
+        idempotency_key: "observation-b".to_string(),
+    };
+    let second = observation_store
+        .record_observation(&owner, &request_b)
+        .await
+        .expect("record second-session observation");
+    assert_eq!(second.session_id, session_b);
+    assert_eq!(
+        observation_store
+            .list_observations(&owner, &experiment_id)
+            .await
+            .expect("list owner observations")
+            .len(),
+        2
+    );
+
+    // Handoff advances the canonical generation. A new observation from the
+    // stale runner is rejected, while the exact committed retry above stays
+    // readable and immutable.
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation = 1
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run_a)
+    .execute(pool.get())
+    .await
+    .expect("advance observation run generation");
+    let mut stale = request_a.clone();
+    stale.idempotency_key = "observation-stale".to_string();
+    assert!(matches!(
+        observation_store.record_observation(&owner, &stale).await,
+        Err(EvaluationExecutionError::Persistence(
+            EvaluationPersistenceError::Conflict(_)
+        ))
+    ));
+    assert_eq!(
+        observation_store
+            .record_observation(&owner, &request_a)
+            .await
+            .expect("committed observation remains an exact retry")
+            .observation_id,
+        first.observation_id
+    );
+
+    cleanup(&pool, &owner).await;
+    cleanup(&pool, &other_owner).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn evaluation_plan_is_idempotent_owner_scoped_and_concurrent() {
     let pool = common::setup_pool().await;
     let store = DatabaseEvaluationPlanStore::new(pool.clone());
@@ -552,6 +899,38 @@ async fn evaluation_trial_binding_is_atomic_across_sessions_and_owner_scoped() {
     .execute(pool.get())
     .await
     .expect("restore evaluation trial fixture");
+
+    // The hot-path loader must also reject a coordinated sequence tamper;
+    // updating both the JSON and relational column must not bypass the
+    // deterministic ordering contract.
+    let mut tampered_sequence = trials[0].trial.clone();
+    tampered_sequence.sequence = 99;
+    sqlx::query(
+        "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(99_i64)
+    .bind(serde_json::to_string(&tampered_sequence).unwrap())
+    .bind(&owner)
+    .bind(&trials[0].trial_id)
+    .execute(pool.get())
+    .await
+    .expect("tamper evaluation sequence fixture");
+    assert!(matches!(
+        store.load_trial(&owner, &trials[0].trial_id).await,
+        Err(EvaluationPersistenceError::Conflict(_))
+    ));
+    sqlx::query(
+        "UPDATE evaluation_trial_bindings SET sequence_num = ?, trial_json = ?
+         WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(i64::from(trials[0].trial.sequence))
+    .bind(serde_json::to_string(&trials[0].trial).unwrap())
+    .bind(&owner)
+    .bind(&trials[0].trial_id)
+    .execute(pool.get())
+    .await
+    .expect("restore evaluation sequence fixture");
 
     let session_a = insert_session(&pool, &owner).await;
     let session_b = insert_session(&pool, &owner).await;

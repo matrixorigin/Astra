@@ -377,14 +377,13 @@ impl DatabaseMaterializationReceiptStore {
         if let Err(source) = insert_result {
             let duplicate = is_duplicate_key(&source);
             let _ = tx.rollback().await;
-            if duplicate {
-                if let Some(existing) = self
+            if duplicate
+                && let Some(existing) = self
                     .load_by_idempotency(&trusted.owner_user_id, &request.idempotency_key)
                     .await?
-                {
-                    ensure_idempotent_receipt(&existing, &request_fingerprint)?;
-                    return Ok(existing);
-                }
+            {
+                ensure_idempotent_receipt(&existing, &request_fingerprint)?;
+                return Ok(existing);
             }
             return Err(MaterializationReceiptError::Database {
                 operation: "insert_materialization_receipt",
@@ -472,6 +471,7 @@ impl DatabaseMaterializationReceiptStore {
     /// generation lock. This is the admission-facing read path; a plain
     /// `load_receipt` is intentionally only an owner-scoped lookup and must
     /// not be used to claim that a trial is executable.
+    #[allow(clippy::too_many_arguments)]
     pub async fn validate_receipts_for_execution(
         &self,
         owner_user_id: &str,
@@ -693,13 +693,13 @@ pub fn validate_receipt_set(
                 reason: error.to_string(),
             })?;
         }
-        if let Some(expires_at) = receipt.expires_at {
-            if expires_at <= now {
-                return Err(MaterializationValidationError::Expired {
-                    receipt_id: receipt.receipt_id.clone(),
-                    expires_at,
-                });
-            }
+        if let Some(expires_at) = receipt.expires_at
+            && expires_at <= now
+        {
+            return Err(MaterializationValidationError::Expired {
+                receipt_id: receipt.receipt_id.clone(),
+                expires_at,
+            });
         }
     }
     for component in required_components {
