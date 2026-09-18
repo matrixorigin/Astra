@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, Row};
+use sqlx::{Acquire, Executor, Row};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
