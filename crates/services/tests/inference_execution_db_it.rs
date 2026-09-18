@@ -5951,6 +5951,33 @@ async fn combined_successful_settlement_commits_exact_terminal() {
     )
     .await
     .expect("commit combined physical and logical success");
+    finish_successful_inference_provider_attempt_and_invocation(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+    )
+    .await
+    .expect("exact combined physical and logical success replay is idempotent");
+    let conflicting_terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(13, 8, 2),
+            output_tokens: 6,
+        },
+        Some("different-combined-success-response".to_string()),
+    );
+    assert_eq!(
+        finish_successful_inference_provider_attempt_and_invocation(
+            &shared_pool,
+            &plan,
+            &attempt,
+            &conflicting_terminal,
+        )
+        .await
+        .expect_err("conflicting combined success replay must fail closed")
+        .kind,
+        ServiceErrorKind::Conflict
+    );
 
     let persisted = sqlx::query(
         "SELECT invocation.status AS invocation_status,

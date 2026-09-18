@@ -3161,11 +3161,7 @@ impl LockedInferenceOwnerFact {
         owner_generation: i64,
         action: &'static str,
     ) -> ServiceResult<()> {
-        if self.owner_token != owner_token || self.owner_generation != owner_generation {
-            return Err(ServiceError::conflict(format!(
-                "inference invocation {invocation_id} belongs to a different owner generation; cannot {action}"
-            )));
-        }
+        self.validate_owner(invocation_id, owner_token, owner_generation, action)?;
         match self.status.as_str() {
             "admitted" if self.lease_live => Ok(()),
             "admitted" => Err(ServiceError::conflict(format!(
@@ -3175,6 +3171,21 @@ impl LockedInferenceOwnerFact {
                 "inference invocation {invocation_id} is {status}; cannot {action}"
             ))),
         }
+    }
+
+    fn validate_owner(
+        &self,
+        invocation_id: &str,
+        owner_token: &str,
+        owner_generation: i64,
+        action: &'static str,
+    ) -> ServiceResult<()> {
+        if self.owner_token != owner_token || self.owner_generation != owner_generation {
+            return Err(ServiceError::conflict(format!(
+                "inference invocation {invocation_id} belongs to a different owner generation; cannot {action}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3232,16 +3243,29 @@ async fn lock_admitted_inference_invocation(
 /// before the combined terminal transaction mutates either row. Provider
 /// attempt admission takes the same invocation lock, so observing exactly one
 /// open attempt here fences concurrent admission without re-reading our own
-/// attempt write from a correlated UPDATE later in the transaction.
+/// attempt write from a correlated UPDATE later in the transaction. The same
+/// lock also classifies an exact terminal replay, so a concurrent first commit
+/// cannot fall through the admitted-only checks after it becomes durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CombinedSuccessfulSettlementLockOutcome {
+    Ready,
+    ExactReplay,
+}
+
 async fn lock_combined_successful_inference_settlement(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     plan: &InferenceInvocationPlan,
-) -> ServiceResult<()> {
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+    terminal: &InferenceInvocationTerminal,
+    fingerprint: &str,
+) -> ServiceResult<CombinedSuccessfulSettlementLockOutcome> {
     let owner_generation = i64::try_from(plan.owner_generation).map_err(|_| {
         ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
     })?;
     let row = sqlx::query(
-        "SELECT invocation.status, invocation.admission_token,
+        "SELECT invocation.status, invocation.terminal_fingerprint,
+                invocation.admission_token,
                 invocation.owner_token, invocation.owner_generation,
                 IF(invocation.owner_lease_expires_at > NOW(6), 1, 0) AS lease_live,
                 (SELECT COUNT(*)
@@ -3270,7 +3294,8 @@ async fn lock_combined_successful_inference_settlement(
             plan.invocation_id
         )));
     };
-    LockedInferenceOwnerFact::decode(&row)?.validate_admitted_owner(
+    let owner = LockedInferenceOwnerFact::decode(&row)?;
+    owner.validate_owner(
         &plan.invocation_id,
         &plan.owner_token,
         owner_generation,
@@ -3291,6 +3316,51 @@ async fn lock_combined_successful_inference_settlement(
             plan.invocation_id
         )));
     }
+    if owner.status != "admitted" {
+        let terminal_fingerprint = row
+            .try_get::<Option<String>, _>("terminal_fingerprint")
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode locked inference terminal fingerprint",
+                    error,
+                )
+            })?;
+        if owner.status != terminal.status.as_str()
+            || terminal_fingerprint.as_deref() != Some(fingerprint)
+        {
+            return Err(ServiceError::conflict(format!(
+                "inference invocation {} has a conflicting terminal; cannot commit a successful provider and logical terminal",
+                plan.invocation_id
+            )));
+        }
+        let Some(persisted_attempt) = load_provider_attempt_fact(&mut **tx, attempt).await? else {
+            return Err(ServiceError::conflict(format!(
+                "inference provider attempt {} is unavailable for combined successful settlement replay",
+                attempt.attempt_id
+            )));
+        };
+        if classify_persisted_provider_terminal(
+            &persisted_attempt,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            fingerprint,
+        )? != PersistedProviderTerminalMatch::ExactTerminal
+        {
+            return Err(ServiceError::conflict(format!(
+                "inference provider attempt {} is not terminal for combined successful settlement replay",
+                attempt.attempt_id
+            )));
+        }
+        return Ok(CombinedSuccessfulSettlementLockOutcome::ExactReplay);
+    }
+    owner.validate_admitted_owner(
+        &plan.invocation_id,
+        &plan.owner_token,
+        owner_generation,
+        "commit a successful provider and logical terminal",
+    )?;
     let open_attempt_count = row
         .try_get::<i64, _>("open_attempt_count")
         .map_err(|error| {
@@ -3306,7 +3376,7 @@ async fn lock_combined_successful_inference_settlement(
             plan.invocation_id
         )));
     }
-    Ok(())
+    Ok(CombinedSuccessfulSettlementLockOutcome::Ready)
 }
 
 /// Extend the current owner's lease using the database clock. An expired lease
@@ -4640,7 +4710,42 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
             error,
         )
     })?;
-    lock_combined_successful_inference_settlement(&mut tx, plan).await?;
+    if lock_combined_successful_inference_settlement(
+        &mut tx,
+        plan,
+        attempt,
+        provider_wire_bytes,
+        terminal,
+        &fingerprint,
+    )
+    .await?
+        == CombinedSuccessfulSettlementLockOutcome::ExactReplay
+    {
+        if let Err(error) = tx.commit().await {
+            drop(connection);
+            let commit_error = ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "commit exact combined successful inference settlement replay",
+                error,
+            );
+            return if combined_successful_settlement_is_durable_cancellation_safe(
+                db,
+                plan,
+                attempt,
+                provider_wire_bytes,
+                terminal,
+                &fingerprint,
+            )
+            .await?
+            {
+                Ok(())
+            } else {
+                Err(commit_error)
+            };
+        }
+        connection.release();
+        return Ok(());
+    }
 
     let attempt_update = sqlx::query(
         "UPDATE inference_provider_attempts
