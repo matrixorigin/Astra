@@ -323,30 +323,31 @@ impl DatabaseEvaluationObservationStore {
         owner_user_id: &str,
         experiment_id: &str,
     ) -> Result<Vec<EvaluationObservationRecord>, EvaluationExecutionError> {
-        validate_id("owner_user_id", owner_user_id, MAX_ID_BYTES)
-            .map_err(EvaluationExecutionError::InvalidInput)?;
-        validate_id("experiment_id", experiment_id, MAX_ID_BYTES)
-            .map_err(EvaluationExecutionError::InvalidInput)?;
-        let rows = sqlx::query(
-            "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
-                    session_id, execution_run_id, execution_run_generation, spec_fingerprint,
-                    observation_json, materialization_receipt_ids_json, request_fingerprint,
-                    idempotency_key, CAST(created_at AS CHAR) AS created_at,
-                    CAST(updated_at AS CHAR) AS updated_at
-             FROM evaluation_trial_observations
-             WHERE owner_user_id = ? AND experiment_id = ?
-             ORDER BY created_at ASC, observation_id ASC
-             LIMIT 4096",
-        )
-        .bind(owner_user_id)
-        .bind(experiment_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| EvaluationExecutionError::Database {
-            operation: "list_evaluation_observations",
-            source,
-        })?;
-        rows.into_iter().map(decode_observation).collect()
+        let mut tx =
+            self.pool
+                .get()
+                .begin()
+                .await
+                .map_err(|source| EvaluationExecutionError::Database {
+                    operation: "begin_list_evaluation_observations",
+                    source,
+                })?;
+        let observations = list_observations_tx(&mut tx, owner_user_id, experiment_id).await?;
+        tx.commit()
+            .await
+            .map_err(|source| EvaluationExecutionError::Database {
+                operation: "commit_list_evaluation_observations",
+                source,
+            })?;
+        Ok(observations)
+    }
+
+    pub(crate) async fn list_observations_in_transaction(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        experiment_id: &str,
+    ) -> Result<Vec<EvaluationObservationRecord>, EvaluationExecutionError> {
+        list_observations_tx(tx, owner_user_id, experiment_id).await
     }
 
     pub async fn load_by_trial(
@@ -547,6 +548,37 @@ impl DatabaseEvaluationObservationStore {
         })?;
         row.map(decode_observation).transpose()
     }
+}
+
+async fn list_observations_tx(
+    tx: &mut Transaction<'_, MySql>,
+    owner_user_id: &str,
+    experiment_id: &str,
+) -> Result<Vec<EvaluationObservationRecord>, EvaluationExecutionError> {
+    validate_id("owner_user_id", owner_user_id, MAX_ID_BYTES)
+        .map_err(EvaluationExecutionError::InvalidInput)?;
+    validate_id("experiment_id", experiment_id, MAX_ID_BYTES)
+        .map_err(EvaluationExecutionError::InvalidInput)?;
+    let rows = sqlx::query(
+        "SELECT schema_version, owner_user_id, observation_id, experiment_id, trial_id,
+                session_id, execution_run_id, execution_run_generation, spec_fingerprint,
+                observation_json, materialization_receipt_ids_json, request_fingerprint,
+                idempotency_key, CAST(created_at AS CHAR) AS created_at,
+                CAST(updated_at AS CHAR) AS updated_at
+         FROM evaluation_trial_observations
+         WHERE owner_user_id = ? AND experiment_id = ?
+         ORDER BY created_at ASC, observation_id ASC
+         LIMIT 4096",
+    )
+    .bind(owner_user_id)
+    .bind(experiment_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|source| EvaluationExecutionError::Database {
+        operation: "list_evaluation_observations",
+        source,
+    })?;
+    rows.into_iter().map(decode_observation).collect()
 }
 
 fn validate_binding_for_observation(

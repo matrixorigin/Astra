@@ -165,12 +165,7 @@ fn build_comparison(
         .len();
     let mut unavailable = observations
         .iter()
-        .filter(|observation| {
-            matches!(
-                observation.status,
-                TrialStatus::Unavailable | TrialStatus::Unknown
-            )
-        })
+        .filter(|observation| !matches!(observation.status, TrialStatus::Completed))
         .map(|observation| {
             format!(
                 "trial {} has status {:?}",
@@ -187,7 +182,7 @@ fn build_comparison(
         "No complete baseline/candidate case pair is available; do not claim an improvement."
             .to_string()
     } else if !unavailable.is_empty() {
-        "Paired observations exist, but unavailable or unknown trials limit the conclusion."
+        "Paired observations exist, but non-completed, unavailable or unknown trials limit the conclusion."
             .to_string()
     } else {
         "Both arms are present for at least one case; controlled comparability has not been proven."

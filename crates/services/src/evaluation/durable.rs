@@ -6,7 +6,7 @@ use super::experiment::{ExperimentSpec, TrialUnit};
 use astra_core::SharedPool;
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Row, Transaction};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 const MAX_SUBMISSION_KEY_BYTES: usize = 128;
@@ -85,6 +85,10 @@ pub struct DatabaseEvaluationPlanStore {
 impl DatabaseEvaluationPlanStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    pub(crate) fn shared_pool(&self) -> SharedPool {
+        self.pool.clone()
     }
 
     /// Register an immutable experiment and all planned trial identities in
@@ -379,6 +383,75 @@ impl DatabaseEvaluationPlanStore {
                 source,
             })?;
         Ok(trials)
+    }
+
+    /// Read the current canonical Run status for every bound trial in one
+    /// owner-scoped query. A missing row is intentionally omitted: the
+    /// projection layer distinguishes an unobserved terminal Run from a Run
+    /// whose status could not be read, rather than turning either into a
+    /// successful result.
+    pub async fn list_trial_run_statuses(
+        &self,
+        owner_user_id: &str,
+        experiment_id: &str,
+    ) -> Result<BTreeMap<String, String>, EvaluationPersistenceError> {
+        validate_owner(owner_user_id)?;
+        validate_bounded("experiment_id", experiment_id, 128)?;
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            EvaluationPersistenceError::Database {
+                operation: "begin_list_evaluation_trial_run_statuses",
+                source,
+            }
+        })?;
+        let statuses =
+            Self::list_trial_run_statuses_tx(&mut tx, owner_user_id, experiment_id).await?;
+        tx.commit()
+            .await
+            .map_err(|source| EvaluationPersistenceError::Database {
+                operation: "commit_list_evaluation_trial_run_statuses",
+                source,
+            })?;
+        Ok(statuses)
+    }
+    pub(crate) async fn list_trial_run_statuses_tx(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        experiment_id: &str,
+    ) -> Result<BTreeMap<String, String>, EvaluationPersistenceError> {
+        let rows = sqlx::query(
+            "SELECT b.trial_id, r.status
+             FROM evaluation_trial_bindings b
+             LEFT JOIN agent_runs r
+               ON r.user_id = b.owner_user_id
+              AND r.run_id = b.run_id
+              AND r.session_id = b.session_id
+              AND r.run_generation = b.run_generation
+             WHERE b.owner_user_id = ? AND b.experiment_id = ?
+             ORDER BY b.sequence_num ASC, b.trial_id ASC
+             LIMIT 4096",
+        )
+        .bind(owner_user_id)
+        .bind(experiment_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "list_evaluation_trial_run_statuses",
+            source,
+        })?;
+        let mut statuses = BTreeMap::new();
+        for row in rows {
+            let trial_id = row_string(&row, "trial_id", "decode_evaluation_trial_run_status")?;
+            let status = row
+                .try_get::<Option<String>, _>("status")
+                .map_err(|source| EvaluationPersistenceError::Database {
+                    operation: "decode_evaluation_trial_run_status",
+                    source,
+                })?;
+            if let Some(status) = status {
+                statuses.insert(trial_id, status);
+            }
+        }
+        Ok(statuses)
     }
 
     /// Load one owner-scoped persisted trial without scanning every persisted
@@ -770,7 +843,7 @@ async fn load_experiment_tx(
     load_experiment_tx_with_lock(tx, owner_user_id, experiment_id, true).await
 }
 
-async fn load_experiment_read_tx(
+pub(crate) async fn load_experiment_read_tx(
     tx: &mut Transaction<'_, MySql>,
     owner_user_id: &str,
     experiment_id: &str,
@@ -811,7 +884,7 @@ async fn load_experiment_tx_with_lock(
     row.map(decode_experiment).transpose()
 }
 
-async fn count_trials_tx(
+pub(crate) async fn count_trials_tx(
     tx: &mut Transaction<'_, MySql>,
     owner_user_id: &str,
     experiment_id: &str,
@@ -833,7 +906,7 @@ async fn count_trials_tx(
     })
 }
 
-async fn load_trial_bindings_tx(
+pub(crate) async fn load_trial_bindings_tx(
     tx: &mut Transaction<'_, MySql>,
     owner_user_id: &str,
     experiment_id: &str,
@@ -1119,7 +1192,7 @@ fn ensure_registration_identity(
     Ok(())
 }
 
-fn validate_owner(owner_user_id: &str) -> Result<(), EvaluationPersistenceError> {
+pub(crate) fn validate_owner(owner_user_id: &str) -> Result<(), EvaluationPersistenceError> {
     validate_bounded("owner_user_id", owner_user_id, MAX_OWNER_ID_BYTES)
 }
 
@@ -1136,7 +1209,7 @@ fn validate_non_empty(label: &str, value: &str) -> Result<(), EvaluationPersiste
     Ok(())
 }
 
-fn validate_bounded(
+pub(crate) fn validate_bounded(
     label: &str,
     value: &str,
     max_bytes: usize,

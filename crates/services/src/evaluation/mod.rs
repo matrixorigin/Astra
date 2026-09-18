@@ -5,6 +5,8 @@ pub mod execution;
 pub mod experiment;
 pub mod materialization;
 pub mod noop;
+pub mod projection;
+pub mod report;
 pub mod service;
 pub mod types;
 pub mod utils;
@@ -38,5 +40,14 @@ pub use materialization::{
     TrustedMaterializerContext, required_components_for_spec, validate_receipt_set,
 };
 pub use noop::UnconfiguredEvaluationService;
+pub use projection::{
+    DatabaseEvaluationProjectionStore, EvaluationExperimentProjection, EvaluationProjectionError,
+    EvaluationTrialLifecycle, EvaluationTrialProjection,
+};
+pub use report::{
+    EVALUATION_REPORT_RENDERER_VERSION, EVALUATION_REPORT_SCHEMA_VERSION, EvaluationReportArtifact,
+    EvaluationReportCoverage, EvaluationReportManifest, EvaluationReportObservationRef,
+    build_report_artifact,
+};
 pub use service::EvaluationService;
 pub use types::*;
