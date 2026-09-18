@@ -1,3 +1,4 @@
+pub mod api;
 pub mod assessment;
 pub mod database;
 pub mod durable;
@@ -11,6 +12,7 @@ pub mod service;
 pub mod types;
 pub mod utils;
 
+pub use api::{EvaluationExperimentCreateRequest, EvaluationReportQuery};
 pub use assessment::{
     ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport,
     EvidenceAvailability, EvidenceKind, EvidenceRef, Measurement, MeasurementStatus,
@@ -47,7 +49,7 @@ pub use projection::{
 pub use report::{
     EVALUATION_REPORT_RENDERER_VERSION, EVALUATION_REPORT_SCHEMA_VERSION, EvaluationReportArtifact,
     EvaluationReportCoverage, EvaluationReportManifest, EvaluationReportObservationRef,
-    build_report_artifact,
+    build_report_artifact, validate_report_label,
 };
 pub use service::EvaluationService;
 pub use types::*;

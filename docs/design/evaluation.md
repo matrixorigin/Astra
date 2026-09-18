@@ -153,6 +153,27 @@ large-plan scheduler must add explicit batching and pagination before raising
 it. Required Memory or MatrixOne branches are still unavailable until a
 materialization receipt is recorded; registration alone never claims isolation.
 
+## Control-plane API boundary
+
+The generic control-plane API exposes three owner-authenticated operations:
+
+* `POST /evaluation/experiments` freezes and idempotently registers a client
+  `ExperimentSpec` plus its submission key;
+* `GET /evaluation/experiments/{experiment_id}` reads a consistent projection
+  of the plan, binding, canonical Run status, and terminal observations; and
+* `GET /evaluation/experiments/{experiment_id}/report` returns the structured
+  comparison, deterministic Markdown, coverage, observation references, and
+  content/artifact fingerprints.
+
+The API accepts client intent only. It never accepts client-supplied
+observations and never starts a provider from a read request. Every read uses
+the authenticated owner and one database transaction, so a concurrent
+settlement cannot be rendered as a mixture of old and new facts. A missing or
+unknown Run status is exposed as unavailable; it is not treated as running or
+successful. The report is recomputable and deterministic at this stage; a
+future artifact persistence layer may attach a durable download reference
+without changing its fact or identity contract.
+
 ## Materialization receipt boundary
 
 Materialization is an append-only evidence boundary between a planned trial

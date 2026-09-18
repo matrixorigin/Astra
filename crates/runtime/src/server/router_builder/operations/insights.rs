@@ -3,6 +3,18 @@ use super::super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/evaluation/experiments",
+            post(evaluation::create_experiment_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}",
+            get(evaluation::get_experiment_projection_handler),
+        )
+        .route(
+            "/evaluation/experiments/{experiment_id}/report",
+            get(evaluation::get_experiment_report_handler),
+        )
+        .route(
             "/evaluation/quality/trend",
             get(evaluation::quality_trend_handler),
         )

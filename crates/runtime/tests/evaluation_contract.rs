@@ -151,6 +151,50 @@ fn build_memoria_backed_app(memoria_base_url: String) -> axum::Router {
     build_app(state)
 }
 
+fn generic_experiment_create_body() -> body::Body {
+    let hash = |letter: char| format!("sha256:{}", letter.to_string().repeat(64));
+    body::Body::from(
+        serde_json::to_vec(&json!({
+            "submission_idempotency_key": "contract-submission",
+            "spec": {
+                "schema_version": 1,
+                "experiment_id": "contract-experiment",
+                "target": {
+                    "kind": "prompt",
+                    "baseline": {"revision_id": "base", "content_hash": hash('a')},
+                    "candidate": {"revision_id": "candidate", "content_hash": hash('b')}
+                },
+                "cases": [{
+                    "case_id": "case-1",
+                    "input_snapshot_ref": "input://case-1",
+                    "input_content_hash": hash('c'),
+                    "verifier_id": "none",
+                    "verifier_version": "1",
+                    "holdout": false
+                }],
+                "repetitions": 1,
+                "order": {"kind": "baseline_first"},
+                "conditions": {
+                    "isolation_profile": "prompt_only_private",
+                    "model_binding": "model",
+                    "provider_binding": "provider",
+                    "context_snapshot_hash": hash('d'),
+                    "tool_policy_hash": hash('e'),
+                    "cache_policy": "provider_default_recorded",
+                    "memory_isolation": {"kind": "disabled"},
+                    "data_isolation": {"kind": "disabled"}
+                },
+                "budget": {
+                    "max_trials": 2,
+                    "max_concurrency": 1,
+                    "max_wall_time_secs": 60
+                }
+            }
+        }))
+        .expect("serialize generic experiment request"),
+    )
+}
+
 /// `json_ct`: send `content-type: application/json` (only for POST bodies that had it originally).
 async fn oneshot_eval(
     app: axum::Router,
@@ -172,6 +216,15 @@ async fn oneshot_eval(
 #[tokio::test]
 async fn unconfigured_evaluation_routes_return_503() {
     let app = build_unconfigured_app();
+    let generic_get_uris = [
+        "/evaluation/experiments/exp-1",
+        "/evaluation/experiments/exp-1/report",
+    ];
+    for uri in generic_get_uris {
+        let resp = oneshot_eval(app.clone(), "GET", uri, body::Body::empty(), false).await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "GET {uri}");
+    }
+
     let get_uris = [
         "/evaluation/quality/trend",
         "/evaluation/drift",
@@ -209,6 +262,16 @@ async fn unconfigured_evaluation_routes_return_503() {
             true,
         ),
     ];
+    let generic_create = oneshot_eval(
+        app.clone(),
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_body(),
+        true,
+    )
+    .await;
+    assert_eq!(generic_create.status(), StatusCode::NOT_IMPLEMENTED);
+
     for (uri, b, json_ct) in post_cases {
         let resp = oneshot_eval(app.clone(), "POST", uri, b, json_ct).await;
         assert_eq!(
@@ -217,6 +280,33 @@ async fn unconfigured_evaluation_routes_return_503() {
             "POST {uri}"
         );
     }
+}
+
+#[tokio::test]
+async fn generic_evaluation_control_plane_requires_database() {
+    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+        .with_auth_service(Arc::new(StubAuthService));
+    let app = build_app(state);
+
+    let projection = oneshot_eval(
+        app.clone(),
+        "GET",
+        "/evaluation/experiments/exp-1",
+        body::Body::empty(),
+        false,
+    )
+    .await;
+    assert_eq!(projection.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let create = oneshot_eval(
+        app,
+        "POST",
+        "/evaluation/experiments",
+        generic_experiment_create_body(),
+        true,
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

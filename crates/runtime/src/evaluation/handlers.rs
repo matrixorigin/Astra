@@ -5,8 +5,14 @@ use axum::{
 };
 
 use crate::AppState;
-use astra_core::{ErrorResponse, error_response};
+use astra_core::{ErrorResponse, error_response, internal_error};
 use astra_services::evaluation::types::*;
+use astra_services::evaluation::{
+    DatabaseEvaluationPlanStore, DatabaseEvaluationProjectionStore,
+    EvaluationExperimentCreateRequest, EvaluationExperimentRecord, EvaluationPersistenceError,
+    EvaluationProjectionError, EvaluationReportArtifact, EvaluationReportQuery,
+    build_report_artifact, validate_report_label,
+};
 
 fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     headers
@@ -15,6 +21,134 @@ fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Erro
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Missing X-User-Id header"))
+}
+
+fn map_evaluation_persistence_error(
+    error: EvaluationPersistenceError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        EvaluationPersistenceError::InvalidInput(detail) => {
+            error_response(StatusCode::BAD_REQUEST, detail)
+        }
+        EvaluationPersistenceError::Conflict(detail) => {
+            error_response(StatusCode::CONFLICT, detail)
+        }
+        EvaluationPersistenceError::NotFound(detail) => {
+            error_response(StatusCode::NOT_FOUND, detail)
+        }
+        other => internal_error(other),
+    }
+}
+
+fn map_evaluation_projection_error(
+    error: EvaluationProjectionError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        EvaluationProjectionError::Persistence(error) => map_evaluation_persistence_error(error),
+        EvaluationProjectionError::Execution(error) => internal_error(error),
+        EvaluationProjectionError::Conflict(detail) => error_response(StatusCode::CONFLICT, detail),
+    }
+}
+
+fn evaluation_pool(
+    state: &AppState,
+) -> Result<astra_core::SharedPool, (StatusCode, Json<ErrorResponse>)> {
+    state.shared_pool.clone().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "evaluation database is not configured",
+        )
+    })
+}
+
+pub async fn create_experiment_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EvaluationExperimentCreateRequest>,
+) -> Result<(StatusCode, Json<EvaluationExperimentRecord>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let store = DatabaseEvaluationPlanStore::new(evaluation_pool(&state)?);
+    let record = store
+        .register_experiment(
+            &user.user_id,
+            &request.spec,
+            &request.submission_idempotency_key,
+        )
+        .await
+        .map_err(map_evaluation_persistence_error)?;
+    Ok((StatusCode::OK, Json(record)))
+}
+
+pub async fn get_experiment_projection_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(experiment_id): Path<String>,
+) -> Result<
+    Json<astra_services::evaluation::EvaluationExperimentProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let store = DatabaseEvaluationProjectionStore::new(evaluation_pool(&state)?);
+    let projection = store
+        .load_experiment(&user.user_id, &experiment_id)
+        .await
+        .map_err(map_evaluation_projection_error)?;
+    Ok(Json(projection))
+}
+
+pub async fn get_experiment_report_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(experiment_id): Path<String>,
+    Query(query): Query<EvaluationReportQuery>,
+) -> Result<Json<EvaluationReportArtifact>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if let Some(label) = query.baseline_label.as_deref() {
+        validate_report_label("baseline_label", label)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+    }
+    if let Some(label) = query.candidate_label.as_deref() {
+        validate_report_label("candidate_label", label)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+    }
+    let store = DatabaseEvaluationProjectionStore::new(evaluation_pool(&state)?);
+    let projection = store
+        .load_experiment(&user.user_id, &experiment_id)
+        .await
+        .map_err(map_evaluation_projection_error)?;
+    let baseline_label = query.baseline_label.unwrap_or_else(|| {
+        projection
+            .experiment
+            .spec
+            .target
+            .baseline
+            .revision_id
+            .clone()
+    });
+    let candidate_label = query.candidate_label.unwrap_or_else(|| {
+        projection
+            .experiment
+            .spec
+            .target
+            .candidate
+            .revision_id
+            .clone()
+    });
+    let report = build_report_artifact(
+        &user.user_id,
+        &projection.experiment,
+        &projection
+            .trials
+            .iter()
+            .filter_map(|trial| trial.observation.as_ref())
+            .cloned()
+            .collect::<Vec<_>>(),
+        &projection.unavailable_trial_ids,
+        baseline_label,
+        candidate_label,
+    )
+    .map_err(|detail| error_response(StatusCode::CONFLICT, detail))?;
+    Ok(Json(report))
 }
 
 pub async fn quality_trend_handler(

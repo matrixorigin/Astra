@@ -14,6 +14,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 1;
 pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v1";
+const MAX_REPORT_LABEL_BYTES: usize = 256;
+
+pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
+    if label.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if label.len() > MAX_REPORT_LABEL_BYTES {
+        return Err(format!(
+            "{name} must be at most {MAX_REPORT_LABEL_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +88,14 @@ pub fn build_report_artifact(
 ) -> Result<EvaluationReportArtifact, String> {
     if owner_user_id != experiment.owner_user_id {
         return Err("report owner does not match the experiment owner".to_string());
+    }
+    let baseline_label = baseline_label.into();
+    let candidate_label = candidate_label.into();
+    for (name, label) in [
+        ("baseline_label", &baseline_label),
+        ("candidate_label", &candidate_label),
+    ] {
+        validate_report_label(name, label)?;
     }
     let planned_trial_ids = experiment
         .spec
