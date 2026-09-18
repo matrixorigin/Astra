@@ -1,14 +1,52 @@
 use crate::cli::surface::skill_install_status_surface::skill_install_status_surface;
-use crate::cli::{
-    cli_config::{
-        cli_output,
-        cli_utils::{prefix_chars, truncate_str},
-    },
-    session::session_state::SessionState,
-    theme,
-};
+use crate::cli::{cli_config::cli_output, session::session_state::SessionState, theme};
 use astra_runtime::prompts;
 use crossterm::style::Stylize;
+
+async fn start_skillify_from_session(
+    arg: &str,
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+    state: &SessionState,
+) -> Result<(), String> {
+    let skill_name = arg.split_whitespace().next().unwrap_or("").trim();
+    if skill_name.is_empty()
+        || skill_name.len() > 128
+        || skill_name.contains('/')
+        || skill_name.contains('\\')
+        || skill_name.contains("..")
+    {
+        return Err("Usage: /skill create <safe-skill-name>".to_string());
+    }
+    let session_id = state
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "no active session is available for Skillify".to_string())?;
+    let body = serde_json::json!({
+        "session_ids": [session_id],
+        "skill_name": skill_name,
+        "topic": "Extract a reusable workflow from the selected session; preserve failures and cite the source events.",
+        "target_scope": "personal"
+    });
+    let response = api
+        .post_bearer_path_json_text(token.unwrap_or(""), "/harnesses/skillify/runs", &body)
+        .await
+        .map_err(|error| format!("Skillify request failed: {error}"))?;
+    let run: astra_services::HarnessRunRecord = serde_json::from_str(&response)
+        .map_err(|error| format!("Skillify returned invalid run metadata: {error}"))?;
+    eprintln!(
+        "  {} Skillify run {} ({})",
+        theme::icon_ok(),
+        run.harness_run_id,
+        run.status
+    );
+    eprintln!(
+        "  Review the durable evidence and draft at /harnesses/runs/{}/skill-drafts",
+        run.harness_run_id
+    );
+    eprintln!("  Nothing was activated; publishing/adoption remains an explicit reviewed action.");
+    Ok(())
+}
 
 pub(crate) fn default_skill_category(category: Option<&str>) -> String {
     category
@@ -101,8 +139,8 @@ pub(crate) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill create".magenta(),
-                "Auto-generate from session".dim()
+                "/skill create <name>".magenta(),
+                "Create a Skillify draft from this session".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -1215,8 +1253,7 @@ Follow these steps:
         }
 
         "create" => {
-            // Auto-generate a skill from the current session transcript
-            create_skill_from_session(sub_arg, state).await?;
+            start_skillify_from_session(sub_arg, api, token, state).await?;
         }
 
         "feedback" => {
@@ -1515,267 +1552,6 @@ fn skill_relevance_score(m: &astra_skills::SkillManifest, query: &str) -> u32 {
     }
 
     score
-}
-
-// ═══════════════════════════════════════════════ Skill Auto-Generation ════
-
-/// Analyze the current session and generate a SKILL.md from observed patterns.
-async fn create_skill_from_session(arg: &str, state: &mut SessionState) -> Result<(), String> {
-    use astra_services::session_journal;
-    use std::collections::HashMap;
-
-    let name = arg.split_whitespace().next().unwrap_or("").trim();
-    if name.is_empty() {
-        eprintln!("{}", "  Usage: /skill create <name>".yellow());
-        eprintln!(
-            "{}",
-            "  Analyzes the current session and generates a skill from it.".dim()
-        );
-        return Ok(());
-    }
-
-    // Validate name (kebab-case)
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        eprintln!(
-            "  {} Skill name must be alphanumeric, hyphens, or underscores.",
-            theme::icon_err()
-        );
-        return Ok(());
-    }
-
-    // Check not duplicate
-    let skills_base = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join(".astra/skills");
-    let skill_dir = skills_base.join(name);
-    if skill_dir.exists() {
-        eprintln!(
-            "  {} Skill '{}' already exists at {}",
-            theme::icon_err(),
-            name,
-            skill_dir.display()
-        );
-        return Ok(());
-    }
-
-    // Read session journal
-    let session_id = match &state.session_id {
-        Some(s) => s.clone(),
-        None => {
-            eprintln!("  {} No active session to analyze.", theme::icon_err());
-            return Ok(());
-        }
-    };
-
-    let events = session_journal::read_journal(&session_id).map_err(|e| e.to_string())?;
-    let turns: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e.event_type, session_journal::JournalEventType::Turn))
-        .collect();
-
-    if turns.is_empty() {
-        eprintln!(
-            "  {} No turns in current session to analyze.",
-            theme::icon_warn()
-        );
-        return Ok(());
-    }
-
-    eprintln!(
-        "  {} Analyzing {} turns from session {}...",
-        theme::icon_info(),
-        turns.len(),
-        &session_id[..8.min(session_id.len())]
-    );
-
-    // ── Extract patterns ────────────────────────────────────────────────
-
-    // 1. Tool frequency
-    let mut tool_freq: HashMap<String, u32> = HashMap::new();
-    let mut total_tool_calls = 0u32;
-    for t in &turns {
-        if let Some(ref tools) = t.tools_used {
-            for tool in tools {
-                *tool_freq.entry(tool.clone()).or_insert(0) += 1;
-                total_tool_calls += 1;
-            }
-        }
-    }
-
-    // Sort by frequency, take top tools
-    let mut tool_ranked: Vec<_> = tool_freq.into_iter().collect();
-    tool_ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
-    let top_tools: Vec<String> = tool_ranked.iter().take(10).map(|t| t.0.clone()).collect();
-
-    // 2. Collect user intents (first line of each user input)
-    let mut user_intents: Vec<String> = Vec::new();
-    for t in &turns {
-        if let Some(ref input) = t.user_input {
-            let first_line = input.lines().next().unwrap_or("").trim();
-            if !first_line.is_empty() && first_line.len() < 200 {
-                user_intents.push(first_line.to_string());
-            }
-        }
-    }
-
-    // 3. Skills already used
-    let mut skills_used: Vec<String> = Vec::new();
-    for t in &turns {
-        if let Some(ref skills) = t.selected_skills {
-            for s in skills {
-                if !skills_used.contains(s) {
-                    skills_used.push(s.clone());
-                }
-            }
-        }
-    }
-
-    // 4. Estimate description from first user message
-    let description = user_intents.first().cloned().unwrap_or_else(|| {
-        format!(
-            "Auto-generated skill from session {}",
-            prefix_chars(&session_id, 8)
-        )
-    });
-
-    // ── Build steps from turn transcript ────────────────────────────────
-
-    let mut steps = Vec::new();
-    for (i, t) in turns.iter().enumerate() {
-        let mut step = String::new();
-        if let Some(ref input) = t.user_input {
-            let preview = truncate_str(input, 120);
-            step.push_str(&format!("User asked: {preview}"));
-        }
-        if let Some(ref tools) = t.tools_used {
-            if !tools.is_empty() {
-                step.push_str(&format!(" → Tools: {}", tools.join(", ")));
-            }
-        }
-        if !step.is_empty() {
-            steps.push(format!("{}. {step}", i + 1));
-        }
-    }
-
-    // ── Generate SKILL.md ───────────────────────────────────────────────
-
-    let allowed_tools_yaml = if top_tools.is_empty() {
-        "allowed_tools: []".to_string()
-    } else {
-        let items: Vec<String> = top_tools.iter().map(|t| format!("  - {t}")).collect();
-        format!("allowed_tools:\n{}", items.join("\n"))
-    };
-
-    let session_steps = if steps.is_empty() {
-        "1. Understand the user's request\n2. Execute the task\n3. Report results".to_string()
-    } else {
-        steps.join("\n")
-    };
-
-    let skill_md = format!(
-        r#"---
-name: {name}
-description: "{description}"
-version: "0.1.0"
-user_invocable: true
-{allowed_tools_yaml}
-when_to_use: "{description}"
-# arguments:
-#   - name: TARGET
-#     description: "Target file or directory"
-#     required: false
----
-
-# {name}
-
-Skill auto-generated from session {session_short}.
-{total_tool_calls} tool calls across {turn_count} turns.
-
-## Objective
-
-{description}
-
-## Steps
-
-{session_steps}
-
-## Tools Available
-
-{tool_summary}
-
-## Guidelines
-
-- Follow the step sequence above, adapting to the specific request
-- Use the allowed tools listed in the frontmatter
-- Report progress and results clearly
-"#,
-        session_short = &session_id[..8.min(session_id.len())],
-        turn_count = turns.len(),
-        tool_summary = if top_tools.is_empty() {
-            "All tools available.".to_string()
-        } else {
-            format!(
-                "Primary tools (by frequency): {}",
-                tool_ranked
-                    .iter()
-                    .take(5)
-                    .map(|(n, c)| format!("{n} ({c}x)"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        },
-    );
-
-    // Write to disk
-    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
-    std::fs::write(skill_dir.join("SKILL.md"), &skill_md).map_err(|e| e.to_string())?;
-
-    // Summary output
-    eprintln!(
-        "\n  {} Skill '{}' created from session analysis",
-        theme::icon_ok(),
-        name.to_string().magenta()
-    );
-    eprintln!("  {}", format!("  Path: {}", skill_dir.display()).dim());
-    eprintln!(
-        "  {}",
-        format!(
-            "  Derived from: {} turns, {} tool calls",
-            turns.len(),
-            total_tool_calls
-        )
-        .dim()
-    );
-    if !top_tools.is_empty() {
-        eprintln!(
-            "  {}",
-            format!(
-                "  Top tools: {}",
-                top_tools[..top_tools.len().min(5)].join(", ")
-            )
-            .dim()
-        );
-    }
-    eprintln!(
-        "\n  {}",
-        format!("  Edit: {}/SKILL.md", skill_dir.display()).dim()
-    );
-    match state.unified_skill_registry.discover_all().await {
-        Ok(_) => eprintln!("  {}", "  Skill registry refreshed.".dim()),
-        Err(err) => eprintln!(
-            "  {} {}",
-            "Warning:".yellow(),
-            format!("Skill registry refresh failed: {err}").dim()
-        ),
-    }
-    eprintln!("  {}", format!("  Dev mode: /skill dev {name}").dim());
-    eprintln!("  {}", format!("  Test: /skill test {name}").dim());
-    eprintln!();
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2305,6 +2081,78 @@ mod tests {
             assert_eq!(default_skill_category(Some("")), "general");
             assert_eq!(default_skill_category(Some("   ")), "general");
             assert_eq!(default_skill_category(Some("automation")), "automation");
+        }
+    }
+
+    mod skillify_tests {
+        use super::super::handle_skill_command;
+        use crate::cli::session::session_state::SessionState;
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn create_delegates_the_current_session_without_local_activation() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/skillify/runs"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_json(serde_json::json!({
+                    "session_ids": ["session-123"],
+                    "skill_name": "review-helper",
+                    "topic": "Extract a reusable workflow from the selected session; preserve failures and cite the source events.",
+                    "target_scope": "personal"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "harness_run_id": "run-123",
+                    "harness_id": "skillify",
+                    "version_id": "skillify.v1",
+                    "user_id": "user-1",
+                    "session_id": "session-123",
+                    "status": "completed",
+                    "input_json": {},
+                    "output_json": {},
+                    "error": null,
+                    "created_at": "2026-09-18T00:00:00Z",
+                    "updated_at": "2026-09-18T00:00:01Z"
+                })))
+                .expect(1)
+                .mount(&srv)
+                .await;
+
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            state.session_id = Some("session-123".to_string());
+            handle_skill_command(
+                "create review-helper",
+                &client,
+                &mut state,
+                None,
+                Some("tok"),
+            )
+            .await
+            .unwrap();
+
+            assert!(state.skill_dev.is_none());
+            assert!(state.active_system_skills.is_empty());
+        }
+
+        #[tokio::test]
+        async fn create_without_a_session_fails_before_calling_the_service() {
+            let srv = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/harnesses/skillify/runs"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&srv)
+                .await;
+
+            let client = astra_thin_client::ThinClient::new(&srv.uri(), None).unwrap();
+            let mut state = SessionState::default();
+            let error =
+                handle_skill_command("create review-helper", &client, &mut state, None, None)
+                    .await
+                    .unwrap_err();
+            assert!(error.contains("no active session"));
         }
     }
 }
