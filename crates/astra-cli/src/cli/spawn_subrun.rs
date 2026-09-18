@@ -379,6 +379,9 @@ fn stream_event_to_agent_live_kind(
         StreamEvent::AssistantOutputSettled => {
             Some(AgentLiveEventKind::Signal(AgentLiveSignal::OutputSettled))
         }
+        StreamEvent::RunInterrupted { user_message } => {
+            Some(AgentLiveEventKind::Status(user_message))
+        }
         StreamEvent::AskUserPrompted { request_id, prompt } => Some(AgentLiveEventKind::Signal(
             AgentLiveSignal::AskUserPrompted { request_id, prompt },
         )),

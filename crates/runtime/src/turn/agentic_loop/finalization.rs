@@ -819,9 +819,6 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
-const PARTIAL_ASSISTANT_RESPONSE_MARKER: &str =
-    "\n\nPartial assistant response before interruption:\n";
-
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
     let latest_provider_text = state
         .hooks
@@ -834,34 +831,16 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         .deferred_candidate_text
         .take();
 
-    // An interruption is authoritative. Never let a candidate (or a stale
-    // model answer) turn an interrupted turn into a success-shaped response.
-    // Preserve useful mixed-response text as an explicitly labelled partial
-    // section so callers can resume with evidence instead of losing the last
-    // substantive model output.
+    // Interruption state is carried by the structured lifecycle projection;
+    // assistant text remains assistant-authored content. Do not flatten
+    // runtime diagnostics into the transcript or prepend an interruption
+    // envelope to text that may already have streamed. Apart from leaking
+    // internal details, re-rendering that envelope on an append-only stream
+    // duplicates the provider response.
     if let Some(interruption) = state.interruption.as_ref() {
-        let interruption_text = interruption_terminal_message(interruption);
-        // Finalization can be reached from more than one terminal path (for
-        // example, a provider boundary followed by lifecycle settlement).
-        // Treat the already-rendered interruption envelope as idempotent. If
-        // we append it to itself on the second pass, users see duplicate
-        // stop messages and the partial answer becomes misleading evidence.
-        let already_rendered = state.final_text.starts_with(&interruption_text)
-            && (state.final_text == interruption_text
-                || state.final_text.contains(PARTIAL_ASSISTANT_RESPONSE_MARKER));
-        if already_rendered {
-            // Preserve whether the existing envelope has already crossed the
-            // render boundary. Resetting this bit here makes a second
-            // finalization pass render identical interruption text twice;
-            // forcing it true would instead suppress a first render when an
-            // earlier lifecycle path assembled but did not display the text.
-            return;
-        }
-
-        // Prefer an explicitly deferred mixed response. Otherwise retain a
-        // substantive provider text that ingest recorded before the typed
-        // interruption was known. A pre-existing interruption envelope is
-        // not a candidate and is handled by the idempotence guard above.
+        // Prefer the latest provider response, then the bounded settlement
+        // candidate. A current runtime-owned Work settlement sentence is not
+        // provider output and must not be promoted to partial assistant text.
         let candidate = latest_provider_text
             .filter(|text| !text.trim().is_empty())
             .or_else(|| deferred_candidate.filter(|text| !text.trim().is_empty()))
@@ -874,12 +853,23 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                     && !state.final_text.trim().is_empty())
                 .then(|| state.final_text.trim().to_string())
             });
-        state.final_text = interruption_text;
         if let Some(candidate) = candidate {
-            state.final_text.push_str(PARTIAL_ASSISTANT_RESPONSE_MARKER);
-            state.final_text.push_str(candidate.trim());
+            let candidate = candidate.trim();
+            let already_current = state.final_text.trim() == candidate;
+            state.final_text = candidate.to_string();
+            // Preserve the live-stream fact only when this is the exact text
+            // that already crossed the render boundary. A replacement
+            // candidate still needs one render.
+            if !already_current {
+                state.final_text_streamed = false;
+            }
+        } else {
+            // With no partial assistant content, render only the safe public
+            // message. `error_detail` remains available on `run_interrupted`
+            // for diagnostics but never becomes transcript text.
+            state.final_text = interruption_terminal_message(interruption);
+            state.final_text_streamed = false;
         }
-        state.final_text_streamed = false;
         return;
     }
 
@@ -984,24 +974,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
 fn interruption_terminal_message(
     interruption: &astra_turn_core::interruption::InterruptionRecord,
 ) -> String {
-    let mut message = interruption.user_message.clone();
-    append_interruption_detail(&mut message, interruption);
-    message
-}
-
-fn append_interruption_detail(
-    message: &mut String,
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-) {
-    if let Some(detail) = interruption
-        .error_detail
-        .as_deref()
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty())
-    {
-        message.push_str("\n\nWhy stopped: ");
-        message.push_str(detail);
-    }
+    interruption.user_message.clone()
 }
 
 fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
@@ -1263,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn interruption_keeps_typed_reason_and_partial_candidate_without_success_shape() {
+    fn interruption_keeps_partial_candidate_and_structured_reason_separate() {
         let mut state = make_state();
         state.final_text = "stale completion-shaped summary".to_string();
         state.hooks.completion_settlement.deferred_candidate_text =
@@ -1284,22 +1257,14 @@ mod tests {
 
         ensure_terminal_text(&mut state);
 
-        assert!(state.final_text.contains("token budget"));
-        assert!(state.final_text.contains("Why stopped: prompt budget"));
-        assert!(
+        assert_eq!(state.final_text, "The build passed its final check.");
+        assert!(!state.final_text.contains("prompt budget"));
+        assert_eq!(
             state
-                .final_text
-                .contains("Partial assistant response before interruption:")
-        );
-        assert!(
-            state
-                .final_text
-                .contains("The build passed its final check.")
-        );
-        assert!(
-            !state
-                .final_text
-                .starts_with("stale completion-shaped summary")
+                .interruption
+                .as_ref()
+                .and_then(|interruption| interruption.error_detail.as_deref()),
+            Some("prompt budget remained above the configured rail")
         );
         assert!(!state.final_text_streamed);
     }
@@ -1896,7 +1861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_surfaces_budget_interruption_detail() {
+    async fn finalize_and_render_keeps_budget_detail_out_of_assistant_text() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.final_text.clear();
@@ -1920,7 +1885,39 @@ mod tests {
         finalize_and_render(&mut host, &mut state).await;
 
         assert_eq!(state.final_text, expected);
+        assert!(!state.final_text.contains("Infrastructure round limit"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn finalize_and_render_does_not_repeat_streamed_partial_text() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Useful partial answer.".to_string();
+        state.final_text_streamed = true;
+        state.hooks.completion_settlement.latest_provider_text = Some(state.final_text.clone());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 4,
+                error_detail: Some(
+                    "persistent unresolved tool outcome; coverage=missing_assessment".into(),
+                ),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert_eq!(state.final_text, "Useful partial answer.");
+        assert!(state.final_text_streamed);
+        assert!(host.rendered_final_text.is_empty());
+        assert!(!state.final_text.contains("missing_assessment"));
     }
 
     #[tokio::test]
@@ -1962,15 +1959,15 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)
         );
-        assert!(
+        assert_eq!(state.final_text, answer);
+        assert_eq!(
             state
-                .final_text
-                .contains("Why stopped: typed completion action was not satisfied"),
-            "unexpected incomplete terminal: {}",
-            state.final_text
+                .interruption
+                .as_ref()
+                .and_then(|interruption| interruption.error_detail.as_deref()),
+            Some("typed completion action was not satisfied")
         );
-        assert!(state.final_text.contains(answer));
-        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages.len(), 1);
         assert_eq!(
             state.messages[0],
             serde_json::json!({
@@ -1978,14 +1975,6 @@ mod tests {
                 "content": "No workspace mutation was needed based on the evidence."
             }),
             "the provider response must remain intact as historical evidence"
-        );
-        assert_eq!(
-            state.messages[1],
-            serde_json::json!({
-                "role": "assistant",
-                "content": state.final_text,
-            }),
-            "the typed interruption envelope must be retained after the provider response"
         );
     }
 

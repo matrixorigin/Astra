@@ -11865,25 +11865,25 @@ esac
         );
     }
 
-    struct SubmitProviderInteractionGate {
+    struct FixedProviderInteractionGate {
         calls: Arc<AtomicUsize>,
+        decision: astra_tools::ProviderInteractionDecision,
     }
 
     #[async_trait]
-    impl astra_tools::ProviderInteractionGate for SubmitProviderInteractionGate {
+    impl astra_tools::ProviderInteractionGate for FixedProviderInteractionGate {
         async fn request_interaction(
             &self,
             _request: &astra_turn_types::ProviderInteractionRequest,
         ) -> astra_tools::ProviderInteractionDecision {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            astra_tools::ProviderInteractionDecision::Submitted(json!({
-                "selected": "primary"
-            }))
+            self.decision.clone()
         }
     }
 
     async fn execute_provider_interaction_sequence(
         unique_request_ids: bool,
+        decision: astra_tools::ProviderInteractionDecision,
     ) -> (astra_tools::ToolResult, usize, usize) {
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
@@ -11948,8 +11948,9 @@ esac
                 &endpoint,
             ),
         ));
-        exec.set_provider_interaction_gate(Arc::new(SubmitProviderInteractionGate {
+        exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
             calls: Arc::clone(&gate_calls),
+            decision,
         }));
         let mut request = exec.tool_execution_request("mcp__mail__send", &json!({}));
         request.tool_call_id = "call-provider-interaction".to_string();
@@ -11972,8 +11973,13 @@ esac
 
     #[tokio::test]
     async fn provider_interaction_loop_rejects_repeated_resolved_request_id() {
-        let (result, provider_calls, gate_calls) =
-            execute_provider_interaction_sequence(false).await;
+        let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+            false,
+            astra_tools::ProviderInteractionDecision::Submitted(json!({
+                "selected": "primary"
+            })),
+        )
+        .await;
         assert!(result.is_error, "{result:?}");
         assert!(result.output.contains("made no progress"), "{result:?}");
         assert_eq!(provider_calls, 2);
@@ -11982,8 +11988,13 @@ esac
 
     #[tokio::test]
     async fn provider_interaction_loop_bounds_unique_sequential_requests() {
-        let (result, provider_calls, gate_calls) =
-            execute_provider_interaction_sequence(true).await;
+        let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+            true,
+            astra_tools::ProviderInteractionDecision::Submitted(json!({
+                "selected": "primary"
+            })),
+        )
+        .await;
         assert!(result.is_error, "{result:?}");
         assert!(
             result
@@ -11993,6 +12004,26 @@ esac
         );
         assert_eq!(provider_calls, 17);
         assert_eq!(gate_calls, 16);
+    }
+
+    #[tokio::test]
+    async fn rejected_provider_submission_does_not_continue_the_mcp_call() {
+        let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+            true,
+            astra_tools::ProviderInteractionDecision::Error(
+                "provider interaction response was recorded without durable resume authority"
+                    .to_string(),
+            ),
+        )
+        .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("without durable resume authority"),
+            "{result:?}"
+        );
+        assert_eq!(provider_calls, 1, "no continuation MCP call may be sent");
+        assert_eq!(gate_calls, 1);
     }
 
     struct AlwaysTimeoutGate;

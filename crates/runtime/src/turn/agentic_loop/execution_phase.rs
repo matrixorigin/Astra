@@ -2615,15 +2615,15 @@ fn enforce_persistent_unresolved_outcome_terminal(
         "persistent tool outcome remains uncovered at completion"
     );
 
-    // Keep the model's latest text as a labelled partial response when it
-    // exists.  A truthful reconciliation such as "the exact cause remains
-    // unresolved" is useful evidence and must not be replaced by a generic
-    // runtime sentence.  The typed interruption below still prevents that
-    // text from being presented as an unqualified successful completion.
+    // Keep the model's latest text as the partial response when it exists. A
+    // truthful reconciliation such as "the exact cause remains unresolved"
+    // is useful evidence and must not be replaced by a generic runtime
+    // sentence. The typed interruption below carries the incomplete status
+    // independently from assistant text.
     if state.final_text.trim().is_empty() {
         state.final_text = "The requested execution remains incomplete: a previously observed tool outcome is still unresolved after the bounded reconciliation pass. Completed receipts are preserved; continue from the checkpoint to resolve it or report the verified limitation.".to_string();
+        state.final_text_streamed = false;
     }
-    state.final_text_streamed = false;
     state.interruption = Some(InterruptionRecord::new(
         InterruptionKind::ExecutionIncomplete,
         ResumeAction::ContinueImmediately,
@@ -15603,18 +15603,14 @@ mod tests {
 
         assert!(matches!(outcome, AgenticLoopOutcome::Completed));
         assert_eq!(host.turn_count(), 1, "interruption must not reopen the LLM");
-        assert!(
+        assert_eq!(state.final_text, "partial provider result");
+        assert_eq!(
             state
-                .final_text
-                .contains("Why stopped: provider output cap exhausted")
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref()),
+            Some("provider output cap exhausted")
         );
-        assert!(
-            state
-                .final_text
-                .contains("Partial assistant response before interruption:")
-        );
-        assert!(state.final_text.contains("partial provider result"));
-        assert_eq!(state.final_text.matches("Why stopped:").count(), 1);
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
@@ -15647,7 +15643,18 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert!(state.final_text.contains("Why stopped"));
+        assert_eq!(
+            state.final_text,
+            "The requested file was updated successfully."
+        );
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some(),
+            "the structured interruption must retain the internal diagnostic"
+        );
     }
 
     #[tokio::test]
@@ -15684,7 +15691,18 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert!(state.final_text.contains("Why stopped"));
+        assert_eq!(
+            state.final_text,
+            "The managed external state is configured and verified."
+        );
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some(),
+            "the structured interruption must retain the internal diagnostic"
+        );
     }
 
     #[tokio::test]
@@ -15778,7 +15796,15 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert!(state.final_text.contains("Why stopped"));
+        assert_eq!(state.final_text, "Still done.");
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some(),
+            "the structured interruption must retain the internal diagnostic"
+        );
     }
 
     #[test]
@@ -16981,8 +17007,15 @@ mod tests {
                 .is_some_and(|record| record.kind == InterruptionKind::ExecutionIncomplete),
             "persistent unresolved evidence must remain resumable"
         );
-        assert!(state.final_text.contains(corrected));
-        assert!(state.final_text.contains("Why stopped"));
+        assert_eq!(state.final_text, corrected);
+        assert!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some(),
+            "the structured interruption must retain the internal diagnostic"
+        );
         assert!(state.messages.iter().all(|message| {
             message
                 .get("content")
@@ -18796,12 +18829,11 @@ mod tests {
                 .map(|record| &record.resume_action),
             Some(&ResumeAction::ContinueImmediately)
         );
-        assert!(
-            state
-                .final_text
-                .contains("Useful progress summary from the exhausted execution slice.")
+        assert_eq!(
+            state.final_text,
+            "Useful progress summary from the exhausted execution slice."
         );
-        assert!(state.final_text.contains("Why stopped:"));
+        assert!(!state.final_text.contains("Why stopped:"));
     }
 
     #[tokio::test]

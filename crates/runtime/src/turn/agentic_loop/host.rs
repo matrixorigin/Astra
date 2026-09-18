@@ -7301,6 +7301,14 @@ pub(crate) mod tests {
         );
         assert!(
             state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some_and(|detail| detail.contains("ignored repeated wrap-up advisories")),
+            "the structured interruption must retain the concrete diagnostic"
+        );
+        assert!(
+            !state
                 .final_text
                 .contains("ignored repeated wrap-up advisories")
         );
@@ -7450,8 +7458,7 @@ pub(crate) mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::BudgetExhausted)
         );
-        assert!(state.final_text.contains("The run reached its turn budget"));
-        assert!(state.final_text.contains("partial progress summary"));
+        assert_eq!(state.final_text, "partial progress summary");
         assert_eq!(host.rendered_final_text.last(), Some(&state.final_text));
     }
 
@@ -7471,19 +7478,18 @@ pub(crate) mod tests {
             host.current_turn, 2,
             "one focused settlement retry is allowed"
         );
-        assert!(
-            state
-                .final_text
-                .contains("Why stopped: canonical Work still had an unsettled item")
-        );
-        assert_eq!(state.final_text.matches("Why stopped:").count(), 1);
-        assert!(state.final_text.contains(
-            "Partial assistant response before interruption:\nstill claiming completion"
-        ));
+        assert_eq!(state.final_text, "still claiming completion");
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
             Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete),
             "contract failure must be visible to typed outcome consumers"
+        );
+        assert_eq!(
+            state
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref()),
+            Some("canonical Work still had an unsettled item at the terminal boundary")
         );
     }
 
@@ -11596,15 +11602,14 @@ pub(crate) mod tests {
             astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
             "abort interruption must be TokenBudgetExceeded"
         );
-        assert!(
-            state.final_text.contains("Why stopped:"),
-            "terminal output should explain why the runtime aborted the wrapup path"
-        );
+        assert!(!state.final_text.contains("Why stopped:"));
         assert!(
             state
-                .final_text
-                .contains("ignored repeated wrap-up advisories"),
-            "terminal output should include the concrete abort reason"
+                .interruption
+                .as_ref()
+                .and_then(|record| record.error_detail.as_deref())
+                .is_some_and(|detail| detail.contains("ignored repeated wrap-up advisories")),
+            "structured interruption should retain the concrete diagnostic"
         );
     }
 
@@ -11665,11 +11670,8 @@ pub(crate) mod tests {
             Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete),
             "a repeated tool request after lockout must remain resumably incomplete"
         );
-        assert!(state.final_text.contains(candidate));
-        assert!(
-            state.final_text.contains("Why stopped:"),
-            "the preserved candidate must be labelled as a partial response"
-        );
+        assert_eq!(state.final_text, candidate);
+        assert!(!state.final_text.contains("Why stopped:"));
         assert_eq!(host.terminal_tool_records.len(), 1);
         assert_eq!(
             host.terminal_tool_records[0].disposition,

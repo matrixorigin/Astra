@@ -1500,7 +1500,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
         "outcome": if body.cancelled { "cancelled" } else { "submitted" },
         "payload": body.payload,
     });
-    match state
+    let queued = match state
         .execution
         .run_lifecycle_service
         .resolve_run_interaction(
@@ -1514,13 +1514,8 @@ pub(crate) async fn post_provider_interaction_respond_handler(
         .await
     {
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
-        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
-        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => {
-            return Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Provider interaction entered the approval-only queued protocol",
-            ));
-        }
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => false,
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => true,
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing)) => {
             return Err(error_response(
                 StatusCode::CONFLICT,
@@ -1575,7 +1570,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
                 format!("provider interaction resolution failed: {}", error.0.detail),
             ));
         }
-    }
+    };
 
     tracing::info!(
         target: "astra_runtime::edge_callback",
@@ -1589,6 +1584,7 @@ pub(crate) async fn post_provider_interaction_respond_handler(
         "ok": true,
         "request_id": request_id,
         "durable": true,
+        "queued": queued,
     })))
 }
 
@@ -3416,6 +3412,64 @@ mod edge_callback_insert_tests {
         .await
         .expect_err("a conflicting late response must not replace the durable outcome");
         assert_eq!(conflict.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_interaction_handler_accepts_a_durable_pre_wait_queue() {
+        let descriptor = Arc::new(Mutex::new(None));
+        let lifecycle = Arc::new(
+            ApprovalTargetRunLifecycle::new("run-provider-queued", "sess-provider-queued")
+                .with_required(
+                    "req-provider-queued",
+                    "provider_interaction_required",
+                    json!({
+                        "request_id": "req-provider-queued",
+                        "session_id": "sess-provider-queued",
+                        "provider_run_owner": {
+                            "provider_id": "moi",
+                            "provider_scope_id": "workspace-a"
+                        },
+                        "interaction": {
+                            "request_id": "req-provider-queued",
+                            "payload": {"type": "provider.opaque.select"}
+                        }
+                    }),
+                )
+                .with_queued_frontier(),
+        );
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                descriptor,
+                provider_id: "moi".into(),
+                provider_scope_id: "workspace-a".into(),
+            }))
+            .with_run_lifecycle_service(lifecycle.clone());
+        let body = serde_json::to_vec(&astra_thin_client::ProviderInteractionRespondRequest {
+            request_id: "req-provider-queued".into(),
+            session_id: "sess-provider-queued".into(),
+            run_id: "run-provider-queued".into(),
+            cancelled: false,
+            payload: Some(json!({"selected": "early-option"})),
+        })
+        .unwrap();
+
+        let response = post_provider_interaction_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-provider-queued".into(),
+            }),
+            State(state),
+            Method::POST,
+            Uri::from_static(astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND),
+            HeaderMap::new(),
+            Bytes::from(body),
+        )
+        .await
+        .expect("pre-wait Provider callback must return durable queued success");
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["durable"], true);
+        assert_eq!(response.0["queued"], true);
+        assert_eq!(lifecycle.queued.lock().unwrap().len(), 1);
+        assert!(lifecycle.resolved.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

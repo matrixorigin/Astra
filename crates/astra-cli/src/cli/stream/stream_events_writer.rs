@@ -263,6 +263,12 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::AssistantOutputSettled => {
             serde_json::json!({"type": "assistant_output_settled"})
         }
+        StreamEvent::RunInterrupted { user_message } => {
+            serde_json::json!({
+                "type": "run_interrupted",
+                "user_message": user_message,
+            })
+        }
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
         }
@@ -456,6 +462,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "token");
         assert_eq!(v["text"], "hello");
+    }
+
+    #[test]
+    fn run_interrupted_event_serializes_only_the_safe_message() {
+        let json = event_to_json(&StreamEvent::RunInterrupted {
+            user_message: "Progress is saved. Continue to resume.".into(),
+        });
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "run_interrupted");
+        assert_eq!(
+            value["user_message"],
+            "Progress is saved. Continue to resume."
+        );
+        assert!(value.get("error_detail").is_none());
     }
 
     #[test]

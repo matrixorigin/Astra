@@ -154,6 +154,11 @@ pub(crate) enum WireEvent {
     AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),
     AgentCommunication(astra_turn_types::AgentCommunicationEvent),
 
+    /// The runtime ended the turn with a typed interruption after emitting
+    /// partial assistant output. The reducer commits that output first, then
+    /// renders this safe lifecycle notice as a separate system cell.
+    RunInterrupted(String),
+
     /// Turn ended cleanly; ChatWidget should emit a summary cell.
     TurnComplete(Box<TurnStats>),
 
@@ -2883,6 +2888,7 @@ impl ChatWidget {
             WireEvent::AgentCommunication(event) => {
                 self.agent_runs.record_communication(&event);
             }
+            WireEvent::RunInterrupted(msg) => self.on_run_interrupted(msg),
             WireEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
             WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
@@ -4262,6 +4268,11 @@ impl ChatWidget {
         self.end_turn_agent_observation();
         self.commit_explain_analyze_projection();
         self.commit_cell(Box::new(SystemCell::error(msg)));
+    }
+
+    fn on_run_interrupted(&mut self, msg: String) {
+        self.commit_transcript_boundary();
+        self.commit_cell(Box::new(SystemCell::warning(msg)));
     }
 
     fn on_system_warning(&mut self, msg: String) {

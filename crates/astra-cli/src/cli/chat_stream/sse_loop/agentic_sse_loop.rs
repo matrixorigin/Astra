@@ -248,7 +248,7 @@ fn non_empty_json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String {
-    let mut text = non_empty_json_str(interruption, "user_message")
+    non_empty_json_str(interruption, "user_message")
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
             let kind = kind.unwrap_or("interrupted");
@@ -262,16 +262,17 @@ fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String
                 ""
             };
             format!("[{kind}] Turn interrupted.{suffix}")
-        });
+        })
+}
 
-    if let Some(detail) = non_empty_json_str(interruption, "error_detail")
-        && !text.contains(detail)
-    {
-        text.push_str("\n\nStop reason: ");
-        text.push_str(detail);
-    }
-
-    text
+pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<String> {
+    let interruption = result.interruption.as_ref()?;
+    let notice = interruption_visible_text(interruption, result.interruption_kind.as_deref());
+    let assistant_text = result.full_text.trim();
+    // An interruption without provider text already uses this same safe
+    // notice as its only visible text. Publish a separate lifecycle row only
+    // when there is distinct partial assistant content to preserve.
+    (!assistant_text.is_empty() && assistant_text != notice.trim()).then_some(notice)
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -432,7 +433,9 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 }
 #[cfg(test)]
 mod tests {
-    use super::{StreamResultBuild, build_stream_result, resolved_tool_metrics};
+    use super::{
+        StreamResultBuild, build_stream_result, partial_interruption_notice, resolved_tool_metrics,
+    };
     use astra_pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;
@@ -595,11 +598,36 @@ mod tests {
             Some("budget_exhausted")
         );
         assert!(result.full_text.contains("46 tool call(s) completed"));
-        assert!(
-            result
-                .full_text
-                .contains("model kept calling tools after the runtime injected")
+        assert!(!result.full_text.contains("model kept calling tools"));
+        assert_eq!(partial_interruption_notice(&result), None);
+    }
+
+    #[test]
+    fn build_stream_result_keeps_partial_answer_and_interruption_notice_separate() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.full_text = "The requested file was updated successfully.".into();
+        ctx.interruption = Some(serde_json::json!({
+            "kind": "execution_incomplete",
+            "resumable": true,
+            "user_message": "The requested execution did not complete. Progress is saved. Continue this session to resume.",
+            "error_detail": "persistent unresolved tool outcome after bounded reconciliation"
+        }));
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(
+            result.full_text,
+            "The requested file was updated successfully."
         );
+        assert_eq!(
+            partial_interruption_notice(&result).as_deref(),
+            Some(
+                "The requested execution did not complete. Progress is saved. Continue this session to resume."
+            )
+        );
+        assert!(!result.full_text.contains("persistent unresolved"));
     }
 
     #[test]
@@ -622,11 +650,7 @@ mod tests {
                 .full_text
                 .starts_with("[harness_blocked] Turn interrupted.")
         );
-        assert!(
-            result
-                .full_text
-                .contains("Stop reason: required harness capability is unavailable")
-        );
+        assert!(!result.full_text.contains("required harness capability"));
     }
 
     #[test]
@@ -650,7 +674,7 @@ mod tests {
                 .starts_with("[interrupted] Turn interrupted.")
         );
         assert!(
-            result
+            !result
                 .full_text
                 .contains("missing kind should not look completed")
         );

@@ -1867,6 +1867,7 @@ async fn project_shared_run_interaction_resolution(
     let expected_waiting_for = match resolved_event_type {
         "approval_resolved" => Some("tool_approval"),
         "ask_user_resolved" => Some("user_input"),
+        "provider_interaction_resolved" => Some("provider_interaction"),
         _ => None,
     };
     // Re-read the bounded authoritative tail before changing the process-local
@@ -1932,11 +1933,7 @@ fn approval_decision_from_shared_event(
     event: &Value,
 ) -> Result<astra_tools::ApprovalDecision, String> {
     let data = event.get("data").unwrap_or(event);
-    if data
-        .pointer("/_durable_resolution/disposition")
-        .and_then(Value::as_str)
-        != Some("resumed")
-    {
+    if !interaction_has_durable_resume_authority(data) {
         return Err(
             "approval was recorded without durable resume authority; the stale run must stop"
                 .to_string(),
@@ -1966,22 +1963,16 @@ fn ask_user_decision_from_shared_event(event: &Value) -> astra_tools::AskUserDec
         .and_then(Value::as_str)
         .unwrap_or("error")
     {
-        "submitted"
-            if data
-                .pointer("/_durable_resolution/disposition")
-                .and_then(Value::as_str)
-                == Some("resumed") =>
-        {
-            data.get("answers")
-                .cloned()
-                .and_then(|answers| serde_json::from_value(answers).ok())
-                .map(astra_tools::AskUserDecision::Submitted)
-                .unwrap_or_else(|| {
-                    astra_tools::AskUserDecision::Error(
-                        "durable ask_user response contains invalid answers".to_string(),
-                    )
-                })
-        }
+        "submitted" if interaction_has_durable_resume_authority(data) => data
+            .get("answers")
+            .cloned()
+            .and_then(|answers| serde_json::from_value(answers).ok())
+            .map(astra_tools::AskUserDecision::Submitted)
+            .unwrap_or_else(|| {
+                astra_tools::AskUserDecision::Error(
+                    "durable ask_user response contains invalid answers".to_string(),
+                )
+            }),
         "submitted" => astra_tools::AskUserDecision::Error(
             "ask_user response was recorded without durable resume authority".to_string(),
         ),
@@ -2005,7 +1996,7 @@ fn provider_interaction_decision_from_shared_event(
         .and_then(Value::as_str)
         .unwrap_or("error")
     {
-        "submitted" => data
+        "submitted" if interaction_has_durable_resume_authority(data) => data
             .get("payload")
             .filter(|payload| payload.is_object())
             .cloned()
@@ -2015,6 +2006,10 @@ fn provider_interaction_decision_from_shared_event(
                     "durable provider interaction response contains invalid payload".to_string(),
                 )
             }),
+        "submitted" => astra_tools::ProviderInteractionDecision::Error(
+            "provider interaction response was recorded without durable resume authority"
+                .to_string(),
+        ),
         "cancelled" => astra_tools::ProviderInteractionDecision::Cancelled,
         "timed_out" => astra_tools::ProviderInteractionDecision::Timeout,
         _ => astra_tools::ProviderInteractionDecision::Error(
@@ -2024,6 +2019,12 @@ fn provider_interaction_decision_from_shared_event(
                 .to_string(),
         ),
     }
+}
+
+fn interaction_has_durable_resume_authority(data: &Value) -> bool {
+    data.pointer("/_durable_resolution/disposition")
+        .and_then(Value::as_str)
+        == Some("resumed")
 }
 
 enum DurableServerInteractionWaitStart {
@@ -2890,7 +2891,11 @@ impl DurableRunUserPromptGate {
     /// transition are already durable. This method must never append another
     /// event or manufacture local authority when the transaction did not
     /// commit.
-    async fn project_durable_wait(&self, event: Value) {
+    async fn project_durable_wait(
+        &self,
+        event: Value,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) {
         let indexed_event = load_exact_indexed_interaction_event(
             &self.run_engine,
             &self.user_id,
@@ -2907,7 +2912,7 @@ impl DurableRunUserPromptGate {
             let mut runs = self.runs.write().await;
             runs.get_mut(&self.context.run_id).map(|run| {
                 run.status = RunStatus::Waiting;
-                run.waiting_for = Some("user_input".to_string());
+                run.waiting_for = Some(kind.waiting_for().to_string());
                 run.events.push(event);
                 run.live_tx.clone()
             })
@@ -2961,7 +2966,11 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(required_event).await;
+                self.project_durable_wait(
+                    required_event,
+                    astra_services::runs::DurableRunInteractionKind::AskUser,
+                )
+                .await;
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),
@@ -3109,6 +3118,10 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         };
         let event = json!({
             "event_type": "provider_interaction_required",
+            "idempotency_key": format!(
+                "server-provider-interaction-required:{}",
+                request.request_id
+            ),
             "data": {
                 "request_id": &request.request_id,
                 "session_id": &self.context.session_id,
@@ -3133,7 +3146,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(event).await;
+                self.project_durable_wait(
+                    event,
+                    astra_services::runs::DurableRunInteractionKind::Provider,
+                )
+                .await;
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),

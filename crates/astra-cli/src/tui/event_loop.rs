@@ -9691,6 +9691,7 @@ fn handle_app_event(
             // Progress ticks handled by ChatWidget via the bridge.
         }
         TuiAppEvent::AssistantOutputSettled
+        | TuiAppEvent::RunInterrupted { .. }
         | TuiAppEvent::TurnStreamClosed
         | TuiAppEvent::TurnProjectionDrained
         | TuiAppEvent::WorkTaskBoardUpdate(_)

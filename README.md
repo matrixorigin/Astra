@@ -1,6 +1,9 @@
 <div align="center">
 
-# Astra
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo/astra-lockup-dark.svg">
+  <img alt="Astra" src="docs/assets/logo/astra-lockup.svg" width="340">
+</picture>
 
 ### An agent runtime with EXPLAIN ANALYZE for context
 

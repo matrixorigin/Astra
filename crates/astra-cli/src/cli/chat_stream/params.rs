@@ -230,6 +230,13 @@ pub enum StreamEvent {
     /// running. UI consumers use this as the accurate boundary between live
     /// generation and finalization.
     AssistantOutputSettled,
+    /// Safe user-facing projection of a typed runtime interruption. This is
+    /// deliberately separate from assistant text: partial provider output
+    /// remains unchanged, while clients can render the lifecycle outcome as
+    /// its own status without exposing `error_detail`.
+    RunInterrupted {
+        user_message: String,
+    },
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
     /// A mid-turn input reached the runtime's next safe model boundary.

@@ -111,6 +111,11 @@ pub(crate) enum TuiAppEvent {
     /// The agentic loop has settled its last model-visible output. Durable
     /// turn settlement may still be running, but the reply can no longer grow.
     AssistantOutputSettled,
+    /// Safe foreground projection of an interrupted turn. The assistant's
+    /// partial response remains a separate transcript cell.
+    RunInterrupted {
+        user_message: String,
+    },
     /// The response event stream is closed. This freezes the mutable reply
     /// projection, but does not claim that durable turn settlement has
     /// completed yet.

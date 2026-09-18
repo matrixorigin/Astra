@@ -129,6 +129,9 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::TurnComplete => Some(AppEvent::wire(WireEvent::TurnComplete(Box::new(
             ctx.into_stats(),
         )))),
+        TuiAppEvent::RunInterrupted { user_message } => {
+            Some(AppEvent::wire(WireEvent::RunInterrupted(user_message)))
+        }
         TuiAppEvent::TurnError(msg) => Some(AppEvent::wire(WireEvent::TurnError(msg))),
         TuiAppEvent::SystemWarning(msg) => Some(AppEvent::wire(WireEvent::SystemWarning(msg))),
         TuiAppEvent::SystemInfo(msg) => Some(AppEvent::wire(WireEvent::SystemInfo(msg))),
@@ -279,6 +282,19 @@ mod tests {
             TurnContext::default(),
         );
         assert!(matches!(wire(&out), Some(WireEvent::SystemWarning(s)) if s == "not logged in"));
+    }
+
+    #[test]
+    fn run_interrupted_becomes_a_separate_typed_view_event() {
+        let out = translate(
+            TuiAppEvent::RunInterrupted {
+                user_message: "The turn is incomplete. Continue to resume.".into(),
+            },
+            TurnContext::default(),
+        );
+        assert!(
+            matches!(wire(&out), Some(WireEvent::RunInterrupted(s)) if s == "The turn is incomplete. Continue to resume.")
+        );
     }
 
     #[test]

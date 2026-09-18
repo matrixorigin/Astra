@@ -45,7 +45,7 @@ use crate::cli::chat_stream::params::StreamEvent;
 use crate::cli::session::session_runtime::{self, ServerDefaultModel};
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
-    resolved_tool_metrics,
+    partial_interruption_notice, resolved_tool_metrics,
 };
 use serde_json::{Value, json};
 use server_admission_host::{CliServerAdmissionHost, is_pre_admission_rejection};
@@ -1360,6 +1360,18 @@ pub(crate) async fn stream_chat_sse(
         run_transcript_messages,
         applied_user_intents,
     });
+    if let Some(ref tx) = p.stream_event_tx
+        && let Some(user_message) = partial_interruption_notice(&result)
+        && tx
+            .send(StreamEvent::RunInterrupted { user_message })
+            .await
+            .is_err()
+    {
+        tracing::warn!(
+            target: "astra_cli::tui",
+            "interruption notice could not reach the foreground stream projection"
+        );
+    }
     tracing::debug!(
         target: "astra_cli::turn_settlement",
         post_loop_projection_ms = post_loop_projection_started_at.elapsed().as_millis() as u64,

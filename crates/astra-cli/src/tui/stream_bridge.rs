@@ -524,6 +524,9 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         StreamEvent::WaitingForModel => TuiAppEvent::WaitingForModel,
         StreamEvent::ModelResponding => TuiAppEvent::ModelResponding,
         StreamEvent::AssistantOutputSettled => TuiAppEvent::AssistantOutputSettled,
+        StreamEvent::RunInterrupted { user_message } => {
+            TuiAppEvent::RunInterrupted { user_message }
+        }
         StreamEvent::StatusLine(text) => TuiAppEvent::StatusLine(text),
         StreamEvent::UserIntentApplied {
             intent_id,
@@ -708,6 +711,17 @@ mod tests {
         assert!(matches!(
             map_stream_event(StreamEvent::AssistantOutputSettled),
             Some(TuiAppEvent::AssistantOutputSettled)
+        ));
+    }
+
+    #[test]
+    fn run_interrupted_maps_to_typed_tui_lifecycle_event() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::RunInterrupted {
+                user_message: "Progress is saved. Continue to resume.".into(),
+            }),
+            Some(TuiAppEvent::RunInterrupted { user_message })
+                if user_message == "Progress is saved. Continue to resume."
         ));
     }
 
