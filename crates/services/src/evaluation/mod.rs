@@ -1,5 +1,6 @@
 pub mod assessment;
 pub mod database;
+pub mod durable;
 pub mod experiment;
 pub mod noop;
 pub mod service;
@@ -12,6 +13,10 @@ pub use assessment::{
     TrialObservation, TrialStatus, build_comparison_for_plan, render_markdown,
 };
 pub use database::DatabaseEvaluationService;
+pub use durable::{
+    DatabaseEvaluationPlanStore, EvaluationExperimentRecord, EvaluationPersistenceError,
+    EvaluationTrialBindingRecord,
+};
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
     EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,

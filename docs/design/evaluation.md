@@ -1,7 +1,7 @@
 # Evaluation
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-18.
 
 Evaluation defines how Astra measures agent quality, safety, reliability, and regression risk across prompts, tools, providers, memory, and orchestration.
 
@@ -125,3 +125,28 @@ remains missing, and a partial or unavailable trial is never converted to zero
 or silently excluded. The report distinguishes paired comparison support from
 mechanism evidence; a trace being available does not by itself prove a causal
 effect.
+
+## Durable registration boundary
+
+The first durable Eval boundary is intentionally small. An owner-scoped
+experiment row stores the immutable `ExperimentSpec` and its submission
+idempotency key. Its trial rows store the canonical planned `TrialUnit` and
+remain `planned` until an existing owner-scoped Session and Run are bound. Eval
+does not create a second execution state machine: progress and terminal state
+come from the normal Run/Session backbone, while the binding table only records
+which trial owns which execution identity.
+
+Every registration and binding query includes the authenticated owner. A
+repeated owner/spec/submission tuple returns the same plan; a reused experiment
+ID or submission key with different content is a conflict. A Run can belong to
+at most one trial for an owner, and a binding is an atomic compare-and-set, so
+two sessions or edges cannot silently charge the same execution twice. Foreign
+owners receive the same not-found/conflict boundary without learning another
+owner's trial data.
+
+The persistence adapter currently accepts a bounded plan (4,096 trials and a
+bounded serialized payload) and reads it as one consistent snapshot. This is a
+deliberate admission limit for predictable multi-tenant latency; a future
+large-plan scheduler must add explicit batching and pagination before raising
+it. Required Memory or MatrixOne branches are still unavailable until a
+materialization receipt is recorded; registration alone never claims isolation.

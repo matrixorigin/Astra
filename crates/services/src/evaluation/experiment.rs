@@ -455,6 +455,25 @@ impl ExperimentSpec {
     /// and enforce the fingerprint; planning alone does not prevent duplicate
     /// execution or billing.
     pub fn plan_trials(&self) -> Result<Vec<TrialUnit>, String> {
+        self.plan_trials_internal(None)
+    }
+
+    /// Expand trials while bounding the work and serialized payload retained
+    /// by a durable caller. The budget is checked as each trial is built, so a
+    /// legal specification with very large repeated case fields cannot first
+    /// allocate an unbounded vector and only then be rejected.
+    pub fn plan_trials_with_limits(
+        &self,
+        max_trials: usize,
+        max_serialized_bytes: usize,
+    ) -> Result<Vec<TrialUnit>, String> {
+        self.plan_trials_internal(Some((max_trials, max_serialized_bytes)))
+    }
+
+    fn plan_trials_internal(
+        &self,
+        limits: Option<(usize, usize)>,
+    ) -> Result<Vec<TrialUnit>, String> {
         self.validate()?;
         let spec_fingerprint = self.spec_fingerprint()?;
         let memory_base_snapshot_ref = match &self.conditions.memory_isolation {
@@ -469,11 +488,20 @@ impl ExperimentSpec {
                 Some(base_snapshot_ref.clone())
             }
         };
-        let mut trials = Vec::with_capacity(self.planned_trial_count()?);
+        let planned_trial_count = self.planned_trial_count()?;
+        if let Some((max_trials, _)) = limits
+            && planned_trial_count > max_trials
+        {
+            return Err(format!(
+                "planned trial count {planned_trial_count} exceeds expansion limit {max_trials}"
+            ));
+        }
+        let mut trials = Vec::with_capacity(planned_trial_count);
+        let mut estimated_serialized_bytes = 0_usize;
         for case in &self.cases {
             for repetition in 0..self.repetitions {
                 for arm in [ComparisonArm::Baseline, ComparisonArm::Candidate] {
-                    trials.push(TrialUnit {
+                    let trial = TrialUnit {
                         trial_id: trial_id(
                             &spec_fingerprint,
                             &self.experiment_id,
@@ -494,7 +522,26 @@ impl ExperimentSpec {
                         holdout: case.holdout,
                         memory_base_snapshot_ref: memory_base_snapshot_ref.clone(),
                         data_base_snapshot_ref: data_base_snapshot_ref.clone(),
-                    });
+                    };
+                    if let Some((_, max_serialized_bytes)) = limits {
+                        // Sequence is assigned after ordering. Reserve a
+                        // small digit-length margin so the early check stays
+                        // conservative without materializing the full plan.
+                        let trial_bytes = serde_json::to_vec(&trial)
+                            .map_err(|error| format!("failed to size evaluation trial: {error}"))?
+                            .len()
+                            .checked_add(16)
+                            .ok_or_else(|| "evaluation trial size overflow".to_string())?;
+                        estimated_serialized_bytes = estimated_serialized_bytes
+                            .checked_add(trial_bytes)
+                            .ok_or_else(|| "evaluation plan size overflow".to_string())?;
+                        if estimated_serialized_bytes > max_serialized_bytes {
+                            return Err(format!(
+                                "planned trial payload exceeds expansion limit {max_serialized_bytes} bytes"
+                            ));
+                        }
+                    }
+                    trials.push(trial);
                 }
             }
         }
@@ -507,6 +554,21 @@ impl ExperimentSpec {
             // Sequence is assigned after ordering and is not part of the
             // idempotency identity.
             trial.sequence = sequence as u32 + 1;
+        }
+        if let Some((_, max_serialized_bytes)) = limits {
+            let actual_serialized_bytes = trials.iter().try_fold(0_usize, |total, trial| {
+                let trial_bytes = serde_json::to_vec(trial)
+                    .map_err(|error| format!("failed to size evaluation trial: {error}"))?
+                    .len();
+                total
+                    .checked_add(trial_bytes)
+                    .ok_or_else(|| "evaluation plan size overflow".to_string())
+            })?;
+            if actual_serialized_bytes > max_serialized_bytes {
+                return Err(format!(
+                    "planned trial payload is {actual_serialized_bytes} bytes; expansion limit is {max_serialized_bytes}"
+                ));
+            }
         }
         Ok(trials)
     }

@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-16-v78";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-18-v80";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3633,6 +3633,7 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
     core_schema_create!(
         pool,
         "auth_roles",
@@ -3645,7 +3646,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
     core_schema_create!(
         pool,
         "auth_user_roles",
@@ -4140,6 +4140,81 @@ async fn ensure_core_schema_while_leased(
         &settings.database,
         "agent_runs",
         &[("trigger_event_id", AGENT_EVENT_ID_LEN as u64)],
+    )
+    .await?;
+
+    // Generic evaluation registration and trial identity. These tables only
+    // bind immutable Eval plans to the canonical Session/Run backbone; they
+    // are deliberately owner-scoped and do not hold a second run lifecycle.
+    core_schema_create!(
+        pool,
+        "evaluation_experiments",
+        "CREATE TABLE IF NOT EXISTS evaluation_experiments (
+            owner_user_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            spec_json LONGTEXT NOT NULL,
+            submission_idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, experiment_id),
+            UNIQUE KEY uq_eval_experiment_submission
+                (owner_user_id, submission_idempotency_key),
+            INDEX idx_eval_experiments_owner_updated
+                (owner_user_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_trial_bindings",
+        "CREATE TABLE IF NOT EXISTS evaluation_trial_bindings (
+            owner_user_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            sequence_num INT NOT NULL,
+            trial_json LONGTEXT NOT NULL,
+            binding_status VARCHAR(32) NOT NULL DEFAULT 'planned',
+            session_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_trial_sequence
+                (owner_user_id, experiment_id, sequence_num),
+            UNIQUE KEY uq_eval_trial_run (owner_user_id, run_id),
+            INDEX idx_eval_trials_owner_binding
+                (owner_user_id, binding_status, updated_at),
+            CONSTRAINT chk_eval_trial_binding_status
+                CHECK (binding_status IN ('planned', 'bound')),
+            CONSTRAINT chk_eval_trial_binding_refs
+                CHECK (
+                    (binding_status = 'planned' AND session_id IS NULL AND run_id IS NULL)
+                    OR
+                    (binding_status = 'bound' AND session_id IS NOT NULL AND run_id IS NOT NULL)
+                )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_experiments",
+        "idx_eval_experiments_owner_updated",
+        &["owner_user_id", "updated_at"],
+        "ALTER TABLE evaluation_experiments ADD INDEX idx_eval_experiments_owner_updated (owner_user_id, updated_at)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_trial_bindings",
+        "uq_eval_trial_run",
+        &["owner_user_id", "run_id"],
+        "ALTER TABLE evaluation_trial_bindings ADD UNIQUE INDEX uq_eval_trial_run (owner_user_id, run_id)",
     )
     .await?;
 
