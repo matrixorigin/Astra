@@ -2107,6 +2107,24 @@ where
     })
 }
 
+async fn load_provider_attempt_fact_cancellation_safe(
+    db: &sqlx::Pool<sqlx::MySql>,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<Option<PersistedProviderAttemptFact>> {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference provider attempt fact connection",
+                error,
+            )
+        })?;
+    let persisted = load_provider_attempt_fact(connection.connection_mut(), attempt).await;
+    connection.release();
+    persisted
+}
+
 fn decode_persisted_provider_attempt_fact(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<PersistedProviderAttemptFact, sqlx::Error> {
@@ -2333,6 +2351,35 @@ where
             "provider attempt admission canonical payload hash does not match its immutable identity",
         ))
     }
+}
+
+async fn validate_ambiguous_provider_attempt_admission_cancellation_safe(
+    db: &sqlx::Pool<sqlx::MySql>,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+) -> ServiceResult<bool> {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire provider attempt admission reconciliation connection",
+                error,
+            )
+        })?;
+    let result = async {
+        let Some(persisted) =
+            load_provider_attempt_fact(connection.connection_mut(), attempt).await?
+        else {
+            return Ok(false);
+        };
+        validate_ambiguous_provider_attempt_admission(&persisted, attempt, provider_wire_bytes)?;
+        validate_ambiguous_canonical_head_admission(connection.connection_mut(), attempt).await?;
+        Ok(true)
+    }
+    .await;
+    connection.release();
+    result
 }
 
 fn validate_first_provider_attempt_binding(
@@ -3371,14 +3418,26 @@ pub async fn begin_inference_provider_attempt(
 ) -> ServiceResult<()> {
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference provider attempt admission connection",
+                error,
+            )
+        })?;
+    if let Some(persisted) =
+        load_provider_attempt_fact(connection.connection_mut(), attempt).await?
+    {
         validate_persisted_provider_attempt_identity(&persisted, attempt, provider_wire_bytes)?;
+        connection.release();
         return Err(ServiceError::conflict(format!(
             "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
             attempt.attempt_id, persisted.status
         )));
     }
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference provider attempt admission",
@@ -3545,25 +3604,31 @@ pub async fn begin_inference_provider_attempt(
                 rollback_inference_tx(tx, "record accepted model request context").await;
                 return Err(error);
             }
-            let Err(error) = tx.commit().await else {
-                return Ok(());
+            let error = match tx.commit().await {
+                Ok(()) => {
+                    connection.release();
+                    return Ok(());
+                }
+                Err(error) => {
+                    drop(connection);
+                    error
+                }
             };
             let commit_error = ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "commit inference provider attempt admission",
                 error,
             );
-            match load_provider_attempt_fact(db, attempt).await {
-                Ok(Some(persisted)) => {
-                    validate_ambiguous_provider_attempt_admission(
-                        &persisted,
-                        attempt,
-                        provider_wire_bytes,
-                    )?;
-                    validate_ambiguous_canonical_head_admission(db, attempt).await
-                }
-                Ok(None) => Err(commit_error),
-                Err(read_error) => {
+            match validate_ambiguous_provider_attempt_admission_cancellation_safe(
+                db,
+                attempt,
+                provider_wire_bytes,
+            )
+            .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(commit_error),
+                Err(read_error) if read_error.kind == ServiceErrorKind::Persistence => {
                     tracing::warn!(
                         attempt_id = %attempt.attempt_id,
                         %read_error,
@@ -3571,6 +3636,7 @@ pub async fn begin_inference_provider_attempt(
                     );
                     Err(commit_error)
                 }
+                Err(error) => Err(error),
             }
         }
         Ok(_) => Err(ServiceError::conflict(format!(
@@ -3579,7 +3645,10 @@ pub async fn begin_inference_provider_attempt(
         ))),
         Err(error) => {
             rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-            if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+            drop(connection);
+            if let Some(persisted) =
+                load_provider_attempt_fact_cancellation_safe(db, attempt).await?
+            {
                 validate_persisted_provider_attempt_identity(
                     &persisted,
                     attempt,
@@ -4449,7 +4518,7 @@ async fn recover_provider_terminal_after_unknown_write(
     fingerprint: &str,
     original_error: ServiceError,
 ) -> ServiceResult<()> {
-    match load_provider_attempt_fact(db, attempt).await {
+    match load_provider_attempt_fact_cancellation_safe(db, attempt).await {
         Ok(Some(persisted)) => match classify_persisted_provider_terminal(
             &persisted,
             attempt,
@@ -4475,15 +4544,16 @@ async fn recover_provider_terminal_after_unknown_write(
     }
 }
 
-async fn combined_successful_settlement_is_durable(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn combined_successful_settlement_is_durable_on_connection(
+    connection: &mut sqlx::MySqlConnection,
     plan: &InferenceInvocationPlan,
     attempt: &InferenceProviderAttemptPlan,
     provider_wire_bytes: i64,
     terminal: &InferenceInvocationTerminal,
     fingerprint: &str,
 ) -> ServiceResult<bool> {
-    let Some(persisted_attempt) = load_provider_attempt_fact(db, attempt).await? else {
+    let Some(persisted_attempt) = load_provider_attempt_fact(&mut *connection, attempt).await?
+    else {
         return Ok(false);
     };
     if classify_persisted_provider_terminal(
@@ -4496,7 +4566,40 @@ async fn combined_successful_settlement_is_durable(
     {
         return Ok(false);
     }
-    Ok(existing_terminal_fingerprint(db, plan).await?.as_deref() == Some(fingerprint))
+    Ok(existing_terminal_fingerprint(&mut *connection, plan)
+        .await?
+        .as_deref()
+        == Some(fingerprint))
+}
+
+async fn combined_successful_settlement_is_durable_cancellation_safe(
+    db: &sqlx::Pool<sqlx::MySql>,
+    plan: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+    terminal: &InferenceInvocationTerminal,
+    fingerprint: &str,
+) -> ServiceResult<bool> {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire combined successful settlement reconciliation connection",
+                error,
+            )
+        })?;
+    let durable = combined_successful_settlement_is_durable_on_connection(
+        connection.connection_mut(),
+        plan,
+        attempt,
+        provider_wire_bytes,
+        terminal,
+        fingerprint,
+    )
+    .await;
+    connection.release();
+    durable
 }
 
 /// Atomically settle a successful physical attempt and its logical invocation.
@@ -4521,7 +4624,16 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
         ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
     })?;
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire combined successful inference settlement connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin combined successful inference settlement",
@@ -4572,7 +4684,8 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
 
     if attempt_update.rows_affected() != 1 {
         rollback_inference_tx(tx, "classify combined successful inference settlement").await;
-        return if combined_successful_settlement_is_durable(
+        drop(connection);
+        return if combined_successful_settlement_is_durable_cancellation_safe(
             db,
             plan,
             attempt,
@@ -4642,12 +4755,13 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     }
 
     if let Err(error) = tx.commit().await {
+        drop(connection);
         let commit_error = ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "commit combined successful inference settlement",
             error,
         );
-        if combined_successful_settlement_is_durable(
+        if combined_successful_settlement_is_durable_cancellation_safe(
             db,
             plan,
             attempt,
@@ -4661,6 +4775,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
         }
         return Err(commit_error);
     }
+    connection.release();
     Ok(())
 }
 
@@ -4673,7 +4788,17 @@ pub async fn finish_inference_provider_attempt(
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await?
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference provider terminal connection",
+                error,
+            )
+        })?;
+    if let Some(persisted) =
+        load_provider_attempt_fact(connection.connection_mut(), attempt).await?
         && classify_persisted_provider_terminal(
             &persisted,
             attempt,
@@ -4682,6 +4807,7 @@ pub async fn finish_inference_provider_attempt(
             &fingerprint,
         )? == PersistedProviderTerminalMatch::ExactTerminal
     {
+        connection.release();
         return Ok(());
     }
     let update = sqlx::query(
@@ -4720,7 +4846,7 @@ pub async fn finish_inference_provider_attempt(
         // A successful physical response is final. Persist its recovery debt in
         // the same transaction, so a crash cannot leave a successful response
         // invisible to the logical lifecycle without an explicit recovery fact.
-        let mut tx = db.begin().await.map_err(|error| {
+        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin successful inference provider terminal",
@@ -4745,6 +4871,7 @@ pub async fn finish_inference_provider_attempt(
                     error,
                 );
                 rollback_inference_tx(tx, "finish successful inference provider attempt").await;
+                drop(connection);
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -4784,6 +4911,7 @@ pub async fn finish_inference_provider_attempt(
             return Err(error);
         }
         if let Err(error) = tx.commit().await {
+            drop(connection);
             let commit_error = ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "commit successful inference provider terminal",
@@ -4802,7 +4930,7 @@ pub async fn finish_inference_provider_attempt(
         }
         result
     } else {
-        let mut tx = db.begin().await.map_err(|error| {
+        let mut tx = connection.connection_mut().begin().await.map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "begin inference provider terminal",
@@ -4833,6 +4961,7 @@ pub async fn finish_inference_provider_attempt(
                     return Err(error);
                 }
                 if let Err(error) = tx.commit().await {
+                    drop(connection);
                     let commit_error = ServiceError::with_source(
                         ServiceErrorKind::Persistence,
                         "commit inference provider terminal",
@@ -4858,6 +4987,7 @@ pub async fn finish_inference_provider_attempt(
                     error,
                 );
                 rollback_inference_tx(tx, "finish inference provider attempt").await;
+                drop(connection);
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -4872,9 +5002,12 @@ pub async fn finish_inference_provider_attempt(
         }
     };
     if result.rows_affected() == 1 {
+        connection.release();
         return Ok(());
     }
-    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+    if let Some(persisted) =
+        load_provider_attempt_fact(connection.connection_mut(), attempt).await?
+    {
         return match classify_persisted_provider_terminal(
             &persisted,
             attempt,
@@ -4883,15 +5016,20 @@ pub async fn finish_inference_provider_attempt(
             &fingerprint,
         )? {
             PersistedProviderTerminalMatch::ExactTerminal => {
+                connection.release();
                 record_successful_attempt_debt_if_needed(db, attempt, terminal, &terminal_state)
                     .await
             }
-            PersistedProviderTerminalMatch::Started => Err(ServiceError::conflict(format!(
-                "inference provider attempt {} terminal update changed no started row",
-                attempt.attempt_id
-            ))),
+            PersistedProviderTerminalMatch::Started => {
+                connection.release();
+                Err(ServiceError::conflict(format!(
+                    "inference provider attempt {} terminal update changed no started row",
+                    attempt.attempt_id
+                )))
+            }
         };
     }
+    connection.release();
     Err(ServiceError::conflict(format!(
         "inference provider attempt {} is not in started state",
         attempt.attempt_id
