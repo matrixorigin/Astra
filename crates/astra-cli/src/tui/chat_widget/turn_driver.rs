@@ -249,6 +249,73 @@ fn turn_error_mid_stream_commits_partial_assistant_then_error() {
     assert!(w.active_cell().is_none());
 }
 
+#[tokio::test]
+async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separately() {
+    use crate::cli::chat_stream::StreamEvent;
+    use crate::tui::stream_bridge;
+
+    let mut w = ChatWidget::new("");
+    w.handle_event(AppEvent::User(UserEvent::Submit("update the file".into())));
+
+    let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    let (stream_tx, control) = stream_bridge::create_controlled_per_turn_bridge(tui_tx);
+    let assistant_text = "The requested file was updated successfully.";
+    let user_message = "The requested execution did not complete. Progress is saved. Continue this session to resume.";
+
+    stream_tx
+        .send(StreamEvent::Token(assistant_text.into()))
+        .await
+        .expect("partial assistant text should enter the ordered stream");
+    stream_tx
+        .send(StreamEvent::AssistantOutputSettled)
+        .await
+        .expect("assistant settlement should enter the ordered stream");
+    stream_tx
+        .send(StreamEvent::RunInterrupted {
+            user_message: user_message.into(),
+        })
+        .await
+        .expect("interruption notice should enter the ordered stream");
+    control.close_and_drain();
+
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), tui_rx.recv())
+            .await
+            .expect("bridge must drain the interrupted turn")
+            .expect("TUI channel remains open");
+        let drained = matches!(
+            event,
+            crate::tui::app_event::TuiAppEvent::TurnProjectionDrained
+        );
+        if let Some(event) = super::bridge::translate(event, Default::default()) {
+            w.handle_event(event);
+        }
+        if drained {
+            break;
+        }
+    }
+    w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+    let kinds: Vec<&'static str> = w
+        .history()
+        .iter()
+        .map(|cell| cell_kind_name(cell.as_ref()))
+        .collect();
+    assert_eq!(kinds, vec!["User", "Assistant", "System", "TurnSummary"]);
+    let interruption_notice = w
+        .history()
+        .iter()
+        .find_map(|cell| {
+            cell.as_any_ref()
+                .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
+        })
+        .expect("interruption should render as a separate system cell");
+    assert_eq!(interruption_notice.message(), user_message);
+    let rendered = render_history(&w, 100);
+    assert_eq!(rendered.matches(assistant_text).count(), 1);
+    assert!(!rendered.contains("persistent unresolved tool outcome"));
+}
+
 // ── helpers ─────────────────────────────────────────────────────
 
 fn cell_kind_name(c: &dyn HistoryCell) -> &'static str {

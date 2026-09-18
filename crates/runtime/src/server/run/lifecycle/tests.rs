@@ -16795,6 +16795,16 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["partial"], true);
     assert_eq!(
+        events[0]["data"]["full_text"],
+        "[Round budget hard-limit reached]"
+    );
+    assert!(
+        !events[0]["data"]["full_text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Why stopped:")
+    );
+    assert_eq!(
         events[0]["data"]["interruption"]["kind"],
         "budget_exhausted"
     );
