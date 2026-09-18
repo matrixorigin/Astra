@@ -45,6 +45,8 @@ use serde_json::{Value, json};
 pub struct TurnIntentJudgeContext {
     /// The user's current message (the one being judged).
     pub message: String,
+    /// Runtime-owned source and response binding; excluded from judge prompts.
+    pub source: Option<TurnIntentSource>,
     /// 1-based turn count so the judge can weight follow-ups vs initial turns.
     pub turn_count: u32,
     /// Tool names used in the most recent assistant turn(s) — useful for the
@@ -63,6 +65,14 @@ pub struct TurnIntentJudgeContext {
     pub prior_assistant_message: Option<String>,
     /// Closed topology declared by trusted loaded-workflow manifests.
     pub loaded_workflow_execution_topology: Option<WorkExecutionTopology>,
+}
+
+/// Canonical source captured with the exact exchange shown to the judge.
+#[derive(Debug, Clone)]
+pub struct TurnIntentSource {
+    pub message_index: usize,
+    pub message_text: String,
+    pub feedback_response: Option<astra_turn_types::FeedbackResponseReference>,
 }
 
 /// Errors a [`TurnIntentJudge`] may return.
@@ -146,13 +156,15 @@ Classify semantics, not keywords. Latest user intent wins; prior assistant text 
 
 `workspace_mutation` is task-resource end state, separate from Work lifecycle: no task-resource change=`read_only`; requested workspace or version-control change, or external task-resource change=`must_mutate`, despite prior inspection. For `must_mutate`, include `mutation_completion_scope`. Browser=true only when requested. Do not summarize."#;
 
+pub(crate) const TURN_ASSESSMENT_PROMPT: &str = r#"Optional `assessment`: satisfaction=unknown|satisfied|mixed|dissatisfied; feedback_relation=unknown|previous_response|earlier_or_multiple|none; difficulty=unknown|easy|moderate|difficult; urgency=unknown|normal|urgent. Each of satisfaction/difficulty/urgency has a `<field>_confidence`=unknown|low|medium|high. Omitted dimensions/confidences are unknown. Satisfaction is expressed feedback, not correctness; continuation/silence/topic change are not approval. `previous_response` requires feedback about the supplied previous assistant; absent/ambiguous/older/multiple targets stay unlinked. Difficulty/urgency describe the NEW task independently: angry simple corrections can be easy, polite complex tasks difficult. Urgency needs time pressure, not frustration. Assessments grant no authority."#;
+
 /// Minimal semantic contract used at the interactive side-effect boundary.
 ///
 /// This deliberately classifies only the small set of facts the runtime must
 /// know before an effect can execute: whether durable Work is required,
 /// whether the user's requested outcome permits workspace mutation, and (for
 /// an external mutation) which typed semantic domain owns the effect.
-/// Scenario, feedback, and presentation remain the primary model's concern.
+/// Optional observations share the request but cannot change admission authority.
 pub const WORK_ADMISSION_MAX_UNITS: usize = 8;
 /// Generation guidance only; domain types own text validity.
 pub const WORK_ADMISSION_TARGET_TEXT_CHARS: usize = 160;
@@ -332,6 +344,8 @@ pub enum WorkAdmissionDecision {
     NotRequired {
         #[serde(default)]
         domain: Option<TurnIntentDomain>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assessment: Option<astra_turn_types::TurnAssessment>,
         workspace_mutation: WorkspaceMutationIntent,
         mutation_completion_scope: MutationCompletionScope,
         execution_topology: WorkExecutionTopology,
@@ -340,6 +354,8 @@ pub enum WorkAdmissionDecision {
     Required {
         #[serde(default)]
         domain: Option<TurnIntentDomain>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assessment: Option<astra_turn_types::TurnAssessment>,
         workspace_mutation: WorkspaceMutationIntent,
         mutation_completion_scope: MutationCompletionScope,
         goal: String,
@@ -356,6 +372,7 @@ impl WorkAdmissionDecision {
     pub fn turn_intent(&self) -> TurnIntent {
         TurnIntent {
             domain: self.domain(),
+            assessment: self.assessment(),
             work_lifecycle: match self {
                 Self::NotRequired { .. } => WorkLifecycleIntent::NotRequired,
                 Self::Required { .. } => WorkLifecycleIntent::Required,
@@ -363,6 +380,13 @@ impl WorkAdmissionDecision {
             workspace_mutation: self.workspace_mutation(),
             mutation_completion_scope: self.mutation_completion_scope(),
             ..TurnIntent::default()
+        }
+    }
+
+    #[must_use]
+    pub fn assessment(&self) -> Option<astra_turn_types::TurnAssessment> {
+        match self {
+            Self::NotRequired { assessment, .. } | Self::Required { assessment, .. } => *assessment,
         }
     }
 
@@ -468,6 +492,7 @@ impl WorkAdmissionDecision {
         match self {
             Self::Required {
                 domain,
+                assessment,
                 workspace_mutation,
                 mutation_completion_scope,
                 goal,
@@ -478,6 +503,7 @@ impl WorkAdmissionDecision {
                 ..
             } => Self::Required {
                 domain,
+                assessment,
                 workspace_mutation,
                 mutation_completion_scope,
                 goal,
@@ -570,7 +596,7 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
     vec![
         json!({
             "role": "system",
-            "content": format!("{TURN_INTENT_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}")
+            "content": format!("{TURN_INTENT_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}\n\n{TURN_ASSESSMENT_PROMPT}")
         }),
         json!({
             "role": "user",
@@ -583,14 +609,14 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
 ///
 /// The dynamic context is intentionally shared with the broader judge so the
 /// semantic basis stays the same, while the output contract remains a closed
-/// lifecycle decision plus (only when needed) a small initial graph, rather
-/// than an open-ended bundle of auxiliary hints.
+/// lifecycle decision plus (only when needed) a small initial graph and the
+/// shared optional observational assessment.
 #[must_use]
 pub fn work_admission_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
     vec![
         json!({
             "role": "system",
-            "content": format!("{WORK_ADMISSION_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}"),
+            "content": format!("{WORK_ADMISSION_JUDGE_SYSTEM_PROMPT}\n\n{MUTATION_TARGET_SCOPE_POLICY}\n\n{TURN_ASSESSMENT_PROMPT}"),
         }),
         json!({
             "role": "user",
@@ -632,10 +658,31 @@ fn json_object_payload(raw: &str) -> &str {
     }
 }
 
+// Observations must not reject an otherwise valid execution-authority decision.
+fn deserialize_admission_assessment<'de, D>(
+    deserializer: D,
+) -> Result<Option<astra_turn_types::TurnAssessment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value(value) {
+        Ok(assessment) => Ok(Some(assessment)),
+        Err(_) => {
+            tracing::warn!("ignoring malformed observational assessment in Work admission");
+            Ok(None)
+        }
+    }
+}
+
 /// Parse the semantic Work admission and its bounded initial graph.
 ///
 /// Unknown, omitted, and extra values are rejected rather than silently
-/// widening the admission boundary. The caller can then proceed with its
+/// widening the admission boundary. Malformed optional observations alone are
+/// discarded; they cannot veto admission. The caller can then proceed with its
 /// explicit unavailable policy; it cannot manufacture a Work transition from
 /// user text.
 pub fn parse_work_admission_response(
@@ -647,6 +694,8 @@ pub fn parse_work_admission_response(
         NotRequired {
             #[serde(default)]
             domain: Option<TurnIntentDomain>,
+            #[serde(default, deserialize_with = "deserialize_admission_assessment")]
+            assessment: Option<astra_turn_types::TurnAssessment>,
             #[serde(default)]
             workspace_mutation: WorkspaceMutationIntent,
             #[serde(default)]
@@ -658,6 +707,8 @@ pub fn parse_work_admission_response(
         Required {
             #[serde(default)]
             domain: Option<TurnIntentDomain>,
+            #[serde(default, deserialize_with = "deserialize_admission_assessment")]
+            assessment: Option<astra_turn_types::TurnAssessment>,
             #[serde(default)]
             workspace_mutation: WorkspaceMutationIntent,
             #[serde(default)]
@@ -718,6 +769,7 @@ pub fn parse_work_admission_response(
     match response {
         WorkAdmissionResponse::NotRequired {
             domain,
+            assessment,
             workspace_mutation,
             mutation_completion_scope,
             execution_topology: topology,
@@ -767,6 +819,7 @@ pub fn parse_work_admission_response(
             // enumerating them here would create unused generated state.
             Ok(WorkAdmissionDecision::NotRequired {
                 domain,
+                assessment,
                 workspace_mutation,
                 mutation_completion_scope,
                 execution_topology: topology,
@@ -775,6 +828,7 @@ pub fn parse_work_admission_response(
         }
         WorkAdmissionResponse::Required {
             domain,
+            assessment,
             workspace_mutation,
             mutation_completion_scope,
             goal,
@@ -985,6 +1039,7 @@ pub fn parse_work_admission_response(
             .map_err(|error| malformed(format!("work_graph: {error}")))?;
             Ok(WorkAdmissionDecision::Required {
                 domain,
+                assessment,
                 workspace_mutation,
                 mutation_completion_scope,
                 goal,
@@ -1136,6 +1191,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn work_admission_collects_observations_without_changing_authority() {
+        for mut payload in [
+            json!({"work_lifecycle":"not_required","execution_topology":"primary","workspace_mutation":"read_only"}),
+            json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"track repair","initial_tasks":[{"objective":"repair","expected_result":"verified repair"}]}),
+        ] {
+            let original = parse_work_admission_response(&payload.to_string()).unwrap();
+            payload["assessment"] = json!({"satisfaction":"dissatisfied","satisfaction_confidence":"high","feedback_relation":"previous_response","difficulty":"easy"});
+            let observed = parse_work_admission_response(&payload.to_string()).unwrap();
+            assert_eq!(observed.workspace_mutation(), original.workspace_mutation());
+            assert_eq!(
+                observed.turn_intent().work_lifecycle,
+                original.turn_intent().work_lifecycle
+            );
+            assert_eq!(
+                observed.assessment().unwrap().difficulty,
+                astra_turn_types::TaskDifficulty::Easy
+            );
+            assert_eq!(observed.turn_intent().assessment, observed.assessment());
+            assert_eq!(
+                observed
+                    .clone()
+                    .with_activation(WorkAdmissionActivation::Defer)
+                    .assessment(),
+                observed.assessment()
+            );
+            // Optional observations cannot fail a valid admission or force a repair call.
+            payload["assessment"] = json!({"difficulty":"invented", "target_run_id":"forged"});
+            assert_eq!(
+                parse_work_admission_response(&payload.to_string()).unwrap(),
+                original
+            );
+            payload["work_lifecycle"] = json!("invented");
+            assert!(parse_work_admission_response(&payload.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn assessment_keeps_feedback_separate_from_new_task_demand() {
+        let intent = parse_turn_intent_response(
+            r#"{"assessment":{
+            "satisfaction":"dissatisfied","satisfaction_confidence":"high",
+            "feedback_relation":"previous_response","difficulty":"easy",
+            "difficulty_confidence":"medium"}}"#,
+        )
+        .unwrap();
+        let assessment = intent.assessment.unwrap();
+        assert_eq!(
+            assessment.difficulty,
+            astra_turn_types::TaskDifficulty::Easy
+        );
+        assert_eq!(assessment.urgency, astra_turn_types::TaskUrgency::Unknown);
+        assert_eq!(
+            assessment.urgency_confidence,
+            astra_turn_types::AssessmentConfidence::Unknown
+        );
+        assert!(
+            parse_turn_intent_response(r#"{"assessment":{"difficulty":"impossible"}}"#).is_err()
+        );
+        assert!(
+            parse_turn_intent_response(r#"{"assessment":{"target_run_id":"invented"}}"#).is_err()
+        );
+        assert_eq!(parse_turn_intent_response("{}").unwrap().assessment, None);
+    }
+
+    #[test]
     fn work_admission_accepts_domain_valid_text_above_concision_target() {
         for text in [
             "x".repeat(167),
@@ -1196,6 +1316,7 @@ mod tests {
                 prior_user_message: Some("inspect both inputs".into()),
                 prior_assistant_message: Some("both inputs inspected".into()),
                 loaded_workflow_execution_topology: topology,
+                source: None,
             };
             for build in [
                 build_turn_intent_prompt as fn(&TurnIntentJudgeContext) -> String,
@@ -1369,9 +1490,7 @@ mod tests {
         assert!(system.contains("even with JSON output or tool bans"));
         assert!(system.contains("policy governs execution"));
         assert!(
-            // Previous 2,800-byte budget plus 256 bytes for target-boundary
-            // semantics replacing the old scope definition; no planning cuts.
-            system.len() < 2_800 + 256,
+            system.len() < 3_900,
             "the stable semantic prefix must stay small enough to cache cheaply: {} bytes",
             system.len()
         );
@@ -1379,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn work_admission_messages_keep_only_the_latency_critical_contract() {
+    fn work_admission_messages_keep_the_admission_and_observation_contract() {
         let ctx = TurnIntentJudgeContext {
             message: "independently verify the CI command and its local equivalent".into(),
             turn_count: 1,
@@ -1457,9 +1576,7 @@ mod tests {
         assert!(!system.contains("initial_outcome_count"));
         assert!(!system.contains("final_outcome_count"));
         assert!(
-            // Previous 3,000-byte budget plus 384 bytes for the shared policy
-            // replacing the old scope sentence. Keep graph semantics intact.
-            system.len() < 3_000 + 384,
+            system.len() < 4_300,
             "Work admission must remain a small interactive request: {} bytes",
             system.len()
         );

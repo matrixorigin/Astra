@@ -661,6 +661,7 @@ fn single_child_fanout_start(arguments: &Value) -> bool {
 fn explicit_fanout_admission_decision(
     decision: astra_services::WorkAdmissionDecision,
 ) -> astra_services::WorkAdmissionDecision {
+    let assessment = decision.assessment();
     let (domain, workspace_mutation, mutation_completion_scope, mut required_capabilities) =
         match decision {
             astra_services::WorkAdmissionDecision::NotRequired {
@@ -687,6 +688,7 @@ fn explicit_fanout_admission_decision(
         required_capabilities.push(astra_services::WorkAdmissionCapability::AgentSpawner);
     }
     astra_services::WorkAdmissionDecision::NotRequired {
+        assessment,
         domain,
         workspace_mutation,
         mutation_completion_scope,
@@ -703,12 +705,14 @@ fn project_complete_admission_effect(
 ) -> astra_services::WorkAdmissionDecision {
     match decision {
         astra_services::WorkAdmissionDecision::NotRequired {
+            assessment,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
             execution_topology,
             required_capabilities,
             ..
         } => astra_services::WorkAdmissionDecision::NotRequired {
+            assessment,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -2839,10 +2843,13 @@ impl SummaryClientWorkAdmissionJudge {
             return reconcile_trusted_workflow_topology(ctx, classification.into_not_required()?);
         }
         let messages = astra_services::work_admission_plan_messages(ctx, &classification);
-        let decision = planner
+        let mut decision = planner
             .judge_messages(ctx, messages, Some(&classification))
             .await?;
         classification.validate_plan(&decision)?;
+        if let astra_services::WorkAdmissionDecision::Required { assessment, .. } = &mut decision {
+            *assessment = classification.assessment.or(*assessment);
+        }
         Ok(decision)
     }
 
@@ -8430,13 +8437,7 @@ impl ServerAgenticLoopHost {
         let turn_count = state.current_session_turn_number();
         let user_intent = state.runtime_decision_user_intent();
         let user_intent_chars = user_intent.chars().count();
-        let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
-            &state.messages,
-            &user_intent,
-            turn_count,
-            &state.recent_tools,
-            &state.skills.execution.invoked,
-        );
+        let context = crate::turn::agentic::turn_intent::context_for_state(state);
         let classification = astra_services::work_admission_classification_request(&context);
         let client = match self
             .judgment_summary_client(state, "request_judgment", &classification)
@@ -8998,14 +8999,21 @@ impl ServerAgenticLoopHost {
             // on loop state so delegation and completion policy inherit the
             // same authority instead of running disconnected classifiers.
             let boundary_intent = decision.turn_intent();
+            if boundary_intent.assessment.is_some() {
+                crate::turn::agentic_loop::lifecycle::record_current_user_turn_semantics(
+                    state,
+                    &boundary_intent,
+                );
+            }
             let mut intent = state.turn_intent.take().unwrap_or_default();
             // Work admission is the authoritative semantic boundary for the
             // fields it projects.  Preserve its typed domain even though the
             // compact admission contract does not classify scenario,
-            // feedback, or presentation.  In particular, a memory mutation
+            // objective changes, or presentation.  In particular, a memory mutation
             // must bind its executor receipt to the memory domain; retaining
             // a stale/empty value here would make a real receipt look like an
             // unrelated external effect at terminal settlement.
+            intent.assessment = intent.assessment.or(boundary_intent.assessment);
             if boundary_intent.domain.is_some()
                 || boundary_intent.workspace_mutation
                     != astra_config::user_profile::WorkspaceMutationIntent::Unknown
@@ -18793,15 +18801,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // The auxiliary judge classifies an outer user turn, not an
             // inner provider round.  Preserve the session turn across
             // multi-round tool execution and resumed conversations.
-            let turn_count = state.current_session_turn_number();
-            let user_intent = state.runtime_decision_user_intent();
-            let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
-                &state.messages,
-                &user_intent,
-                turn_count,
-                &state.recent_tools,
-                &state.skills.execution.invoked,
-            );
+            let context = crate::turn::agentic::turn_intent::context_for_state(state);
             let outcome =
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
                     crate::turn::agentic::turn_intent::judge_turn_intent_with_llm_deadline(
@@ -30064,6 +30064,7 @@ mod tests {
         .build();
         parallel_bound.apply_work_admission_decision(
             astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
                 mutation_completion_scope:
@@ -30086,6 +30087,7 @@ mod tests {
         .build();
         direct_parallel_bound.apply_work_admission_decision(
             astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
                 mutation_completion_scope:
@@ -32825,6 +32827,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -32922,6 +32925,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -38351,6 +38355,7 @@ mod tests {
             Some(pending_work_admission_judge_for_test(tokio::spawn(async {
                 (
                     Ok(astra_services::WorkAdmissionDecision::Required {
+                        assessment: None,
                         domain: None,
                         workspace_mutation:
                             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
@@ -38417,6 +38422,7 @@ mod tests {
             }
         })];
         let decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -38477,6 +38483,7 @@ mod tests {
         .build();
         fast_not_required.apply_work_admission_decision(
             astra_services::WorkAdmissionDecision::NotRequired {
+                assessment: None,
                 domain: None,
                 workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
                 mutation_completion_scope:
@@ -38610,6 +38617,7 @@ mod tests {
         .with_pool(pool.clone())
         .build();
         let admission_decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -38961,6 +38969,7 @@ mod tests {
         )
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39112,6 +39121,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39193,6 +39203,7 @@ mod tests {
         // replacing authority underneath an unresolved call.
         host.pending_work_establishment = None;
         host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39248,6 +39259,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39443,6 +39455,7 @@ mod tests {
         )
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39515,6 +39528,7 @@ mod tests {
             WorkspaceMutationIntent as Mutation,
         };
         let raw = astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: Some(Domain::Memory),
             workspace_mutation: Mutation::MustMutate,
             mutation_completion_scope: Scope::Unknown,
@@ -39626,6 +39640,7 @@ mod tests {
         )
         .build();
         let partial = astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: Some(Domain::Memory),
             workspace_mutation: Mutation::MustMutate,
             mutation_completion_scope: Scope::Unknown,
@@ -39684,6 +39699,7 @@ mod tests {
         )
         .build();
         host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope:
@@ -39733,6 +39749,7 @@ mod tests {
         assert!(explicit.task_profile.mutates_workspace);
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39764,6 +39781,7 @@ mod tests {
         )
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: Some(astra_config::user_profile::TurnIntentDomain::Memory),
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope:
@@ -39826,6 +39844,7 @@ mod tests {
             .find(|schema| tool_schema_name(schema) == Some("bash"))
             .expect("ordinary server turns expose Bash");
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope:
@@ -39874,6 +39893,7 @@ mod tests {
         let mut state = create_test_state();
         state.session_turn = 2;
         host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -39958,6 +39978,7 @@ mod tests {
         .build();
         let mut state = create_test_state();
         host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40003,6 +40024,7 @@ mod tests {
         ))
         .build();
         let initial_decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             mutation_completion_scope:
@@ -40498,6 +40520,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40511,6 +40534,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40544,6 +40568,7 @@ mod tests {
             .is_none()
         );
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40615,6 +40640,7 @@ mod tests {
         ))
         .build();
         let initial_decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40711,6 +40737,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40777,6 +40804,7 @@ mod tests {
         .with_work_item_attempt_bound(true)
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -40829,6 +40857,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41024,6 +41053,7 @@ mod tests {
         ))
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41103,6 +41133,7 @@ mod tests {
         );
 
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41202,6 +41233,7 @@ mod tests {
         .with_provider_capabilities(server_public_network_capabilities())
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41313,6 +41345,7 @@ mod tests {
         ])
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -41490,6 +41523,7 @@ mod tests {
         .with_work_item_attempt_bound(true)
         .build();
         host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -50425,6 +50459,7 @@ mod tests {
             state.messages = vec![
                 serde_json::json!({"role": "user", "content": "earlier"}),
                 serde_json::json!({"role": "assistant", "content": "ok"}),
+                serde_json::json!({"role": "user", "content": state.message}),
             ];
             state.recent_tools = vec!["read_file".to_string()];
             // The provider may take several inner rounds for one user turn.
@@ -50838,6 +50873,127 @@ mod tests {
             assert!(!host.work_admission_requires_settlement());
             host.work_admission_conflict = Some("trusted workflow conflict".into());
             assert!(host.work_admission_requires_settlement());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn builtin_work_admission_records_assessment_through_turn_entrypoint() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+            let ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+            let assessment = json!({"satisfaction":"dissatisfied","satisfaction_confidence":"high","feedback_relation":"previous_response","difficulty":"easy","difficulty_confidence":"high"});
+            let mut response: Value =
+                serde_json::from_str(&classification_response(false)).unwrap();
+            response["assessment"] = assessment;
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classification_client = SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new([response.to_string()].into()),
+                requests: requests.clone(),
+            };
+            let planner_client = SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                requests: requests.clone(),
+            };
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-observation".into(),
+                "s-observation".into(),
+            )
+            .with_test_inference_ledger(ledger.clone())
+            .with_test_judgment_clients([
+                Box::new(classification_client)
+                    as Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+                Box::new(planner_client),
+            ])
+            .build();
+            let mut state = create_durable_execution_test_state("s-observation");
+            state.session_turn = 3;
+            state.user_intent = "correct it".into();
+            state.message =
+                "<project-instructions>context</project-instructions>\n\ncorrect it".into();
+            let prefix = vec![
+                json!({"role":"user","content":"first"}),
+                json!({"role":"assistant","content":"response A"}),
+                json!({"role":"user","content":"correct it"}),
+                json!({"role":"assistant","content":"response B"}),
+            ];
+            state.messages = prefix.clone();
+            state
+                .messages
+                .push(json!({"role":"user","content":state.message}));
+            let semantics = astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Correct,
+                Some(astra_turn_types::UserFeedback {
+                    kind: astra_turn_types::UserFeedbackKind::Correction,
+                    target: astra_turn_types::UserFeedbackTarget::Approach,
+                }),
+            );
+            assert!(astra_turn_types::mark_user_turn_semantics(
+                &mut state.messages[4],
+                semantics.clone(),
+            ));
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+                .await
+                .unwrap();
+            assert!(
+                host.turn_intent_judge.is_none(),
+                "test must use the built-in production producer"
+            );
+            state
+                .messages
+                .push(json!({"role":"assistant","content":"later response"}));
+            host.resolve_pending_work_admission(true).await;
+            host.flush_completed_work_admission_phase(&mut state);
+            let recorded = astra_turn_types::user_turn_semantics(&state.messages[4])
+                .unwrap()
+                .unwrap();
+            assert_eq!(recorded.objective_relation, semantics.objective_relation);
+            assert_eq!(recorded.feedback, semantics.feedback);
+            assert_eq!(
+                serde_json::to_value(recorded.assessment.unwrap()).unwrap()["difficulty"],
+                "easy"
+            );
+            assert_eq!(
+                recorded.feedback_response.as_ref().unwrap(),
+                &astra_turn_types::FeedbackResponseReference::from_canonical_prefix(prefix.clone())
+            );
+            host.flush_completed_work_admission_phase(&mut state);
+            assert_eq!(
+                astra_turn_types::user_turn_semantics(&state.messages[4]).unwrap(),
+                Some(recorded.clone())
+            );
+            let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+                &prefix,
+                true,
+                &state.messages,
+                None,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                astra_turn_types::user_turn_semantics(&segments[0][0]).unwrap(),
+                Some(recorded)
+            );
+            let requests = requests.lock().unwrap().clone();
+            assert_eq!(
+                requests.len(),
+                1,
+                "assessment shares the Work admission call"
+            );
+            let context: Value =
+                serde_json::from_str(requests[0][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                context["state"]["context"]["immediate_previous_exchange"]["assistant"],
+                "response B"
+            );
+            assert!(
+                context["state"]["context"].get("source").is_none(),
+                "runtime IDs are never model-authored"
+            );
+            ledger.assert_quiescent();
         }
 
         #[tokio::test]

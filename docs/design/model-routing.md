@@ -81,3 +81,57 @@ Escalate when:
 - Per-agent override respects account policy.
 - Safety-critical tasks do not route to disallowed models.
 - Fallback preserves prompt/context contract.
+
+## Next-turn observations (stage 2)
+
+The shared `TurnIntentJudge` can emit an optional typed `assessment`. It keeps
+response satisfaction (satisfied/mixed/dissatisfied/unknown) separate from the
+new request's difficulty (easy/moderate/difficult/unknown) and urgency
+(normal/urgent/unknown). Each dimension has its own categorical confidence;
+these are judge estimates, not calibrated probabilities or correctness scores.
+An angry simple correction need not require a stronger model. A polite complex
+request may. Missing fields and unavailable judges produce no inferred labels.
+The production Work-admission judge emits the same optional assessment in its
+existing request. The shared turn entrypoint captures the source and preceding
+exchange before primary rounds, and the completed admission records observations
+on that source even when the result arrives later. Invalid optional assessments
+are discarded without rejecting a valid Work decision. Full injected turn-intent
+judges use the same assessment contract and runtime binding. Fixed-default,
+already-bound Work, and capacity-policy skips do not add a call for observation;
+their missing assessments remain unknown. Native TypeSafe responses preserve the
+optional assessment through answer validation for the admission parser to decode.
+
+The canonical user-message semantics marker stores the assessment beside its
+source text, without duplicating prompts or adding a database table. A missing
+assessment can be filled after objective/feedback semantics have been recorded,
+without replacing those semantics or replaying their effects. An existing
+assessment and its response reference are preserved when the objective is later
+resolved. When the judge explicitly targets the immediate previous response,
+runtime binds a `feedback_response` reference to the sanitized canonical prefix
+ending at that assistant message: its content root and message count. The reference owner
+excludes optional user-turn semantics from the root, matching persistence's
+content identity rule, so carrying those annotations forward cannot invalidate
+the link. This is a snapshot
+reference, not a model-generated ID or an inference `route_id`. Resolve it only
+against matching retained canonical history in the source session/branch;
+compacted or unavailable evidence stays unresolved. Earlier/multiple/ambiguous
+targets remain unlinked. Source resolution prefers the submitted canonical
+payload over an older occurrence of the raw intent. Assistant text uses the same
+normalization for the judge and reference. Assistant rounds after the source
+prompt are excluded, and a rewritten source is never relocated by matching text.
+Telemetry identifies the feedback-producing run as `source_run_id`, rather than
+claiming it is the response being rated.
+
+The optional fields preserve reads of old records. Older strict readers reject
+records containing the new fields, so mixed-version deployments need coordinated
+upgrades. Canonical persistence and restore carry the fields with the existing
+semantics marker. No additional model call, routing change, policy activation,
+or automatic training export is introduced by this stage.
+
+For offline training, a next-turn assessment is a delayed, noisy outcome label
+for the referenced response. It must never become an input feature for that
+response's original routing decision. New-request difficulty/urgency belong to
+the new request only. Silence and simple continuation are not approval; expressed
+satisfaction is not task success. Dataset creation still requires the consent,
+redaction, lineage, evaluation, and split controls in
+[evaluation-and-learning.md](evaluation-and-learning.md).

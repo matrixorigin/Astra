@@ -782,12 +782,17 @@ mod tests {
                 gc_retain_snapshots: 2,
             },
         );
-        let semantics = astra_turn_types::UserTurnSemantics::new(
+        let mut semantics = astra_turn_types::UserTurnSemantics::new(
             astra_turn_types::ObjectiveRelation::Replace,
             None,
         );
+        semantics.assessment = Some(astra_turn_types::TurnAssessment {
+            difficulty: astra_turn_types::TaskDifficulty::Difficult,
+            difficulty_confidence: astra_turn_types::AssessmentConfidence::High,
+            ..Default::default()
+        });
         let mut objective = user_msg("repair lifecycle");
-        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics.clone());
         mgr.persist_turn(1, &[objective, assistant_msg("working")], &default_state())
             .await
             .unwrap();

@@ -67,3 +67,12 @@ Activation is handled through tuning jobs or explicit product changes, not direc
 - Do not use sensitive raw data without consent.
 - Do not treat low-confidence implicit feedback as a hard label.
 - Do not activate a change without rollback.
+
+## Next-turn assessment collection
+
+The existing semantic admission judges own optional response satisfaction and new-task
+difficulty/urgency observations. Their canonical source message, uncertainty,
+response-reference rules, collection coverage, and training leakage constraints
+are specified in [model-routing.md](model-routing.md#next-turn-observations-stage-2).
+These observations supplement objective/task verification; they are not success
+verdicts and do not activate routing or learning policies.

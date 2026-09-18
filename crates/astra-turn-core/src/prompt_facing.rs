@@ -1270,7 +1270,7 @@ mod tests {
             None,
         );
         let mut user = json!({"role": "user", "content": "continue"});
-        astra_turn_types::mark_user_turn_semantics(&mut user, semantics);
+        astra_turn_types::mark_user_turn_semantics(&mut user, semantics.clone());
         let messages = vec![
             user,
             runtime_owned_message(

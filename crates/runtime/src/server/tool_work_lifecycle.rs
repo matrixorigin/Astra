@@ -2515,6 +2515,7 @@ mod tests {
 
     fn replacement_admission_decision(goal: &str) -> astra_services::WorkAdmissionDecision {
         astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -2648,6 +2649,7 @@ mod tests {
             }],
         };
         let decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,

@@ -126,14 +126,110 @@ pub struct UserFeedback {
     pub target: UserFeedbackTarget,
 }
 
+/// Confidence in one observational dimension, not a calibrated probability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentConfidence {
+    #[default]
+    Unknown,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseSatisfaction {
+    #[default]
+    Unknown,
+    Satisfied,
+    Mixed,
+    Dissatisfied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackResponseRelation {
+    #[default]
+    Unknown,
+    PreviousResponse,
+    EarlierOrMultiple,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskDifficulty {
+    #[default]
+    Unknown,
+    Easy,
+    Moderate,
+    Difficult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskUrgency {
+    #[default]
+    Unknown,
+    Normal,
+    Urgent,
+}
+
+/// Observational judge output, never an authorization or a correctness verdict.
+/// Each dimension has its own uncertainty; missing evidence stays unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TurnAssessment {
+    pub satisfaction: ResponseSatisfaction,
+    pub satisfaction_confidence: AssessmentConfidence,
+    pub feedback_relation: FeedbackResponseRelation,
+    pub difficulty: TaskDifficulty,
+    pub difficulty_confidence: AssessmentConfidence,
+    pub urgency: TaskUrgency,
+    pub urgency_confidence: AssessmentConfidence,
+}
+
+/// Runtime-owned reference to the judged history snapshot. The root covers the
+/// content prefix ending at the target, excluding mutable semantic annotations,
+/// so repeated text and divergent content branches differ.
+/// Resolve only against that exact snapshot; never guess after compaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackResponseReference {
+    pub prefix_root: String,
+    pub message_count: usize,
+}
+
+impl FeedbackResponseReference {
+    /// Bind normalized canonical content, excluding the optional semantic
+    /// annotations that display-history persistence may carry forward later.
+    #[must_use]
+    pub fn from_canonical_prefix(mut messages: Vec<Value>) -> Self {
+        for message in &mut messages {
+            if let Some(object) = message.as_object_mut() {
+                object.remove(USER_TURN_SEMANTICS_FIELD);
+            }
+        }
+        Self {
+            prefix_root: crate::canonical_conversation_root(&messages),
+            message_count: messages.len(),
+        }
+    }
+}
+
 /// Persisted semantics for a canonical user message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserTurnSemantics {
     pub schema_version: u8,
     pub objective_relation: ObjectiveRelation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<UserFeedback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<TurnAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_response: Option<FeedbackResponseReference>,
 }
 
 /// Invalid producer-owned metadata is distinct from metadata that is absent.
@@ -159,6 +255,8 @@ impl UserTurnSemantics {
             schema_version: USER_TURN_SEMANTICS_SCHEMA_VERSION,
             objective_relation,
             feedback,
+            assessment: None,
+            feedback_response: None,
         }
     }
 }
@@ -232,6 +330,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn feedback_reference_survives_annotation_carry_forward_but_not_branch_changes() {
+        let mut prefix = vec![
+            json!({"role":"user","content":"request"}),
+            json!({"role":"assistant","content":"answer"}),
+        ];
+        let reference = FeedbackResponseReference::from_canonical_prefix(prefix.clone());
+        mark_user_turn_semantics(
+            &mut prefix[0],
+            UserTurnSemantics::new(ObjectiveRelation::Replace, None),
+        );
+        assert_eq!(
+            FeedbackResponseReference::from_canonical_prefix(prefix.clone()),
+            reference
+        );
+        prefix[0]["content"] = json!("different branch");
+        assert_ne!(
+            FeedbackResponseReference::from_canonical_prefix(prefix),
+            reference
+        );
+    }
+
+    #[test]
+    fn historical_semantics_remain_readable_and_assessments_round_trip() {
+        let mut message = json!({"role":"user","content":"feedback",
+            USER_TURN_SEMANTICS_FIELD: {"schema_version":1,"objective_relation":"unknown"}});
+        let mut semantics = user_turn_semantics(&message).unwrap().unwrap();
+        assert_eq!(semantics.assessment, None);
+        assert_eq!(semantics.feedback_response, None);
+        semantics.assessment = Some(TurnAssessment {
+            satisfaction: ResponseSatisfaction::Mixed,
+            satisfaction_confidence: AssessmentConfidence::Low,
+            feedback_relation: FeedbackResponseRelation::PreviousResponse,
+            difficulty: TaskDifficulty::Difficult,
+            difficulty_confidence: AssessmentConfidence::High,
+            ..Default::default()
+        });
+        semantics.feedback_response = Some(FeedbackResponseReference {
+            prefix_root: crate::canonical_conversation_root(&[
+                json!({"role":"assistant","content":"prior"}),
+            ]),
+            message_count: 1,
+        });
+        assert!(mark_user_turn_semantics(&mut message, semantics.clone()));
+        assert_eq!(user_turn_semantics(&message).unwrap(), Some(semantics));
+    }
+
+    #[test]
     fn wire_values_are_stable_and_typed() {
         assert_eq!(
             serde_json::to_value(UserIntentDelivery::GuideCurrentRun).unwrap(),
@@ -258,7 +403,7 @@ mod tests {
         );
         let mut message = json!({"role": "user", "content": "arbitrary text"});
 
-        assert!(mark_user_turn_semantics(&mut message, semantics));
+        assert!(mark_user_turn_semantics(&mut message, semantics.clone()));
         assert_eq!(user_turn_semantics(&message).unwrap(), Some(semantics));
     }
 
@@ -267,7 +412,7 @@ mod tests {
         let semantics = UserTurnSemantics::new(ObjectiveRelation::Replace, None);
         let mut assistant = json!({"role": "assistant", "content": "done"});
 
-        assert!(!mark_user_turn_semantics(&mut assistant, semantics));
+        assert!(!mark_user_turn_semantics(&mut assistant, semantics.clone()));
         assistant[USER_TURN_SEMANTICS_FIELD] = json!(semantics);
         assert!(matches!(
             user_turn_semantics(&assistant),

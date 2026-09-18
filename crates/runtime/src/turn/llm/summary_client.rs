@@ -780,7 +780,7 @@ mod tests {
                 let yes = matches!(key.as_str(), "mutation.read_only" | "scope.unknown" | "domain.none");
                 (key.clone(), serde_json::json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}))
             }).collect();
-            axum::Json(serde_json::json!({"model":"configured-jev", "answers":answers,"usage":{"input_tokens":123,"output_tokens":19}}))
+            axum::Json(serde_json::json!({"model":"configured-jev", "answers":answers,"assessment":{"difficulty":"easy","difficulty_confidence":"high"},"usage":{"input_tokens":123,"output_tokens":19}}))
         }));
         let mut execution = summary_execution(spawn_summary_test_server(app).await);
         execution.provider = "typesafe".into();
@@ -817,7 +817,15 @@ mod tests {
             response.judgment_provenance,
         )
         .unwrap();
-        assert!(classification.into_not_required().is_ok());
+        let decision = classification.into_not_required().unwrap();
+        assert_eq!(
+            decision.assessment(),
+            Some(astra_turn_types::TurnAssessment {
+                difficulty: astra_turn_types::TaskDifficulty::Easy,
+                difficulty_confidence: astra_turn_types::AssessmentConfidence::High,
+                ..Default::default()
+            })
+        );
         assert_eq!(response.usage["input_tokens"], 123);
         assert_eq!(response.usage["output_tokens"], 19);
         let provenance = response.execution.expect("durable execution provenance");

@@ -234,7 +234,7 @@ fn objective_context_from_entries(entries: &[PromptEntry]) -> Vec<ObjectiveConte
         if entry.role != "user" {
             continue;
         }
-        let Some(semantics) = entry.semantics else {
+        let Some(semantics) = entry.semantics.as_ref() else {
             continue;
         };
 

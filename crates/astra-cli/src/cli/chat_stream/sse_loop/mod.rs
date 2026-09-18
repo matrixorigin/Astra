@@ -911,6 +911,7 @@ pub(crate) async fn stream_chat_sse(
         },
         telemetry: TelemetryState {
             trace_ingestion: None,
+            turn_intent_context: None,
             explain_analyze_events: Vec::new(),
             explain_analyze_degraded: false,
             first_ttft_ms: None,

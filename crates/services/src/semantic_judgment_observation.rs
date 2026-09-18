@@ -52,6 +52,7 @@ pub fn accepted_request_judgment_result(
         mutation_completion_scope: decision.mutation_completion_scope(),
         execution_topology: decision.execution_topology(),
         required_capabilities: decision.required_capabilities().to_vec(),
+        assessment: decision.assessment(),
     };
     request_judgment_result(&Ok(classification))
 }
