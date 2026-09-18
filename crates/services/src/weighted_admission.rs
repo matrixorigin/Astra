@@ -329,13 +329,37 @@ impl DatabaseWeightedAdmissionController {
         validate_distributed_request(key, work, ttl, idempotency_key)?;
         validate_requested_work(self.limits, work)?;
 
+        // The deadline covers the whole admission transaction, not only the
+        // queue, pool checkout, BEGIN, and durable gate lock. Dropping a
+        // timed-out transaction closes its connection while a cancelled SQL
+        // future is still in flight, so a slow repair/insert/commit cannot
+        // silently extend the caller's admission budget.
+        let deadline = self.admission_deadline();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.try_reserve_until(key, work, ttl, idempotency_key, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.admission_timeout()),
+        }
+    }
+
+    async fn try_reserve_until(
+        &self,
+        key: &SessionKeyV1,
+        work: AdmissionWork,
+        ttl: Duration,
+        idempotency_key: &str,
+        deadline: std::time::Instant,
+    ) -> Result<DistributedAdmissionPermit, DistributedAdmissionError> {
         // Do not acquire a SQL connection while waiting for the single
         // durable gate row. All callers sharing this controller use the same
         // FIFO async queue; independent server processes still contend only
         // on the durable row and retain the same global invariant. The same
         // deadline is then applied to pool acquisition, so queueing cannot
         // silently extend the database wait budget.
-        let deadline = self.admission_deadline();
         let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
         let idempotency_hash = distributed_idempotency_hash(idempotency_key);
         let mut tx = self
@@ -433,6 +457,23 @@ impl DatabaseWeightedAdmissionController {
             &reservation.idempotency_hash,
         )?;
         let deadline = self.admission_deadline();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.renew_until(reservation, ttl, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.admission_timeout()),
+        }
+    }
+
+    async fn renew_until(
+        &self,
+        reservation: &DistributedAdmissionReservation,
+        ttl: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<DistributedAdmissionReservation, DistributedAdmissionError> {
         let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
         let mut tx = self.begin_transaction(deadline, "begin_renewal").await?;
         let now = self.lock_admission_gate(&mut tx, deadline).await?.now;
@@ -481,6 +522,22 @@ impl DatabaseWeightedAdmissionController {
         reservation: &DistributedAdmissionReservation,
     ) -> Result<(), DistributedAdmissionError> {
         let deadline = self.admission_deadline();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.release_until(reservation, deadline),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(self.admission_timeout()),
+        }
+    }
+
+    async fn release_until(
+        &self,
+        reservation: &DistributedAdmissionReservation,
+        deadline: std::time::Instant,
+    ) -> Result<(), DistributedAdmissionError> {
         let _reservation_gate = self.acquire_reservation_gate(deadline).await?;
         let mut tx = self.begin_transaction(deadline, "begin_release").await?;
         let gate = self.lock_admission_gate(&mut tx, deadline).await?;
