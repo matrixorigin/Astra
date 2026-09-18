@@ -9739,10 +9739,13 @@ async fn acquire_cancellation_safe_connection(
     operation: &'static str,
     entity: &str,
 ) -> Result<CancellationSafePoolConnection, String> {
-    tokio::time::timeout_at(deadline, CancellationSafePoolConnection::acquire(pool))
-        .await
-        .map_err(|_| bounded_run_control_timeout(operation, entity))?
-        .map_err(|source| db_error(operation, entity, source).to_string())
+    tokio::time::timeout_at(
+        deadline,
+        CancellationSafePoolConnection::acquire(pool.get()),
+    )
+    .await
+    .map_err(|_| bounded_run_control_timeout(operation, entity))?
+    .map_err(|source| db_error(operation, entity, source).to_string())
 }
 
 struct BoundedRunControlConnection {

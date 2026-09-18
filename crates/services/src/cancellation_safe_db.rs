@@ -1,4 +1,3 @@
-use astra_core::SharedPool;
 use sqlx::{MySql, pool::PoolConnection};
 
 /// A checked-out shared-pool connection that is reusable only after its
@@ -13,8 +12,8 @@ pub(crate) struct CancellationSafePoolConnection {
 }
 
 impl CancellationSafePoolConnection {
-    pub(crate) async fn acquire(pool: &SharedPool) -> Result<Self, sqlx::Error> {
-        let connection = pool.get().acquire().await?;
+    pub(crate) async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
+        let connection = pool.acquire().await?;
         Ok(Self {
             connection: Some(connection),
         })

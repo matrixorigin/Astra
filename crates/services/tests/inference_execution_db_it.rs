@@ -219,6 +219,135 @@ async fn append_run_control_event(
     tx.commit().await.expect("commit inference control event");
 }
 
+async fn hold_pool_checkouts(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    count: usize,
+) -> Vec<sqlx::pool::PoolConnection<sqlx::MySql>> {
+    let mut held = Vec::with_capacity(count);
+    for _ in 0..count {
+        held.push(
+            tokio::time::timeout(std::time::Duration::from_secs(5), pool.acquire())
+                .await
+                .expect("acquire inference cancellation fixture before deadline")
+                .expect("acquire inference cancellation fixture"),
+        );
+    }
+    held
+}
+
+async fn assert_independent_query_can_replace_cancelled_checkout(pool: &sqlx::Pool<sqlx::MySql>) {
+    let value: i64 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query_scalar("SELECT 1").fetch_one(pool),
+    )
+    .await
+    .expect("cancelled inference checkout must release pool capacity")
+    .expect("independent inference query after cancellation");
+    assert_eq!(value, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn cancelled_inference_recovery_and_settlement_close_their_physical_checkouts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("inference-cancel-user-{suffix}");
+    let session_id = format!("inference-cancel-session-{suffix}");
+    let run_id = format!("inference-cancel-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let admitted = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "cancelled_settlement",
+    ))
+    .expect("plan cancelled settlement fixture");
+    admit_inference_invocation(&shared_pool, &admitted)
+        .await
+        .expect("admit cancelled settlement fixture");
+    let uncertain = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        1,
+        "cancelled_admission_recovery",
+    ))
+    .expect("plan cancelled admission recovery fixture");
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("cancel the blocked persistence fixture".to_string()),
+    };
+    let max_connections = shared_pool.stats().max_connections as usize;
+    assert!(
+        max_connections >= 3,
+        "cancellation isolation requires blocker, worker, and health-query capacity"
+    );
+
+    let mut lifecycle_blocker = pool.begin().await.expect("begin lifecycle blocker");
+    sqlx::query(
+        "SELECT session_id FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *lifecycle_blocker)
+    .await
+    .expect("lock lifecycle fence");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            settle_uncertain_inference_admission(&shared_pool, &uncertain, &terminal),
+        )
+        .await
+        .is_err(),
+        "lifecycle-fence recovery must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    lifecycle_blocker
+        .rollback()
+        .await
+        .expect("release lifecycle blocker");
+
+    let mut settlement_blocker = pool.begin().await.expect("begin settlement blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(&mut *settlement_blocker)
+    .await
+    .expect("lock inference invocation settlement row");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            declare_inference_settlement(&shared_pool, &admitted, &terminal),
+        )
+        .await
+        .is_err(),
+        "settlement debt write must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    settlement_blocker
+        .rollback()
+        .await
+        .expect("release settlement blocker");
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
