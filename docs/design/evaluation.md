@@ -155,7 +155,7 @@ materialization receipt is recorded; registration alone never claims isolation.
 
 ## Control-plane API boundary
 
-The generic control-plane API exposes three owner-authenticated operations:
+The generic control-plane API exposes four owner-authenticated operations:
 
 * `POST /evaluation/experiments` freezes and idempotently registers a client
   `ExperimentSpec` plus its submission key;
@@ -164,6 +164,33 @@ The generic control-plane API exposes three owner-authenticated operations:
 * `GET /evaluation/experiments/{experiment_id}/report` returns the structured
   comparison, deterministic Markdown, coverage, observation references, and
   content/artifact fingerprints.
+
+The execution entrypoint is also owner-authenticated and deliberately narrow:
+
+* `POST /evaluation/experiments/{experiment_id}/trials/{trial_id}/start`
+  accepts only the frozen case message plus the exact Prompt revision content
+  or owner-scoped Skill revision name. The server derives the Session and Run
+  identities from `(owner, experiment, trial)`, applies the frozen model and
+  budget, and calls the normal Run lifecycle. It never accepts a provider,
+  tool policy, memory branch, receipt set, or terminal observation from the
+  client.
+
+One exact trial has one durable Session and one durable Run. Retries and
+concurrent requests with the same normalized payload replay that identity;
+they do not spend another session/run quota or invoke a second provider. A
+different payload for the same trial is a conflict. The Session bootstrap
+identity is stored in its own immutable database field, separate from mutable
+user metadata. The Run start claim is the existing owner lease/CAS boundary,
+and ProviderTask/WorkTurn identities keep their existing lifecycle paths.
+
+The clean-session check is scoped to the derived Run identity: the first
+request must see no prior session state, while a concurrent retry may observe
+that same Run's in-flight rows. A different Run or pre-existing session state
+still makes the trial unavailable. If a process dies after the Run claim but
+before evaluation admission, recovery reads the trusted admission intent from
+the canonical `run_started` event, binds the same Run generation to the
+planned trial, and records a failed/cancelled observation after the crash
+terminal transition. It never creates a replacement Run.
 
 The API accepts client intent only. It never accepts client-supplied
 observations and never starts a provider from a read request. Every read uses

@@ -146,6 +146,33 @@ pub(super) async fn build_runtime_wiring(
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));
     }
 
+    // A process can die after the canonical evaluation Run claim but before
+    // the trial binding/admission marker is written. Reconcile those bounded
+    // recovery results through the same lifecycle owner before serving new
+    // requests, so a planned trial cannot remain invisible forever.
+    for run in &recovered_runs {
+        if run.status == astra_core::STATUS_FAILED
+            || run.status == astra_core::STATUS_CANCELLED
+            || run.status == astra_core::STATUS_COMPLETED
+        {
+            let has_evaluation_intent = run.events.iter().any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_started")
+                    && event.pointer("/data/evaluation_admission").is_some()
+            });
+            if has_evaluation_intent {
+                run_lifecycle
+                    .reconcile_evaluation_observation_for_run(
+                        &run.user_id,
+                        &run.run_id,
+                        &run.session_id,
+                        run.run_generation,
+                        &run.status,
+                    )
+                    .await;
+            }
+        }
+    }
+
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 

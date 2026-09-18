@@ -40,6 +40,26 @@ pub trait SessionService: Send + Sync {
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Create or replay a server-owned session bootstrap. The caller supplies
+    /// a stable session identity and request hash; implementations must
+    /// return the existing session before applying a new-session quota check
+    /// when the hash matches. This is used by durable workflows whose retry
+    /// identity is not a client/provider session reference.
+    async fn create_idempotent_session(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _request: SessionCreateRequestData,
+        _request_hash: String,
+        _quota: crate::resource_governor::LimitCheck,
+    ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::NOT_IMPLEMENTED,
+            "Idempotent session bootstrap is not configured",
+            "session_bootstrap_unconfigured",
+        ))
+    }
+
     async fn create_provider_session(
         &self,
         _identity: ProviderSessionCreationIdentity,
@@ -445,6 +465,7 @@ impl DatabaseSessionService {
         session_id: String,
         request: SessionCreateRequestData,
         provider_creation: Option<(String, crate::resource_governor::LimitCheck)>,
+        idempotent_creation: Option<(String, crate::resource_governor::LimitCheck)>,
     ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let title = request
@@ -457,7 +478,7 @@ impl DatabaseSessionService {
             .await
             .map_err(internal_error)?;
 
-        if let Some((payload_hash, quota)) = &provider_creation {
+        if let Some((payload_hash, _quota)) = &provider_creation {
             let existing = query(
                 "SELECT provider_creation_hash FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
             ).bind(&session_id).bind(&user_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
@@ -482,13 +503,46 @@ impl DatabaseSessionService {
                     created: false,
                 });
             }
+        }
+        if let Some((request_hash, _quota)) = &idempotent_creation {
+            let existing = query(
+                "SELECT bootstrap_creation_hash FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+            )
+            .bind(&session_id)
+            .bind(&user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+            if let Some(existing) = existing {
+                let existing_hash: Option<String> = existing
+                    .try_get("bootstrap_creation_hash")
+                    .map_err(internal_error)?;
+                if existing_hash.as_deref() != Some(request_hash.as_str()) {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        "session bootstrap identity was already used with different parameters",
+                        "session_bootstrap_conflict",
+                    ));
+                }
+                let record = self
+                    .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+                    .await?
+                    .ok_or_else(|| internal_error("failed to read idempotent session"))?;
+                tx.commit().await.map_err(internal_error)?;
+                return Ok(SessionCreationResult {
+                    session: record,
+                    created: false,
+                });
+            }
+        }
+        if let Some((_, quota)) = provider_creation.as_ref().or(idempotent_creation.as_ref()) {
             crate::resource_governor::enforce_session_create_quota(quota)?;
         }
 
         query(
             "INSERT INTO agent_sessions \
-             (session_id, user_id, agent_id, title, status, event_count, created_at, updated_at, last_active_at, `metadata`, provider_creation_hash) \
-             VALUES (?, ?, ?, ?, 'active', 0, NOW(), NOW(), NOW(), ?, ?)",
+             (session_id, user_id, agent_id, title, status, event_count, created_at, updated_at, last_active_at, `metadata`, provider_creation_hash, bootstrap_creation_hash) \
+             VALUES (?, ?, ?, ?, 'active', 0, NOW(), NOW(), NOW(), ?, ?, ?)",
         )
         .bind(&session_id)
         .bind(&user_id)
@@ -496,6 +550,7 @@ impl DatabaseSessionService {
         .bind(&title)
         .bind(metadata)
         .bind(provider_creation.as_ref().map(|(hash, _)| hash.as_str()))
+        .bind(idempotent_creation.as_ref().map(|(hash, _)| hash.as_str()))
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
@@ -640,9 +695,37 @@ impl SessionService for DatabaseSessionService {
         user_id: String,
         request: SessionCreateRequestData,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
+        self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None, None)
             .await
             .map(|result| result.session)
+    }
+
+    async fn create_idempotent_session(
+        &self,
+        user_id: String,
+        session_id: String,
+        request: SessionCreateRequestData,
+        request_hash: String,
+        quota: crate::resource_governor::LimitCheck,
+    ) -> Result<SessionCreationResult, (StatusCode, Json<ErrorResponse>)> {
+        crate::validate_persisted_session_id(&session_id).map_err(|error| {
+            error_response_coded(StatusCode::BAD_REQUEST, error, "session_id_invalid")
+        })?;
+        if request_hash.len() != 64 || !request_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "session bootstrap request hash must be 64 hexadecimal characters",
+                "session_bootstrap_invalid",
+            ));
+        }
+        self.create_session_record(
+            user_id,
+            session_id,
+            request,
+            None,
+            Some((request_hash.to_ascii_lowercase(), quota)),
+        )
+        .await
     }
 
     async fn create_provider_session(
@@ -658,6 +741,7 @@ impl SessionService for DatabaseSessionService {
             identity.session_id,
             request,
             Some((payload_hash, quota)),
+            None,
         )
         .await
     }

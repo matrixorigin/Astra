@@ -494,7 +494,16 @@ impl DatabaseEvaluationObservationStore {
                             enriched = Some((generation, admission));
                         }
                     } else if fallback.is_none() {
-                        fallback = Some(admission);
+                        let generation = event
+                            .pointer("/data/owner_generation")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| {
+                                EvaluationExecutionError::Conflict(
+                                    "run_started evaluation admission has no owner generation"
+                                        .to_string(),
+                                )
+                            })?;
+                        fallback = Some((generation, admission));
                     }
                 }
                 _ => {}
@@ -507,8 +516,11 @@ impl DatabaseEvaluationObservationStore {
                 return Ok(None);
             }
             (generation, admission)
-        } else if let Some(admission) = fallback {
-            (expected_run_generation, admission)
+        } else if let Some((generation, admission)) = fallback {
+            if generation != expected_run_generation {
+                return Ok(None);
+            }
+            (generation, admission)
         } else {
             return Ok(None);
         };

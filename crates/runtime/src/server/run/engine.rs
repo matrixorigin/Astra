@@ -188,7 +188,7 @@ fn delegation_terminal_events(
     events
 }
 
-fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
+fn crash_recovery_terminal_events(owner_generation: u64) -> [serde_json::Value; 2] {
     [
         serde_json::json!({
             "event_type": "run_error",
@@ -197,6 +197,7 @@ fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
+                "owner_generation": owner_generation,
             },
         }),
         serde_json::json!({
@@ -207,6 +208,7 @@ fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
+                "owner_generation": owner_generation,
             },
         }),
     ]
@@ -227,6 +229,16 @@ fn crash_recovery_cancellation_event(
             "cancellation_origin": origin,
         }
     })
+}
+
+fn crash_recovery_cancellation_event_for_generation(
+    run_id: &str,
+    origin: astra_turn_core::orchestration_types::CancellationOrigin,
+    owner_generation: u64,
+) -> serde_json::Value {
+    let mut event = crash_recovery_cancellation_event(run_id, origin);
+    event["data"]["owner_generation"] = serde_json::Value::from(owner_generation);
+    event
 }
 
 fn turn_cancellation_origin(
@@ -1260,7 +1272,12 @@ impl RunEngine {
             .runtime_profile
             .map(runtime_profile_label)
             .map(str::to_string);
-        let run_started_data = run_started_event_data(&context);
+        let mut run_started_data = run_started_event_data(&context);
+        // A new root Run always starts at generation zero. Persisting the
+        // generation beside server-owned evaluation intent lets recovery
+        // distinguish this admission from a later owner generation instead
+        // of treating any historical run_started payload as current proof.
+        run_started_data["owner_generation"] = serde_json::Value::from(0_u64);
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
@@ -3112,7 +3129,11 @@ impl RunEngine {
                     return None;
                 }
             };
-            let event = crash_recovery_cancellation_event(&run.run_id, cancellation_origin);
+            let event = crash_recovery_cancellation_event_for_generation(
+                &run.run_id,
+                cancellation_origin,
+                run.run_generation,
+            );
             return match self
                 .store
                 .update_run_status_with_events_if_current(
@@ -3242,7 +3263,7 @@ impl RunEngine {
                 }
             }
         } else {
-            let events = crash_recovery_terminal_events();
+            let events = crash_recovery_terminal_events(run.run_generation);
             match self
                 .store
                 .update_run_status_with_events_if_current(

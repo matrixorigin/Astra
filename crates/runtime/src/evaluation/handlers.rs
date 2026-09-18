@@ -79,6 +79,25 @@ pub async fn create_experiment_handler(
     Ok((StatusCode::OK, Json(record)))
 }
 
+pub async fn start_trial_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((experiment_id, trial_id)): Path<(String, String)>,
+    Json(request): Json<astra_services::evaluation::EvaluationTrialStartRequest>,
+) -> Result<
+    (
+        StatusCode,
+        Json<astra_services::evaluation::EvaluationTrialStartResponse>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let response =
+        super::start::start_trial(&state, &user.user_id, &experiment_id, &trial_id, request)
+            .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
 pub async fn get_experiment_projection_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

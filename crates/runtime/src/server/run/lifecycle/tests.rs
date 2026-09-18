@@ -36,6 +36,41 @@ fn evaluation_trial_status_keeps_terminal_run_meanings_distinct() {
 }
 
 #[test]
+fn evaluation_crash_recovery_requires_current_generation_and_terminal_match() {
+    let old_generation = json!({
+        "event_type": "run_finished",
+        "data": {
+            "status": STATUS_FAILED,
+            "source": "crash_recovery",
+            "owner_generation": 2,
+        }
+    });
+    let current_generation = json!({
+        "event_type": "run_finished",
+        "data": {
+            "status": STATUS_FAILED,
+            "source": "crash_recovery",
+            "owner_generation": 3,
+        }
+    });
+    assert!(!evaluation_crash_recovery_is_current_generation(
+        std::slice::from_ref(&old_generation),
+        STATUS_FAILED,
+        3,
+    ));
+    assert!(evaluation_crash_recovery_is_current_generation(
+        std::slice::from_ref(&current_generation),
+        STATUS_FAILED,
+        3,
+    ));
+    assert!(!evaluation_crash_recovery_is_current_generation(
+        std::slice::from_ref(&current_generation),
+        STATUS_COMPLETED,
+        3,
+    ));
+}
+
+#[test]
 fn evaluation_skill_invocation_evidence_requires_the_admitted_revision() {
     let svc = test_service();
     let request = test_request("invoke the pinned skill");
@@ -18620,6 +18655,45 @@ async fn work_turn_exact_retry_attaches_and_changed_payload_fails_closed() {
         mismatch.1.0.error_code.as_deref(),
         Some("idempotency_mismatch")
     );
+}
+
+#[test]
+fn evaluation_start_rejects_mismatched_authority_and_session() {
+    let identity = RunStartIdempotency::new(
+        RunStartIdempotencyKind::EvaluationTrial,
+        "evaluation-run-1",
+        "1".repeat(64),
+    )
+    .expect("evaluation identity");
+
+    let authority_error = AgenticRunLifecycleService::validate_start_request_authority(
+        Some(&identity),
+        Some("different-run"),
+    )
+    .expect_err("conversation authority must not override the stable evaluation Run");
+    assert_eq!(authority_error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        authority_error.1.0.error_code.as_deref(),
+        Some("conversation_authority_run_conflict")
+    );
+
+    let session_error = AgenticRunLifecycleService::validate_start_request_session(
+        &identity,
+        Some("different-session"),
+        "evaluation-session-1",
+    )
+    .expect_err("evaluation identity must stay in one stable session");
+    assert_eq!(session_error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        session_error.1.0.error_code.as_deref(),
+        Some("evaluation_trial_start_mismatch")
+    );
+}
+
+#[test]
+fn ordinary_start_without_evaluation_authority_remains_unconstrained() {
+    AgenticRunLifecycleService::validate_start_request_authority(None, Some("ordinary-run"))
+        .expect("ordinary starts have no evaluation identity to conflict with");
 }
 
 #[tokio::test]

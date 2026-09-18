@@ -8574,7 +8574,42 @@ impl AgenticRunLifecycleService {
                 PreSpawnFailureCode::PreSpawnFailure,
             )
             .await;
+            self.reconcile_evaluation_observation_for_run(
+                user_id,
+                run_id,
+                expected_session_id,
+                execution_owner_generation,
+                STATUS_FAILED,
+            )
+            .await;
         }
+    }
+
+    async fn fail_evaluation_run_before_spawn(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        execution_owner_generation: u64,
+        message: &str,
+    ) {
+        self.fail_started_run_before_spawn(
+            user_id,
+            expected_session_id,
+            run_id,
+            execution_owner_generation,
+            message,
+            PreSpawnFailureCode::PreSpawnFailure,
+        )
+        .await;
+        self.reconcile_evaluation_observation_for_run(
+            user_id,
+            run_id,
+            expected_session_id,
+            execution_owner_generation,
+            STATUS_FAILED,
+        )
+        .await;
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
@@ -11146,6 +11181,10 @@ impl AgenticRunLifecycleService {
                 "Work turn request identity is already bound to a different payload",
                 "idempotency_mismatch",
             ),
+            RunStartIdempotencyKind::EvaluationTrial => (
+                "evaluation trial is already bound to a different start request",
+                "evaluation_trial_start_mismatch",
+            ),
         };
         Err(error_response_coded(StatusCode::CONFLICT, detail, code))
     }
@@ -11165,8 +11204,28 @@ impl AgenticRunLifecycleService {
                     "Work turn request identity is already bound to a different branch",
                     "idempotency_mismatch",
                 ),
+                RunStartIdempotencyKind::EvaluationTrial => (
+                    "evaluation trial is already bound to a different session",
+                    "evaluation_trial_start_mismatch",
+                ),
             };
             return Err(error_response_coded(StatusCode::CONFLICT, detail, code));
+        }
+        Ok(())
+    }
+
+    fn validate_start_request_authority(
+        identity: Option<&RunStartIdempotency>,
+        authority_run_id: Option<&str>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let (Some(identity), Some(authority_run_id)) = (identity, authority_run_id)
+            && identity.run_id() != authority_run_id
+        {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "request idempotency and conversation authority identify different runs",
+                "conversation_authority_run_conflict",
+            ));
         }
         Ok(())
     }
@@ -12762,6 +12821,58 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    async fn evaluation_session_has_only_expected_run(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+        expected_run_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let expected_run_exists = sqlx::query(
+            "SELECT run_id FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(expected_run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_session_check_failed",
+                format!("failed to inspect the evaluation Run identity: {error}"),
+            )
+        })?
+        .is_some();
+        if !expected_run_exists {
+            return Ok(false);
+        }
+        let foreign_run = sqlx::query(
+            "SELECT run_id FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id <> ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(expected_run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| {
+            evaluation_preflight_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_session_check_failed",
+                format!("failed to inspect competing evaluation Runs: {error}"),
+            )
+        })?;
+        if foreign_run.is_some() {
+            return Err(evaluation_preflight_error(
+                StatusCode::CONFLICT,
+                "evaluation_session_not_clean",
+                "evaluation session already contains another Run",
+            ));
+        }
+        Ok(true)
+    }
+
     /// Evaluation trials must start from a genuinely empty
     /// session. Reusing a normal chat session would silently import canonical
     /// history, checkpoints, state projections, or context snapshots that
@@ -12770,6 +12881,7 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         session_id: &str,
+        expected_run_id: &str,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let Some(shared) = &self.shared_pool else {
             return Err(evaluation_preflight_error(
@@ -12779,6 +12891,23 @@ impl AgenticRunLifecycleService {
             ));
         };
         let pool = shared.get();
+        // The stable evaluation session is also the retry boundary. Once the
+        // canonical Run for this exact trial exists, its own in-flight rows
+        // are valid state and concurrent retries must reach the durable claim
+        // instead of being mistaken for cross-run contamination. A different
+        // Run still rejects the session below. The same check is repeated when
+        // a later table query observes state, closing the race where another
+        // process claims this exact Run between the first query and that scan.
+        if Self::evaluation_session_has_only_expected_run(
+            pool,
+            user_id,
+            session_id,
+            expected_run_id,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let checks = [
             (
                 "agent_events",
@@ -12828,6 +12957,20 @@ impl AgenticRunLifecycleService {
                 })?
                 .is_some();
             if present {
+                if Self::evaluation_session_has_only_expected_run(
+                    pool,
+                    user_id,
+                    session_id,
+                    expected_run_id,
+                )
+                .await?
+                {
+                    // The canonical ClaimOrReplay below revalidates the
+                    // request fingerprint and owner authority. This branch
+                    // only prevents a concurrent exact retry from being
+                    // rejected as session contamination.
+                    return Ok(());
+                }
                 return Err(evaluation_preflight_error(
                     StatusCode::CONFLICT,
                     "evaluation_session_not_clean",
@@ -12853,6 +12996,16 @@ impl AgenticRunLifecycleService {
             })?
             .is_some();
         if transcript_present {
+            if Self::evaluation_session_has_only_expected_run(
+                pool,
+                user_id,
+                session_id,
+                expected_run_id,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_session_not_clean",
@@ -14269,7 +14422,7 @@ impl AgenticRunLifecycleService {
     /// exact generation has closed its settlement fence. This is intentionally
     /// a projection retry, not a second executor: owner/session/generation/
     /// terminal checks remain in `DatabaseEvaluationObservationStore`.
-    async fn reconcile_evaluation_observation_for_run(
+    pub(crate) async fn reconcile_evaluation_observation_for_run(
         &self,
         user_id: &str,
         run_id: &str,
@@ -14289,6 +14442,9 @@ impl AgenticRunLifecycleService {
         else {
             return;
         };
+        // Completed trials are immutable. Check the projection first so a
+        // repeated status poll does not hydrate the entire Run event stream
+        // after the observation has already been written.
         if observation_store
             .load_by_trial(user_id, &marker.admission.trial_id)
             .await
@@ -14298,6 +14454,25 @@ impl AgenticRunLifecycleService {
         {
             return;
         }
+        let Some(run) = self
+            .run_engine
+            .load_run(user_id, run_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        if run.run_generation != run_generation || run.status != durable_status {
+            // A stale status callback must not settle evidence for a newer
+            // owner generation or a different terminal transition.
+            return;
+        }
+        let crash_recovered = evaluation_crash_recovery_is_current_generation(
+            &run.events,
+            &run.status,
+            run.run_generation,
+        );
         let Some(status) = RunStatus::from_durable_status(durable_status) else {
             return;
         };
@@ -14306,8 +14481,28 @@ impl AgenticRunLifecycleService {
         }
         // Terminal status is not enough: a status poll may race the executor
         // between its terminal CAS and the accounting/settlement fence. Do
-        // not create an immutable `Missing` observation in that window.
-        if !marker.settlement_finished {
+        // not create an immutable `Missing` observation in that window. A
+        // crash-recovery terminal event is the explicit owner transition for
+        // the pre-spawn window; it has no normal settlement marker, but the
+        // trial still needs a bound failed/cancelled observation instead of
+        // remaining permanently planned.
+        if !marker.settlement_finished && !crash_recovered {
+            return;
+        }
+        let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+        if let Err(error) = plan_store
+            .bind_trial_run(user_id, &marker.admission.trial_id, session_id, run_id)
+            .await
+        {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                owner_user_id = user_id,
+                session_id,
+                run_id,
+                trial_id = %marker.admission.trial_id,
+                error = %error,
+                "evaluation recovery could not bind the canonical Run to its trial"
+            );
             return;
         }
         persist_evaluation_observation_after_settlement(
@@ -14371,6 +14566,44 @@ impl AgenticRunLifecycleService {
         runs.get(run_id)
             .map(|r| r.pause_flag.load(Ordering::Acquire))
     }
+}
+
+fn evaluation_crash_recovery_is_current_generation(
+    events: &[Value],
+    terminal_status: &str,
+    owner_generation: u64,
+) -> bool {
+    if terminal_status != STATUS_FAILED && terminal_status != STATUS_CANCELLED {
+        return false;
+    }
+    events.iter().any(|event| {
+        let event_type = event.get("event_type").and_then(Value::as_str);
+        let data = event.get("data").and_then(Value::as_object);
+        let same_generation = data
+            .and_then(|data| data.get("owner_generation"))
+            .and_then(Value::as_u64)
+            == Some(owner_generation);
+        if !same_generation {
+            return false;
+        }
+        match event_type {
+            Some("run_error") => {
+                data.and_then(|data| data.get("error_code"))
+                    .and_then(Value::as_str)
+                    == Some("crash_recovery")
+            }
+            Some("run_finished") => {
+                data.and_then(|data| data.get("source"))
+                    .and_then(Value::as_str)
+                    == Some("crash_recovery")
+                    && data
+                        .and_then(|data| data.get("status"))
+                        .and_then(Value::as_str)
+                        == Some(terminal_status)
+            }
+            _ => false,
+        }
+    })
 }
 
 fn should_allow_empty_delta(
@@ -16461,7 +16694,40 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
-        let request = self.prepare_chat_request(&user_id, request).await?;
+        // Background `create_run` historically ignores ProviderTask/WorkTurn
+        // identities; those callers use the streaming lifecycle below. Only
+        // the server-owned evaluation bootstrap opts into this durable claim.
+        let start_identity = request
+            .run_start_idempotency
+            .as_ref()
+            .filter(|identity| identity.kind() == RunStartIdempotencyKind::EvaluationTrial)
+            .cloned();
+        let request = if let Some(identity) = start_identity.as_ref() {
+            let requested_session_id = request.session_id.clone();
+            if let Some(durable) = self
+                .load_durable_run_for_user(identity.run_id(), &user_id)
+                .await?
+            {
+                Self::validate_start_request_session(
+                    identity,
+                    requested_session_id.as_deref(),
+                    &durable.session_id,
+                )?;
+                Self::validate_start_request_fingerprint(
+                    identity,
+                    durable.start_request_fingerprint.as_deref(),
+                )?;
+                return Ok(ChatRunRecord {
+                    session_id: durable.session_id,
+                    run_id: durable.run_id,
+                    status: durable.status,
+                    explain: None,
+                });
+            }
+            self.prepare_chat_request(&user_id, request).await?
+        } else {
+            self.prepare_chat_request(&user_id, request).await?
+        };
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -16477,10 +16743,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        let run_id = request
+        let idempotent_start = start_identity.is_some();
+        let authority_run_id = request
             .conversation_authority
             .as_ref()
-            .map(|authority| authority.run_id.clone())
+            .map(|authority| authority.run_id.as_str());
+        Self::validate_start_request_authority(start_identity.as_ref(), authority_run_id)?;
+        let run_id = authority_run_id
+            .map(str::to_owned)
+            .or_else(|| {
+                start_identity
+                    .as_ref()
+                    .map(|identity| identity.run_id().to_string())
+            })
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id
@@ -16488,7 +16763,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let evaluation_mode = request.evaluation_admission.is_some();
         if evaluation_mode {
-            self.ensure_evaluation_session_clean(&user_id, &session_id)
+            self.ensure_evaluation_session_clean(&user_id, &session_id, &run_id)
                 .await?;
         }
         let active_personal_skills =
@@ -16563,14 +16838,103 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             );
         }
 
-        // Guard: reject if this session already has a blocking run.
-        // Hold write lock across check+insert to prevent TOCTOU race.
         let (run_state, cancel_flag, pause_flag, llm_cancel_token, execution_lease_lost) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+        let mut execution_owner_generation = None;
+        let mut owner_lease_heartbeat = None;
+        if idempotent_start {
+            let identity = start_identity
+                .as_ref()
+                .expect("idempotent start has a durable identity");
+            match self
+                .persist_run_start(
+                    &run_id,
+                    &user_id,
+                    &session_id,
+                    &request,
+                    None,
+                    runtime_capabilities.agent_binding.as_ref(),
+                    work_runtime_binding.as_ref(),
+                    Some(identity.request_fingerprint()),
+                    RunStartPersistenceMode::ClaimOrReplay,
+                )
+                .await?
+            {
+                DurableRunStartClaim::Started { owner_generation } => {
+                    execution_owner_generation = Some(owner_generation);
+                    let confirmed = self
+                        .run_engine
+                        .confirm_execution_authority(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            owner_generation,
+                            llm_cancel_token.as_ref(),
+                        )
+                        .await;
+                    if !matches!(confirmed, Ok(true)) {
+                        self.fail_claimed_idempotent_run_before_spawn(
+                            execution_owner_generation,
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            "durable evaluation authority could not be confirmed before activation",
+                        )
+                        .await;
+                        return match confirmed {
+                            Ok(false) => Err(error_response(
+                                StatusCode::CONFLICT,
+                                "durable evaluation authority expired before activation",
+                            )),
+                            Err(error) => Err(error_response(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("failed to confirm durable evaluation authority: {error}"),
+                            )),
+                            Ok(true) => unreachable!("matched above"),
+                        };
+                    }
+                    owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
+                        user_id.clone(),
+                        session_id.clone(),
+                        run_id.clone(),
+                        owner_generation,
+                        execution_lease_lost.clone(),
+                        llm_cancel_token.clone(),
+                    );
+                }
+                DurableRunStartClaim::Existing {
+                    start_request_fingerprint,
+                    ..
+                } => {
+                    Self::validate_start_request_fingerprint(
+                        identity,
+                        start_request_fingerprint.as_deref(),
+                    )?;
+                    let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                    return Ok(ChatRunRecord {
+                        session_id: durable.session_id,
+                        run_id: durable.run_id,
+                        status: durable.status,
+                        explain: None,
+                    });
+                }
+                DurableRunStartClaim::SessionMismatch { bound_session_id } => {
+                    Self::validate_start_request_session(
+                        identity,
+                        request.session_id.as_deref(),
+                        &bound_session_id,
+                    )?;
+                    unreachable!("evaluation bootstrap identity must keep one session");
+                }
+            }
+        }
+
+        // Guard ordinary starts locally. Evaluation starts already hold the
+        // durable claim above, so a second process cannot pass this boundary
+        // for the same identity.
         {
             let mut runs = self.runs.write().await;
-            let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
-            if has_active {
+            if !idempotent_start && Self::session_has_blocking_run(&runs, &user_id, &session_id) {
                 return Err(error_response(
                     StatusCode::CONFLICT,
                     "session already has an active run".to_string(),
@@ -16588,6 +16952,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         {
             Ok(record) => record,
             Err(error) => {
+                self.fail_claimed_idempotent_run_before_spawn(
+                    execution_owner_generation,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "cloud workspace provisioning failed after evaluation Run claim",
+                )
+                .await;
                 self.runs.write().await.remove(&run_id);
                 return Err(error);
             }
@@ -16607,6 +16979,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 {
                     Ok(workspace) => Some(workspace),
                     Err(error) => {
+                        self.fail_claimed_idempotent_run_before_spawn(
+                            execution_owner_generation,
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            "server workspace provisioning failed after evaluation Run claim",
+                        )
+                        .await;
                         self.runs.write().await.remove(&run_id);
                         return Err(error);
                     }
@@ -16630,6 +17010,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         if let Some(generation) = request.execution_binding_generation {
             let Some(snapshot) = execution_bindings.as_mut() else {
+                self.fail_claimed_idempotent_run_before_spawn(
+                    execution_owner_generation,
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "Work execution provider could not be materialized after evaluation Run claim",
+                )
+                .await;
                 self.runs.write().await.remove(&run_id);
                 return Err(error_response_coded(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -16647,6 +17035,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
         {
+            self.fail_claimed_idempotent_run_before_spawn(
+                execution_owner_generation,
+                &user_id,
+                &session_id,
+                &run_id,
+                "optional tool validation failed after evaluation Run claim",
+            )
+            .await;
             self.runs.write().await.remove(&run_id);
             if let Some(record) = cloud_workspace_record.as_ref() {
                 self.cleanup_cloud_workspace_after_failed_start(
@@ -16666,6 +17062,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             && let Err(error) =
                 Self::invalidate_work_subject_before_execution(pool, binding, &run_id).await
         {
+            self.fail_claimed_idempotent_run_before_spawn(
+                execution_owner_generation,
+                &user_id,
+                &session_id,
+                &run_id,
+                "Work subject invalidation failed after evaluation Run claim",
+            )
+            .await;
             self.runs.write().await.remove(&run_id);
             return Err(work_subject_invalidation_response(error));
         }
@@ -16680,44 +17084,57 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             match self.provision_server_workspace(&session_id) {
                 Ok(workspace) => Some(workspace),
                 Err(error) => {
+                    self.fail_claimed_idempotent_run_before_spawn(
+                        execution_owner_generation,
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        "tool executor workspace provisioning failed after evaluation Run claim",
+                    )
+                    .await;
                     self.runs.write().await.remove(&run_id);
                     return Err(error);
                 }
             }
         };
 
-        let execution_owner_generation = match self
-            .persist_run_start(
-                &run_id,
-                &user_id,
-                &session_id,
-                &request,
-                execution_bindings.as_ref(),
-                runtime_capabilities.agent_binding.as_ref(),
-                work_runtime_binding.as_ref(),
-                None,
-                RunStartPersistenceMode::Insert,
-            )
-            .await
+        let execution_owner_generation = if let Some(owner_generation) = execution_owner_generation
         {
-            Ok(DurableRunStartClaim::Started { owner_generation }) => owner_generation,
-            Ok(other) => unreachable!("insert-only run start returned {other:?}"),
-            Err(error) => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        format!(
-                            "durable run start failed after cloud workspace provisioning: {}",
-                            error.1.0.detail
-                        ),
-                    )
-                    .await;
+            owner_generation
+        } else {
+            match self
+                .persist_run_start(
+                    &run_id,
+                    &user_id,
+                    &session_id,
+                    &request,
+                    execution_bindings.as_ref(),
+                    runtime_capabilities.agent_binding.as_ref(),
+                    work_runtime_binding.as_ref(),
+                    None,
+                    RunStartPersistenceMode::Insert,
+                )
+                .await
+            {
+                Ok(DurableRunStartClaim::Started { owner_generation }) => owner_generation,
+                Ok(other) => unreachable!("insert-only run start returned {other:?}"),
+                Err(error) => {
+                    self.runs.write().await.remove(&run_id);
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            format!(
+                                "durable run start failed after cloud workspace provisioning: {}",
+                                error.1.0.detail
+                            ),
+                        )
+                        .await;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         };
         let execution_authority_confirmed = self
@@ -16731,6 +17148,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await;
         if !matches!(execution_authority_confirmed, Ok(true)) {
+            if idempotent_start {
+                self.fail_evaluation_run_before_spawn(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    execution_owner_generation,
+                    "durable evaluation authority could not be confirmed before activation",
+                )
+                .await;
+            }
             self.runs.write().await.remove(&run_id);
             if let Some(record) = cloud_workspace_record.as_ref() {
                 self.cleanup_cloud_workspace_after_failed_start(
@@ -16755,14 +17182,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Ok(true) => unreachable!("matched above"),
             };
         }
-        let owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
-            user_id.clone(),
-            session_id.clone(),
-            run_id.clone(),
-            execution_owner_generation,
-            execution_lease_lost.clone(),
-            llm_cancel_token.clone(),
-        );
+        if owner_lease_heartbeat.is_none() {
+            owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
+                user_id.clone(),
+                session_id.clone(),
+                run_id.clone(),
+                execution_owner_generation,
+                execution_lease_lost.clone(),
+                llm_cancel_token.clone(),
+            );
+        }
 
         // Spawn background agentic loop.
         // Load plan state as structured data: prompt hint for context, plus
@@ -16836,15 +17265,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         {
             Ok(admission) => admission,
             Err(error) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    execution_owner_generation,
-                    "canonical turn admission failed",
-                    PreSpawnFailureCode::PreSpawnFailure,
-                )
-                .await;
+                if evaluation_mode {
+                    self.fail_evaluation_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "canonical turn admission failed",
+                    )
+                    .await;
+                } else {
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        execution_owner_generation,
+                        "canonical turn admission failed",
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                }
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
@@ -16869,13 +17309,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // soon as the canonical reservation proves the session is no
             // longer empty and release the reservation before returning.
             drop(canonical_turn);
-            self.fail_started_run_before_spawn(
+            self.fail_evaluation_run_before_spawn(
                 &user_id,
                 &session_id,
                 &run_id,
                 execution_owner_generation,
                 "evaluation requires an empty canonical session",
-                PreSpawnFailureCode::PreSpawnFailure,
             )
             .await;
             if let Some(record) = cloud_workspace_record.as_ref() {
@@ -16941,13 +17380,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         Ok(true) => {}
                         Ok(false) => {
                             drop(canonical_turn);
-                            self.fail_started_run_before_spawn(
+                            self.fail_evaluation_run_before_spawn(
                                 &user_id,
                                 &session_id,
                                 &run_id,
                                 execution_owner_generation,
                                 "evaluation admission lost its canonical execution generation",
-                                PreSpawnFailureCode::PreSpawnFailure,
                             )
                             .await;
                             if let Some(record) = cloud_workspace_record.as_ref() {
@@ -16969,13 +17407,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         Err(persist_error) => {
                             drop(canonical_turn);
-                            self.fail_started_run_before_spawn(
+                            self.fail_evaluation_run_before_spawn(
                                 &user_id,
                                 &session_id,
                                 &run_id,
                                 execution_owner_generation,
                                 "evaluation admission evidence could not be persisted",
-                                PreSpawnFailureCode::PreSpawnFailure,
                             )
                             .await;
                             if let Some(record) = cloud_workspace_record.as_ref() {
@@ -17000,13 +17437,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 Err(error) => {
                     drop(canonical_turn);
-                    self.fail_started_run_before_spawn(
+                    self.fail_evaluation_run_before_spawn(
                         &user_id,
                         &session_id,
                         &run_id,
                         execution_owner_generation,
                         "evaluation trial admission failed before execution",
-                        PreSpawnFailureCode::PreSpawnFailure,
                     )
                     .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
@@ -17546,16 +17982,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .conversation_authority
             .as_ref()
             .map(|authority| authority.run_id.as_str());
-        if let (Some(identity), Some(authority_run_id)) =
-            (start_identity.as_ref(), authority_run_id)
-            && identity.run_id() != authority_run_id
-        {
-            return Err(error_response_coded(
-                StatusCode::CONFLICT,
-                "request idempotency and conversation authority identify different runs",
-                "conversation_authority_run_conflict",
-            ));
-        }
+        Self::validate_start_request_authority(start_identity.as_ref(), authority_run_id)?;
         let run_id = authority_run_id
             .map(str::to_owned)
             .or_else(|| {

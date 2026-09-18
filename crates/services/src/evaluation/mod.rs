@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assessment;
+pub mod bootstrap;
 pub mod database;
 pub mod durable;
 pub mod execution;
@@ -12,12 +13,16 @@ pub mod service;
 pub mod types;
 pub mod utils;
 
-pub use api::{EvaluationExperimentCreateRequest, EvaluationReportQuery};
+pub use api::{
+    EvaluationExperimentCreateRequest, EvaluationReportQuery, EvaluationTrialStartRequest,
+    EvaluationTrialStartResponse,
+};
 pub use assessment::{
     ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport,
     EvidenceAvailability, EvidenceKind, EvidenceRef, Measurement, MeasurementStatus,
     TrialObservation, TrialStatus, build_comparison_for_plan, render_markdown,
 };
+pub use bootstrap::{EvaluationBootstrapError, EvaluationTrialStartPlan, prepare_trial_start};
 pub use database::DatabaseEvaluationService;
 pub use durable::{
     DatabaseEvaluationPlanStore, EvaluationExperimentRecord, EvaluationPersistenceError,
