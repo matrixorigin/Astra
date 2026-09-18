@@ -186,7 +186,14 @@ pub use decisions::{
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
-pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
+pub use evaluation::{
+    ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport, DataIsolation,
+    DatabaseEvaluationService, EvaluationBudget, EvaluationCase, EvaluationService,
+    EvaluationTarget, EvaluationTargetKind, EvidenceAvailability, EvidenceKind, EvidenceRef,
+    ExperimentSpec, FrozenConditions, Measurement, MeasurementStatus, MemoryIsolation, RevisionRef,
+    TrialObservation, TrialOrder, TrialStatus, TrialUnit, UnconfiguredEvaluationService,
+    build_comparison_for_plan, render_markdown,
+};
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
     EventListRecord, EventRecord, EventService, UnconfiguredEventService,
