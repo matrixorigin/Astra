@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-17-v81";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-18-v82";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2110,13 +2110,13 @@ async fn reject_obsolete_weighted_admission_schema(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is older than v81; missing {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema is older than v82; missing {}. Compatibility migration is disabled; recreate database {database} with the current schema",
             missing.join(", ")
         )));
     }
     if !table_exists(pool, database, OWNER_USAGE).await? {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete for v81; missing table {OWNER_USAGE}. Compatibility migration is disabled; recreate database {database} with the current schema"
+            "weighted admission schema is incomplete for v82; missing table {OWNER_USAGE}. Compatibility migration is disabled; recreate database {database} with the current schema"
         )));
     }
 
@@ -2182,7 +2182,7 @@ async fn reject_obsolete_weighted_admission_schema(
     }
     if !mismatches.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is not the current v81 physical shape: {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema is not the current v82 physical shape: {}. Compatibility migration is disabled; recreate database {database} with the current schema",
             mismatches.join(", ")
         )));
     }
@@ -4893,7 +4893,7 @@ async fn ensure_core_schema_while_leased(
 
     // Create the owner usage table before the gate row. If startup is
     // interrupted before the gate DDL, the next run sees no gate and retries
-    // bootstrap; it cannot publish a gate that will fail the v81 preflight
+    // bootstrap; it cannot publish a gate that will fail the v82 preflight
     // because its owner table is missing.
     core_schema_create!(
         pool,
