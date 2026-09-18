@@ -183,19 +183,9 @@ impl ServerAgenticLoopHost {
                 .turn_intent
                 .as_ref()
                 .and_then(|intent| intent.assessment);
-            let read_only = self
-                .pending_work_admission
-                .as_ref()
-                .is_some_and(|decision| {
-                    matches!(
-                        decision,
-                        astra_services::WorkAdmissionDecision::NotRequired { .. }
-                    ) && decision.workspace_mutation()
-                        == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
-                        && decision.execution_topology()
-                            == astra_services::WorkExecutionTopology::Primary
-                        && decision.required_capabilities().is_empty()
-                });
+            let read_only = astra_services::model_routing::routing_read_only_primary(
+                self.pending_work_admission.as_ref(),
+            );
             let text_only_history = state.messages.iter().all(|message| {
                 message
                     .get("content")
@@ -203,11 +193,13 @@ impl ServerAgenticLoopHost {
                     && message.get("reasoning_signature").is_none()
                     && message.get("encrypted_content").is_none()
             });
-            let mut reason = astra_turn_core::model_routing::economy_eligibility(
+            let features = astra_turn_types::model_routing::ModelRoutingFeatures::new(
                 assessment,
                 read_only,
                 supported_input && text_only_history && input_reference.is_some(),
             );
+            let mut reason =
+                astra_turn_core::model_routing::economy_eligibility_from_features(features);
             let mut execution = baseline.clone();
             if reason == ModelRoutingReason::EasyReadOnly {
                 // The catalog is owner-scoped; retaining the same access id
@@ -244,6 +236,7 @@ impl ServerAgenticLoopHost {
             }
             let decision = ModelRoutingDecision {
                 schema_version: 1,
+                features: Some(features),
                 work_admission: self.pending_work_admission.clone(),
                 work_admission_skill_revision: self.work_admission_skill_revision,
                 policy_version: astra_turn_core::model_routing::POLICY_VERSION.into(),

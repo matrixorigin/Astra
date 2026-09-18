@@ -11,6 +11,8 @@ pub const DECISION_KEY: &str = "model-routing-v1";
 #[serde(deny_unknown_fields)]
 pub struct ModelRoutingDecision {
     pub schema_version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<astra_turn_types::model_routing::ModelRoutingFeatures>,
     /// Full canonical semantic decision, including graph, topology and capabilities.
     pub work_admission: Option<crate::WorkAdmissionDecision>,
     pub work_admission_skill_revision: usize,
@@ -69,4 +71,15 @@ pub(crate) fn selection_for_new_events(
         selection = Some(decision);
     }
     Ok(selection)
+}
+
+/// Canonical structural predicate shared by online routing and offline validation.
+pub fn routing_read_only_primary(decision: Option<&crate::WorkAdmissionDecision>) -> bool {
+    decision.is_some_and(|decision| {
+        matches!(decision, crate::WorkAdmissionDecision::NotRequired { .. })
+            && decision.workspace_mutation()
+                == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+            && decision.execution_topology() == crate::WorkExecutionTopology::Primary
+            && decision.required_capabilities().is_empty()
+    })
 }

@@ -2020,6 +2020,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
         schema_version: 1,
+        features: None,
         policy_version: "easy-read-only-v1".into(),
         policy: AutoModelRoutingPolicy {
             revision: "test-qualified-v1".into(),

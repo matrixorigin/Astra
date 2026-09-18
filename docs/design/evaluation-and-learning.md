@@ -88,3 +88,20 @@ Learning data must be filtered for:
 ## Activation boundary
 
 Datasets do not change runtime behavior by themselves. Behavior changes go through tuning jobs, evaluation gates, and rollout/rollback policy.
+
+## Offline routing artifacts
+
+The implemented stage-4 router importer lives under the existing evaluation
+owner and enforces explicit per-owner source-hash approvals, redaction revision,
+expiry, lineage, outcome separation and related-group time splits. It exports
+only typed structural evidence and produces offline candidates, with no
+production activation. It does not reuse the session-summary exporter as a
+routing corpus. Approved local evidence/authorization files are operator
+attestations; automatic consent collection and deletion of already exported
+files are not implemented. Operators must invalidate those files through their
+source lineage when consent is revoked. Router lineage includes the containing
+envelope and referenced feedback, execution, verifier evidence and replay
+snapshot IDs. Explicit dependency revocations invalidate containing envelopes
+and exported datasets even when their top-level approvals remain present. See
+[model-routing.md](model-routing.md#offline-router-datasets-and-candidates-stage-4)
+and the [offline workflow](../guides/model-router-offline.md).

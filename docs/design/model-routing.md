@@ -213,3 +213,97 @@ malformed facts, and changed model contracts stop execution; they cannot
 silently reroute or replay tool effects. Credential rotation is permitted
 through normal reauthorization. Learned routing, mid-turn escalation, and
 independent child routing remain later stages.
+
+## Offline router datasets and candidates (stage 4)
+
+`astra-test router-offline` builds a consented structural dataset and fits an
+**offline-only** candidate. It does not load credentials, query production
+traces, invoke providers/tools, activate a policy, or change Offering admission.
+The existing session-score training exporter is not a router corpus and remains
+unchanged. Dataset validation belongs to `services::evaluation::router`; the
+pure categorical trainer belongs to `turn_core::model_routing::offline`. The
+harness supplies the explicit local file boundary.
+
+New decisions carry an optional version-1 `features` snapshot, frozen before
+primary inference: assessment presence, difficulty and its confidence,
+read-only primary execution, and supported input. The online baseline and its
+offline comparison share the same eligibility function. Missing historical
+snapshots remain missing; they are not reconstructed from eventual outcomes.
+Old decisions remain readable. Older strict readers cannot read new feature
+fields, so mixed-version deployments require coordinated upgrades.
+
+The input is an explicitly reviewed evidence bundle, not a raw trace directory.
+An independent authorization file approves content hashes of complete source
+envelopes for one owner, dataset, redaction revision, expiry, and
+`offline_model_routing` use. Withdrawing an envelope removes its approval.
+Explicit revocations also cover referenced feedback source IDs, observed/replayed
+execution IDs, verifier evidence IDs and replay snapshot roots, even when their
+containing envelope remains approved or is ineligible for training. The same
+derived lineage drives build/revalidation checks and `complete.json` so operators
+can invalidate every artifact that retains withdrawn evidence. Every build/train
+checks these grants and revocations. These files are local operator
+attestations, not authentication tokens or automated proof of consent/redaction.
+The allowlisted export excludes Work plans, prompt text, tool output, selected
+model display strings, credentials, and free-text judge explanations. References
+and group keys must be opaque identifiers and must be reviewed for disclosure.
+
+Each source binds its actual immutable routing decision, timestamp and input
+prefix to optional observed execution, follow-up evidence, and paired replay.
+Profiles pin Offering identity and model contract revision. Human or executable
+verifier evidence must target an execution and the dataset's versioned acceptance
+rubric. Transport completion, satisfaction, a model's historical selection, or
+missing feedback never establish correctness. Follow-up assessments remain
+outcome-only and must resolve to the observed response's exact canonical prefix.
+Observed episodes retain their full start time, including admission/judge work:
+`started_at <= decision_at <= completed_at`. Replayed episodes instead require
+`decision_at <= started_at <= completed_at`. Both must finish by the dataset's
+creation time, and verifier evidence cannot precede completion. An outcome horizon
+applies to original-turn feedback; independently produced replay episodes have
+their own horizon starting at replay execution.
+
+Paired evidence requires the same decision-time input, environment/tool/budget
+snapshot and candidate profiles. Mutable sandbox IDs must differ. Both models
+must have passed capability/access checks. The importer validates these
+attestations and identities; it does not implement live historical replay or
+prove isolation from a string. The existing replay API is still unavailable.
+Use the existing model-matrix harness in independently provisioned isolated
+fixtures to collect evidence; never replay production side effects or treat a
+recorded transcript as the unchosen model's rollout.
+
+Examples are split by decision time. Shared sessions, identical input prefixes,
+and supplied workspace/repository/duplicate-task group keys cannot cross splits.
+Within a split, transitive related groups contribute at most one representative,
+chosen by source ID before inspecting label availability. Related examples and
+failures remain in the export and coverage report. The exporter is responsible
+for supplying complete grouping keys; this stage does not discover semantic
+near-duplicates or train across owners.
+
+Training uses only complete paired groups with known verifier labels and
+full-episode prices. Both-fail and economy-wins pairs are retained. Provider,
+tool and cancellation failures, unavailable prices, incomplete horizons,
+unsupported candidate pairs, absent snapshots and unknown labels remain
+separately visible; they are not silently counted as successes. Consequently,
+reported policy metrics apply to the disclosed complete-pair cohort, not all
+production requests.
+
+The baseline estimates per-candidate acceptability and mean full-episode cost
+in categorical feature buckets. It requires minimum independent support and
+uses a Wilson lower-bound threshold heuristic. Validation selects a threshold
+subject to a configured quality-regression limit and lower cost than strong;
+test labels never influence fitting or threshold selection. Unsupported inputs,
+non-read-only tasks and insufficient evidence abstain to strong. Reports compare
+always-economy, always-strong, deterministic Auto and the learned candidate on
+the same held-out groups, including acceptance, cost per acceptable task,
+latency, abstentions, coverage and an economy Brier score. All attempts and
+auxiliary inference must be included in each supplied episode cost.
+
+These probabilities and intervals are not empirically calibrated guarantees.
+Threshold selection is not a rollout gate: every report has
+`production_qualified: false`, and candidates have `activation: offline_only`.
+Representative data, verifier calibration, critical-task evaluation, broader
+strata, powered quality/cost comparisons and controlled canaries remain necessary
+before activation through the tuning-job owner. No production savings claim is
+made from synthetic fixtures.
+
+See [the offline router workflow](../guides/model-router-offline.md) for commands,
+evidence preparation, outputs, and revocation handling.

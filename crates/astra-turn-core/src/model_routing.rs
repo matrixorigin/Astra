@@ -2,7 +2,9 @@
 use astra_turn_types::model_routing::ModelRoutingReason;
 use astra_turn_types::{AssessmentConfidence, TaskDifficulty, TurnAssessment};
 
-pub const POLICY_VERSION: &str = "easy-read-only-v1";
+pub mod offline;
+
+pub use astra_turn_types::model_routing::DETERMINISTIC_ROUTING_POLICY_VERSION as POLICY_VERSION;
 
 /// Work/capability facts are supplied by the canonical semantic admission.
 /// Satisfaction and urgency deliberately do not select a cheaper model.
@@ -11,16 +13,28 @@ pub fn economy_eligibility(
     read_only_primary: bool,
     supported_input: bool,
 ) -> ModelRoutingReason {
-    if !supported_input {
+    economy_eligibility_from_features(astra_turn_types::model_routing::ModelRoutingFeatures::new(
+        assessment,
+        read_only_primary,
+        supported_input,
+    ))
+}
+
+pub fn economy_eligibility_from_features(
+    features: astra_turn_types::model_routing::ModelRoutingFeatures,
+) -> ModelRoutingReason {
+    if features.schema_version != astra_turn_types::model_routing::MODEL_ROUTING_FEATURE_VERSION
+        || !features.supported_input
+    {
         return ModelRoutingReason::UnsupportedInput;
     }
-    let Some(assessment) = assessment else {
+    if !features.assessment_present {
         return ModelRoutingReason::AssessmentUnavailable;
-    };
-    if assessment.difficulty_confidence != AssessmentConfidence::High {
+    }
+    if features.difficulty_confidence != AssessmentConfidence::High {
         return ModelRoutingReason::InsufficientConfidence;
     }
-    if assessment.difficulty != TaskDifficulty::Easy || !read_only_primary {
+    if features.difficulty != TaskDifficulty::Easy || !features.read_only_primary {
         return ModelRoutingReason::StrongRequired;
     }
     ModelRoutingReason::EasyReadOnly

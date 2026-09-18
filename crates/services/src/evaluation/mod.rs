@@ -1,5 +1,6 @@
 pub mod database;
 pub mod noop;
+pub mod router;
 pub mod service;
 pub mod types;
 pub mod utils;

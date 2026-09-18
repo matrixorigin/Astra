@@ -178,6 +178,7 @@ pub(crate) async fn auto_parent_run(run_id: &str, execution: &AdmittedModelExecu
         .unwrap();
     let decision = ModelRoutingDecision {
         schema_version: 1,
+        features: None,
         work_admission: None,
         work_admission_skill_revision: 0,
         policy_version: astra_turn_core::model_routing::POLICY_VERSION.into(),

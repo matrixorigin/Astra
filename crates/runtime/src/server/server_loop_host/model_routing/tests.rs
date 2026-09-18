@@ -106,6 +106,23 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
                 "assessment_unavailable"
             }
         );
+        let frozen: ModelRoutingDecision =
+            serde_json::from_value(decision["data"].clone()).unwrap();
+        let features = frozen
+            .features
+            .expect("decision-time features must be durable before I/O");
+        assert!(features.supported_input);
+        if economy {
+            assert!(features.read_only_primary);
+        }
+        assert_eq!(
+            astra_turn_core::model_routing::economy_eligibility_from_features(features),
+            if economy {
+                ModelRoutingReason::EasyReadOnly
+            } else {
+                ModelRoutingReason::AssessmentUnavailable
+            }
+        );
         crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
             .await
             .unwrap();

@@ -1,0 +1,170 @@
+{
+  "manifest": {
+    "schema_version": 1,
+    "dataset_id": "synthetic-router-dataset",
+    "owner_id": "synthetic-owner",
+    "redaction_version": "structural-only-v1",
+    "policy_version": "easy-read-only-v1",
+    "policy_revision": "synthetic-pair-v1",
+    "rubric_version": "task-acceptance-v1",
+    "economy": {
+      "profile_id": "economy-v1",
+      "offering_id": "economy",
+      "contract_root": "economy-contract"
+    },
+    "strong": {
+      "profile_id": "strong-v1",
+      "offering_id": "strong",
+      "contract_root": "strong-contract"
+    },
+    "created_at": "2024-05-01T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z",
+    "train_before": "2024-02-01T00:00:00Z",
+    "validation_before": "2024-03-01T00:00:00Z",
+    "outcome_horizon_seconds": 86400
+  },
+  "sources": [
+    {
+      "source_id": "source-1",
+      "owner_id": "synthetic-owner",
+      "decision_at": "2024-01-01T00:00:00Z",
+      "decision": {
+        "schema_version": 1,
+        "features": {
+          "schema_version": 1,
+          "assessment_present": true,
+          "difficulty": "easy",
+          "difficulty_confidence": "high",
+          "read_only_primary": true,
+          "supported_input": true
+        },
+        "work_admission": {
+          "not_required": {
+            "domain": null,
+            "assessment": {
+              "satisfaction": "unknown",
+              "satisfaction_confidence": "unknown",
+              "feedback_relation": "none",
+              "difficulty": "easy",
+              "difficulty_confidence": "high",
+              "urgency": "unknown",
+              "urgency_confidence": "unknown"
+            },
+            "workspace_mutation": "read_only",
+            "mutation_completion_scope": "unknown",
+            "execution_topology": "primary",
+            "required_capabilities": []
+          }
+        },
+        "work_admission_skill_revision": 0,
+        "policy_version": "easy-read-only-v1",
+        "policy": {
+          "revision": "synthetic-pair-v1",
+          "economy_offering_id": "economy",
+          "strong_offering_id": "strong"
+        },
+        "run_id": "synthetic-run",
+        "session_id": "synthetic-session",
+        "selected_offering_id": "economy",
+        "selected_model": "synthetic-economy",
+        "selected_contract_root": "economy-contract",
+        "input_reference": {
+          "prefix_root": "synthetic-input-root",
+          "message_count": 1
+        },
+        "reason": "easy_read_only",
+        "assessment": {
+          "satisfaction": "unknown",
+          "satisfaction_confidence": "unknown",
+          "feedback_relation": "none",
+          "difficulty": "easy",
+          "difficulty_confidence": "high",
+          "urgency": "unknown",
+          "urgency_confidence": "unknown"
+        }
+      },
+      "group_keys": [
+        "synthetic-task"
+      ],
+      "observed": null,
+      "paired": {
+        "isolation": "immutable_fixtures",
+        "fixture_revision": "synthetic-fixtures-v1",
+        "both_eligible": true,
+        "economy": {
+          "input_reference": {
+            "prefix_root": "synthetic-input-root",
+            "message_count": 1
+          },
+          "snapshot_root": "synthetic-environment-root",
+          "isolation_id": "fixtures",
+          "episode": {
+            "execution_id": "economy-execution",
+            "profile_id": "economy-v1",
+            "contract_root": "economy-contract",
+            "started_at": "2024-01-01T00:00:01Z",
+            "completed_at": "2024-01-01T00:00:05Z",
+            "response_reference": {
+              "prefix_root": "economy-response",
+              "message_count": 2
+            },
+            "status": "completed",
+            "quality": {
+              "target_execution_id": "economy-execution",
+              "rubric_version": "task-acceptance-v1",
+              "assessor": "executable_verifier",
+              "assessor_version": "fixture-verifier-v1",
+              "evidence_ids": [
+                "economy-verification"
+              ],
+              "assessed_at": "2024-01-01T00:00:06Z",
+              "verdict": "acceptable"
+            },
+            "cost": {
+              "total_usd": 0.01,
+              "pricing_revision": "fixture-prices-v1",
+              "covers_full_episode": true
+            }
+          }
+        },
+        "strong": {
+          "input_reference": {
+            "prefix_root": "synthetic-input-root",
+            "message_count": 1
+          },
+          "snapshot_root": "synthetic-environment-root",
+          "isolation_id": "fixtures",
+          "episode": {
+            "execution_id": "strong-execution",
+            "profile_id": "strong-v1",
+            "contract_root": "strong-contract",
+            "started_at": "2024-01-01T00:00:01Z",
+            "completed_at": "2024-01-01T00:00:05Z",
+            "response_reference": {
+              "prefix_root": "strong-response",
+              "message_count": 2
+            },
+            "status": "completed",
+            "quality": {
+              "target_execution_id": "strong-execution",
+              "rubric_version": "task-acceptance-v1",
+              "assessor": "executable_verifier",
+              "assessor_version": "fixture-verifier-v1",
+              "evidence_ids": [
+                "strong-verification"
+              ],
+              "assessed_at": "2024-01-01T00:00:06Z",
+              "verdict": "acceptable"
+            },
+            "cost": {
+              "total_usd": 0.05,
+              "pricing_revision": "fixture-prices-v1",
+              "covers_full_episode": true
+            }
+          }
+        }
+      },
+      "followup": null
+    }
+  ]
+}
