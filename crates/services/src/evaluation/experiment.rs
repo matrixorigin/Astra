@@ -7,11 +7,14 @@
 //! Skill-specific loop.
 
 use super::assessment::ComparisonArm;
+use astra_core::composite_snapshot::CompositeSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 pub const EXPERIMENT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 const MAX_CASES: usize = 10_000;
 const MAX_REPETITIONS: u32 = 100;
 const MAX_TRIALS: u64 = 100_000;
@@ -81,6 +84,203 @@ pub enum MemoryIsolation {
 pub enum DataIsolation {
     Disabled,
     MatrixOneBranchPerTrial { base_snapshot_ref: String },
+}
+
+/// A verified identity envelope for the state a trial actually starts from.
+///
+/// The envelope is metadata around the existing [`CompositeSnapshot`]; it does
+/// not duplicate checkpoints or grant access to any component. A materializer
+/// must attach owner/trial-scoped receipts before a Memory or Data component is
+/// considered isolated. `snapshot_id` is an address and coordination key;
+/// `snapshot_fingerprint` is the content identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotEnvelope {
+    pub schema_version: u32,
+    /// UUIDv7 address for cross-edge lookup and idempotency.
+    pub snapshot_id: String,
+    pub owner_id: String,
+    pub experiment_id: String,
+    pub trial_id: Option<String>,
+    pub composite: CompositeSnapshot,
+    pub context_snapshot_hash: String,
+    pub policy_snapshot_hash: String,
+    pub snapshot_fingerprint: String,
+}
+
+impl SnapshotEnvelope {
+    /// Wrap a composite snapshot with an owner/trial-scoped immutable identity.
+    /// The envelope address is intentionally separate from the composite's
+    /// existing snapshot index identity; wrapping must not invalidate old
+    /// snapshot diffs or checkpoint references.
+    pub fn new(
+        owner_id: impl Into<String>,
+        experiment_id: impl Into<String>,
+        trial_id: Option<String>,
+        composite: CompositeSnapshot,
+        context_snapshot_hash: impl Into<String>,
+        policy_snapshot_hash: impl Into<String>,
+    ) -> Result<Self, String> {
+        let snapshot_id = Uuid::now_v7().to_string();
+        let mut envelope = Self {
+            schema_version: SNAPSHOT_ENVELOPE_SCHEMA_VERSION,
+            snapshot_id,
+            owner_id: owner_id.into(),
+            experiment_id: experiment_id.into(),
+            trial_id,
+            composite,
+            context_snapshot_hash: context_snapshot_hash.into(),
+            policy_snapshot_hash: policy_snapshot_hash.into(),
+            snapshot_fingerprint: String::new(),
+        };
+        envelope.validate_without_fingerprint()?;
+        envelope.snapshot_fingerprint = envelope.computed_fingerprint()?;
+        Ok(envelope)
+    }
+
+    /// Validate identity and references without asserting external materialization.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_without_fingerprint()?;
+        let computed = self.computed_fingerprint()?;
+        if self.snapshot_fingerprint != computed {
+            return Err(format!(
+                "snapshot fingerprint mismatch: expected {computed}, found {}",
+                self.snapshot_fingerprint
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the envelope against the caller's expected ownership and
+    /// execution binding. This proves identity agreement, not provider-side
+    /// authorization; repositories and materializers must still enforce ACLs.
+    pub fn validate_for(
+        &self,
+        expected_owner_id: &str,
+        expected_experiment_id: &str,
+        expected_trial_id: Option<&str>,
+        expected_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if self.owner_id != expected_owner_id {
+            return Err("snapshot owner does not match the request owner".to_string());
+        }
+        if self.experiment_id != expected_experiment_id {
+            return Err("snapshot experiment does not match the request experiment".to_string());
+        }
+        if self.trial_id.as_deref() != expected_trial_id {
+            return Err("snapshot trial does not match the requested trial".to_string());
+        }
+        if let Some(expected_session_id) = expected_session_id
+            && self.composite.session_id != expected_session_id
+        {
+            return Err("snapshot session does not match the requested session".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn computed_fingerprint(&self) -> Result<String, String> {
+        let mut refs = self
+            .composite
+            .refs
+            .iter()
+            .cloned()
+            .map(|reference| match reference {
+                astra_core::composite_snapshot::SnapshotRef::DataSnapshot(mut data) => {
+                    // A creation timestamp helps operations locate a database
+                    // snapshot, but is not part of its content identity.
+                    data.timestamp = None;
+                    astra_core::composite_snapshot::SnapshotRef::DataSnapshot(data)
+                }
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        refs.sort_by_key(snapshot_ref_rank);
+        let payload = serde_json::json!({
+            "schema_version": self.schema_version,
+            "owner_id": self.owner_id,
+            "experiment_id": self.experiment_id,
+            "trial_id": self.trial_id,
+            "composite": {
+                "session_id": self.composite.session_id,
+                "turn": self.composite.turn,
+                "refs": refs,
+            },
+            "context_snapshot_hash": self.context_snapshot_hash,
+            "policy_snapshot_hash": self.policy_snapshot_hash,
+        });
+        let canonical = astra_core::canonical_json_string(&payload);
+        let digest = Sha256::digest(canonical.as_bytes());
+        Ok(format!("sha256:{digest:x}"))
+    }
+
+    fn validate_without_fingerprint(&self) -> Result<(), String> {
+        if self.schema_version != SNAPSHOT_ENVELOPE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported snapshot envelope schema version {}",
+                self.schema_version
+            ));
+        }
+        let parsed_id = Uuid::parse_str(&self.snapshot_id)
+            .map_err(|error| format!("snapshot_id must be a UUIDv7: {error}"))?;
+        if parsed_id.get_version_num() != 7 {
+            return Err("snapshot_id must be a UUIDv7".to_string());
+        }
+        for (field, value) in [
+            ("owner_id", &self.owner_id),
+            ("experiment_id", &self.experiment_id),
+            ("context_snapshot_hash", &self.context_snapshot_hash),
+            ("policy_snapshot_hash", &self.policy_snapshot_hash),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{field} must not be empty"));
+            }
+        }
+        validate_identifier("experiment_id", &self.experiment_id)?;
+        if let Some(trial_id) = &self.trial_id {
+            if trial_id.is_empty()
+                || trial_id.len() > 128
+                || !trial_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+                })
+            {
+                return Err("trial_id contains an unsupported character".to_string());
+            }
+        }
+        if self.composite.snapshot_id.trim().is_empty() {
+            return Err("composite snapshot_id must not be empty".to_string());
+        }
+        if self.composite.session_id.trim().is_empty() {
+            return Err("composite session_id must not be empty".to_string());
+        }
+        if self.composite.created_at.trim().is_empty() {
+            return Err("composite created_at must not be empty".to_string());
+        }
+        let mut dimensions = HashSet::new();
+        for reference in &self.composite.refs {
+            let dimension = match reference {
+                astra_core::composite_snapshot::SnapshotRef::SessionState(_) => "session",
+                astra_core::composite_snapshot::SnapshotRef::DataSnapshot(_) => "data",
+                astra_core::composite_snapshot::SnapshotRef::MemorySnapshot(_) => "memory",
+                astra_core::composite_snapshot::SnapshotRef::GitCommit(_) => "git",
+                astra_core::composite_snapshot::SnapshotRef::WorkspaceState(_) => "workspace",
+            };
+            if !dimensions.insert(dimension) {
+                return Err(format!("duplicate snapshot dimension `{dimension}`"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_ref_rank(reference: &astra_core::composite_snapshot::SnapshotRef) -> u8 {
+    match reference {
+        astra_core::composite_snapshot::SnapshotRef::SessionState(_) => 0,
+        astra_core::composite_snapshot::SnapshotRef::DataSnapshot(_) => 1,
+        astra_core::composite_snapshot::SnapshotRef::MemorySnapshot(_) => 2,
+        astra_core::composite_snapshot::SnapshotRef::GitCommit(_) => 3,
+        astra_core::composite_snapshot::SnapshotRef::WorkspaceState(_) => 4,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,5 +781,163 @@ mod tests {
         assert!(trials.iter().all(|trial| {
             trial.data_base_snapshot_ref.as_deref() == Some("matrixone:snapshot:42")
         }));
+    }
+
+    fn composite_for_snapshot() -> CompositeSnapshot {
+        CompositeSnapshot {
+            snapshot_id: "legacy-snapshot-id".to_string(),
+            session_id: "trial-session".to_string(),
+            turn: 3,
+            created_at: "2026-09-18T00:00:00Z".to_string(),
+            version: 1,
+            label: Some("eval baseline".to_string()),
+            refs: vec![
+                astra_core::composite_snapshot::SnapshotRef::GitCommit(
+                    "0123456789abcdef".to_string(),
+                ),
+                astra_core::composite_snapshot::SnapshotRef::WorkspaceState(
+                    "trial-session".to_string(),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn snapshot_envelope_uses_uuidv7_and_content_fingerprint() {
+        let envelope = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            Some("trial:sha256:abc".to_string()),
+            composite_for_snapshot(),
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        let id = Uuid::parse_str(&envelope.snapshot_id).unwrap();
+        assert_eq!(id.get_version_num(), 7);
+        assert_eq!(envelope.composite.snapshot_id, "legacy-snapshot-id");
+        assert!(envelope.validate().is_ok());
+        assert!(
+            envelope
+                .validate_for(
+                    "user-a",
+                    "exp-1",
+                    Some("trial:sha256:abc"),
+                    Some("trial-session")
+                )
+                .is_ok()
+        );
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        let restored: SnapshotEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, envelope);
+        assert_eq!(
+            envelope.snapshot_fingerprint,
+            envelope.computed_fingerprint().unwrap()
+        );
+        let mut equivalent_composite = composite_for_snapshot();
+        equivalent_composite.created_at = "2027-01-01T00:00:00Z".to_string();
+        equivalent_composite.version = 99;
+        equivalent_composite.label = Some("another display label".to_string());
+        equivalent_composite.refs.reverse();
+        let equivalent = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            Some("trial:sha256:abc".to_string()),
+            equivalent_composite,
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        assert_eq!(
+            envelope.snapshot_fingerprint, equivalent.snapshot_fingerprint,
+            "address, timestamp, label, version, and ref order are not content identity"
+        );
+    }
+
+    #[test]
+    fn snapshot_envelope_rejects_tampering_and_duplicate_dimensions() {
+        let mut envelope = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            None,
+            composite_for_snapshot(),
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        envelope.context_snapshot_hash = "sha256:changed".to_string();
+        assert!(envelope.validate().unwrap_err().contains("fingerprint"));
+
+        let mut duplicate = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            None,
+            composite_for_snapshot(),
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        duplicate
+            .composite
+            .refs
+            .push(astra_core::composite_snapshot::SnapshotRef::GitCommit(
+                "fedcba9876543210".to_string(),
+            ));
+        duplicate.snapshot_fingerprint = duplicate.computed_fingerprint().unwrap();
+        assert!(duplicate.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn snapshot_envelope_rejects_non_v7_and_foreign_bindings() {
+        let mut envelope = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            None,
+            composite_for_snapshot(),
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        envelope.snapshot_id = Uuid::new_v4().to_string();
+        assert!(envelope.validate().unwrap_err().contains("UUIDv7"));
+
+        let envelope = SnapshotEnvelope::new(
+            "user-a",
+            "exp-1",
+            None,
+            composite_for_snapshot(),
+            "sha256:context",
+            "sha256:policy",
+        )
+        .unwrap();
+        assert!(
+            envelope
+                .validate_for("user-b", "exp-1", None, Some("trial-session"))
+                .unwrap_err()
+                .contains("owner")
+        );
+        assert!(
+            envelope
+                .validate_for("user-a", "other-exp", None, Some("trial-session"))
+                .unwrap_err()
+                .contains("experiment")
+        );
+        assert!(
+            envelope
+                .validate_for(
+                    "user-a",
+                    "exp-1",
+                    Some("trial:other"),
+                    Some("trial-session")
+                )
+                .unwrap_err()
+                .contains("trial")
+        );
+        assert!(
+            envelope
+                .validate_for("user-a", "exp-1", None, Some("other-session"))
+                .unwrap_err()
+                .contains("session")
+        );
     }
 }

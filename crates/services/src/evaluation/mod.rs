@@ -15,7 +15,7 @@ pub use database::DatabaseEvaluationService;
 pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
     EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
-    TrialOrder, TrialUnit,
+    SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
 };
 pub use noop::UnconfiguredEvaluationService;
 pub use service::EvaluationService;

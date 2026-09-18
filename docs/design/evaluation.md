@@ -104,6 +104,16 @@ fail closed when a required branch, snapshot, or isolation receipt is missing.
 `Disabled` means the corresponding memory or data capability is prohibited for
 the trial, not that it may be used without isolation.
 
+Each trial input is addressed by a snapshot envelope. The envelope has a
+UUIDv7 `snapshot_id` for lookup and idempotency, wraps the existing composite
+snapshot references, and stores a canonical `snapshot_fingerprint` over its
+owner, experiment/trial scope, context hash, policy hash, and component refs.
+The UUID and the creation timestamp are metadata; the fingerprint and the
+component references are the evidence of what was frozen. A materialization
+receipt must still prove that an owner/trial-scoped Memory or MatrixOne branch
+was created. A complete-looking envelope without that receipt is unavailable,
+not an isolated execution.
+
 The report must preserve all samples, including failures, cancellations,
 timeouts, unavailable infrastructure, and missing measurements. It may state
 that evidence is insufficient, but must not infer equivalence or causal credit
