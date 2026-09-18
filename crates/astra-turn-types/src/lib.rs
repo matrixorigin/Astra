@@ -231,9 +231,11 @@ pub use turn_provenance::{
     mark_turn_message, turn_message_provenance,
 };
 pub use user_intent::{
-    ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,
-    UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
-    UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
+    AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
+    ResponseSatisfaction, TaskDifficulty, TaskUrgency, TurnAssessment, USER_TURN_SEMANTICS_FIELD,
+    USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback, UserFeedbackKind, UserFeedbackTarget,
+    UserIntentDelivery, UserIntentStatus, UserTurnSemantics, UserTurnSemanticsError,
+    mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
     BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,

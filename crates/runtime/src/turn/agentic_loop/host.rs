@@ -1747,6 +1747,8 @@ fn serialize_invoked_skills<S: serde::Serializer>(
 /// Telemetry and observability state for the agentic loop.
 #[derive(Default)]
 pub struct TelemetryState {
+    /// Conversational evidence and runtime attribution captured before judging.
+    pub turn_intent_context: Option<astra_services::TurnIntentJudgeContext>,
     /// Canonical runtime Explain Analyze facts. Trace records remain in their
     /// own observation pipeline and are never merged into this graph.
     pub explain_analyze_events: Vec<astra_turn_types::ExplainAnalyzeEventV1>,
