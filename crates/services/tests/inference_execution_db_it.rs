@@ -345,6 +345,65 @@ async fn cancelled_inference_recovery_and_settlement_close_their_physical_checko
         .await
         .expect("release settlement blocker");
 
+    finish_inference_invocation(&shared_pool, &admitted, &terminal)
+        .await
+        .expect("finish cancellation-safe terminal fixture");
+    sqlx::query(
+        "INSERT INTO inference_invocation_settlement_debts
+         (user_id, invocation_id, session_id, harness_run_id,
+          terminal_status, terminal_fingerprint, usage_status,
+          provider_delivery_state)
+         SELECT user_id, invocation_id, session_id, harness_run_id,
+                status, terminal_fingerprint, usage_status,
+                provider_delivery_state
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .execute(pool)
+    .await
+    .expect("seed matching terminal cleanup debt");
+    let mut terminal_cleanup_blocker = pool.begin().await.expect("begin terminal cleanup blocker");
+    sqlx::query(
+        "SELECT invocation_id FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(&mut *terminal_cleanup_blocker)
+    .await
+    .expect("lock matching terminal cleanup debt");
+    let held = hold_pool_checkouts(pool, max_connections - 2).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            finish_inference_invocation(&shared_pool, &admitted, &terminal),
+        )
+        .await
+        .is_err(),
+        "idempotent terminal debt cleanup must still be blocked when its caller cancels"
+    );
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+    drop(held);
+    terminal_cleanup_blocker
+        .rollback()
+        .await
+        .expect("release terminal cleanup blocker");
+    finish_inference_invocation(&shared_pool, &admitted, &terminal)
+        .await
+        .expect("retry exact terminal cleanup after cancellation");
+    let terminal_cleanup_debts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(admitted.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count terminal cleanup debts after exact replay");
+    assert_eq!(terminal_cleanup_debts, 0);
+
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 

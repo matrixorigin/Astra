@@ -4957,6 +4957,29 @@ where
     .map(Option::flatten)
 }
 
+async fn existing_terminal_fingerprint_cancellation_safe(
+    db: &sqlx::Pool<sqlx::MySql>,
+    plan: &InferenceInvocationPlan,
+) -> ServiceResult<Option<String>> {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference terminal fingerprint connection",
+                error,
+            )
+        })?;
+    let existing = existing_terminal_fingerprint(connection.connection_mut(), plan).await;
+    match existing {
+        Ok(existing) => {
+            connection.release();
+            Ok(existing)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DurableInferenceTerminal {
     status: String,
@@ -5701,13 +5724,16 @@ pub async fn declare_inference_attempt_settlement(
     .await
 }
 
-async fn clear_inference_settlement_debt(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn clear_inference_settlement_debt<'e, E>(
+    executor: E,
     user_id: &str,
     invocation_id: &str,
     terminal_fingerprint: &str,
-) -> ServiceResult<()> {
-    delete_inference_settlement_debt(db, user_id, invocation_id, terminal_fingerprint)
+) -> ServiceResult<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    delete_inference_settlement_debt(executor, user_id, invocation_id, terminal_fingerprint)
         .await
         .map_err(|error| {
             ServiceError::with_source(
@@ -6902,18 +6928,7 @@ async fn recover_terminal_after_commit_error(
         );
         return Ok(false);
     }
-    let mut connection = CancellationSafePoolConnection::acquire(db)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "acquire inference terminal recovery connection",
-                error,
-            )
-        })?;
-    let existing = existing_terminal_fingerprint(connection.connection_mut(), plan).await;
-    connection.release();
-    let Some(existing) = existing? else {
+    let Some(existing) = existing_terminal_fingerprint_cancellation_safe(db, plan).await? else {
         return Ok(false);
     };
     if existing == fingerprint {
@@ -6938,16 +6953,27 @@ pub async fn finish_inference_invocation(
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let db = pool.get();
-    if let Some(existing) = existing_terminal_fingerprint(db, plan).await? {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference terminal connection",
+                error,
+            )
+        })?;
+    if let Some(existing) = existing_terminal_fingerprint(connection.connection_mut(), plan).await?
+    {
         return if existing == fingerprint {
-            if let Err(error) = clear_inference_settlement_debt(
-                db,
+            let cleanup = clear_inference_settlement_debt(
+                connection.connection_mut(),
                 &plan.input.user_id,
                 &plan.invocation_id,
                 &fingerprint,
             )
-            .await
-            {
+            .await;
+            connection.release();
+            if let Err(error) = cleanup {
                 tracing::warn!(
                     invocation_id = %plan.invocation_id,
                     %error,
@@ -6956,12 +6982,14 @@ pub async fn finish_inference_invocation(
             }
             Ok(())
         } else {
+            connection.release();
             Err(ServiceError::conflict(format!(
                 "inference invocation {} terminal payload conflicts with its durable result",
                 plan.invocation_id
             )))
         };
     }
+    connection.release();
     // The finalization owner explicitly records the logical outcome before it
     // tries to mirror it to `inference_invocations`. Unlike a provider attempt
     // failure, this is a durable declaration that retry policy has finished.
@@ -6980,7 +7008,16 @@ pub async fn finish_inference_invocation(
     )
     .await?;
 
-    let mut tx = db.begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference terminal commit connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference terminal commit",
@@ -7065,7 +7102,8 @@ pub async fn finish_inference_invocation(
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "finish_inference_invocation").await;
-        if let Some(existing) = existing_terminal_fingerprint(db, plan).await? {
+        drop(connection);
+        if let Some(existing) = existing_terminal_fingerprint_cancellation_safe(db, plan).await? {
             return if existing == fingerprint {
                 Ok(())
             } else {
@@ -7085,12 +7123,13 @@ pub async fn finish_inference_invocation(
         return Err(error);
     }
     if let Err(error) = tx.commit().await {
+        drop(connection);
         let commit_error = ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "commit inference terminal state",
             error,
         );
-        if let Some(existing) = existing_terminal_fingerprint(db, plan).await? {
+        if let Some(existing) = existing_terminal_fingerprint_cancellation_safe(db, plan).await? {
             return if existing == fingerprint {
                 Ok(())
             } else {
@@ -7109,6 +7148,7 @@ pub async fn finish_inference_invocation(
         }
         return Err(commit_error);
     }
+    connection.release();
     Ok(())
 }
 
