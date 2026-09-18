@@ -5186,7 +5186,11 @@ pub trait RunStateStore: Send + Sync {
     ///
     /// Shared durable stores should only renew rows still owned by this store
     /// instance and still in one of the expected active statuses. Returning
-    /// `Ok(false)` tells the runtime to stop heartbeating that run.
+    /// `Ok(false)` tells the runtime to stop heartbeating that run. The caller
+    /// owns the semantic deadline: activation uses its bounded admission wait,
+    /// while the heartbeat fences the executor before the durable lease can
+    /// expire. Implementations must remain cancellation-safe when that caller
+    /// deadline drops the renewal future.
     async fn renew_owner_lease(
         &self,
         _user_id: &str,
@@ -21056,26 +21060,20 @@ impl RunStateStore for DatabaseRunStateStore {
         separated.push_unseparated(")");
         query.push(" AND cancellation_requested_at IS NULL");
 
-        let deadline = tokio::time::Instant::now() + RUN_CONTROL_DB_ATTEMPT_TIMEOUT;
-        let mut connection = acquire_cancellation_safe_connection(
-            &self.pool,
-            deadline,
-            "renew_owner_lease_prepare",
-            run_id,
-        )
-        .await?;
-        let result = match tokio::time::timeout_at(
-            deadline,
-            query.build().execute(connection.connection_mut()),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(source)) => {
-                return Err(db_error("renew_owner_lease", run_id, source).to_string());
-            }
-            Err(_) => return Err(bounded_run_control_timeout("renew_owner_lease", run_id)),
-        };
+        // Renewal is already bounded by the caller's lease-aware fence. A
+        // shorter storage-local deadline can reject a healthy renewal while
+        // durable authority is still valid, especially when MatrixOne needs to
+        // hydrate cold object metadata. If the caller's deadline wins, dropping
+        // this guard closes the in-flight physical connection instead of
+        // returning it to the shared pool.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("renew_owner_lease_prepare", run_id, source).to_string())?;
+        let result = query
+            .build()
+            .execute(connection.connection_mut())
+            .await
+            .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
         let renewed = result.rows_affected() > 0;
         connection.release();
         Ok(renewed)
@@ -25886,6 +25884,74 @@ mod tests {
             .expect("read MatrixOne session lock timeout");
         raw.parse()
             .expect("MatrixOne session lock timeout must be an integer")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_owner_lease_renewal_uses_the_callers_lease_fence_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let store = store.with_lease_ttl(Duration::from_secs(30));
+        let nonce = Uuid::new_v4();
+        let user_id = format!("owner-renewal-fence-u-{nonce}");
+        let session_id = format!("owner-renewal-fence-s-{nonce}");
+        let run_id = format!("owner-renewal-fence-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id.clone();
+        store.insert_run(run).await.expect("insert owned run");
+
+        let mut blocker = pool.get().begin().await.expect("begin exact-row blocker");
+        sqlx::query(
+            "SELECT run_id FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+             FOR UPDATE",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .expect("lock the owned run row");
+
+        let renewal_store = store.clone();
+        let renewal_user = user_id.clone();
+        let renewal_session = session_id.clone();
+        let renewal_run = run_id.clone();
+        let renewal = tokio::spawn(async move {
+            renewal_store
+                .renew_owner_lease(
+                    &renewal_user,
+                    &renewal_session,
+                    &renewal_run,
+                    0,
+                    &[STATUS_RUNNING],
+                )
+                .await
+        });
+
+        tokio::time::sleep(RUN_CONTROL_DB_ATTEMPT_TIMEOUT + Duration::from_millis(250)).await;
+        assert!(
+            !renewal.is_finished(),
+            "the generic run-control timeout must not preempt the caller's lease fence"
+        );
+        blocker.rollback().await.expect("release owned run row");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), renewal)
+                .await
+                .expect("renewal must finish after the row lock is released")
+                .expect("join renewal task")
+                .expect("renew owner lease"),
+            "the current owner generation must retain execution authority"
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool.get())
+            .await
+            .expect("clean owner renewal session");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

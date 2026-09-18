@@ -79,7 +79,7 @@ const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
 const RUN_RECOVERY_MAX_CONCURRENCY: usize = 8;
 const RUN_RECOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED];
-const OWNER_LEASE_ACTIVATION_MAX_WAIT: Duration = Duration::from_secs(5);
+const PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT: Duration = Duration::from_secs(5);
 // Lease release only shortens the recovery TTL; it is not a correctness
 // commit. Never let a stalled database release leave one detached task per
 // completed run behind indefinitely.
@@ -1027,9 +1027,12 @@ impl RunEngine {
             .owner_lease_renewal_interval()
             .unwrap_or_else(|| lease_duration / 3)
             .max(Duration::from_millis(1));
+        // Activation is the first lease renewal, so it must use the same
+        // lease-derived deadline as later renewals. A shorter generic database
+        // timeout can reject a healthy owner while its durable lease remains
+        // valid under load.
         let activation_wait = renewal_interval
             .min(lease_duration)
-            .min(OWNER_LEASE_ACTIVATION_MAX_WAIT)
             .max(Duration::from_millis(1));
         let renew = self.store.renew_owner_lease(
             user_id,
@@ -3674,8 +3677,8 @@ impl UserIntentProvider for RunEngine {
         let max_wait = self
             .store
             .owner_lease_duration()
-            .unwrap_or(OWNER_LEASE_ACTIVATION_MAX_WAIT)
-            .min(OWNER_LEASE_ACTIVATION_MAX_WAIT)
+            .unwrap_or(PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT)
+            .min(PROVIDER_BOUNDARY_AUTHORIZATION_MAX_WAIT)
             .max(Duration::from_millis(1));
         let outcome = tokio::time::timeout(
             max_wait,
@@ -4625,6 +4628,46 @@ mod tests {
             .unwrap();
         assert_eq!(durable.status, STATUS_RUNNING);
         assert_eq!(durable.run_generation, authority.owner_generation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execution_activation_uses_the_lease_renewal_deadline() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_secs(15))
+                .with_lease_renewal_behavior(LeaseRenewalBehavior::Delayed(Duration::from_secs(6))),
+        );
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("activation-delayed", "user-1", "session-1")
+            .await
+            .expect("durable admission");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let cancel = cancel.clone();
+            async move {
+                engine
+                    .confirm_execution_authority(
+                        "user-1",
+                        "session-1",
+                        "activation-delayed",
+                        authority.owner_generation,
+                        &cancel,
+                    )
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 1);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            task.await
+                .expect("activation task")
+                .expect("renewal within the lease-derived deadline"),
+            "a renewal slower than the generic five-second database budget must still activate"
+        );
     }
 
     #[tokio::test]
