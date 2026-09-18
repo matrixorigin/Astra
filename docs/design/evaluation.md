@@ -150,3 +150,45 @@ deliberate admission limit for predictable multi-tenant latency; a future
 large-plan scheduler must add explicit batching and pagination before raising
 it. Required Memory or MatrixOne branches are still unavailable until a
 materialization receipt is recorded; registration alone never claims isolation.
+
+## Materialization receipt boundary
+
+Materialization is an append-only evidence boundary between a planned trial
+and an executor. A trusted server-side materializer records one receipt per
+component (`context`, `policy`, `memory`, `data`, or `workspace`) with the
+owner, experiment, trial, Session, spec fingerprint, exact snapshot envelope,
+component address/content identity, branch base when applicable, materializer
+kind, provider/runner binding and generation, outcome, and optional expiry. A
+user-supplied request cannot choose the owner, provider, or runner identity
+through this boundary. The receipt provider binding must equal the frozen
+experiment provider, and `execution_run_id`/`execution_run_generation` must
+equal the bound canonical Run identity. These fields identify the Run
+generation, not an Edge or User Runner capability; a future adapter must add
+its own authenticated capability binding instead of overloading this field.
+
+Receipt writes lock the owner-scoped bound trial in the same transaction. The
+owner and idempotency key are unique; the same request is safe to retry and a
+different request with that key is a conflict. Receipts are never updated or
+selected by recency. A read requires the exact owner, trial, Session, and
+envelope supplied by the consumer, so a second user or session cannot reuse an
+unrelated materialization.
+
+Before execution, the consumer supplies the exact receipt set. The required
+set is derived from the frozen spec: Context and Policy are always required,
+and Memory/Data are required only for their explicit per-trial branch modes.
+The validator rejects missing, duplicate, expired, mismatched, failed,
+unavailable, disabled, or undeclared receipts. Context and Policy receipts
+must carry the frozen content hashes; Memory and Data receipts must carry a
+component content identity, the declared base snapshot, and the corresponding
+snapshot dimension in the envelope. Disabled dimensions never receive a
+synthetic `available` receipt. Replaying an expired registration with the same
+idempotency key returns the original immutable fact, while use of that fact is
+rejected. Until a verified Memory/Data materializer adapter exists, those
+components may record unavailable/failed facts only; an unverified branch
+address cannot be marked available. These receipts prove the recorded
+identity and outcome, while the eventual materializer remains responsible for
+provider ACLs and the executor remains responsible for refusing side effects
+outside the declared profile. The execution-facing validation is a
+point-in-time check: after its transaction commits, the Run generation may
+advance. An executor must carry the returned generation into the canonical Run
+admission/fencing CAS and refuse to start if it changed.

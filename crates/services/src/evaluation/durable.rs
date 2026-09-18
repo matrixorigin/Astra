@@ -69,6 +69,10 @@ pub struct EvaluationTrialBindingRecord {
     pub binding_status: String,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// The canonical Run generation captured while the binding was created.
+    /// Receipts must carry this same generation so a resumed/replaced runner
+    /// cannot reuse an older materialization identity.
+    pub run_generation: Option<u64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -422,7 +426,7 @@ impl DatabaseEvaluationPlanStore {
             )));
         }
         let run_exists = sqlx::query(
-            "SELECT session_id FROM agent_runs
+            "SELECT session_id, run_generation FROM agent_runs
              WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
         )
         .bind(owner_user_id)
@@ -443,10 +447,15 @@ impl DatabaseEvaluationPlanStore {
                 "run {run_id} belongs to another session"
             )));
         }
+        let run_generation = row_i64(&run_row, "run_generation", "validate_evaluation_trial_run")?;
+        let run_generation = u64::try_from(run_generation).map_err(|_| {
+            EvaluationPersistenceError::Conflict(format!("run {run_id} has an invalid generation"))
+        })?;
 
         let row = sqlx::query(
             "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
                     sequence_num, trial_json, binding_status, session_id, run_id,
+                    run_generation,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
              FROM evaluation_trial_bindings
@@ -480,6 +489,11 @@ impl DatabaseEvaluationPlanStore {
             (existing.session_id.as_deref(), existing.run_id.as_deref())
         {
             if existing_session == session_id && existing_run == run_id {
+                if existing.run_generation != Some(run_generation) {
+                    return Err(EvaluationPersistenceError::Conflict(format!(
+                        "run {run_id} generation changed while its evaluation binding was reused"
+                    )));
+                }
                 tx.commit()
                     .await
                     .map_err(|source| EvaluationPersistenceError::Database {
@@ -499,12 +513,15 @@ impl DatabaseEvaluationPlanStore {
         }
         let result = match sqlx::query(
             "UPDATE evaluation_trial_bindings
-             SET binding_status = 'bound', session_id = ?, run_id = ?, updated_at = NOW(6)
+             SET binding_status = 'bound', session_id = ?, run_id = ?, run_generation = ?, updated_at = NOW(6)
              WHERE owner_user_id = ? AND trial_id = ? AND binding_status = 'planned'
-               AND session_id IS NULL AND run_id IS NULL",
+               AND session_id IS NULL AND run_id IS NULL AND run_generation IS NULL",
         )
         .bind(session_id)
         .bind(run_id)
+        .bind(i64::try_from(run_generation).map_err(|_| {
+            EvaluationPersistenceError::InvalidInput("run generation exceeds BIGINT".to_string())
+        })?)
         .bind(owner_user_id)
         .bind(trial_id)
         .execute(&mut *tx)
@@ -531,6 +548,7 @@ impl DatabaseEvaluationPlanStore {
         let bound = sqlx::query(
             "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
                     sequence_num, trial_json, binding_status, session_id, run_id,
+                    run_generation,
                     CAST(created_at AS CHAR) AS created_at,
                     CAST(updated_at AS CHAR) AS updated_at
              FROM evaluation_trial_bindings
@@ -552,6 +570,143 @@ impl DatabaseEvaluationPlanStore {
                 source,
             })?;
         Ok(bound)
+    }
+
+    /// Lock and validate the immutable owner-scoped trial binding for a
+    /// materializer. The caller must keep the transaction open while it
+    /// records a receipt so a receipt can never be attached to a trial that
+    /// is concurrently rebound or partially repaired.
+    pub(crate) async fn lock_bound_trial_for_receipt(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        trial_id: &str,
+        session_id: &str,
+    ) -> Result<
+        (EvaluationExperimentRecord, EvaluationTrialBindingRecord),
+        EvaluationPersistenceError,
+    > {
+        validate_owner(owner_user_id)?;
+        validate_bounded("trial_id", trial_id, MAX_TRIAL_ID_BYTES)?;
+        validate_bounded("session_id", session_id, MAX_SESSION_ID_BYTES)?;
+        // Discover the canonical Run without taking a lock first. The lock
+        // order below then matches bind_trial_run: Session -> Run -> Trial.
+        // That keeps a first bind and a receipt attempt from deadlocking.
+        let trial_run_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT run_id FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND trial_id = ? LIMIT 1",
+        )
+        .bind(owner_user_id)
+        .bind(trial_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "discover_evaluation_trial_run_for_receipt",
+            source,
+        })?;
+        let Some(trial_run_id) = trial_run_id else {
+            return Err(EvaluationPersistenceError::NotFound(format!(
+                "trial {trial_id}"
+            )));
+        };
+        let Some(trial_run_id) = trial_run_id else {
+            return Err(EvaluationPersistenceError::Conflict(format!(
+                "trial {trial_id} is not bound to a canonical run"
+            )));
+        };
+        let session_row = sqlx::query(
+            "SELECT status FROM agent_sessions
+             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(owner_user_id)
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "validate_evaluation_receipt_session",
+            source,
+        })?
+        .ok_or_else(|| EvaluationPersistenceError::NotFound(format!("session {session_id}")))?;
+        if row_string(
+            &session_row,
+            "status",
+            "validate_evaluation_receipt_session",
+        )? != "active"
+        {
+            return Err(EvaluationPersistenceError::Conflict(format!(
+                "session {session_id} is not active"
+            )));
+        }
+        let run_row = sqlx::query(
+            "SELECT session_id, run_generation FROM agent_runs
+             WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(owner_user_id)
+        .bind(&trial_run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "validate_evaluation_receipt_run",
+            source,
+        })?
+        .ok_or_else(|| EvaluationPersistenceError::NotFound(format!("run {trial_run_id}")))?;
+        if row_string(&run_row, "session_id", "validate_evaluation_receipt_run")? != session_id {
+            return Err(EvaluationPersistenceError::Conflict(format!(
+                "run {trial_run_id} belongs to another session"
+            )));
+        }
+        let current_generation = u64::try_from(row_i64(
+            &run_row,
+            "run_generation",
+            "validate_evaluation_receipt_run",
+        )?)
+        .map_err(|_| {
+            EvaluationPersistenceError::Conflict(format!(
+                "run {trial_run_id} has an invalid generation"
+            ))
+        })?;
+        let row = sqlx::query(
+            "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
+                    sequence_num, trial_json, binding_status, session_id, run_id,
+                    run_generation,
+                    CAST(created_at AS CHAR) AS created_at,
+                    CAST(updated_at AS CHAR) AS updated_at
+             FROM evaluation_trial_bindings
+             WHERE owner_user_id = ? AND trial_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(owner_user_id)
+        .bind(trial_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| EvaluationPersistenceError::Database {
+            operation: "lock_evaluation_trial_for_receipt",
+            source,
+        })?;
+        let Some(row) = row else {
+            return Err(EvaluationPersistenceError::NotFound(format!(
+                "trial {trial_id}"
+            )));
+        };
+        let binding = decode_trial_binding(row)?;
+        let experiment = load_experiment_read_tx(tx, owner_user_id, &binding.experiment_id)
+            .await?
+            .ok_or_else(|| {
+                EvaluationPersistenceError::Conflict(format!(
+                    "trial {trial_id} references a missing experiment {}",
+                    binding.experiment_id
+                ))
+            })?;
+        let canonical = canonical_trial_index(&experiment)?;
+        validate_trial_against_experiment(&binding, &experiment, &canonical)?;
+        if binding.binding_status != "bound"
+            || binding.session_id.as_deref() != Some(session_id)
+            || binding.run_id.as_deref() != Some(trial_run_id.as_str())
+            || binding.run_generation != Some(current_generation)
+        {
+            return Err(EvaluationPersistenceError::Conflict(format!(
+                "trial {trial_id} is not bound to the current run generation for session {session_id}"
+            )));
+        }
+        Ok((experiment, binding))
     }
 }
 
@@ -633,7 +788,8 @@ async fn load_trial_bindings_tx(
 ) -> Result<Vec<EvaluationTrialBindingRecord>, EvaluationPersistenceError> {
     let rows = sqlx::query(
         "SELECT owner_user_id, trial_id, experiment_id, spec_fingerprint,
-                sequence_num, trial_json, binding_status, session_id, run_id,
+                    sequence_num, trial_json, binding_status, session_id, run_id,
+                    run_generation,
                 CAST(created_at AS CHAR) AS created_at,
                 CAST(updated_at AS CHAR) AS updated_at
          FROM evaluation_trial_bindings
@@ -752,9 +908,24 @@ fn decode_trial_binding(
                 operation: "decode_evaluation_trial",
                 source,
             })?;
+    let run_generation: Option<i64> =
+        row.try_get("run_generation")
+            .map_err(|source| EvaluationPersistenceError::Database {
+                operation: "decode_evaluation_trial",
+                source,
+            })?;
+    let run_generation = run_generation
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                EvaluationPersistenceError::Conflict(
+                    "persisted evaluation run generation is invalid".to_string(),
+                )
+            })
+        })
+        .transpose()?;
     match binding_status.as_str() {
-        "planned" if session_id.is_none() && run_id.is_none() => {}
-        "bound" if session_id.is_some() && run_id.is_some() => {}
+        "planned" if session_id.is_none() && run_id.is_none() && run_generation.is_none() => {}
+        "bound" if session_id.is_some() && run_id.is_some() && run_generation.is_some() => {}
         "planned" | "bound" => {
             return Err(EvaluationPersistenceError::Conflict(
                 "persisted evaluation trial binding is incomplete".to_string(),
@@ -775,6 +946,7 @@ fn decode_trial_binding(
         binding_status,
         session_id,
         run_id,
+        run_generation,
         created_at: row_string(&row, "created_at", "decode_evaluation_trial")?,
         updated_at: row_string(&row, "updated_at", "decode_evaluation_trial")?,
     })
@@ -945,7 +1117,7 @@ fn validate_persistence_budget(
     Ok(())
 }
 
-fn is_duplicate_key(error: &sqlx::Error) -> bool {
+pub(crate) fn is_duplicate_key(error: &sqlx::Error) -> bool {
     matches!(
         error,
         sqlx::Error::Database(database_error)
@@ -959,6 +1131,15 @@ fn row_string(
     column: &'static str,
     operation: &'static str,
 ) -> Result<String, EvaluationPersistenceError> {
+    row.try_get(column)
+        .map_err(|source| EvaluationPersistenceError::Database { operation, source })
+}
+
+fn row_i64(
+    row: &sqlx::mysql::MySqlRow,
+    column: &'static str,
+    operation: &'static str,
+) -> Result<i64, EvaluationPersistenceError> {
     row.try_get(column)
         .map_err(|source| EvaluationPersistenceError::Database { operation, source })
 }

@@ -2,6 +2,7 @@ pub mod assessment;
 pub mod database;
 pub mod durable;
 pub mod experiment;
+pub mod materialization;
 pub mod noop;
 pub mod service;
 pub mod types;
@@ -21,6 +22,12 @@ pub use experiment::{
     DataIsolation, EXPERIMENT_SCHEMA_VERSION, EvaluationBudget, EvaluationCase, EvaluationTarget,
     EvaluationTargetKind, ExperimentSpec, FrozenConditions, MemoryIsolation, RevisionRef,
     SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialOrder, TrialUnit,
+};
+pub use materialization::{
+    DatabaseMaterializationReceiptStore, MATERIALIZATION_RECEIPT_SCHEMA_VERSION,
+    MaterializationComponentKind, MaterializationOutcome, MaterializationReceiptError,
+    MaterializationReceiptRecord, MaterializationReceiptRequest, MaterializationValidationError,
+    TrustedMaterializerContext, required_components_for_spec, validate_receipt_set,
 };
 pub use noop::UnconfiguredEvaluationService;
 pub use service::EvaluationService;

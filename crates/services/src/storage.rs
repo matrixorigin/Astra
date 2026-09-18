@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-18-v80";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-18-v83";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4179,6 +4179,7 @@ async fn ensure_core_schema_while_leased(
             binding_status VARCHAR(32) NOT NULL DEFAULT 'planned',
             session_id VARCHAR(64) NULL,
             run_id VARCHAR(64) NULL,
+            run_generation BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (owner_user_id, trial_id),
@@ -4191,13 +4192,23 @@ async fn ensure_core_schema_while_leased(
                 CHECK (binding_status IN ('planned', 'bound')),
             CONSTRAINT chk_eval_trial_binding_refs
                 CHECK (
-                    (binding_status = 'planned' AND session_id IS NULL AND run_id IS NULL)
+                    (binding_status = 'planned' AND session_id IS NULL AND run_id IS NULL
+                     AND run_generation IS NULL)
                     OR
-                    (binding_status = 'bound' AND session_id IS NOT NULL AND run_id IS NOT NULL)
+                    (binding_status = 'bound' AND session_id IS NOT NULL AND run_id IS NOT NULL
+                     AND run_generation IS NOT NULL)
                 )
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "evaluation_trial_bindings",
+        "run_generation",
+        "ALTER TABLE evaluation_trial_bindings ADD COLUMN run_generation BIGINT NULL",
+    )
     .await?;
     ensure_index_shape(
         &pool,
@@ -4215,6 +4226,81 @@ async fn ensure_core_schema_while_leased(
         "uq_eval_trial_run",
         &["owner_user_id", "run_id"],
         "ALTER TABLE evaluation_trial_bindings ADD UNIQUE INDEX uq_eval_trial_run (owner_user_id, run_id)",
+    )
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_materialization_receipts",
+        "CREATE TABLE IF NOT EXISTS evaluation_materialization_receipts (
+            schema_version INT NOT NULL DEFAULT 1,
+            owner_user_id VARCHAR(128) NOT NULL,
+            receipt_id VARCHAR(64) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            spec_fingerprint VARCHAR(128) NOT NULL,
+            envelope_id VARCHAR(64) NOT NULL,
+            envelope_fingerprint VARCHAR(128) NOT NULL,
+            component_kind VARCHAR(32) NOT NULL,
+            component_snapshot_ref VARCHAR(2048) NULL,
+            component_base_snapshot_ref VARCHAR(2048) NULL,
+            component_content_fingerprint VARCHAR(128) NULL,
+            outcome VARCHAR(32) NOT NULL,
+            failure_code VARCHAR(128) NULL,
+            materializer_kind VARCHAR(128) NOT NULL,
+            provider_binding_id VARCHAR(128) NULL,
+            execution_run_id VARCHAR(128) NULL,
+            execution_run_generation BIGINT NULL,
+            request_fingerprint VARCHAR(128) NOT NULL,
+            idempotency_key VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            expires_at DATETIME(6) NULL,
+            PRIMARY KEY (owner_user_id, receipt_id),
+            UNIQUE KEY uq_eval_materialization_idempotency
+                (owner_user_id, idempotency_key),
+            INDEX idx_eval_materialization_owner_trial
+                (owner_user_id, trial_id, created_at, receipt_id),
+            INDEX idx_eval_materialization_owner_expiry
+                (owner_user_id, expires_at),
+            CONSTRAINT chk_eval_materialization_outcome
+                CHECK (outcome IN ('available', 'unavailable', 'failed')),
+            CONSTRAINT chk_eval_materialization_component
+                CHECK (component_kind IN ('context', 'policy', 'memory', 'data', 'workspace'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "evaluation_materialization_receipts",
+        "component_base_snapshot_ref",
+        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN component_base_snapshot_ref VARCHAR(2048) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "evaluation_materialization_receipts",
+        "execution_run_id",
+        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN execution_run_id VARCHAR(128) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "evaluation_materialization_receipts",
+        "execution_run_generation",
+        "ALTER TABLE evaluation_materialization_receipts ADD COLUMN execution_run_generation BIGINT NULL",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "evaluation_materialization_receipts",
+        "uq_eval_materialization_idempotency",
+        &["owner_user_id", "idempotency_key"],
+        "ALTER TABLE evaluation_materialization_receipts ADD UNIQUE INDEX uq_eval_materialization_idempotency (owner_user_id, idempotency_key)",
     )
     .await?;
 

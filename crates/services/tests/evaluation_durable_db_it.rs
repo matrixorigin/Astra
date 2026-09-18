@@ -7,10 +7,14 @@
 mod common;
 
 use astra_core::SharedPool;
+use astra_core::composite_snapshot::CompositeSnapshot;
 use astra_services::{
-    ComparisonArm, DataIsolation, DatabaseEvaluationPlanStore, EvaluationBudget, EvaluationCase,
-    EvaluationPersistenceError, EvaluationTarget, EvaluationTargetKind, ExperimentSpec,
-    FrozenConditions, MemoryIsolation, RevisionRef, TrialOrder,
+    ComparisonArm, DataIsolation, DatabaseEvaluationPlanStore, DatabaseMaterializationReceiptStore,
+    EvaluationBudget, EvaluationCase, EvaluationPersistenceError, EvaluationTarget,
+    EvaluationTargetKind, ExperimentSpec, FrozenConditions, MaterializationComponentKind,
+    MaterializationOutcome, MaterializationReceiptError, MaterializationReceiptRequest,
+    MaterializationValidationError, MemoryIsolation, RevisionRef, SnapshotEnvelope, TrialOrder,
+    TrustedMaterializerContext, validate_receipt_set,
 };
 use uuid::Uuid;
 
@@ -92,6 +96,7 @@ async fn insert_run(pool: &SharedPool, owner: &str, session_id: &str) -> String 
 
 async fn cleanup(pool: &SharedPool, owner: &str) {
     for (table, column) in [
+        ("evaluation_materialization_receipts", "owner_user_id"),
         ("evaluation_trial_bindings", "owner_user_id"),
         ("evaluation_experiments", "owner_user_id"),
         ("agent_runs", "user_id"),
@@ -103,6 +108,259 @@ async fn cleanup(pool: &SharedPool, owner: &str) {
             .await
             .expect("clean evaluation test rows");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn materialization_receipts_are_owner_scoped_idempotent_and_fail_closed() {
+    let pool = common::setup_pool().await;
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let receipt_store = DatabaseMaterializationReceiptStore::new(pool.clone());
+    let owner = format!("receipt-owner-a-{}", Uuid::new_v4());
+    let other_owner = format!("receipt-owner-b-{}", Uuid::new_v4());
+    let experiment_id = format!("receipt-exp-{}", Uuid::new_v4().simple());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec(&experiment_id), "receipt-submit")
+        .await
+        .expect("register receipt plan");
+    let trials = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("list receipt trials");
+    let session = insert_session(&pool, &owner).await;
+    let run = insert_run(&pool, &owner, &session).await;
+    let binding = plan_store
+        .bind_trial_run(&owner, &trials[0].trial_id, &session, &run)
+        .await
+        .expect("bind receipt trial");
+    let envelope = SnapshotEnvelope::new(
+        &owner,
+        &experiment.experiment_id,
+        Some(binding.trial_id.clone()),
+        CompositeSnapshot {
+            snapshot_id: format!("composite-{}", Uuid::new_v4()),
+            session_id: session.clone(),
+            turn: 1,
+            created_at: "2026-09-18T00:00:00Z".to_string(),
+            version: 1,
+            label: None,
+            refs: vec![],
+        },
+        "sha256:context",
+        "sha256:tools",
+    )
+    .expect("build receipt envelope");
+    let trusted = TrustedMaterializerContext {
+        owner_user_id: owner.clone(),
+        materializer_kind: "test.materializer".to_string(),
+        provider_binding_id: Some("provider-v1".to_string()),
+        execution_run_id: Some(run.clone()),
+        execution_run_generation: Some(0),
+    };
+    let request = MaterializationReceiptRequest {
+        trial_id: binding.trial_id.clone(),
+        session_id: session.clone(),
+        envelope: envelope.clone(),
+        component_kind: MaterializationComponentKind::Context,
+        component_snapshot_ref: Some("context://snapshot/1".to_string()),
+        component_base_snapshot_ref: None,
+        component_content_fingerprint: Some("sha256:context".to_string()),
+        outcome: MaterializationOutcome::Available,
+        failure_code: None,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        idempotency_key: "receipt-context-1".to_string(),
+    };
+    let first = receipt_store
+        .record_receipt(&trusted, &request)
+        .await
+        .expect("record context receipt");
+    let repeated = receipt_store
+        .record_receipt(&trusted, &request)
+        .await
+        .expect("repeat receipt is idempotent");
+    assert_eq!(first, repeated);
+    assert_eq!(first.owner_user_id, owner);
+    assert_eq!(first.session_id, session);
+    assert_eq!(first.envelope_id, envelope.snapshot_id);
+
+    let loaded = receipt_store
+        .load_receipt(
+            &first.owner_user_id,
+            &first.receipt_id,
+            &first.trial_id,
+            &first.session_id,
+            &envelope,
+        )
+        .await
+        .expect("load exact receipt");
+    assert_eq!(loaded, first);
+    assert!(matches!(
+        receipt_store
+            .load_receipt(
+                &other_owner,
+                &first.receipt_id,
+                &first.trial_id,
+                &first.session_id,
+                &envelope,
+            )
+            .await,
+        Err(MaterializationReceiptError::NotFound(_))
+    ));
+
+    let mut conflicting = request.clone();
+    conflicting.component_snapshot_ref = Some("context://snapshot/changed".to_string());
+    assert!(matches!(
+        receipt_store.record_receipt(&trusted, &conflicting).await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+
+    let policy_request = MaterializationReceiptRequest {
+        trial_id: binding.trial_id.clone(),
+        session_id: session.clone(),
+        envelope: envelope.clone(),
+        component_kind: MaterializationComponentKind::Policy,
+        component_snapshot_ref: Some("policy://snapshot/1".to_string()),
+        component_base_snapshot_ref: None,
+        component_content_fingerprint: Some("sha256:tools".to_string()),
+        outcome: MaterializationOutcome::Available,
+        failure_code: None,
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+        idempotency_key: "receipt-policy-1".to_string(),
+    };
+    let policy = receipt_store
+        .record_receipt(&trusted, &policy_request)
+        .await
+        .expect("record policy receipt");
+
+    let concurrent_key = "receipt-context-race".to_string();
+    let mut concurrent_request = request.clone();
+    concurrent_request.idempotency_key = concurrent_key;
+    let left_store = receipt_store.clone();
+    let right_store = receipt_store.clone();
+    let left_request = concurrent_request.clone();
+    let right_request = concurrent_request.clone();
+    let (left, right) = tokio::join!(
+        left_store.record_receipt(&trusted, &left_request),
+        right_store.record_receipt(&trusted, &right_request),
+    );
+    let left = left.expect("first concurrent receipt succeeds");
+    let right = right.expect("second concurrent receipt is idempotent");
+    assert_eq!(left.receipt_id, right.receipt_id);
+
+    let wrong_session = insert_session(&pool, &owner).await;
+    let mut wrong_session_request = request.clone();
+    wrong_session_request.session_id = wrong_session;
+    assert!(matches!(
+        receipt_store
+            .record_receipt(&trusted, &wrong_session_request)
+            .await,
+        Err(MaterializationReceiptError::Conflict(_))
+    ));
+
+    let now = chrono::Utc::now();
+    assert!(
+        validate_receipt_set(
+            &binding,
+            &experiment.spec,
+            &envelope,
+            &[first.clone(), policy.clone()],
+            now,
+        )
+        .is_ok()
+    );
+    let admitted = receipt_store
+        .validate_receipts_for_execution(
+            &owner,
+            &binding.trial_id,
+            &session,
+            &experiment.spec,
+            &envelope,
+            &[first.receipt_id.clone(), policy.receipt_id.clone()],
+            now,
+        )
+        .await
+        .expect("current generation admits the exact receipt set");
+    assert_eq!(admitted.len(), 2);
+    assert!(matches!(
+        validate_receipt_set(&binding, &experiment.spec, &envelope, &[first.clone()], now,),
+        Err(MaterializationValidationError::MissingComponent(
+            MaterializationComponentKind::Policy
+        ))
+    ));
+
+    // A runner handoff advances the canonical Run generation. A fresh
+    // materialization request from the stale runner is rejected, while a
+    // retry of an already committed idempotency key returns its old fact.
+    sqlx::query(
+        "UPDATE agent_runs SET run_generation = 1
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .expect("advance canonical run generation");
+    let mut stale_request = request.clone();
+    stale_request.idempotency_key = "receipt-stale-generation".to_string();
+    assert!(matches!(
+        receipt_store.record_receipt(&trusted, &stale_request).await,
+        Err(MaterializationReceiptError::Persistence(
+            EvaluationPersistenceError::Conflict(_)
+        ))
+    ));
+    assert!(matches!(
+        receipt_store
+            .validate_receipts_for_execution(
+                &owner,
+                &binding.trial_id,
+                &session,
+                &experiment.spec,
+                &envelope,
+                &[first.receipt_id.clone(), policy.receipt_id.clone()],
+                chrono::Utc::now(),
+            )
+            .await,
+        Err(MaterializationReceiptError::Persistence(
+            EvaluationPersistenceError::Conflict(_)
+        ))
+    ));
+    let old_retry = receipt_store
+        .record_receipt(&trusted, &request)
+        .await
+        .expect("old committed receipt remains idempotent after handoff");
+    assert_eq!(old_retry.receipt_id, first.receipt_id);
+
+    // Registration remains idempotent after the evidence expires; only use
+    // validation rejects the stale receipt. This keeps retries from creating
+    // a second fact or silently refreshing an immutable expiry.
+    sqlx::query(
+        "UPDATE evaluation_materialization_receipts
+         SET expires_at = NOW(6) - INTERVAL 1 SECOND
+         WHERE owner_user_id = ? AND receipt_id = ?",
+    )
+    .bind(&owner)
+    .bind(&left.receipt_id)
+    .execute(pool.get())
+    .await
+    .expect("expire concurrent receipt fixture");
+    let expired_retry = receipt_store
+        .record_receipt(&trusted, &concurrent_request)
+        .await
+        .expect("expired receipt retry remains idempotent");
+    assert_eq!(expired_retry.receipt_id, left.receipt_id);
+    assert!(matches!(
+        validate_receipt_set(
+            &binding,
+            &experiment.spec,
+            &envelope,
+            &[expired_retry, policy],
+            chrono::Utc::now(),
+        ),
+        Err(MaterializationValidationError::Expired { .. })
+    ));
+
+    cleanup(&pool, &owner).await;
+    cleanup(&pool, &other_owner).await;
 }
 
 #[tokio::test]

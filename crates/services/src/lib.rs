@@ -188,13 +188,16 @@ pub use decisions::{
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{
     ASSESSMENT_SCHEMA_VERSION, CausalStrength, ComparisonArm, ComparisonReport, DataIsolation,
-    DatabaseEvaluationPlanStore, DatabaseEvaluationService, EvaluationBudget, EvaluationCase,
-    EvaluationExperimentRecord, EvaluationPersistenceError, EvaluationService, EvaluationTarget,
-    EvaluationTargetKind, EvaluationTrialBindingRecord, EvidenceAvailability, EvidenceKind,
-    EvidenceRef, ExperimentSpec, FrozenConditions, Measurement, MeasurementStatus, MemoryIsolation,
-    RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION, SnapshotEnvelope, TrialObservation, TrialOrder,
-    TrialStatus, TrialUnit, UnconfiguredEvaluationService, build_comparison_for_plan,
-    render_markdown,
+    DatabaseEvaluationPlanStore, DatabaseEvaluationService, DatabaseMaterializationReceiptStore,
+    EvaluationBudget, EvaluationCase, EvaluationExperimentRecord, EvaluationPersistenceError,
+    EvaluationService, EvaluationTarget, EvaluationTargetKind, EvaluationTrialBindingRecord,
+    EvidenceAvailability, EvidenceKind, EvidenceRef, ExperimentSpec, FrozenConditions,
+    MaterializationComponentKind, MaterializationOutcome, MaterializationReceiptError,
+    MaterializationReceiptRecord, MaterializationReceiptRequest, MaterializationValidationError,
+    Measurement, MeasurementStatus, MemoryIsolation, RevisionRef, SNAPSHOT_ENVELOPE_SCHEMA_VERSION,
+    SnapshotEnvelope, TrialObservation, TrialOrder, TrialStatus, TrialUnit,
+    TrustedMaterializerContext, UnconfiguredEvaluationService, build_comparison_for_plan,
+    render_markdown, required_components_for_spec, validate_receipt_set,
 };
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
