@@ -81,7 +81,7 @@ pub enum CandidateChoice {
     Strong,
     Abstain,
 }
-fn feature_key(features: ModelRoutingFeatures) -> String {
+pub(super) fn feature_key(features: ModelRoutingFeatures) -> String {
     serde_json::to_string(&features).expect("finite typed feature schema")
 }
 impl RouterCandidate {
@@ -158,7 +158,7 @@ pub struct RouterTrainingOutput {
 /// Pick the first source by immutable source ID from each connected group before
 /// inspecting label availability. Shared sessions, repos or duplicate keys join
 /// transitively. This avoids treating correlated rounds as independent evidence.
-fn representatives(examples: &[RouterExample]) -> Vec<&RouterExample> {
+pub(super) fn representatives(examples: &[RouterExample]) -> Vec<&RouterExample> {
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         let mut root = i;
         while parent[root] != root {
@@ -227,7 +227,19 @@ fn evaluate(
     }
     result
 }
-fn comparisons(
+pub(super) fn recorded_auto_choice(
+    example: &RouterExample,
+    candidate: &RouterCandidate,
+) -> CandidateChoice {
+    // The online choice also reflects catalog and contract fallbacks that
+    // cannot be reconstructed from the frozen feature snapshot alone.
+    if example.selected_profile_id == candidate.economy.profile_id {
+        CandidateChoice::Economy
+    } else {
+        CandidateChoice::Strong
+    }
+}
+pub(super) fn comparisons(
     examples: &[&RouterExample],
     candidate: &RouterCandidate,
 ) -> BTreeMap<String, PolicyMetrics> {
@@ -242,15 +254,7 @@ fn comparisons(
         ),
         (
             "deterministic_auto".into(),
-            evaluate(examples, |example| {
-                // Preserve the immutable online choice, including catalog and
-                // contract fallbacks that cannot be recovered from features.
-                if example.selected_profile_id == candidate.economy.profile_id {
-                    CandidateChoice::Economy
-                } else {
-                    CandidateChoice::Strong
-                }
-            }),
+            evaluate(examples, |example| recorded_auto_choice(example, candidate)),
         ),
         (
             "learned_candidate".into(),
