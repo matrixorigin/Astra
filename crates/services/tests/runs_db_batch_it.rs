@@ -2012,3 +2012,181 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
         .await
         .expect("clean Explain session");
 }
+
+async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &DurableRunRecord) {
+    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
+    use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
+    let decision = ModelRoutingDecision {
+        schema_version: 1,
+        policy_version: "easy-read-only-v1".into(),
+        policy: AutoModelRoutingPolicy {
+            revision: "test-qualified-v1".into(),
+            economy_offering_id: "economy".into(),
+            strong_offering_id: "strong".into(),
+        },
+        run_id: run.run_id.clone(), session_id: run.session_id.clone(),
+        selected_offering_id: "economy".into(), selected_model: "economy-model".into(),
+        selected_contract_root: "test-contract".into(), input_reference: None,
+        assessment: None, reason: ModelRoutingReason::EasyReadOnly,
+        work_admission: Some(astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#).unwrap()),
+        work_admission_skill_revision: 0,
+    };
+    let event =
+        json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    for (owner, session, generation, status) in [
+        (
+            "wrong-owner",
+            run.session_id.as_str(),
+            run.run_generation,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            "wrong-session",
+            run.run_generation,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            run.session_id.as_str(),
+            run.run_generation + 1,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            run.session_id.as_str(),
+            run.run_generation,
+            "paused",
+        ),
+    ] {
+        assert!(
+            !store
+                .append_events_if_current_generation_and_status(
+                    owner,
+                    session,
+                    &run.run_id,
+                    generation,
+                    &[status],
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let mut invalid = event.clone();
+    invalid["data"]["policy"]["strong_offering_id"] = json!("wrong-baseline");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[invalid],
+            )
+            .await
+            .is_err()
+    );
+    let unchanged = store
+        .load_run(&run.user_id, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.model_offering_id.as_deref(), Some("strong"));
+    assert!(
+        !unchanged
+            .events
+            .iter()
+            .any(|e| e["event_type"] == EVENT_TYPE)
+    );
+    for _ in 0..2 {
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &run.user_id,
+                    &run.session_id,
+                    &run.run_id,
+                    run.run_generation,
+                    &["running"],
+                    std::slice::from_ref(&event),
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let committed = store
+        .load_run(&run.user_id, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.model_offering_id.as_deref(), Some("economy"));
+    assert_eq!(
+        committed.resolved_model_name.as_deref(),
+        Some("economy-model")
+    );
+    assert_eq!(
+        committed
+            .events
+            .iter()
+            .filter(|e| e["event_type"] == EVENT_TYPE)
+            .count(),
+        1
+    );
+    let mut conflict = event;
+    conflict["data"]["selected_offering_id"] = json!("strong");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[conflict],
+            )
+            .await
+            .is_err()
+    );
+    let after = store
+        .load_run(&run.user_id, &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.model_offering_id, committed.model_offering_id);
+    assert_eq!(after.events, committed.events);
+}
+
+#[tokio::test]
+async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
+    let store = astra_services::runs::InMemoryRunStateStore::new();
+    let mut run = durable_run_record(
+        "routing-memory".into(),
+        "routing-user".into(),
+        "routing-session".into(),
+    );
+    run.model_offering_id = Some("strong".into());
+    run.resolved_model_name = Some("strong-model".into());
+    store.insert_run(run.clone()).await.unwrap();
+    assert_auto_model_routing_commit(&store, &run).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
+    let settings = common::require_db_it_env();
+    let db = std::env::var("ASTRA_TEST_DATABASE").expect("explicit test database");
+    assert!(db.starts_with("astra_test_router_") && db.len() > "astra_test_router_".len());
+    assert_eq!(settings.database, db);
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut run = durable_run_record(
+        format!("routing-{id}"),
+        format!("routing-user-{id}"),
+        format!("routing-session-{id}"),
+    );
+    run.model_offering_id = Some("strong".into());
+    run.resolved_model_name = Some("strong-model".into());
+    insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
+    assert_auto_model_routing_commit(store.as_ref(), &run).await;
+}

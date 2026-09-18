@@ -3776,6 +3776,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
         }
     }
+    host.prepare_model_selection(state).await?;
     if let Some(prompt) =
         astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
         && let Some(content) = prompt.get("content").and_then(Value::as_str)

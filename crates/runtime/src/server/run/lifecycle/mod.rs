@@ -3991,6 +3991,7 @@ fn apply_normalized_skill_allowlist(
 /// Build a server-side skill executor that supports both Inline and Fork
 /// execution contexts via [`SkillExecutionRouter`].
 fn build_server_skill_executor(
+    run_engine: &RunEngine,
     matrixone: &MatrixOneSettings,
     encryptor: &Arc<FernetTokenEncryptor>,
     model_service: Option<Arc<dyn ModelService>>,
@@ -4041,6 +4042,7 @@ fn build_server_skill_executor(
     )
     .with_pool(shared_pool.cloned())
     .with_model_service(model_service)
+    .with_run_engine(run_engine.clone())
     .with_default_model(model_override.map(String::from))
     .with_admitted_model_execution(admitted_model_execution.cloned())
     .with_edge_tools(edge_tools.to_vec())
@@ -9979,6 +9981,17 @@ impl AgenticRunLifecycleService {
                 ),
             )
             .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        if request.execution_policy.model_routing
+            == astra_turn_types::model_routing::ModelRoutingMode::Auto
+        {
+            return crate::server::model_execution_admission::admit_auto_model_request(
+                &self.model_service,
+                user_id,
+                request,
+                astra_config::RuntimeConfig::cached().model_routing.clone(),
+            )
+            .await;
+        }
         if request.model_selection_mode == ModelSelectionMode::ServerDefault {
             if request.provider_runtime_authorized
                 || request.model_selection.is_some()
@@ -11782,7 +11795,16 @@ impl AgenticRunLifecycleService {
                 .expect("test_work_admission must satisfy the typed semantic-admission contract");
             builder = builder.with_test_work_admission(decision);
         }
-        builder.build()
+        let mut host = builder.build();
+        if let ModelSelectionMode::Auto(policy) = &request.model_selection_mode {
+            host.configure_model_routing(
+                policy.clone(),
+                self.model_service.clone(),
+                self.run_engine.clone(),
+                request.parts.is_empty() && request.attachments.is_empty(),
+            );
+        }
+        host
     }
 
     fn configure_host_approval_audit_context(
@@ -12160,6 +12182,7 @@ impl AgenticRunLifecycleService {
             }
         });
         let skill_executor = build_server_skill_executor(
+            &self.run_engine,
             &self.matrixone,
             &self.encryptor,
             Some(self.model_service.clone()),
@@ -14105,7 +14128,7 @@ impl AgenticRunLifecycleService {
             .agent_id
             .clone()
             .unwrap_or_else(|| "root-agent".to_string());
-        let persist_ctx = PostLoopPersistContext {
+        let mut persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
             user_id: user_id.clone(),
@@ -14313,6 +14336,9 @@ impl AgenticRunLifecycleService {
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
+                if let Some(model) = loop_state.current_model_identity() {
+                    persist_ctx.model_name = Some(model.to_owned());
+                }
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.settlement_in_progress = true;
                 }
@@ -17362,7 +17388,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .agent_id
             .clone()
             .unwrap_or_else(|| "root-agent".to_string());
-        let persist_ctx = PostLoopPersistContext {
+        let mut persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
             user_id: user_id.clone(),
@@ -17610,6 +17636,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                if let Some(model) = state.current_model_identity() {
+                    persist_ctx.model_name = Some(model.to_owned());
+                }
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.settlement_in_progress = true;
                 }
@@ -20547,8 +20576,9 @@ impl ServerSpawnAgentExecutor {
                 "server dynamic agent executor requires parent run lineage".to_string()
             })?;
 
-        let registry = self.runtime_context_registry.read().await;
-        registry
+        let mut context = {
+            let registry = self.runtime_context_registry.read().await;
+            registry
             .current_context_id_by_run
             .get(parent_run_id)
             .and_then(|context_id| registry.contexts_by_id.get(context_id))
@@ -20557,7 +20587,32 @@ impl ServerSpawnAgentExecutor {
                 format!(
                     "server dynamic agent executor has no runtime context for parent run {parent_run_id}"
                 )
-            })
+            })?
+        };
+        let context_user_id = &context.user_id;
+        if let Some(engine) = &self.run_engine {
+            context.admitted_model_execution =
+                crate::server::model_execution_admission::inherit_routed_execution(
+                    engine,
+                    &context.user_id,
+                    &context.session_id,
+                    parent_run_id,
+                    context.admitted_model_execution.as_ref(),
+                    |id| async move {
+                        astra_services::revalidate_admitted_model_execution(
+                            &self.matrixone,
+                            self.encryptor.as_ref(),
+                            context_user_id,
+                            &id,
+                            self.shared_pool.as_ref().map(SharedPool::get),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .await?;
+        }
+        Ok(context)
     }
 
     /// Publish the child as the next possible parent before its loop starts.

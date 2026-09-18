@@ -560,8 +560,12 @@ function normalizeReflectReport(
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
-    model_selection: modelSelectionToWire(req.modelSelection),
   };
+  if (req.modelSelection === "auto") {
+    body.execution_policy = { model_routing: "auto" };
+  } else {
+    body.model_selection = modelSelectionToWire(req.modelSelection);
+  }
   if (req.parts) body.parts = req.parts;
   if (req.attachments) body.attachments = req.attachments;
   if (req.executionBudget) {

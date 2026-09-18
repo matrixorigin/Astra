@@ -1611,6 +1611,7 @@ fn chat_request_into_data_maps_all_fields() {
             remaining_seconds: 37,
         }),
         execution_policy: ExecutionPolicyRequest {
+            model_routing: Default::default(),
             turn_intent: TurnIntentExecutionPolicy::FixedDefault,
             skill_auto_route: SkillAutoRouteExecutionPolicy::Disabled,
         },

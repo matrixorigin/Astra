@@ -135,3 +135,81 @@ the new request only. Silence and simple continuation are not approval; expresse
 satisfaction is not task success. Dataset creation still requires the consent,
 redaction, lineage, evaluation, and split controls in
 [evaluation-and-learning.md](evaluation-and-learning.md).
+
+## Deterministic Auto selection (stage 3)
+
+Auto is opt-in for primary HTTP chat turns using Server-catalog Offerings.
+Explicit selections and Server-default Work admission retain their existing
+behavior. Configure a qualified pair in the Server's `runtime.toml`:
+
+```toml
+[model_routing]
+revision = "evaluated-pair-v1"
+economy_offering_id = "economy-offering"
+strong_offering_id = "strong-offering"
+```
+
+No policy is enabled by default. The operator must establish the economy
+candidate's lower cost and acceptable task quality for these exact model
+revisions before enabling the pair. This implementation neither infers model
+quality from names/prices nor claims measured savings. The policy revision
+identifies that qualification; a model or pricing change requires re-evaluation.
+
+Send `execution_policy.model_routing = "auto"` without `model_selection`.
+The TypeScript SDK exposes this as `modelSelection: "auto"`. Explicit model
+state combined with Auto is rejected, rather than silently overridden.
+Provider-authorized model gateways, Device models, bound Work requests, and
+fixed-default semantic admission are unsupported for Auto in this stage.
+CLI/Web selectors and WebSocket chat continue to use explicit Offerings.
+
+The configured strong Offering is admitted for the authenticated principal
+first. Auto treats model selection as an explicit semantic-admission boundary:
+it starts or awaits the shared bounded Work-admission request before primary
+inference under the default capacity-aware policy, `boundary_only`, or `always`.
+It reuses an existing decision or in-flight request. `disabled` still suppresses
+the judge, and missing or unusable assessments retain strong. Ordinary non-Auto
+turns retain their existing admission timing. The pure policy
+`easy-read-only-v1` selects economy only for high-confidence `easy` assessments,
+read-only primary execution with no required Work or additional capability,
+and text-only input/history with an exact source binding. Satisfaction and
+urgency do not reduce the quality tier. Absent/uncertain observations and
+unsupported input retain strong; there is no prompt-length or keyword rule.
+
+Economy must be active in the principal's effective catalog, share the strong
+Offering's access identity and execution placement, and pass canonical
+Offering admission. It must preserve provider, generation/reasoning and cache
+contracts and have known context/output limits at least as large as strong.
+Unavailable or incompatible economy candidates retain strong. These
+conservative conditions avoid introducing model-dependent prompt loss in the
+initial policy. Existing request budgets remain in force; no new monetary
+budget guarantee is introduced.
+
+The policy snapshot is retained in run admission metadata. Before primary
+dispatch, a generation-fenced immutable `model_routing_decision` run event
+records the policy/algorithm versions, run/session identities, input-prefix
+reference, assessment, selected Offering/model, contract digest, reason, and
+the complete typed Work-admission decision (including its graph, topology,
+capabilities, and skill revision). The existing fenced run-event transaction
+atomically updates the run's effective Offering/model alongside that immutable
+fact; child admission therefore inherits the same selected identity. There is
+no new table. Failure to persist stops primary inference. Model material, loop invocation
+material, runtime manifest, and model-specific tool policy are
+updated together before context preparation. Dynamic-agent and forked-skill
+executors created during baseline admission refresh inherited execution from
+the durable choice and reauthorize it before use. Endpoints and credentials are
+never stored in the decision. Primary inference ledger records join through
+the owning run and selected Offering; auxiliary judge calls retain their own
+purpose and usage attribution.
+
+One choice governs all primary rounds of the run. Host recovery loads the
+immutable decision and re-admits that Offering, even if the current policy
+has changed. A recovered host restores the saved Work graph, topology, and
+capabilities through the existing semantic owner before primary execution,
+without another judge call or duplicate feedback observation. If no Work
+decision was available at selection, normal semantic admission still runs.
+A changed skill revision invalidates the restored Work decision through the
+existing admission path. Missing decisions on a resumed nonzero round, revoked access,
+malformed facts, and changed model contracts stop execution; they cannot
+silently reroute or replay tool effects. Credential rotation is permitted
+through normal reauthorization. Learned routing, mid-turn escalation, and
+independent child routing remain later stages.

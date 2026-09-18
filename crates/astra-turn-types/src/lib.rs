@@ -36,6 +36,7 @@ mod memory_ranking;
 mod memory_structure;
 mod permission_mode;
 pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionMode};
+pub mod model_routing;
 mod provider_canonical_transition;
 mod provider_contract;
 mod recovery_point;
