@@ -696,6 +696,11 @@ pub struct ModelRequestContextEvent {
     pub schema: String,
     pub stage: ModelRequestEventStage,
     pub identity: ModelRequestIdentity,
+    /// Admitted route attribution, taken from the inference ledger rather
+    /// than caller-supplied diagnostic metadata. Older records have no route
+    /// projection; absence must not be interpreted as a default selection.
+    #[serde(default)]
+    pub route: Option<ModelRequestRoute>,
     pub lineage: ModelRequestLineage,
     pub budget: ModelRequestBudget,
     pub usage: Option<ModelRequestUsage>,
@@ -708,6 +713,21 @@ pub struct ModelRequestContextEvent {
     #[serde(default)]
     pub usage_status: Option<String>,
     pub error_kind: Option<String>,
+}
+
+/// Non-secret linkage between a physical request and its admitted route.
+///
+/// Physical retries share an invocation and route. A new logical invocation
+/// has its own route; this is not an adaptive router decision identifier.
+/// These facts describe execution, not response quality or selection policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRequestRoute {
+    pub route_id: String,
+    pub invocation_id: String,
+    pub upstream_model: String,
+    pub execution_placement: crate::models::ModelExecutionPlacement,
+    pub access_kind: crate::models::ModelAccessKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

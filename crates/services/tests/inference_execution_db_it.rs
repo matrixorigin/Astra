@@ -4661,6 +4661,39 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         .filter(|event| event.stage == astra_services::ModelRequestEventStage::Terminal)
         .count();
     assert_eq!((accepted, terminal), (2, 2));
+    for context in &context_events {
+        let route = context
+            .event
+            .route
+            .as_ref()
+            .expect("admitted route projection");
+        assert_eq!(route.route_id, plan.route_id());
+        assert_eq!(route.invocation_id, plan.invocation_id());
+        assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);
+        assert_eq!(route.access_kind, ModelAccessKind::SelfHosted);
+    }
+    let failed_context = context_events
+        .iter()
+        .find(|event| event.terminal_status.as_deref() == Some("failed"))
+        .expect("failed attempt remains visible");
+    assert_eq!(
+        failed_context.event.usage_status.as_deref(),
+        Some("unavailable")
+    );
+    assert!(failed_context.event.usage.is_none());
+    assert!(failed_context.event.budget.measured_input_tokens.is_none());
+    let missing_usage_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_request_context_events
+         WHERE user_id = ? AND attempt_id = ? AND event_stage = 'terminal'
+           AND input_tokens IS NULL AND output_tokens IS NULL
+           AND cache_read_tokens IS NULL AND cache_creation_tokens IS NULL",
+    )
+    .bind(&user_id)
+    .bind(first_attempt.request_id())
+    .fetch_one(pool)
+    .await
+    .expect("unavailable usage persists as unknown rather than measured zero");
+    assert_eq!(missing_usage_columns, 1);
     let successful_context = context_events
         .iter()
         .find(|event| event.terminal_status.as_deref() == Some("succeeded"))

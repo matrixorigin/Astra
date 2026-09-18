@@ -214,6 +214,54 @@ fallback_available
 failed_at
 ```
 
+## Model request attribution and usage
+
+The inference ledger stores content-free accepted/terminal request diagnostics
+in `model_request_context_events`. These records complement `agent_events` and
+are exposed through the existing owner-scoped request queries and session
+observability projection. They do not require full prompt capture.
+
+`ModelRequestContextEvent.route` projects non-secret facts from the admitted
+inference plan:
+
+```text
+route_id
+invocation_id
+upstream_model
+execution_placement
+access_kind
+```
+
+The adjacent request identity owns the Offering, configured model, purpose,
+session/run/turn/round, and physical request ID. Accepted and terminal events
+must agree on route attribution, including recovery after process failure.
+Older records without this projection deserialize with an unknown route;
+readers must not infer selection policy from a model name or missing field.
+Credentials, owner/admission tokens, endpoint URLs, and raw prompt content do
+not belong in this projection.
+
+Request diagnostics use strict typed readers. Deployments adding route fields
+must upgrade readers and recovery workers before new producers, or drain old
+instances during a coordinated upgrade. Backward reading of stored records
+without route fields does not imply older binaries can read the new projection.
+
+Usage coverage is independent of request outcome:
+
+- `provider_exact`: observed usage is available, including a measured zero.
+  Full-input budget errors and cache-read share may be computed.
+- `provider_partial`: retain observed token lanes, but do not report them as
+  a complete input measurement, budget estimate error, or cache-read share.
+- `unavailable`: usage and measured diagnostic fields are absent. Placeholder
+  zeroes in legacy records are not evidence of zero-token billing.
+
+Accepted events have no provider measurements. Terminal diagnostics with
+unavailable usage store nullable token columns as `NULL`. Aggregate request
+counters still count those attempts; token sums contain only observed usage
+and do not establish complete billing coverage. Consumers estimating cost or
+building learning examples must retain per-request coverage and treat missing
+or expired diagnostics as unknown. Foreground settlement and recovery share
+the same coverage projection.
+
 ## Agent event field requirements
 
 Agent event storage should support the following logical fields, whether physically normalized or stored with indexed metadata:

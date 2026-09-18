@@ -250,7 +250,7 @@ pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,
     ModelRequestComposition, ModelRequestContextEvent, ModelRequestContextRecord,
     ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestLineage,
-    ModelRequestMetricsRow, ModelRequestRolloutStage, ModelRequestTopology,
+    ModelRequestMetricsRow, ModelRequestRolloutStage, ModelRequestRoute, ModelRequestTopology,
     ModelRequestTraceCoverage, ModelRequestUsage, ModelRequestWireComposition,
     aggregate_model_request_metrics, list_model_request_context_events,
     model_request_trace_coverage,

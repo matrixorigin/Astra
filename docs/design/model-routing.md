@@ -43,6 +43,27 @@ trace_event_id
 
 Provider, endpoint, credential, execution placement, and billing owner are resolved Server-side from the selected Offering. A routing policy cannot invent or override them.
 
+## Execution attribution
+
+Routing evaluation must join selection evidence to actual inference execution.
+The canonical inference ledger owns the admitted route, logical invocation,
+physical provider attempts, and their terminal outcomes. Request diagnostics
+project that attribution through `ModelRequestContextEvent.route`; they must
+not construct a second route or credential authority.
+
+A route identifier belongs to a logical invocation, not a whole user turn or
+an adaptive routing decision. Physical retries share its route and invocation
+identifiers while retaining distinct request identifiers. Future adaptive
+decisions must reference these identities explicitly rather than group requests
+by a display model name. Preserve the distinction between the configured model
+name and the model name sent upstream.
+
+Missing selection rationale, historical route attribution, or response-quality
+labels remain unknown. A provider request marked `succeeded` proves transport
+completion under its inference contract; it does not prove task correctness.
+Cost evaluation must respect the usage-coverage contract in
+[observation-plane.md](observation-plane.md#model-request-attribution-and-usage).
+
 ## Escalation
 
 Escalate when:

@@ -8,8 +8,9 @@ use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
-    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology,
-    ModelRequestUsage, ModelRequestWireComposition, compact_model_request_context_scope,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestRoute,
+    ModelRequestTopology, ModelRequestUsage, ModelRequestWireComposition,
+    compact_model_request_context_scope,
 };
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
@@ -62,6 +63,7 @@ pub struct InferenceInvocationPlan {
 pub struct InferenceProviderAttemptPlan {
     attempt_id: String,
     invocation_id: String,
+    route_id: String,
     user_id: String,
     attempt_index: u32,
     provider: String,
@@ -682,6 +684,7 @@ pub fn plan_inference_provider_attempt_with_context(
             ],
         ),
         invocation_id: invocation.invocation_id.clone(),
+        route_id: invocation.route_id.clone(),
         user_id: invocation.input.user_id.clone(),
         attempt_index,
         provider: invocation.input.provider.clone(),
@@ -747,35 +750,8 @@ fn model_request_event(
             "model request accepted events cannot carry terminals and terminal events require one",
         ));
     }
-    let mut budget = attempt.request_context.budget.clone();
-    let usage = terminal.map(|terminal| {
-        let measured = terminal.usage.input.total_input_tokens();
-        budget.measured_input_tokens = Some(measured);
-        budget.usage_source = Some("provider_terminal".to_string());
-        if let Some(estimated) = budget.estimated_input_tokens {
-            let error = i128::from(measured) - i128::from(estimated);
-            budget.estimate_error_tokens =
-                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
-                    i64::MIN
-                } else {
-                    i64::MAX
-                }));
-            budget.estimate_error_ratio =
-                (estimated > 0).then_some(error as f64 / estimated as f64);
-        }
-        ModelRequestUsage {
-            input: terminal.usage.input,
-            output_tokens: terminal.usage.output_tokens,
-        }
-    });
-    let mut cache = attempt.request_context.cache.clone();
-    if let Some(usage) = usage.as_ref() {
-        let total_input_tokens = usage.total_input_tokens();
-        cache.cache_read_share = (total_input_tokens > 0)
-            .then_some(usage.input.cache_read_tokens as f64 / total_input_tokens as f64);
-    }
     let input = &attempt.invocation_input;
-    let event = ModelRequestContextEvent {
+    let mut event = ModelRequestContextEvent {
         schema: MODEL_REQUEST_CONTEXT_SCHEMA.to_string(),
         stage,
         identity: ModelRequestIdentity {
@@ -809,17 +785,38 @@ fn model_request_event(
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: attempt.wire.provider_wire_bytes,
         },
+        route: Some(ModelRequestRoute {
+            route_id: attempt.route_id.clone(),
+            invocation_id: attempt.invocation_id.clone(),
+            upstream_model: input.upstream_model_name.clone(),
+            execution_placement: input.execution_placement,
+            access_kind: input.access_kind,
+        }),
         lineage: attempt.request_context.lineage.clone(),
-        budget,
-        usage,
+        budget: attempt.request_context.budget.clone(),
+        usage: None,
         composition: attempt.request_context.composition.clone(),
         wire_composition: attempt.wire.composition.clone(),
-        cache,
+        cache: attempt.request_context.cache.clone(),
         compaction: attempt.request_context.compaction.clone(),
         terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
         usage_status: terminal.map(|terminal| terminal.usage_status.as_str().to_string()),
         error_kind: terminal.and_then(|terminal| terminal.error_kind.clone()),
     };
+    // Surface diagnostics are not provider measurements. Clear any stale
+    // derived values even on the accepted record, before a response exists.
+    clear_model_request_measured_usage(&mut event);
+    if let Some(terminal) = terminal {
+        apply_model_request_terminal_usage(
+            &mut event,
+            ModelRequestUsage {
+                input: terminal.usage.input,
+                output_tokens: terminal.usage.output_tokens,
+            },
+            terminal.usage_status.as_str(),
+            "provider_terminal",
+        )?;
+    }
     let event_json = serde_json::to_string(&event).map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Internal,
@@ -829,6 +826,56 @@ fn model_request_event(
     })?;
     let event_id = hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]);
     Ok((event_id, event_json, event))
+}
+
+fn clear_model_request_measured_usage(event: &mut ModelRequestContextEvent) {
+    event.usage = None;
+    event.budget.measured_input_tokens = None;
+    event.budget.usage_source = None;
+    event.budget.estimate_error_tokens = None;
+    event.budget.estimate_error_ratio = None;
+    event.cache.cache_read_share = None;
+}
+
+/// Foreground settlement and recovery must project the same usage coverage.
+/// Partial usage is useful evidence, but cannot measure a full-request budget
+/// error or cache-hit share. Unavailable usage is not measured zero usage.
+fn apply_model_request_terminal_usage(
+    event: &mut ModelRequestContextEvent,
+    usage: ModelRequestUsage,
+    usage_status: &str,
+    source: &str,
+) -> ServiceResult<()> {
+    let exact = match usage_status {
+        "provider_exact" => true,
+        "provider_partial" | "unavailable" => false,
+        _ => return Err(ServiceError::conflict("unknown model request usage status")),
+    };
+    clear_model_request_measured_usage(event);
+    event.usage_status = Some(usage_status.to_string());
+    if usage_status == "unavailable" {
+        return Ok(());
+    }
+    if exact {
+        let measured = usage.total_input_tokens();
+        event.budget.measured_input_tokens = Some(measured);
+        event.budget.usage_source = Some(source.to_string());
+        if let Some(estimated) = event.budget.estimated_input_tokens {
+            let error = i128::from(measured) - i128::from(estimated);
+            event.budget.estimate_error_tokens =
+                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }));
+            event.budget.estimate_error_ratio =
+                (estimated > 0).then_some(error as f64 / estimated as f64);
+        }
+        event.cache.cache_read_share =
+            (measured > 0).then_some(usage.input.cache_read_tokens as f64 / measured as f64);
+    }
+    event.usage = Some(usage);
+    Ok(())
 }
 
 async fn insert_model_request_context_event(
@@ -972,7 +1019,10 @@ async fn insert_model_request_context_event_with_expiry(
             compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
         }
     }
-    if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
+    // Count every terminal request, including failures with unavailable
+    // usage. Token sums contain observed usage only; coverage remains in the
+    // per-request usage_status and must be checked before estimating cost.
+    if let Some(status) = event.terminal_status.as_deref() {
         sqlx::query(
             "INSERT INTO model_request_metric_shards
              (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -995,19 +1045,19 @@ async fn insert_model_request_context_event_with_expiry(
         .bind(&event.identity.inference_purpose)
         .bind(status)
         .bind(checked_i64(
-            usage.total_input_tokens(),
+            usage.map_or(0, ModelRequestUsage::total_input_tokens),
             "model request metric input_tokens",
         )?)
         .bind(checked_i64(
-            usage.output_tokens,
+            usage.map_or(0, |usage| usage.output_tokens),
             "model request metric output_tokens",
         )?)
         .bind(checked_i64(
-            usage.input.cache_read_tokens,
+            usage.map_or(0, |usage| usage.input.cache_read_tokens),
             "model request metric cache_read_tokens",
         )?)
         .bind(checked_i64(
-            usage.input.cache_creation_tokens,
+            usage.map_or(0, |usage| usage.input.cache_creation_tokens),
             "model request metric cache_creation_tokens",
         )?)
         .execute(&mut *connection)
@@ -1088,23 +1138,13 @@ async fn insert_recovered_model_request_terminal_tx(
         ),
         output_tokens,
     };
-    let measured = usage.total_input_tokens();
-    event.budget.measured_input_tokens = Some(measured);
-    event.budget.usage_source = Some("provider_terminal_recovery".to_string());
-    if let Some(estimated) = event.budget.estimated_input_tokens {
-        let error = i128::from(measured) - i128::from(estimated);
-        event.budget.estimate_error_tokens =
-            Some(i64::try_from(error).unwrap_or(if error.is_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            }));
-        event.budget.estimate_error_ratio =
-            (estimated > 0).then_some(error as f64 / estimated as f64);
-    }
-    event.cache.cache_read_share =
-        (measured > 0).then_some(usage.input.cache_read_tokens as f64 / measured as f64);
-    event.usage = Some(usage.clone());
+    apply_model_request_terminal_usage(
+        &mut event,
+        usage,
+        &terminal.usage_status,
+        "provider_terminal_recovery",
+    )
+    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     event.terminal_status = Some(terminal.status.clone());
     event.usage_status = Some(terminal.usage_status.clone());
     event.error_kind = terminal.error_kind.clone();
@@ -1114,11 +1154,15 @@ async fn insert_recovered_model_request_terminal_tx(
         "mrctx",
         &[attempt_id, ModelRequestEventStage::Terminal.as_str()],
     );
-    let total_input_tokens = terminal
-        .input_tokens
-        .checked_add(terminal.cache_read_tokens)
-        .and_then(|total| total.checked_add(terminal.cache_creation_tokens))
-        .ok_or_else(|| sqlx::Error::Protocol("recovered input token total overflow".to_string()))?;
+    let observed_usage = event.usage.as_ref();
+    let total_input_tokens = checked_optional_i64(
+        observed_usage.map(ModelRequestUsage::total_input_tokens),
+        "recovered model request input tokens",
+    )
+    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    let output_tokens = observed_usage.map(|_| terminal.output_tokens);
+    let cache_read_tokens = observed_usage.map(|_| terminal.cache_read_tokens);
+    let cache_creation_tokens = observed_usage.map(|_| terminal.cache_creation_tokens);
     let existing_terminal = sqlx::query(
         "SELECT event_json FROM model_request_context_events
          WHERE event_id = ? FOR UPDATE",
@@ -1130,12 +1174,16 @@ async fn insert_recovered_model_request_terminal_tx(
         let existing_json = existing_terminal.try_get::<String, _>("event_json")?;
         let existing_event = serde_json::from_str::<ModelRequestContextEvent>(&existing_json)
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        let exact_usage = existing_event.usage.as_ref().is_some_and(|existing| {
-            existing.input.fresh_input_tokens == fresh_input_tokens
-                && existing.input.cache_read_tokens == cache_read_tokens
-                && existing.input.cache_creation_tokens == cache_creation_tokens
-                && existing.output_tokens == output_tokens
-        });
+        // Older unavailable-usage events stored placeholder zero buckets.
+        // Coverage, rather than those placeholders, is the durable fact.
+        let exact_usage = if terminal.usage_status == "unavailable" {
+            existing_event.usage.is_none()
+                || existing_event.usage.as_ref().is_some_and(|usage| {
+                    usage.total_input_tokens() == 0 && usage.output_tokens == 0
+                })
+        } else {
+            existing_event.usage == event.usage
+        };
         let exact_terminal = existing_event.stage == ModelRequestEventStage::Terminal
             && existing_event.terminal_status.as_deref() == Some(terminal.status.as_str())
             && existing_event.usage_status.as_deref() == Some(terminal.usage_status.as_str())
@@ -1150,33 +1198,43 @@ async fn insert_recovered_model_request_terminal_tx(
             )))
         };
     }
-    sqlx::query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO model_request_context_events
          (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(event_id)
-    .bind(user_id)
-    .bind(attempt_id)
-    .bind(invocation_id)
-    .bind(event.identity.session_id.as_deref())
-    .bind(event.identity.run_id.as_deref())
-    .bind(event.identity.harness_run_id.as_deref())
-    .bind(&terminal.status)
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(&model_family)
-    .bind(&event.identity.inference_purpose)
-    .bind(total_input_tokens)
-    .bind(terminal.output_tokens)
-    .bind(terminal.cache_read_tokens)
-    .bind(terminal.cache_creation_tokens)
-    .bind(event_json)
-    .execute(&mut *connection)
-    .await?;
+        [
+            event.identity.session_id.is_some(),
+            event.identity.run_id.is_some(),
+            event.identity.harness_run_id.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+            observed_usage.is_some(),
+        ],
+    );
+    sqlx::query(&insert_sql)
+        .bind(event_id)
+        .bind(user_id)
+        .bind(attempt_id)
+        .bind(invocation_id)
+        .bind(event.identity.session_id.as_deref())
+        .bind(event.identity.run_id.as_deref())
+        .bind(event.identity.harness_run_id.as_deref())
+        .bind(&terminal.status)
+        .bind(event.identity.topology.as_str())
+        .bind(&event.identity.provider)
+        .bind(&model_family)
+        .bind(&event.identity.inference_purpose)
+        .bind(total_input_tokens)
+        .bind(output_tokens)
+        .bind(cache_read_tokens)
+        .bind(cache_creation_tokens)
+        .bind(event_json)
+        .execute(&mut *connection)
+        .await?;
     sqlx::query(
         "INSERT INTO model_request_metric_shards
          (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -1197,10 +1255,10 @@ async fn insert_recovered_model_request_terminal_tx(
     .bind(model_family)
     .bind(&event.identity.inference_purpose)
     .bind(&terminal.status)
-    .bind(total_input_tokens)
-    .bind(terminal.output_tokens)
-    .bind(terminal.cache_read_tokens)
-    .bind(terminal.cache_creation_tokens)
+    .bind(total_input_tokens.unwrap_or(0))
+    .bind(output_tokens.unwrap_or(0))
+    .bind(cache_read_tokens.unwrap_or(0))
+    .bind(cache_creation_tokens.unwrap_or(0))
     .execute(&mut *connection)
     .await?;
     Ok(())
@@ -7983,6 +8041,14 @@ mod tests {
                 .expect("terminal event");
 
         assert_ne!(accepted_id, terminal_id);
+        let route = accepted.route.as_ref().expect("admitted route attribution");
+        assert_eq!(route.route_id, invocation.route_id());
+        assert_eq!(route.invocation_id, invocation.invocation_id());
+        assert_eq!(route.upstream_model, "provider-model-1");
+        assert_eq!(accepted.identity.model, "model-1");
+        assert_eq!(route.access_kind, ModelAccessKind::SelfHosted);
+        assert_eq!(route.execution_placement, ModelExecutionPlacement::Server);
+        assert_eq!(accepted.route, terminal_event.route);
         assert!(accepted.usage.is_none());
         assert!(accepted.usage_status.is_none());
         assert_eq!(terminal_event.identity.physical_attempt, 2);
@@ -8005,6 +8071,9 @@ mod tests {
         );
         assert_eq!(terminal_event.wire_composition.system_bytes, 100);
         assert!(!accepted_json.contains("provider-response"));
+        assert!(!accepted_json.contains(&invocation.admission_token));
+        assert!(!accepted_json.contains(&invocation.owner_token));
+        assert!(!accepted_json.contains(&attempt.admission_token));
         assert!(terminal_json.contains(MODEL_REQUEST_CONTEXT_SCHEMA));
 
         for status in [
@@ -8027,5 +8096,170 @@ mod tests {
                 Some(1_000)
             );
         }
+    }
+
+    #[test]
+    fn model_request_event_route_links_retries_without_merging_invocations() {
+        let invocation = plan_inference_invocation(input()).expect("invocation");
+        let wire = InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            100,
+        )
+        .expect("wire");
+        let first = plan_inference_provider_attempt(&invocation, 0, wire.clone());
+        let retry = plan_inference_provider_attempt(&invocation, 1, wire.clone());
+        let (_, _, first_event) =
+            model_request_event(&first, ModelRequestEventStage::Accepted, None).unwrap();
+        let (_, _, retry_event) =
+            model_request_event(&retry, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(
+            first_event.identity.request_id,
+            retry_event.identity.request_id
+        );
+        assert_eq!(first_event.route, retry_event.route);
+
+        let mut next_input = input();
+        next_input.scope = InferenceInvocationScope::Run {
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            turn: 3,
+            round: 2,
+            operation_id: "agent_turn".into(),
+            logical_attempt: 1,
+        };
+        let next = plan_inference_invocation(next_input).unwrap();
+        let next_attempt = plan_inference_provider_attempt(&next, 0, wire.clone());
+        let (_, _, next_event) =
+            model_request_event(&next_attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(first_event.route, next_event.route);
+
+        let mut other_owner = input();
+        other_owner.user_id = "user-2".into();
+        let other = plan_inference_invocation(other_owner).unwrap();
+        let other_attempt = plan_inference_provider_attempt(&other, 0, wire);
+        let (_, _, other_event) =
+            model_request_event(&other_attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert_ne!(first_event.route, other_event.route);
+    }
+
+    #[test]
+    fn model_request_event_preserves_missing_legacy_route_as_unknown() {
+        let invocation = plan_inference_invocation(input()).unwrap();
+        let attempt = plan_inference_provider_attempt(
+            &invocation,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                100,
+            )
+            .unwrap(),
+        );
+        let (_, encoded, _) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        legacy.as_object_mut().unwrap().remove("route");
+        let decoded: ModelRequestContextEvent = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.route.is_none());
+        assert_eq!(decoded.identity.offering_id, "offer-1");
+        assert_eq!(decoded.schema, MODEL_REQUEST_CONTEXT_SCHEMA);
+    }
+
+    #[test]
+    fn model_request_event_usage_distinguishes_unknown_partial_and_measured_zero() {
+        let invocation = plan_inference_invocation(input()).unwrap();
+        let mut seed = ModelRequestContextSeed::server_default();
+        seed.budget.estimated_input_tokens = Some(100);
+        // Caller diagnostics must not fabricate provider measurements.
+        seed.budget.measured_input_tokens = Some(999);
+        seed.budget.estimate_error_tokens = Some(899);
+        seed.budget.estimate_error_ratio = Some(8.99);
+        seed.cache.cache_read_share = Some(0.9);
+        let attempt = plan_inference_provider_attempt_with_context(
+            &invocation,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                100,
+            )
+            .unwrap(),
+            seed,
+        );
+        let (_, _, accepted) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
+        assert!(accepted.budget.measured_input_tokens.is_none());
+        assert!(accepted.cache.cache_read_share.is_none());
+
+        for status in [
+            InferenceUsageStatus::Unavailable,
+            InferenceUsageStatus::ProviderPartial,
+            InferenceUsageStatus::ProviderExact,
+        ] {
+            let terminal = InferenceInvocationTerminal {
+                status: InferenceTerminalStatus::Failed,
+                usage: InferenceUsage::default(),
+                usage_status: status,
+                provider_response_id: None,
+                error_kind: Some("transport".into()),
+                error_message: None,
+            };
+            let (_, _, event) =
+                model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
+                    .unwrap();
+            assert_eq!(event.usage_status.as_deref(), Some(status.as_str()));
+            assert_eq!(
+                event.usage.is_none(),
+                status == InferenceUsageStatus::Unavailable
+            );
+            assert_eq!(
+                event.budget.measured_input_tokens,
+                (status == InferenceUsageStatus::ProviderExact).then_some(0),
+            );
+            assert_eq!(
+                event.budget.estimate_error_tokens,
+                (status == InferenceUsageStatus::ProviderExact).then_some(-100),
+            );
+            assert!(event.cache.cache_read_share.is_none());
+            assert_eq!(event.route, accepted.route);
+
+            // Recovery uses the same projection from the persisted accepted
+            // record; it must preserve route attribution and usage coverage.
+            let mut recovered = accepted.clone();
+            apply_model_request_terminal_usage(
+                &mut recovered,
+                ModelRequestUsage {
+                    input: terminal.usage.input,
+                    output_tokens: terminal.usage.output_tokens,
+                },
+                status.as_str(),
+                "provider_terminal_recovery",
+            )
+            .unwrap();
+            assert_eq!(recovered.usage, event.usage);
+            assert_eq!(
+                recovered.budget.measured_input_tokens,
+                event.budget.measured_input_tokens
+            );
+            assert_eq!(recovered.route, event.route);
+        }
+        let partial = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(25, 50, 0),
+                output_tokens: 10,
+            },
+            usage_status: InferenceUsageStatus::ProviderPartial,
+            provider_response_id: None,
+            error_kind: None,
+            error_message: None,
+        };
+        let (_, _, event) =
+            model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&partial))
+                .unwrap();
+        assert_eq!(event.usage.as_ref().unwrap().total_input_tokens(), 75);
+        assert!(event.budget.estimate_error_ratio.is_none());
+        assert!(event.cache.cache_read_share.is_none());
     }
 }
