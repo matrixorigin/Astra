@@ -414,6 +414,7 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                         | "run_interrupted"
                         | "run_waiting"
                         | "run_finished"
+                        | "evaluation_skill_invoked"
                         // Keep reasoning/thinking completion markers, not raw
                         // chain-of-thought content or incremental deltas.
                         | "reasoning_done"
@@ -515,6 +516,7 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 // reasoning_message_content remains live-only.
                 | "reasoning_done"
                 | "thinking_done"
+                | "evaluation_skill_invoked"
         )
     )
 }

@@ -35,6 +35,135 @@ fn evaluation_trial_status_keeps_terminal_run_meanings_distinct() {
     }
 }
 
+#[test]
+fn evaluation_skill_invocation_evidence_requires_the_admitted_revision() {
+    let svc = test_service();
+    let request = test_request("invoke the pinned skill");
+    let mut state =
+        svc.build_initial_state("owner-a", &request, "session-a", "run-a", None, None, None);
+    let revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: "review-skill".to_string(),
+        revision_id: "skill-version-1".to_string(),
+        content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+    };
+    let admission = EvaluationRunAdmission {
+        experiment_id: "experiment-a".to_string(),
+        trial_id: "trial-a".to_string(),
+        input_content_hash: revision.content_hash.clone(),
+        revision_content_hash: revision.content_hash.clone(),
+        skill_revision: Some(revision.clone()),
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    };
+    assert!(evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1).is_none());
+
+    state.skills.execution.invoked.insert(
+        "other-skill".to_string(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: "other-skill".to_string(),
+            content: "wrong revision".to_string(),
+            invoked_at_turn: 1,
+            reentry_count: 0,
+            execution_topology: None,
+        },
+    );
+    assert!(evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1).is_none());
+
+    state.skills.execution.invoked.insert(
+        "review".to_string(),
+        crate::turn::skill_tool::InvokedSkill {
+            name: "review".to_string(),
+            content: "pinned instructions".to_string(),
+            invoked_at_turn: 2,
+            reentry_count: 1,
+            execution_topology: None,
+        },
+    );
+    let pinned_revision = astra_services::UserSkillVersionRecord {
+        version_id: "skill-version-1".to_string(),
+        source_id: "skill-source-1".to_string(),
+        owner_user_id: "owner-a".to_string(),
+        skill_name: "review-skill".to_string(),
+        version: "1.0.0".to_string(),
+        manifest_json: json!({
+            "name": "review-skill",
+            "execution_context": "inline",
+            "aliases": ["review"],
+        }),
+        content_markdown: "pinned instructions".to_string(),
+        content_hash: revision.content_hash.clone(),
+        normalize_version: "v1".to_string(),
+        token_estimate: 2,
+        status: "published".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    let pinned =
+        crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(&pinned_revision)
+            .expect("pinned resolver");
+    state.skills.resolver = Some(Arc::new(pinned));
+    let event = evaluation_skill_invocation_event(Some(&admission), &state, "run-a", 1)
+        .expect("alias invocation should still identify the admitted revision");
+    assert_eq!(event["event_type"], "evaluation_skill_invoked");
+    assert_eq!(event["data"]["skill_name"], "review-skill");
+    assert_eq!(event["data"]["invoked_name"], "review");
+    assert_eq!(event["data"]["revision_id"], "skill-version-1");
+}
+
+#[test]
+fn evaluation_skill_revision_matching_recomputes_stored_content_identity() {
+    let manifest = json!({
+        "name": "review-skill",
+        "execution_context": "inline",
+    });
+    let content = "pinned instructions";
+    let content_hash = astra_services::skill_md_content_hash(&manifest, content);
+    let expected = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: "review-skill".to_string(),
+        revision_id: "skill-version-1".to_string(),
+        content_hash: content_hash.clone(),
+    };
+    let revision = astra_services::UserSkillVersionRecord {
+        version_id: expected.revision_id.clone(),
+        source_id: "skill-source-1".to_string(),
+        owner_user_id: "owner-a".to_string(),
+        skill_name: expected.skill_name.clone(),
+        version: "1.0.0".to_string(),
+        manifest_json: manifest,
+        content_markdown: content.to_string(),
+        content_hash: content_hash.clone(),
+        normalize_version: "v1".to_string(),
+        token_estimate: 2,
+        status: "published".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    assert!(evaluation_skill_revision_matches(
+        &revision,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
+
+    let mut tampered_content = revision.clone();
+    tampered_content.content_markdown.push_str(" changed");
+    assert!(!evaluation_skill_revision_matches(
+        &tampered_content,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
+    let mut tampered_manifest = revision;
+    tampered_manifest.manifest_json["description"] = json!("changed");
+    assert!(!evaluation_skill_revision_matches(
+        &tampered_manifest,
+        "owner-a",
+        &expected,
+        &content_hash,
+    ));
+}
+
 fn complete_tool_ledger_receipt(
     run_id: &str,
     attempted: u32,
@@ -8572,6 +8701,152 @@ async fn spawn_terminal_test_llm() -> TerminalTestLlm {
     }
 }
 
+/// Real HTTP provider fixture for the Skill evaluation harness. The first
+/// request emits an OpenAI-compatible `skill` tool call and the next request
+/// returns the final answer, proving that the resolver crossed the ordinary
+/// agentic loop rather than only being present in admission metadata.
+async fn spawn_skill_invoking_test_llm(skill_name: &str) -> TerminalTestLlm {
+    use axum::{Router, extract::State, response::IntoResponse, routing::post};
+
+    let skill_name = skill_name.to_string();
+    async fn chat_completions(
+        State((skill_name, requests)): State<(String, Arc<AtomicUsize>)>,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        requests.fetch_add(1, Ordering::SeqCst);
+        let stream = request.get("stream").and_then(Value::as_bool) == Some(true);
+        let messages = request.get("messages").and_then(Value::as_array);
+        let has_tool_result = messages.is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        });
+        let has_skill_tool = request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.pointer("/function/name").and_then(Value::as_str) == Some("skill")
+                })
+            });
+        if has_tool_result {
+            let skill_result = messages
+                .and_then(|messages| {
+                    messages.iter().rev().find_map(|message| {
+                        (message.get("role").and_then(Value::as_str) == Some("tool"))
+                            .then(|| message.get("content").and_then(Value::as_str))
+                            .flatten()
+                    })
+                })
+                .unwrap_or_default();
+            let answer = if skill_result.contains("SKILL_NEXT") {
+                "skill-result-candidate"
+            } else if skill_result.contains("SKILL_OK") {
+                "skill-result-baseline"
+            } else {
+                "skill-result-unknown"
+            };
+            if stream {
+                let delta = json!({"choices":[{"delta":{"content":answer}}]});
+                let terminal = json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":9,"completion_tokens":3}
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 3}
+            }))
+            .into_response();
+        }
+        if !has_skill_tool {
+            let content = r#"{"communicative_act":"task","objective_relation":"replace","work_lifecycle":"not_required","workspace_mutation":"read_only"}"#;
+            if stream {
+                let delta = json!({"choices":[{"delta":{"content":content}}]});
+                let terminal = json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1}
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+            }))
+            .into_response();
+        }
+        {
+            let arguments = json!({
+                "skill_name": skill_name,
+            })
+            .to_string();
+            if stream {
+                let delta = json!({
+                    "choices": [{"delta": {"role": "assistant", "tool_calls": [{
+                        "index": 0,
+                        "id": "skill-eval-call",
+                        "type": "function",
+                        "function": {"name": "skill", "arguments": arguments}
+                    }]}, "finish_reason": "tool_calls"}]
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {delta}\n\ndata: [DONE]\n\n"),
+                )
+                    .into_response();
+            }
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "skill-eval-call",
+                            "type": "function",
+                            "function": {
+                                "name": "skill",
+                                "arguments": arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2}
+            }))
+            .into_response();
+        }
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state((skill_name, requests.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Skill evaluation test LLM");
+    let addr = listener
+        .local_addr()
+        .expect("Skill evaluation test LLM address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve Skill evaluation test LLM");
+    });
+    TerminalTestLlm {
+        base_url: format!("http://{addr}/v1"),
+        requests,
+        server,
+    }
+}
+
 async fn spawn_incremental_terminal_test_llm(terminal_delay: Duration) -> TerminalTestLlm {
     use axum::{
         Router,
@@ -10080,7 +10355,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         schema_version: 1,
         experiment_id: experiment_id.clone(),
         target: astra_services::evaluation::EvaluationTarget {
-            kind: astra_services::evaluation::EvaluationTargetKind::Skill,
+            kind: astra_services::evaluation::EvaluationTargetKind::Prompt,
             baseline: astra_services::evaluation::RevisionRef {
                 revision_id: "revision-baseline".to_string(),
                 content_hash: revision_hash.clone(),
@@ -10133,6 +10408,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         trial_id: trial.trial_id.clone(),
         input_content_hash: trial.trial.input_content_hash.clone(),
         revision_content_hash: revision_hash,
+        skill_revision: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -10227,6 +10503,7 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         trial_id: cancel_trial.trial_id.clone(),
         input_content_hash: cancel_trial.trial.input_content_hash.clone(),
         revision_content_hash: content_fingerprint("Candidate revision text"),
+        skill_revision: None,
         receipt_ids: Vec::new(),
         snapshot_envelope: None,
     });
@@ -10339,6 +10616,388 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
         .execute(pool.get())
         .await
         .expect("clean runtime evaluation model fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evidence() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("eval-skill-owner-{}", Uuid::new_v4());
+    let session_id = format!("eval-skill-session-{}", Uuid::new_v4());
+    let skill_name = format!("eval-skill-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session_id).await;
+    let llm = spawn_skill_invoking_test_llm(&skill_name).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind("model-test-model")
+        .execute(pool.get())
+        .await
+        .expect("clear Skill evaluation model fixture");
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+        .bind("model-test-model")
+        .bind("test-model")
+        .bind(test_encryptor().encrypt("test-key").expect("encrypt test key"))
+        .bind(&llm.base_url)
+        .bind(r#"["text"]"#)
+        .bind(r#"["text"]"#)
+        .bind("[]")
+        .bind("{}")
+        .bind("[]")
+        .bind("{}")
+        .execute(pool.get())
+        .await
+        .expect("seed Skill evaluation model fixture");
+    let service = db_backed_test_service(&pool, &format!("eval-skill-pod-{}", Uuid::new_v4()))
+        .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_run_concurrency_limit(1);
+    let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+    let manifest = json!({
+        "name": skill_name,
+        "description": "A deterministic evaluation Skill",
+        "execution_context": "inline",
+        "allowed_tools": [],
+        "required_capabilities": []
+    });
+    let baseline_skill = skill_store
+        .submit_version(
+            &owner,
+            &skill_name,
+            astra_services::SubmitUserSkillVersion {
+                version: "1.0.0".to_string(),
+                manifest_json: manifest.clone(),
+                content_markdown: "Always produce the exact result marker SKILL_OK.".to_string(),
+                status: Some("published".to_string()),
+            },
+        )
+        .await
+        .expect("publish baseline evaluation Skill");
+    let candidate_skill = skill_store
+        .submit_version(
+            &owner,
+            &skill_name,
+            astra_services::SubmitUserSkillVersion {
+                version: "2.0.0".to_string(),
+                manifest_json: manifest,
+                content_markdown: "Always produce the exact result marker SKILL_NEXT.".to_string(),
+                status: Some("published".to_string()),
+            },
+        )
+        .await
+        .expect("publish candidate evaluation Skill");
+    let mut request = test_request("evaluate the pinned Skill");
+    request.session_id = Some(session_id.clone());
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 60,
+    });
+    let input_hash = prompt_context_fingerprint(
+        &request.message,
+        &request.parts,
+        &request.attachments,
+        request.context.as_ref(),
+    );
+    let skill_revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: skill_name.clone(),
+        revision_id: baseline_skill.version_id.clone(),
+        content_hash: baseline_skill.content_hash.clone(),
+    };
+    let admitted_model = test_admitted_model_execution();
+    let policy_facts = json!({
+        "model_binding": "model-test-model",
+        "provider_binding": "openai",
+        "cache_policy": "provider_default_recorded",
+        "resolved_model_selection": {
+            "offering_id": "model-test-model",
+            "model_name": "test-model"
+        },
+        "admitted_provider": admitted_model.provider,
+        "admitted_cache_capability": admitted_model.cache_capability,
+        "execution_policy": request.execution_policy,
+        "allow_skills": request.allow_skills,
+        "allow_skill_sources": request.allow_skill_sources,
+        "allow_tools": request.allow_tools,
+        "enabled_tools": request.enabled_tools,
+        "runtime_profile": request.runtime_profile,
+    });
+    let policy_hash = prompt_policy_fingerprint(&policy_facts);
+    let experiment_id = format!("eval-skill-exp-{}", Uuid::new_v4());
+    let spec = astra_services::evaluation::ExperimentSpec {
+        schema_version: 1,
+        experiment_id: experiment_id.clone(),
+        target: astra_services::evaluation::EvaluationTarget {
+            kind: astra_services::evaluation::EvaluationTargetKind::Skill,
+            baseline: astra_services::evaluation::RevisionRef {
+                revision_id: baseline_skill.version_id.clone(),
+                content_hash: baseline_skill.content_hash.clone(),
+            },
+            candidate: astra_services::evaluation::RevisionRef {
+                revision_id: candidate_skill.version_id.clone(),
+                content_hash: candidate_skill.content_hash.clone(),
+            },
+        },
+        cases: vec![astra_services::evaluation::EvaluationCase {
+            case_id: "case-skill-runtime".to_string(),
+            input_snapshot_ref: "input://skill-runtime".to_string(),
+            input_content_hash: input_hash.clone(),
+            verifier_id: "verifier-skill-runtime".to_string(),
+            verifier_version: "1".to_string(),
+            holdout: false,
+        }],
+        repetitions: 1,
+        order: astra_services::evaluation::TrialOrder::BaselineFirst,
+        conditions: astra_services::evaluation::FrozenConditions {
+            isolation_profile: "skill_inline_private".to_string(),
+            model_binding: "model-test-model".to_string(),
+            provider_binding: "openai".to_string(),
+            context_snapshot_hash: input_hash,
+            tool_policy_hash: policy_hash,
+            cache_policy: "provider_default_recorded".to_string(),
+            memory_isolation: astra_services::evaluation::MemoryIsolation::Disabled,
+            data_isolation: astra_services::evaluation::DataIsolation::Disabled,
+        },
+        budget: astra_services::evaluation::EvaluationBudget {
+            max_trials: 2,
+            max_concurrency: 1,
+            max_wall_time_secs: 60,
+        },
+    };
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec, "runtime-skill-eval-submit")
+        .await
+        .expect("register Skill evaluation");
+    let trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("load Skill evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Baseline)
+        .expect("baseline Skill trial");
+    request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: trial.trial_id.clone(),
+        input_content_hash: trial.trial.input_content_hash.clone(),
+        revision_content_hash: baseline_skill.content_hash.clone(),
+        skill_revision: Some(skill_revision.clone()),
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+
+    let baseline_request = request.clone();
+    let run = service
+        .create_run(owner.clone(), request)
+        .await
+        .expect("Skill evaluation must use the ordinary durable Run entrypoint");
+    let durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &run.run_id)
+                .await
+                .expect("load Skill evaluation run")
+                .expect("Skill evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Skill evaluation should settle");
+    assert_eq!(durable.status, STATUS_COMPLETED, "{durable:?}");
+    let invocation_event = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "successful Skill invocation evidence event; events={:?}",
+                durable.events
+            )
+        });
+    assert_eq!(invocation_event["data"]["skill_name"], skill_name);
+    assert_eq!(
+        invocation_event["data"]["revision_id"],
+        baseline_skill.version_id
+    );
+    assert_eq!(
+        invocation_event["data"]["content_hash"],
+        baseline_skill.content_hash
+    );
+    assert!(durable.events.iter().any(|event| {
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some("skill-result-baseline")
+    }));
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
+
+    let observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &trial.trial_id)
+                .await
+                .expect("load Skill evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Skill evaluation observation should settle");
+    let skill_evidence = observation
+        .observation
+        .evidence
+        .iter()
+        .find(|evidence| evidence.evidence_id.starts_with("skill-invocation:"))
+        .expect("Skill invocation evidence reference");
+    assert_eq!(skill_evidence.availability, EvidenceAvailability::Available);
+    assert!(skill_evidence.content_hash.is_some());
+
+    let candidate_session_id = format!("eval-skill-cand-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &candidate_session_id)
+        .await;
+    let candidate_trial = plan_store
+        .list_trials(&owner, &experiment.experiment_id)
+        .await
+        .expect("reload Skill evaluation trials")
+        .into_iter()
+        .find(|trial| trial.trial.arm == astra_services::evaluation::ComparisonArm::Candidate)
+        .expect("candidate Skill trial");
+    let candidate_skill_revision = astra_services::evaluation::EvaluationSkillRevision {
+        skill_name: skill_name.clone(),
+        revision_id: candidate_skill.version_id.clone(),
+        content_hash: candidate_skill.content_hash.clone(),
+    };
+    let mut candidate_request = baseline_request.clone();
+    candidate_request.session_id = Some(candidate_session_id.clone());
+    candidate_request.evaluation_admission = Some(EvaluationRunAdmission {
+        experiment_id: experiment.experiment_id.clone(),
+        trial_id: candidate_trial.trial_id.clone(),
+        input_content_hash: candidate_trial.trial.input_content_hash.clone(),
+        revision_content_hash: candidate_skill.content_hash.clone(),
+        skill_revision: Some(candidate_skill_revision.clone()),
+        receipt_ids: Vec::new(),
+        snapshot_envelope: None,
+    });
+    let candidate_run = service
+        .create_run(owner.clone(), candidate_request)
+        .await
+        .expect("candidate Skill arm should share the frozen policy hash");
+    let candidate_durable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let durable = service
+                .run_engine
+                .load_run(&owner, &candidate_run.run_id)
+                .await
+                .expect("load candidate Skill evaluation run")
+                .expect("candidate Skill evaluation run exists");
+            if matches!(
+                durable.status.as_str(),
+                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+            ) {
+                break durable;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("candidate Skill evaluation should settle");
+    assert_eq!(
+        candidate_durable.status, STATUS_COMPLETED,
+        "{candidate_durable:?}"
+    );
+    let candidate_invocation = candidate_durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+        })
+        .expect("candidate Skill invocation evidence event");
+    assert_eq!(
+        candidate_invocation["data"]["revision_id"],
+        candidate_skill.version_id
+    );
+    assert_eq!(
+        candidate_invocation["data"]["content_hash"],
+        candidate_skill.content_hash
+    );
+    assert!(candidate_durable.events.iter().any(|event| {
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some("skill-result-candidate")
+    }));
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
+    let candidate_observation = tokio::time::timeout(Duration::from_secs(10), async {
+        let store = DatabaseEvaluationObservationStore::new(pool.clone());
+        loop {
+            if let Some(observation) = store
+                .load_by_trial(&owner, &candidate_trial.trial_id)
+                .await
+                .expect("load candidate Skill evaluation observation")
+            {
+                break observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("candidate Skill evaluation observation should settle");
+    assert_eq!(
+        candidate_observation
+            .observation
+            .evidence
+            .iter()
+            .find(|evidence| evidence.evidence_id.starts_with("skill-invocation:"))
+            .expect("candidate Skill invocation evidence reference")
+            .availability,
+        EvidenceAvailability::Available
+    );
+
+    let rejected_session_id = format!("eval-skill-rej-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &rejected_session_id)
+        .await;
+    let mut unstable_prompt_request = baseline_request.clone();
+    unstable_prompt_request.session_id = Some(rejected_session_id.clone());
+    unstable_prompt_request.stable_runtime_system_prompt = Some("unfrozen prompt".to_string());
+    let rejected = service
+        .create_run(owner.clone(), unstable_prompt_request)
+        .await
+        .expect_err("Skill evaluation must reject an unfrozen system prompt");
+    assert_eq!(
+        rejected.1.error_code.as_deref(),
+        Some("evaluation_skill_system_prompt_unsupported")
+    );
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
+
+    for table in [
+        "evaluation_trial_observations",
+        "evaluation_materialization_receipts",
+        "evaluation_trial_bindings",
+        "evaluation_experiments",
+        "user_skill_versions",
+        "user_skill_sources",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE owner_user_id = ?"))
+            .bind(&owner)
+            .execute(pool.get())
+            .await
+            .expect("clean Skill evaluation fixture");
+    }
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run.run_id).await;
+    cleanup_lifecycle_run_fixture(&pool, &owner, &candidate_run.run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &candidate_session_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &rejected_session_id).await;
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind("model-test-model")
+        .execute(pool.get())
+        .await
+        .expect("clean Skill evaluation model fixture");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

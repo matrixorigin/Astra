@@ -48,6 +48,122 @@ use crate::skills::traits::{SkillExecutionContext, SkillExecutor};
 
 pub use astra_skills::traits::{ResolvedSkill, SkillResolver, SkillToolInfo};
 
+/// Resolver for one immutable owner-scoped Skill revision.
+///
+/// Evaluation must not discover a mutable catalog and then hope the selected
+/// name still points at the same bytes when the model calls it. This resolver
+/// is deliberately a one-entry catalog built from the revision loaded at
+/// admission; it cannot resolve another version or another user's skill.
+#[derive(Clone)]
+pub struct PinnedSkillResolver {
+    resolved: ResolvedSkill,
+    info: SkillToolInfo,
+}
+
+impl PinnedSkillResolver {
+    pub fn from_user_skill_revision(
+        revision: &astra_services::UserSkillVersionRecord,
+    ) -> Result<Self, String> {
+        let mut manifest: SkillManifest = serde_json::from_value(revision.manifest_json.clone())
+            .map_err(|error| format!("skill manifest is invalid JSON: {error}"))?;
+        if manifest.name != revision.skill_name {
+            return Err(format!(
+                "skill manifest name '{}' does not match revision skill '{}'",
+                manifest.name, revision.skill_name
+            ));
+        }
+        if manifest.execution_context != ExecutionContext::Inline {
+            return Err("evaluation skill adapter supports inline skills only".to_string());
+        }
+        if !manifest.allowed_tools.is_empty()
+            || !manifest.required_capabilities.is_empty()
+            || manifest
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| !hooks.is_empty())
+            || manifest.remote_url.is_some()
+            || !manifest.forward_headers.is_empty()
+            || !manifest.required_headers.is_empty()
+            || manifest.composition.is_some()
+        {
+            return Err(
+                "evaluation skill adapter supports instruction-only skills without side effects"
+                    .to_string(),
+            );
+        }
+        // Personal skill revisions are owner-authenticated database content.
+        // The source label used for policy/catalog output must not inherit a
+        // stale or caller-controlled manifest value.
+        manifest.source = SkillSourceKind::Database;
+        let info = SkillToolInfo {
+            name: revision.skill_name.clone(),
+            description: manifest.description.clone(),
+            when_to_use: manifest.when_to_use.clone(),
+            source: SkillSourceKind::Database,
+            aliases: manifest.aliases.clone(),
+            category: manifest.category.clone(),
+            tags: manifest.tags.clone(),
+        };
+        let resolved = ResolvedSkill {
+            name: revision.skill_name.clone(),
+            instructions: revision.content_markdown.clone(),
+            max_tokens: manifest.max_tokens,
+            allowed_tools: Vec::new(),
+            execution_context: manifest.execution_context,
+            hooks: manifest.hooks.clone().unwrap_or_default(),
+            skill_dir: None,
+            source: SkillSourceKind::Database,
+            success_criteria: manifest.success_criteria.clone(),
+            composition: None,
+            input_schema: manifest.input_schema.clone(),
+            output_schema: manifest.output_schema.clone(),
+            remote_url: None,
+            forward_headers: Vec::new(),
+            required_headers: Vec::new(),
+            aliases: manifest.aliases,
+            effort: manifest.effort,
+            agent_type: manifest.agent_type,
+            trust_tier: manifest.trust_tier,
+        };
+        Ok(Self { resolved, info })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && (self.resolved.name.eq_ignore_ascii_case(name)
+                || self
+                    .resolved
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name)))
+    }
+}
+
+impl SkillResolver for PinnedSkillResolver {
+    fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+        if self.matches(name) {
+            Ok(self.resolved.clone())
+        } else {
+            Err(crate::skills::SkillError::NotFound(format!(
+                "skill '{name}' is not part of the pinned evaluation revision"
+            )))
+        }
+    }
+
+    fn available_skills(&self) -> Vec<SkillToolInfo> {
+        vec![self.info.clone()]
+    }
+
+    fn catalog_is_authoritative(&self) -> bool {
+        true
+    }
+
+    fn execution_catalog_contains(&self, name: &str) -> bool {
+        self.matches(name)
+    }
+}
+
 // ─── Skill context ───────────────────────────────────────────────────────────
 
 /// Runtime context available to skills during execution.
@@ -2266,6 +2382,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use serde_json::json;
+
     use super::*;
 
     /// Stub resolver for tests.
@@ -2336,6 +2454,73 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    fn pinned_revision(manifest: Value) -> astra_services::UserSkillVersionRecord {
+        astra_services::UserSkillVersionRecord {
+            version_id: "skill-version-1".to_string(),
+            source_id: "skill-source-1".to_string(),
+            owner_user_id: "owner-1".to_string(),
+            skill_name: "review-skill".to_string(),
+            version: "1.0.0".to_string(),
+            manifest_json: manifest,
+            content_markdown: "Follow the review checklist.".to_string(),
+            content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            normalize_version: "v1".to_string(),
+            token_estimate: 5,
+            status: "published".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn pinned_skill_resolver_is_single_revision_and_rejects_side_effect_manifests() {
+        let manifest = json!({
+            "name": "review-skill",
+            "description": "Review source",
+            "execution_context": "inline",
+            "aliases": ["review"],
+        });
+        let revision = pinned_revision(manifest);
+        let resolver = PinnedSkillResolver::from_user_skill_revision(&revision)
+            .expect("instruction-only revision should be pinnable");
+        assert!(resolver.catalog_is_authoritative());
+        assert!(resolver.execution_catalog_contains("review"));
+        assert_eq!(resolver.available_skills().len(), 1);
+        assert_eq!(
+            resolver.resolve("review").unwrap().instructions,
+            "Follow the review checklist."
+        );
+        assert!(resolver.resolve("other-skill").is_err());
+
+        for field in [
+            json!({"allowed_tools": ["bash"]}),
+            json!({"hooks": {"pre_invoke": [{"type": "shell", "command": "touch /tmp/unsafe"}]}}),
+            json!({"remote_url": "https://example.test/skill"}),
+            json!({"execution_context": "fork"}),
+        ] {
+            let mut blocked_manifest = json!({
+                "name": "review-skill",
+                "execution_context": "inline",
+            });
+            for (key, value) in field.as_object().expect("manifest override").clone() {
+                blocked_manifest[key] = value;
+            }
+            assert!(
+                PinnedSkillResolver::from_user_skill_revision(&pinned_revision(blocked_manifest))
+                    .is_err(),
+                "side-effect or fork manifest must not enter the isolated adapter"
+            );
+        }
+
+        let mut wrong_name = pinned_revision(json!({
+            "name": "different-name",
+            "execution_context": "inline",
+        }));
+        wrong_name.skill_name = "review-skill".to_string();
+        assert!(PinnedSkillResolver::from_user_skill_revision(&wrong_name).is_err());
     }
 
     #[test]

@@ -22,8 +22,8 @@ pub use durable::{
 pub use execution::{
     DatabaseEvaluationObservationStore, EVALUATION_EXECUTION_SCHEMA_VERSION,
     EvaluationAdmissionMarker, EvaluationExecutionError, EvaluationObservationRecord,
-    EvaluationObservationRequest, EvaluationRunAdmission, content_fingerprint,
-    evaluation_component_idempotency_key, prompt_context_fingerprint,
+    EvaluationObservationRequest, EvaluationRunAdmission, EvaluationSkillRevision,
+    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
     prompt_only_snapshot_envelope, prompt_policy_fingerprint, terminal_run_observation,
 };
 pub use experiment::{

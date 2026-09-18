@@ -538,6 +538,7 @@ async fn evaluation_observations_are_owner_scoped_idempotent_and_generation_fenc
             trial_id: binding_a.trial_id.clone(),
             input_content_hash: format!("sha256:{}", "a".repeat(64)),
             revision_content_hash: format!("sha256:{}", "b".repeat(64)),
+            skill_revision: None,
             receipt_ids: vec![
                 context_receipt.receipt_id.clone(),
                 policy_receipt.receipt_id.clone(),

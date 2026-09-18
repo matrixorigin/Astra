@@ -127,8 +127,9 @@ Markdown parses. The draft records its source packets, citations, redaction
 and evidence watermark, target scope, and uncertainty. Skillify supplies one
 candidate adapter; it does not own experiments or assessment semantics.
 
-The first evaluation job type is a private paired comparison for prompt-only
-inputs. The same evaluation owner can later compare prompts, routing,
+The first executable evaluation job type is a private paired comparison for
+prompt inputs and instruction-only Skill revisions. The same evaluation owner
+can later compare prompts, routing,
 provider/model bindings, memory policies, tool policies, and workflows. It is
 rejected at preflight when the input requires tools, external writes,
 undeclared resources, or a verifier that cannot be isolated. Each trial

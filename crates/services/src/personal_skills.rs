@@ -358,6 +358,19 @@ impl DatabasePersonalSkillStore {
             .collect()
     }
 
+    /// Load one immutable owner-scoped revision for a trusted execution
+    /// adapter. Callers must still validate the returned content hash and
+    /// lifecycle status against their frozen experiment.
+    pub async fn load_version(
+        &self,
+        owner_user_id: &str,
+        skill_name: &str,
+        version_id: &str,
+    ) -> Result<Option<UserSkillVersionRecord>, PersonalSkillError> {
+        self.load_version_by_id(owner_user_id, skill_name, version_id)
+            .await
+    }
+
     /// Activate a version with an explicit compare-and-set expectation.
     ///
     /// `None` means the caller expects no active version for this skill. An

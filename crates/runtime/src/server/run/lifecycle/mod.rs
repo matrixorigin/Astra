@@ -48,9 +48,10 @@ use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::evaluation::{
     DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
     DatabaseMaterializationReceiptStore, EvaluationObservationRequest, EvaluationRunAdmission,
-    EvidenceAvailability, EvidenceKind, EvidenceRef, MaterializationComponentKind,
-    MaterializationOutcome, MaterializationReceiptRequest, TrialStatus, TrustedMaterializerContext,
-    content_fingerprint, evaluation_component_idempotency_key, prompt_context_fingerprint,
+    EvaluationSkillRevision, EvidenceAvailability, EvidenceKind, EvidenceRef,
+    MaterializationComponentKind, MaterializationOutcome, MaterializationReceiptRequest,
+    TrialStatus, TrustedMaterializerContext, content_fingerprint,
+    evaluation_component_idempotency_key, prompt_context_fingerprint,
     prompt_only_snapshot_envelope, prompt_policy_fingerprint, terminal_run_observation,
 };
 use astra_services::runs::{
@@ -4560,6 +4561,11 @@ struct PreparedRuntimeCapabilities {
     agent_binding: Option<PreparedAgentBindingLoopContext>,
 }
 
+struct AdmittedEvaluationTrial {
+    admission: EvaluationRunAdmission,
+    skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+}
+
 #[derive(Clone)]
 struct PreparedAgentBindingLoopContext {
     bindings: Vec<astra_services::AgentBindingRecord>,
@@ -7837,7 +7843,7 @@ impl AgenticRunLifecycleService {
         execution_owner_generation: u64,
         request: &ChatRequestData,
         admission: &EvaluationRunAdmission,
-    ) -> Result<EvaluationRunAdmission, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<AdmittedEvaluationTrial, (StatusCode, Json<ErrorResponse>)> {
         admission.validate_shape().map_err(|error| {
             evaluation_preflight_error(
                 StatusCode::BAD_REQUEST,
@@ -7915,7 +7921,7 @@ impl AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::BAD_REQUEST,
                 "evaluation_deadline_missing",
-                "prompt-only evaluation requires an admitted execution deadline",
+                "evaluation requires an admitted execution deadline",
             ));
         };
         let execution_deadline = chrono::DateTime::from_timestamp_millis(
@@ -7983,20 +7989,123 @@ impl AgenticRunLifecycleService {
                 "trial revision content does not match the frozen baseline/candidate",
             ));
         }
-        let Some(revision_prompt) = request.stable_runtime_system_prompt.as_deref() else {
-            return Err(evaluation_preflight_error(
-                StatusCode::BAD_REQUEST,
-                "evaluation_revision_content_missing",
-                "prompt-only evaluation requires the frozen revision content",
-            ));
+        let evaluation_skill_resolver = match experiment.spec.target.kind {
+            astra_services::evaluation::EvaluationTargetKind::Prompt => {
+                if admission.skill_revision.is_some() {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_skill_revision_unexpected",
+                        "prompt evaluation must not carry a Skill revision identity",
+                    ));
+                }
+                let Some(revision_prompt) = request.stable_runtime_system_prompt.as_deref() else {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_revision_content_missing",
+                        "prompt evaluation requires the frozen revision content",
+                    ));
+                };
+                if content_fingerprint(revision_prompt) != admission.revision_content_hash {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_revision_content_mismatch",
+                        "revision content hash does not match the frozen prompt identity",
+                    ));
+                }
+                None
+            }
+            astra_services::evaluation::EvaluationTargetKind::Skill => {
+                let Some(skill_revision) = admission.skill_revision.as_ref() else {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::BAD_REQUEST,
+                        "evaluation_skill_revision_missing",
+                        "Skill evaluation requires an owner-scoped immutable revision identity",
+                    ));
+                };
+                if request.stable_runtime_system_prompt.is_some() {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "evaluation_skill_system_prompt_unsupported",
+                        "instruction-only Skill evaluation cannot carry an unfrozen system prompt",
+                    ));
+                }
+                let expected_revision_id = match trial.arm {
+                    astra_services::evaluation::ComparisonArm::Baseline => {
+                        &experiment.spec.target.baseline.revision_id
+                    }
+                    astra_services::evaluation::ComparisonArm::Candidate => {
+                        &experiment.spec.target.candidate.revision_id
+                    }
+                };
+                if skill_revision.revision_id != *expected_revision_id {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_skill_revision_mismatch",
+                        "Skill revision id does not match the frozen baseline/candidate",
+                    ));
+                }
+                let skill_store = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+                let revision = skill_store
+                    .load_version(
+                        user_id,
+                        &skill_revision.skill_name,
+                        &skill_revision.revision_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "evaluation_skill_revision_unavailable",
+                            error,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        evaluation_preflight_error(
+                            StatusCode::CONFLICT,
+                            "evaluation_skill_revision_not_found",
+                            "the requested owner-scoped Skill revision no longer exists",
+                        )
+                    })?;
+                if !evaluation_skill_revision_matches(
+                    &revision,
+                    user_id,
+                    skill_revision,
+                    &admission.revision_content_hash,
+                ) {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_skill_revision_mismatch",
+                        "loaded Skill content does not match the frozen owner/version/hash identity",
+                    ));
+                }
+                if revision.status != "published" {
+                    return Err(evaluation_preflight_error(
+                        StatusCode::CONFLICT,
+                        "evaluation_skill_revision_unavailable",
+                        "only published Skill revisions can enter an evaluation",
+                    ));
+                }
+                let resolver =
+                    crate::turn::skill_tool::PinnedSkillResolver::from_user_skill_revision(
+                        &revision,
+                    )
+                    .map_err(|error| {
+                        evaluation_preflight_error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "evaluation_skill_surface_unsupported",
+                            error,
+                        )
+                    })?;
+                Some(Arc::new(resolver) as Arc<dyn crate::turn::skill_tool::SkillResolver>)
+            }
+            _ => {
+                return Err(evaluation_preflight_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "evaluation_target_unsupported",
+                    "this execution adapter supports Prompt and instruction-only Skill targets",
+                ));
+            }
         };
-        if content_fingerprint(revision_prompt) != admission.revision_content_hash {
-            return Err(evaluation_preflight_error(
-                StatusCode::CONFLICT,
-                "evaluation_revision_content_mismatch",
-                "revision content hash does not match the frozen revision identity",
-            ));
-        }
         if trial.input_content_hash != admission.input_content_hash {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
@@ -8010,7 +8119,7 @@ impl AgenticRunLifecycleService {
             &request.attachments,
             request.context.as_ref(),
         );
-        // The prompt-only adapter defines Context as the canonical request
+        // The evaluation adapter defines Context as the canonical request
         // payload (message, parts, attachments, and explicit context).  The
         // frozen case input and the frozen Context snapshot must therefore
         // both name this exact assembly; a caller cannot manufacture an
@@ -8070,7 +8179,7 @@ impl AgenticRunLifecycleService {
                 StatusCode::NOT_IMPLEMENTED,
                 "evaluation_cache_policy_unsupported",
                 format!(
-                    "prompt-only evaluation supports cache policy {expected_cache_policy}, not {}",
+                    "this evaluation adapter supports cache policy {expected_cache_policy}, not {}",
                     experiment.spec.conditions.cache_policy
                 ),
             ));
@@ -8085,7 +8194,7 @@ impl AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "evaluation_isolation_unsupported",
-                "this execution adapter supports only prompt-only trials; Memory/Data branches are not materialized",
+                "this execution adapter does not materialize Memory/Data branches",
             ));
         }
         let edge_context = Self::extract_edge_context(request)?;
@@ -8124,7 +8233,7 @@ impl AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "evaluation_execution_surface_unsupported",
-                "prompt-only evaluation does not admit workspace, edge, MCP, skill, or tool side effects",
+                "evaluation does not admit workspace, edge, MCP, or tool side effects",
             ));
         }
         let policy_facts = serde_json::json!({
@@ -8225,7 +8334,7 @@ impl AgenticRunLifecycleService {
             let expires_at = receipt_expiry;
             let trusted = TrustedMaterializerContext {
                 owner_user_id: user_id.to_string(),
-                materializer_kind: "runtime.prompt_only.v1".to_string(),
+                materializer_kind: "runtime.evaluation.v1".to_string(),
                 provider_binding_id: Some(experiment.spec.conditions.provider_binding.clone()),
                 execution_run_id: Some(run_id.to_string()),
                 execution_run_generation: Some(execution_owner_generation),
@@ -8244,7 +8353,7 @@ impl AgenticRunLifecycleService {
                             envelope: envelope.clone(),
                             component_kind,
                             component_snapshot_ref: Some(format!(
-                                "prompt-only://{}/{}/{fingerprint}",
+                                "evaluation://{}/{}/{fingerprint}",
                                 experiment.experiment_id, trial.trial_id
                             )),
                             component_base_snapshot_ref: None,
@@ -8292,13 +8401,17 @@ impl AgenticRunLifecycleService {
                     error,
                 )
             })?;
-        Ok(EvaluationRunAdmission {
-            experiment_id: admission.experiment_id.clone(),
-            trial_id: admission.trial_id.clone(),
-            input_content_hash: admission.input_content_hash.clone(),
-            revision_content_hash: admission.revision_content_hash.clone(),
-            receipt_ids,
-            snapshot_envelope: Some(envelope),
+        Ok(AdmittedEvaluationTrial {
+            admission: EvaluationRunAdmission {
+                experiment_id: admission.experiment_id.clone(),
+                trial_id: admission.trial_id.clone(),
+                input_content_hash: admission.input_content_hash.clone(),
+                revision_content_hash: admission.revision_content_hash.clone(),
+                skill_revision: admission.skill_revision.clone(),
+                receipt_ids,
+                snapshot_envelope: Some(envelope),
+            },
+            skill_resolver: evaluation_skill_resolver,
         })
     }
 
@@ -12649,7 +12762,7 @@ impl AgenticRunLifecycleService {
         }
     }
 
-    /// Prompt-only evaluation trials must start from a genuinely empty
+    /// Evaluation trials must start from a genuinely empty
     /// session. Reusing a normal chat session would silently import canonical
     /// history, checkpoints, state projections, or context snapshots that
     /// are absent from the frozen Context receipt.
@@ -12718,16 +12831,14 @@ impl AgenticRunLifecycleService {
                 return Err(evaluation_preflight_error(
                     StatusCode::CONFLICT,
                     "evaluation_session_not_clean",
-                    format!(
-                        "prompt-only evaluation requires a new session; {table} already has state"
-                    ),
+                    format!("evaluation requires a new session; {table} already has state"),
                 ));
             }
         }
         // The transcript helper is intentionally best-effort for ordinary
         // resume hydration. Admission is different: an unavailable history
         // query must fail closed, otherwise a partially visible old prompt
-        // could contaminate a supposedly prompt-only trial.
+        // could contaminate a supposedly evaluation trial.
         let transcript_present = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)
             .bind(session_id)
             .bind(user_id)
@@ -12745,7 +12856,7 @@ impl AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_session_not_clean",
-                "prompt-only evaluation requires a new session without conversation history",
+                "evaluation requires a new session without conversation history",
             ));
         }
         Ok(())
@@ -15119,7 +15230,7 @@ async fn persist_evaluation_observation_after_settlement(
         "events": evidence_events,
     });
     let evidence_json = serde_json::to_string(&evidence_payload).ok();
-    let evidence = vec![EvidenceRef {
+    let mut evidence = vec![EvidenceRef {
         evidence_id: format!("run:{run_id}:{run_generation}"),
         kind: EvidenceKind::Trace,
         availability: if evidence_available && evidence_json.is_some() {
@@ -15133,6 +15244,32 @@ async fn persist_evaluation_observation_after_settlement(
             .map(content_fingerprint),
         locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
     }];
+    if let Some(skill_revision) = admission.skill_revision.as_ref() {
+        let skill_event = accounting_index.and_then(|index| {
+            canonical_events[..=index].iter().find(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("evaluation_skill_invoked")
+                    && event.get("run_generation").and_then(Value::as_u64) == Some(run_generation)
+                    && event.pointer("/data/skill_name").and_then(Value::as_str)
+                        == Some(skill_revision.skill_name.as_str())
+                    && event.pointer("/data/revision_id").and_then(Value::as_str)
+                        == Some(skill_revision.revision_id.as_str())
+                    && event.pointer("/data/content_hash").and_then(Value::as_str)
+                        == Some(skill_revision.content_hash.as_str())
+            })
+        });
+        let skill_event_json = skill_event.and_then(|event| serde_json::to_string(event).ok());
+        evidence.push(EvidenceRef {
+            evidence_id: format!("skill-invocation:{run_id}:{run_generation}"),
+            kind: EvidenceKind::Trace,
+            availability: if skill_event_json.is_some() {
+                EvidenceAvailability::Available
+            } else {
+                EvidenceAvailability::Missing
+            },
+            content_hash: skill_event_json.as_deref().map(content_fingerprint),
+            locator: Some(format!("run://{owner_user_id}/{session_id}/{run_id}")),
+        });
+    }
     let observation = terminal_run_observation(
         experiment.spec_fingerprint.clone(),
         binding.trial.trial_id.clone(),
@@ -15178,6 +15315,73 @@ async fn persist_evaluation_observation_after_settlement(
             "durable evaluation observation settlement failed"
         ),
     }
+}
+
+/// Emit a durable fact only when the canonical loop recorded a successful
+/// invocation of the exact owner-scoped revision admitted for this Run. A
+/// Skill resolver being installed is not evidence that the model used it.
+fn evaluation_skill_invocation_event(
+    admission: Option<&EvaluationRunAdmission>,
+    state: &AgenticLoopState,
+    run_id: &str,
+    run_generation: u64,
+) -> Option<Value> {
+    let skill_revision = admission?.skill_revision.as_ref()?;
+    let invocation = state
+        .skills
+        .execution
+        .invoked
+        .get(&skill_revision.skill_name)
+        .or_else(|| {
+            state
+                .skills
+                .execution
+                .invoked
+                .iter()
+                .find(|(name, _)| {
+                    state.skills.resolver.as_ref().is_some_and(|resolver| {
+                        resolver.available_skills().iter().any(|skill| {
+                            skill.name.eq_ignore_ascii_case(&skill_revision.skill_name)
+                                && skill
+                                    .aliases
+                                    .iter()
+                                    .any(|alias| alias.eq_ignore_ascii_case(name))
+                        })
+                    })
+                })
+                .map(|(_, invocation)| invocation)
+        })?;
+    Some(json!({
+        "event_type": "evaluation_skill_invoked",
+        "run_generation": run_generation,
+        "idempotency_key": format!("evaluation-skill-invoked:{run_id}:{run_generation}"),
+        "data": {
+            "skill_name": skill_revision.skill_name,
+            "invoked_name": invocation.name,
+            "revision_id": skill_revision.revision_id,
+            "content_hash": skill_revision.content_hash,
+            "invoked_at_turn": invocation.invoked_at_turn,
+            "reentry_count": invocation.reentry_count,
+        },
+    }))
+}
+
+fn evaluation_skill_revision_matches(
+    revision: &astra_services::UserSkillVersionRecord,
+    owner_user_id: &str,
+    expected: &EvaluationSkillRevision,
+    frozen_content_hash: &str,
+) -> bool {
+    revision.owner_user_id == owner_user_id
+        && revision.skill_name == expected.skill_name
+        && revision.version_id == expected.revision_id
+        && revision.content_hash == frozen_content_hash
+        && revision.content_hash
+            == astra_services::skill_md_content_hash(
+                &revision.manifest_json,
+                &revision.content_markdown,
+            )
+        && expected.content_hash == frozen_content_hash
 }
 
 impl AgenticRunLifecycleService {
@@ -15601,6 +15805,14 @@ impl AgenticRunLifecycleService {
                 let (mut events, final_status, error_msg) =
                     Self::finalize_run_events(outcome, events, &loop_state);
                 Self::stamp_run_finished_owner_generation(&mut events, execution_owner_generation);
+                if let Some(event) = evaluation_skill_invocation_event(
+                    bg_eval_admission.as_ref(),
+                    &loop_state,
+                    &bg_run_id,
+                    execution_owner_generation,
+                ) {
+                    events.push(event);
+                }
                 let mut user_cancellation = false;
                 if matches!(&final_status, RunStatus::Cancelled) {
                     let cancellation_origin = resolve_cancellation_origin(&mut loop_state).await;
@@ -16274,26 +16486,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .session_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let evaluation_prompt_only = request.evaluation_admission.is_some();
-        if evaluation_prompt_only {
+        let evaluation_mode = request.evaluation_admission.is_some();
+        if evaluation_mode {
             self.ensure_evaluation_session_clean(&user_id, &session_id)
                 .await?;
         }
         let active_personal_skills =
             load_active_personal_skills(self.shared_pool.as_ref(), &user_id, &session_id).await?;
-        if evaluation_prompt_only && !active_personal_skills.is_empty() {
+        if evaluation_mode && !active_personal_skills.is_empty() {
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_session_not_clean",
-                "prompt-only evaluation cannot run in a session with active personal skills",
+                "evaluation cannot run in a session with active personal skills",
             ));
         }
-        let work_runtime_binding = if evaluation_prompt_only {
+        let work_runtime_binding = if evaluation_mode {
             if request.work_binding.is_some() {
                 return Err(evaluation_preflight_error(
                     StatusCode::NOT_IMPLEMENTED,
                     "evaluation_execution_surface_unsupported",
-                    "prompt-only evaluation cannot inherit a Work session context",
+                    "evaluation cannot inherit a Work session context",
                 ));
             }
             // Do not discover the session's implicit Work binding here. The
@@ -16316,7 +16528,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let agent_binding_mode = request.has_agent_binding_runtime();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
-        let server_service_tool_catalog_enabled = if evaluation_prompt_only {
+        let server_service_tool_catalog_enabled = if evaluation_mode {
             false
         } else {
             Self::server_service_tool_catalog_enabled_for_request(
@@ -16324,7 +16536,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 edge_context.has_tools(),
             )
         };
-        let runtime_capabilities = self
+        let mut runtime_capabilities = self
             .prepare_runtime_capabilities(&request, &request_constraints)
             .await?;
         let mut edge_profile =
@@ -16336,7 +16548,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
-        if !evaluation_prompt_only {
+        if !evaluation_mode {
             self.append_latest_explain_artifact_context_bounded(
                 &user_id,
                 &session_id,
@@ -16556,13 +16768,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Load plan state as structured data: prompt hint for context, plus
         // an independent authoring flag for the tool gate. Ordinary session
         // resume context must not activate plan-mode blocking.
-        let plan_resume_snapshot =
-            if !evaluation_prompt_only && let Some(shared) = &self.shared_pool {
-                let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-                astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-            } else {
-                astra_plan::PlanResumeSnapshot::default()
-            };
+        let plan_resume_snapshot = if !evaluation_mode && let Some(shared) = &self.shared_pool {
+            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
+        } else {
+            astra_plan::PlanResumeSnapshot::default()
+        };
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
@@ -16574,7 +16785,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             edge_tools,
             edge_profile.clone(),
             server_service_tool_catalog_enabled,
-            !agent_binding_mode && !evaluation_prompt_only,
+            !agent_binding_mode && !evaluation_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
             plan_authoring_active,
@@ -16647,7 +16858,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
-        if evaluation_prompt_only
+        if evaluation_mode
             && canonical_turn.as_ref().is_some_and(|admission| {
                 admission.had_canonical_head || !admission.prior_messages.is_empty()
             })
@@ -16663,7 +16874,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &session_id,
                 &run_id,
                 execution_owner_generation,
-                "prompt-only evaluation requires an empty canonical session",
+                "evaluation requires an empty canonical session",
                 PreSpawnFailureCode::PreSpawnFailure,
             )
             .await;
@@ -16673,14 +16884,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &session_id,
                     &run_id,
                     record,
-                    "prompt-only evaluation requires an empty canonical session".to_string(),
+                    "evaluation requires an empty canonical session".to_string(),
                 )
                 .await;
             }
             return Err(evaluation_preflight_error(
                 StatusCode::CONFLICT,
                 "evaluation_session_not_clean",
-                "prompt-only evaluation requires an empty canonical session",
+                "evaluation requires an empty canonical session",
             ));
         }
         // Admit the frozen trial only after the canonical coordinator has
@@ -16701,6 +16912,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
             {
                 Ok(admitted) => {
+                    if let Some(skill_resolver) = admitted.skill_resolver {
+                        runtime_capabilities.request_scoped_skill_resolver = Some(skill_resolver);
+                    }
                     let admitted_event = json!({
                         "event_type": "evaluation_admitted",
                         "run_generation": execution_owner_generation,
@@ -16709,7 +16923,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ),
                         "data": {
                             "schema_version": astra_services::evaluation::EVALUATION_EXECUTION_SCHEMA_VERSION,
-                            "admission": admitted.clone(),
+                            "admission": admitted.admission.clone(),
                         },
                     });
                     match self
@@ -16782,7 +16996,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             ));
                         }
                     }
-                    request.evaluation_admission = Some(admitted)
+                    request.evaluation_admission = Some(admitted.admission)
                 }
                 Err(error) => {
                     drop(canonical_turn);
@@ -16899,7 +17113,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if restore_prior_prompt_history && !evaluation_prompt_only {
+        if restore_prior_prompt_history && !evaluation_mode {
             if let Ok(Some(restored)) =
                 astra_pipeline::step_restore::restore_session(&user_id, &session_id)
             {
@@ -16913,7 +17127,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── CSL: Load conversation history from the log ─────────────
         let csl_manager = if restore_prior_prompt_history
-            && !evaluation_prompt_only
+            && !evaluation_mode
             && canonical_turn
                 .as_ref()
                 .is_none_or(|admission| !admission.had_canonical_head)
@@ -16979,7 +17193,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             );
-            if !evaluation_prompt_only {
+            if !evaluation_mode {
                 if let Some(memoria_port) = self
                     .memory_extraction_service
                     .as_ref()
@@ -17309,7 +17523,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(evaluation_preflight_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "evaluation_streaming_unsupported",
-                "prompt-only evaluation currently requires the durable background Run entrypoint",
+                "evaluation currently requires the durable background Run entrypoint",
             ));
         }
         let request_constraints = self

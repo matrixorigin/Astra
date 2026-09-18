@@ -105,9 +105,10 @@ regression failures.
 ## Evidence-backed evaluation and Skillify adapter
 
 Evaluation is a shared capability for prompts, skills, routing, provider/model
-bindings, memory policies, and workflows. The first product slice is
-deliberately bounded to private, prompt-only comparisons whose task outputs can
-be checked without mutating an external system. Skillify is the first adapter:
+bindings, memory policies, and workflows. The first executable slices are
+deliberately bounded to private prompt comparisons and owner-scoped,
+instruction-only Skill comparisons whose task outputs can be checked without
+mutating an external system. Skillify is the first authoring adapter:
 it turns selected work evidence into a candidate revision and citations, then
 hands the candidate to the shared evaluation owner. It does not own trial
 identity, assessment, or report semantics.
@@ -131,7 +132,10 @@ retries are separate attempts and retain their own cost and uncertainty. The
 no-skill arm keeps normal base capabilities, and the executor cannot read the
 authoring conversation, the other arm's output, hidden answers, or production
 learning state. Unsupported tool-backed or external-side-effect tasks fail
-preflight instead of receiving a misleading score.
+preflight instead of receiving a misleading score. The current Skill execution
+adapter pins one published owner-scoped revision, recomputes its
+manifest-plus-Markdown identity, and rejects tool-backed, forked, remote,
+hook, or other external-side-effect surfaces at preflight.
 
 Reports are derived from persisted trial facts and expose content, behavior,
 and result differences with links to authorized evidence. Measured,

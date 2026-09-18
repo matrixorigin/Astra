@@ -98,9 +98,11 @@ scheduler persists a trial identity before creating a run. Run creation and
 settlement are idempotent; an unknown provider outcome remains an uncertain
 attempt rather than being silently retried as a new success.
 
-The current contract records and validates these requirements; it does not yet
-create branches or enforce access at execution time. The durable executor must
-fail closed when a required branch, snapshot, or isolation receipt is missing.
+The current contract records and validates these requirements. The durable
+executor currently materializes prompt trials and owner-scoped,
+instruction-only Skill trials; Memory/Data branches are still unavailable
+until a materialization adapter is added. It must fail closed when a required
+branch, snapshot, or isolation receipt is missing.
 `Disabled` means the corresponding memory or data capability is prohibited for
 the trial, not that it may be used without isolation.
 

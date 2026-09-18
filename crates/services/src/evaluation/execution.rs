@@ -3,7 +3,7 @@
 //! This module does not run an agent or create a second lifecycle.  It carries
 //! the small amount of immutable evaluation metadata through the existing Run
 //! backbone and records the terminal fact produced by that Run.  The runtime
-//! is responsible for materializing the actual prompt-only context/policy and
+//! is responsible for materializing the actual evaluation context/policy and
 //! for calling this store at the canonical admission and settlement fences.
 
 use super::assessment::{
@@ -35,7 +35,24 @@ const MAX_MEASUREMENTS: usize = 32;
 const MAX_TEXT_BYTES: usize = 512;
 const MAX_OBSERVATION_BYTES: usize = 256 * 1024;
 
-/// Metadata injected only by a trusted evaluation entrypoint.  It is not a
+/// Immutable owner-scoped identity for a Skill target revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationSkillRevision {
+    pub skill_name: String,
+    pub revision_id: String,
+    pub content_hash: String,
+}
+
+impl EvaluationSkillRevision {
+    pub fn validate_shape(&self) -> Result<(), String> {
+        validate_id("skill_name", &self.skill_name, MAX_ID_BYTES)?;
+        validate_id("skill revision_id", &self.revision_id, MAX_ID_BYTES)?;
+        validate_hash("skill content_hash", &self.content_hash)
+    }
+}
+
+/// Metadata injected only by a trusted evaluation entrypoint. It is not a
 /// client wire field and is deliberately separate from the prompt so the
 /// experiment identity cannot perturb prompt caching or model context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,8 +62,13 @@ pub struct EvaluationRunAdmission {
     pub trial_id: String,
     pub input_content_hash: String,
     pub revision_content_hash: String,
+    /// A Skill target carries the owner-scoped immutable revision identity.
+    /// Prompt targets leave this unset and use the frozen system prompt as the
+    /// revision material instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_revision: Option<EvaluationSkillRevision>,
     /// A caller may provide receipts from a trusted external materializer.
-    /// The prompt-only runtime adapter fills this list before execution when
+    /// The runtime adapter fills this list before execution when
     /// it can prove the frozen Context/Policy hashes locally.
     #[serde(default)]
     pub receipt_ids: Vec<String>,
@@ -62,6 +84,14 @@ impl EvaluationRunAdmission {
         validate_id("trial_id", &self.trial_id, MAX_ID_BYTES)?;
         validate_hash("input_content_hash", &self.input_content_hash)?;
         validate_hash("revision_content_hash", &self.revision_content_hash)?;
+        if let Some(skill_revision) = &self.skill_revision {
+            skill_revision.validate_shape()?;
+            if skill_revision.content_hash != self.revision_content_hash {
+                return Err(
+                    "skill revision content_hash must match revision_content_hash".to_string(),
+                );
+            }
+        }
         validate_receipt_ids(&self.receipt_ids).map_err(|error| error.to_string())?;
         if let Some(envelope) = &self.snapshot_envelope {
             envelope.validate()?;
@@ -1325,6 +1355,7 @@ mod tests {
             revision_content_hash:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
+            skill_revision: None,
             receipt_ids: vec![],
             snapshot_envelope: None,
         };
