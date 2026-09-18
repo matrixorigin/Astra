@@ -282,7 +282,15 @@ function mergeTranscriptPages(
   const items = [...bySeq.values()].sort((left, right) => left.item_seq - right.item_seq);
   // Once the user has reached the beginning, never reintroduce a cursor from
   // a newer server window; doing so would request duplicate history.
-  const nextBefore = current.has_more ? current.next_before_item_seq : null;
+  // An empty current page has no pagination state of its own. This happens
+  // when a refresh races the first committed transcript window; in that case
+  // the incoming page owns the cursor. Once local items exist, preserve the
+  // cursor for the already-read prefix so a refresh cannot move the user
+  // backwards or duplicate an earlier request.
+  const paginationPage = current.items.length === 0 ? incoming : current;
+  const nextBefore = paginationPage.has_more
+    ? paginationPage.next_before_item_seq
+    : null;
   return {
     ...incoming,
     items,

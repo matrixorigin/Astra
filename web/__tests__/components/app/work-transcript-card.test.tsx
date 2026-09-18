@@ -189,3 +189,50 @@ test("uses a fresh bounded window instead of rendering a disconnected transcript
   await waitFor(() => expect(screen.getByText("New window")).toBeInTheDocument());
   expect(screen.queryByText("Older window")).not.toBeInTheDocument();
 });
+
+test("keeps the incoming pagination cursor when a refresh fills an empty page", async () => {
+  loadEarlier.mockResolvedValue({
+    ok: false,
+    status: 503,
+    code: "transcript_unavailable",
+    retryable: true,
+  });
+  const emptyPage = {
+    ...initial,
+    sync: "current" as const,
+    items: [],
+    next_before_item_seq: null,
+    has_more: false,
+  };
+  const refreshedPage = {
+    ...emptyPage,
+    items: Array.from({ length: 50 }, (_, index) => ({
+      ...initial.items[0]!,
+      item_seq: 51 + index,
+      content: `Transcript item ${51 + index}`,
+    })),
+    next_before_item_seq: 51,
+    has_more: true,
+  };
+  const { rerender } = render(
+    <WorkTranscriptCard workId="work-1" branchId="branch-1" initial={emptyPage} />,
+  );
+
+  rerender(
+    <WorkTranscriptCard
+      workId="work-1"
+      branchId="branch-1"
+      initial={refreshedPage}
+    />,
+  );
+
+  const earlier = await screen.findByRole("button", { name: "Earlier" });
+  fireEvent.click(earlier);
+  await waitFor(() =>
+    expect(loadEarlier).toHaveBeenCalledWith({
+      workId: "work-1",
+      branchId: "branch-1",
+      beforeItemSeq: 51,
+    }),
+  );
+});
