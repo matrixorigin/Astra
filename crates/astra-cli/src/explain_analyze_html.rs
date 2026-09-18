@@ -1034,6 +1034,7 @@ mod tests {
         ExplainAnalyzeTransitionV1,
     };
 
+    #[allow(clippy::too_many_arguments)]
     fn event(
         event_id: &str,
         node_id: &str,
