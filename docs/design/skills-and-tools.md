@@ -140,7 +140,12 @@ usage or incomplete traces are reported as missing; they are never converted
 to zero. A report can be regenerated without rerunning a trial.
 
 Private adoption is an explicit compare-and-set against the currently active
-revision. A conflict preserves both revisions and is visible to the user.
-Running trials keep their pinned revision. Rollback is another recorded
-adoption, and a follow-up real invocation must prove that the adopted revision
-is loaded with its version/hash identity intact.
+revision. The activation request carries `expected_active_version_id`; `null`
+means that no revision is expected. The server locks only the target session,
+checks the revision content hash before writing, and returns a conflict when
+the expectation is stale. Repeating the same target is idempotent only when
+the request names the currently active revision as its expectation. A conflict
+preserves both revisions and is visible to the user. Running trials keep their
+pinned revision. Rollback is another recorded adoption, and a follow-up real
+invocation must prove that the adopted revision is loaded with its version/hash
+identity intact.

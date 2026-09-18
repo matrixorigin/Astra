@@ -208,6 +208,14 @@ pub enum StateProjectionError {
     },
     #[error("personal skill version is not activatable: version={version_id}, status={status}")]
     PersonalSkillVersionNotActivatable { version_id: String, status: String },
+    #[error(
+        "personal skill activation changed concurrently: skill={skill_name}, expected={expected:?}, actual={actual:?}"
+    )]
+    PersonalSkillActivationConflict {
+        skill_name: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -268,10 +276,6 @@ pub struct BubbleUpTarget {
     pub session_id: String,
     pub run_id: String,
     pub depth: u32,
-}
-
-pub trait SkillActivationLlmProbe: Send + Sync {
-    fn record_llm_call(&self);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1124,42 +1128,16 @@ impl DatabaseStateProjectionStore {
         Ok(out)
     }
 
-    pub async fn activate_personal_skill_from_ui(
+    pub async fn activate_personal_skill_from_ui_with_expected(
         &self,
         user_id: &str,
         session_id: &str,
         skill_name: &str,
         version_id: &str,
-    ) -> Result<(), StateProjectionError> {
-        self.activate_personal_skill_from_ui_with_probe(
-            user_id, session_id, skill_name, version_id, None,
-        )
-        .await
-    }
-
-    pub async fn activate_personal_skill_from_ui_with_probe(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        skill_name: &str,
-        version_id: &str,
-        _llm_probe: Option<&dyn SkillActivationLlmProbe>,
+        expected_active_version_id: Option<&str>,
     ) -> Result<(), StateProjectionError> {
         let event_id = format!("event-{}", Uuid::new_v4());
         let item_id = bounded_state_item_id("active-skill", &[session_id, skill_name]);
-        let payload = json!({
-            "skill_name": skill_name,
-            "version_id": version_id,
-            "activation_source": "ui_structured_intent",
-            "llm_involved": false,
-        });
-        let payload_json =
-            serde_json::to_string(&payload).map_err(|source| StateProjectionError::Json {
-                operation: "serialize_skill_activation",
-                entity: skill_name.to_string(),
-                source,
-            })?;
-        let payload_hash = content_hash(&payload_json);
         let mut tx =
             self.pool
                 .get()
@@ -1202,8 +1180,9 @@ impl DatabaseStateProjectionStore {
                 session_id: session_id.to_string(),
             });
         }
-        let version_status = sqlx::query(
-            "SELECT status FROM user_skill_versions
+        let version = sqlx::query(
+            "SELECT status, content_hash, manifest_json, content_markdown
+             FROM user_skill_versions
              WHERE owner_user_id = ? AND skill_name = ? AND version_id = ?
              LIMIT 1 FOR UPDATE",
         )
@@ -1216,27 +1195,221 @@ impl DatabaseStateProjectionStore {
             operation: "validate_skill_activation_version",
             entity: version_id.to_string(),
             source,
-        })?
-        .map(|row| row.try_get::<String, _>("status"))
-        .transpose()
-        .map_err(|source| StateProjectionError::Database {
-            operation: "validate_skill_activation_version",
-            entity: version_id.to_string(),
-            source,
         })?;
-        let Some(version_status) = version_status else {
+        let Some(version) = version else {
             return Err(StateProjectionError::PersonalSkillVersionUnavailable {
                 user_id: user_id.to_string(),
                 skill_name: skill_name.to_string(),
                 version_id: version_id.to_string(),
             });
         };
+        let version_status = version.try_get::<String, _>("status").map_err(|source| {
+            StateProjectionError::Database {
+                operation: "validate_skill_activation_version",
+                entity: version_id.to_string(),
+                source,
+            }
+        })?;
+        let version_content_hash =
+            version
+                .try_get::<String, _>("content_hash")
+                .map_err(|source| StateProjectionError::Database {
+                    operation: "validate_skill_activation_version",
+                    entity: version_id.to_string(),
+                    source,
+                })?;
         if version_status != "published" {
             return Err(StateProjectionError::PersonalSkillVersionNotActivatable {
                 version_id: version_id.to_string(),
                 status: version_status,
             });
         }
+        if version_content_hash.trim().is_empty() {
+            return Err(StateProjectionError::InvalidDatabaseValue {
+                operation: "validate_skill_activation_version",
+                entity: version_id.to_string(),
+                column: "content_hash",
+                value: version_content_hash,
+                reason: "must be non-empty",
+            });
+        }
+        let manifest_raw = version
+            .try_get::<String, _>("manifest_json")
+            .map_err(|source| StateProjectionError::Database {
+                operation: "validate_skill_activation_version",
+                entity: version_id.to_string(),
+                source,
+            })?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest_raw).map_err(|source| StateProjectionError::Json {
+                operation: "deserialize_skill_activation_manifest",
+                entity: version_id.to_string(),
+                source,
+            })?;
+        let content_markdown =
+            version
+                .try_get::<String, _>("content_markdown")
+                .map_err(|source| StateProjectionError::Database {
+                    operation: "validate_skill_activation_version",
+                    entity: version_id.to_string(),
+                    source,
+                })?;
+        let recomputed_content_hash =
+            crate::personal_skills::skill_md_content_hash(&manifest, &content_markdown);
+        if version_content_hash != recomputed_content_hash {
+            return Err(StateProjectionError::InvalidDatabaseValue {
+                operation: "validate_skill_activation_version",
+                entity: version_id.to_string(),
+                column: "content_hash",
+                value: version_content_hash,
+                reason: "does not match manifest_json and content_markdown",
+            });
+        }
+        let current_active = sqlx::query(
+            "SELECT payload_json FROM session_state_items
+             WHERE user_id = ? AND session_id = ? AND scope = 'session'
+               AND category = 'active_skill' AND item_key = ? AND status = 'active'
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(skill_name)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "load_current_skill_activation",
+            entity: skill_name.to_string(),
+            source,
+        })?
+        .map(|row| row.try_get::<String, _>("payload_json"))
+        .transpose()
+        .map_err(|source| StateProjectionError::Database {
+            operation: "load_current_skill_activation",
+            entity: skill_name.to_string(),
+            source,
+        })?
+        .map(|payload_json| {
+            serde_json::from_str::<serde_json::Value>(&payload_json)
+                .map_err(|source| StateProjectionError::Json {
+                    operation: "deserialize_current_skill_activation",
+                    entity: skill_name.to_string(),
+                    source,
+                })
+                .and_then(|payload| {
+                    let projected_name = payload
+                        .get("skill_name")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| StateProjectionError::InvalidDatabaseValue {
+                            operation: "deserialize_current_skill_activation",
+                            entity: skill_name.to_string(),
+                            column: "payload_json.skill_name",
+                            value: payload.to_string(),
+                            reason: "must be a string",
+                        })?;
+                    let version_id = payload
+                        .get("version_id")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| StateProjectionError::InvalidDatabaseValue {
+                            operation: "deserialize_current_skill_activation",
+                            entity: skill_name.to_string(),
+                            column: "payload_json.version_id",
+                            value: payload.to_string(),
+                            reason: "must be a string",
+                        })?;
+                    let content_hash = payload
+                        .get("content_hash")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| StateProjectionError::InvalidDatabaseValue {
+                            operation: "deserialize_current_skill_activation",
+                            entity: skill_name.to_string(),
+                            column: "payload_json.content_hash",
+                            value: payload.to_string(),
+                            reason: "must be a string",
+                        })?;
+                    if projected_name != skill_name || content_hash.trim().is_empty() {
+                        return Err(StateProjectionError::InvalidDatabaseValue {
+                            operation: "deserialize_current_skill_activation",
+                            entity: skill_name.to_string(),
+                            column: "payload_json",
+                            value: payload.to_string(),
+                            reason: "skill_name and content_hash must be valid",
+                        });
+                    }
+                    Ok((version_id.to_string(), content_hash.to_string()))
+                })
+        })
+        .transpose()?;
+        let current_active_version = current_active
+            .as_ref()
+            .map(|(version_id, _)| version_id.as_str());
+        let current_active_hash = current_active
+            .as_ref()
+            .map(|(_, content_hash)| content_hash);
+        if let Some(current_hash) = current_active_hash {
+            let current_version_id = current_active_version.expect("hash implies version");
+            let stored_hash = sqlx::query(
+                "SELECT content_hash FROM user_skill_versions
+                 WHERE owner_user_id = ? AND skill_name = ? AND version_id = ?
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(skill_name)
+            .bind(current_version_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "validate_current_skill_activation_hash",
+                entity: skill_name.to_string(),
+                source,
+            })?
+            .map(|row| row.try_get::<String, _>("content_hash"))
+            .transpose()
+            .map_err(|source| StateProjectionError::Database {
+                operation: "validate_current_skill_activation_hash",
+                entity: skill_name.to_string(),
+                source,
+            })?;
+            if stored_hash.as_deref() != Some(current_hash.as_str()) {
+                return Err(StateProjectionError::InvalidDatabaseValue {
+                    operation: "validate_current_skill_activation_hash",
+                    entity: skill_name.to_string(),
+                    column: "payload_json.content_hash",
+                    value: current_hash.clone(),
+                    reason: "does not match the stored revision hash",
+                });
+            }
+        }
+        if current_active_version.as_deref() != expected_active_version_id {
+            return Err(StateProjectionError::PersonalSkillActivationConflict {
+                skill_name: skill_name.to_string(),
+                expected: expected_active_version_id.map(str::to_string),
+                actual: current_active_version.map(str::to_string),
+            });
+        }
+        if current_active_version.as_deref() == Some(version_id) {
+            tx.commit()
+                .await
+                .map_err(|source| StateProjectionError::Database {
+                    operation: "commit_idempotent_skill_activation",
+                    entity: session_id.to_string(),
+                    source,
+                })?;
+            return Ok(());
+        }
+        let payload = json!({
+            "skill_name": skill_name,
+            "version_id": version_id,
+            "content_hash": version_content_hash,
+            "activation_source": "ui_structured_intent",
+            "llm_involved": false,
+        });
+        let payload_json =
+            serde_json::to_string(&payload).map_err(|source| StateProjectionError::Json {
+                operation: "serialize_skill_activation",
+                entity: skill_name.to_string(),
+                source,
+            })?;
+        let payload_hash = content_hash(&payload_json);
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, created_at)

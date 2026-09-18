@@ -39,6 +39,9 @@ fn map_personal_skill_error(error: PersonalSkillError) -> (StatusCode, Json<Erro
         PersonalSkillError::InvalidActiveProjection { .. } => {
             error_response(StatusCode::CONFLICT, error.to_string())
         }
+        PersonalSkillError::ActivationConflict { .. } => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
         other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
@@ -115,11 +118,12 @@ pub(super) async fn activate_user_skill_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let store = require_personal_skill_store(&state)?;
     store
-        .activate_version(
+        .activate_version_with_expected(
             &user.user_id,
             &request.session_id,
             &skill_name,
             &request.version_id,
+            request.expected_active_version_id.as_deref(),
         )
         .await
         .map(Json)

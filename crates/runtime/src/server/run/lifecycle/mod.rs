@@ -3856,19 +3856,25 @@ fn install_active_personal_skills(
     active_skills: Vec<astra_services::ActivePersonalSkillRecord>,
 ) {
     for skill in active_skills {
-        state
-            .skills
-            .execution
-            .pinned
-            .insert(skill.skill_name.clone());
+        let skill_name = skill.skill_name;
+        let revision_id = skill.version_id;
+        let content_hash = skill.content_hash;
+        state.skills.execution.pinned.insert(skill_name.clone());
         state.skills.execution.invoked.insert(
-            skill.skill_name.clone(),
+            skill_name.clone(),
             crate::turn::skill_tool::InvokedSkill {
-                name: skill.skill_name,
+                name: skill_name.clone(),
                 content: skill.content_markdown,
                 invoked_at_turn: state.current_session_turn_number(),
                 reentry_count: 0,
                 execution_topology: None,
+            },
+        );
+        state.skills.execution.revision_identities.insert(
+            skill_name,
+            crate::turn::agentic_loop::host::SkillRevisionIdentity {
+                version_id: revision_id,
+                content_hash,
             },
         );
     }

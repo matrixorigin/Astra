@@ -163,6 +163,7 @@ fn active_personal_skill_is_installed_as_exact_runtime_content() {
             skill_name: "review-exact".to_string(),
             version_id: "version-exact".to_string(),
             version: "1.0.0".to_string(),
+            content_hash: "sha256:exact".to_string(),
             content_markdown: "EXACT PERSONAL SKILL CONTENT".to_string(),
         }],
     );
@@ -175,6 +176,17 @@ fn active_personal_skill_is_installed_as_exact_runtime_content() {
         .expect("active personal skill must be in runtime prompt attachments");
     assert_eq!(invoked.content, "EXACT PERSONAL SKILL CONTENT");
     assert!(state.skills.execution.pinned.contains("review-exact"));
+    assert_eq!(
+        state
+            .skills
+            .execution
+            .revision_identities
+            .get("review-exact"),
+        Some(&crate::turn::agentic_loop::host::SkillRevisionIdentity {
+            version_id: "version-exact".to_string(),
+            content_hash: "sha256:exact".to_string(),
+        })
+    );
 }
 
 #[test]

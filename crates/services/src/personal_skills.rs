@@ -65,6 +65,14 @@ pub enum PersonalSkillError {
         session_id: String,
         skill_name: String,
     },
+    #[error(
+        "skill activation changed concurrently: skill={skill_name}, expected={expected:?}, actual={actual:?}"
+    )]
+    ActivationConflict {
+        skill_name: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,6 +122,11 @@ pub struct ActivePersonalSkillRecord {
     pub skill_name: String,
     pub version_id: String,
     pub version: String,
+    /// Immutable content identity carried into every runtime invocation.
+    /// The version label alone is not sufficient because a mutable source
+    /// projection or an incorrectly restored checkpoint could otherwise load
+    /// different bytes under the same display version.
+    pub content_hash: String,
     pub content_markdown: String,
 }
 
@@ -138,6 +151,8 @@ pub struct SubmitUserSkillVersion {
 pub struct ActivateUserSkillVersion {
     pub session_id: String,
     pub version_id: String,
+    #[serde(default)]
+    pub expected_active_version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -343,12 +358,19 @@ impl DatabasePersonalSkillStore {
             .collect()
     }
 
-    pub async fn activate_version(
+    /// Activate a version with an explicit compare-and-set expectation.
+    ///
+    /// `None` means the caller expects no active version for this skill. An
+    /// already-applied activation is idempotent only when the caller supplies
+    /// that same version as its expected baseline; a stale writer is a
+    /// visible conflict rather than an implicit overwrite.
+    pub async fn activate_version_with_expected(
         &self,
         owner_user_id: &str,
         session_id: &str,
         skill_name: &str,
         version_id: &str,
+        expected_active_version_id: Option<&str>,
     ) -> Result<UserSkillVersionRecord, PersonalSkillError> {
         let version = self
             .load_version_by_id(owner_user_id, skill_name, version_id)
@@ -365,7 +387,13 @@ impl DatabasePersonalSkillStore {
             });
         }
         let activation = DatabaseStateProjectionStore::new(self.pool.clone())
-            .activate_personal_skill_from_ui(owner_user_id, session_id, skill_name, version_id)
+            .activate_personal_skill_from_ui_with_expected(
+                owner_user_id,
+                session_id,
+                skill_name,
+                version_id,
+                expected_active_version_id,
+            )
             .await;
         match activation {
             Ok(()) => {}
@@ -388,6 +416,17 @@ impl DatabasePersonalSkillStore {
                     status,
                 });
             }
+            Err(StateProjectionError::PersonalSkillActivationConflict {
+                skill_name,
+                expected,
+                actual,
+            }) => {
+                return Err(PersonalSkillError::ActivationConflict {
+                    skill_name,
+                    expected,
+                    actual,
+                });
+            }
             Err(source) => {
                 return Err(PersonalSkillError::StateProjection {
                     operation: "activate_user_skill_version",
@@ -406,7 +445,8 @@ impl DatabasePersonalSkillStore {
     ) -> Result<Vec<ActivePersonalSkillRecord>, PersonalSkillError> {
         let rows = sqlx::query(
             "SELECT state.item_key AS skill_name, state.payload_json,
-                    versions.version_id, versions.version, versions.content_markdown,
+                    versions.version_id, versions.version, versions.content_hash,
+                    versions.manifest_json, versions.content_markdown,
                     versions.status AS version_status
              FROM session_state_items state
              JOIN agent_sessions sessions
@@ -460,6 +500,7 @@ impl DatabasePersonalSkillStore {
                 })?;
                 let projected_name = payload.get("skill_name").and_then(Value::as_str);
                 let projected_version = payload.get("version_id").and_then(Value::as_str);
+                let projected_hash = payload.get("content_hash").and_then(Value::as_str);
                 let version_id =
                     row.try_get::<Option<String>, _>("version_id")
                         .map_err(|source| {
@@ -470,10 +511,38 @@ impl DatabasePersonalSkillStore {
                         .map_err(|source| {
                             db_error("load_active_personal_skills", &skill_name, source)
                         })?;
+                let content_hash =
+                    row.try_get::<Option<String>, _>("content_hash")
+                        .map_err(|source| {
+                            db_error("load_active_personal_skills", &skill_name, source)
+                        })?;
+                let manifest_raw = row_string(
+                    &row,
+                    "load_active_personal_skills",
+                    session_id,
+                    "manifest_json",
+                )?;
+                let manifest: Value = serde_json::from_str(&manifest_raw).map_err(|source| {
+                    PersonalSkillError::Json {
+                        operation: "deserialize_active_personal_skill_manifest",
+                        entity: skill_name.clone(),
+                        source,
+                    }
+                })?;
+                let content_markdown = row_string(
+                    &row,
+                    "load_active_personal_skills",
+                    session_id,
+                    "content_markdown",
+                )?;
                 if projected_name != Some(skill_name.as_str())
                     || projected_version.is_none()
                     || version_id.as_deref() != projected_version
+                    || projected_hash.is_none()
+                    || content_hash.as_deref() != projected_hash
                     || version_status.as_deref() != Some("published")
+                    || content_hash.as_deref()
+                        != Some(skill_md_content_hash(&manifest, &content_markdown).as_str())
                 {
                     return Err(PersonalSkillError::InvalidActiveProjection {
                         owner_user_id: owner_user_id.to_string(),
@@ -490,12 +559,8 @@ impl DatabasePersonalSkillStore {
                         session_id,
                         "version",
                     )?,
-                    content_markdown: row_string(
-                        &row,
-                        "load_active_personal_skills",
-                        session_id,
-                        "content_markdown",
-                    )?,
+                    content_hash: content_hash.expect("validated present"),
+                    content_markdown,
                 })
             })
             .collect()

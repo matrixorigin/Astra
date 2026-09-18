@@ -144,19 +144,31 @@ async fn l2_45_active_switch_accepts_only_published_version() {
         .await
         .unwrap();
     store
-        .activate_version(&user_id, &session_id, &skill_name, &v1.version_id)
+        .activate_version_with_expected(&user_id, &session_id, &skill_name, &v1.version_id, None)
         .await
         .unwrap();
     assert!(matches!(
         store
-            .activate_version(&user_id, &session_id, &skill_name, &v2.version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &skill_name,
+                &v2.version_id,
+                Some(&v1.version_id),
+            )
             .await,
         Err(PersonalSkillError::VersionNotActivatable { .. })
     ));
     let typo_session = format!("typo-{}", Uuid::new_v4());
     assert!(matches!(
         store
-            .activate_version(&user_id, &typo_session, &skill_name, &v1.version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &typo_session,
+                &skill_name,
+                &v1.version_id,
+                None,
+            )
             .await,
         Err(PersonalSkillError::SessionNotActive { .. })
     ));
@@ -318,7 +330,13 @@ async fn l2_48_active_personal_skill_content_is_exactly_session_and_owner_scoped
         .await
         .unwrap();
     store
-        .activate_version(&user_id, &session_a, &skill_name, &version.version_id)
+        .activate_version_with_expected(
+            &user_id,
+            &session_a,
+            &skill_name,
+            &version.version_id,
+            None,
+        )
         .await
         .unwrap();
     let active = store
@@ -424,12 +442,18 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
     }
     let v2 = versions[1].clone();
     store
-        .activate_version(&user_id, &session_id, &skill_name, &v2.version_id)
+        .activate_version_with_expected(&user_id, &session_id, &skill_name, &v2.version_id, None)
         .await
         .unwrap();
     assert!(
         store
-            .activate_version(&user_id, &session_id, &skill_name, &versions[6].version_id)
+            .activate_version_with_expected(
+                &user_id,
+                &session_id,
+                &skill_name,
+                &versions[6].version_id,
+                Some(&v2.version_id),
+            )
             .await
             .is_err(),
         "quarantined version must be ready for quarantine enforcement"
@@ -462,5 +486,6 @@ async fn l3_16_s13_seven_version_iteration_append_only_and_structured_switch_bac
     let _structured_request = ActivateUserSkillVersion {
         session_id,
         version_id: v2.version_id,
+        expected_active_version_id: None,
     };
 }

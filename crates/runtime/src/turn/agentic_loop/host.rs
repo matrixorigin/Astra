@@ -1658,9 +1658,20 @@ pub struct SkillExecutionState {
     /// Original delivered instructions and re-entry counters, not reloaded content.
     #[serde(serialize_with = "serialize_invoked_skills")]
     pub invoked: HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    /// Exact personal-skill revision identities loaded for this execution.
+    /// This is observational state; it does not grant activation authority.
+    #[serde(default)]
+    pub revision_identities: HashMap<String, SkillRevisionIdentity>,
     /// Failed/invalid auto-route attempts must not restart after recovery.
     #[serde(serialize_with = "serialize_skill_set")]
     pub auto_route_attempts: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRevisionIdentity {
+    pub version_id: String,
+    pub content_hash: String,
 }
 
 impl SkillExecutionState {
@@ -1671,6 +1682,13 @@ impl SkillExecutionState {
             .any(|(name, invocation)| name != &invocation.name)
         {
             return Err("invoked skill key differs from its canonical identity");
+        }
+        if self
+            .revision_identities
+            .keys()
+            .any(|name| !self.invoked.contains_key(name))
+        {
+            return Err("skill revision identity has no corresponding invocation");
         }
         Ok(())
     }
@@ -10863,6 +10881,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let original = state.skills.execution.invoked["test-skill"].clone();
+        state.skills.execution.revision_identities.insert(
+            "test-skill".to_string(),
+            SkillRevisionIdentity {
+                version_id: "v1".to_string(),
+                content_hash: "sha256:test".to_string(),
+            },
+        );
         let wire =
             serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
         let restored: OriginalLoopExecutionFacts = serde_json::from_value(wire.clone()).unwrap();
@@ -10889,7 +10914,18 @@ pub(crate) mod tests {
         let mut bad = wire.clone();
         bad["skill_execution"]["invoked"]["test-skill"]["name"] = json!("another-skill");
         assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(bad).is_err());
+        let mut bad = wire.clone();
+        bad["skill_execution"]["revision_identities"]["orphan"] = json!({
+            "version_id": "v2",
+            "content_hash": "sha256:orphan"
+        });
+        assert!(serde_json::from_value::<OriginalLoopExecutionFacts>(bad).is_err());
         for field in wire["skill_execution"].as_object().unwrap().keys() {
+            // Revision identities are observational metadata and default to an
+            // empty map when a checkpoint predates this metadata.
+            if field == "revision_identities" {
+                continue;
+            }
             let mut bad = wire.clone();
             bad["skill_execution"]
                 .as_object_mut()

@@ -8723,7 +8723,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .await
         .expect("publish personal skill version fixture");
     state_projection_store
-        .activate_personal_skill_from_ui_with_probe(
+        .activate_personal_skill_from_ui_with_expected(
             &user_id,
             &state_session,
             &active_skill_name,
