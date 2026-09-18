@@ -8482,14 +8482,18 @@ impl AgenticRunLifecycleService {
                     let msg = err.to_string();
                     let error_kind = err.kind.as_str();
                     let error_code = classified_terminal_error_code(&err);
-                    events.push(json!({
+                    let mut run_error = json!({
                         "event_type": "run_error",
                         "data": {
                             "error": &msg,
                             "error_code": &error_code,
                             "error_kind": error_kind,
                         }
-                    }));
+                    });
+                    if let Some(data) = run_error["data"].as_object_mut() {
+                        data.extend(classified_terminal_error_metadata(&err));
+                    }
+                    events.push(run_error);
                     let mut finished = usage;
                     finished["error"] = Value::String(msg.clone());
                     finished["error_code"] = Value::String(error_code);

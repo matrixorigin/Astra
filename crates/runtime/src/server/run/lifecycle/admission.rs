@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use astra_core::{ErrorResponse, error_response_coded};
 
@@ -168,6 +168,18 @@ pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError
         && let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json)
     {
         match details.get("source").and_then(Value::as_str) {
+            Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE) => {
+                if let Some(error_code) =
+                    details
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .filter(|code| {
+                            astra_services::models::is_safe_moi_model_gateway_error_code(code)
+                        })
+                {
+                    return error_code.to_string();
+                }
+            }
             Some("llm_provider_admission") => {
                 return "llm_provider_admission_rejected".to_string();
             }
@@ -190,6 +202,48 @@ pub(super) fn classified_terminal_error_code(error: &astra_core::ClassifiedError
         }
     }
     error.kind.as_str().to_string()
+}
+
+/// Return the bounded, non-message fields that the trusted MOI model gateway
+/// explicitly declared safe for the external run_error contract.
+pub(super) fn classified_terminal_error_metadata(
+    error: &astra_core::ClassifiedError,
+) -> Map<String, Value> {
+    let Some(details) = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Map::new();
+    };
+    if details.get("source").and_then(Value::as_str)
+        != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE)
+    {
+        return Map::new();
+    }
+    let mut metadata = Map::from_iter([(
+        "source".to_string(),
+        Value::String(astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE.to_string()),
+    )]);
+    if let Some(retryable) = details.get("retryable").and_then(Value::as_bool) {
+        metadata.insert("retryable".to_string(), Value::Bool(retryable));
+    }
+    if let Some(action) = details
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|value| astra_services::models::is_safe_moi_model_gateway_error_code(value))
+    {
+        metadata.insert("action".to_string(), Value::String(action.to_string()));
+    }
+    if let Some(status) = details
+        .get("http_status")
+        .and_then(Value::as_u64)
+        .filter(|status| (400..=599).contains(status))
+    {
+        metadata.insert("http_status".to_string(), Value::from(status));
+    }
+    metadata
 }
 
 pub(super) fn register_run_admission_metrics(
@@ -233,6 +287,49 @@ pub(super) fn register_durable_run_event_metrics(
         "Configured maximum estimated durable run event bytes per terminal batch.",
     );
     refresh_durable_run_event_budget_metrics(registry);
+}
+
+#[cfg(test)]
+mod model_gateway_error_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_model_gateway_error_projects_stable_terminal_fields() {
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Unknown,
+            "MOI model gateway rejected inference: insufficient_credit",
+        )
+        .with_details_json(
+            json!({
+                "source": "moi_model_gateway",
+                "http_status": 402,
+                "error_code": "insufficient_credit",
+                "retryable": false,
+                "action": "open_billing_overview",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classified_terminal_error_code(&error),
+            "insufficient_credit"
+        );
+        assert_eq!(
+            classified_terminal_error_metadata(&error),
+            Map::from_iter([
+                (
+                    "source".to_string(),
+                    Value::String("moi_model_gateway".to_string()),
+                ),
+                ("retryable".to_string(), Value::Bool(false)),
+                (
+                    "action".to_string(),
+                    Value::String("open_billing_overview".to_string()),
+                ),
+                ("http_status".to_string(), Value::from(402)),
+            ])
+        );
+    }
 }
 
 pub(super) fn register_post_loop_memory_cleanup_metrics(

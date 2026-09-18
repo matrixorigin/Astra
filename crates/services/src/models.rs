@@ -676,6 +676,25 @@ pub enum ModelExecutionPlacement {
     Edge,
 }
 
+/// Versioned error contract negotiated only for the trusted MOI runtime model
+/// gateway. Ordinary provider routes must not set this header: their response
+/// bodies remain untrusted diagnostics and continue to be redacted by the LLM
+/// transport boundary.
+pub const MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER: &str = "x-moi-model-gateway-error-contract";
+pub const MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1: &str = "v1";
+pub const MOI_MODEL_GATEWAY_ERROR_SOURCE: &str = "moi_model_gateway";
+
+/// Return whether a machine-readable MOI model gateway field is safe to
+/// propagate through Astra's public run-event contract.
+#[must_use]
+pub fn is_safe_moi_model_gateway_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 impl ModelExecutionPlacement {
     #[must_use]
     pub fn as_str(self) -> &'static str {

@@ -64,7 +64,7 @@ pub(crate) async fn admit_model_execution(
                 )
             })?;
         let provider = execution_provider_for_protocol(&gateway.protocol)?;
-        return Ok(AdmittedModelExecution::from_endpoint(
+        let mut execution = AdmittedModelExecution::from_endpoint(
             selection.offering_id.clone(),
             resolved.model_name.clone(),
             provider.to_string(),
@@ -74,7 +74,17 @@ pub(crate) async fn admit_model_execution(
             gateway
                 .model_context_window
                 .expect("validated model_gateway capability must carry a positive context window"),
-        ));
+        );
+        // This execution material exists only after the provider-authorized
+        // model_gateway descriptor and runtime identity have both been
+        // validated above. Negotiate MOI's safe structured error envelope at
+        // that trust boundary; TUI and ordinary provider routes never receive
+        // this header and retain the existing redaction behavior.
+        execution.header_overrides.insert(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        );
+        return Ok(execution);
     }
 
     if resolved.is_some() {
@@ -245,6 +255,12 @@ mod tests {
         assert_eq!(
             endpoint.completions_url_override.as_deref(),
             Some("http://127.0.0.1:8181/chat/completions")
+        );
+        assert_eq!(
+            endpoint
+                .header_overrides
+                .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER),
+            Some(&astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string())
         );
     }
 

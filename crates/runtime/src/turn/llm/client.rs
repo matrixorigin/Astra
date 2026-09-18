@@ -60,6 +60,72 @@ pub(crate) fn redact_provider_secrets(s: &str) -> String {
     redact_known_secret_patterns(s)
 }
 
+fn uses_moi_model_gateway_error_contract(
+    header_overrides: Option<&HashMap<String, String>>,
+) -> bool {
+    header_overrides.is_some_and(|headers| {
+        headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+            ) && value == astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1
+        })
+    })
+}
+
+struct MoiModelGatewayError {
+    classified: astra_core::ClassifiedError,
+    retryable: bool,
+}
+
+/// Parse only the versioned envelope emitted by the trusted MOI model gateway.
+/// The provider message is deliberately ignored: only bounded machine fields
+/// cross the provider boundary, so echoed prompts, credentials, and arbitrary
+/// upstream text cannot become an Astra or client-facing error.
+fn moi_model_gateway_error(
+    status: u16,
+    response_body: &str,
+    header_overrides: Option<&HashMap<String, String>>,
+    response_contract_version: Option<&str>,
+) -> Option<MoiModelGatewayError> {
+    if !uses_moi_model_gateway_error_contract(header_overrides)
+        || response_contract_version
+            != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1)
+    {
+        return None;
+    }
+    let envelope = serde_json::from_str::<Value>(response_body).ok()?;
+    let error = envelope.get("error")?.as_object()?;
+    let code = error.get("code")?.as_str()?.trim();
+    if !astra_services::models::is_safe_moi_model_gateway_error_code(code) {
+        return None;
+    }
+    let retryable = error
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let action = error
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| astra_services::models::is_safe_moi_model_gateway_error_code(action));
+    let mut details = json!({
+        "source": astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE,
+        "http_status": status,
+        "error_code": code,
+        "retryable": retryable,
+    });
+    if let Some(action) = action {
+        details["action"] = Value::String(action.to_string());
+    }
+    Some(MoiModelGatewayError {
+        classified: astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Unknown,
+            format!("MOI model gateway rejected inference: {code}"),
+        )
+        .with_details_json(details.to_string()),
+        retryable,
+    })
+}
+
 /// Maximum retries for known provider failures (429, 5xx, connect-before-delivery).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
@@ -4845,6 +4911,7 @@ async fn call_llm_and_collect_with_total_budget(
 
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
+    let mut last_model_gateway_error = None;
     let max_retries = LLM_MAX_RETRIES;
     let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
@@ -5094,6 +5161,10 @@ async fn call_llm_and_collect_with_total_budget(
                     )
                     .await?;
                 }
+                // This transport failure is the newest provider attempt outcome.
+                // Do not let structured metadata from an earlier gateway response
+                // replace the final connection failure after retries are exhausted.
+                last_model_gateway_error = None;
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -5524,6 +5595,10 @@ async fn call_llm_and_collect_with_total_budget(
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
+        let model_gateway_error_contract = headers
+            .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -5583,6 +5658,24 @@ async fn call_llm_and_collect_with_total_budget(
                 return Err(error);
             }
         };
+
+        if let Some(model_gateway_error) = moi_model_gateway_error(
+            status,
+            &text,
+            header_overrides,
+            model_gateway_error_contract.as_deref(),
+        ) {
+            let error = model_gateway_error.classified;
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            if model_gateway_error.retryable && status >= 500 {
+                last_err = error.message.clone();
+                last_kind = error.kind;
+                last_model_gateway_error = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+        last_model_gateway_error = None;
 
         // Auth errors: redact the body in logs and return a generic message
         // so provider-echoed secrets cannot leak through error propagation.
@@ -5717,6 +5810,9 @@ async fn call_llm_and_collect_with_total_budget(
         return Err(error);
     }
 
+    if let Some(error) = last_model_gateway_error {
+        return Err(error);
+    }
     Err(astra_core::ClassifiedError::new(
         last_kind,
         format!("{last_err} (after {} retries)", LLM_MAX_RETRIES),
@@ -14328,6 +14424,247 @@ mod tests {
             .status(401)
             .body(Body::from("Unauthorized"))
             .unwrap()
+    }
+
+    async fn mock_402_moi_model_gateway() -> Response {
+        Response::builder()
+            .status(402)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"message":"provider secret must stay hidden","type":"billing_admission_denied","code":"insufficient_credit","retryable":false,"action":"open_billing_overview"}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn mock_402_without_model_gateway_contract() -> Response {
+        Response::builder()
+            .status(402)
+            .body(Body::from(
+                r#"{"error":{"message":"provider secret must stay hidden","type":"billing_admission_denied","code":"insufficient_credit","retryable":false,"action":"open_billing_overview"}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn mock_retryable_503_moi_model_gateway(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(503)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"code":"temporary_unavailable","retryable":true,"action":"retry"}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn spawn_single_retryable_moi_gateway_503_server() -> (String, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind single-response gateway listener");
+        let addr = listener.local_addr().expect("single-response local_addr");
+        let responses = Arc::new(AtomicU32::new(0));
+        let responses_for_server = responses.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept gateway request");
+            drop(listener);
+
+            let mut request = vec![0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let body =
+                r#"{"error":{"code":"temporary_unavailable","retryable":true,"action":"retry"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+                body.len(),
+                body,
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write gateway response");
+            responses_for_server.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.shutdown().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        (format!("http://{addr}"), responses)
+    }
+
+    async fn call_retryable_moi_model_gateway(base_url: &str) -> astra_core::ClassifiedError {
+        reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
+        let headers = HashMap::from([(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        )]);
+        let messages = vec![json!({"role":"user","content":"x"})];
+        call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url,
+                    provider: "openai",
+                    header_overrides: Some(&headers),
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("retryable gateway failures must exhaust the model call")
+    }
+
+    async fn call_mock_402_moi_model_gateway(
+        header_overrides: Option<&HashMap<String, String>>,
+        response_uses_contract: bool,
+    ) -> astra_core::ClassifiedError {
+        reset_rate_limit_cooldown_for_tests();
+        let app = if response_uses_contract {
+            Router::new().route("/chat/completions", post(mock_402_moi_model_gateway))
+        } else {
+            Router::new().route(
+                "/chat/completions",
+                post(mock_402_without_model_gateway_contract),
+            )
+        };
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("402 must fail the model call")
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_contract_preserves_bounded_error_fields() {
+        let headers = HashMap::from([(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        )]);
+        let error = call_mock_402_moi_model_gateway(Some(&headers), true).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
+        assert_eq!(
+            error.message,
+            "MOI model gateway rejected inference: insufficient_credit"
+        );
+        assert!(!error.message.contains("provider secret"));
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("structured details"))
+                .expect("valid details");
+        assert_eq!(details["source"], "moi_model_gateway");
+        assert_eq!(details["http_status"], 402);
+        assert_eq!(details["error_code"], "insufficient_credit");
+        assert_eq!(details["retryable"], false);
+        assert_eq!(details["action"], "open_billing_overview");
+    }
+
+    #[tokio::test]
+    async fn ordinary_provider_route_does_not_trust_moi_model_gateway_shaped_error_body() {
+        let error = call_mock_402_moi_model_gateway(None, true).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
+        assert_eq!(error.message, "LLM request rejected: 402");
+        assert_eq!(error.details_json, None);
+        assert!(!error.message.contains("insufficient_credit"));
+        assert!(!error.message.contains("provider secret"));
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_request_contract_does_not_trust_an_unversioned_response() {
+        let headers = HashMap::from([(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        )]);
+        let error = call_mock_402_moi_model_gateway(Some(&headers), false).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
+        assert_eq!(error.message, "LLM request rejected: 402");
+        assert_eq!(error.details_json, None);
+        assert!(!error.message.contains("insufficient_credit"));
+        assert!(!error.message.contains("provider secret"));
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_retry_returns_the_final_transport_failure() {
+        let (base, responses) = spawn_single_retryable_moi_gateway_503_server().await;
+        let error = call_retryable_moi_model_gateway(&base).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Network);
+        assert_eq!(error.details_json, None);
+        assert!(!error.message.contains("temporary_unavailable"));
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_retry_preserves_the_last_gateway_failure() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_retryable_503_moi_model_gateway),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let error = call_retryable_moi_model_gateway(&base).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("last gateway failure must retain structured details"),
+        )
+        .expect("valid gateway details");
+        assert_eq!(details["source"], "moi_model_gateway");
+        assert_eq!(details["http_status"], 503);
+        assert_eq!(details["error_code"], "temporary_unavailable");
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["action"], "retry");
+        assert_eq!(hits.load(Ordering::SeqCst), LLM_MAX_RETRIES + 1);
     }
 
     #[tokio::test]

@@ -24033,6 +24033,12 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                         serde_json::Value::from(retry_after_ms),
                     );
                 }
+            } else if data.get("source").and_then(serde_json::Value::as_str)
+                == Some(crate::models::MOI_MODEL_GATEWAY_ERROR_SOURCE)
+            {
+                for key in ["retryable", "action", "http_status"] {
+                    insert_if_present(&mut out, &data, key);
+                }
             }
             for key in ["run_id", "error_kind", "reason", "blocked"] {
                 insert_if_present(&mut out, &data, key);
@@ -34080,6 +34086,27 @@ mod tests {
                 make_event("run_error", json!({})),
                 &|o| {
                     assert_eq!(o["message"], "Unknown error");
+                },
+            ),
+            (
+                "run_error trusted gateway metadata",
+                make_event(
+                    "run_error",
+                    json!({
+                        "error": "MOI model gateway rejected inference: insufficient_credit",
+                        "error_code": "insufficient_credit",
+                        "error_kind": "unknown",
+                        "source": "moi_model_gateway",
+                        "retryable": false,
+                        "action": "open_billing_overview",
+                        "http_status": 402
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["error_code"], "insufficient_credit");
+                    assert_eq!(o["retryable"], false);
+                    assert_eq!(o["action"], "open_billing_overview");
+                    assert_eq!(o["http_status"], 402);
                 },
             ),
             // ── approval / user_input ──
