@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-19-v87";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-19-v88";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -4475,6 +4475,22 @@ async fn ensure_core_schema_while_leased(
         &["owner_user_id", "idempotency_key"],
         "ALTER TABLE evaluation_materialization_receipts ADD UNIQUE INDEX uq_eval_materialization_idempotency (owner_user_id, idempotency_key)",
     )
+    .await?;
+    core_schema_create!(
+        pool,
+        "evaluation_task_assessments",
+        "CREATE TABLE IF NOT EXISTS evaluation_task_assessments (
+            owner_user_id VARCHAR(128) NOT NULL,
+            trial_id VARCHAR(128) NOT NULL,
+            experiment_id VARCHAR(128) NOT NULL,
+            assessment_id VARCHAR(128) NOT NULL,
+            assessment_json LONGTEXT NOT NULL,
+            PRIMARY KEY (owner_user_id, trial_id),
+            UNIQUE KEY uq_eval_task_assessment_id (owner_user_id, assessment_id),
+            INDEX idx_eval_task_assessment_experiment (owner_user_id, experiment_id, trial_id)
+        )",
+    )
+    .execute(&pool)
     .await?;
     core_schema_create!(
         pool,

@@ -15,6 +15,7 @@ use super::durable::{
 use super::execution::{
     DatabaseEvaluationObservationStore, EvaluationExecutionError, EvaluationObservationRecord,
 };
+use super::task_assessment::{TaskAssessmentError, TaskAssessmentRecord};
 use astra_core::{
     STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
     STATUS_WAITING, SharedPool,
@@ -42,6 +43,7 @@ pub struct EvaluationTrialProjection {
     pub run_status: Option<String>,
     pub lifecycle: EvaluationTrialLifecycle,
     pub observation: Option<EvaluationObservationRecord>,
+    pub task_assessment: Option<TaskAssessmentRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -60,6 +62,8 @@ pub enum EvaluationProjectionError {
     Persistence(#[from] EvaluationPersistenceError),
     #[error(transparent)]
     Execution(#[from] EvaluationExecutionError),
+    #[error(transparent)]
+    Assessment(#[from] TaskAssessmentError),
     #[error("evaluation projection conflict: {0}")]
     Conflict(String),
 }
@@ -73,6 +77,7 @@ impl EvaluationExperimentProjection {
         bindings: Vec<EvaluationTrialBindingRecord>,
         run_statuses: BTreeMap<String, String>,
         observations: Vec<EvaluationObservationRecord>,
+        assessments: Vec<TaskAssessmentRecord>,
     ) -> Result<Self, EvaluationProjectionError> {
         let owner = experiment.owner_user_id.as_str();
         let experiment_id = experiment.experiment_id.as_str();
@@ -186,6 +191,7 @@ impl EvaluationExperimentProjection {
                 run_status,
                 lifecycle,
                 observation,
+                task_assessment: None,
             });
         }
         if let Some((trial_id, _)) = observation_by_trial.into_iter().next() {
@@ -215,6 +221,29 @@ impl EvaluationExperimentProjection {
             .filter(|trial| matches!(trial.lifecycle, EvaluationTrialLifecycle::Unavailable))
             .map(|trial| trial.binding.trial_id.clone())
             .collect::<Vec<_>>();
+        for assessment in assessments {
+            let trial = trials
+                .iter_mut()
+                .find(|trial| trial.binding.trial_id == assessment.trial_id)
+                .ok_or_else(|| {
+                    EvaluationProjectionError::Conflict(
+                        "assessment references an unplanned trial".into(),
+                    )
+                })?;
+            let observation = trial.observation.as_ref().ok_or_else(|| {
+                EvaluationProjectionError::Conflict("assessment has no terminal observation".into())
+            })?;
+            assessment.validate_binding(&experiment, observation)?;
+            if let Some(previous) = &trial.task_assessment {
+                if previous != &assessment {
+                    return Err(EvaluationProjectionError::Conflict(
+                        "trial has conflicting task assessments".into(),
+                    ));
+                }
+            } else {
+                trial.task_assessment = Some(assessment);
+            }
+        }
         Ok(Self {
             experiment,
             trials,
@@ -283,6 +312,12 @@ impl DatabaseEvaluationProjectionStore {
             experiment_id,
         )
         .await?;
+        let assessments = super::task_assessment::list_assessments_in_transaction(
+            &mut tx,
+            owner_user_id,
+            experiment_id,
+        )
+        .await?;
         tx.commit().await.map_err(|source| {
             EvaluationProjectionError::Persistence(EvaluationPersistenceError::Database {
                 operation: "commit_load_evaluation_projection",
@@ -294,6 +329,7 @@ impl DatabaseEvaluationProjectionStore {
             bindings,
             run_statuses,
             observations,
+            assessments,
         )
     }
 }
@@ -339,10 +375,13 @@ mod tests {
                 input_content_hash:
                     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                         .to_string(),
-                verifier_id: "none".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
                 input_content: None,
             }],
             repetitions: 1,
@@ -453,6 +492,7 @@ mod tests {
             bindings,
             BTreeMap::new(),
             observations,
+            Vec::new(),
         )
         .expect("projection");
         assert_eq!(
@@ -510,6 +550,7 @@ mod tests {
                 bindings.clone(),
                 BTreeMap::new(),
                 vec![observation.clone()],
+                Vec::new(),
             )
             .is_err()
         );
@@ -528,6 +569,7 @@ mod tests {
                 bindings,
                 BTreeMap::new(),
                 vec![owned, conflict],
+                Vec::new(),
             )
             .is_err()
         );
@@ -547,6 +589,7 @@ mod tests {
             bindings.clone(),
             BTreeMap::new(),
             vec![foreign_observation],
+            Vec::new(),
         )
         .expect_err("foreign execution identity must be rejected");
         assert!(error.to_string().contains("run identity"));
@@ -558,6 +601,7 @@ mod tests {
             bindings.clone(),
             BTreeMap::new(),
             vec![recovered.clone()],
+            Vec::new(),
         )
         .expect("persisted recovery observation binds to original admission generation");
         assert_eq!(projection.observed_trial_count, 1);
@@ -568,6 +612,7 @@ mod tests {
                 bindings.clone(),
                 BTreeMap::new(),
                 vec![recovered],
+                Vec::new(),
             )
             .is_err(),
             "terminal generation cannot replace the immutable binding generation"
@@ -584,6 +629,7 @@ mod tests {
             experiment,
             bindings,
             statuses,
+            Vec::new(),
             Vec::new(),
         )
         .expect("projection");
@@ -614,6 +660,7 @@ mod tests {
             experiment,
             bindings,
             statuses,
+            Vec::new(),
             Vec::new(),
         )
         .expect("projection");

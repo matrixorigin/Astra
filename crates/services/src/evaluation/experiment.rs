@@ -60,11 +60,9 @@ pub struct EvaluationCase {
     pub case_id: String,
     pub input_snapshot_ref: String,
     pub input_content_hash: String,
-    pub verifier_id: String,
-    pub verifier_version: String,
     pub holdout: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_verifier: Option<super::task_verifier::TaskVerifierSpec>,
+    /// Complete server-frozen criterion identity; execution success alone is not a verdict.
+    pub task_verifier: super::task_verifier::TaskVerifierSpec,
     /// Frozen text for the first prompt/Skill adapter. Generic adapters may
     /// use only the content hash until they provide their own materializer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,8 +346,6 @@ pub struct TrialUnit {
     pub repetition: u32,
     pub input_snapshot_ref: String,
     pub input_content_hash: String,
-    pub verifier_id: String,
-    pub verifier_version: String,
     pub holdout: bool,
     pub memory_base_snapshot_ref: Option<String>,
     pub data_base_snapshot_ref: Option<String>,
@@ -396,8 +392,6 @@ impl ExperimentSpec {
             for (field, value) in [
                 ("input_snapshot_ref", &case.input_snapshot_ref),
                 ("input_content_hash", &case.input_content_hash),
-                ("verifier_id", &case.verifier_id),
-                ("verifier_version", &case.verifier_version),
             ] {
                 if value.trim().is_empty() {
                     return Err(format!(
@@ -414,14 +408,7 @@ impl ExperimentSpec {
                     case.case_id
                 ));
             }
-            if let Some(verifier) = &case.task_verifier {
-                verifier.validate()?;
-                if verifier.implementation_id != case.verifier_id
-                    || verifier.implementation_version != case.verifier_version
-                {
-                    return Err("case verifier identity does not match frozen task verifier".into());
-                }
-            }
+            case.task_verifier.validate()?;
         }
         self.conditions.execution_config.validate()?;
         let config = &self.conditions.execution_config;
@@ -607,8 +594,6 @@ impl ExperimentSpec {
         };
         if trial.input_snapshot_ref != case.input_snapshot_ref
             || trial.input_content_hash != case.input_content_hash
-            || trial.verifier_id != case.verifier_id
-            || trial.verifier_version != case.verifier_version
             || trial.holdout != case.holdout
             || trial.memory_base_snapshot_ref.as_deref() != expected_memory_base
             || trial.data_base_snapshot_ref.as_deref() != expected_data_base
@@ -772,8 +757,6 @@ impl ExperimentSpec {
                         repetition,
                         input_snapshot_ref: case.input_snapshot_ref.clone(),
                         input_content_hash: case.input_content_hash.clone(),
-                        verifier_id: case.verifier_id.clone(),
-                        verifier_version: case.verifier_version.clone(),
                         holdout: case.holdout,
                         memory_base_snapshot_ref: memory_base_snapshot_ref.clone(),
                         data_base_snapshot_ref: data_base_snapshot_ref.clone(),
@@ -955,10 +938,13 @@ mod tests {
                 case_id: "case-a".to_string(),
                 input_snapshot_ref: "snapshot-a".to_string(),
                 input_content_hash: "sha256:input".to_string(),
-                verifier_id: "verifier".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
                 input_content: None,
             }],
             repetitions: 2,
@@ -987,6 +973,52 @@ mod tests {
             measurement_profile:
                 crate::evaluation::measurement_profile::MeasurementProfile::InstructionOnlyV1,
         }
+    }
+
+    #[test]
+    fn task_verifier_is_required_validated_and_bound_by_trial_fingerprint() {
+        let original = spec(TrialOrder::BaselineFirst);
+        original.validate().unwrap();
+        let encoded = serde_json::to_value(&original.cases[0]).unwrap();
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove("task_verifier");
+        assert!(serde_json::from_value::<EvaluationCase>(missing).is_err());
+        let mut null = encoded.clone();
+        null["task_verifier"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<EvaluationCase>(null).is_err());
+        for field in ["verifier_id", "verifier_version"] {
+            let mut legacy = encoded.clone();
+            legacy[field] = serde_json::json!("legacy");
+            assert!(serde_json::from_value::<EvaluationCase>(legacy).is_err());
+        }
+        for field in [
+            "implementation_id",
+            "implementation_version",
+            "implementation_hash",
+            "rubric_hash",
+            "config_hash",
+        ] {
+            let mut forged = serde_json::to_value(&original).unwrap();
+            forged["cases"][0]["task_verifier"][field] = serde_json::json!("forged");
+            let forged: ExperimentSpec = serde_json::from_value(forged).unwrap();
+            assert!(forged.validate().is_err(), "accepted forged {field}");
+        }
+        let mut changed = original.clone();
+        changed.cases[0].task_verifier.config.expected = serde_json::json!({"ok": false});
+        assert!(changed.validate().is_err());
+        changed.cases[0].task_verifier = super::super::task_verifier::TaskVerifierSpec::freeze(
+            changed.cases[0].task_verifier.config.clone(),
+        )
+        .unwrap();
+        changed.validate().unwrap();
+        assert_ne!(
+            original.spec_fingerprint().unwrap(),
+            changed.spec_fingerprint().unwrap()
+        );
+        assert_ne!(
+            original.plan_trials().unwrap()[0].spec_fingerprint,
+            changed.plan_trials().unwrap()[0].spec_fingerprint
+        );
     }
 
     #[test]
@@ -1133,10 +1165,13 @@ mod tests {
             case_id: "case-b".to_string(),
             input_snapshot_ref: "snapshot-b".to_string(),
             input_content_hash: "sha256:input-b".to_string(),
-            verifier_id: "verifier".to_string(),
-            verifier_version: "1".to_string(),
             holdout: true,
-            task_verifier: None,
+            task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: serde_json::json!({"ok": true}),
+                },
+            )
+            .unwrap(),
             input_content: None,
         });
         let budget = spec

@@ -52,10 +52,13 @@ fn spec(experiment_id: &str) -> ExperimentSpec {
             case_id: "case-a".to_string(),
             input_snapshot_ref: "input-snapshot-a".to_string(),
             input_content_hash: format!("sha256:{}", "a".repeat(64)),
-            verifier_id: "verifier-a".to_string(),
-            verifier_version: "1".to_string(),
             holdout: false,
-            task_verifier: None,
+            task_verifier: astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                astra_services::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: serde_json::json!({"ok": true}),
+                },
+            )
+            .unwrap(),
             input_content: None,
         }],
         repetitions: 1,
@@ -271,6 +274,8 @@ async fn insert_run_event(
 
 async fn cleanup(pool: &SharedPool, owner: &str) {
     for (table, column) in [
+        ("evaluation_task_assessments", "owner_user_id"),
+        ("session_transcript_items", "user_id"),
         ("evaluation_trial_observations", "owner_user_id"),
         ("evaluation_materialization_receipts", "owner_user_id"),
         ("evaluation_trial_bindings", "owner_user_id"),
@@ -1752,4 +1757,406 @@ async fn evaluation_trial_binding_is_atomic_across_sessions_and_owner_scoped() {
     }
     cleanup(&pool, &owner).await;
     cleanup(&pool, &other_owner).await;
+}
+
+/// Real admission receipts and a canonical atomic terminal transaction. The
+/// returned request still crosses the production observation writer in tests.
+async fn settle_task_assessment_trial(
+    pool: &SharedPool,
+    owner: &str,
+    experiment: &astra_services::evaluation::EvaluationExperimentRecord,
+    trial: &TrialUnit,
+    content: &str,
+    status: &str,
+) -> EvaluationObservationRequest {
+    use astra_services::evaluation::content_fingerprint;
+    use astra_services::runs::AtomicRunTerminalSettlementRequest;
+    let session = insert_session(pool, owner).await;
+    let run = insert_evaluation_run(pool, owner, &session, &experiment.spec, trial).await;
+    let store = DatabaseRunStateStore::new(pool.clone());
+    let envelope = SnapshotEnvelope::new(
+        owner,
+        &experiment.experiment_id,
+        Some(trial.trial_id.clone()),
+        CompositeSnapshot {
+            snapshot_id: Uuid::new_v4().to_string(),
+            session_id: session.clone(),
+            turn: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            version: 1,
+            label: None,
+            refs: vec![],
+        },
+        &experiment.spec.conditions.context_snapshot_hash,
+        &experiment.spec.conditions.tool_policy_hash,
+    )
+    .unwrap();
+    let trusted = TrustedMaterializerContext {
+        owner_user_id: owner.into(),
+        materializer_kind: "test.task_assessment".into(),
+        provider_binding_id: Some(experiment.spec.conditions.provider_binding.clone()),
+        execution_run_id: Some(run.clone()),
+        execution_run_generation: Some(0),
+    };
+    let receipt_store = DatabaseMaterializationReceiptStore::new(pool.clone());
+    let mut receipt_ids = Vec::new();
+    for (kind, name, hash) in [
+        (
+            MaterializationComponentKind::Context,
+            "context",
+            &experiment.spec.conditions.context_snapshot_hash,
+        ),
+        (
+            MaterializationComponentKind::Policy,
+            "policy",
+            &experiment.spec.conditions.tool_policy_hash,
+        ),
+    ] {
+        let receipt = receipt_store
+            .record_receipt(
+                &trusted,
+                &MaterializationReceiptRequest {
+                    trial_id: trial.trial_id.clone(),
+                    session_id: session.clone(),
+                    envelope: envelope.clone(),
+                    component_kind: kind,
+                    component_snapshot_ref: Some(format!("{name}://assessment")),
+                    component_base_snapshot_ref: None,
+                    component_content_fingerprint: Some(hash.clone()),
+                    outcome: MaterializationOutcome::Available,
+                    failure_code: None,
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                    idempotency_key: format!("{run}:{name}"),
+                },
+            )
+            .await
+            .unwrap();
+        receipt_ids.push(receipt.receipt_id);
+    }
+    let mut admission: EvaluationRunAdmission = serde_json::from_value(
+        evaluation_run_record(owner, &session, &experiment.spec, trial).events[0]["data"]["evaluation_admission"].clone()
+    ).unwrap();
+    admission.receipt_ids = receipt_ids.clone();
+    admission.snapshot_envelope = Some(envelope);
+    store.append_events_batch(owner, &session, &run, &[serde_json::json!({
+        "event_type":"evaluation_admitted", "run_generation":0,
+        "idempotency_key":format!("evaluation-admitted:{run}:0"), "data":{"admission":admission}
+    })]).await.unwrap();
+    let events = [
+        serde_json::json!({"event_type":"run_output_recorded","idempotency_key":"run-output-recorded:0",
+            "data":{"schema_version":1,"owner_user_id":owner,"session_id":session,"run_id":run,"run_generation":0,
+                "source_event_id":"assessment-output","content_hash":content_fingerprint(content),"content_bytes":content.len()}}),
+        serde_json::json!({"event_type":"run_finished","data":{"status":status}}),
+        serde_json::json!({"event_type":"run_accounting_finalized","idempotency_key":"run-accounting-finalized:0",
+            "data":{"usage_scope":"run_total","prompt_tokens":7,"cache_read_tokens":4,"cache_creation_tokens":2,"completion_tokens":5,"tool_call_count":0}}),
+    ];
+    let mut tx = pool.get().begin().await.unwrap();
+    sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'assessment-output','transcript-envelope')")
+        .bind(owner).bind(&session).bind(&run).bind(content).execute(&mut *tx).await.unwrap();
+    store
+        .settle_terminal_in_existing_transaction(
+            &mut tx,
+            AtomicRunTerminalSettlementRequest {
+                user_id: owner,
+                expected_session_id: &session,
+                run_id: &run,
+                expected_owner_generation: 0,
+                expected_statuses: &["queued"],
+                status,
+                waiting_for: None,
+                error_message: None,
+                events: &events,
+                prompt_tokens: 13,
+                completion_tokens: 5,
+                tool_calls: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("canonical atomic terminal commits");
+    tx.commit().await.unwrap();
+    store
+        .append_events_batch(
+            owner,
+            &session,
+            &run,
+            &[serde_json::json!({"event_type":"run_settlement_finished",
+        "idempotency_key":"run-settlement-finished:0","data":{"owner_generation":0}})],
+        )
+        .await
+        .unwrap();
+    EvaluationObservationRequest {
+        session_id: session,
+        execution_run_id: run.clone(),
+        admission_run_generation: 0,
+        execution_run_generation: 0,
+        observation: astra_services::evaluation::terminal_run_observation(
+            experiment.spec_fingerprint.clone(),
+            trial.trial_id.clone(),
+            trial.case_id.clone(),
+            trial.arm.clone(),
+            trial.repetition,
+            if status == "completed" {
+                TrialStatus::Completed
+            } else {
+                TrialStatus::Failed
+            },
+            Some(7),
+            Some(5),
+            Some(0),
+            vec![EvidenceRef {
+                evidence_id: format!("run:{run}"),
+                kind: EvidenceKind::Trace,
+                availability: EvidenceAvailability::Available,
+                content_hash: None,
+                locator: Some(format!("run://{owner}/{run}")),
+            }],
+        ),
+        materialization_receipt_ids: receipt_ids,
+        idempotency_key: format!("{run}:observation"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn task_assessment_is_historical_owner_bound_and_retries_missing_sources() {
+    use astra_services::evaluation::{
+        TaskAssessmentOutcome, TaskAssessmentResult, TaskAssessmentUnavailableReason,
+    };
+    let pool = common::setup_pool().await;
+    let owner = format!("assessment-owner-{}", Uuid::new_v4());
+    let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
+    let store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let experiment_id = format!("assessment-{}", Uuid::new_v4());
+    let experiment = plan_store
+        .register_experiment(&owner, &spec(&experiment_id), "task-assessment")
+        .await
+        .unwrap();
+    let trials = experiment.spec.plan_trials().unwrap();
+    for (trial, content, expected) in [
+        (&trials[0], "{\"ok\":false}", TaskAssessmentOutcome::Fail),
+        (&trials[1], "{\"ok\":true}", TaskAssessmentOutcome::Pass),
+    ] {
+        let request =
+            settle_task_assessment_trial(&pool, &owner, &experiment, trial, content, "completed")
+                .await;
+        assert_eq!(
+            store
+                .assess_trial(&owner, &experiment_id, &trial.trial_id)
+                .await
+                .unwrap(),
+            TaskAssessmentResult::Pending
+        );
+        // Historical repair must not require an active session or renewed receipt.
+        sqlx::query(
+            "UPDATE agent_sessions SET status = 'archived' WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&request.session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE evaluation_materialization_receipts SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 DAY) WHERE owner_user_id = ? AND trial_id = ?")
+            .bind(&owner).bind(&trial.trial_id).execute(pool.get()).await.unwrap();
+        let observation = store
+            .record_observation(&owner, &request)
+            .await
+            .expect("historical observation repair");
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&request.session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .assess_trial(&owner, &experiment_id, &trial.trial_id)
+                .await
+                .unwrap(),
+            TaskAssessmentResult::Pending
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM evaluation_task_assessments WHERE owner_user_id = ? AND trial_id = ?")
+            .bind(&owner).bind(&trial.trial_id).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            count, 0,
+            "missing transcript must not become immutable unavailable"
+        );
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'assessment-output','transcript-envelope')")
+            .bind(&owner).bind(&request.session_id).bind(&request.execution_run_id).bind(content).execute(pool.get()).await.unwrap();
+        // Re-publish the exact production-validated observation behind the
+        // Session lock. Assessment discovery precedes observation publication.
+        sqlx::query(
+            "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+        )
+        .bind(&owner)
+        .bind(&trial.trial_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let mut publishing = pool.get().begin().await.unwrap();
+        sqlx::query(
+            "SELECT session_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+        )
+        .bind(&owner)
+        .bind(&request.session_id)
+        .fetch_one(&mut *publishing)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO evaluation_trial_observations
+            (schema_version,owner_user_id,observation_id,experiment_id,trial_id,session_id,execution_run_id,
+             admission_run_generation,execution_run_generation,spec_fingerprint,observation_json,
+             materialization_receipt_ids_json,request_fingerprint,idempotency_key,created_at,updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(6),NOW(6))")
+            .bind(observation.schema_version).bind(&owner).bind(&observation.observation_id).bind(&experiment_id)
+            .bind(&trial.trial_id).bind(&request.session_id).bind(&request.execution_run_id)
+            .bind(observation.admission_run_generation).bind(observation.execution_run_generation)
+            .bind(&experiment.spec_fingerprint).bind(serde_json::to_string(&observation.observation).unwrap())
+            .bind(serde_json::to_string(&observation.materialization_receipt_ids).unwrap())
+            .bind(&observation.request_fingerprint).bind(&observation.idempotency_key)
+            .execute(&mut *publishing).await.unwrap();
+        let waiting = store.assess_trial(&owner, &experiment_id, &trial.trial_id);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "assessment must wait for the canonical Session lock"
+        );
+        publishing.commit().await.unwrap();
+        let (left, right) = tokio::join!(
+            waiting,
+            store.assess_trial(&owner, &experiment_id, &trial.trial_id)
+        );
+        let first = left.unwrap();
+        assert_eq!(
+            first,
+            right.unwrap(),
+            "concurrent assess must return the same receipt"
+        );
+        let TaskAssessmentResult::Recorded(record) = &first else {
+            panic!("assessment must persist")
+        };
+        assert_eq!(record.outcome, expected);
+        record.validate_binding(&experiment, &observation).unwrap();
+        assert!(
+            store
+                .assess_trial("other-owner", &experiment_id, &trial.trial_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .assess_trial(&owner, "other-experiment", &trial.trial_id)
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&request.session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .assess_trial(&owner, &experiment_id, &trial.trial_id)
+                .await
+                .unwrap(),
+            first,
+            "existing assessment survives source cleanup"
+        );
+    }
+    let failed_id = format!("assessment-failed-{}", Uuid::new_v4());
+    let failed = plan_store
+        .register_experiment(&owner, &spec(&failed_id), "task-assessment-failed")
+        .await
+        .unwrap();
+    let trial = failed.spec.plan_trials().unwrap().remove(0);
+    let request =
+        settle_task_assessment_trial(&pool, &owner, &failed, &trial, "{\"ok\":true}", "failed")
+            .await;
+    store.record_observation(&owner, &request).await.unwrap();
+    let TaskAssessmentResult::Recorded(record) = store
+        .assess_trial(&owner, &failed_id, &trial.trial_id)
+        .await
+        .unwrap()
+    else {
+        panic!("failed run assessment")
+    };
+    assert_eq!(
+        record.outcome,
+        TaskAssessmentOutcome::Unavailable(TaskAssessmentUnavailableReason::TerminalNotCompleted)
+    );
+    assert!(record.output.is_none());
+    // Even an oversized body must match the full receipt hash before an
+    // immutable unavailable verdict. Mixed UTF-8 widths cross chunk boundaries;
+    // mutate the final emoji so a later chunk must participate in the hash.
+    let oversized_trial = failed.spec.plan_trials().unwrap().remove(1);
+    let oversized = format!("\"{}\"", "a你🙂".repeat(150_000));
+    let oversized_request = settle_task_assessment_trial(
+        &pool,
+        &owner,
+        &failed,
+        &oversized_trial,
+        &oversized,
+        "completed",
+    )
+    .await;
+    store
+        .record_observation(&owner, &oversized_request)
+        .await
+        .unwrap();
+    let mut tampered = oversized.clone();
+    let last_emoji = tampered.rfind('🙂').unwrap();
+    tampered.replace_range(last_emoji..last_emoji + '🙂'.len_utf8(), "🙃");
+    assert_eq!(oversized.len(), tampered.len());
+    sqlx::query(
+        "UPDATE session_transcript_items SET content = ? WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&tampered)
+    .bind(&owner)
+    .bind(&oversized_request.session_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    assert!(matches!(
+        store
+            .assess_trial(&owner, &failed_id, &oversized_trial.trial_id)
+            .await,
+        Err(astra_services::evaluation::TaskAssessmentError::Integrity(
+            _
+        ))
+    ));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM evaluation_task_assessments WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&oversized_trial.trial_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "oversize hash mismatch must not persist unavailable"
+    );
+    sqlx::query(
+        "UPDATE session_transcript_items SET content = ? WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&oversized)
+    .bind(&owner)
+    .bind(&oversized_request.session_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let TaskAssessmentResult::Recorded(record) = store
+        .assess_trial(&owner, &failed_id, &oversized_trial.trial_id)
+        .await
+        .unwrap()
+    else {
+        panic!("oversize assessment")
+    };
+    assert_eq!(
+        record.outcome,
+        TaskAssessmentOutcome::Unavailable(TaskAssessmentUnavailableReason::OutputTooLarge)
+    );
+    cleanup(&pool, &owner).await;
 }

@@ -51,12 +51,10 @@ pub struct EvaluationPrepareRevision {
 pub struct EvaluationPrepareCase {
     pub case_id: String,
     pub message: String,
-    pub verifier_id: String,
-    pub verifier_version: String,
     #[serde(default)]
     pub holdout: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verifier_config: Option<super::task_verifier::JsonValueEqualsConfig>,
+    /// Required task criterion. Implementation identity is frozen by the server.
+    pub verifier_config: super::task_verifier::JsonValueEqualsConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -100,4 +98,31 @@ pub struct EvaluationTrialStartResponse {
     pub session_id: String,
     pub run_id: String,
     pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prepare_requires_criterion_and_rejects_client_verifier_identity() {
+        let valid = json!({
+            "case_id": "case-1",
+            "message": "Return the expected JSON",
+            "verifier_config": {"expected": {"ok": true}}
+        });
+        assert!(serde_json::from_value::<EvaluationPrepareCase>(valid.clone()).is_ok());
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("verifier_config");
+        assert!(serde_json::from_value::<EvaluationPrepareCase>(missing).is_err());
+        let mut null = valid.clone();
+        null["verifier_config"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<EvaluationPrepareCase>(null).is_err());
+        for field in ["verifier_id", "verifier_version", "task_verifier"] {
+            let mut forged = valid.clone();
+            forged[field] = json!("client-selected");
+            assert!(serde_json::from_value::<EvaluationPrepareCase>(forged).is_err());
+        }
+    }
 }

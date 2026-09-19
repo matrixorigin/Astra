@@ -15,6 +15,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(evaluation::start_trial_handler),
         )
         .route(
+            "/evaluation/experiments/{experiment_id}/trials/{trial_id}/assess",
+            post(evaluation::assess_trial_handler),
+        )
+        .route(
             "/evaluation/experiments/{experiment_id}",
             get(evaluation::get_experiment_projection_handler),
         )

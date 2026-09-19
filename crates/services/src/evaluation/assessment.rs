@@ -515,10 +515,13 @@ mod tests {
                 case_id: "case-1".to_string(),
                 input_snapshot_ref: "snapshot-1".to_string(),
                 input_content_hash: "sha256:input".to_string(),
-                verifier_id: "verifier".to_string(),
-                verifier_version: "v1".to_string(),
                 holdout: true,
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
                 input_content: None,
             }],
             repetitions: 2,
@@ -641,10 +644,13 @@ mod tests {
             case_id: "case-2".to_string(),
             input_snapshot_ref: "snapshot-2".to_string(),
             input_content_hash: "sha256:input-2".to_string(),
-            verifier_id: "verifier".to_string(),
-            verifier_version: "v1".to_string(),
             holdout: false,
-            task_verifier: None,
+            task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: serde_json::json!({"ok": true}),
+                },
+            )
+            .unwrap(),
             input_content: None,
         });
         let budget = spec

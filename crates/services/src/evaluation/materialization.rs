@@ -1299,8 +1299,6 @@ mod tests {
                 sequence: 1,
                 input_snapshot_ref: "input-a".to_string(),
                 input_content_hash: "hash-a".to_string(),
-                verifier_id: "verifier-a".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
                 memory_base_snapshot_ref: None,
                 data_base_snapshot_ref: None,
@@ -1336,10 +1334,13 @@ mod tests {
                 case_id: "case-a".to_string(),
                 input_snapshot_ref: "input-a".to_string(),
                 input_content_hash: "hash-a".to_string(),
-                verifier_id: "verifier-a".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
                 input_content: None,
             }],
             repetitions: 1,

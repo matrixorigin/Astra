@@ -8,12 +8,40 @@ use crate::AppState;
 use astra_core::{ErrorResponse, error_response, internal_error};
 use astra_services::evaluation::types::*;
 use astra_services::evaluation::{
-    DatabaseEvaluationPlanStore, DatabaseEvaluationProjectionStore,
-    EvaluationExperimentCreateRequest, EvaluationExperimentPrepareRequest,
-    EvaluationExperimentPrepareResponse, EvaluationExperimentRecord, EvaluationPersistenceError,
-    EvaluationProjectionError, EvaluationReportArtifact, EvaluationReportQuery,
+    DatabaseEvaluationObservationStore, DatabaseEvaluationPlanStore,
+    DatabaseEvaluationProjectionStore, EvaluationExperimentCreateRequest,
+    EvaluationExperimentPrepareRequest, EvaluationExperimentPrepareResponse,
+    EvaluationExperimentRecord, EvaluationPersistenceError, EvaluationProjectionError,
+    EvaluationReportArtifact, EvaluationReportQuery, TaskAssessmentError, TaskAssessmentResult,
     build_report_artifact, validate_report_label,
 };
+
+fn map_task_assessment_error(error: TaskAssessmentError) -> (StatusCode, Json<ErrorResponse>) {
+    if error.is_retryable() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Task assessment storage is temporarily unavailable; retry the same trial",
+        );
+    }
+    match error {
+        TaskAssessmentError::InvalidInput(detail) => {
+            error_response(StatusCode::BAD_REQUEST, detail)
+        }
+        TaskAssessmentError::NotFound(detail) => error_response(StatusCode::NOT_FOUND, detail),
+        TaskAssessmentError::Integrity(detail) => error_response(StatusCode::CONFLICT, detail),
+        TaskAssessmentError::Persistence(error) => map_evaluation_persistence_error(error),
+        TaskAssessmentError::Execution(
+            astra_services::evaluation::EvaluationExecutionError::Conflict(detail),
+        ) => error_response(StatusCode::CONFLICT, detail),
+        TaskAssessmentError::Execution(
+            astra_services::evaluation::EvaluationExecutionError::NotFound(detail),
+        ) => error_response(StatusCode::NOT_FOUND, detail),
+        TaskAssessmentError::Execution(
+            astra_services::evaluation::EvaluationExecutionError::Persistence(error),
+        ) => map_evaluation_persistence_error(error),
+        other => internal_error(other),
+    }
+}
 
 fn extract_user_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     headers
@@ -47,6 +75,7 @@ fn map_evaluation_projection_error(
     match error {
         EvaluationProjectionError::Persistence(error) => map_evaluation_persistence_error(error),
         EvaluationProjectionError::Execution(error) => internal_error(error),
+        EvaluationProjectionError::Assessment(error) => map_task_assessment_error(error),
         EvaluationProjectionError::Conflict(detail) => error_response(StatusCode::CONFLICT, detail),
     }
 }
@@ -118,6 +147,54 @@ pub async fn start_trial_handler(
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
+pub async fn assess_trial_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((experiment_id, trial_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<TaskAssessmentResult>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let pool = evaluation_pool(&state)?;
+    let store = DatabaseEvaluationObservationStore::new(pool.clone());
+    // Exact assessment replay precedes every source lookup, including repair.
+    let mut result = store
+        .assess_trial(&user.user_id, &experiment_id, &trial_id)
+        .await
+        .map_err(map_task_assessment_error)?;
+    if matches!(result, TaskAssessmentResult::Pending) {
+        let binding = DatabaseEvaluationPlanStore::new(pool)
+            .load_trial(&user.user_id, &trial_id)
+            .await
+            .map_err(map_evaluation_persistence_error)?;
+        if binding.experiment_id != experiment_id {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Trial not found in experiment",
+            ));
+        }
+        if let (Some(run_id), Some(session_id)) = (&binding.run_id, &binding.session_id) {
+            let repaired = state
+                .execution
+                .run_lifecycle_service
+                .repair_evaluation_observation(&user.user_id, &trial_id, run_id, session_id)
+                .await?;
+            if matches!(
+                repaired,
+                astra_services::runs::EvaluationObservationRepairOutcome::Ready
+            ) {
+                result = store
+                    .assess_trial(&user.user_id, &experiment_id, &trial_id)
+                    .await
+                    .map_err(map_task_assessment_error)?;
+            }
+        }
+    }
+    let status = match result {
+        TaskAssessmentResult::Pending => StatusCode::ACCEPTED,
+        TaskAssessmentResult::Recorded(_) => StatusCode::OK,
+    };
+    Ok((status, Json(result)))
+}
+
 pub async fn get_experiment_projection_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -180,6 +257,12 @@ pub async fn get_experiment_report_handler(
             .trials
             .iter()
             .filter_map(|trial| trial.observation.as_ref())
+            .cloned()
+            .collect::<Vec<_>>(),
+        &projection
+            .trials
+            .iter()
+            .filter_map(|trial| trial.task_assessment.as_ref())
             .cloned()
             .collect::<Vec<_>>(),
         &projection.unavailable_trial_ids,

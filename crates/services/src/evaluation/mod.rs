@@ -12,6 +12,7 @@ pub mod noop;
 pub mod projection;
 pub mod report;
 pub mod service;
+pub mod task_assessment;
 pub mod task_verifier;
 pub mod types;
 pub mod utils;
@@ -72,6 +73,11 @@ pub use report::{
 };
 pub use service::EvaluationService;
 pub use types::*;
+
+pub use task_assessment::{
+    TASK_ASSESSMENT_SCHEMA_VERSION, TaskAssessmentError, TaskAssessmentOutcome,
+    TaskAssessmentRecord, TaskAssessmentResult, TaskAssessmentUnavailableReason,
+};
 
 #[cfg(test)]
 pub(crate) mod test_support {

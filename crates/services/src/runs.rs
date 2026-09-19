@@ -53,8 +53,29 @@ pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResp
         && error.error_code.as_deref() == Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvaluationObservationRepairOutcome {
+    Ready,
+    NotReady,
+    NotEvaluation,
+}
+
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
+    /// Repair terminal Evaluation evidence without starting or resuming a Run.
+    async fn repair_evaluation_observation(
+        &self,
+        _owner_user_id: &str,
+        _trial_id: &str,
+        _run_id: &str,
+        _session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Evaluation observation repair is unavailable",
+        ))
+    }
+
     async fn request_permission_mode(
         &self,
         _user_id: String,
@@ -4836,7 +4857,7 @@ pub(crate) async fn validate_run_recovery_terminal_in_transaction(
     admission_generation: u64,
     terminal_generation: u64,
     admission_event_idx: i64,
-) -> Result<Option<RunRecoveryTerminalProof>, String> {
+) -> Result<Option<RunRecoveryTerminalProof>, RunProofReadError> {
     let sql = format!(
         "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
         WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
@@ -4847,10 +4868,10 @@ pub(crate) async fn validate_run_recovery_terminal_in_transaction(
         .bind(run_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(RunProofReadError::Database)?
         .map(run_record_from_row)
         .transpose()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| RunProofReadError::Integrity(error.to_string()))?;
     let Some(run) = run else { return Ok(None) };
     if run.run_generation != terminal_generation
         || !matches!(run.status.as_str(), STATUS_FAILED | STATUS_CANCELLED)
@@ -4858,7 +4879,9 @@ pub(crate) async fn validate_run_recovery_terminal_in_transaction(
         return Ok(None);
     }
     if admission_generation >= terminal_generation || admission_event_idx < 0 {
-        return Err("recovery proof requires an earlier admission generation and event".into());
+        return Err(RunProofReadError::Integrity(
+            "recovery proof requires an earlier admission generation and event".into(),
+        ));
     }
     let terminal_key = format!("run-recovery-terminal:{terminal_generation}");
     let rows = sqlx::query(
@@ -4878,7 +4901,7 @@ pub(crate) async fn validate_run_recovery_terminal_in_transaction(
     .bind(terminal_key)
     .fetch_all(&mut **tx)
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(RunProofReadError::Database)?;
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -4899,8 +4922,10 @@ pub(crate) async fn validate_run_recovery_terminal_in_transaction(
             }
             decode_atomic_terminal_event_row(row, run_id)
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(RunProofReadError::Integrity)?;
     validate_run_recovery_terminal_rows(&run, admission_generation, admission_event_idx, &rows)
+        .map_err(RunProofReadError::Integrity)
 }
 
 fn validate_run_recovery_terminal_rows(
@@ -4979,6 +5004,342 @@ fn validate_run_recovery_terminal_rows(
         status: run.status.clone(),
         generation: run.run_generation,
     }))
+}
+
+/// Historical committed facts; never authorization to execute a Run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedTerminalProof {
+    pub settlement_batch_id: String,
+    pub terminal_event_idx: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutputProof {
+    pub receipt_event_idx: i64,
+    pub source_event_id: String,
+    pub content_hash: String,
+    pub content_bytes: u64,
+}
+
+/// A proof may be absent, but a failed read must retain its failure class.
+#[derive(Debug, Error)]
+pub enum RunProofReadError {
+    #[error("run proof database read failed: {0}")]
+    Database(#[source] sqlx::Error),
+    #[error("run proof integrity conflict: {0}")]
+    Integrity(String),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TerminalOutputReadError {
+    #[error("terminal output evidence is not yet available")]
+    Pending,
+    #[error(transparent)]
+    Proof(#[from] RunProofReadError),
+}
+
+pub(crate) struct TerminalOutputIdentity<'a> {
+    pub owner_user_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub generation: u64,
+}
+
+pub(crate) struct TerminalOutputEvidence {
+    pub terminal: CommittedTerminalProof,
+    pub output: Option<RunOutputProof>,
+    pub content: Option<String>,
+}
+
+/// Read the immutable atomic cut and its exact transcript content in the caller's
+/// snapshot. No lease, model settings, materialization expiry or current tail check.
+pub(crate) async fn load_verified_terminal_output_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    identity: &TerminalOutputIdentity<'_>,
+    max_content_bytes: usize,
+) -> Result<TerminalOutputEvidence, TerminalOutputReadError> {
+    let integrity = |detail| TerminalOutputReadError::Proof(RunProofReadError::Integrity(detail));
+    let commit = load_committed_atomic_terminal_in_transaction(
+        tx,
+        identity.owner_user_id,
+        identity.session_id,
+        identity.run_id,
+        identity.generation,
+        Some(STATUS_COMPLETED),
+    )
+    .await?
+    .ok_or(TerminalOutputReadError::Pending)?;
+    let tail = commit
+        .event_receipts
+        .last()
+        .ok_or_else(|| integrity("empty terminal proof".into()))?;
+    let terminal = CommittedTerminalProof {
+        settlement_batch_id: tail
+            .settlement_batch_id
+            .clone()
+            .ok_or_else(|| integrity("terminal proof has no batch identity".into()))?,
+        terminal_event_idx: commit.last_event_idx,
+    };
+    let key = format!("run-output-recorded:{}", identity.generation);
+    let matches = commit
+        .event_receipts
+        .iter()
+        .zip(&commit.committed_events)
+        .filter(|(receipt, _)| {
+            receipt.event_type == "run_output_recorded"
+                || receipt.idempotency_key.as_deref() == Some(key.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(TerminalOutputEvidence {
+            terminal,
+            output: None,
+            content: None,
+        });
+    }
+    if matches.len() != 1 {
+        return Err(integrity(
+            "terminal batch has ambiguous output receipts".into(),
+        ));
+    }
+    let (receipt, event) = matches[0];
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OutputData {
+        schema_version: u32,
+        owner_user_id: String,
+        session_id: String,
+        run_id: String,
+        run_generation: u64,
+        source_event_id: String,
+        content_hash: String,
+        content_bytes: u64,
+    }
+    let data: OutputData = serde_json::from_value(
+        event
+            .get("data")
+            .cloned()
+            .ok_or_else(|| integrity("output receipt has no data".into()))?,
+    )
+    .map_err(|error| integrity(error.to_string()))?;
+    if receipt.event_type != "run_output_recorded"
+        || receipt.idempotency_key.as_deref() != Some(key.as_str())
+        || data.schema_version != 1
+        || data.owner_user_id != identity.owner_user_id
+        || data.session_id != identity.session_id
+        || data.run_id != identity.run_id
+        || data.run_generation != identity.generation
+        || data.source_event_id.trim().is_empty()
+        || data.content_hash.trim().is_empty()
+        || data.content_bytes == 0
+    {
+        return Err(integrity("output receipt identity mismatch".into()));
+    }
+    let output = RunOutputProof {
+        receipt_event_idx: receipt.event_idx,
+        source_event_id: data.source_event_id,
+        content_hash: data.content_hash,
+        content_bytes: data.content_bytes,
+    };
+    // Bound allocation independently of the receipt's claimed length. Oversize
+    // output retains its trusted receipt but cannot be passed to this verifier.
+    let rows = sqlx::query("SELECT item_seq, run_id, role, OCTET_LENGTH(content) AS content_bytes,
+        CASE WHEN OCTET_LENGTH(content) <= ? THEN content ELSE NULL END AS content
+        FROM session_transcript_items WHERE user_id = ? AND session_id = ? AND source_event_id = ? LIMIT 2 FOR UPDATE")
+        .bind(max_content_bytes as u64).bind(identity.owner_user_id).bind(identity.session_id).bind(&output.source_event_id)
+        .fetch_all(&mut **tx).await.map_err(RunProofReadError::Database)?;
+    if rows.len() > 1 {
+        return Err(integrity(
+            "output source resolves to multiple transcript rows".into(),
+        ));
+    }
+    if rows.is_empty() {
+        return Err(TerminalOutputReadError::Pending);
+    }
+    let content = if let Some(row) = rows.first() {
+        let run_id: Option<String> = row
+            .try_get("run_id")
+            .map_err(|e| integrity(e.to_string()))?;
+        let role: String = row.try_get("role").map_err(|e| integrity(e.to_string()))?;
+        let bytes: i64 = row
+            .try_get("content_bytes")
+            .map_err(|e| integrity(e.to_string()))?;
+        let content: Option<String> = row
+            .try_get("content")
+            .map_err(|e| integrity(e.to_string()))?;
+        if run_id.as_deref() != Some(identity.run_id)
+            || role != "assistant"
+            || u64::try_from(bytes).ok() != Some(output.content_bytes)
+        {
+            return Err(integrity(
+                "output transcript identity or byte length mismatch".into(),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let mut hashed_bytes = 0_u64;
+        if let Some(text) = &content {
+            hasher.update(text.as_bytes());
+            hashed_bytes = text.len() as u64;
+        } else {
+            let item_seq: i64 = row
+                .try_get("item_seq")
+                .map_err(|e| integrity(e.to_string()))?;
+            // MatrixOne SUBSTRING is character-based even after CAST AS BINARY.
+            // Bound each UTF-8 chunk to at most 65,536 Unicode characters
+            // (256 KiB), and advance by the actual returned character count.
+            // Hash in Rust: the database SHA2 implementation is not authoritative.
+            const CHUNK_CHARS: u64 = 65_536;
+            let mut offset_chars = 0_u64;
+            while hashed_bytes < output.content_bytes {
+                let chunk = sqlx::query_scalar::<_, String>(
+                    "SELECT SUBSTRING(content, ?, ?) FROM session_transcript_items
+                     WHERE user_id = ? AND session_id = ? AND item_seq = ? FOR UPDATE",
+                )
+                .bind(offset_chars + 1)
+                .bind(CHUNK_CHARS)
+                .bind(identity.owner_user_id)
+                .bind(identity.session_id)
+                .bind(item_seq)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(RunProofReadError::Database)?
+                .ok_or_else(|| {
+                    integrity("locked output transcript disappeared during hashing".into())
+                })?;
+                let chars = chunk.chars().count() as u64;
+                if chars == 0 || chars > CHUNK_CHARS {
+                    return Err(integrity(
+                        "output transcript chunk did not make bounded progress".into(),
+                    ));
+                }
+                offset_chars += chars;
+                hashed_bytes += chunk.len() as u64;
+                if hashed_bytes > output.content_bytes {
+                    return Err(integrity(
+                        "output transcript chunks exceed receipt byte length".into(),
+                    ));
+                }
+                hasher.update(chunk.as_bytes());
+            }
+        }
+        if hashed_bytes != output.content_bytes
+            || format!("sha256:{:x}", hasher.finalize()) != output.content_hash
+        {
+            return Err(integrity("output transcript content hash mismatch".into()));
+        }
+        content
+    } else {
+        None
+    };
+    Ok(TerminalOutputEvidence {
+        terminal,
+        output: Some(output),
+        content,
+    })
+}
+
+pub(crate) async fn load_committed_atomic_terminal_in_transaction(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    generation: u64,
+    expected_status: Option<&str>,
+) -> Result<Option<AtomicRunTerminalSettlementCommit>, RunProofReadError> {
+    let lock = if expected_status.is_some() {
+        " FOR UPDATE"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+             WHERE user_id = ? AND session_id = ? AND run_id = ?{lock}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?;
+    let Some(run) = row
+        .map(run_record_from_row)
+        .transpose()
+        .map_err(|error| RunProofReadError::Integrity(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if expected_status.is_some_and(|status| status != run.status)
+        || (expected_status.is_some() && run.run_generation != generation)
+    {
+        return Err(RunProofReadError::Integrity(
+            "historical completed run identity differs from observation".into(),
+        ));
+    }
+    if run.run_generation != generation
+        || !matches!(
+            run.status.as_str(),
+            STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
+        )
+    {
+        return Ok(None);
+    }
+    let anchor_sql = format!(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND idempotency_key = ?{lock}",
+        );
+    let anchor = sqlx::query(&anchor_sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(format!("run-accounting-finalized:{generation}"))
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?;
+    let Some(anchor) = anchor
+        .map(|row| decode_atomic_terminal_event_row(row, run_id))
+        .transpose()
+        .map_err(RunProofReadError::Integrity)?
+    else {
+        return Ok(None);
+    };
+    if anchor.0.event_type != "run_accounting_finalized" {
+        return Err(RunProofReadError::Integrity(
+            "settlement accounting anchor has the wrong event type".into(),
+        ));
+    }
+    let Some(batch_id) = anchor.0.settlement_batch_id.as_deref() else {
+        return Ok(None);
+    };
+    let batch_sql = format!(
+            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND request_id = ?
+             ORDER BY event_idx ASC{lock}",
+        );
+    let rows = sqlx::query(&batch_sql)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(RunProofReadError::Database)?
+        .into_iter()
+        .map(|row| decode_atomic_terminal_event_row(row, run_id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(RunProofReadError::Integrity)?;
+    if rows.last() != Some(&anchor) {
+        return Err(RunProofReadError::Integrity(
+            "settlement accounting anchor is not the batch tail".into(),
+        ));
+    }
+    let commit =
+        committed_atomic_terminal_from_rows(&run, &rows).map_err(RunProofReadError::Integrity)?;
+    Ok(Some(commit))
 }
 
 /// Validate restart-readable facts without inventing the original CAS preconditions.
@@ -11680,13 +12041,13 @@ impl DatabaseRunStateStore {
         admission_generation: u64,
         terminal_generation: u64,
         admission_event_idx: i64,
-    ) -> Result<Option<RunRecoveryTerminalProof>, String> {
+    ) -> Result<Option<RunRecoveryTerminalProof>, RunProofReadError> {
         let mut tx = self
             .pool
             .get()
             .begin()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(RunProofReadError::Database)?;
         let proof = validate_run_recovery_terminal_in_transaction(
             &mut tx,
             user_id,
@@ -11697,7 +12058,7 @@ impl DatabaseRunStateStore {
             admission_event_idx,
         )
         .await?;
-        tx.commit().await.map_err(|error| error.to_string())?;
+        tx.commit().await.map_err(RunProofReadError::Database)?;
         Ok(proof)
     }
 
@@ -11709,75 +12070,19 @@ impl DatabaseRunStateStore {
         session_id: &str,
         run_id: &str,
         generation: u64,
-    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, RunProofReadError> {
         let mut tx = self
             .pool
             .get()
             .begin()
             .await
-            .map_err(|error| error.to_string())?;
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND run_id = ?"
-        );
-        let row = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(run) = row
-            .map(run_record_from_row)
-            .transpose()
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        if run.run_generation != generation
-            || !matches!(
-                run.status.as_str(),
-                STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED | STATUS_DELEGATED
-            )
-        {
-            return Ok(None);
-        }
-        let anchor = sqlx::query(
-            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
-             FROM agent_run_events
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND idempotency_key = ?",
+            .map_err(RunProofReadError::Database)?;
+        let commit = load_committed_atomic_terminal_in_transaction(
+            &mut tx, user_id, session_id, run_id, generation, None,
         )
-        .bind(user_id).bind(session_id).bind(run_id)
-        .bind(format!("run-accounting-finalized:{generation}"))
-        .fetch_optional(&mut *tx).await.map_err(|error| error.to_string())?;
-        let Some(anchor) = anchor
-            .map(|row| decode_atomic_terminal_event_row(row, run_id))
-            .transpose()?
-        else {
-            return Ok(None);
-        };
-        if anchor.0.event_type != "run_accounting_finalized" {
-            return Err("settlement accounting anchor has the wrong event type".into());
-        }
-        let Some(batch_id) = anchor.0.settlement_batch_id.as_deref() else {
-            return Ok(None);
-        };
-        let rows = sqlx::query(
-            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id, payload_json
-             FROM agent_run_events
-             WHERE user_id = ? AND session_id = ? AND run_id = ? AND request_id = ?
-             ORDER BY event_idx ASC",
-        )
-        .bind(user_id).bind(session_id).bind(run_id).bind(batch_id)
-        .fetch_all(&mut *tx).await.map_err(|error| error.to_string())?
-        .into_iter().map(|row| decode_atomic_terminal_event_row(row, run_id))
-        .collect::<Result<Vec<_>, _>>()?;
-        if rows.last() != Some(&anchor) {
-            return Err("settlement accounting anchor is not the batch tail".into());
-        }
-        let commit = committed_atomic_terminal_from_rows(&run, &rows)?;
-        tx.commit().await.map_err(|error| error.to_string())?;
-        Ok(Some(commit))
+        .await?;
+        tx.commit().await.map_err(RunProofReadError::Database)?;
+        Ok(commit)
     }
 
     /// Resolve an uncertain atomic terminal settlement from committed facts.
@@ -31825,12 +32130,12 @@ mod tests {
         }
         sqlx::query("UPDATE agent_run_events SET event_hash = 'corrupted' WHERE user_id = ? AND run_id = ? AND idempotency_key = 'run-recovery-claimed:2'")
             .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
-        assert!(
+        assert!(matches!(
             store
                 .load_verified_recovery_terminal(&user_id, &session_id, &run_id, 0, 3, 0)
-                .await
-                .is_err()
-        );
+                .await,
+            Err(RunProofReadError::Integrity(_))
+        ));
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
             .bind(&user_id)
@@ -32956,6 +33261,153 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_task_output_proof_requires_atomic_receipt_and_exact_transcript() {
+        async fn read(
+            pool: &SharedPool,
+            identity: &TerminalOutputIdentity<'_>,
+        ) -> Result<TerminalOutputEvidence, TerminalOutputReadError> {
+            let mut tx = pool
+                .get()
+                .begin()
+                .await
+                .map_err(RunProofReadError::Database)?;
+            let result =
+                load_verified_terminal_output_in_transaction(&mut tx, identity, 1_048_576).await;
+            tx.rollback().await.map_err(RunProofReadError::Database)?;
+            result
+        }
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let owner = format!("output-u-{suffix}");
+        let session = format!("output-s-{suffix}");
+        let run_id = format!("output-r-{suffix}");
+        insert_active_database_session_fixture(&pool, &owner, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = owner.clone();
+        run.session_id = session.clone();
+        store.insert_run(run).await.unwrap();
+        let identity = TerminalOutputIdentity {
+            owner_user_id: &owner,
+            session_id: &session,
+            run_id: &run_id,
+            generation: 0,
+        };
+        let content = "{\"ok\":true}";
+        let hash = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
+        let events = [
+            json!({"event_type":"run_output_recorded","idempotency_key":"run-output-recorded:0",
+                "data":{"schema_version":1,"owner_user_id":owner,"session_id":session,"run_id":run_id,"run_generation":0,
+                    "source_event_id":"output-source","content_hash":hash,"content_bytes":content.len()}}),
+            json!({"event_type":"run_finished","data":{"status":STATUS_COMPLETED}}),
+            json!({"event_type":"run_accounting_finalized","idempotency_key":"run-accounting-finalized:0",
+                "data":{"usage_scope":"run_total","prompt_tokens":7,"cache_read_tokens":4,"cache_creation_tokens":2,"completion_tokens":5,"tool_call_count":2}}),
+        ];
+        let mut tx = pool.get().begin().await.unwrap();
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'output-source','transcript-envelope-hash')")
+            .bind(&owner).bind(&session).bind(&run_id).bind(content).execute(&mut *tx).await.unwrap();
+        store
+            .settle_terminal_in_existing_transaction(
+                &mut tx,
+                AtomicRunTerminalSettlementRequest {
+                    user_id: &owner,
+                    expected_session_id: &session,
+                    run_id: &run_id,
+                    expected_owner_generation: 0,
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    events: &events,
+                    prompt_tokens: 13,
+                    completion_tokens: 5,
+                    tool_calls: 2,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        let evidence = read(&pool, &identity).await.unwrap();
+        assert_eq!(evidence.content.as_deref(), Some(content));
+        assert_eq!(evidence.output.as_ref().unwrap().content_hash, hash);
+        store
+            .append_events_batch(
+                &owner,
+                &session,
+                &run_id,
+                &[json!({"event_type":"run_settlement_finished","data":{}})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&pool, &identity).await.unwrap().terminal,
+            evidence.terminal
+        );
+        sqlx::query(
+            "UPDATE session_transcript_items SET content = ? WHERE user_id = ? AND session_id = ?",
+        )
+        .bind("{\"ok\":null}")
+        .bind(&owner)
+        .bind(&session)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(matches!(
+            read(&pool, &identity).await,
+            Err(TerminalOutputReadError::Proof(
+                RunProofReadError::Integrity(_)
+            ))
+        ));
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read(&pool, &identity).await,
+            Err(TerminalOutputReadError::Pending)
+        ));
+        sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,source_event_id,content_hash) VALUES (?,?,1,?,'assistant',?,'output-source','transcript-envelope-hash')")
+            .bind(&owner).bind(&session).bind(&run_id).bind(content).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            read(&pool, &identity).await.unwrap().content.as_deref(),
+            Some(content)
+        );
+        let wrong_generation = TerminalOutputIdentity {
+            generation: 1,
+            ..identity
+        };
+        assert!(matches!(
+            read(&pool, &wrong_generation).await,
+            Err(TerminalOutputReadError::Proof(
+                RunProofReadError::Integrity(_)
+            ))
+        ));
+        sqlx::query("DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?")
+            .bind(&owner)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        cleanup_database_run_fixture(&pool, &owner, &run_id).await;
+        pool.get().close().await;
+        assert!(matches!(
+            store
+                .load_committed_atomic_terminal_settlement(&owner, &session, &run_id, 0)
+                .await,
+            Err(RunProofReadError::Database(sqlx::Error::PoolClosed))
+        ));
+        assert!(matches!(
+            store
+                .load_verified_recovery_terminal(&owner, &session, &run_id, 0, 1, 0)
+                .await,
+            Err(RunProofReadError::Database(sqlx::Error::PoolClosed))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_atomic_terminal_settlement_closes_pending_approval_before_terminal_on_matrixone()
      {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -33050,6 +33502,24 @@ mod tests {
         tx.commit()
             .await
             .expect("commit direct terminal settlement transaction");
+
+        let mut proof_tx = pool.get().begin().await.unwrap();
+        let no_output = load_verified_terminal_output_in_transaction(
+            &mut proof_tx,
+            &TerminalOutputIdentity {
+                owner_user_id: &user_id,
+                session_id: &session_id,
+                run_id: &run_id,
+                generation: 0,
+            },
+            1_048_576,
+        )
+        .await
+        .unwrap();
+        assert!(no_output.output.is_none());
+        assert!(no_output.content.is_none());
+        assert_eq!(no_output.terminal.terminal_event_idx, commit.last_event_idx);
+        proof_tx.rollback().await.unwrap();
 
         assert_eq!(commit.event_receipts.len(), 2);
         assert_eq!(commit.event_receipts[0].event_idx, terminal_event_idx);
@@ -33182,10 +33652,17 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                store
-                    .load_committed_atomic_terminal_settlement(&user_id, &session_id, &run_id, 0)
-                    .await
-                    .is_err(),
+                matches!(
+                    store
+                        .load_committed_atomic_terminal_settlement(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            0
+                        )
+                        .await,
+                    Err(RunProofReadError::Integrity(_))
+                ),
                 "{column}"
             );
             sqlx::query(&sql)

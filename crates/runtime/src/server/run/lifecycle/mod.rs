@@ -14,6 +14,7 @@ mod projection;
 pub(crate) mod run_state;
 
 use admission::*;
+use astra_services::runs::EvaluationObservationRepairOutcome;
 use projection::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -4250,13 +4251,15 @@ async fn initialize_runtime_controllers(
     session_id: &str,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
     context_trace_persistence: Option<ContextTracePersistenceContext>,
+    production_state_policy: RuntimeProductionStatePolicy,
 ) {
     let hub = Arc::new(ObservabilityHub::new());
     let session = hub.start_session(user_id, session_id);
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
-    loop_state.telemetry.evaluation_persistence = evaluation_persistence;
+    loop_state.telemetry.evaluation_persistence =
+        production_state_policy.select(evaluation_persistence);
     loop_state.telemetry.context_trace_persistence = context_trace_persistence;
 }
 
@@ -4266,6 +4269,7 @@ async fn configure_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
+    production_state_policy: RuntimeProductionStatePolicy,
 ) {
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
@@ -4284,6 +4288,7 @@ async fn configure_runtime_controllers(
         session_id,
         evaluation_persistence,
         context_trace_persistence,
+        production_state_policy,
     )
     .await
 }
@@ -4599,21 +4604,94 @@ struct PreparedRuntimeCapabilities {
     agent_binding: Option<PreparedAgentBindingLoopContext>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EvaluationObservationRepairError {
+    #[error(transparent)]
+    Execution(#[from] astra_services::evaluation::EvaluationExecutionError),
+    #[error(transparent)]
+    Persistence(#[from] astra_services::evaluation::EvaluationPersistenceError),
+    #[error("evaluation repair evidence serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("evaluation repair storage unavailable")]
+    StorageUnavailable,
+    #[error("evaluation repair Run read failed: {0}")]
+    RunRead(String),
+    #[error(transparent)]
+    TerminalProof(astra_services::runs::RunProofReadError),
+    #[error("evaluation repair binding mismatch")]
+    BindingMismatch,
+    #[error("evaluation repair Run not found")]
+    NotFound,
+}
+
+impl EvaluationObservationRepairError {
+    fn into_http(self) -> (StatusCode, Json<ErrorResponse>) {
+        use astra_services::evaluation::{
+            EvaluationExecutionError as Execution, EvaluationPersistenceError as Persistence,
+        };
+        if let Self::Execution(Execution::Persistence(error)) = self {
+            return Self::Persistence(error).into_http();
+        }
+        let (status, code) = match &self {
+            Self::BindingMismatch
+            | Self::TerminalProof(astra_services::runs::RunProofReadError::Integrity(_))
+            | Self::Execution(Execution::Conflict(_))
+            | Self::Persistence(Persistence::Conflict(_) | Persistence::ProtocolBlocked(_))
+            | Self::Serialization(_)
+            | Self::Execution(Execution::Json { .. })
+            | Self::Persistence(Persistence::Json { .. }) => {
+                (StatusCode::CONFLICT, "evaluation_repair_integrity")
+            }
+            Self::NotFound
+            | Self::Execution(Execution::NotFound(_))
+            | Self::Persistence(Persistence::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "evaluation_repair_not_found")
+            }
+            Self::Execution(Execution::InvalidInput(_))
+            | Self::Persistence(Persistence::InvalidInput(_)) => {
+                (StatusCode::BAD_REQUEST, "evaluation_repair_invalid_input")
+            }
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evaluation_repair_store_unavailable",
+            ),
+        };
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            tracing::warn!(error = %self, "evaluation observation repair storage failure");
+            error_response_coded(
+                status,
+                "Evaluation observation repair storage is unavailable; retry later",
+                code,
+            )
+        } else {
+            error_response_coded(status, self.to_string(), code)
+        }
+    }
+}
+
+/// Preserve the canonical reader's pending/integrity/storage distinction.
+/// Both custody and atomic-batch discovery use this same conversion.
+fn terminal_proof_for_repair<T>(
+    result: Result<Option<T>, astra_services::runs::RunProofReadError>,
+) -> Result<Option<T>, EvaluationObservationRepairError> {
+    result.map_err(EvaluationObservationRepairError::TerminalProof)
+}
+
 struct AdmittedEvaluationTrial {
     admission: EvaluationRunAdmission,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 }
 
-/// Select process-local memory dependencies once at composition boundaries.
-/// Evaluation currently admits only disabled memory; it must not inherit the
-/// owner's production recall, extraction, or observer services.
+/// Select production-state dependencies once at composition boundaries.
+/// Evaluation must not inherit production recall, extraction, observer, or
+/// quality-learning persistence. Observational telemetry remains independent.
 #[derive(Clone, Copy)]
-enum RuntimeMemoryPolicy {
+enum RuntimeProductionStatePolicy {
     Enabled,
     Disabled,
 }
 
-impl RuntimeMemoryPolicy {
+impl RuntimeProductionStatePolicy {
     fn for_request(request: &ChatRequestData) -> Self {
         if request.evaluation_admission.is_some() {
             Self::Disabled
@@ -12915,7 +12993,7 @@ impl AgenticRunLifecycleService {
         }
 
         builder = builder.with_memoria_client(
-            RuntimeMemoryPolicy::for_request(request)
+            RuntimeProductionStatePolicy::for_request(request)
                 .select(self.memory_extraction_service.as_ref())
                 .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
         );
@@ -13538,7 +13616,7 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override.cloned().unwrap_or_else(|| {
             Self::edge_profile_with_skill_listing(edge_context, request_constraints)
         });
-        let memory_extraction_service = RuntimeMemoryPolicy::for_request(request)
+        let memory_extraction_service = RuntimeProductionStatePolicy::for_request(request)
             .select(self.memory_extraction_service.as_ref()).and_then(|svc| {
                 match svc.scoped_to_owner(user_id) {
                     Ok(scoped) => Some(scoped),
@@ -14829,111 +14907,155 @@ impl AgenticRunLifecycleService {
         run_generation: u64,
         durable_status: &str,
     ) {
-        let Some(pool) = self.shared_pool.clone() else {
-            return;
-        };
+        if let Err(error) = self
+            .reconcile_evaluation_observation(
+                user_id,
+                run_id,
+                session_id,
+                run_generation,
+                durable_status,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(user_id, run_id, %error, "evaluation observation repair deferred");
+        }
+    }
+
+    /// Explicit projection repair for a trial already scoped to the authenticated
+    /// owner. Loads current durable authority; never starts or resumes execution.
+    async fn repair_evaluation_observation_inner(
+        &self,
+        owner_user_id: &str,
+        trial_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
+        let binding = DatabaseEvaluationPlanStore::new(pool.clone())
+            .load_trial(owner_user_id, trial_id)
+            .await?;
+        if binding.run_id.as_deref() != Some(run_id)
+            || binding.session_id.as_deref() != Some(session_id)
+        {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        let run = self
+            .run_engine
+            .load_run(owner_user_id, run_id)
+            .await
+            .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+            .ok_or(EvaluationObservationRepairError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        self.reconcile_evaluation_observation(
+            owner_user_id,
+            run_id,
+            session_id,
+            run.run_generation,
+            &run.status,
+            Some(trial_id),
+        )
+        .await
+    }
+
+    async fn reconcile_evaluation_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+        run_generation: u64,
+        durable_status: &str,
+        expected_trial_id: Option<&str>,
+    ) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+        use EvaluationObservationRepairOutcome::{NotEvaluation, NotReady, Ready};
+        let pool = self
+            .shared_pool
+            .as_ref()
+            .ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
         let observation_store = DatabaseEvaluationObservationStore::new(pool.clone());
         let Some(marker) = observation_store
             .load_admission_marker_for_run(user_id, run_id, run_generation)
-            .await
-            .ok()
-            .flatten()
+            .await?
         else {
-            return;
+            return Ok(if expected_trial_id.is_some() {
+                NotReady
+            } else {
+                NotEvaluation
+            });
         };
-        // Completed trials are immutable. Check the projection first so a
-        // repeated status poll does not hydrate the entire Run event stream
-        // after the observation has already been written.
+        if expected_trial_id.is_some_and(|trial_id| trial_id != marker.admission.trial_id) {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
+        // Immutable observation lookup stays ahead of full event hydration.
         if observation_store
             .load_by_trial(user_id, &marker.admission.trial_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .is_some()
         {
-            return;
+            return Ok(Ready);
         }
-        let Some(run) = self
+        let run = self
             .run_engine
             .load_run(user_id, run_id)
             .await
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
+            .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+            .ok_or(EvaluationObservationRepairError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(EvaluationObservationRepairError::BindingMismatch);
+        }
         if run.run_generation != run_generation || run.status != durable_status {
-            // A stale status callback must not settle evidence for a newer
-            // owner generation or a different terminal transition.
-            return;
+            return Ok(NotReady);
         }
         let Some(status) = RunStatus::from_durable_status(durable_status) else {
-            return;
+            return Ok(NotReady);
         };
         if evaluation_trial_status(status).is_none() {
-            return;
+            return Ok(NotReady);
         }
         let run_store = astra_services::runs::DatabaseRunStateStore::new(pool.clone());
         let recovery_terminal_event_idx = if marker.admission_run_generation != run_generation {
-            match run_store
-                .load_verified_recovery_terminal(
-                    user_id,
-                    session_id,
-                    run_id,
-                    marker.admission_run_generation,
-                    run_generation,
-                    marker.admission_event_idx,
-                )
-                .await
-            {
-                Ok(Some(proof)) => Some(proof.terminal_event_idx),
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_runtime::run_lifecycle",
-                        owner_user_id = user_id,
-                        run_id,
-                        run_generation,
-                        error = %error,
-                        "evaluation recovery could not verify canonical recovery evidence"
-                    );
-                    return;
-                }
-            }
-        } else {
-            // Same-generation normal settlement needs either its drain fence
-            // or the committed atomic batch. Recovery custody is not authority
-            // to continue an execution or to claim a successful task outcome.
-            if !marker.settlement_finished {
-                match run_store
-                    .load_committed_atomic_terminal_settlement(
+            let Some(proof) = terminal_proof_for_repair(
+                run_store
+                    .load_verified_recovery_terminal(
                         user_id,
                         session_id,
                         run_id,
+                        marker.admission_run_generation,
                         run_generation,
+                        marker.admission_event_idx,
                     )
-                    .await
-                {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            owner_user_id = user_id,
+                    .await,
+            )?
+            else {
+                return Ok(NotReady);
+            };
+            Some(proof.terminal_event_idx)
+        } else {
+            if !marker.settlement_finished
+                && terminal_proof_for_repair(
+                    run_store
+                        .load_committed_atomic_terminal_settlement(
+                            user_id,
+                            session_id,
                             run_id,
                             run_generation,
-                            error = %error,
-                            "evaluation recovery could not verify atomic terminal evidence"
-                        );
-                        return;
-                    }
-                }
+                        )
+                        .await,
+                )?
+                .is_none()
+            {
+                return Ok(NotReady);
             }
             None
         };
         persist_evaluation_observation_after_settlement(
             &self.run_engine,
-            Some(&pool),
+            Some(pool),
             user_id,
             session_id,
             run_id,
@@ -14944,7 +15066,7 @@ impl AgenticRunLifecycleService {
             status,
             true,
         )
-        .await;
+        .await
     }
 
     async fn require_durable_run_for_user(
@@ -15715,108 +15837,40 @@ async fn persist_evaluation_observation_after_settlement(
     admission: Option<&EvaluationRunAdmission>,
     persisted_status: RunStatus,
     settlement_evidence_ready: bool,
-) {
+) -> Result<EvaluationObservationRepairOutcome, EvaluationObservationRepairError> {
+    use EvaluationObservationRepairOutcome::{NotEvaluation, NotReady, Ready};
     let Some(admission) = admission else {
-        return;
+        return Ok(NotEvaluation);
     };
     let Some(status) = evaluation_trial_status(persisted_status) else {
-        return;
+        return Ok(NotReady);
     };
     if !settlement_evidence_ready {
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            owner_user_id,
-            session_id,
-            run_id,
-            run_generation,
-            "evaluation observation deferred because canonical terminal evidence is not ready"
-        );
-        return;
+        return Ok(NotReady);
     }
-    let Some(pool) = pool else {
-        tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            owner_user_id,
-            session_id,
-            run_id,
-            "evaluation observation could not be persisted without the shared database"
-        );
-        return;
-    };
+    let pool = pool.ok_or(EvaluationObservationRepairError::StorageUnavailable)?;
     let plan_store = DatabaseEvaluationPlanStore::new(pool.clone());
-    let binding = match plan_store
+    let binding = plan_store
         .load_trial(owner_user_id, &admission.trial_id)
-        .await
-    {
-        Ok(binding) => binding,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                trial_id = %admission.trial_id,
-                error = %error,
-                "evaluation observation could not load its frozen trial"
-            );
-            return;
-        }
-    };
-    let experiment = match plan_store
+        .await?;
+    let experiment = plan_store
         .load_experiment(owner_user_id, &admission.experiment_id)
+        .await?;
+    let run = run_engine
+        .load_run(owner_user_id, run_id)
         .await
+        .map_err(|error| EvaluationObservationRepairError::RunRead(error.to_string()))?
+        .ok_or(EvaluationObservationRepairError::NotFound)?;
+    if run.session_id != session_id {
+        return Err(EvaluationObservationRepairError::BindingMismatch);
+    }
+    if run.run_id != run_id
+        || run.run_generation != run_generation
+        || run.status != persisted_status.as_str()
     {
-        Ok(experiment) => experiment,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                experiment_id = %admission.experiment_id,
-                error = %error,
-                "evaluation observation could not load its frozen experiment"
-            );
-            return;
-        }
-    };
-    let canonical_events = match run_engine.load_run(owner_user_id, run_id).await {
-        Ok(Some(run)) if run.run_id == run_id && run.run_generation == run_generation => run.events,
-        Ok(Some(_)) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                run_generation,
-                "evaluation evidence run generation changed before observation; retrying projection later"
-            );
-            return;
-        }
-        Ok(None) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                run_generation,
-                "evaluation evidence run disappeared before observation; retrying projection later"
-            );
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                run_generation,
-                error = %error,
-                "evaluation evidence read failed; retrying projection later"
-            );
-            return;
-        }
-    };
+        return Ok(NotReady);
+    }
+    let canonical_events = run.events;
     let accounting_key = format!("run-accounting-finalized:{run_generation}");
     let accounting_index = recovery_terminal_event_idx
         .is_none()
@@ -15853,13 +15907,16 @@ async fn persist_evaluation_observation_after_settlement(
         let Some(index) = canonical_events.iter().position(|event| {
             event.get("index").and_then(Value::as_i64) == Some(terminal_event_idx)
         }) else {
-            return;
+            return Ok(NotReady);
         };
         Some(index)
     } else {
         accounting_index
     };
-    let evidence_available = evidence_index.is_some();
+    if evidence_index.is_none() {
+        return Ok(NotReady);
+    }
+    let evidence_available = true;
     let evidence_events = evidence_index
         .map(|index| canonical_events[..=index].to_vec())
         .unwrap_or_default();
@@ -15870,7 +15927,7 @@ async fn persist_evaluation_observation_after_settlement(
         "event_watermark": evidence_index,
         "events": evidence_events,
     });
-    let evidence_json = serde_json::to_string(&evidence_payload).ok();
+    let evidence_json = Some(serde_json::to_string(&evidence_payload)?);
     let mut evidence = vec![EvidenceRef {
         evidence_id: format!("run:{run_id}:{run_generation}"),
         kind: EvidenceKind::Trace,
@@ -15899,7 +15956,7 @@ async fn persist_evaluation_observation_after_settlement(
                         == Some(skill_revision.content_hash.as_str())
             })
         });
-        let skill_event_json = skill_event.and_then(|event| serde_json::to_string(event).ok());
+        let skill_event_json = skill_event.map(serde_json::to_string).transpose()?;
         evidence.push(EvidenceRef {
             evidence_id: format!("skill-invocation:{run_id}:{admission_run_generation}"),
             kind: EvidenceKind::Trace,
@@ -15933,31 +15990,15 @@ async fn persist_evaluation_observation_after_settlement(
         materialization_receipt_ids: admission.receipt_ids.clone(),
         idempotency_key: format!("eval-observation:{run_id}:{run_generation}"),
     };
-    match DatabaseEvaluationObservationStore::new(pool.clone())
+    let record = DatabaseEvaluationObservationStore::new(pool.clone())
         .record_observation(owner_user_id, &request)
-        .await
-    {
-        Ok(record) => {
-            tracing::debug!(
-                target: "astra_runtime::run_lifecycle",
-                owner_user_id,
-                session_id,
-                run_id,
-                trial_id = %record.trial_id,
-                observation_id = %record.observation_id,
-                "durable evaluation observation settled"
-            );
-        }
-        Err(error) => tracing::warn!(
-            target: "astra_runtime::run_lifecycle",
-            owner_user_id,
-            session_id,
-            run_id,
-            trial_id = %admission.trial_id,
-            error = %error,
-            "durable evaluation observation settlement failed"
-        ),
-    }
+        .await?;
+    tracing::debug!(
+        owner_user_id, session_id, run_id,
+        trial_id = %record.trial_id, observation_id = %record.observation_id,
+        "durable evaluation observation settled"
+    );
+    Ok(Ready)
 }
 
 /// Emit a durable fact only when the canonical loop recorded a successful
@@ -16105,7 +16146,7 @@ impl AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: RuntimeMemoryPolicy::for_request(&request)
+            observer_worker: RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
@@ -16977,7 +17018,7 @@ impl AgenticRunLifecycleService {
                 // terminal Run. A takeover may race this write; the
                 // observation store rechecks owner/session/generation and
                 // rejects stale writers instead of creating a second result.
-                persist_evaluation_observation_after_settlement(
+                if let Err(error) = persist_evaluation_observation_after_settlement(
                     &run_engine,
                     bg_shared_pool.as_ref(),
                     &bg_user_id,
@@ -16990,7 +17031,10 @@ impl AgenticRunLifecycleService {
                     persisted_status,
                     durable_fence_closed,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(run_id = %bg_run_id, %error, "evaluation observation settlement deferred");
+                }
 
                 if owner_terminal_committed && persist_terminal_events {
                     flush_turn_observability(&mut loop_state, &bg_user_id, &bg_session_id, false);
@@ -17098,6 +17142,18 @@ impl AgenticRunLifecycleService {
 
 #[async_trait]
 impl RunLifecycleService for AgenticRunLifecycleService {
+    async fn repair_evaluation_observation(
+        &self,
+        owner_user_id: &str,
+        trial_id: &str,
+        run_id: &str,
+        session_id: &str,
+    ) -> Result<EvaluationObservationRepairOutcome, (StatusCode, Json<ErrorResponse>)> {
+        self.repair_evaluation_observation_inner(owner_user_id, trial_id, run_id, session_id)
+            .await
+            .map_err(EvaluationObservationRepairError::into_http)
+    }
+
     fn execution_owner_pod_id(&self) -> Option<&str> {
         self.run_engine.execution_owner_pod_id()
     }
@@ -18021,6 +18077,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut loop_state,
             &user_id,
             &session_id,
+            RuntimeProductionStatePolicy::for_request(&request),
         )
         .await;
         // The RuntimeToolExecutor is the owner for server-side runtime tools
@@ -18046,7 +18103,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
             );
-            if let Some(memoria_port) = RuntimeMemoryPolicy::for_request(&request)
+            if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
             {
@@ -19509,6 +19566,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut state,
             &user_id,
             &session_id,
+            RuntimeProductionStatePolicy::for_request(&request),
         );
         tokio::join!(persist_user_transcript, configure_controllers);
 
@@ -19536,7 +19594,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "runtime executor authorization was validated before streaming run start",
                 ),
             );
-            if let Some(memoria_port) = RuntimeMemoryPolicy::for_request(&request)
+            if let Some(memoria_port) = RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.memory_extraction_service.as_ref())
                 .and_then(|service| service.memoria_client_for_owner(&user_id).ok())
             {
@@ -19817,7 +19875,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             model_name: request.model.clone(),
             user_message: request.message.clone(),
             hook_db_writer: self.hook_db_writer.clone(),
-            observer_worker: RuntimeMemoryPolicy::for_request(&request)
+            observer_worker: RuntimeProductionStatePolicy::for_request(&request)
                 .select(self.observer_worker.clone()),
             metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
@@ -26087,6 +26145,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &mut loop_state,
             &config.user_id,
             &config.session_id,
+            RuntimeProductionStatePolicy::Enabled,
         )
         .await;
 
@@ -26769,3 +26828,179 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod production_state_isolation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn evaluation_controllers_remove_quality_sink_but_keep_observability() {
+        let settings = MatrixOneSettings::mock();
+        let quality = EvaluationPersistenceContext {
+            user_id: "isolation-user".into(),
+            evaluation_service: DatabaseEvaluationService::new(settings.clone()),
+        };
+        let trace = ContextTracePersistenceContext {
+            user_id: "isolation-user".into(),
+            event_service: DatabaseEventService::new(settings.clone()),
+            artifact_store: astra_services::DatabaseSessionArtifactStore::new(settings),
+            agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.into(),
+        };
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        initialize_runtime_controllers(
+            &mut state,
+            "isolation-user",
+            "isolation-session",
+            Some(quality.clone()),
+            Some(trace.clone()),
+            RuntimeProductionStatePolicy::Enabled,
+        )
+        .await;
+        assert!(state.telemetry.evaluation_persistence.is_some());
+        // Isolation must also remove a previously attached production sink.
+        initialize_runtime_controllers(
+            &mut state,
+            "isolation-user",
+            "isolation-session",
+            Some(quality),
+            Some(trace),
+            RuntimeProductionStatePolicy::Disabled,
+        )
+        .await;
+        assert!(state.telemetry.evaluation_persistence.is_none());
+        assert!(state.telemetry.context_trace_persistence.is_some());
+        assert!(state.telemetry.observability_hub.is_some());
+        assert!(state.telemetry.observability_session.is_some());
+    }
+}
+
+#[cfg(test)]
+mod observation_repair_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_proof_reader_results_preserve_http_classification() {
+        use astra_services::runs::RunProofReadError;
+
+        assert_eq!(terminal_proof_for_repair::<()>(Ok(None)).unwrap(), None);
+        assert_eq!(terminal_proof_for_repair(Ok(Some(17))).unwrap(), Some(17));
+        let integrity = terminal_proof_for_repair::<()>(Err(RunProofReadError::Integrity(
+            "atomic batch fingerprint mismatch".into(),
+        )))
+        .unwrap_err()
+        .into_http();
+        assert_eq!(integrity.0, StatusCode::CONFLICT);
+        assert_eq!(
+            integrity.1.0.error_code.as_deref(),
+            Some("evaluation_repair_integrity")
+        );
+        let storage = terminal_proof_for_repair::<()>(Err(RunProofReadError::Database(
+            sqlx::Error::PoolTimedOut,
+        )))
+        .unwrap_err()
+        .into_http();
+        assert_eq!(storage.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            storage.1.0.error_code.as_deref(),
+            Some("evaluation_repair_store_unavailable")
+        );
+    }
+
+    #[test]
+    fn explicit_repair_preserves_integrity_and_retryable_storage_statuses() {
+        assert_eq!(
+            EvaluationObservationRepairError::BindingMismatch
+                .into_http()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            EvaluationObservationRepairError::StorageUnavailable
+                .into_http()
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            EvaluationObservationRepairError::Execution(
+                astra_services::evaluation::EvaluationExecutionError::Persistence(
+                    astra_services::evaluation::EvaluationPersistenceError::Conflict(
+                        "binding changed".into()
+                    ),
+                ),
+            )
+            .into_http()
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_repair_distinguishes_pending_non_eval_and_storage_failure() {
+        let engine = RunEngine::new(Arc::new(astra_services::runs::InMemoryRunStateStore::new()));
+        let admission = EvaluationRunAdmission {
+            experiment_id: "experiment".into(),
+            trial_id: "trial".into(),
+            input_content_hash: "input".into(),
+            revision_content_hash: "revision".into(),
+            skill_revision: None,
+            receipt_ids: Vec::new(),
+            snapshot_envelope: None,
+        };
+        for (status, admission, evidence_ready, expected) in [
+            (
+                RunStatus::Completed,
+                None,
+                true,
+                EvaluationObservationRepairOutcome::NotEvaluation,
+            ),
+            (
+                RunStatus::Running,
+                Some(&admission),
+                true,
+                EvaluationObservationRepairOutcome::NotReady,
+            ),
+            (
+                RunStatus::Completed,
+                Some(&admission),
+                false,
+                EvaluationObservationRepairOutcome::NotReady,
+            ),
+        ] {
+            let result = persist_evaluation_observation_after_settlement(
+                &engine,
+                None,
+                "owner",
+                "session",
+                "run",
+                0,
+                0,
+                None,
+                admission,
+                status,
+                evidence_ready,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, expected);
+        }
+        let error = persist_evaluation_observation_after_settlement(
+            &engine,
+            None,
+            "owner",
+            "session",
+            "run",
+            0,
+            0,
+            None,
+            Some(&admission),
+            RunStatus::Completed,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EvaluationObservationRepairError::StorageUnavailable
+        ));
+    }
+}

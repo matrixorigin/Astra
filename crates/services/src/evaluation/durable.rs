@@ -209,11 +209,15 @@ impl DatabaseEvaluationPlanStore {
             bindings.clone(),
             BTreeMap::new(),
             observations,
+            Vec::new(),
         )
         .map_err(|error| match error {
             super::projection::EvaluationProjectionError::Persistence(error) => error,
             super::projection::EvaluationProjectionError::Execution(error) => {
                 execution_persistence_error(error)
+            }
+            super::projection::EvaluationProjectionError::Assessment(error) => {
+                EvaluationPersistenceError::Conflict(error.to_string())
             }
             super::projection::EvaluationProjectionError::Conflict(detail) => {
                 EvaluationPersistenceError::Conflict(detail)
@@ -794,6 +798,42 @@ impl DatabaseEvaluationPlanStore {
         ),
         EvaluationPersistenceError,
     > {
+        Self::lock_trial_run_identity(tx, owner_user_id, trial_id, session_id, run_id, true).await
+    }
+
+    /// Historical assessment locks identities without requiring an active Session.
+    pub(crate) async fn lock_historical_trial_run(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        trial_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<
+        (
+            EvaluationExperimentRecord,
+            EvaluationTrialBindingRecord,
+            u64,
+        ),
+        EvaluationPersistenceError,
+    > {
+        Self::lock_trial_run_identity(tx, owner_user_id, trial_id, session_id, run_id, false).await
+    }
+
+    async fn lock_trial_run_identity(
+        tx: &mut Transaction<'_, MySql>,
+        owner_user_id: &str,
+        trial_id: &str,
+        session_id: &str,
+        run_id: &str,
+        require_active_session: bool,
+    ) -> Result<
+        (
+            EvaluationExperimentRecord,
+            EvaluationTrialBindingRecord,
+            u64,
+        ),
+        EvaluationPersistenceError,
+    > {
         let session_exists = sqlx::query(
             "SELECT status FROM agent_sessions
              WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
@@ -813,7 +853,7 @@ impl DatabaseEvaluationPlanStore {
         };
         let session_status =
             row_string(&session_row, "status", "validate_evaluation_trial_session")?;
-        if session_status != "active" {
+        if require_active_session && session_status != "active" {
             return Err(EvaluationPersistenceError::Conflict(format!(
                 "session {session_id} is not active"
             )));

@@ -538,6 +538,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / evaluation",
         product_owner="evaluation terminal accounting, recovery, and comparison evidence",
     ),
+    "evaluation_task_assessments": TableMetadata(
+        semantic_owner="astra_services::evaluation::task_assessment / DatabaseEvaluationObservationStore",
+        state_class="immutable owner-scoped task criterion assessment derived from terminal output evidence",
+        primary_query="assessment by owner_user_id and trial_id; experiment assessments by owner_user_id, experiment_id, and trial_id",
+        retention_policy="retain with the experiment for exact retries and reports; an existing assessment remains replayable after source transcript cleanup, without reconstructing or restoring deleted text; no dedicated assessment TTL or deletion cascade is implemented",
+        rebuildability="new assessments require the frozen verifier, trusted terminal observation, and canonical complete output proof; a retained verdict cannot be recreated from final prose or Run status after its source evidence is lost",
+        merge_guidance="keep criterion facts separate from Run lifecycle, observations, and report projections; assessments do not grant execution, release, or revision activation authority",
+        migration_owner="astra_services::storage / evaluation",
+        product_owner="evaluation task criteria, evidence provenance, and comparison reporting",
+    ),
     "run_checkpoints": TableMetadata(
         semantic_owner="astra_services::runs::DatabaseRunStateStore",
         state_class="durable run checkpoint fact",

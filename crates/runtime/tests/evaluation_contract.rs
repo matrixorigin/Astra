@@ -13,6 +13,11 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
 
+mod execution_fixture {
+    use astra_services as services;
+    include!("../../services/tests/fixtures/evaluation_execution_config.rs");
+}
+
 #[derive(Clone)]
 struct StubHealthChecker;
 
@@ -168,13 +173,15 @@ fn generic_experiment_create_value() -> serde_json::Value {
                 "case_id": "case-1",
                 "input_snapshot_ref": "input://case-1",
                 "input_content_hash": hash('c'),
-                "verifier_id": "none",
-                "verifier_version": "1",
+                "task_verifier": astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    astra_services::evaluation::task_verifier::JsonValueEqualsConfig { expected: json!({"ok": true}) },
+                ).expect("freeze contract task verifier"),
                 "holdout": false
             }],
             "repetitions": 1,
             "order": {"kind": "baseline_first"},
             "conditions": {
+                "execution_config": execution_fixture::execution_config("model", "provider", "case-1"),
                 "isolation_profile": "prompt_only_private",
                 "model_binding": "model",
                 "provider_binding": "provider",
@@ -221,8 +228,7 @@ fn prepared_experiment_body() -> body::Body {
             "case": {
                 "case_id": "case-1",
                 "message": "fixed input",
-                "verifier_id": "none",
-                "verifier_version": "1",
+                "verifier_config": {"expected": {"ok": true}},
                 "holdout": false
             },
             "model_offering_id": "model",
@@ -252,7 +258,7 @@ async fn oneshot_eval(
 }
 
 #[tokio::test]
-async fn unconfigured_evaluation_routes_return_503() {
+async fn unconfigured_evaluation_routes_return_errors() {
     let app = build_unconfigured_app();
     let generic_get_uris = [
         "/evaluation/experiments/exp-1",
@@ -308,6 +314,8 @@ async fn unconfigured_evaluation_routes_return_503() {
         true,
     )
     .await;
+    // Authentication is unconfigured here; the authenticated fixture below
+    // separately exercises the database-availability boundary.
     assert_eq!(generic_create.status(), StatusCode::NOT_IMPLEMENTED);
 
     for (uri, b, json_ct) in post_cases {

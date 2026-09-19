@@ -8971,9 +8971,9 @@ async fn spawn_skill_invoking_test_llm(skill_name: &str) -> TerminalTestLlm {
                 })
                 .unwrap_or_default();
             let answer = if skill_result.contains("SKILL_NEXT") {
-                "skill-result-candidate"
+                r#"{"ok":true}"#
             } else if skill_result.contains("SKILL_OK") {
-                "skill-result-baseline"
+                r#"{"ok":false}"#
             } else {
                 "skill-result-unknown"
             };
@@ -10769,10 +10769,13 @@ async fn evaluation_create_run_crosses_the_real_run_boundary_and_settles_owner_s
             case_id: "case-runtime".to_string(),
             input_snapshot_ref: "input://runtime".to_string(),
             input_content_hash: input_hash.clone(),
-            verifier_id: "verifier-runtime".to_string(),
-            verifier_version: "1".to_string(),
             holdout: false,
-            task_verifier: None,
+            task_verifier: astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                astra_services::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: json!({"ok": true}),
+                },
+            )
+            .expect("freeze required runtime task verifier"),
             input_content: None,
         }],
         repetitions: 1,
@@ -11410,8 +11413,7 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
         "case": {
             "case_id": "http-case",
             "message": "Explain the frozen evaluation input.",
-            "verifier_id": "manual",
-            "verifier_version": "v1",
+            "verifier_config": {"expected": {"ok": true}},
             "holdout": false
         },
         "model_offering_id": offering_id.clone(),
@@ -11545,6 +11547,153 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
     );
 
     let requests_before_replay = llm.requests.load(Ordering::SeqCst);
+    // Simulate a lost first-arm observation while its durable Run is terminal
+    // and the experiment is still incomplete. Reads must leave it missing.
+    let deleted = sqlx::query(
+        "DELETE FROM evaluation_trial_observations WHERE owner_user_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&trial_id)
+    .execute(pool.get())
+    .await
+    .expect("remove first-arm observation before explicit repair");
+    assert_eq!(deleted.rows_affected(), 1);
+    let removed_marker = sqlx::query(
+        "DELETE FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_settlement_finished'",
+    )
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(pool.get())
+    .await
+    .expect("remove late settlement marker to require canonical atomic proof");
+    assert_eq!(removed_marker.rows_affected(), 1);
+    let (accounting_event_idx, accounting_event_hash): (i64, String) = sqlx::query_as(
+        "SELECT event_idx, event_hash FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_type = 'run_accounting_finalized'",
+    )
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("load committed accounting anchor");
+    let (status, missing) = request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "missing projection: {missing}");
+    assert_eq!(missing["observed_trial_count"], 0);
+    assert!(missing["trials"][0]["observation"].is_null());
+    let (status, missing_report) = request_json(
+        &app,
+        &owner,
+        "GET",
+        &format!("{projection_uri}/report"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "missing report: {missing_report}");
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let assess_uri = format!("{projection_uri}/trials/{trial_id}/assess");
+    let (status, _) = request_json(&app, &foreign_owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let corrupted = sqlx::query(
+        "UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx = ?",
+    )
+    .bind("corrupted-accounting-proof")
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(accounting_event_idx)
+    .execute(pool.get())
+    .await
+    .expect("corrupt only this fixture's accounting anchor hash");
+    assert_eq!(corrupted.rows_affected(), 1);
+    let (corrupt_status, corrupt_response) =
+        request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    // Restore the persisted hash even when the HTTP status is unexpected, so
+    // the negative assertion never leaves a corrupted shared test database.
+    let restored = sqlx::query(
+        "UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx = ?",
+    )
+    .bind(&accounting_event_hash)
+    .bind(&owner)
+    .bind(&session_id)
+    .bind(&run_id)
+    .bind(accounting_event_idx)
+    .execute(pool.get())
+    .await
+    .expect("restore original accounting anchor hash");
+    assert_eq!(restored.rows_affected(), 1);
+    assert_eq!(
+        corrupt_status,
+        StatusCode::CONFLICT,
+        "corrupted canonical proof must surface as HTTP 409: {corrupt_response}"
+    );
+    assert_eq!(llm.requests.load(Ordering::SeqCst), requests_before_replay);
+    assert!(
+        DatabaseEvaluationObservationStore::new(pool.clone())
+            .load_by_trial(&owner, &trial_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let assessment_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM evaluation_task_assessments WHERE owner_user_id = ? AND experiment_id = ? AND trial_id = ?",
+    )
+    .bind(&owner)
+    .bind(&experiment_id)
+    .bind(&trial_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("check corrupt proof did not persist an assessment");
+    assert_eq!(assessment_count, 0);
+    let (status, assessed) = request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "repair and assess: {assessed}");
+    assert_eq!(assessed["status"], "recorded");
+    assert_eq!(assessed["assessment"]["trial_id"], trial_id);
+    assert_eq!(
+        assessed["assessment"]["outcome"]["status"], "fail",
+        "the provider's plain-text done is not the required JSON value"
+    );
+    let repaired = DatabaseEvaluationObservationStore::new(pool.clone())
+        .load_by_trial(&owner, &trial_id)
+        .await
+        .unwrap()
+        .expect("POST repairs first arm");
+    assert_eq!(
+        serde_json::to_value(&repaired).unwrap()["request_fingerprint"],
+        projection["trials"][0]["observation"]["request_fingerprint"]
+    );
+    let (status, replay_assessed) =
+        request_json(&app, &owner, "POST", &assess_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay_assessed, assessed, "assessment replay is immutable");
+    let (status, repaired_projection) =
+        request_json(&app, &owner, "GET", &projection_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repaired_projection["observed_trial_count"], 1);
+    assert_eq!(
+        repaired_projection["trials"][0]["task_assessment"],
+        assessed["assessment"]
+    );
+    assert!(repaired_projection["trials"][1]["binding"]["run_id"].is_null());
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        requests_before_replay,
+        "repair, assessment and reads must not reexecute either arm"
+    );
     let (replay_status, replay_started) =
         request_json(&app, &owner, "POST", &start_uri, json!({})).await;
     assert_eq!(
@@ -11577,6 +11726,17 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
     assert_eq!(report["manifest"]["experiment_id"], experiment_id);
     assert_eq!(report["manifest"]["coverage"]["planned_trial_count"], 2);
     assert_eq!(report["manifest"]["coverage"]["observed_trial_count"], 1);
+    assert_eq!(
+        report["manifest"]["assessment_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        report["manifest"]["assessment_refs"][0]["assessment_id"],
+        assessed["assessment"]["assessment_id"]
+    );
     assert_eq!(
         report["manifest"]["coverage"]["missing_trial_ids"]
             .as_array()
@@ -11621,6 +11781,11 @@ async fn evaluation_http_prepare_start_replays_and_reports() {
     .await
     .expect("retried second arm must settle through the canonical lifecycle");
 
+    sqlx::query("DELETE FROM evaluation_task_assessments WHERE owner_user_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("clean HTTP evaluation assessments");
     sqlx::query("DELETE FROM evaluation_trial_observations WHERE owner_user_id = ?")
         .bind(&owner)
         .execute(pool.get())
@@ -11791,10 +11956,13 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             case_id: "case-skill-runtime".to_string(),
             input_snapshot_ref: "input://skill-runtime".to_string(),
             input_content_hash: input_hash.clone(),
-            verifier_id: "verifier-skill-runtime".to_string(),
-            verifier_version: "1".to_string(),
             holdout: false,
-            task_verifier: None,
+            task_verifier: astra_services::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                astra_services::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: json!({"ok": true}),
+                },
+            )
+            .expect("freeze required runtime task verifier"),
             input_content: None,
         }],
         repetitions: 1,
@@ -11895,7 +12063,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         baseline_skill.content_hash
     );
     assert!(durable.events.iter().any(|event| {
-        event.pointer("/data/full_text").and_then(Value::as_str) == Some("skill-result-baseline")
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some(r#"{"ok":false}"#)
     }));
     assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
 
@@ -11922,6 +12090,26 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         .expect("Skill invocation evidence reference");
     assert_eq!(skill_evidence.availability, EvidenceAvailability::Available);
     assert!(skill_evidence.content_hash.is_some());
+
+    use astra_services::evaluation::task_assessment::{
+        TaskAssessmentOutcome, TaskAssessmentResult,
+    };
+    let assessment_store = DatabaseEvaluationObservationStore::new(pool.clone());
+    let TaskAssessmentResult::Recorded(baseline_assessment) = assessment_store
+        .assess_trial(&owner, &experiment.experiment_id, &trial.trial_id)
+        .await
+        .expect("assess baseline before the experiment completes")
+    else {
+        panic!("terminal baseline output must produce a durable assessment");
+    };
+    assert_eq!(baseline_assessment.outcome, TaskAssessmentOutcome::Fail);
+    assert_eq!(
+        baseline_assessment.observation_id,
+        observation.observation_id
+    );
+    assert!(baseline_assessment.terminal.is_some());
+    assert!(baseline_assessment.output.is_some());
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
 
     let candidate_session_id = format!("eval-skill-cand-{}", Uuid::new_v4());
     crate::server::run::insert_active_run_session_fixture(&pool, &owner, &candidate_session_id)
@@ -11992,7 +12180,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
         candidate_skill.content_hash
     );
     assert!(candidate_durable.events.iter().any(|event| {
-        event.pointer("/data/full_text").and_then(Value::as_str) == Some("skill-result-candidate")
+        event.pointer("/data/full_text").and_then(Value::as_str) == Some(r#"{"ok":true}"#)
     }));
     assert_eq!(llm.requests.load(Ordering::SeqCst), 4);
     let candidate_observation = tokio::time::timeout(Duration::from_secs(10), async {
@@ -12019,6 +12207,98 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
             .expect("candidate Skill invocation evidence reference")
             .availability,
         EvidenceAvailability::Available
+    );
+
+    let TaskAssessmentResult::Recorded(candidate_assessment) = assessment_store
+        .assess_trial(&owner, &experiment.experiment_id, &candidate_trial.trial_id)
+        .await
+        .expect("assess candidate from its committed output")
+    else {
+        panic!("terminal candidate output must produce a durable assessment");
+    };
+    assert_eq!(candidate_assessment.outcome, TaskAssessmentOutcome::Pass);
+    assert_eq!(
+        candidate_assessment.observation_id,
+        candidate_observation.observation_id
+    );
+    assert!(candidate_assessment.terminal.is_some());
+    assert!(candidate_assessment.output.is_some());
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert_eq!(
+            assessment_store
+                .assess_trial(&owner, &experiment.experiment_id, &assessment.trial_id)
+                .await
+                .expect("replay immutable task assessment"),
+            TaskAssessmentResult::Recorded(assessment.clone())
+        );
+    }
+    let projected =
+        astra_services::evaluation::DatabaseEvaluationProjectionStore::new(pool.clone())
+            .load_experiment(&owner, &experiment.experiment_id)
+            .await
+            .expect("project assessed Skill arms");
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert_eq!(
+            projected
+                .trials
+                .iter()
+                .find(|projected| projected.binding.trial_id == assessment.trial_id)
+                .expect("projected assessed trial")
+                .task_assessment
+                .as_ref(),
+            Some(assessment.as_ref())
+        );
+    }
+    let artifact = astra_services::evaluation::report::build_report_artifact(
+        &owner,
+        &projected.experiment,
+        &projected
+            .trials
+            .iter()
+            .filter_map(|trial| trial.observation.clone())
+            .collect::<Vec<_>>(),
+        &projected
+            .trials
+            .iter()
+            .filter_map(|trial| trial.task_assessment.clone())
+            .collect::<Vec<_>>(),
+        &projected.unavailable_trial_ids,
+        "baseline",
+        "candidate",
+    )
+    .expect("report real Skill task assessments");
+    assert_eq!(artifact.manifest.assessment_refs.len(), 2);
+    for (trial_id, expected) in [(&trial.trial_id, 0.0), (&candidate_trial.trial_id, 1.0)] {
+        let observed = artifact
+            .report
+            .observations
+            .iter()
+            .find(|observed| &observed.trial_id == trial_id)
+            .expect("reported Skill arm");
+        assert_eq!(
+            observed.status,
+            astra_services::evaluation::assessment::TrialStatus::Completed
+        );
+        let success = observed
+            .measurements
+            .iter()
+            .find(|metric| metric.name == "task_success")
+            .expect("report task success from persisted assessment");
+        assert_eq!(success.value, Some(expected));
+    }
+    for assessment in [&baseline_assessment, &candidate_assessment] {
+        assert!(
+            artifact
+                .manifest
+                .assessment_refs
+                .iter()
+                .any(|reference| reference.assessment_id == assessment.assessment_id)
+        );
+    }
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        4,
+        "assessments, replay, projection and report use durable evidence only"
     );
 
     let rejected_session_id = format!("eval-skill-rej-{}", Uuid::new_v4());
@@ -12072,6 +12352,7 @@ async fn evaluation_skill_revision_crosses_real_run_and_reports_invocation_evide
     assert_eq!(rejected_run.status, STATUS_FAILED);
 
     for table in [
+        "evaluation_task_assessments",
         "evaluation_trial_observations",
         "evaluation_materialization_receipts",
         "evaluation_trial_bindings",

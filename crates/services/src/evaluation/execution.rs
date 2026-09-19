@@ -177,7 +177,7 @@ pub enum EvaluationExecutionError {
 
 #[derive(Clone)]
 pub struct DatabaseEvaluationObservationStore {
-    pool: SharedPool,
+    pub(super) pool: SharedPool,
 }
 
 impl DatabaseEvaluationObservationStore {
@@ -224,7 +224,7 @@ impl DatabaseEvaluationObservationStore {
         }
 
         let (experiment, binding, current_generation) =
-            DatabaseEvaluationPlanStore::lock_trial_run(
+            DatabaseEvaluationPlanStore::lock_historical_trial_run(
                 &mut tx,
                 owner_user_id,
                 &request.observation.trial_id,
@@ -503,6 +503,26 @@ impl DatabaseEvaluationObservationStore {
         })?;
         row.map(decode_observation).transpose()
     }
+}
+
+pub(crate) async fn load_observation_by_trial_in_transaction(
+    tx: &mut Transaction<'_, MySql>,
+    owner: &str,
+    trial: &str,
+) -> Result<Option<EvaluationObservationRecord>, EvaluationExecutionError> {
+    let row = sqlx::query(&format!(
+        "{} FOR UPDATE",
+        observation_select_sql("owner_user_id = ? AND trial_id = ?")
+    ))
+    .bind(owner)
+    .bind(trial)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|source| EvaluationExecutionError::Database {
+        operation: "load_task_assessment_observation",
+        source,
+    })?;
+    row.map(decode_observation).transpose()
 }
 
 async fn list_observations_tx(
@@ -889,7 +909,17 @@ async fn validate_canonical_run_and_receipts(
             marker.admission_event_idx,
         )
         .await
-        .map_err(EvaluationExecutionError::Conflict)?
+        .map_err(|error| match error {
+            crate::runs::RunProofReadError::Database(source) => {
+                EvaluationExecutionError::Database {
+                    operation: "validate_evaluation_recovery_proof",
+                    source,
+                }
+            }
+            crate::runs::RunProofReadError::Integrity(detail) => {
+                EvaluationExecutionError::Conflict(detail)
+            }
+        })?
         .ok_or_else(|| {
             EvaluationExecutionError::Conflict(
                 "recovery observation lacks complete custody and terminal proof".into(),
@@ -1056,6 +1086,11 @@ fn validate_request_shape(
     }
     let mut measurement_names = HashSet::new();
     for measurement in &request.observation.measurements {
+        if measurement.name == "task_success" {
+            return Err(EvaluationExecutionError::InvalidInput(
+                "task_success is derived only from a persisted task assessment".into(),
+            ));
+        }
         validate_text("measurement.name", &measurement.name, MAX_TEXT_BYTES)?;
         validate_text("measurement.unit", &measurement.unit, MAX_TEXT_BYTES)?;
         if !measurement_names.insert(&measurement.name) {
@@ -1596,6 +1631,14 @@ mod tests {
         assert!(
             validate_request_shape(&recovery).is_err(),
             "admission cannot follow terminal generation"
+        );
+        let mut forged = request.clone();
+        forged.observation.measurements[0].name = "task_success".into();
+        assert!(
+            validate_request_shape(&forged)
+                .unwrap_err()
+                .to_string()
+                .contains("persisted task assessment")
         );
         request.observation.measurements[0].value = None;
         assert!(validate_request_shape(&request).is_err());

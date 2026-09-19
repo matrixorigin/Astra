@@ -91,12 +91,9 @@ pub fn prepared_request_matches_spec(
     }
     let case = &spec.cases[0];
     if case.case_id != request.case.case_id
-        || case.verifier_id != request.case.verifier_id
-        || case.verifier_version != request.case.verifier_version
         || case.holdout != request.case.holdout
         || case.input_content.as_deref() != Some(request.case.message.as_str())
-        || case.task_verifier.as_ref().map(|verifier| &verifier.config)
-            != request.case.verifier_config.as_ref()
+        || case.task_verifier.config != request.case.verifier_config
     {
         return false;
     }
@@ -240,16 +237,11 @@ pub fn build_prepared_experiment_spec(
             case_id: request.case.case_id.clone(),
             input_snapshot_ref: format!("evaluation://input/{input_content_hash}"),
             input_content_hash: input_content_hash.clone(),
-            verifier_id: request.case.verifier_id.clone(),
-            verifier_version: request.case.verifier_version.clone(),
             holdout: request.case.holdout,
-            task_verifier: request
-                .case
-                .verifier_config
-                .clone()
-                .map(super::task_verifier::TaskVerifierSpec::freeze)
-                .transpose()
-                .map_err(EvaluationBootstrapError::InvalidInput)?,
+            task_verifier: super::task_verifier::TaskVerifierSpec::freeze(
+                request.case.verifier_config.clone(),
+            )
+            .map_err(EvaluationBootstrapError::InvalidInput)?,
             input_content: Some(request.case.message.clone()),
         }],
         repetitions: 1,
@@ -656,11 +648,14 @@ mod tests {
                 case_id: "case-1".to_string(),
                 input_snapshot_ref: "input://case-1".to_string(),
                 input_content_hash: input_hash.clone(),
-                verifier_id: "verifier".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
                 input_content: Some(message.clone()),
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
             }],
             repetitions: 1,
             order: TrialOrder::BaselineFirst,
@@ -830,10 +825,10 @@ mod tests {
             case: super::super::api::EvaluationPrepareCase {
                 case_id: "case-1".to_string(),
                 message: "fixed input".to_string(),
-                verifier_id: "verifier".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
-                verifier_config: None,
+                verifier_config: crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                    expected: serde_json::json!({"ok": true}),
+                },
             },
             model_offering_id: "model-1".to_string(),
             max_concurrency: 2,
@@ -844,10 +839,9 @@ mod tests {
     #[test]
     fn prepares_prompt_spec_from_user_content_and_trusted_model_facts() {
         let mut request = prepared_request(EvaluationTargetKind::Prompt);
-        request.case.verifier_id = super::super::task_verifier::JSON_VALUE_EQUALS_ID.into();
-        request.case.verifier_config = Some(super::super::task_verifier::JsonValueEqualsConfig {
+        request.case.verifier_config = super::super::task_verifier::JsonValueEqualsConfig {
             expected: serde_json::json!({"private_expected_answer": 42}),
-        });
+        };
         let spec = build_prepared_experiment_spec(
             "owner-1",
             "evx_prepare",
@@ -870,10 +864,17 @@ mod tests {
             Some("baseline prompt")
         );
         assert_eq!(spec.cases[0].input_content.as_deref(), Some("fixed input"));
-        assert!(spec.cases[0].task_verifier.is_some());
+        assert_eq!(
+            spec.cases[0].task_verifier,
+            super::super::task_verifier::TaskVerifierSpec::freeze(
+                request.case.verifier_config.clone()
+            )
+            .unwrap()
+        );
         assert!(prepared_request_matches_spec(&request, &spec));
         let mut changed_verifier = request.clone();
-        changed_verifier.case.verifier_config = None;
+        changed_verifier.case.verifier_config.expected =
+            serde_json::json!({"private_expected_answer": 43});
         assert!(!prepared_request_matches_spec(&changed_verifier, &spec));
         assert_eq!(
             spec.target.baseline.content_hash,

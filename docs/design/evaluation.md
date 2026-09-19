@@ -160,25 +160,50 @@ Reports enumerate gaps for every planned trial and metric,
 including trials without observations. Numeric measurements and textual basis
 labels alone do not prove scoped assessment or complete collection. Existing
 token measurements are reported subtotals with unknown request/lane coverage,
-not complete cost. Until trusted assessment and collector receipts are wired
-in, these gaps remain open; no verifier execution or monetary estimate is
-implied by freezing a profile.
+not complete cost. Metrics without a trusted assessment or complete collector
+receipts remain gaps; freezing a profile does not imply verifier execution or
+a monetary estimate.
 
-The prepare API may freeze `case.verifier_config.expected` for the
+The prepare API requires `case.verifier_config.expected` for the
 `json_value_equals` verifier version `1`. The server records the implementation
 manifest, fixed rubric, and canonical configuration hashes in the case; these
 are part of the experiment identity. The expected value is evaluator input,
 never trial prompt content. A changed configuration conflicts on submission
-retry. Cases may omit this optional verifier contract. The shared pure JSON criterion
+retry. Cases carry the complete frozen verifier contract; separate caller-provided
+verifier identity fields are not accepted. The shared pure JSON criterion
 is also used by the test harness: it consumes the complete document and uses
 JSON value equality, without extracting code fences or interpreting prose.
 Canonical atomic terminal settlement now writes `run_output_recorded` in the
 same transaction, binding the output to its owner, Session, Run, generation,
 and transcript `source_event_id`, with a content-only hash and byte count.
 No output means no output receipt. This receipt proves recorded output identity,
-not task success. The verifier execution path is not yet fully integrated:
-a trusted assessment must consume this output evidence and persist an
-append-only assessment before a report may claim task success.
+not task success. The trusted assessment service consumes this output evidence
+and the complete matching transcript text, verifying ownership, Run generation,
+source event, content hash, and byte count before running the frozen criterion.
+It persists one immutable assessment per owner/trial. Pass and Fail mean only
+that the frozen structured-output criterion passed or failed; Run completion
+alone does not establish either verdict. Non-completed executions and proven
+absence of terminal output have no numeric task-success value.
+
+`POST /evaluation/experiments/{experiment_id}/trials/{trial_id}/assess` takes
+only authenticated owner and path identities. It returns an existing assessment
+before reading historical output again. Otherwise it can repair the existing
+Run's missing terminal observation and assess the persisted evidence. It never
+starts a Run, resumes execution, or calls a provider. This works for a completed
+first arm while the second arm is still waiting. Observation remains the
+sequential-arm barrier; assessment does not introduce another scheduling gate.
+Recorded assessments return HTTP 200, evidence not yet ready returns 202,
+integrity conflicts return 409, and temporary storage failures return 503.
+Missing evidence and transient read failures must not occupy an immutable verdict.
+Historical verification does not re-admit the current model, require an active
+Session, or renew the original materialization receipts.
+
+Experiment and report GETs remain read-only. Reports derive `task_success` only
+from persisted assessments and include their identities in the report manifest
+and content fingerprint. An assessment closes only its task metric coverage;
+uncollected tool, context, provider, safety, reliability, and cost evidence
+remains explicitly incomplete. Evaluation keeps observational telemetry but
+does not write its samples to production quality or learning sinks.
 
 ## Durable registration boundary
 

@@ -8,12 +8,13 @@
 use super::assessment::{ComparisonReport, build_comparison_for_plan, render_markdown};
 use super::durable::EvaluationExperimentRecord;
 use super::execution::{EvaluationObservationRecord, content_fingerprint};
+use super::task_assessment::TaskAssessmentRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 3;
-pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v4";
+pub const EVALUATION_REPORT_SCHEMA_VERSION: u32 = 4;
+pub const EVALUATION_REPORT_RENDERER_VERSION: &str = "evaluation-markdown.v5";
 const MAX_REPORT_LABEL_BYTES: usize = 256;
 
 pub fn validate_report_label(name: &str, label: &str) -> Result<(), String> {
@@ -34,6 +35,14 @@ pub struct EvaluationReportObservationRef {
     pub observation_id: String,
     pub trial_id: String,
     pub request_fingerprint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationReportAssessmentRef {
+    pub assessment_id: String,
+    pub trial_id: String,
+    pub assessment_fingerprint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +74,7 @@ pub struct EvaluationReportManifest {
     pub experiment_id: String,
     pub spec_fingerprint: String,
     pub observation_refs: Vec<EvaluationReportObservationRef>,
+    pub assessment_refs: Vec<EvaluationReportAssessmentRef>,
     pub renderer_version: String,
     pub coverage: EvaluationReportCoverage,
     pub report_content_hash: String,
@@ -93,6 +103,7 @@ pub fn build_report_artifact(
     owner_user_id: &str,
     experiment: &EvaluationExperimentRecord,
     observations: &[EvaluationObservationRecord],
+    assessments: &[TaskAssessmentRecord],
     unavailable_trial_ids: &[String],
     baseline_label: impl Into<String>,
     candidate_label: impl Into<String>,
@@ -157,14 +168,61 @@ pub fn build_report_artifact(
             observation_refs_by_id.insert(record.observation_id.clone(), observation_ref);
         }
     }
+    let mut assessment_refs_by_trial = BTreeMap::new();
+    let mut assessed_observations = observations
+        .iter()
+        .map(|record| record.observation.clone())
+        .collect::<Vec<_>>();
+    if assessed_observations.iter().any(|observation| {
+        observation
+            .measurements
+            .iter()
+            .any(|item| item.name == "task_success")
+    }) {
+        return Err("task_success must come from a persisted task assessment".into());
+    }
+    for assessment in assessments {
+        let record = observations
+            .iter()
+            .find(|record| record.trial_id == assessment.trial_id)
+            .ok_or_else(|| {
+                format!(
+                    "assessment {} has no terminal observation",
+                    assessment.assessment_id
+                )
+            })?;
+        assessment
+            .validate_binding(experiment, record)
+            .map_err(|error| error.to_string())?;
+        let reference = EvaluationReportAssessmentRef {
+            assessment_id: assessment.assessment_id.clone(),
+            trial_id: assessment.trial_id.clone(),
+            assessment_fingerprint: assessment.assessment_fingerprint.clone(),
+        };
+        if let Some(previous) = assessment_refs_by_trial.get(&assessment.trial_id) {
+            if previous != &reference {
+                return Err(format!(
+                    "trial {} has conflicting assessments",
+                    assessment.trial_id
+                ));
+            }
+            continue;
+        }
+        assessment_refs_by_trial.insert(assessment.trial_id.clone(), reference);
+        for observation in assessed_observations
+            .iter_mut()
+            .filter(|observation| observation.trial_id == assessment.trial_id)
+        {
+            observation.measurements.push(assessment.measurement());
+            observation.evidence.push(assessment.evidence());
+        }
+    }
+    let assessment_refs = assessment_refs_by_trial.into_values().collect::<Vec<_>>();
     let mut report = build_comparison_for_plan(
         &experiment.spec,
         baseline_label,
         candidate_label,
-        &observations
-            .iter()
-            .map(|record| record.observation.clone())
-            .collect::<Vec<_>>(),
+        &assessed_observations,
     )?;
     for trial_id in &normalized_unavailable {
         report
@@ -182,6 +240,29 @@ pub fn build_report_artifact(
     }
     let observation_refs = observation_refs_by_id.into_values().collect::<Vec<_>>();
     let mut markdown = render_markdown(&report);
+    markdown.push_str("\n## Task criteria\n\n| Trial | Criterion result |\n| --- | --- |\n");
+    for trial_id in &planned_trial_ids {
+        use super::task_assessment::{TaskAssessmentOutcome, TaskAssessmentUnavailableReason};
+        let result = match assessments
+            .iter()
+            .find(|record| &record.trial_id == trial_id)
+            .map(|record| &record.outcome)
+        {
+            Some(TaskAssessmentOutcome::Pass) => "Pass",
+            Some(TaskAssessmentOutcome::Fail) => "Fail",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::TerminalNotCompleted,
+            )) => "Unavailable: execution did not complete",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::NoTerminalOutput,
+            )) => "Unavailable: no terminal output",
+            Some(TaskAssessmentOutcome::Unavailable(
+                TaskAssessmentUnavailableReason::OutputTooLarge,
+            )) => "Unavailable: output exceeds the frozen verifier limit",
+            None => "Not assessed",
+        };
+        markdown.push_str(&format!("| `{trial_id}` | {result} |\n"));
+    }
     let mut metric_gaps = Vec::new();
     for trial_id in &planned_trial_ids {
         let observation = report
@@ -191,6 +272,17 @@ pub fn build_report_artifact(
         for &(dimension, metric, unit) in experiment.spec.measurement_profile.requirements() {
             let measurement = observation
                 .and_then(|item| item.measurements.iter().find(|item| item.name == metric));
+            if metric == "task_success"
+                && assessment_refs
+                    .iter()
+                    .any(|item| &item.trial_id == trial_id)
+                && measurement.is_some_and(|item| {
+                    item.unit == unit
+                        && item.status == super::assessment::MeasurementStatus::Observed
+                })
+            {
+                continue;
+            }
             let reason = match measurement {
                 None => "required measurement is missing",
                 Some(item) if item.unit != unit => {
@@ -257,6 +349,7 @@ pub fn build_report_artifact(
         "report": report.clone(),
         "markdown": markdown.clone(),
         "observation_refs": observation_refs.clone(),
+        "assessment_refs": assessment_refs.clone(),
         "coverage": coverage.clone(),
     });
     let report_content_hash = content_fingerprint(
@@ -271,6 +364,7 @@ pub fn build_report_artifact(
             "renderer_version": EVALUATION_REPORT_RENDERER_VERSION,
             "report_content_hash": report_content_hash.clone(),
             "observation_refs": observation_refs.clone(),
+            "assessment_refs": assessment_refs.clone(),
             "coverage": coverage.clone(),
         }))
         .map_err(|error| format!("serialize report artifact identity: {error}"))?,
@@ -282,6 +376,7 @@ pub fn build_report_artifact(
             experiment_id: experiment.experiment_id.clone(),
             spec_fingerprint: experiment.spec_fingerprint.clone(),
             observation_refs,
+            assessment_refs,
             renderer_version: EVALUATION_REPORT_RENDERER_VERSION.to_string(),
             coverage,
             report_content_hash,
@@ -334,10 +429,13 @@ mod tests {
                 input_content_hash:
                     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                         .to_string(),
-                verifier_id: "none".to_string(),
-                verifier_version: "1".to_string(),
                 holdout: false,
-                task_verifier: None,
+                task_verifier: crate::evaluation::task_verifier::TaskVerifierSpec::freeze(
+                    crate::evaluation::task_verifier::JsonValueEqualsConfig {
+                        expected: serde_json::json!({"ok": true}),
+                    },
+                )
+                .unwrap(),
                 input_content: None,
             }],
             repetitions: 1,
@@ -429,9 +527,16 @@ mod tests {
     fn frozen_requirements_cover_every_planned_trial_and_dimension() {
         let (experiment, _) = fixture();
         let observations = Vec::new();
-        let artifact =
-            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
-                .unwrap();
+        let artifact = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
         assert!(artifact.manifest.coverage.evidence_incomplete);
         assert_eq!(artifact.manifest.coverage.metric_gaps.len(), 24);
         let dimensions = artifact
@@ -470,9 +575,16 @@ mod tests {
             record.observation.measurements[0].name = "prompt_tokens".into();
             record.observation.measurements[0].value = Some(0.0);
         }
-        let artifact =
-            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
-                .unwrap();
+        let artifact = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
         let gaps = artifact
             .manifest
             .coverage
@@ -495,12 +607,21 @@ mod tests {
     #[test]
     fn report_identity_is_stable_when_observation_delivery_order_changes() {
         let (experiment, observations) = fixture();
-        let first = build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
-            .expect("report");
+        let first = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .expect("report");
         let mut reversed = observations.clone();
         reversed.reverse();
-        let second = build_report_artifact("owner", &experiment, &reversed, &[], "base", "cand")
-            .expect("report");
+        let second =
+            build_report_artifact("owner", &experiment, &reversed, &[], &[], "base", "cand")
+                .expect("report");
         assert_eq!(
             first.manifest.report_content_hash,
             second.manifest.report_content_hash
@@ -523,9 +644,16 @@ mod tests {
                     record.observation.evidence.clear();
                 }
             }
-            let artifact =
-                build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
-                    .expect("missing evidence stays reportable");
+            let artifact = build_report_artifact(
+                "owner",
+                &experiment,
+                &observations,
+                &[],
+                &[],
+                "base",
+                "cand",
+            )
+            .expect("missing evidence stays reportable");
             assert!(artifact.manifest.coverage.evidence_incomplete);
             assert_eq!(artifact.manifest.coverage.observed_trial_count, 2);
             assert!(artifact.markdown.contains(if missing_measurements {
@@ -541,13 +669,141 @@ mod tests {
     }
 
     #[test]
+    fn persisted_assessments_close_only_task_coverage_and_bind_report_identity() {
+        use crate::evaluation::task_assessment::{TaskAssessmentOutcome, test_assessment_record};
+        let (experiment, observations) = fixture();
+        let assessments = vec![
+            test_assessment_record(&experiment, &observations[0], TaskAssessmentOutcome::Fail),
+            test_assessment_record(&experiment, &observations[1], TaskAssessmentOutcome::Pass),
+        ];
+        let artifact = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &assessments,
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
+        assert_eq!(artifact.manifest.assessment_refs.len(), 2);
+        for (trial, expected) in observations.iter().zip([0.0, 1.0]) {
+            let observed = artifact
+                .report
+                .observations
+                .iter()
+                .find(|item| item.trial_id == trial.trial_id)
+                .unwrap();
+            assert_eq!(
+                observed
+                    .measurements
+                    .iter()
+                    .find(|item| item.name == "task_success")
+                    .unwrap()
+                    .value,
+                Some(expected)
+            );
+        }
+        assert!(
+            artifact
+                .manifest
+                .coverage
+                .metric_gaps
+                .iter()
+                .all(|gap| gap.metric != "task_success")
+        );
+        assert!(
+            artifact
+                .manifest
+                .coverage
+                .metric_gaps
+                .iter()
+                .any(|gap| gap.metric == "estimated_cost_usd")
+        );
+        assert!(artifact.manifest.coverage.evidence_incomplete);
+        let mut reordered = assessments.clone();
+        reordered.reverse();
+        reordered.push(assessments[0].clone());
+        let replay = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &reordered,
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
+        assert_eq!(artifact, replay);
+        let missing = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .unwrap();
+        assert_ne!(
+            artifact.manifest.artifact_fingerprint,
+            missing.manifest.artifact_fingerprint
+        );
+        let mut foreign = assessments;
+        foreign[0].owner_user_id = "other-owner".into();
+        assert!(
+            build_report_artifact(
+                "owner",
+                &experiment,
+                &observations,
+                &foreign,
+                &[],
+                "base",
+                "cand"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn report_rejects_task_success_without_a_persisted_assessment() {
+        let (experiment, mut observations) = fixture();
+        observations[0].observation.measurements.push(Measurement {
+            name: "task_success".into(),
+            value: Some(1.0),
+            unit: "boolean".into(),
+            status: MeasurementStatus::Observed,
+            basis: Some("completed run".into()),
+        });
+        let error = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .expect_err("a completion label is not verifier evidence");
+        assert!(error.contains("persisted task assessment"));
+    }
+
+    #[test]
     fn report_rejects_observed_measurement_without_a_value() {
         let (experiment, mut observations) = fixture();
         observations[0].observation.measurements[0].value = None;
         assert!(
-            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand",)
-                .expect_err("invalid observed fact")
-                .contains("must have a finite value")
+            build_report_artifact(
+                "owner",
+                &experiment,
+                &observations,
+                &[],
+                &[],
+                "base",
+                "cand",
+            )
+            .expect_err("invalid observed fact")
+            .contains("must have a finite value")
         );
     }
 
@@ -568,6 +824,7 @@ mod tests {
             "owner",
             &experiment,
             &observations,
+            &[],
             std::slice::from_ref(&unavailable_trial_id),
             "base",
             "cand",
@@ -590,6 +847,7 @@ mod tests {
             "owner",
             &experiment,
             &observations,
+            &[],
             &["unreadable-trial".to_string()],
             "base",
             "cand",
@@ -601,9 +859,16 @@ mod tests {
     #[test]
     fn report_artifact_identity_includes_coverage_and_observation_refs() {
         let (experiment, observations) = fixture();
-        let complete =
-            build_report_artifact("owner", &experiment, &observations, &[], "base", "cand")
-                .expect("complete report");
+        let complete = build_report_artifact(
+            "owner",
+            &experiment,
+            &observations,
+            &[],
+            &[],
+            "base",
+            "cand",
+        )
+        .expect("complete report");
         let candidate_trial_id = experiment
             .spec
             .plan_trials()
@@ -616,6 +881,7 @@ mod tests {
             "owner",
             &experiment,
             &observations[..1],
+            &[],
             std::slice::from_ref(&candidate_trial_id),
             "base",
             "cand",

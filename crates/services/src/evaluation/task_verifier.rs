@@ -11,7 +11,7 @@ pub const JSON_VALUE_EQUALS_VERSION: &str = "1";
 const IMPLEMENTATION: &str = "json_value_equals.v1: complete JSON document; root Value equality; object order irrelevant; array order significant; integer and float representations distinct; no Markdown or prose; max expected canonical UTF-8 bytes=65536; max output UTF-8 bytes=1048576";
 const RUBRIC: &str = "The complete assistant output must parse as one JSON value and equal the frozen expected value. This verifies only that structured-output criterion.";
 const MAX_EXPECTED_BYTES: usize = 65_536;
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
+pub(super) const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
