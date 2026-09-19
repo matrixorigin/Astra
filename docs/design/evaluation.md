@@ -210,6 +210,45 @@ successful. The report is recomputable and deterministic at this stage; a
 future artifact persistence layer may attach a durable download reference
 without changing its fact or identity contract.
 
+## Local workspace evaluation delivery boundary
+
+Status: required delivery contract; the current text adapter does not implement
+this path. Its HTTP integration test proves routing through the canonical Run
+and reporting, not TUI operation or local tool isolation.
+
+Developer-facing coding evaluation must be usable from TUI with an explicitly
+selected Edge or User Runner. HTTP controls the experiment; it does not determine
+where tools execute. Local shell, files, and Git remain on the selected provider
+through the existing execution binding, permission admission, and durable tool
+ledger. When CLI/TUI is the selected Edge tool host, it must service the
+canonical tool-dispatch channel throughout execution. An independently running
+User Runner retains its own lifecycle; the TUI may disconnect and reconnect
+through the existing observation APIs.
+
+The first workspace delivery covers one repository, one fixed case, and two
+serial arms starting from the same verified source snapshot. Each arm has its
+own Session, execution directory, and writable Git metadata. Worktree separation
+alone does not establish isolation: shared temporary paths, environment,
+credentials, Git metadata, and external side effects must be accounted for by
+the selected sandbox and frozen tool policy. Unsupported isolation is reported
+before execution rather than silently using ordinary local permissions.
+
+The plan records the source identity, selected executor, effective tool and
+environment policy, and comparison inputs. An authenticated workspace
+materializer supplies the actual trial instance and executor binding generation
+as evidence. A client-provided path or hash is selection intent, not proof of
+materialization. Retry retains that instance and its outputs; cleanup may remove
+only the instance whose ownership the materializer can prove. Edge disconnect
+does not authorize Server-local fallback.
+
+Acceptance requires a real client and Edge tool host to execute file and shell
+operations, produce test output and patch evidence, and preserve the source and
+other arm. Wrong owner, stale binding, unavailable runner, cancellation, and
+tool-result replay must follow their canonical contracts. Reports distinguish
+Run completion, Skill invocation, verifier success, and missing evidence. This
+delivery is required for coding Skill evaluation; completing the text adapter
+does not complete the developer-facing Eval goal.
+
 ## Materialization receipt boundary
 
 Materialization is an append-only evidence boundary between a planned trial
