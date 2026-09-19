@@ -314,3 +314,13 @@ tools, implicit helpers, provisioning, trusted Runner receipts, and the Eval/TUI
 binding still require integration. It does not upgrade macOS process-group
 ownership into proof that every escaped descendant has terminated; a trial
 cannot claim complete settlement or safely recycle its workspace on that basis.
+
+Native CLI file admission intersects the immutable host roots with the ordinary
+permission policy: explicit toolchain roots are read-only, and permission
+expansion cannot widen the host boundary. This remains a path admission check,
+not descriptor-relative isolation against concurrent symlink replacement.
+Under this host constraint, native edits skip automatic formatters and do not
+schedule passive LSP, Cargo, or TypeScript checks. Required formatter/verifier
+commands must run explicitly through confined shell so their execution appears
+in the trial evidence. Other delegated tools still need constraint-aware
+admission before enabling a complete workspace evaluation profile.

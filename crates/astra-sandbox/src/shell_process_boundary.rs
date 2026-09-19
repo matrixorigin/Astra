@@ -64,6 +64,20 @@ impl ShellProcessBoundary {
         })
     }
 
+    /// Apply the same host roots to native file admission. This is a path
+    /// check, not an atomic open: callers still own race-safe file access.
+    pub fn validate_file_access(&self, path: &Path, write: bool) -> Result<PathBuf, String> {
+        let mut policy = crate::SandboxPolicy::for_project(&self.workspace);
+        policy.allowed_paths = if write {
+            Vec::new()
+        } else {
+            self.read_only_paths.clone()
+        };
+        let path = path.to_str().ok_or("file access requires a UTF-8 path")?;
+        crate::validate_path(&policy, path)
+            .map_err(|_| "path is outside the immutable host file boundary; changing permission mode cannot grant access".to_string())
+    }
+
     /// Return an argv wrapper; never interpolate the command into profile text.
     /// Unsupported hosts fail closed instead of executing an ordinary shell.
     pub fn wrap(&self, program: &str, args: &[String]) -> Result<(String, Vec<String>), String> {
@@ -149,6 +163,46 @@ mod tests {
         assert!(boundary.validate(&boundary.workspace).is_err());
         boundary.home = boundary.temp.clone();
         assert!(boundary.validate(&boundary.workspace).is_err());
+    }
+
+    #[test]
+    fn native_file_access_separates_read_roots_from_write_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut boundary = fixture(root.path());
+        let toolchain = root.path().join("toolchain");
+        std::fs::create_dir(&toolchain).unwrap();
+        std::fs::write(toolchain.join("input"), "data").unwrap();
+        boundary.read_only_paths.push(toolchain.clone());
+        let boundary = boundary.validate(&boundary.workspace).unwrap();
+        assert!(
+            boundary
+                .validate_file_access(&boundary.workspace.join("new"), true)
+                .is_ok()
+        );
+        assert!(
+            boundary
+                .validate_file_access(&toolchain.join("input"), false)
+                .is_ok()
+        );
+        assert!(
+            boundary
+                .validate_file_access(&toolchain.join("new"), true)
+                .is_err()
+        );
+        assert!(
+            boundary
+                .validate_file_access(&root.path().join("outside"), false)
+                .is_err()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.path(), boundary.workspace.join("escape")).unwrap();
+            assert!(
+                boundary
+                    .validate_file_access(&boundary.workspace.join("escape/new"), true)
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -1410,7 +1410,7 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
     str_replace_with_formatting(workspace_root, args, true)
 }
 
-pub(crate) fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
+pub fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
     str_replace_with_formatting(workspace_root, args, false)
 }
 

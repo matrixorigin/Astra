@@ -4221,6 +4221,9 @@ impl ToolExecutor {
         project_root: &Path,
         tool_results_nonempty: bool,
     ) -> Vec<Value> {
+        if self.shell_process_boundary.is_some() {
+            return Vec::new();
+        }
         let mut out = self
             .passive_lsp
             .take_diagnostic_messages(tool_results_nonempty)

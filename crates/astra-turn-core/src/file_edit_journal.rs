@@ -330,6 +330,18 @@ impl FileEditJournal {
         result
     }
 
+    /// Return the paths that a turn rollback would mutate, in rollback order.
+    /// Callers with an additional filesystem authority can validate the full
+    /// plan before `undo_turn_since*` performs its first write.
+    pub fn paths_for_turn_since(&self, turn_index: u32, checkpoint: u64) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     /// Re-apply all file edits from a specific turn transactionally.
     ///
     /// This is the inverse of [`Self::undo_turn_transactional`]. It is
